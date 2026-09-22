@@ -8461,6 +8461,250 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+HUMAN_REVIEWER_SENTINEL = "human"
+
+
+def is_human_reviewer(value: Optional[str]) -> bool:
+    """Return True for the explicit human-review sentinel.
+
+    Accepts the bare sentinel ``human`` and the attributed form
+    ``human:<name>`` so a board can name WHICH human owns the lane while
+    still being recognizable as a deliberate (non-spawnable) terminal lane.
+    """
+    if not isinstance(value, str):
+        return False
+    head = value.strip().casefold().split(":", 1)[0].strip()
+    return head == HUMAN_REVIEWER_SENTINEL
+
+
+def spawnable_reviewer_profiles() -> list[str]:
+    """Installed NAMED profile ids that a review card may legally be assigned to.
+
+    Excludes the implicit ``default`` entry, which :func:`list_profile_names`
+    always reports whether or not any profile directory exists — so an empty
+    list here means "no fleet profiles installed", not "one is installed".
+    """
+    try:
+        from hermes_cli.profiles import list_profile_names
+
+        return sorted(n for n in list_profile_names() if n != "default")
+    except Exception:
+        return []
+
+
+def configured_review_assignee() -> Optional[str]:
+    """Default reviewer from ``kanban.review_assignee`` (no implementer fallback).
+
+    Returns ``None`` when unset/blank so the caller can refuse explicitly
+    rather than silently leaving the implementer as their own reviewer.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get("review_assignee")
+    except Exception:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def review_stale_minutes() -> int:
+    """Minutes an unclaimed review card may sit before it is reported stale."""
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get(
+            "review_stale_minutes", 30
+        )
+        minutes = int(value)
+    except Exception:
+        return 30
+    return minutes if minutes > 0 else 30
+
+
+def resolve_reviewer(
+    reviewer: Optional[str],
+    implementer: Optional[str],
+    *,
+    allow_same_actor: bool = False,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve+validate a review assignee. Returns ``(canonical, error)``.
+
+    The invariant this enforces, at the moment the reviewer is SET: a review
+    assignee must be spawnable (a real profile) or explicitly ``human``.
+    Before this gate any free-text string (the literal ``reviewer``) was
+    accepted, the card was reassigned to it, and the dispatcher then skipped
+    it forever as a "non-spawnable assignee" with nothing alerting.
+
+    ``reviewer=None`` resolves to config ``kanban.review_assignee`` — never to
+    the implementer, never to a placeholder.
+    """
+    if reviewer is None or not str(reviewer).strip():
+        reviewer = configured_review_assignee()
+        if reviewer is None:
+            # No explicit reviewer and no configured default: leave the
+            # assignee untouched (pre-gate behavior) rather than refusing the
+            # transition outright — an unconfigured board would otherwise be
+            # unable to request review at all. The fleet sets
+            # kanban.review_assignee, so it resolves to a real profile there;
+            # boards that don't are surfaced by review_awaiting_human()'s
+            # stale branch instead of silently parking.
+            return None, None
+
+    raw = str(reviewer).strip()
+    if is_human_reviewer(raw):
+        return raw.casefold(), None
+
+    try:
+        canonical = _canonical_assignee(raw)
+    except Exception:
+        canonical = None
+    if not canonical:
+        return None, f"invalid reviewer {raw!r}"
+
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        # Can't introspect profiles (partial install) — accept, preserving
+        # the pre-gate behavior rather than hard-failing the transition.
+        return canonical, None
+
+    if not spawnable_reviewer_profiles():
+        # No profiles installed AT ALL: this is not a real fleet board (bare
+        # checkout / hermetic test home), so profile_exists() would refuse
+        # every possible reviewer. Fail open, mirroring has_spawnable_ready.
+        return canonical, None
+
+    if not profile_exists(canonical):
+        known = ", ".join(spawnable_reviewer_profiles()) or "(none installed)"
+        return None, (
+            f"reviewer {canonical!r} is not an installed profile and is not "
+            f"the explicit sentinel '{HUMAN_REVIEWER_SENTINEL}' — a review "
+            "card assigned to it can never be spawned and would wait "
+            f"forever. Spawnable reviewer profiles: {known}"
+        )
+
+    if (
+        implementer
+        and not allow_same_actor
+        and canonical == _canonical_assignee(implementer)
+    ):
+        return None, (
+            f"reviewer {canonical!r} is the implementer — same-actor review "
+            "is refused; pass a different reviewer or allow_same_actor=True "
+            "(--allow-same-actor), which is recorded on the event"
+        )
+
+    return canonical, None
+
+
+def review_awaiting_human(
+    conn: sqlite3.Connection, *, stale_minutes: Optional[int] = None
+) -> list[dict]:
+    """Review cards that no autonomous reviewer will ever pick up (or hasn't).
+
+    Returns one dict per card — ``{task_id, assignee, age_minutes, reason}``,
+    oldest first — for every ``review`` task that is unclaimed AND either
+
+    * ``non_spawnable``: its assignee is not an installed profile (an explicit
+      ``human`` lane, or the placeholder bug this detector exists for), or
+    * ``stale``: it is spawnable but has sat unclaimed longer than
+      ``kanban.review_stale_minutes``.
+
+    The dispatcher previously reported these as "terminal lane, OK" and
+    nothing alerted, so a card could wait for a human indefinitely with no
+    signal (incident 2026-09-21: 10 cards, one for 2h+).
+    """
+    if stale_minutes is None:
+        stale_minutes = review_stale_minutes()
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+
+    now = int(time.time())
+    out: list[dict] = []
+    for row in conn.execute(
+        "SELECT id, assignee, COALESCE(started_at, created_at) AS since "
+        "FROM tasks WHERE status = 'review' AND claim_lock IS NULL"
+    ):
+        assignee = row["assignee"]
+        since = int(row["since"] or now)
+        age_minutes = max(0, (now - since) // 60)
+        spawnable = bool(
+            assignee
+            and profile_exists is not None
+            and profile_exists(assignee)
+        )
+        if not assignee or not spawnable:
+            reason = "non_spawnable"
+        elif age_minutes >= stale_minutes:
+            reason = "stale"
+        else:
+            continue
+        out.append(
+            {
+                "task_id": row["id"],
+                "assignee": assignee,
+                "age_minutes": age_minutes,
+                "reason": reason,
+            }
+        )
+    out.sort(key=lambda r: -r["age_minutes"])
+    return out
+
+
+def format_review_awaiting_human(entries: list[dict]) -> Optional[str]:
+    """One-line operator summary for :func:`review_awaiting_human`."""
+    if not entries:
+        return None
+    oldest = entries[0]
+    ids = ", ".join(e["task_id"] for e in entries[:5])
+    if len(entries) > 5:
+        ids += f", +{len(entries) - 5} more"
+    return (
+        f"review: {len(entries)} awaiting HUMAN "
+        f"(oldest {oldest['age_minutes']}m): {ids}"
+    )
+
+
+def arm_review_stale_alerts(conn: sqlite3.Connection, entries: list[dict]) -> list[dict]:
+    """Return the subset of *entries* that have not yet been alerted, arming them.
+
+    One-shot per review episode: an alert fires the first time a card crosses
+    the threshold, and re-arms when the card is claimed (a claim closes the
+    review episode, and a later ``review_requested`` starts a new one, both of
+    which leave events newer than the alert marker).
+    """
+    fresh: list[dict] = []
+    with write_txn(conn):
+        for entry in entries:
+            task_id = entry["task_id"]
+            row = conn.execute(
+                "SELECT kind FROM task_events "
+                "WHERE task_id = ? "
+                "  AND kind IN ('review_stale_alerted', 'review_requested', "
+                "               'claimed') "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is not None and row["kind"] == "review_stale_alerted":
+                continue  # already alerted for this review episode
+            _append_event(
+                conn,
+                task_id,
+                "review_stale_alerted",
+                {
+                    "assignee": entry.get("assignee"),
+                    "age_minutes": entry.get("age_minutes"),
+                    "reason": entry.get("reason"),
+                },
+            )
+            fresh.append(entry)
+    return fresh
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8470,6 +8714,7 @@ def request_review(
     reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     force: bool = False,
+    allow_same_actor: bool = False,
     with_reason: bool = False,
 ):
     """Transition implementation work into the first-class review phase.
@@ -8559,7 +8804,14 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
-        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        # Validate/resolve at the gate: a review assignee must be spawnable
+        # (a real profile) or the explicit `human` sentinel. A placeholder
+        # string used to be accepted here and parked the card forever.
+        reviewer, reviewer_error = resolve_reviewer(
+            reviewer, implementer, allow_same_actor=allow_same_actor
+        )
+        if reviewer_error is not None:
+            return _ret(False, reviewer_error)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
@@ -8617,6 +8869,14 @@ def request_review(
                 "summary": event_summary or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                **(
+                    {"allow_same_actor": True}
+                    if allow_same_actor
+                    and reviewer
+                    and implementer
+                    and reviewer == _canonical_assignee(implementer)
+                    else {}
+                ),
             },
             run_id=run_id,
         )

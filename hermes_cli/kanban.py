@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,7 @@ from typing import Any, Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_identity import safe_comment_provenance
+from hermes_constants import get_default_hermes_root
 
 
 # ---------------------------------------------------------------------------
@@ -859,7 +861,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_request_review.add_argument(
         "--reviewer", default=None,
-        help="Optional reviewer profile; reassigns the task before review dispatch.",
+        help=(
+            "Reviewer profile (or the explicit sentinel 'human' / "
+            "'human:<name>'); reassigns the task before review dispatch. "
+            "Defaults to config kanban.review_assignee. A reviewer that is "
+            "neither an installed profile nor 'human' is refused."
+        ),
+    )
+    p_request_review.add_argument(
+        "--allow-same-actor", action="store_true",
+        help=(
+            "Permit the implementer to review their own work (normally "
+            "refused). Recorded on the review_requested event."
+        ),
     )
     p_request_review.add_argument(
         "--metadata", default=None,
@@ -3081,6 +3095,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             reviewer=reviewer,
             expected_run_id=_worker_run_id_for(tid),
             force=bool(getattr(args, "force", False)),
+            allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
             with_reason=True,
         )
         if not ok:
@@ -3348,7 +3363,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             except Exception:
                 pass
     if getattr(args, "json", False):
+        # The human-readable tick prints the awaiting-HUMAN detector below;
+        # without this key a JSON consumer is exactly as blind as it was
+        # before the detector existed. Same dry-run rule as the text path:
+        # report, but only arm/send on a real tick.
+        review_awaiting = _collect_review_awaiting_human(
+            alert=not args.dry_run
+        )
         print(json.dumps({
+            "review_awaiting_human": review_awaiting,
             "reclaimed": res.reclaimed,
             "skipped_locked": res.skipped_locked,
             "lock_holder": res.lock_holder,
@@ -3493,11 +3516,109 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             )
     if res.skipped_nonspawnable:
         print(
-            f"Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"Skipped (non-spawnable assignee — HUMAN review required): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    # --dry-run is documented (and mandated by the incident runbook) as the
+    # SAFE probe, so it must not arm alerts or send: arming writes a durable
+    # review_stale_alerted event, and the send fires a real Discord message.
+    # The detector still PRINTS — that is the whole value of the line — it
+    # just stops mutating the board it is only supposed to observe.
+    _print_review_awaiting_human(alert=not args.dry_run)
     _print_stranded_by_triage(res.stranded_by_triage)
     return 0
+
+
+def _notify_script_path():
+    """Locate ``notify.py`` (the out-of-agent Discord/Telegram alert helper).
+
+    Resolved under the *running* Hermes root, never a hardcoded ``~/.hermes``.
+    These assets are root-level (shared across profiles), so
+    ``get_default_hermes_root()`` is the right resolver: it maps a profile home
+    ``<root>/profiles/<name>`` back to ``<root>`` while leaving a redirected
+    home (a sandbox, a hermetic test home, CI) pointing at itself. Hardcoding
+    the path made a sandboxed board fire a REAL alert to the live channel about
+    cards that do not exist on the real board.
+    """
+    root = get_default_hermes_root()
+    candidates = [
+        str(root / "scripts" / "notify.py"),
+        str(root / "skills-shared/general/scheduler/scripts/notify.py"),
+        str(root / "skills/devops/scheduler/scripts/notify.py"),
+    ]
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def _send_review_stale_alert(entries) -> None:
+    """Fire one #alerts message for cards that just crossed the threshold."""
+    script = _notify_script_path()
+    if script is None:
+        return
+    lines = [
+        f"  • {e['task_id']} → {e['assignee'] or '(unassigned)'} "
+        f"({e['age_minutes']}m, {e['reason']})"
+        for e in entries[:10]
+    ]
+    body = (
+        "🕰️ Kanban review lane awaiting a HUMAN\n"
+        + "\n".join(lines)
+        + "\nNo autonomous reviewer will pick these up. Reassign with: "
+        "hermes kanban assign <id> argus"
+    )
+    try:
+        subprocess.run(
+            [sys.executable, str(script), "--send", body, "--channel", "discord"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception:
+        pass
+
+
+def _collect_review_awaiting_human(*, alert: bool = True) -> list:
+    """Return review cards nothing will ever spawn; arm+send only if ``alert``.
+
+    Single owner of this detector's side-effect policy. Both the text tick and
+    the ``--json`` tick go through here, so the two surfaces cannot drift into
+    reporting different things — or into one of them writing when the other
+    does not. ``alert=False`` makes the call strictly read-only: no
+    ``review_stale_alerted`` event, no Discord send.
+    """
+    try:
+        with kb.connect_closing() as conn:
+            entries = kb.review_awaiting_human(conn)
+            if entries and alert:
+                fresh = kb.arm_review_stale_alerts(conn, entries)
+                if fresh:
+                    _send_review_stale_alert(fresh)
+            return entries
+    except Exception:
+        return []
+
+
+def _print_review_awaiting_human(*, alert: bool = True) -> None:
+    """Report review cards nothing will ever spawn, and alert once each.
+
+    Before this, the dispatcher printed those cards as "terminal lane, OK"
+    and there was no other signal — 10 cards sat in review (one 2h+) with
+    nothing raised (incident 2026-09-21).
+    """
+    entries = _collect_review_awaiting_human(alert=alert)
+    try:
+        line = kb.format_review_awaiting_human(entries)
+    except Exception:
+        return
+    if line:
+        print(line)
 
 
 def _print_stranded_by_triage(stranded) -> None:
@@ -3729,6 +3850,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         stats = kb.board_stats(conn)
+        stats["review_awaiting_human"] = kb.review_awaiting_human(conn)
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
@@ -3755,6 +3877,9 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    line = kb.format_review_awaiting_human(stats.get("review_awaiting_human") or [])
+    if line:
+        print(f"\n{line}")
     return 0
 
 
