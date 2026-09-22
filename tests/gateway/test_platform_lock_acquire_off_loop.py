@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import os
 import threading
 from pathlib import Path
 from typing import Any, Dict
@@ -545,8 +546,13 @@ async def test_the_orphan_drain_does_not_delete_a_retry_connects_live_lock(
             slow_done.set()
             entered.set()
             proceed.wait(timeout=10)
+        # Model the real contract: the second element is the PRE-EXISTING
+        # record, so it is non-None exactly when somebody already held the pair.
+        # `acquire_scoped_lock` self-reacquires for the calling PID, so both of
+        # these acquires succeed.
+        existing = {"pid": os.getpid()} if (scope, identity) in held else None
         held.add((scope, identity))
-        return True, None
+        return True, existing
 
     monkeypatch.setattr(status, "acquire_scoped_lock", _fake_acquire)
     monkeypatch.setattr(
@@ -642,14 +648,93 @@ async def test_a_second_cancel_during_the_drain_still_does_not_orphan_the_lock(
     )
 
 
-def test_the_generation_counter_is_bumped_by_the_sync_choke_point(monkeypatch):
-    """The generation guard must be driven by real acquisitions, not by the drain.
+@pytest.mark.asyncio
+async def test_the_drain_does_not_release_while_a_sibling_acquisition_is_live(
+    monkeypatch,
+):
+    """Refcount, not "am I the only record".
 
-    Non-vacuity floor for the two tests above: if
+    ``acquire_scoped_lock`` SELF-REACQUIRES for the calling PID, so an orphaned
+    worker and a live retry connect can BOTH hold the same pair.  The drain must
+    decide on whether any OTHER live acquisition remains -- not on a count, and
+    not on being the newest.  This pins the case where the drain drops its own
+    token and a sibling's acquisition is still recorded: the lock must survive.
+    """
+    from gateway.platforms import base as base_mod
+
+    held: set[tuple[str, str]] = set()
+    entered = threading.Event()
+    proceed = threading.Event()
+    worker_finished = threading.Event()
+
+    def _fake_acquire(scope: str, identity: str, metadata=None):
+        existing = {"pid": os.getpid()} if (scope, identity) in held else None
+        held.add((scope, identity))
+        return True, existing
+
+    monkeypatch.setattr(status, "acquire_scoped_lock", _fake_acquire)
+    monkeypatch.setattr(
+        status, "release_scoped_lock", lambda s, i: held.discard((s, i))
+    )
+
+    adapter = _adapter()
+    real_acquire = adapter._acquire_platform_lock
+
+    def _slow(scope: str, identity: str, resource_desc: str) -> bool:
+        entered.set()
+        proceed.wait(timeout=10)
+        try:
+            return real_acquire(scope, identity, resource_desc)
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", _slow)
+
+    task = asyncio.ensure_future(
+        adapter._acquire_platform_lock_async("telegram-bot-token", "tok", "d")
+    )
+    await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+
+    # A retry connect comes up for the same credential and is STILL LIVE when
+    # our orphaned worker finishes.
+    retry = _adapter()
+    assert retry._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
+
+    task.cancel()
+    proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.get_running_loop().run_in_executor(
+        None, worker_finished.wait, 10
+    ), "the acquire worker never finished"
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+
+    assert held == {("telegram-bot-token", "tok")}, (
+        "the drain deleted the machine-global lock while a live retry connect "
+        "was still holding it"
+    )
+    # ...and the drain must have dropped ITS OWN acquisition, or the pair stays
+    # pinned forever and the retry's own teardown can never release it.
+    assert base_mod._platform_lock_holder_count("telegram-bot-token", "tok") == 1, (
+        "the cancelled acquire leaked its acquisition record; the pair is now "
+        "permanently pinned and no later release of it can ever fire"
+    )
+    retry._release_platform_lock()
+    assert held == set(), (
+        "the live holder's own teardown could not release the lock, because a "
+        "drained acquisition was still on record"
+    )
+
+
+def test_the_ownership_token_is_recorded_by_the_sync_choke_point(monkeypatch):
+    """The ownership guard must be driven by real acquisitions, not by the drain.
+
+    Non-vacuity floor for the cancel-path tests above: if
     ``_note_platform_lock_acquired`` stopped being called from
-    :meth:`_acquire_platform_lock`, the generation would never move and the
-    guard would decide "someone else re-acquired" for every drain -- silently
-    turning the cancel-path release back into the no-op that orphans the lock.
+    :meth:`_acquire_platform_lock`, no acquisition would ever be recorded, the
+    drain's token would never match, and the cancel-path release would silently
+    become the no-op that orphans the lock.
     """
     from gateway.platforms import base as base_mod
 
@@ -657,14 +742,200 @@ def test_the_generation_counter_is_bumped_by_the_sync_choke_point(monkeypatch):
         status, "acquire_scoped_lock", lambda s, i, metadata=None: (True, None)
     )
 
-    before = base_mod._platform_lock_generation("telegram-bot-token", "tok")
-    assert _adapter()._acquire_platform_lock(
-        "telegram-bot-token", "tok", "d"
-    ) is True
-    after = base_mod._platform_lock_generation("telegram-bot-token", "tok")
+    adapter = _adapter()
+    assert adapter._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
 
-    assert after == before + 1, (
-        "a successful acquire did not advance the scoped-lock generation; the "
-        "cancel-path release guard has nothing to distinguish our acquisition "
-        "from a retry connect's"
+    token = adapter._platform_lock_token
+    assert token is not None, (
+        "a successful acquire recorded no ownership token; the cancel-path and "
+        "teardown release guards have nothing to match against"
     )
+    assert base_mod._platform_lock_holder_count("telegram-bot-token", "tok") == 1, (
+        "the acquiring adapter is not on record as a live holder of the pair "
+        "it just acquired"
+    )
+
+
+def test_a_dropped_adapter_does_not_keep_ownership_forever(monkeypatch):
+    """A record whose adapter is gone must not keep the pair pinned.
+
+    Adapters are dropped without teardown (a failed connect, a GC'd retry).  If
+    the acquisition record outlived them, the pair would look permanently held
+    by a live sibling and no later release would ever fire -- turning the orphan
+    bug back on permanently.
+    """
+    import gc
+
+    from gateway.platforms import base as base_mod
+
+    monkeypatch.setattr(
+        status, "acquire_scoped_lock", lambda s, i, metadata=None: (True, None)
+    )
+
+    doomed = _adapter()
+    assert doomed._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
+    assert base_mod._platform_lock_holder_count("telegram-bot-token", "tok") == 1
+
+    del doomed
+    gc.collect()
+
+    assert base_mod._platform_lock_holder_count("telegram-bot-token", "tok") == 0, (
+        "a dropped adapter's acquisition record kept the pair pinned; no later "
+        "release of that lock can ever fire"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_drain_releases_even_when_an_unrelated_connect_churned_the_pair(
+    monkeypatch,
+):
+    """Ownership is not a counter delta.
+
+    The previous guard released only when the acquisition GENERATION advanced by
+    exactly one while the drain ran.  That is a proxy, and an unrelated connect
+    that acquires and RELEASES the same ``(scope, identity)`` while our worker is
+    blocked advances it by two -- so the drain refuses to release a lock our own
+    worker really does hold, and it is orphaned: every later connect anywhere on
+    the machine fails "already in use" until the process restarts.
+
+    Oracle is the resource.  Regression for the FleetReview P1 at
+    ``base.py:3929``/``:3878`` on record ``401cd4c23e``.
+    """
+    held: set[tuple[str, str]] = set()
+    entered = threading.Event()
+    proceed = threading.Event()
+    worker_finished = threading.Event()
+    slow_done = threading.Event()
+
+    def _fake_acquire(scope: str, identity: str, metadata=None):
+        # Models the real contract: the second element is the PRE-EXISTING
+        # record, and `acquire_scoped_lock` self-reacquires for the calling PID.
+        existing = {"pid": os.getpid()} if (scope, identity) in held else None
+        held.add((scope, identity))
+        return True, existing
+
+    monkeypatch.setattr(status, "acquire_scoped_lock", _fake_acquire)
+    monkeypatch.setattr(
+        status, "release_scoped_lock", lambda s, i: held.discard((s, i))
+    )
+
+    adapter = _adapter()
+    real_acquire = adapter._acquire_platform_lock
+
+    def _slow(scope: str, identity: str, resource_desc: str) -> bool:
+        if not slow_done.is_set():
+            slow_done.set()
+            entered.set()
+            proceed.wait(timeout=10)
+        try:
+            return real_acquire(scope, identity, resource_desc)
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", _slow)
+
+    task = asyncio.ensure_future(
+        adapter._acquire_platform_lock_async("telegram-bot-token", "tok", "d")
+    )
+    await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+
+    # An UNRELATED connect for the same credential acquires and releases while
+    # our worker is still blocked: +2 on any counter, and gone by the time we
+    # finish.
+    other = _adapter()
+    assert other._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
+    other._release_platform_lock()
+    assert held == set()
+
+    task.cancel()
+    proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert await asyncio.get_running_loop().run_in_executor(
+        None, worker_finished.wait, 10
+    ), "the acquire worker never finished"
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+
+    assert held == set(), (
+        "the drain refused to release a lock its own worker took, because an "
+        f"unrelated connect had churned the same pair: {held}. Every later "
+        "connect will fail 'already in use' until the process restarts."
+    )
+
+
+@pytest.mark.asyncio
+async def test_teardown_after_a_cancelled_acquire_does_not_release_twice(
+    monkeypatch,
+):
+    """Teardown must not delete a retry connect's live lock.
+
+    The sync acquire sets ``_platform_lock_identity`` BEFORE it acquires, and
+    the cancel drain releases without clearing it -- so the adapter still points
+    at the pair after its lock is gone.  Teardown always runs, so an
+    identity-only release fires a SECOND time and deletes whatever retry connect
+    has since legitimately claimed that machine-global pair.
+
+    Regression for the FleetReview P1 at ``base.py:3940`` on record
+    ``401cd4c23e``.
+    """
+    held: set[tuple[str, str]] = set()
+    entered = threading.Event()
+    proceed = threading.Event()
+    worker_finished = threading.Event()
+
+    def _fake_acquire(scope: str, identity: str, metadata=None):
+        # Models the real contract: the second element is the PRE-EXISTING
+        # record, and `acquire_scoped_lock` self-reacquires for the calling PID.
+        existing = {"pid": os.getpid()} if (scope, identity) in held else None
+        held.add((scope, identity))
+        return True, existing
+
+    monkeypatch.setattr(status, "acquire_scoped_lock", _fake_acquire)
+    monkeypatch.setattr(
+        status, "release_scoped_lock", lambda s, i: held.discard((s, i))
+    )
+
+    adapter = _adapter()
+    real_acquire = adapter._acquire_platform_lock
+
+    def _slow(scope: str, identity: str, resource_desc: str) -> bool:
+        entered.set()
+        proceed.wait(timeout=10)
+        try:
+            return real_acquire(scope, identity, resource_desc)
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", _slow)
+
+    task = asyncio.ensure_future(
+        adapter._acquire_platform_lock_async("telegram-bot-token", "tok", "d")
+    )
+    await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+    task.cancel()
+    proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.get_running_loop().run_in_executor(
+        None, worker_finished.wait, 10
+    ), "the acquire worker never finished"
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    assert held == set(), "the drain should have released its own lock"
+
+    # A retry connect now legitimately holds the machine-global pair ...
+    retry = _adapter()
+    assert retry._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
+    assert held == {("telegram-bot-token", "tok")}
+
+    # ... and the cancelled adapter's teardown runs, as it always does.
+    adapter._release_platform_lock()
+
+    assert held == {("telegram-bot-token", "tok")}, (
+        "the cancelled adapter's teardown released the pair a second time and "
+        "deleted a LIVE retry connect's machine-global lock; that adapter is "
+        "now running without its credential lock."
+    )
+
