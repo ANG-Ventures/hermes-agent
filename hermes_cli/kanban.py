@@ -751,13 +751,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--survivor-pr", default=None, metavar="OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
                                  "gh pr view (state OPEN or MERGED) AND required to name this "
-                                 "task in its branch; an unverifiable claim refuses the completion.")
+                                 "task; an unverifiable claim refuses the completion. Naming "
+                                 "the task in the PR's head BRANCH binds the claim. A match "
+                                 "only in the PR title or body is a mention, not a tie to this "
+                                 "card's work, so it is recorded as an unbound claim (see "
+                                 "--survivor-unbound) and never becomes standing authority to "
+                                 "delete the workspace later.")
     p_complete.add_argument("--survivor-unbound", action="store_true",
                             help="Operator override: accept a --survivor-ref/--survivor-pr that "
                                  "is live but does NOT name this task, for the case where the "
                                  "work really did land on an unrelated-looking branch. The claim "
-                                 "is still remote-verified; the override and the OS user who made "
-                                 "it are recorded on the survivor and in the task event log.")
+                                 "is still remote-verified; the override and the OS user (resolved "
+                                 "from the real uid, not $USER) are recorded on the survivor and "
+                                 "in the task event log. An unbound claim authorises THIS "
+                                 "completion only: a later reclamation will not reuse it.")
 
     p_edit = sub.add_parser(
         "edit",
@@ -1438,7 +1445,13 @@ def kanban_command(args: argparse.Namespace) -> int:
         try:
             return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
+            # A survivor refusal carries its operator-only hint on the
+            # exception, not in the persisted message, so render it HERE --
+            # at the boundary whose environment belongs to the caller actually
+            # reading the text. See kanban_survivor.render_override_hint.
+            from hermes_cli.kanban_survivor import render_override_hint
+
+            print(f"kanban: {render_override_hint(exc)}", file=sys.stderr)
             return 1
 
 

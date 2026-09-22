@@ -90,10 +90,11 @@ def _claimed_card(board, title="external implementation"):
     {"survivor_ref": f"{URL}#{HEAD}"},
 ])
 def test_unrelated_live_claim_is_refused(board, unrelated, kwargs, monkeypatch):
-    # The refusal names the override only for a caller with no dispatcher
-    # grant (see `_override_hint`). `tests/conftest.py` scrubs those vars, so
-    # this would pass implicitly -- assert the operator shape explicitly, so a
-    # change to that scrub list cannot silently flip what this test measures.
+    # The refusal MESSAGE never names the override, in any environment: it is
+    # persisted as held_reason and replayed to workers by kanban_show, so the
+    # hint is rendered at the CLI boundary instead (see the CLI tests below).
+    # Assert the operator shape explicitly, so a change to the conftest scrub
+    # list cannot silently flip what this test measures.
     for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
         monkeypatch.delenv(key, raising=False)
     tid = _claimed_card(board)
@@ -102,7 +103,8 @@ def test_unrelated_live_claim_is_refused(board, unrelated, kwargs, monkeypatch):
 
     message = str(excinfo.value)
     assert "does not name" in message and tid in message
-    assert "--survivor-unbound" in message, "the refusal must name the reachable override"
+    assert "--survivor-unbound" not in message, "the flag must not be in the persisted text"
+    assert excinfo.value.override_hint, "the override must still be reachable for a renderer"
     assert kb.get_task(board, tid).status != "done"
     assert not board.execute(
         "SELECT 1 FROM task_workspace_survivors WHERE task_id = ? AND survivor IS NOT NULL",
@@ -127,15 +129,68 @@ def test_unrelated_live_claim_does_not_delete_the_workspace(board, unrelated):
 
 # --- the binding: a claim that DOES name the card is still accepted ---------
 
-@pytest.mark.parametrize("field", ["headRefName", "title", "body"])
-def test_claim_naming_the_card_is_accepted(board, unrelated, field):
+def test_claim_naming_the_card_in_its_branch_is_bound(board, unrelated):
+    """The head branch ties the PR's CONTENT to the card: a full binding."""
     tid = _claimed_card(board)
-    unrelated[0][field] = f"kanban/{tid}-fix"
+    unrelated[0]["headRefName"] = f"kanban/{tid}-fix"
     assert kb.complete_task(board, tid, survivor_pr=PR,
                             metadata={"changed_files": ["code.py"]})
     saved = kb.latest_run(board, tid).metadata["survivor"]
     assert saved["refs"][0]["sha"] == MERGE
+    assert saved["refs"][0]["corroborated_by"] == "branch"
     assert not saved["refs"][0].get("unbound")
+
+
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_a_mention_in_the_title_or_body_is_recorded_unbound(board, unrelated, field):
+    """A card id in PR prose is a MENTION, not a tie to this card's work.
+
+    An umbrella changelog, a dependency note, even "does not address t_..."
+    satisfies a substring test. Such a claim may still close the card -- the
+    operator typed the number -- but it must not become the standing delete
+    authority a bound claim becomes via ``_reusable``.
+    """
+    tid = _claimed_card(board)
+    unrelated[0][field] = f"follow-up to {tid}; does not address it"
+    assert kb.complete_task(board, tid, survivor_pr=PR,
+                            metadata={"changed_files": ["code.py"]})
+    ref = kb.latest_run(board, tid).metadata["survivor"]["refs"][0]
+    assert ref["corroborated_by"] == field
+    assert ref["unbound"] is True, "a mention must not buy standing delete authority"
+    assert ref["claimed_by"]
+
+
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_a_mention_is_not_reusable_as_reclamation_authority(board, unrelated, field):
+    """The CONSEQUENCE of the line above, measured on the reclamation branch.
+
+    The expectation is computed independently of the function under test:
+    ``_reusable`` is never called here, the real ``preserve(cleanup=True)`` is
+    driven on the dir-ABSENT branch where the recorded survivor is the sole
+    authority, and the assertion is that it HOLDs.
+    """
+    from hermes_cli import kanban_survivor as ks
+
+    tid = _claimed_card(board)
+    unrelated[0][field] = f"mentions {tid} in passing"
+    assert kb.complete_task(board, tid, survivor_pr=PR,
+                            metadata={"changed_files": ["code.py"]})
+    ws = _reclaimable(board, tid)
+    with pytest.raises(ValueError, match="no verifiable external survivor"):
+        ks.preserve(board, tid, cleanup=True, workspace=ws)
+
+
+def test_a_branch_bound_claim_is_still_reusable(board, unrelated):
+    """Anti-vacuity for the two tests above: same rig, branch match, REUSED."""
+    from hermes_cli import kanban_survivor as ks
+
+    tid = _claimed_card(board)
+    unrelated[0]["headRefName"] = f"kanban/{tid}-fix"
+    assert kb.complete_task(board, tid, survivor_pr=PR,
+                            metadata={"changed_files": ["code.py"]})
+    ws = _reclaimable(board, tid)
+    survivor = ks.preserve(board, tid, cleanup=True, workspace=ws)
+    assert survivor and survivor["refs"][0]["pr"] == PR
 
 
 def test_the_wider_corroboration_is_explicit_only(board, unrelated):
@@ -153,8 +208,8 @@ def test_the_wider_corroboration_is_explicit_only(board, unrelated):
     unrelated[0]["body"] = f"implements {tid}"
 
     assert ext.verify_pr(PR, mined_for=tid) is None, "mined path must stay branch-only"
-    assert ext.verify_pr(PR, mined_for=tid,
-                         corroborate=("headRefName", "title", "body")) is not None
+    widened = ext.verify_pr(PR, mined_for=tid, corroborate=("headRefName", "title", "body"))
+    assert widened is not None and widened["corroborated_by"] == "body"
     # And end to end: the mined path still refuses this PR ...
     with pytest.raises(ValueError, match="survivor-pr"):
         kb.complete_task(board, tid, result=f"Shipped {PR}",
@@ -166,17 +221,37 @@ def test_the_wider_corroboration_is_explicit_only(board, unrelated):
 
 # --- the escape hatch stays reachable, and is auditable ---------------------
 
-def test_operator_override_accepts_an_unrelated_branch_and_records_it(board, unrelated):
-    """The legitimate case: a human who KNOWS the work landed elsewhere."""
+def test_operator_override_accepts_an_unrelated_branch_and_records_it(board, unrelated, monkeypatch):
+    """The legitimate case: a human who KNOWS the work landed elsewhere.
+
+    ``claimed_by`` must be the REAL OS user. ``getpass.getuser()`` consults
+    ``$LOGNAME``/``$USER``/``$USERNAME`` before the passwd database, so the one
+    control this design keeps -- attribution -- would otherwise yield an
+    attacker-chosen string: this repo's own threat model has a dispatched
+    worker reaching the flag through a shell at the same uid, so it could
+    record ``claimed_by="operator"``. Poison those vars and compute the
+    expectation from ``pwd``/``os.getuid`` directly, independent of
+    ``_claimant``.
+    """
+    import os
+    import pwd
+
+    for var in ("LOGNAME", "USER", "LNAME", "USERNAME"):
+        monkeypatch.setenv(var, "operator")
+
     tid = _claimed_card(board)
     assert kb.complete_task(board, tid, survivor_pr=PR, survivor_unbound=True,
                             metadata={"changed_files": ["code.py"]})
     ref = kb.latest_run(board, tid).metadata["survivor"]["refs"][0]
     assert ref["sha"] == MERGE
     assert ref["unbound"] is True
-    assert ref["claimed_by"], "an unbound authorisation must record WHO made it"
+    uid = os.getuid()
+    assert ref["claimed_by"] == f"{pwd.getpwuid(uid).pw_name} (uid {uid})"
+    assert "operator" not in ref["claimed_by"], "the audit trail must not be $USER"
+    assert str(uid) in ref["claimed_by"], "record the numeric uid alongside the name"
     events = [e for e in kb.list_events(board, tid) if e.kind == "workspace_survivor"]
     assert events and events[-1].payload["refs"][0]["unbound"] is True
+    assert events[-1].payload["refs"][0]["claimed_by"] == ref["claimed_by"]
 
 
 def test_override_still_requires_the_claim_to_be_real(board, unrelated):
@@ -348,36 +423,82 @@ def test_a_worker_using_the_cli_override_gains_no_reclamation_authority(
 
 # --- the refusal must not hand a worker the escape --------------------------
 
-def test_the_refusal_names_the_override_for_an_operator(board, unrelated, monkeypatch):
+def test_the_operator_cli_renders_the_override_hint(board, unrelated, monkeypatch, capsys):
     """An operator shell has no dispatcher grant: the hint is useful there."""
     for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
         monkeypatch.delenv(key, raising=False)
     tid = _claimed_card(board)
-    with pytest.raises(ValueError) as excinfo:
-        kb.complete_task(board, tid, survivor_pr=PR, metadata={"changed_files": ["code.py"]})
-    assert "--survivor-unbound" in str(excinfo.value)
+    assert _cli(board, monkeypatch, ["complete", tid, "--survivor-pr", PR,
+                                     "--metadata", '{"changed_files": ["code.py"]}']) == 1
+    assert "--survivor-unbound" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("grant", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"])
-def test_the_refusal_withholds_the_override_from_a_worker(board, unrelated, monkeypatch, grant):
-    """The refusal is forwarded to a worker's model and persisted as held_reason.
-
-    Argus measured #848's first refusal text telling a dispatched worker the
-    exact flag that converts its own refusal into a completion. The refusal
-    must still say WHY it refused -- it just must not hand over the command.
-    """
+def test_the_worker_cli_withholds_the_override_hint(board, unrelated, monkeypatch, capsys, grant):
     monkeypatch.setenv(grant, "t_whatever")
     tid = _claimed_card(board)
-    with pytest.raises(ValueError) as excinfo:
+    assert _cli(board, monkeypatch, ["complete", tid, "--survivor-pr", PR,
+                                     "--metadata", '{"changed_files": ["code.py"]}']) == 1
+    err = capsys.readouterr().err
+    assert "--survivor-unbound" not in err, "the escape must not be advertised to a worker"
+    assert "does not name" in err and tid in err, "it must still explain the refusal"
+
+
+@pytest.mark.parametrize("writer_grant", [None, "HERMES_KANBAN_TASK"])
+def test_the_persisted_refusal_never_carries_the_override(board, unrelated, monkeypatch,
+                                                          writer_grant):
+    """The mitigation must not depend on WHO wrote the record.
+
+    ``_hold`` writes the refusal to ``held_reason`` AND to a ``workspace_held``
+    event, and ``kanban_show`` (worker toolset) replays events with full
+    payloads. So an OPERATOR's refusal is read later by a worker redispatched
+    onto the same card. Deciding the hint from the writer's environment is
+    therefore defeated by the realistic sequence; the persisted text must be
+    hint-free in BOTH writer shapes.
+    """
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(key, raising=False)
+    if writer_grant:
+        monkeypatch.setenv(writer_grant, "t_whatever")
+
+    tid = _claimed_card(board)
+    with pytest.raises(ValueError):
         kb.complete_task(board, tid, survivor_pr=PR, metadata={"changed_files": ["code.py"]})
 
-    message = str(excinfo.value)
-    assert "--survivor-unbound" not in message, "the escape must not be advertised to a worker"
-    assert "does not name" in message and tid in message, "it must still explain the refusal"
     held = board.execute(
         "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
         (tid,)).fetchone()
-    assert held and "--survivor-unbound" not in (held[0] or "")
+    assert held and "does not name" in (held[0] or ""), "the hold must explain itself"
+    assert "--survivor-unbound" not in (held[0] or "")
+    # The channel the worker actually reads: kanban_show replays event payloads.
+    replayed = json.dumps([e.payload for e in kb.list_events(board, tid)])
+    assert "--survivor-unbound" not in replayed
+
+
+def test_a_redispatched_worker_cannot_read_the_override_off_its_own_card(
+        board, unrelated, monkeypatch):
+    """End to end on the sequence from the review: operator writes, worker reads.
+
+    The expectation is computed independently of the hint code: it is the
+    literal payload ``tools.kanban_tools._handle_show`` returns to a worker's
+    model, scanned for the flag.
+    """
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(key, raising=False)
+    tid = _claimed_card(board)
+
+    # 1. An operator refuses the claim from a shell with no dispatcher grant.
+    assert _cli(board, monkeypatch, ["complete", tid, "--survivor-pr", PR,
+                                     "--metadata", '{"changed_files": ["code.py"]}']) == 1
+
+    # 2. The card is redispatched; the worker reads its own history.
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setattr(kt, "_connect", lambda *a, **k: (kb, board))
+    shown = kt._handle_show({"task_id": tid})
+    assert tid in shown, "the card must still be readable"
+    assert "--survivor-unbound" not in shown
 
 
 # --- redaction is unchanged on the new refusal branch -----------------------

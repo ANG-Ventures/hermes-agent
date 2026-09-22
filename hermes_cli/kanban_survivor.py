@@ -5,7 +5,6 @@ against a published ancestor, or a self-contained bundle when none survives.
 """
 from __future__ import annotations
 
-import getpass
 import hashlib
 import json
 import logging
@@ -24,7 +23,16 @@ _log = logging.getLogger(__name__)
 
 
 class SurvivorUnavailable(ValueError):
-    """Completion/reclamation must retain the workspace for recovery."""
+    """Completion/reclamation must retain the workspace for recovery.
+
+    ``override_hint`` is deliberately NOT part of ``str(self)``. The refusal
+    text is persisted as ``held_reason`` and replayed to a worker's model by
+    ``kanban_show``, so anything baked into the message reaches readers the
+    raising process never inspected. The hint is rendered at the CLI boundary
+    instead, where the environment being tested is the one actually reading.
+    """
+
+    override_hint = ""
 
 
 log = logging.getLogger(__name__)
@@ -275,6 +283,16 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
     CAPABILITY instead -- see :func:`_reusable`: an unbound claim authorises
     THIS completion and never becomes standing authority that a later
     reclamation reuses without re-testing.
+
+    NOT every corroboration is the same strength, and the weak ones are held
+    to the same bound as the override. ``verify_pr`` reports WHICH field
+    answered: a head branch or a claimed SHA ties the PR's *content* to the
+    card, but a substring in the PR title or body is only a MENTION -- an
+    umbrella changelog, a dependency note, even "does not address t_..."
+    satisfies it. Accepting a mention as a bound survivor would make it
+    standing delete authority via :func:`_reusable`, which is the very thing
+    this card closed. So a title/body match is recorded as an unbound claim:
+    it still completes the card, and it still never buys a later delete.
     """
     for claim, flag, verify, extra in (
         (survivor_ref, "--survivor-ref", _ext.verify_ref, {}),
@@ -287,48 +305,88 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
         if ref is None:
             # The claim is unverified and may carry a token: echo it redacted only.
             if not unbound and verify(claim, **extra) is not None:
-                raise SurvivorUnavailable(
+                raise _refusal(
                     f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
-                    f"name {task_id}, so it is not evidence of THIS card's work"
-                    + _override_hint()
+                    f"name {task_id}, so it is not evidence of THIS card's work",
+                    hint=True,
                 )
             raise SurvivorUnavailable(
                 f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} against the remote"
             )
-        if unbound:
-            # Record WHO authorised an unbound claim: _record replays the
-            # survivor into the task's event log, so the override is auditable.
+        if unbound or ref.get("corroborated_by") in _WEAK_CORROBORATION:
+            # Record WHO authorised an unbound claim and WHY it is unbound:
+            # _record replays the survivor into the task's event log, so the
+            # authorisation is auditable.
             ref = dict(ref, unbound=True, claimed_by=_claimant())
-            _log.warning("Unbound survivor accepted for task %s by %s: %s",
-                         task_id, ref["claimed_by"], _ext.redact(claim))
+            _log.warning("Unbound survivor accepted for task %s by %s (%s): %s",
+                         task_id, ref["claimed_by"],
+                         ref.get("corroborated_by") or "operator override",
+                         _ext.redact(claim))
         return ref
     return None
 
 
-def _override_hint():
-    """Name the override only in text a dispatched worker will not be reading.
+#: Corroboration that is only a MENTION of the card, never a tie to its work.
+_WEAK_CORROBORATION = frozenset({"title", "body"})
 
-    The refusal is persisted as ``held_reason`` and forwarded to a worker's
-    model by the ``kanban_complete`` tool, so naming the flag there hands the
-    reader the exact command that converts its own refusal into a completion --
-    an instruction it is reasonable to follow and is not entitled to use. A
-    worker's environment carries the dispatcher's grant, so treat the mere
+
+def _refusal(message, *, hint=False):
+    """Build the refusal, keeping the override out of the PERSISTED text.
+
+    ``preserve`` writes the refusal to ``held_reason`` and to a
+    ``workspace_held`` event, and ``kanban_show`` replays events to a worker's
+    model. A hint baked into the message therefore reaches readers that the
+    raising process never inspected -- including a worker redispatched onto a
+    card an OPERATOR refused earlier. So the flag name is not in the string at
+    all; it rides on the exception and is rendered at the CLI boundary, where
+    the environment being tested belongs to the caller actually reading it.
+    """
+    exc = SurvivorUnavailable(message)
+    if hint:
+        exc.override_hint = (
+            "re-run with --survivor-unbound if the work really did land on an "
+            "unrelated-looking branch"
+        )
+    return exc
+
+
+def render_override_hint(exc):
+    """Append an exception's override hint for a caller entitled to read it.
+
+    A worker's environment carries the dispatcher's grant, so treat the mere
     PRESENCE of that grant as "someone other than an operator is reading",
     without asking whether the grant belongs to this process: for a hint,
     unlike for an authority check, over-suppressing costs only an operator one
     ``--help``.
     """
-    if any(os.environ.get(key) for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID")):
-        return ""
-    return ("; re-run with --survivor-unbound if the work really did land on an "
-            "unrelated-looking branch")
+    hint = getattr(exc, "override_hint", "")
+    if not hint or any(
+        os.environ.get(key) for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID")
+    ):
+        return str(exc)
+    return f"{exc}; {hint}"
 
 
 def _claimant():
-    try:
-        return getpass.getuser()
-    except (KeyError, OSError):  # no passwd entry (containers, CI)
+    """Attribute an unbound claim to the OS user, not to a chosen string.
+
+    ``getpass.getuser()`` consults ``LOGNAME``/``USER``/``LNAME``/``USERNAME``
+    before the passwd database, so anything that can invoke the CLI can also
+    choose the name recorded against a workspace delete -- including a worker
+    writing ``claimed_by="operator"``. That is not attribution; the whole
+    safety argument for the override is that the authorisation is auditable.
+    Resolve the real uid instead, and record the number alongside the name so
+    the audit trail survives a host with no passwd entry at all.
+    """
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    if uid is None:
         return "unknown"
+    try:
+        import pwd
+
+        return f"{pwd.getpwuid(uid).pw_name} (uid {uid})"
+    except (KeyError, OSError, ImportError):  # containers, CI, Windows
+        return f"uid {uid}"
 
 
 def _reusable(previous):
@@ -552,8 +610,11 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         return _record(conn, task_id, survivor, previous)
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: capture failed"
+        # `reason` is what gets PERSISTED (held_reason + a workspace_held event
+        # kanban_show replays to workers), so it must stay hint-free. The hint
+        # rides the re-raised exception instead, for the CLI to render.
         _hold(conn, task_id, reason)
-        raise SurvivorUnavailable(reason) from exc
+        raise _refusal(reason, hint=bool(getattr(exc, "override_hint", ""))) from exc
 
 
 def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False):

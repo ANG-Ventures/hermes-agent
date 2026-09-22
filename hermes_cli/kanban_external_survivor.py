@@ -72,7 +72,8 @@ def verify_ref(claim, *, mined_for=None):
     oid, ref = next(iter(matches.items()))
     if mined_for and mined_for not in ref:
         return None
-    return {"remote": url, "branch": ref, "sha": oid, "external": True}
+    verified = {"remote": url, "branch": ref, "sha": oid, "external": True}
+    return dict(verified, corroborated_by="branch") if mined_for else verified
 
 
 def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
@@ -92,6 +93,13 @@ def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
     :func:`discover`; widening the mined path here would let a PR body that
     merely mentions a card id verify itself.
 
+    ``corroborated_by`` reports WHICH signal answered, because the signals are
+    not equally strong and the caller must be able to tell them apart. A head
+    branch or a claimed SHA ties the PR's *content* to the card; a substring in
+    the title or body is only a mention, and an umbrella changelog or a
+    dependency note ("does not address t_...") satisfies it. Callers treat the
+    weak ones as an unbound claim (see ``kanban_survivor._verified_explicit``).
+
     A PR mined from handoff text is additionally only a hint: it must be
     corroborated by a claimed SHA that is the PR head or squash merge, or --
     with no SHA claimed -- by the same naming test. A bare ``owner/repo#N``
@@ -105,6 +113,7 @@ def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
                      "--json", "state,headRefOid,headRefName,mergeCommit,title,body"])
     if output is None:
         return None
+    corroborated_by = None
     try:
         view = json.loads(output)
         state, head = view["state"], view["headRefOid"]
@@ -115,14 +124,21 @@ def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
         if shas:
             if not any(value and value.startswith(sha) for value in (head, merge) for sha in shas):
                 return None
-        elif mined_for and not any(
-            mined_for in str(view.get(field) or "") for field in corroborate
-        ):
-            return None
+            corroborated_by = "sha"
+        elif mined_for:
+            corroborated_by = next(
+                (field for field in corroborate if mined_for in str(view.get(field) or "")),
+                None,
+            )
+            if corroborated_by is None:
+                return None
+            if corroborated_by == "headRefName":
+                corroborated_by = "branch"
     except (ValueError, TypeError, KeyError, AttributeError):
         return None
-    return {"remote": f"https://github.com/{slug}.git", "branch": f"refs/pull/{number}/head",
-            "sha": oid, "pr": f"{slug}#{number}", "state": state, "external": True}
+    verified = {"remote": f"https://github.com/{slug}.git", "branch": f"refs/pull/{number}/head",
+                "sha": oid, "pr": f"{slug}#{number}", "state": state, "external": True}
+    return dict(verified, corroborated_by=corroborated_by) if corroborated_by else verified
 
 
 def discover(conn, task_id, metadata, evidence, urls):
