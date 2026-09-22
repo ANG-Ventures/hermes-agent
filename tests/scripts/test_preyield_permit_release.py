@@ -681,6 +681,41 @@ def test_guard_does_not_demand_a_release_from_a_swallowing_arm():
         ("an attribute load", "except BaseException:\n    x = surface.depth\n"),
         ("a subscript", "except BaseException:\n    x = surface[0]\n"),
         ("an await", "except BaseException:\n    await _drain()\n"),
+        # A bare NAME load raises UnboundLocalError when the binding has not
+        # run yet — an ordinary possibility inside an except arm, and a
+        # measured 1-permit leak.
+        ("a name load", "except BaseException:\n    x = surface\n"),
+        # An assignment TARGET is not a value: a tuple/list target UNPACKS,
+        # which raises TypeError on a non-iterable and ValueError on an arity
+        # mismatch, even when every name in it is inert.
+        ("a tuple-target unpack", "except BaseException:\n    a, b = 0\n"),
+        ("a starred tuple-target unpack", "except BaseException:\n    a, *b = 0\n"),
+        ("a list-target unpack", "except BaseException:\n    [a, b] = 0\n"),
+        ("an attribute target", "except BaseException:\n    surface.x = 0\n"),
+        ("a subscript target", "except BaseException:\n    surface[0] = 0\n"),
+        # Only a nested def's BODY is deferred; its signature runs now.
+        (
+            "a nested def with a raising default",
+            "except BaseException:\n    def _later(x=_boom()):\n        pass\n",
+        ),
+        (
+            "a nested def with a raising kw-only default",
+            "except BaseException:\n    def _later(*, x=_boom()):\n        pass\n",
+        ),
+        (
+            "a nested def with a raising arg annotation",
+            "except BaseException:\n    def _later(x: _boom()):\n        pass\n",
+        ),
+        (
+            "a nested def with a raising return annotation",
+            "except BaseException:\n    def _later() -> _boom():\n        pass\n",
+        ),
+        # Set/dict displays HASH at construction, so inert elements are not
+        # enough to make the display inert.
+        ("an unhashable set literal", "except BaseException:\n    s = {[1]}\n"),
+        ("an unhashable dict key", "except BaseException:\n    d = {[1]: 2}\n"),
+        # AnnAssign evaluates its annotation at runtime without PEP 563.
+        ("a raising annotation", "except BaseException:\n    x: _boom() = 1\n"),
     ],
 )
 def test_guard_flags_an_arm_that_can_leave_without_a_raise_statement(shape, arm):
@@ -688,9 +723,14 @@ def test_guard_flags_an_arm_that_can_leave_without_a_raise_statement(shape, arm)
 
     Asking "does this arm contain a ``raise``/``return`` STATEMENT?" excused a
     call that raises, an ``assert``, arithmetic that divides by zero, and a
-    plain logging call given a bad format argument.  Each is a measured
-    1-permit leak.  The window check has always treated a call / attribute /
-    subscript / await as raise-capable; the arm check now agrees.
+    plain logging call given a bad format argument.  The first whitelist then
+    excused a second family: an unpacking assignment target, a nested ``def``
+    whose SIGNATURE (defaults / annotations) is evaluated at definition time, a
+    set/dict display that hashes an unhashable element, and a bare name load
+    that can be an unbound local.  Every shape here is a measured 1-permit
+    leak.  The window check has always treated a call / attribute / subscript /
+    await as raise-capable; the arm check now agrees, and additionally refuses
+    to excuse anything whose targets or signature can raise.
     """
     guard = _load_guard()
     _sites, violations = guard.scan_source(_sibling_arm_source(arm), "new.py")
@@ -704,11 +744,20 @@ def test_guard_flags_an_arm_that_can_leave_without_a_raise_statement(shape, arm)
     [
         ("pass", "except BaseException:\n    pass\n"),
         ("a bare constant", 'except BaseException:\n    "swallowed"\n'),
-        ("an assignment between names", "except BaseException:\n    x = surface\n"),
         ("a constant assignment", "except BaseException:\n    x = 0\n"),
+        ("a constant tuple value", "except BaseException:\n    x = (1, 2)\n"),
+        ("a hashable set literal", "except BaseException:\n    s = {1, 2}\n"),
+        (
+            "a constant annotated assignment",
+            'except BaseException:\n    x: "int" = 0\n',
+        ),
         (
             "a nested def",
             "except BaseException:\n    def _later():\n        sem.release()\n",
+        ),
+        (
+            "a nested def with a constant default",
+            "except BaseException:\n    def _later(x=0):\n        sem.release()\n",
         ),
     ],
 )

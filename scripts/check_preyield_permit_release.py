@@ -335,26 +335,75 @@ def _falls_through(stmt: ast.stmt) -> bool:
     return True
 
 
+def _hashable_literal(node: ast.AST) -> bool:
+    """True only for a literal that provably hashes without raising.
+
+    A set display and a dict display HASH their elements/keys at construction
+    time, so inert elements are not enough: ``{[1]}`` and ``{[1]: 2}`` each
+    raise ``TypeError`` while every sub-expression in them is inert.
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Tuple):
+        return all(_hashable_literal(e) for e in node.elts)
+    return False
+
+
 def _inert_expr(node: ast.AST) -> bool:
     """True only for an expression that provably cannot raise.
 
     Deliberately a WHITELIST.  Anything not listed here — a call, an attribute
-    load, a subscript, an ``await``, arithmetic on a name — can leave the arm
-    by raising, and must therefore keep the arm in the "may exit" class.
+    load, a subscript, an ``await``, arithmetic on a name, a bare NAME load —
+    can leave the arm by raising, and must therefore keep the arm in the
+    "may exit" class.
     """
     if isinstance(node, ast.Constant):
         return True
-    if isinstance(node, ast.Name):
-        # A local load can raise NameError only in code that is already broken;
-        # treating it as inert keeps `x = y` out of the exit class.
-        return isinstance(node.ctx, (ast.Load, ast.Store))
-    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+    if isinstance(node, (ast.Tuple, ast.List)):
         return all(_inert_expr(e) for e in node.elts)
+    if isinstance(node, ast.Set):
+        return all(_hashable_literal(e) for e in node.elts)
     if isinstance(node, ast.Dict):
-        return all(
-            k is not None and _inert_expr(k) for k in node.keys
-        ) and all(_inert_expr(v) for v in node.values)
+        return all(k is not None and _hashable_literal(k) for k in node.keys) and all(
+            _inert_expr(v) for v in node.values
+        )
     return False
+
+
+def _inert_target(node: ast.AST) -> bool:
+    """True only for an assignment target that provably cannot raise.
+
+    A target is not a value.  A ``Tuple``/``List`` target is an UNPACK, which
+    raises ``TypeError`` on a non-iterable and ``ValueError`` on an arity
+    mismatch even when every name in it is inert; an ``Attribute``/``Subscript``
+    target runs ``__setattr__``/``__setitem__``.  Only a bare local name is
+    safe, and only in ``Store`` context.
+    """
+    return isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+
+
+def _inert_signature(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True only when executing this ``def`` statement evaluates nothing.
+
+    Only the BODY of a nested function is deferred.  Decorators, defaults,
+    keyword-only defaults, parameter annotations and the return annotation are
+    all evaluated when the ``def`` executes, so any of them can leave the arm.
+    """
+    if fn.decorator_list:
+        return False
+    if getattr(fn, "type_params", ()):
+        return False
+    args = fn.args
+    if not all(_inert_expr(d) for d in args.defaults):
+        return False
+    if not all(d is None or _inert_expr(d) for d in args.kw_defaults):
+        return False
+    if fn.returns is not None and not _inert_expr(fn.returns):
+        return False
+    slots = [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
+    return all(
+        a is None or a.annotation is None or _inert_expr(a.annotation) for a in slots
+    )
 
 
 def _inert_stmt(stmt: ast.stmt) -> bool:
@@ -364,15 +413,21 @@ def _inert_stmt(stmt: ast.stmt) -> bool:
     if isinstance(stmt, ast.Expr):
         return _inert_expr(stmt.value)
     if isinstance(stmt, ast.Assign):
-        return all(_inert_expr(t) for t in stmt.targets) and _inert_expr(stmt.value)
+        return all(_inert_target(t) for t in stmt.targets) and _inert_expr(stmt.value)
     if isinstance(stmt, ast.AnnAssign):
-        return _inert_expr(stmt.target) and (
-            stmt.value is None or _inert_expr(stmt.value)
+        # The annotation is evaluated at runtime unless the module carries
+        # `from __future__ import annotations`; we do not read the module's
+        # future-imports here, so an annotation that is not itself inert keeps
+        # the arm in the may-exit class.
+        return (
+            _inert_target(stmt.target)
+            and _inert_expr(stmt.annotation)
+            and (stmt.value is None or _inert_expr(stmt.value))
         )
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        # Defining a nested callable does not run it; its body is its own
-        # lifecycle.  The `def` statement itself cannot leave the arm.
-        return not stmt.decorator_list
+        # Defining a nested callable does not run its BODY; its body is its own
+        # lifecycle.  The signature, however, runs now.
+        return _inert_signature(stmt)
     return False
 
 
