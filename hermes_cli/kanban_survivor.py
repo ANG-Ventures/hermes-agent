@@ -34,8 +34,21 @@ def _git(repo, *args, env=None, check=True):
         capture_output=True, timeout=30, env=env,
     )
     if check and result.returncode:
-        # Git stderr can contain credential-bearing remote URLs. Do not persist it.
-        raise SurvivorUnavailable("survivor_unavailable: git inspection failed")
+        # Git stderr can contain credential-bearing remote URLs, so it is never
+        # persisted raw. The SUBCOMMAND and returncode are not secrets, and
+        # without them a hold reads identically whether the cause is a real
+        # capture defect or the environment (a vanished workspace, a busy
+        # index), which costs a full attribution pass to tell apart. Carry
+        # those in the reason and log the stderr once, redacted.
+        subcommand = next((a for a in args if not str(a).startswith("-")), "inspection")
+        stderr = _ext.redact(result.stderr.decode("utf-8", "replace").strip())
+        _log.warning(
+            "kanban survivor: git %s failed (rc=%s) in %s: %s",
+            subcommand, result.returncode, repo, stderr,
+        )
+        raise SurvivorUnavailable(
+            f"survivor_unavailable: git {subcommand} failed (rc={result.returncode})"
+        )
     return result
 
 

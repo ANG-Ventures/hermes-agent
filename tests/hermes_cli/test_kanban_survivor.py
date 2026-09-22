@@ -553,3 +553,39 @@ def test_record_baseline_skips_unreadable_dirs_instead_of_failing_dispatch(board
             survivor.record_baseline(conn, tid, ws)
     finally:
         survivor.os.walk = orig
+
+
+def test_git_failure_reason_names_subcommand_and_rc_without_leaking_credentials(
+    tmp_path, caplog, monkeypatch
+):
+    """A hold must distinguish environment from defect, and still not echo a token.
+
+    `survivor_unavailable: git inspection failed` was identical for every git
+    fault, so a vanished workspace and a real capture bug read the same and
+    cost an attribution pass to tell apart (t_169d6e46).
+    """
+    import hermes_cli.kanban_survivor as survivor
+
+    missing = tmp_path / "gone"                      # the observed flake shape
+    with pytest.raises(survivor.SurvivorUnavailable) as excinfo:
+        survivor._git(missing, "status", "--porcelain", "--untracked-files=all")
+    assert "git status failed (rc=128)" in str(excinfo.value)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Hermetic: no remote is contacted. Git's own stderr is stubbed so the
+    # assertion is about our redaction boundary, not about DNS.
+    leaky = subprocess.CompletedProcess(
+        args=["git"], returncode=128, stdout=b"",
+        stderr=b"fatal: could not read from 'https://user:s3cr3t-token@example.invalid/x.git?k=v'\n",
+    )
+    caplog.clear()
+    with caplog.at_level("WARNING"), \
+            monkeypatch.context() as patch, \
+            pytest.raises(survivor.SurvivorUnavailable) as excinfo:
+        patch.setattr(survivor.subprocess, "run", lambda *a, **k: leaky)
+        survivor._git(repo, "ls-remote", "origin")
+    message = str(excinfo.value)
+    assert "git ls-remote failed (rc=128)" in message
+    assert "s3cr3t-token" not in message and "s3cr3t-token" not in caplog.text
+    assert "could not read from" in caplog.text      # the diagnostic still lands
