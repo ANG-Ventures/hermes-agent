@@ -346,9 +346,34 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # A patch cannot add a gitlink and files below the same path.
             raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
         keys = {str(r.relative_to(workspace)) for r in repos}
+        recovered = None
         if set(bases) - keys:
-            raise SurvivorUnavailable("survivor_unavailable: recorded repository missing")
-        patches, refs, bundles, repositories = [], [], [], []
+            # The repository recorded at dispatch is gone while the directory
+            # survived (a reaped clone leaving evidence behind). Without an
+            # operator survivor this must stay fail-closed: it is what protects
+            # unpushed implementation work. But the workspace-MISSING branch
+            # above already treats a remote-verified `--survivor-pr`/`ref` as
+            # authority, and an operator-named, remote-verified survivor is
+            # strictly better evidence than the checkout we lost -- so consult
+            # it here too, or this state has no reachable remedy at all.
+            if not explicit:
+                raise SurvivorUnavailable(
+                    f"survivor_unavailable: recorded repository missing; {_ext.HINT}"
+                )
+            # A vanished recorded repository is an unmet claim. Force the
+            # external path below so the verified survivor is actually recorded,
+            # and so failing to produce one still HOLDS rather than completing
+            # with no survivor at all. `recovered` additionally carries it onto
+            # the in-tree paths: when only SOME recorded repos vanished, the
+            # survivors of the rest would otherwise satisfy the completion on
+            # their own and silently drop the operator's ref for the lost one.
+            claimed = True
+            if repos:
+                # Only a PARTIAL loss needs this. With no repo left at all the
+                # external path below records `explicit` on its own; seeding it
+                # here too would duplicate the ref.
+                recovered = dict(explicit, repository=sorted(set(bases) - keys)[0])
+        patches, refs, bundles, repositories = [], [recovered] if recovered else [], [], []
         for repo in repos:
             key = str(repo.relative_to(workspace))
             published = list(_published_refs(repo, workspace))
@@ -371,7 +396,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 header = f"# kanban repository={json.dumps(key)} base={base}\n".encode()
                 patches.append(header + data)
             repositories.append({"repository": key, "base_sha": base})
-        if repos and len(refs) == len(repos):
+        if repos and len(refs) == len(repos) + (1 if recovered else 0):
             survivor = {"kind": "ref", "refs": refs}
         elif patches or bundles:
             data = b"".join(patches)
