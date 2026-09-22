@@ -244,6 +244,124 @@ def test_repo_context_is_none_when_remotes_disagree_and_body_is_silent(
     ) == "b/two"
 
 
+def test_repo_context_refuses_a_walk_up_to_an_enclosing_repo(
+    tmp_path: Path,
+) -> None:
+    """A ``scratch`` workspace must NEVER inherit its parent repo's remotes.
+
+    ``git -C <dir>`` walks UP to the first enclosing repository, so a
+    workspace with no ``.git`` of its own answers for whatever repo happens
+    to contain it. Every scratch-kind card lives under ``~/.hermes``, which is
+    itself a checkout with both remotes on ``ANG-Ventures/hermes-home`` — so
+    the walk-up returned ONE consistent slug and the ambiguity fail-safe
+    (which only triggers on DISAGREEING remotes) could not see it. On
+    2026-09-21 that unblocked card ``t_cb701eee`` two seconds after a verifier
+    blocked it, on merge evidence from a repository the card never touched.
+
+    The guard is toplevel-identity, not ``.git`` presence, so a git worktree
+    (whose ``.git`` is a file, and whose toplevel IS itself) still resolves.
+    """
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=outer, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:ANG-Ventures/hermes-home.git"],
+        cwd=outer, check=True,
+    )
+    scratch = outer / "kanban" / "boards" / "b" / "workspaces" / "t_x"
+    scratch.mkdir(parents=True)
+
+    # Precondition: git really does answer for the enclosing repo here.
+    walked = subprocess.run(
+        ["git", "-C", str(scratch), "rev-parse", "--show-toplevel"],
+        stdout=subprocess.PIPE, text=True, check=True,
+    ).stdout.strip()
+    assert Path(walked).resolve() == outer.resolve()
+
+    assert prg._remotes_for(str(scratch)) == set()
+    assert prg.repo_context(workspace_path=str(scratch), body=None) is None
+    # ...and the fallback still yields the card's OWN repo when it names one.
+    assert prg.repo_context(
+        workspace_path=str(scratch),
+        body="PRs are Kyzcreig/ace-media-homelab#160 and #159",
+    ) == "Kyzcreig/ace-media-homelab"
+
+
+def test_repo_context_still_resolves_a_real_checkout_toplevel(
+    tmp_path: Path,
+) -> None:
+    """Do not regress the feature: a genuine checkout still answers.
+
+    This is why the fix is a toplevel check and not "stop trusting remotes".
+    """
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:o/r.git"],
+        cwd=repo, check=True,
+    )
+    assert prg._remotes_for(str(repo)) == {"o/r"}
+    assert prg.repo_context(workspace_path=str(repo), body=None) == "o/r"
+
+
+def test_repo_context_is_none_when_workspace_and_body_disagree(
+    tmp_path: Path,
+) -> None:
+    """Defense in depth: a workspace answer the body contradicts is not used.
+
+    Even with the toplevel guard, a card whose workspace is a real checkout of
+    repo B while its body names repo A has two incompatible answers. Unblocking
+    is a state transition that reverts a human decision; a coin flip between
+    two named repos is not evidence enough for it.
+    """
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:ANG-Ventures/hermes-home.git"],
+        cwd=repo, check=True,
+    )
+    assert prg.repo_context(
+        workspace_path=str(repo),
+        body="PRs are Kyzcreig/ace-media-homelab#160 and #159",
+    ) is None
+    # A body that AGREES (or names nothing) leaves the workspace answer intact.
+    assert prg.repo_context(
+        workspace_path=str(repo),
+        body="see ANG-Ventures/hermes-home#160",
+    ) == "ANG-Ventures/hermes-home"
+    assert prg.repo_context(
+        workspace_path=str(repo), body="no repo named here",
+    ) == "ANG-Ventures/hermes-home"
+
+
+def test_gate_does_not_fire_twice_for_the_same_card_and_pr_set(
+    kanban_home: Path,
+) -> None:
+    """``gate_auto_resolved`` is written once, not once per tick.
+
+    Argus flagged the absence of a dedup like ``_already_flagged_closed``.
+    The structural guard is that ``_gate_candidates`` only selects
+    ``status='blocked'`` cards, so an unblocked card leaves scope — but a
+    RE-blocked card on the same reason must not re-fire either, which is what
+    this pins.
+    """
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        for _ in range(3):
+            prg.clear_cache()
+            prg.reevaluate_pr_gates(
+                conn, query_fn=_stub({("o/r", 7): _merged()}),
+            )
+        assert kb.get_task(conn, tid).status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM task_events "
+            "WHERE task_id = ? AND kind = 'gate_auto_resolved'",
+            (tid,),
+        ).fetchone()["c"] == 1
+
+
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------

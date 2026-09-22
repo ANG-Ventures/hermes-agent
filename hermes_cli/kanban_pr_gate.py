@@ -390,11 +390,11 @@ def parse_pr_refs(
     return refs
 
 
-def _remotes_for(workspace_path: str) -> set[str]:
-    """Return the distinct ``owner/repo`` slugs a checkout's remotes point at."""
+def _git(workspace_path: str, *args: str) -> Optional[str]:
+    """Run a read-only git command in ``workspace_path``; None on any failure."""
     try:
         proc = subprocess.run(
-            ["git", "-C", workspace_path, "remote", "-v"],
+            ["git", "-C", workspace_path, *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -402,11 +402,54 @@ def _remotes_for(workspace_path: str) -> set[str]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError, TimeoutError):
-        return set()
+        return None
     if proc.returncode != 0:
+        return None
+    return proc.stdout or ""
+
+
+def _is_repo_toplevel(workspace_path: str) -> bool:
+    """True only when ``workspace_path`` IS a checkout root, not inside one.
+
+    ``git -C <dir>`` WALKS UP to the first enclosing repository, so a directory
+    with no repo of its own silently answers for whatever contains it. Every
+    ``scratch``-kind kanban workspace lives under ``~/.hermes``, which is itself
+    a checkout — and its remotes all agree, so the walk-up produced a single
+    UNANIMOUS (and wrong) slug that the disagreeing-remotes fail-safe in
+    :func:`repo_context` cannot see. That is how card ``t_cb701eee`` was
+    unblocked two seconds after a verifier blocked it, on merge evidence from
+    ``ANG-Ventures/hermes-home`` (2026-09-21).
+
+    Toplevel identity, not ``.git`` presence, is the discriminator: a git
+    worktree's ``.git`` is a file, and its toplevel is itself, so a worktree
+    workspace still resolves normally.
+    """
+    out = _git(workspace_path, "rev-parse", "--show-toplevel")
+    if not out:
+        return False
+    toplevel = out.strip()
+    if not toplevel:
+        return False
+    try:
+        return Path(toplevel).resolve() == Path(workspace_path).resolve()
+    except OSError:
+        return False
+
+
+def _remotes_for(workspace_path: str) -> set[str]:
+    """Return the distinct ``owner/repo`` slugs a checkout's remotes point at.
+
+    Empty when ``workspace_path`` is not the checkout TOPLEVEL — see
+    :func:`_is_repo_toplevel`. ``repo_context`` then falls through to
+    body-based resolution, which yields the card's own repo or None.
+    """
+    if not _is_repo_toplevel(workspace_path):
+        return set()
+    stdout = _git(workspace_path, "remote", "-v")
+    if stdout is None:
         return set()
     slugs: set[str] = set()
-    for line in (proc.stdout or "").splitlines():
+    for line in stdout.splitlines():
         parts = line.split()
         if len(parts) < 2:
             continue
@@ -477,10 +520,21 @@ def repo_context(
 ) -> Optional[str]:
     """Best-effort repository for resolving a bare ``#N``.
 
-    Order: the card's workspace remote (only when EVERY remote agrees — the
-    hermes-agent checkout has ``origin`` = upstream and ``fork`` = ours, so a
-    bare ``#787`` there is genuinely ambiguous), then the first ``owner/repo``
-    mentioned in the card body. None means "do not resolve bare numbers".
+    Order: the card's workspace remote (only when the workspace IS the
+    checkout toplevel AND every remote agrees — the hermes-agent checkout has
+    ``origin`` = upstream and ``fork`` = ours, so a bare ``#787`` there is
+    genuinely ambiguous), then the first ``owner/repo`` mentioned in the card
+    body. None means "do not resolve bare numbers".
+
+    Two fail-safes, both of which have to hold before a workspace answer is
+    trusted:
+
+    * **no walk-up** — :func:`_is_repo_toplevel` refuses an answer inherited
+      from an ENCLOSING repository (every ``scratch`` workspace sits under
+      ``~/.hermes``, itself a checkout);
+    * **body cross-check** — a workspace answer the body CONTRADICTS is
+      discarded. Ambiguity detection alone cannot catch a confidently-wrong
+      answer, and an unblock reverts a human/verifier decision.
     """
     if workspace_path:
         try:
@@ -490,7 +544,16 @@ def repo_context(
         if exists:
             slugs = _remotes_for(workspace_path)
             if len(slugs) == 1:
-                return next(iter(slugs))
+                chosen = next(iter(slugs))
+                corroborated = _corroborated_repos(body) if isinstance(body, str) else []
+                if corroborated and not any(
+                    slug.lower() == chosen.lower() for slug in corroborated
+                ):
+                    # The body names PRs in a DIFFERENT repo than the workspace
+                    # resolves to. Two incompatible answers, no way to rank
+                    # them: take no action.
+                    return None
+                return chosen
             if len(slugs) > 1 and isinstance(body, str):
                 # Ambiguous remotes: let an explicit body mention pick one.
                 lowered = {s.lower(): s for s in slugs}
