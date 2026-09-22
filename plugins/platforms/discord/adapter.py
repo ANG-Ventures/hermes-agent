@@ -1656,7 +1656,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         try:
-            if not self._acquire_platform_lock('discord-bot-token', self.config.token, 'Discord bot token'):
+            if not await self._acquire_platform_lock_async('discord-bot-token', self.config.token, 'Discord bot token'):
                 return False
 
             # Snapshot this profile's gate env vars (issue #72348): connect()

@@ -6,8 +6,10 @@ and implement the required methods.
 """
 
 import asyncio
+import contextvars
 import inspect
 import ipaddress
+import itertools
 import logging
 import os
 import random
@@ -26,6 +28,141 @@ from urllib.parse import urlsplit
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
+
+# Scoped-lock ownership tokens, keyed by (scope, identity).
+#
+# The scoped lock is ONE machine-global file per (scope, identity), so a
+# release by that pair deletes whoever currently holds it -- including a
+# different, live in-process holder.  Two code paths need to tell "the lock MY
+# acquire took" apart from "the lock somebody else has since taken":
+#
+#   * the cancelled-acquire drain in
+#     :meth:`BasePlatformAdapter._acquire_platform_lock_async`, whose orphaned
+#     worker may have taken the lock after a retry connect already claimed it;
+#   * adapter teardown (:meth:`BasePlatformAdapter._release_platform_lock`,
+#     24 call sites), which fires on an adapter whose own acquire was cancelled
+#     and released long ago, while a retry connect now legitimately holds the
+#     pair.
+#
+# A monotonic COUNTER cannot answer that.  "The generation advanced by exactly
+# one" is a proxy for ownership, and it is wrong in both directions: an
+# unrelated acquire+release of the same pair during the drain advances it by
+# two (so the drain refuses to release a lock it really does hold, orphaning
+# it), and the counter says nothing at all about whether the CURRENT holder is
+# the acquisition a later teardown is trying to release.
+#
+# So track the thing itself.  Every successful acquire through the choke point
+# mints a unique token and joins the pair's set of LIVE acquisitions.  A release
+# drops its own token, and only performs the actual ``release_scoped_lock`` when
+# that set becomes empty -- i.e. when no other in-process acquisition of the
+# pair is still live.
+#
+# A set rather than a single owner, because "who holds it" is genuinely
+# ambiguous here: ``acquire_scoped_lock`` SELF-REACQUIRES for the calling PID,
+# so an orphaned worker's acquire and a retry connect's acquire can both succeed
+# and both legitimately consider themselves holders.  Refcounting is the only
+# answer that is correct in both directions -- the drain releases the lock it
+# took when nothing else wants it, and keeps its hands off when a live retry
+# connect does.
+#
+# Entries are keyed by token and hold a weak reference to the acquiring adapter,
+# so an adapter dropped without teardown (a failed connect, a GC'd retry) cannot
+# pin the pair forever.
+_PLATFORM_LOCK_OWNERS: "dict[tuple[str, str], dict[int, Any]]" = {}
+_PLATFORM_LOCK_OWNERS_LOCK = threading.Lock()
+_PLATFORM_LOCK_TOKEN_SEQ = itertools.count(1)
+
+
+def _live_platform_lock_holders(key: "tuple[str, str]") -> "dict[int, Any]":
+    """Return the live acquisitions for ``key``, pruning collected adapters.
+
+    Caller must hold ``_PLATFORM_LOCK_OWNERS_LOCK``.
+    """
+    holders = _PLATFORM_LOCK_OWNERS.get(key)
+    if not holders:
+        return {}
+    for token, ref in list(holders.items()):
+        if ref is not None and ref() is None:
+            del holders[token]
+    if not holders:
+        _PLATFORM_LOCK_OWNERS.pop(key, None)
+        return {}
+    return holders
+
+
+def _platform_lock_holder_count(scope: str, identity: str) -> int:
+    """Number of live in-process acquisitions of one scoped-lock pair."""
+    with _PLATFORM_LOCK_OWNERS_LOCK:
+        return len(_live_platform_lock_holders((scope, identity)))
+
+
+def _note_platform_lock_acquired(
+    scope: str,
+    identity: str,
+    owner: "Any" = None,
+    *,
+    had_prior_holder: bool = True,
+) -> int:
+    """Record a live acquisition of ``(scope, identity)``; return its token.
+
+    ``had_prior_holder`` is the ground truth from ``acquire_scoped_lock``: it is
+    False when the lock file did not exist, i.e. NOBODY held the pair at the
+    moment we took it.  Any acquisitions still on record are then stale by
+    definition (an adapter that was dropped or torn down without releasing), and
+    are pruned -- otherwise a leaked record would make the pair look permanently
+    held by a live sibling and no later release would ever fire.
+    """
+    with _PLATFORM_LOCK_OWNERS_LOCK:
+        token = next(_PLATFORM_LOCK_TOKEN_SEQ)
+        key = (scope, identity)
+        if not had_prior_holder:
+            _PLATFORM_LOCK_OWNERS.pop(key, None)
+        holders = _live_platform_lock_holders(key)
+        ref = None
+        if owner is not None:
+            try:
+                ref = weakref.ref(owner)
+            except TypeError:  # pragma: no cover - non-weakrefable stub
+                ref = None
+        holders[token] = ref
+        _PLATFORM_LOCK_OWNERS[key] = holders
+        return token
+
+
+def _claim_platform_lock_release(scope: str, identity: str, token: "Optional[int]") -> bool:
+    """Drop ``token``'s acquisition and report whether the lock may be released.
+
+    Returns True only when no OTHER live acquisition of the pair remains, so the
+    caller's ``release_scoped_lock`` cannot delete a machine-global lock that a
+    concurrent, still-live acquisition (a retry connect, a sibling adapter for
+    the same credential) is actively using.
+
+    A ``token`` of ``None`` means the caller never acquired through the choke
+    point -- it set ``_platform_lock_identity`` by hand (a direct/legacy caller
+    or a test harness) and has no acquisition on record.  It still releases when
+    nothing live is recorded, preserving the pre-ownership-tracking contract.
+    """
+    with _PLATFORM_LOCK_OWNERS_LOCK:
+        key = (scope, identity)
+        holders = _live_platform_lock_holders(key)
+        if token is not None:
+            holders.pop(token, None)
+            if not holders:
+                _PLATFORM_LOCK_OWNERS.pop(key, None)
+        return not holders
+
+
+# Per-call sink through which the cancelled-acquire drain learns the token its
+# OWN worker minted.  A ContextVar rather than a parameter or an attribute:
+# ``asyncio.to_thread`` copies the calling context into the worker thread, so
+# this reaches the worker without changing ``_acquire_platform_lock``'s
+# signature (~28 direct callers and every test that monkeypatches it keep their
+# contract), and without reading the token back off the adapter -- a retry
+# connect on the same adapter would have overwritten that attribute, making the
+# drain act with the retry's own token.
+_PLATFORM_LOCK_TOKEN_SINK: "contextvars.ContextVar[Optional[list]]" = (
+    contextvars.ContextVar("hermes_platform_lock_token_sink", default=None)
+)
 
 
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
@@ -3783,6 +3920,151 @@ class BasePlatformAdapter(ABC):
                     task.add_done_callback(_consume_detached_handler_exception)
                 raise
 
+    async def _acquire_platform_lock_async(
+        self, scope: str, identity: str, resource_desc: str
+    ) -> bool:
+        """Off-loop form of :meth:`_acquire_platform_lock`.
+
+        Every ``async def connect()``/``open()`` MUST use this form.  The sync
+        method's takeover path writes the takeover marker (``atomic_json_write``)
+        and then polls for the old owner's exit with ``time.sleep`` -- up to
+        20x0.5s graceful plus 20x0.25s forced, i.e. ~15s.  Executed inline on
+        the running loop that stalls the whole gateway: every other adapter's
+        polling, every in-flight turn, every heartbeat.
+
+        BUDGET, measured from the code rather than asserted.  The sleeps are
+        ``_wait_for_scoped_lock_owner_exit(attempts=20, delay=0.5)`` then
+        ``(attempts=20, delay=0.25)`` in ``gateway/status.py``: 10s + 5s = 15s
+        of sleeping.  That is the sleep budget only -- it excludes the marker
+        write, the ``psutil`` owner-state probes on each attempt, and (on
+        Windows) ``terminate_pid``'s ``taskkill`` subprocess, which carries its
+        own ``timeout=10``.  So 15s is the floor of the stall, not a ceiling;
+        do not read it as a bound.
+
+        This is a pure transport: arguments, return value, raised exceptions and
+        every attribute the sync body mutates (``_platform_lock_*``, the
+        ``_set_fatal_error`` state the runner reads for retryability) pass
+        through unchanged.  The sync method keeps its exact contract for the
+        direct callers that are not on a loop.
+
+        CANCELLATION.  Moving the body to a worker thread introduces an await
+        point where the blocking call had none, so ``connect()`` can now be
+        cancelled (shutdown, reconnect supervisor, adapter teardown) WHILE the
+        acquire is still in flight.  ``asyncio.to_thread`` cannot interrupt the
+        thread: it keeps running and may take the scoped lock after its awaiter
+        is gone, leaving a machine-global lock held by nobody -- the next
+        connect then fails "already in use" and only a process restart clears
+        it.  So on cancellation we do not abandon the thread: we wait for it to
+        finish and release the lock if it did acquire one, then re-raise.  The
+        wait is bounded by the sync body's own termination budget (see BUDGET
+        above -- a floor of ~15s of sleeping, plus probe/subprocess time).
+
+        The cancel-path release goes through
+        :meth:`_release_platform_lock_identity` with the EXPLICIT arguments we
+        were called with, never through :meth:`_release_platform_lock`: the
+        latter reads ``_platform_lock_identity``, and adapter teardown (18 call
+        sites across signal/yuanbao/qqbot/weixin/discord/telegram/slack/
+        whatsapp) clears that attribute -- typically in the very teardown that
+        cancelled us -- which would turn the release into a silent no-op and
+        orphan the lock anyway.
+
+        That release is OWNERSHIP-GUARDED.  The scoped lock is one
+        machine-global file per ``(scope, identity)``, so releasing it deletes
+        whoever holds it; a retry connect that acquired the same pair while we
+        drained is a live holder, and deleting its lock is the same orphaning
+        failure pointed the other way.  Every successful acquire through the
+        sync choke point mints an ownership TOKEN, and we release only when our
+        worker's token is still the live owner's -- an exact test, not an
+        inference from a counter.
+
+        Repeat cancellations are ABSORBED, not obeyed.  Teardown commonly
+        cancels the same connect task more than once (supervisor, adapter
+        teardown, shutdown); giving up the drain on a second cancel re-opens
+        the orphan window this drain exists to close.
+
+        Whatever the drained worker does, the caller asked to be cancelled, so
+        this always surfaces as ``CancelledError``; a worker exception must not
+        replace it and let ``connect()`` proceed after teardown.
+        """
+        # The token our OWN worker mints, captured per-call via a ContextVar
+        # rather than read back off the adapter: the same adapter can be
+        # re-connected while we drain, which would overwrite an attribute and
+        # make us release the RETRY's lock with the retry's own token.
+        # ``asyncio.to_thread`` copies the current context into the worker, so
+        # setting it here is enough -- and the token the worker appends is
+        # visible in THIS list, which the worker's context copy shares by
+        # reference.
+        token_sink: "list[int]" = []
+        sink_token = _PLATFORM_LOCK_TOKEN_SINK.set(token_sink)
+        try:
+            task = asyncio.ensure_future(
+                asyncio.to_thread(
+                    self._acquire_platform_lock, scope, identity, resource_desc
+                )
+            )
+        finally:
+            _PLATFORM_LOCK_TOKEN_SINK.reset(sink_token)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError as cancelled:
+            # Let the orphaned worker finish so the lock cannot outlive us.
+            # `task` is shielded, so it is still running, not cancelled.
+            #
+            # FURTHER cancellations must not abandon it.  Teardown routinely
+            # cancels more than once (supervisor + adapter teardown + shutdown
+            # all target the same connect task), and giving up on the second
+            # one puts us back in the orphan case this drain exists to close:
+            # the worker runs on and takes the machine-global lock with nobody
+            # left to release it.  So absorb repeat cancels and keep draining;
+            # the wait is still bounded by the sync body's own termination
+            # budget.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            acquired = False
+            if task.done() and not task.cancelled():
+                worker_error = task.exception()
+                if worker_error is not None:
+                    # The acquire failed on its own; nothing was taken.
+                    logger.debug(
+                        "[%s] acquire of %s failed while cancelled: %s",
+                        self.name,
+                        resource_desc,
+                        worker_error,
+                    )
+                else:
+                    acquired = bool(task.result())
+            # Release ONLY the lock OUR worker took, and only while it is still
+            # the live holder.
+            #
+            # The release is by (scope, identity), and the scoped lock is a
+            # single machine-global file: releasing it deletes whoever holds
+            # it.  While we were draining, a retry connect (reconnect
+            # supervisor, a sibling adapter for the same credential) can have
+            # acquired that very pair for itself and be using it right now.
+            # An unconditional release would delete a LIVE holder's lock --
+            # the same orphaning failure, pointed the other way.  The ownership
+            # token our worker minted is an exact test of which acquisition
+            # holds the lock; claiming it also clears the record, so a later
+            # teardown on this adapter cannot release it a second time.
+            our_token = token_sink[0] if token_sink else None
+            if acquired and _claim_platform_lock_release(scope, identity, our_token):
+                try:
+                    self._release_platform_lock_identity(scope, identity)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "[%s] could not release %s taken by a cancelled "
+                        "acquire: %s",
+                        self.name,
+                        resource_desc,
+                        exc,
+                    )
+            raise cancelled
+
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
         """Acquire a scoped lock for this adapter. Returns True on success.
 
@@ -3790,6 +4072,16 @@ class BasePlatformAdapter(ABC):
         explicitly arms this adapter for its initial ``--replace`` connect.
         The status module validates PID/start-time/home ownership, places the
         marker in the target's home, and performs the bounded termination.
+
+        Every successful acquire mints an ownership TOKEN recorded against
+        ``(scope, identity)``; it is stored on the adapter for teardown and
+        published to ``_PLATFORM_LOCK_TOKEN_SINK`` for the cancelled-acquire
+        drain.  Only the holder of the live token may release the lock, so
+        neither the drain nor a late teardown can delete a different
+        acquisition's machine-global lock.
+
+        BLOCKING.  On the takeover path this writes a marker and sleeps for up
+        to ~15s.  Coroutines must call :meth:`_acquire_platform_lock_async`.
         """
         from gateway.status import (
             acquire_scoped_lock,
@@ -3803,6 +4095,9 @@ class BasePlatformAdapter(ABC):
             scope, identity, metadata={'platform': self.platform.value}
         )
         if acquired:
+            self._note_acquired_platform_lock(
+                scope, identity, had_prior_holder=existing is not None
+            )
             return True
 
         takeover_allowed = bool(
@@ -3832,6 +4127,9 @@ class BasePlatformAdapter(ABC):
                     metadata={"platform": self.platform.value},
                 )
                 if acquired:
+                    self._note_acquired_platform_lock(
+                        scope, identity, had_prior_holder=existing is not None
+                    )
                     logger.info(
                         "[%s] Acquired %s after taking over PID %d",
                         self.name,
@@ -3860,14 +4158,56 @@ class BasePlatformAdapter(ABC):
         self._set_fatal_error(f'{scope}_lock', message, retryable=True)
         return False
 
+    def _note_acquired_platform_lock(
+        self, scope: str, identity: str, *, had_prior_holder: bool
+    ) -> None:
+        """Mint and record the ownership token for a just-acquired lock."""
+        token = _note_platform_lock_acquired(
+            scope, identity, self, had_prior_holder=had_prior_holder
+        )
+        self._platform_lock_token = token
+        sink = _PLATFORM_LOCK_TOKEN_SINK.get()
+        if sink is not None:
+            sink.append(token)
+
     def _release_platform_lock(self) -> None:
-        """Release the scoped lock acquired by _acquire_platform_lock."""
+        """Release the scoped lock acquired by _acquire_platform_lock.
+
+        OWNERSHIP-GUARDED.  The scoped lock is one machine-global file per
+        ``(scope, identity)``, and this adapter's ``_platform_lock_identity``
+        outlives its acquisition: the sync acquire sets it BEFORE acquiring, and
+        the cancelled-acquire drain releases the lock without clearing it.  So a
+        later teardown on that same adapter -- teardown always runs -- would
+        release the pair a SECOND time, deleting whatever retry connect has
+        since legitimately claimed it.  Release only while our own token is
+        still the live owner's.
+        """
         identity = getattr(self, '_platform_lock_identity', None)
         if not identity:
             return
-        from gateway.status import release_scoped_lock
-        release_scoped_lock(self._platform_lock_scope, identity)
+        scope = self._platform_lock_scope
+        token = getattr(self, '_platform_lock_token', None)
+        if not _claim_platform_lock_release(scope, identity, token):
+            # Not ours any more (already released by the cancel drain, or
+            # re-acquired by someone else).  Still drop our own bookkeeping.
+            self._platform_lock_identity = None
+            self._platform_lock_token = None
+            return
+        self._release_platform_lock_identity(scope, identity)
         self._platform_lock_identity = None
+        self._platform_lock_token = None
+
+    def _release_platform_lock_identity(self, scope: str, identity: str) -> None:
+        """Release one EXPLICIT (scope, identity) scoped lock.
+
+        :meth:`_release_platform_lock` is identity-derived and therefore
+        no-ops once teardown has cleared ``_platform_lock_identity``.  The
+        cancelled-acquire drain in :meth:`_acquire_platform_lock_async` knows
+        exactly which lock the worker thread took and must release THAT one
+        regardless of adapter state, so it comes through here.
+        """
+        from gateway.status import release_scoped_lock
+        release_scoped_lock(scope, identity)
 
     def _wire_plugin_handlers(self, native: Any = None) -> None:
         """Invoke plugin-registered native handler factories for this platform.
