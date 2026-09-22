@@ -115,7 +115,6 @@ REACHABLE_BASELINE = frozenset({
     "gateway/run.py start -> atomic_json_write",
     "gateway/run.py start_gateway -> atomic_json_write",
     "gateway/run.py stop -> atomic_json_write",
-    "plugins/platforms/matrix/adapter.py _resolve_message_context -> atomic_json_write",
 })
 
 

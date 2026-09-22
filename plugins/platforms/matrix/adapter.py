@@ -3423,7 +3423,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # DM mention-thread.
         if is_dm and not thread_id and self._dm_mention_threads and is_mentioned:
             thread_id = event_id
-            self._threads.mark(thread_id)
+            await self._threads.mark_async(thread_id)
 
         # Strip mention from body (only when mention-gating is active).
         if is_mentioned and self._require_mention:
@@ -3435,15 +3435,15 @@ class MatrixAdapter(BasePlatformAdapter):
             if is_dm:
                 if self._dm_auto_thread:
                     thread_id = event_id
-                    self._threads.mark(thread_id)
+                    await self._threads.mark_async(thread_id)
             elif self._matrix_session_scope == "room":
                 thread_id = None
             elif self._matrix_session_scope == "thread":
                 thread_id = event_id
-                self._threads.mark(thread_id)
+                await self._threads.mark_async(thread_id)
             elif self._auto_thread:
                 thread_id = event_id
-                self._threads.mark(thread_id)
+                await self._threads.mark_async(thread_id)
 
         display_name = await self._get_display_name(room_id, sender)
         source = self.build_source(
@@ -3460,7 +3460,7 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         if thread_id:
-            self._threads.mark(thread_id)
+            await self._threads.mark_async(thread_id)
 
         self._background_read_receipt(room_id, event_id)
 
