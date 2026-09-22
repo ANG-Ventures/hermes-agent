@@ -415,13 +415,33 @@ class MessageStore:
 
     def _ensure_search_content_column(self) -> None:
         """Add the ``search_content`` column if missing (split from the
-        backfill so the FTS self-heal can run between them — see init)."""
+        backfill so the FTS self-heal can run between them — see init).
+
+        Also creates the PARTIAL index the backfill probe needs. Without it
+        ``WHERE search_content IS NULL`` is a full-table scan on every boot —
+        measured 2026-09-22 on the Mac Studio: 10.9 GB / 2.5 M rows, ~21 min on a
+        contended disk, inside the process-wide engine-load lock, with all 8 turn
+        slots of the default gateway parked behind it and the user reading it as
+        "Apollo is frozen". The index only holds rows that still NEED backfill,
+        so on a healthy DB it is empty and the probe is O(1).
+        """
         assert self._conn is not None
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
         if "search_content" not in columns:
             self._conn.execute("ALTER TABLE messages ADD COLUMN search_content TEXT")
+        # Idempotent; building it once on a large legacy DB is a single scan,
+        # after which every boot's probe reads an (almost always) empty index.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_search_content_null "
+            "ON messages(store_id) WHERE search_content IS NULL"
+        )
+
+    # Rows per UPDATE transaction during a real backfill. Bounded so a restart
+    # mid-backfill keeps what was done (the old loop committed only at the very
+    # end of init, so a kill re-did all of it next boot).
+    BACKFILL_BATCH_ROWS = 2000
 
     def _backfill_search_content(self) -> None:
         """Backfill NULL ``search_content`` rows. Runs AFTER the FTS self-heal
@@ -433,6 +453,11 @@ class MessageStore:
         ``database disk image is malformed``, killing store construction — so
         skip the backfill entirely when the index is absent; it is rebuilt (and
         backfilled) the next time the FTS table is created.
+
+        Cost contract: the presence probe uses the partial index from
+        ``_ensure_search_content_column`` (O(1) when nothing is pending); real
+        work is batched and committed per BACKFILL_BATCH_ROWS so it is
+        restart-safe and never holds one giant transaction.
         """
         assert self._conn is not None
         has_fts = self._conn.execute(
@@ -440,34 +465,62 @@ class MessageStore:
         ).fetchone()
         if not has_fts:
             return
-        rows = self._conn.execute(
-            "SELECT store_id, content FROM messages WHERE search_content IS NULL"
-        ).fetchall()
-        for store_id, content in rows:
-            try:
-                plain_content = self._cipher.decrypt_text(content, field="content")
-                search_content = _index_safe_text(plain_content, self._ingest_protection_config)
-            except RuntimeError:
-                search_content = None
-            try:
-                self._conn.execute(
-                    "UPDATE messages SET search_content = ? WHERE store_id = ?",
-                    (search_content, store_id),
-                )
-            except sqlite3.DatabaseError as exc:
-                # The UPDATE fires msg_fts_update. On a legacy/drifted DB whose
-                # FTS shadow tables are missing or corrupt this raises
-                # "database disk image is malformed" — which must NOT kill store
-                # construction (the whole engine would fall back to the built-in
-                # compressor). Degrade: leave search_content NULL; the search
-                # path already falls back to LIKE, and the next successful FTS
-                # rebuild backfills it.
+        # O(1) on the partial index: nothing pending -> nothing to do.
+        if self._conn.execute(
+            "SELECT 1 FROM messages WHERE search_content IS NULL LIMIT 1"
+        ).fetchone() is None:
+            return
+        done = 0
+        while True:
+            rows = self._conn.execute(
+                "SELECT store_id, content FROM messages WHERE search_content IS NULL "
+                "LIMIT ?",
+                (self.BACKFILL_BATCH_ROWS,),
+            ).fetchall()
+            if not rows:
+                break
+            for store_id, content in rows:
+                try:
+                    plain_content = self._cipher.decrypt_text(content, field="content")
+                    search_content = _index_safe_text(plain_content, self._ingest_protection_config)
+                except RuntimeError:
+                    search_content = None
+                try:
+                    self._conn.execute(
+                        "UPDATE messages SET search_content = ? WHERE store_id = ?",
+                        (search_content, store_id),
+                    )
+                except sqlite3.DatabaseError as exc:
+                    # The UPDATE fires msg_fts_update. On a legacy/drifted DB whose
+                    # FTS shadow tables are missing or corrupt this raises
+                    # "database disk image is malformed" — which must NOT kill store
+                    # construction (the whole engine would fall back to the built-in
+                    # compressor). Degrade: leave search_content NULL; the search
+                    # path already falls back to LIKE, and the next successful FTS
+                    # rebuild backfills it.
+                    logger.warning(
+                        "search_content backfill skipped for store_id=%s (FTS index unusable): %s",
+                        store_id,
+                        exc,
+                    )
+                    self._conn.commit()
+                    return
+            # A row whose decrypt failed stays NULL and would be re-selected
+            # forever; the batch loop would spin. Stop when a batch made no progress.
+            still_null = self._conn.execute(
+                "SELECT count(*) FROM messages WHERE search_content IS NULL AND store_id IN (%s)"
+                % ",".join("?" * len(rows)),
+                [r[0] for r in rows],
+            ).fetchone()[0]
+            self._conn.commit()
+            done += len(rows) - still_null
+            if still_null == len(rows):
                 logger.warning(
-                    "search_content backfill skipped for store_id=%s (FTS index unusable): %s",
-                    store_id,
-                    exc,
+                    "search_content backfill: %d row(s) undecryptable, leaving NULL", still_null
                 )
-                return
+                break
+        if done:
+            logger.info("search_content backfill: populated %d row(s)", done)
 
     def _ensure_storage_columns(self) -> None:
         """Back-compat shim: column-add + backfill in one call (old order).
