@@ -58,6 +58,67 @@ def _clear_pr_cache() -> None:
     prg.clear_cache()
 
 
+# Captured at import, BEFORE the autouse hermeticity fixture can replace the
+# module attribute. Tests that need the genuine implementation (its redirect
+# and failure handling) call this and fake ``subprocess.run`` instead.
+#
+# ``getattr`` with a default rather than a plain attribute read: the RED-PROVE
+# arm swaps in the PRE-FIX source, which has no ``repo_exists`` at all. A hard
+# read there fails COLLECTION (rc=2), which proves only that a symbol is
+# missing — not that the guard's behaviour is absent. Degrading to None keeps
+# the module importable so the pre-fix arm fails on real assertions.
+_real_repo_exists = getattr(prg, "repo_exists", None)
+
+# Repos the hermetic oracle below considers to exist. Deliberately a small
+# fixed set: a test that wants a different answer overrides ``_repo_exists``
+# explicitly, so no test can depend on the ambient network.
+_EXISTING_REPOS = frozenset(
+    {
+        "ang-ventures/hermes-agent",
+        "ang-ventures/hermes-home",
+        "kyzcreig/ace-media-homelab",
+        "nousresearch/hermes-agent",
+        "o/r",
+        "b/one",
+        "b/two",
+        "src/utils",
+        # `10/10` is a REAL GitHub repository, and card bodies say "rated
+        # 10/10" constantly. It is in this set ON PURPOSE: it is the case
+        # existence CANNOT reject, so the numeric-segment filter is the only
+        # thing standing between that prose and a live lookup. Remove it and
+        # the filter becomes untestable (and its mutant survives).
+        "10/10",
+        # The NAME-segment twin of the case above, and in this set for the
+        # same reason. `10/10` and `13/13` (both real, both live in card
+        # bodies) have a numeric OWNER, so an owner-only filter still rejects
+        # them and the name half of the check looks like dead weight. It is
+        # not: a GitHub repo name may be all digits under a word owner, so
+        # `level/3` is a REALIZABLE collision even though measurement found
+        # none today -- 2466 card bodies across 76 boards yield 75 distinct
+        # `word/NUMBER` tokens and 0 of them are real repos. This entry is the
+        # hypothetical made concrete so the name half is gated by a test
+        # rather than by that sweep.
+        "level/3",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_repo_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let ``_body_repo_choice`` shell out to a live ``gh`` in tests.
+
+    :func:`prg.repo_exists` is a REAL network call, so leaving it live makes
+    every body-leg assertion depend on GitHub reachability and on ``gh`` being
+    on PATH — the suite passed with ``gh`` present and produced six failures
+    without it. Stubbing it here rather than per-test means a newly added test
+    inherits hermeticity instead of having to remember it.
+    """
+    monkeypatch.setattr(
+        prg, "repo_exists", lambda slug: slug.lower() in _EXISTING_REPOS,
+        raising=False,
+    )
+
+
 def _merged(sha: str = "abcdef1234567890", at: str = "2026-09-20T13:05:00Z") -> dict:
     return {"state": "MERGED", "mergedAt": at, "mergeCommitSha": sha}
 
@@ -463,6 +524,220 @@ def test_repo_context_keeps_resolving_when_the_body_names_no_repo(
         workspace_path=str(repo),
         body="wrap it in try/except, 30/31 runs green",
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# The BODY leg (t_e36cd2b3): ranking a lone prose token as the default repo
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The live shape: card t_edb301c0 on board hermes-fork. "before/after."
+        # is the body's ONLY slash token, so it was the single candidate and
+        # was RANKED as the repo for a bare #683.
+        "Also worth checking upstream (NousResearch) for the same gap "
+        "before/after. Land the fix then merge #683.",
+        # Prose that sits next to the strongest possible repo cue. A lexical
+        # discriminator cannot reject this; existence can.
+        "the repo is fine; wrap the call in try/except then merge #12",
+        # Numeric prose. `10/10` is a REAL GitHub repository, so this case is
+        # rejected on the numeric-segment filter BEFORE the existence check —
+        # existence alone would admit it.
+        "Ace already rated these 10/10 in the survey; merge #7 when green",
+        "30/31 runs green after the patch; then land #44",
+        # The NAME-segment case. `level/3` is stubbed as a REAL repository in
+        # `_EXISTING_REPOS`, so existence cannot reject it and the owner half
+        # of the numeric filter does not apply -- only the name half does.
+        # Without this case an owner-only filter passes the whole suite.
+        "back to level/3 on the retry ladder; then merge #51",
+    ],
+)
+def test_body_repo_choice_refuses_prose_that_merely_contains_a_slash(
+    body: str,
+) -> None:
+    """A lone slash-bearing prose token is not a repository.
+
+    This is the BODY-leg twin of the walk-up defect ``_is_repo_toplevel``
+    closed: a single candidate was taken as certainty, so the gate resolved a
+    bare ``#N`` against a repo derived from English. Live on ``t_edb301c0``,
+    which was the only surviving bare-``#N`` resolution on the fleet.
+
+    The discriminator is EXISTENCE, not vocabulary, because real repo names
+    and English word pairs are lexically identical. Measured over all 76
+    boards: of the 522 bodies that reach this branch the best lexical cue kept
+    10 of 22 real repos and still admitted 14 prose tokens, while existence
+    keeps 18 of 18 and admits 0 of 412.
+    """
+    assert prg._body_repo_choice(body) is None
+    assert prg.repo_context(workspace_path=None, body=body) is None
+
+
+def test_body_repo_choice_still_resolves_a_real_single_mention() -> None:
+    """Do not regress the feature #808/#833 shipped.
+
+    A body naming exactly one real repository and no competing noise still
+    resolves, so the legitimate bare-``#N`` case keeps working.
+    """
+    body = "land it on ANG-Ventures/hermes-agent first, then merge #808"
+    assert prg._body_repo_choice(body) == "ANG-Ventures/hermes-agent"
+    assert prg.parse_pr_refs(
+        "merge #808 then unblock",
+        default_repo=prg._body_repo_choice(body),
+    ) == [prg.PrRef(repo="ANG-Ventures/hermes-agent", number=808)]
+
+
+def test_body_repo_choice_declines_when_the_existence_oracle_fails() -> None:
+    """A failed lookup declines the resolution; it never guesses one.
+
+    ``repo_exists`` is fail-SAFE in the restrictive direction (no ``gh``, no
+    network, timeout, 404 all read as False), matching ``query_pr``'s None.
+    """
+    assert prg._body_repo_choice(
+        "land it on ANG-Ventures/hermes-agent then merge #808",
+        exists_fn=lambda _slug: False,
+    ) is None
+
+
+def test_repo_exists_rejects_a_redirected_full_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 200 is not enough — GitHub redirects renamed and numeric paths.
+
+    ``gh api repos/14/14`` answers 200 with ``paglia201/paglia201``, so a bare
+    returncode check re-admits the prose token ``14/14`` as a repository.
+
+    ``_real_repo_exists`` is the unstubbed function: the autouse hermeticity
+    fixture replaces ``prg.repo_exists``, and these two tests are the ones that
+    must exercise the real implementation (with ``subprocess.run`` faked, so
+    still no network).
+    """
+    calls: list[list[str]] = []
+
+    assert _real_repo_exists is not None, "source has no repo_exists"
+
+    class _Proc:
+        def __init__(self, stdout: str, returncode: int = 0) -> None:
+            self.stdout = stdout
+            self.returncode = returncode
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        return _Proc("paglia201/paglia201\n")
+
+    monkeypatch.setattr(prg.subprocess, "run", fake_run)
+    prg.clear_cache()
+    assert _real_repo_exists("14/14") is False
+    assert calls and calls[0][:3] == ["gh", "api", "repos/14/14"]
+
+    monkeypatch.setattr(
+        prg.subprocess, "run",
+        lambda cmd, **kw: _Proc("ANG-Ventures/hermes-agent\n"),
+    )
+    prg.clear_cache()
+    assert _real_repo_exists("ANG-Ventures/hermes-agent") is True
+
+
+def test_repo_exists_is_false_when_gh_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``gh`` on PATH must decline, not raise and not resolve."""
+    assert _real_repo_exists is not None, "source has no repo_exists"
+
+    def boom(*_args, **_kwargs):
+        raise FileNotFoundError("gh")
+
+    monkeypatch.setattr(prg.subprocess, "run", boom)
+    prg.clear_cache()
+    assert _real_repo_exists("ANG-Ventures/hermes-agent") is False
+
+
+def test_bare_refs_resolve_against_the_reasons_own_qualified_repo() -> None:
+    """The reason outranks the body when both name a repository.
+
+    Live shape of card ``t_9a74e029``: the block reason says
+    ``ANG-Ventures/hermes-home#225`` in plain text, and the sibling bare
+    ``#225``/``#228`` in that SAME reason resolved against
+    ``ANG-Ventures/hermes-agent`` because the BODY carried a qualified
+    hermes-agent ref. Both of those are real PRs, so the gate was making live
+    lookups against the wrong repository — it was inert only because that
+    card's ``block_kind='transient'`` sits outside ``GATE_BLOCK_KINDS``, which
+    is timing and not a guard.
+
+    The reason is closer evidence than the body it was derived from.
+    """
+    reason = (
+        "APPROVED for PR ANG-Ventures/hermes-home#225 @ a575c8b11 "
+        "(OPEN/MERGEABLE; land #225 then #228)."
+    )
+    refs = prg.parse_pr_refs(reason, default_repo="ANG-Ventures/hermes-agent")
+    assert refs == [
+        prg.PrRef(repo="ANG-Ventures/hermes-home", number=225),
+        prg.PrRef(repo="ANG-Ventures/hermes-home", number=228),
+    ]
+    assert all(ref.repo == "ANG-Ventures/hermes-home" for ref in refs)
+
+
+def test_bare_refs_are_dropped_when_the_reason_names_two_repos() -> None:
+    """Two repos in one reason is ambiguity: drop the bare numbers.
+
+    Same fail-safe as disagreeing remotes — attaching them to either repo
+    would be a coin flip. The qualified refs themselves still resolve.
+    """
+    reason = (
+        "blocked on ANG-Ventures/hermes-home#225 and "
+        "ANG-Ventures/hermes-agent#870; also land #999 after those."
+    )
+    refs = prg.parse_pr_refs(reason, default_repo="ANG-Ventures/hermes-agent")
+    assert refs == [
+        prg.PrRef(repo="ANG-Ventures/hermes-home", number=225),
+        prg.PrRef(repo="ANG-Ventures/hermes-agent", number=870),
+    ]
+    assert all(ref.number != 999 for ref in refs)
+
+
+def test_reason_override_does_not_disturb_a_reason_with_no_qualified_ref() -> None:
+    """The override only fires when the reason itself names a repo.
+
+    A reason carrying only bare numbers still uses the caller's context, which
+    is the path every one of the 19 live bare-number reasons takes.
+    """
+    assert prg.parse_pr_refs(
+        "merge #808 then unblock me", default_repo="ANG-Ventures/hermes-agent"
+    ) == [prg.PrRef(repo="ANG-Ventures/hermes-agent", number=808)]
+
+
+def test_gate_takes_no_action_on_a_prose_slug_card(kanban_home: Path) -> None:
+    """End to end: the live ``t_edb301c0`` shape must not produce a lookup.
+
+    Proves the guard at the level that matters — a card whose only slash token
+    is prose reaches the re-evaluator, resolves no refs, and leaves the board
+    untouched — rather than only at the helper.
+    """
+    queried: list[tuple[str, int]] = []
+
+    def oracle(repo: str, number: int):
+        queried.append((repo, number))
+        return _merged()
+
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn,
+            reason="land it then merge #683",
+            body=(
+                "Also worth checking upstream (NousResearch) for the same gap "
+                "before/after."
+            ),
+        )
+        outcomes = prg.reevaluate_pr_gates(conn, query_fn=oracle)
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+
+    assert queried == []
+    assert row["status"] == "blocked"
+    assert all(o.action != "unblocked" for o in outcomes)
 
 
 def test_gate_does_not_fire_twice_for_the_same_card_and_pr_set(
