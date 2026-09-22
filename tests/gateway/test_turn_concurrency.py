@@ -20,6 +20,198 @@ from tests.gateway.test_streaming_tts_gateway_regression import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("internal", [False, True])
+async def test_pre_yield_failure_releases_acquired_permits(internal, monkeypatch):
+    """Anything raised after acquire but before yield must release the permit.
+
+    ``slot()`` is an async generator: if it raises before its first ``yield``,
+    ``__aexit__`` never runs, so the pre-yield region is the ONLY place that
+    can hand the permit back. The live case is a CancelledError — the old code
+    awaited the notice task inside that region (a wide window: ``_wait_notice``
+    sits behind ``ack()`` -> ``adapter.send`` after a 15 s wait), so a cancel
+    there permanently burned one of ``cap`` slots. At zero, every turn blocks
+    in acquire forever: the exact starvation this gate exists to prevent.
+    Injected at the region's last statement so the fault is unambiguous.
+    """
+    import gateway.turn_admission as turn_admission
+    from gateway.turn_admission import TurnAdmission
+
+    admission = TurnAdmission(3)
+    calls = []
+
+    def boom(*args, **kwargs):
+        calls.append(args)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(turn_admission.logger, "info", boom)
+    entered = False
+
+    async def turn():
+        nonlocal entered
+        async with admission.slot("victim", internal=internal):
+            entered = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn()
+
+    assert calls, "pre-yield region did not reach the injected fault"
+    assert entered is False
+    assert admission.total._value == 3
+    assert admission.internal._value == 1
+    assert admission.in_flight == 0
+    assert admission.waiting == 0
+    assert not admission._owners
+
+    # The burned-slot symptom: a fresh turn must be admitted immediately.
+    monkeypatch.undo()
+    ran = asyncio.Event()
+
+    async def next_turn():
+        async with admission.slot("next", internal=internal):
+            ran.set()
+
+    await asyncio.wait_for(next_turn(), 5)
+    assert ran.is_set()
+    assert admission.total._value == 3
+    assert admission.internal._value == 1
+
+
+@pytest.mark.asyncio
+async def test_notice_cleanup_never_awaits_inside_the_critical_section():
+    """The notice task is cancelled and reaped detached, never awaited.
+
+    Awaiting it after the permit was acquired is what made the cancellation
+    window wide enough to hit. A notice whose own cleanup blocks forever must
+    not delay — let alone deadlock — the admitted turn.
+    """
+    from gateway.turn_admission import TurnAdmission
+
+    admission = TurnAdmission(2)
+    admission.warning_after = 0
+    notice_running = asyncio.Event()
+    never = asyncio.Event()
+
+    async def _wait_notice(key, internal, ack, started):
+        notice_running.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await never.wait()  # a cleanup that never completes
+
+    admission._wait_notice = _wait_notice
+    entered = asyncio.Event()
+
+    async def turn():
+        async with admission.slot("held"):
+            entered.set()
+
+    # Contend the semaphore so the notice task is genuinely RUNNING (and
+    # therefore has a real cancellation to unwind) when cleanup reaps it.
+    await admission.total.acquire()
+    await admission.total.acquire()
+    task = asyncio.create_task(turn())
+    await asyncio.wait_for(notice_running.wait(), 5)
+    admission.total.release()
+    admission.total.release()
+
+    await asyncio.wait_for(entered.wait(), 5)
+    await asyncio.wait_for(task, 5)
+
+    assert admission.total._value == 2
+    assert admission.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_admitted_resume_handle_cancel_delegates_to_its_task():
+    """cancel() on an admitted handle must own the running resume task.
+
+    A bare Future marks itself done/cancelled instantly while the admitted
+    resume body keeps running. The shutdown path reads exactly that state to
+    distinguish "never started -> cancel + re-mark the session" from "in
+    progress -> leave it alone", so a bare Future let a RUNNING resume be
+    re-marked and restored a second time on top of the original turn.
+    """
+    from gateway.turn_admission import StartupResumePool
+
+    pool = StartupResumePool(1)
+    started = asyncio.Event()
+    cancelled_inside = False
+
+    async def body():
+        nonlocal cancelled_inside
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled_inside = True
+            raise
+
+    handle = pool.submit(body)
+    await asyncio.wait_for(started.wait(), 5)
+
+    assert handle.cancel() is True
+    # The task is cancelled, but the handle must NOT be done until the body
+    # has actually unwound — that is the whole contract.
+    assert not handle.done()
+
+    with pytest.raises(asyncio.CancelledError):
+        await handle
+    assert cancelled_inside is True
+    assert handle.cancelled()
+    assert not pool.running
+
+
+@pytest.mark.asyncio
+async def test_queued_resume_handle_keeps_plain_cancel_contract():
+    """Queued (unadmitted) entries still cancel immediately and never run."""
+    from gateway.turn_admission import StartupResumePool
+
+    pool = StartupResumePool(1)
+    release = asyncio.Event()
+    ran = []
+
+    async def body(label):
+        ran.append(label)
+        await release.wait()
+
+    admitted = pool.submit(body, "admitted")
+    queued = pool.submit(body, "queued")
+    await asyncio.sleep(0)
+    assert ran == ["admitted"]
+
+    assert queued.cancel() is True
+    assert queued.cancelled()
+
+    release.set()
+    await asyncio.wait_for(admitted, 5)
+    await asyncio.sleep(0)
+    # A cancelled queued entry is dropped by the pump, never dispatched.
+    assert ran == ["admitted"]
+    assert not pool.pending
+    assert not pool.running
+
+
+@pytest.mark.asyncio
+async def test_admitted_resume_handle_completes_with_task_result():
+    from gateway.turn_admission import StartupResumePool
+
+    pool = StartupResumePool(2)
+
+    async def ok():
+        return "done"
+
+    async def boom():
+        raise RuntimeError("resume failed")
+
+    good = pool.submit(ok)
+    bad = pool.submit(boom)
+    assert await good == "done"
+    with pytest.raises(RuntimeError, match="resume failed"):
+        await bad
+    assert not pool.running
+
+
 @pytest.mark.parametrize("cap", [2, None])
 @pytest.mark.asyncio
 async def test_run_agent_bounds_real_executor(monkeypatch, tmp_path, cap):
