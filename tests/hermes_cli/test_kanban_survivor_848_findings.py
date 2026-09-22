@@ -444,12 +444,26 @@ def test_an_ambiguous_sha_that_the_binding_cannot_narrow_is_refused(board, remot
     reclamation, so choosing one of several would publish a recovery-index entry
     that is a guess -- the same harm the module refuses when one operator claim
     would vouch for several missing repositories.
+
+    The refusal is an ``AmbiguousRef`` rather than ``None`` (Argus round 1): the
+    remote ANSWERED, so collapsing this into the not-verified return would make
+    the caller report a verdict as a non-answer. Both orderings are driven and
+    the two refusals must carry the SAME tips, which is an invariant of the
+    function rather than a snapshot of its current answer.
     """
     tid = "t_ambiguous"
-    remote["refs"] = [f"{HEAD}\trefs/heads/kanban/{tid}-a",
-                      f"{HEAD}\trefs/heads/kanban/{tid}-b"]
+    a = f"{HEAD}\trefs/heads/kanban/{tid}-a"
+    b = f"{HEAD}\trefs/heads/kanban/{tid}-b"
 
-    assert ext.verify_ref(f"{URL}#{HEAD}", mined_for=tid) is None
+    seen = []
+    for order in ([a, b], [b, a]):
+        remote["refs"] = order
+        with pytest.raises(ext.AmbiguousRef) as excinfo:
+            ext.verify_ref(f"{URL}#{HEAD}", mined_for=tid)
+        seen.append(excinfo.value.tips)
+
+    assert seen[0] == seen[1], "the refusal must not depend on ls-remote order"
+    assert set(seen[0]) == {f"refs/heads/kanban/{tid}-a", f"refs/heads/kanban/{tid}-b"}
 
 
 def test_the_binding_still_narrows_a_tag_beside_the_topic_branch(board, remote):
@@ -466,3 +480,153 @@ def test_the_binding_still_narrows_a_tag_beside_the_topic_branch(board, remote):
     assert verified is not None
     assert verified["branch"] == f"refs/heads/kanban/{tid}-fix"
     assert verified["corroborated_by"] == "branch"
+
+
+# --- Argus round 1: the finding-4 fix must not close the UNBOUND door -------
+#
+# The first fix narrowed `tips` by the binding and refused on `len(tips) != 1`.
+# With `mined_for=None` -- the `--survivor-unbound` path -- NOTHING narrows, so
+# EVERY multi-tip SHA was refused, and that is precisely the shape the override
+# exists for: an ordinary fast-forward that left the topic branch alive beside
+# `main`. Measured by Argus on this project's own remote: 86 of 2009 distinct
+# OIDs (4.3%) carry more than one tip, 80 of them 2+ `refs/heads`. The operator
+# had already played their last move, so the state had NO remedy at all -- the
+# unreachable-remedy bug `_qualified_hint` exists to prevent.
+#
+# Every test below drives the UNBOUND arm, which is what the original 17
+# missed: they all set `mined_for=<tid>` or exercised verify_pr.
+
+def _multi_tip(tid):
+    """A SHA on an odd branch AND on main -- a fast-forward with the topic alive."""
+    return [f"{HEAD}\trefs/heads/someones-odd-branch", f"{HEAD}\trefs/heads/main"]
+
+
+def test_the_override_still_completes_a_card_on_a_multi_tip_sha(board, remote):
+    """The documented override must remain REACHABLE for --survivor-ref.
+
+    The expectation is fixed by construction rather than read off the function:
+    the operator has supplied the relevance the binding cannot, and the card
+    brief's own remedy for "the work landed on an unrelated-looking branch" is
+    this flag. If it refuses here there is no further move to make.
+    """
+    tid = _card(board, workspace=False)
+    remote["refs"] = _multi_tip(tid)
+
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]},
+                            survivor_ref=f"{URL}#{HEAD}", survivor_unbound=True)
+    ref = kb.latest_run(board, tid).metadata["survivor"]["refs"][0]
+    assert ref["unbound"] is True and ref["claimed_by"]
+
+
+def test_the_unbound_verdict_does_not_depend_on_ls_remote_order(board, remote):
+    """Accepting must not mean accepting whatever was emitted last.
+
+    The expectation is computed independently of the function: both orderings of
+    the SAME two refs are driven and the two results must be EQUAL. That is an
+    invariant, not a snapshot, so it cannot be satisfied by luck in one
+    direction -- the same oracle the bound-path test uses.
+    """
+    a, b = _multi_tip("t_unbound")
+
+    remote["refs"] = [a, b]
+    first = ext.verify_ref(f"{URL}#{HEAD}", mined_for=None)
+    remote["refs"] = [b, a]
+    second = ext.verify_ref(f"{URL}#{HEAD}", mined_for=None)
+
+    assert first == second, "the unbound verdict must not depend on ls-remote order"
+    assert first is not None, "and it must be an acceptance, not a shared refusal"
+
+
+def test_an_accepted_multi_tip_records_every_tip_it_could_not_choose_between(board, remote):
+    """The ambiguity is RECORDED, not hidden: `branch` alone would be a guess.
+
+    `branch` is read back by reclamation as this survivor's provenance, so a
+    row that names one of two tips and says nothing about the other publishes a
+    recovery-index entry a human cannot audit. Asserted against the refs the
+    fixture was built from, not against what the function returned.
+    """
+    tid = _card(board, workspace=False)
+    remote["refs"] = _multi_tip(tid)
+
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]},
+                            survivor_ref=f"{URL}#{HEAD}", survivor_unbound=True)
+    ref = kb.latest_run(board, tid).metadata["survivor"]["refs"][0]
+    assert ref["tips"] == ["refs/heads/main", "refs/heads/someones-odd-branch"]
+    assert ref["branch"] in ref["tips"]
+
+
+def test_an_unambiguous_unbound_claim_records_no_tips(board, remote):
+    """Anti-vacuity for the row above: `tips` marks ambiguity, so it must be absent
+    when there is none. Otherwise the field says nothing and the audit is noise."""
+    tid = _card(board, workspace=False)
+    remote["refs"] = [f"{HEAD}\trefs/heads/someones-odd-branch"]
+
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]},
+                            survivor_ref=f"{URL}#{HEAD}", survivor_unbound=True)
+    ref = kb.latest_run(board, tid).metadata["survivor"]["refs"][0]
+    assert "tips" not in ref and ref["branch"] == "refs/heads/someones-odd-branch"
+
+
+def test_the_bound_ambiguous_refusal_is_not_a_claim_about_the_remote(board, remote):
+    """The remote ANSWERED, so the diagnostic must not say it could not be reached.
+
+    The inverse of the t_de2e348e class this module already refuses: there it was
+    a non-answer reported as a verdict; here it was a verdict reported as a
+    non-answer. The refusal must also keep the override hint, because dropping
+    the binding IS the remedy for an ambiguity the binding created.
+    """
+    tid = _card(board, workspace=False)
+    remote["refs"] = [f"{HEAD}\trefs/heads/kanban/{tid}-a",
+                      f"{HEAD}\trefs/heads/kanban/{tid}-b"]
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]},
+                         survivor_ref=f"{URL}#{HEAD}")
+
+    message = str(excinfo.value)
+    assert "could not verify" not in message, "the remote answered; saying otherwise is false"
+    assert f"refs/heads/kanban/{tid}-a" in message and f"refs/heads/kanban/{tid}-b" in message
+    assert excinfo.value.override_hint, "the override is a real remedy here and must be offered"
+
+
+def test_an_unreachable_remote_is_still_reported_as_unreachable(board, remote, monkeypatch):
+    """Anti-vacuity: the new outcome must not swallow the genuine non-answer.
+
+    RemoteUnavailable and AmbiguousRef are different facts and the whole point
+    of the new class is keeping facts apart, so a real blip must still produce
+    the "could not verify" wording -- and must NOT offer the override, which
+    cannot fix a network fault.
+    """
+    tid = _card(board, workspace=False)
+    real = subprocess.run
+
+    def run(args, **kwargs):
+        if "ls-remote" in args and "-C" not in args:
+            return subprocess.CompletedProcess(args, 128, b"", b"fatal: could not read")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]},
+                         survivor_ref=f"{URL}#{HEAD}", survivor_unbound=True)
+    assert "could not verify" in str(excinfo.value)
+    assert not getattr(excinfo.value, "override_hint", ""), (
+        "the override cannot remedy a remote that did not answer"
+    )
+
+
+def test_mining_skips_an_ambiguous_ref_instead_of_crashing(board, remote):
+    """`discover` states no reason, so the new exception must not escape it.
+
+    AmbiguousRef is a ValueError, and `preserve`'s except tuple catches
+    ValueError -- so an unhandled one would HOLD rather than crash. But mining
+    is a hint: an ambiguity there is simply "not this candidate", and it must
+    not stop the scan or turn a hold into an error.
+    """
+    tid = _card(board, workspace=False)
+    remote["refs"] = [f"{HEAD}\trefs/heads/kanban/{tid}-a",
+                      f"{HEAD}\trefs/heads/kanban/{tid}-b"]
+
+    assert ext.discover(board, tid, {"changed_files": ["code.py"]},
+                        [f"work landed at {URL}#{HEAD}"], [URL]) is None

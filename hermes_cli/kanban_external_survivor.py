@@ -36,6 +36,32 @@ def _safe_url(url):
             and not (parsed.username and parsed.scheme != "ssh"))
 
 
+class AmbiguousRef(ValueError):
+    """The remote answered, the SHA is real, and the BINDING cannot pick a ref.
+
+    Distinct from both ``None`` and :class:`RemoteUnavailable`, because it is a
+    third outcome and collapsing it into either one costs the caller the only
+    honest thing it can say. Reported as ``None`` it reads "does not name this
+    card" -- the opposite of the truth, since every surviving tip names it.
+    Reported as ``RemoteUnavailable`` it reads "could not verify against the
+    remote" when the remote answered perfectly, which also loses the
+    ``--survivor-unbound`` hint, since the caller only attaches that to a
+    refusal it has a verdict for (Argus round 1 on this card: a verdict
+    reported as a non-answer, the inverse of t_de2e348e).
+
+    ``tips`` are the refs that survived the binding, so a caller can name them.
+
+    Inherits ``ValueError`` deliberately: ``preserve()``'s ``except`` tuple
+    catches ``ValueError``, so a call site that ever forgets to handle this
+    still HOLDs fail-closed instead of escaping past ``_hold()`` -- the escape
+    class this card's finding 1 was about.
+    """
+
+    def __init__(self, tips):
+        self.tips = list(tips)
+        super().__init__(f"{len(self.tips)} refs carry this sha")
+
+
 class RemoteUnavailable(Exception):
     """The remote did not answer. This says NOTHING about the claim.
 
@@ -77,11 +103,24 @@ def verify_ref(claim, *, mined_for=None):
 
     ``None`` means the remote answered and the claim does not hold up; a
     remote that did not answer raises :class:`RemoteUnavailable` instead, so a
-    caller never reports a blip as a statement about relevance. A SHA that is
-    the tip of more than one ref the binding cannot narrow to exactly one is
-    also ``None``: ``branch`` is recorded as this survivor's provenance, so
-    picking one of several would publish a recovery-index entry that is a
-    guess.
+    caller never reports a blip as a statement about relevance. A SHA whose
+    tips the binding cannot narrow to exactly one raises
+    :class:`AmbiguousRef` -- a THIRD outcome, because the remote answered and
+    every surviving tip satisfies the question asked. ``branch`` is recorded as
+    this survivor's provenance, so a bound claim may not resolve to a guess;
+    the caller refuses and says so.
+
+    On the UNBOUND path (``mined_for=None``) nothing narrows, so an ordinary
+    fast-forward that left the topic branch alive beside ``main`` would refuse
+    EVERY multi-tip SHA -- measured at 86 of 2009 distinct OIDs (4.3%) on this
+    project's own remote. That is the one case ``--survivor-unbound`` exists
+    for, and refusing it leaves the operator with no move left (Argus round 1
+    on kanban card t_99d93499). There is no binding to be a guess ABOUT there:
+    the operator supplied the relevance, the override is stamped with the uid
+    that authorised it, and every tip resolves to the same commit. So the
+    claim is accepted and the ambiguity is RECORDED rather than hidden --
+    ``tips`` carries all of them and ``branch`` takes the lexicographically
+    first, which is deterministic rather than drawn from emission order.
     """
     url, sep, sha = claim.rpartition("#")
     if not sep or not re.fullmatch(_SHA, sha) or not _safe_url(url):
@@ -104,22 +143,30 @@ def verify_ref(claim, *, mined_for=None):
     if len(matches) != 1:
         return None  # unknown or ambiguous abbreviation
     oid, tips = next(iter(matches.items()))
+    tips = sorted(tips)
     if mined_for:
         # The binding is the question being asked, so ask it of every tip, not
         # of one drawn by emission order. A commit does not stop naming the
         # card because it is also reachable as `main` or as a tag.
         tips = [ref for ref in tips if mined_for in ref]
-    if len(tips) != 1:
-        # Still ambiguous after the binding narrowed it: REFUSE rather than
-        # pick. `branch` is persisted as this survivor's provenance and read by
-        # reclamation; choosing one of several candidates would write a
-        # recovery-index entry this module cannot stand behind -- the same harm
-        # as stamping one operator claim onto several missing repositories
-        # (`kanban_survivor.preserve`). A caller who knows which ref carries the
-        # work can name it with `--survivor-pr`.
+        if not tips:
+            return None
+        if len(tips) != 1:
+            # Still ambiguous after the binding narrowed it: REFUSE rather than
+            # pick. `branch` is persisted as this survivor's provenance and read
+            # by reclamation; choosing one of several candidates would write a
+            # recovery-index entry this module cannot stand behind -- the same
+            # harm as stamping one operator claim onto several missing
+            # repositories (`kanban_survivor.preserve`). Raise rather than
+            # return None so the caller can say WHY: the remote answered, and
+            # it answered with several.
+            raise AmbiguousRef(tips)
+    elif not tips:
         return None
     ref = tips[0]
     verified = {"remote": url, "branch": ref, "sha": oid, "external": True}
+    if len(tips) > 1:
+        verified["tips"] = tips
     return dict(verified, corroborated_by="branch") if mined_for else verified
 
 
@@ -230,6 +277,10 @@ def discover(conn, task_id, metadata, evidence, urls):
             try:
                 verified = (verify_pr(claim, shas, mined_for=task_id) if kind == "pr"
                             else verify_ref(claim, mined_for=task_id))
+            except AmbiguousRef:
+                # Several tips name the card and mining states no reason, so
+                # there is nothing to report and nothing to choose between.
+                continue
             except RemoteUnavailable:
                 # Mining only looks for a candidate; an unanswered remote is
                 # indistinguishable from "not this one" HERE, because discover

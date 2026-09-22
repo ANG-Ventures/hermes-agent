@@ -489,6 +489,29 @@ def _unbound_keys(survivor_unbound):
     )
 
 
+def _live(verify, value, extra):
+    """Is this claim real at all, with the binding set aside?
+
+    Only ever asked to DISCRIMINATE a refusal that has already happened: a
+    claim the remote does not know at all and a claim it knows but that does
+    not name the card are different facts and deserve different diagnostics,
+    and only the second has the override as a remedy.
+
+    Asked without ``mined_for``, so :class:`_ext.AmbiguousRef` cannot arise
+    (the unbound path resolves a multi-tip SHA rather than refusing it). It is
+    caught anyway and read as live, because that is what it means -- the remote
+    answered and the refs exist -- and because a future narrowing of the
+    unbound path must not silently turn this discrimination into a crash.
+    :class:`_ext.RemoteUnavailable` is deliberately NOT caught: it propagates to
+    the caller's handler, which reports "could not verify", rather than being
+    flattened into "not live" -- a blip must never be published as a verdict.
+    """
+    try:
+        return verify(value, **extra) is not None
+    except _ext.AmbiguousRef:
+        return True
+
+
 def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
     """An operator-named survivor is a claim: verify it is real AND is THIS card's work.
 
@@ -600,7 +623,7 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
             ref = verify(value, mined_for=None if claim_unbound else task_id, **extra)
             if ref is None:
                 # The claim is unverified and may carry a token: echo it redacted only.
-                if not claim_unbound and verify(value, **extra) is not None:
+                if not claim_unbound and _live(verify, value, extra):
                     raise _refusal(
                         f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
                         f"name {task_id}, so it is not evidence of THIS card's work",
@@ -610,6 +633,20 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
                     f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
                     f"against the remote"
                 )
+        except _ext.AmbiguousRef as exc:
+            # A THIRD outcome, and reporting it as either of the other two lies.
+            # The remote answered, and it answered with several refs that all
+            # name the card -- so "could not verify against the remote" is
+            # false, and "does not name <card>" is its opposite. Name the tips
+            # and keep the hint: the override is a real remedy here, because it
+            # drops the binding that is doing the narrowing.
+            raise _refusal(
+                f"survivor_unavailable: {flag} {_ext.redact(claim)} is the tip of "
+                f"{len(exc.tips)} refs that all name {task_id} "
+                f"({', '.join(_ext.redact(tip) for tip in exc.tips)}), so which one carries "
+                f"THIS card's work cannot be established; name it with --survivor-pr",
+                hint=True,
+            ) from exc
         except _ext.RemoteUnavailable as exc:
             raise SurvivorUnavailable(
                 f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
