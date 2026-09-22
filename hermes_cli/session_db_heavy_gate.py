@@ -149,20 +149,32 @@ async def session_db_heavy_read_slot(surface: str, operation: str):
             retry_after=_QUEUE_WAIT_TIMEOUT_S,
         ) from exc
 
-    queue_wait = loop.time() - start
-    was_queued = queued_at_entry or queue_wait >= _QUEUE_WAIT_LOG_THRESHOLD_S
-    _record_stats(
-        acquired=1,
-        queued=1 if was_queued else 0,
-        queue_wait=queue_wait if was_queued else 0.0,
-    )
-    if was_queued:
-        _LOG.info(
-            "session_db_heavy_read queue_wait=%.3fs surface=%s operation=%s outcome=acquired",
-            queue_wait,
-            surface,
-            operation,
+    try:
+        queue_wait = loop.time() - start
+        was_queued = queued_at_entry or queue_wait >= _QUEUE_WAIT_LOG_THRESHOLD_S
+        _record_stats(
+            acquired=1,
+            queued=1 if was_queued else 0,
+            queue_wait=queue_wait if was_queued else 0.0,
         )
+        if was_queued:
+            _LOG.info(
+                "session_db_heavy_read queue_wait=%.3fs surface=%s operation=%s outcome=acquired",
+                queue_wait,
+                surface,
+                operation,
+            )
+    except BaseException:
+        # A generator that raises BEFORE its first yield never runs __aexit__,
+        # so this is the ONLY release path for the permit acquired above. The
+        # statements in this window (stats bookkeeping, logging) do not raise
+        # today, but without this guard any future one that does — or a cancel
+        # delivered here — burns a permit permanently, and at zero every heavy
+        # read sheds SessionDBHeavyReadBusy until the process restarts. Same
+        # class as gateway/turn_admission.py::TurnAdmission.slot.
+        semaphore.release()
+        raise
+
     try:
         yield
     finally:
