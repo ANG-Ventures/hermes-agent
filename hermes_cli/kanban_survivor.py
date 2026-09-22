@@ -63,6 +63,146 @@ def _git(repo, *args, env=None, check=True):
     return result
 
 
+def _alternates(repo):
+    """Object stores this repo BORROWS from, newest-first as Git reads them.
+
+    A clone made from a local path with `--shared` or `--reference` does not
+    copy the lender's objects: it records the lender here. (A plain
+    `git clone <local-path>` does NOT -- measured on git 2.53.0, it hardlinks
+    and writes no alternates file at all.) When the lender is later pruned or
+    reaped the borrower silently becomes unreadable, which is the upstream
+    cause of a broken object store inside a scratch workspace -- so the
+    lender's path is the single most useful thing to name.
+    """
+    location = _git(repo, "rev-parse", "--path-format=absolute", "--git-path",
+                    "objects/info/alternates", check=False)
+    if location.returncode:
+        return []
+    path = location.stdout.decode("utf-8", "replace").strip()
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines() if path else []
+    except OSError:
+        return []
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+
+
+def _lender(repo, workspace):
+    """The first borrowed object store and whether it lives inside `workspace`.
+
+    A lender INSIDE the same workspace is the reapable shape: the sibling clone
+    it borrows from is itself disposable, so this repo is doomed the moment that
+    sibling is pruned or reclaimed. That is the upstream CAUSE of the broken
+    store, not the symptom.
+    """
+    lenders = _alternates(repo)
+    if not lenders:
+        return None, False
+    try:
+        inside = Path(lenders[0]).resolve().is_relative_to(Path(workspace).resolve())
+    except (OSError, ValueError):
+        inside = False
+    return lenders[0], inside
+
+
+def _warn_borrowed_from_workspace(repo, key, workspace):
+    """Record at baseline that a repo's objects are on loan from a reapable sibling.
+
+    Deliberately a warning, not a refusal: `record_baseline` runs before
+    dispatch and a refusal here would make the card unspawnable over a clone
+    layout that is usually fine. What it buys is attribution -- when the
+    borrower later fails its completion, the dispatch-time log already names
+    the lender that was always going to be reaped.
+    """
+    lender, inside = _lender(repo, workspace)
+    if lender and inside:
+        log.warning(
+            "kanban survivor: %s borrows objects from %s inside the same workspace; "
+            "reaping the lender will make this repo unreadable",
+            key, _ext.redact(lender),
+        )
+
+
+def _advertised_head(repo, workspace, head):
+    """The durable remote ref that already carries `head`, or None.
+
+    Deliberately an EXACT tip match: ancestry (`merge-base --is-ancestor`) needs
+    the local objects that are, by construction, the ones we cannot read here.
+    `ls-remote` needs none of them.
+    """
+    for ref in _published_refs(repo, workspace):
+        if ref["sha"] == head:
+            return ref
+    return None
+
+
+def _object_store_broken(repo):
+    """True when Git cannot walk the objects reachable from HEAD.
+
+    Cheap on purpose (one commit's worth of tree walk, not a full `fsck`):
+    this only runs after a capture has ALREADY failed, so it is a classifier,
+    not a gate on the happy path.
+    """
+    if _git(repo, "rev-parse", "--verify", "HEAD", check=False).returncode:
+        return False  # no commit yet: nothing borrowed can be missing
+    return bool(
+        _git(repo, "cat-file", "-e", "HEAD^{tree}", check=False).returncode
+        or _git(repo, "rev-list", "--objects", "--no-object-names",
+                "--max-count=1", "HEAD", check=False).returncode
+    )
+
+
+def _explain_broken_object_store(repo, key, workspace, bases=()):
+    """Re-raise a failed capture with a diagnosis instead of the bare constant.
+
+    `_git(check=True)` collapses every non-zero rc into
+    "survivor_unavailable: git inspection failed" (the detail is log-only,
+    because git stderr can carry credential-bearing remote URLs). For a broken
+    object store that costs the operator a full manual forensics pass -- on
+    t_85cc093e round 11 it cost ~15 minutes to establish facts this function
+    already has: WHICH repo, WHICH lender, and whether the committed work is
+    published. The repo key is workspace-relative and the lender is a local
+    filesystem path; neither is credential-bearing, so both are safe to persist.
+
+    Returns (raising nothing) when the store reads fine, so any other failure
+    keeps today's constant message and today's behaviour. Fail-closed is
+    preserved either way: this never skips a repo, it only explains the refusal
+    and names the remedy (quarantine by MOVING, never deleting).
+    """
+    if not _object_store_broken(repo):
+        return
+    sha = _git(repo, "rev-parse", "--verify", "HEAD", check=False).stdout.decode().strip()
+    where = "." if key == "." else f"./{key}"
+    lender, inside = _lender(repo, workspace)
+    if lender:
+        scope = "sibling clone inside this workspace" if inside else "external"
+        cause = f"likely a pruned `alternates` lender ({scope}: {_ext.redact(lender)})"
+    else:
+        cause = "objects are missing from this repository"
+    published = _advertised_head(repo, workspace, sha)
+    if published:
+        remedy = (f"HEAD {sha[:12]} is advertised at {published['remote']}/{published['branch']}, "
+                  "so its committed work is published; if the remaining local changes are "
+                  f"disposable, MOVE {where} out of the workspace (never delete it) and retry")
+        if key in bases:
+            # `preserve` has a SECOND fail-closed gate: a repo recorded at
+            # dispatch that is no longer present raises "recorded repository
+            # missing", which says nothing about the quarantine that caused it.
+            # Following the MOVE advice alone would just trade one refusal for
+            # a more confusing one, so the remedy has to name both steps. The
+            # gate itself stays closed -- only the message gets honest.
+            remedy += (f" -- {where} was recorded at dispatch, so the retry must PAIR the move "
+                       "with --survivor-pr <owner/repo#N> or --survivor-ref <repo-url>#<sha> "
+                       "or it will refuse again with 'recorded repository missing'")
+    else:
+        remedy = (f"HEAD {sha[:12]} is not advertised on any durable remote -- do not delete "
+                  f"{where}; restore the missing objects first")
+    log.warning("kanban survivor: unreadable object store in %s (%s)", _ext.redact(str(repo)), cause)
+    raise SurvivorUnavailable(
+        f"survivor_unavailable: git cannot read the objects reachable from HEAD in {where} -- "
+        f"broken object store, {cause}. {remedy}."
+    )
+
+
 def _repos(workspace):
     """Find repos created inside scratch, including linked worktrees; no symlinks."""
     found = []
@@ -106,6 +246,7 @@ def record_baseline(conn, task_id, workspace):
         if key not in bases:
             head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
             bases[key] = head.stdout.decode().strip() if head.returncode == 0 else None
+        _warn_borrowed_from_workspace(repo, key, workspace)
     with kb.write_txn(conn):
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
@@ -246,6 +387,24 @@ def _snapshot(repo, base, prefix):
             "--no-textconv", "--no-renames", f"--src-prefix=a/{prefix}",
             f"--dst-prefix=b/{prefix}", base, "--", ".", env=env,
         ).stdout
+
+
+def _capture(repo, key, workspace):
+    """One repository's survivor material: (remote ref, base, snapshot bytes).
+
+    Extracted verbatim from `preserve`'s loop so the object-reading steps sit
+    inside a single `try` the caller can classify. Behaviour is unchanged.
+    """
+    published = list(_published_refs(repo, workspace))
+    head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
+    dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
+    if not dirty and head.returncode == 0:
+        ref = _remote_survivor(repo, head.stdout.decode().strip(), published)
+        if ref:
+            return ref, None, None
+    base = _base(repo, published)
+    prefix = "" if key == "." else key + "/"
+    return None, base, _snapshot(repo, base, prefix)
 
 
 _QUALIFIER = re.compile(r"[^:?#=]+=")
@@ -946,18 +1105,19 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         patches, refs, bundles, repositories = [], list(carried), list(carried_bundles), []
         for repo in repos:
             key = str(repo.relative_to(workspace))
-            published = list(_published_refs(repo, workspace))
-            head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
-            dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
-            ref = None
-            if not dirty and head.returncode == 0:
-                ref = _remote_survivor(repo, head.stdout.decode().strip(), published)
+            try:
+                ref, base, data = _capture(repo, key, workspace)
+            except SurvivorUnavailable:
+                # Every object-reading step above (`status`, `diff`, and
+                # `_snapshot`'s `git bundle` inside pack-objects) raises the
+                # bare constant. Classify it before it escapes: if this repo's
+                # store is broken, say WHICH repo, WHICH lender and what to do.
+                # Anything else re-raises unchanged.
+                _explain_broken_object_store(repo, key, workspace, bases)
+                raise
             if ref:
                 refs.append(dict(ref, repository=key))
                 continue
-            base = _base(repo, published)
-            prefix = "" if key == "." else key + "/"
-            data = _snapshot(repo, base, prefix)
             if base is None:
                 name = f"implementation-{len(bundles)}.bundle"
                 bundle = _store(conn, task_id, name, data, "application/x-git-bundle")
