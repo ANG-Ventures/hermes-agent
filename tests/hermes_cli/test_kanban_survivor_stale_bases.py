@@ -910,3 +910,99 @@ def test_partial_loss_holds_for_loose_evidence_under_a_bundle_shaped_survivor(
     assert board.execute(
         "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
         (tid,)).fetchone()["held_reason"] is not None
+
+
+# --- coverage must be TOTAL, not merely overlapping ------------------------
+#
+# `missing <= vouched` is the ONLY thing separating "every lost repository is
+# accounted for" from "SOME lost repository is accounted for". Every test above
+# loses exactly ONE repository, and with a single-element `missing` the subset
+# test and an intersection test agree -- so the whole family of relaxations to
+# `missing & vouched` was measured to leave all 86 tests here, and all 151 on
+# the wider survivor surface, GREEN while flipping two cells from fail-closed
+# HOLD to reapable. The discriminating shape is TWO recorded repositories gone
+# with the survivor vouching for only one of them: the unvouched one has no ref,
+# no bundle and no patch anywhere, and its unpushed work would be pointed at
+# nothing after the reap.
+
+
+def _partially_vouched_card(conn, tmp_path, *, partial):
+    """Two recorded repos gone; the recorded survivor covers only `gone_a`."""
+    tid = kb.create_task(conn, title="partially vouched multi-repo loss")
+    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    bases = {"gone_a": STALE, "gone_b": STALE}
+    if partial:
+        bases["kept"] = _seed_published_repo(ws / "kept", tmp_path / "multi-kept.git")
+    kb.set_workspace_path(conn, tid, ws)
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases, "
+            "survivor = excluded.survivor",
+            (tid, json.dumps(bases),
+             json.dumps({"kind": "ref", "refs": [
+                 {"repository": "gone_a", "sha": HEAD, "pr": PR, "external": True}]})),
+        )
+    return tid, ws
+
+
+@pytest.mark.parametrize("partial", [False, True], ids=["total", "partial"])
+def test_cleanup_requires_every_missing_repository_to_be_vouched_for(
+        board, remote, tmp_path, monkeypatch, partial):
+    """A survivor covering SOME lost repositories must not buy a delete for ALL.
+
+    `gone_b` has no survivor of any kind. Relaxing the coverage decision to an
+    intersection (`missing & vouched`) takes the relaxation anyway, returns a
+    survivor naming only the repositories it could account for, and clears the
+    hold -- so the reaper deletes a workspace whose `gone_b` work is
+    unrecoverable. Both loss arms are pinned because the surviving repo in the
+    partial arm resolves its own ref and would otherwise mask the difference.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid, ws = _partially_vouched_card(board, tmp_path, partial=partial)
+
+    # Exactly what `remove_workspace_dir` passes: cleanup, no operator flag.
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert "recorded repository missing" in str(excinfo.value), str(excinfo.value)
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is not None, (
+            "`gone_b` is vouched for by nothing -- the workspace must stay HELD")
+    assert ws.is_dir(), "the held workspace must not be reapable"
+
+
+def test_cleanup_reclaims_when_every_missing_repository_is_vouched_for(
+        board, remote, tmp_path, monkeypatch):
+    """Teeth for the test above: the gate keys on TOTAL coverage, not on the
+    number of repositories that went missing. With BOTH lost repos vouched for
+    by the recorded survivor the reclaim still succeeds and both refs survive.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="fully vouched multi-repo loss")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases, "
+            "survivor = excluded.survivor",
+            (tid, json.dumps({"gone_a": STALE, "gone_b": STALE}),
+             json.dumps({"kind": "ref", "refs": [
+                 {"repository": "gone_a", "sha": HEAD, "pr": PR, "external": True},
+                 {"repository": "gone_b", "sha": HEAD, "pr": PR, "external": True}]})),
+        )
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert {ref["repository"] for ref in out["refs"]} == {"gone_a", "gone_b"}, out
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is None
