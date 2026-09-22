@@ -19825,6 +19825,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(self, "_launchd_exit_timeout_s", None),
                 signal_driven=getattr(self, "_stop_requested_by_signal", False),
                 elapsed_s=_phase_elapsed(),
+                # Same measured sample effective_stop_drain_timeout() fed the
+                # cap. Both derive the SAME deadline, so they must see the
+                # same teardown reserve or the drain is fitted against a
+                # window the watchdog does not actually grant.
+                last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
             )
 
             _cron_at_start = self._active_cron_job_count()

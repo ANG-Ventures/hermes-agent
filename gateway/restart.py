@@ -383,32 +383,56 @@ def resolve_elapsed_adjusted_drain(
     *,
     signal_driven: bool,
     elapsed_s: float,
+    cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
+    last_teardown_s: float | None = None,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
 ) -> float:
-    """Shrink a launchd-timed drain by the pre-drain phases already spent.
+    """Fit a launchd-timed drain inside the deadline the pre-drain phases left.
 
-    The hard-exit watchdog is armed at the TOP of the stop with an
-    ABSOLUTE deadline (``exit_timeout - hard_exit_reserve_s``), but the
-    drain is a RELATIVE budget that only starts after the pre-drain
-    phases: secondary-profile reconnect cancellation (up to the adapter
-    disconnect timeout), the per-session shutdown notifications (a
-    sequential ``await adapter.send`` each, no per-send timeout), the
-    boot-resume cancellation and the pre-drain ``resume_pending`` marking
-    (SQLite writes plus notify sends). The stop path logs those phase
-    elapsed times precisely because they are not free.
+    THE ONE DEADLINE FORMULA for this seam. Every budget on the launchd
+    stop path derives from it; do not re-derive a variant at a call site.
 
-    So with ``elapsed_s`` spent before the drain starts, a drain sized
-    against the absolute deadline actually ends at ``elapsed + drain``
-    and the post-drain teardown gets ``reserve - elapsed``, not
-    ``reserve``. At the production clamp a 15s pre-drain phase consumes
-    the entire 15s default reserve and puts ``os._exit`` inside the
-    SQLite checkpoint — the corruption class the reserve exists to
-    prevent.
+    ``stop()`` runs against an ABSOLUTE wall measured from its own start:
+    launchd SIGKILLs at ``exit_timeout``, the watchdog hard-exits
+    ``hard_exit_reserve_s`` earlier, and the teardown needs
+    ``max(cleanup_reserve_s, last_teardown_s)`` before that. So the drain
+    must simply FINISH by::
 
-    Subtracting the elapsed time keeps the reserve honest in wall-clock
-    terms. Only applies to launchd-timed signal stops: every other path
-    has no absolute supervisor deadline to preserve headroom against, so
-    its configured drain stands untouched. The cron branch already does
-    the equivalent via ``resolve_cron_drain_budget(elapsed=...)``.
+        deadline = exit_timeout - hard_exit_reserve_s - teardown_reserve
+
+    The drain does not start at zero — it starts at ``elapsed_s``, after
+    the pre-drain phases: secondary-profile reconnect cancellation (up to
+    the adapter disconnect timeout), the per-session shutdown
+    notifications (a sequential ``await adapter.send`` each, no per-send
+    timeout), the boot-resume cancellation and the pre-drain
+    ``resume_pending`` marking (SQLite writes plus notify sends). What
+    remains for it is therefore ``deadline - elapsed_s``, and the drain
+    is whichever of that and the configured budget is SMALLER::
+
+        drain = min(configured_drain, deadline - elapsed_s)
+
+    Worked examples at the production clamp (60), ``hard_exit_reserve_s``
+    10, teardown reserve 15 -> ``deadline`` 35:
+
+    * configured 45, elapsed 12 -> ``min(45, 35 - 12)`` = **23**. The
+      deadline binds; the elapsed genuinely costs the drain.
+    * configured 20, elapsed 12 -> ``min(20, 35 - 12)`` = **20**, NOT
+      ``20 - 12`` = 8. The operator's 20s still fits (12 + 20 = 32 <= 35),
+      so it stands in full.
+
+    That second row is the bug this replaced. Subtracting the elapsed
+    from the drain unconditionally treats the launchd budget as a mere
+    boolean gate and charges the elapsed twice whenever the configured
+    drain already fits in the remaining window — dropping in-flight
+    sessions early while the supervisor window sits idle (measured over
+    43,920 geometries: 41.5% over-subtracted, worst case 60s of drain
+    discarded at clamp 300). Taking the ``min`` keeps the teardown
+    reserve exactly as honest while never spending headroom that exists.
+
+    Only applies to launchd-timed signal stops: every other path has no
+    absolute supervisor deadline to preserve headroom against, so its
+    configured drain stands untouched. The cron branch does the
+    equivalent via ``resolve_cron_drain_budget(elapsed=...)``.
     """
 
     def _seconds(value: object) -> float:
@@ -426,7 +450,28 @@ def resolve_elapsed_adjusted_drain(
         return drain
     if budget <= 0.0:
         return drain
-    return max(drain - _seconds(elapsed_s), 0.0)
+    # Fail open on an unreadable elapsed: the whole point of the deadline is
+    # to spend a KNOWN pre-drain cost. With no usable reading there is
+    # nothing to charge, and silently fitting the drain to the bare deadline
+    # would shorten it on a measurement fault rather than a real cost.
+    try:
+        elapsed = max(float(elapsed_s), 0.0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return drain
+    hard_exit = resolve_launchd_shutdown_watchdog_delay(
+        budget, budget, signal_driven=True, hard_exit_reserve_s=hard_exit_reserve_s
+    )
+    # Same actionable-ceiling filter `resolve_launchd_capped_drain` applies,
+    # so an oversized recorded sample cannot zero the deadline here either.
+    ceiling = resolve_max_actionable_teardown_reserve_s(
+        budget, hard_exit_reserve_s=hard_exit_reserve_s
+    )
+    measured = _seconds(last_teardown_s)
+    if ceiling is not None and measured >= ceiling:
+        measured = 0.0
+    reserve = max(_seconds(cleanup_reserve_s), measured)
+    deadline = max(hard_exit - reserve, 0.0)
+    return max(min(drain, deadline - elapsed), 0.0)
 
 
 def effective_stop_drain_timeout(runner: object) -> float:

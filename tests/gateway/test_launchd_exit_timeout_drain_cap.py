@@ -420,12 +420,146 @@ def test_pre_drain_elapsed_comes_out_of_the_drain_not_the_reserve(
 
     drain = resolve_launchd_capped_drain(50.0, 60.0, last_teardown_s=22.0)
     assert drain == 28.0
+    # The recorded sample has to reach BOTH derivations. The cap sized this
+    # drain against a 22s teardown reserve, so the resolver must fit it
+    # against that same deadline (hard exit 50 - 22 = 28) -- the production
+    # call site passes the runner's `_last_shutdown_teardown_s` to each.
     assert (
         resolve_elapsed_adjusted_drain(
-            drain, 60.0, signal_driven=True, elapsed_s=elapsed
+            drain,
+            60.0,
+            signal_driven=True,
+            elapsed_s=elapsed,
+            last_teardown_s=22.0,
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("configured", "elapsed", "expected"),
+    [
+        # FleetReview's two worked examples at the production clamp
+        # (budget 60, hard-exit reserve 10, teardown reserve 15 ->
+        # the drain must merely END by +35s).
+        #
+        # configured 45 sits ABOVE the deadline, so the deadline binds and
+        # the elapsed genuinely comes off: min(45, 35-12) = 23.
+        (45.0, 12.0, 23.0),
+        # configured 20 sits BELOW the deadline. The operator asked for a
+        # 20s drain and 20s still fits (12 + 20 = 32 <= 35), so the full
+        # configured drain stands: min(20, 35-12) = 20, NOT 20 - 12 = 8.
+        (20.0, 12.0, 20.0),
+        # The live geometry of the 09-21 incident host: ExitTimeOut 60,
+        # restart_drain_timeout 30. 30s still fits under the +35s deadline
+        # for any elapsed <= 5s, so a 2s pre-drain phase must not cost the
+        # in-flight turns 2s of drain while 18s of window sits idle.
+        (30.0, 2.0, 30.0),
+        (30.0, 5.0, 30.0),
+        # Past that point the deadline binds and the drain shrinks to fit.
+        (30.0, 12.0, 23.0),
+        (30.0, 30.0, 5.0),
+        # Saturation: nothing left to drain with, but never negative.
+        (30.0, 35.0, 0.0),
+        (30.0, 99.0, 0.0),
+    ],
+)
+def test_drain_is_bounded_by_the_deadline_not_reduced_by_a_full_subtraction(
+    configured, elapsed, expected
+):
+    """The drain is ``min(configured, deadline - elapsed)``, not ``drain - elapsed``.
+
+    The pre-drain phases consume the *absolute* window between the top of
+    ``stop()`` and the hard exit, so what the elapsed time can take away is
+    the deadline, never the operator's configured drain directly. Treating
+    the launchd budget as a boolean gate and always returning
+    ``drain - elapsed`` charges the elapsed twice whenever the configured
+    drain already fits inside the remaining window: it drops in-flight
+    sessions early while the supervisor window still has unused headroom
+    (measured: 41.5% of 43,920 swept geometries over-subtract, worst case
+    60s of drain discarded at clamp 300).
+
+    The deadline here is ``exit_timeout - hard_exit_reserve - teardown``
+    = ``60 - 10 - 15`` = 35s measured from the start of the stop.
+    """
+    from gateway.restart import resolve_elapsed_adjusted_drain
+
+    drain = resolve_launchd_capped_drain(configured, 60.0)
+    assert resolve_elapsed_adjusted_drain(
+        drain, 60.0, signal_driven=True, elapsed_s=elapsed
+    ) == pytest.approx(expected)
+
+
+def test_stop_hands_the_measured_teardown_to_the_drain_resolver():
+    """The recorded sample must reach BOTH derivations of the one deadline.
+
+    ``effective_stop_drain_timeout`` already shrinks the cap with the
+    runner's ``_last_shutdown_teardown_s``. If the resolver does not also
+    receive it, the resolver fits the drain against the DEFAULT 15s-reserve
+    deadline while the watchdog is actually armed for the larger measured
+    reserve — the drain then runs past the window the process really has,
+    which is the SIGKILL-mid-persistence failure this card exists to close.
+
+    Guards the production wiring at ``gateway/run.py``: removing the
+    ``last_teardown_s=`` argument there has to go red.
+    """
+    from gateway.restart import resolve_elapsed_adjusted_drain
+
+    # clamp 60 -> hard exit 50. A recorded 22s teardown moves the deadline
+    # from 50-15=35 down to 50-22=28.
+    drain = resolve_launchd_capped_drain(20.0, 60.0, last_teardown_s=22.0)
+    assert drain == 20.0
+
+    unwired = resolve_elapsed_adjusted_drain(
+        drain, 60.0, signal_driven=True, elapsed_s=15.0
+    )
+    wired = resolve_elapsed_adjusted_drain(
+        drain, 60.0, signal_driven=True, elapsed_s=15.0, last_teardown_s=22.0
+    )
+    # Unwired fits against the wrong (wider) deadline and overruns.
+    assert unwired == pytest.approx(20.0)
+    assert wired == pytest.approx(13.0)
+    assert 15.0 + wired == pytest.approx(28.0), (
+        "the drain must end exactly at the measured-teardown deadline"
+    )
+
+
+def test_elapsed_adjusted_drain_never_runs_past_the_hard_exit_deadline():
+    """The bound that must hold everywhere: drain must END before os._exit.
+
+    Sweeps the supervisor geometries launchd actually hands out. For every
+    row the drain has to finish with the full teardown reserve still intact
+    -- that is the invariant the whole card exists to protect, and it is
+    what stops the "just give the drain more time" correction from
+    re-opening the SIGKILL-mid-persistence failure.
+    """
+    from gateway.restart import (
+        LAUNCHD_STOP_CLEANUP_RESERVE_S,
+        resolve_elapsed_adjusted_drain,
+        resolve_launchd_shutdown_watchdog_delay,
+    )
+
+    violations = []
+    for clamp in (30.0, 45.0, 60.0, 90.0, 120.0, 300.0):
+        hard_exit = resolve_launchd_shutdown_watchdog_delay(
+            clamp, clamp, signal_driven=True
+        )
+        deadline = hard_exit - LAUNCHD_STOP_CLEANUP_RESERVE_S
+        for configured in (5.0, 20.0, 30.0, 45.0, 60.0, 120.0):
+            for elapsed in (0.0, 2.0, 5.0, 12.0, 20.0, 35.0, 60.0):
+                drain = resolve_elapsed_adjusted_drain(
+                    resolve_launchd_capped_drain(configured, clamp),
+                    clamp,
+                    signal_driven=True,
+                    elapsed_s=elapsed,
+                )
+                if drain > 0.0 and elapsed + drain > deadline + 1e-9:
+                    violations.append(
+                        f"clamp={clamp} configured={configured} "
+                        f"elapsed={elapsed} drain={drain} ends at "
+                        f"{elapsed + drain} > deadline {deadline}"
+                    )
+    assert not violations, "drain runs past the hard exit:\n" + "\n".join(violations)
 
 
 def test_elapsed_adjustment_only_applies_to_launchd_timed_signal_stops():
@@ -869,13 +1003,21 @@ def test_stop_spends_pre_drain_elapsed_out_of_the_drain(monkeypatch, tmp_path):
     calls: list[dict] = []
     SENTINEL = 16.0
 
-    def _spy(drain_timeout, launchd_exit_timeout_s, *, signal_driven, elapsed_s):
+    def _spy(
+        drain_timeout,
+        launchd_exit_timeout_s,
+        *,
+        signal_driven,
+        elapsed_s,
+        last_teardown_s=None,
+    ):
         calls.append(
             {
                 "drain": drain_timeout,
                 "clamp": launchd_exit_timeout_s,
                 "signal_driven": signal_driven,
                 "elapsed": elapsed_s,
+                "last_teardown_s": last_teardown_s,
             }
         )
         return SENTINEL
@@ -917,6 +1059,19 @@ def test_stop_spends_pre_drain_elapsed_out_of_the_drain(monkeypatch, tmp_path):
         f"reading is being taken before the loop, so its wall time is "
         f"charged to neither the drain nor the teardown reserve and the "
         f"window before os._exit silently shrinks below the reserve"
+    )
+
+    # The measured teardown must reach the resolver too. The cap already
+    # sized this drain against the runner's 22s sample; if the resolver is
+    # not given the same sample it fits the drain against the default
+    # 15s-reserve deadline (35s) instead of the real one (28s) and the drain
+    # overruns the window the watchdog actually granted.
+    assert call["last_teardown_s"] == 22.0, (
+        f"last_teardown_s={call['last_teardown_s']!r} — the resolver is "
+        f"deriving the deadline from the DEFAULT cleanup reserve while the "
+        f"cap and the watchdog use the measured 22.0s sample; the two "
+        f"derivations of the one deadline disagree and the drain runs past "
+        f"the window before os._exit"
     )
 
     # ...and the drain it actually ran is the adjusted value, not the raw
