@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlsplit
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_external_survivor as _ext
+from hermes_cli.cli_hint import hint_arg
 
 _log = logging.getLogger(__name__)
 
@@ -283,7 +284,14 @@ def _qualified_hint(keys):
         return (f"no qualified form exists for repository {unrepresentable[0]!r} (its name "
                 "contains ':', '?', '#' or '='); rename or re-clone it under a plain path "
                 "to recover")
-    return f"--survivor-pr {sorted(keys)[0]}=owner/repo#N"
+    # Expressible by the grammar is necessary but NOT sufficient: the remedy is
+    # consumed by a shell and then by argparse before `_split_qualifier` ever
+    # sees it. A key starting with `-` reads as an option (`expected one
+    # argument`) and a key holding a space splits into two words, so the bare
+    # `--flag value` form printed an unreachable remedy for exactly those names
+    # -- the same unreachable-remedy bug one layer out. `hint_arg` owns the
+    # spelling that survives both.
+    return hint_arg("--survivor-pr", f"{sorted(keys)[0]}=owner/repo#N")
 
 
 def _verified_explicit(survivor_ref, survivor_pr):
