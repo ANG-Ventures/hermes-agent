@@ -387,6 +387,29 @@ def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cl
     return {"kind": "ref", "refs": [dict(ref, repository=".")]} if ref else None
 
 
+_PATCH_KEYS = ("path", "sha256", "bytes", "sidecar")
+
+
+def _patch_pointers(survivor):
+    """Every stored patch a survivor row points at, top-level slot first.
+
+    A row carries ONE patch in its top-level `path`/`sha256`/`bytes`/`sidecar`
+    slot, because a capture concatenates every repository's diff into a single
+    `implementation.patch`. Two captures cannot share that slot, so a row that
+    must retain a patch from an earlier capture as well keeps the extras in
+    `patches`. Reading through one accessor keeps every consumer -- the
+    non-shrink guard and the sidecar manifest scan -- seeing all of them.
+    """
+    pointers = []
+    for entry in ((survivor or {}), *((survivor or {}).get("patches") or ())):
+        if not isinstance(entry, dict):
+            continue
+        pointer = {key: entry.get(key) for key in _PATCH_KEYS}
+        if pointer["path"] or pointer["sidecar"]:
+            pointers.append(pointer)
+    return pointers
+
+
 def _sidecar_repositories(survivor):
     """Repository keys a stored PATCH accounts for, read from its own manifest.
 
@@ -413,6 +436,20 @@ def _sidecar_repositories(survivor):
             if isinstance(entry, dict) and isinstance(entry.get("repository"), str)}
 
 
+def _all_sidecar_repositories(survivor):
+    """`_sidecar_repositories` over EVERY patch pointer the row carries.
+
+    A patch displaced into `patches` still vouches for the repositories its
+    own manifest names -- that is the whole reason it was kept -- so the
+    non-shrink comparison and the `missing <= absent` coverage test must read
+    it too, or retaining the pointer would buy nothing.
+    """
+    keys = set()
+    for pointer in _patch_pointers(survivor):
+        keys |= _sidecar_repositories(pointer)
+    return keys
+
+
 def _vouched_repositories(survivor):
     """Repository keys a RECORDED survivor actually accounts for.
 
@@ -425,14 +462,27 @@ def _vouched_repositories(survivor):
         for entry in ((survivor or {}).get(shape) or ()):
             if isinstance(entry, dict) and isinstance(entry.get("repository"), str):
                 keys.add(entry["repository"])
-    return keys | _sidecar_repositories(survivor)
+    return keys | _all_sidecar_repositories(survivor)
+
+
+def _patch_carry(previous, survivor):
+    """Recorded patch pointers the fresh row does not already hold.
+
+    Identity is the stored path (or the sidecar's, for a bundle row that has
+    only that), so re-recording an unchanged row carries nothing and a row
+    cannot accumulate duplicate pointers to one artifact across repeated
+    reclamation passes.
+    """
+    held = {p[key] for p in _patch_pointers(survivor) for key in ("path", "sidecar") if p[key]}
+    return [p for p in _patch_pointers(previous)
+            if not any(p[key] in held for key in ("path", "sidecar") if p[key])]
 
 
 def _unshrunk(previous, survivor):
-    """Reclamation may KEEP or EXTEND the recovery index, never shrink it.
+    """No write of the survivor row may shrink the recovery index.
 
-    `_record()` does `SET survivor = excluded.survivor`, so the cleanup pass
-    writes exactly what it re-captured. The repository-keyed carry-forward in
+    `_record()` does `SET survivor = excluded.survivor`, so every write stores
+    exactly what its caller captured. The repository-keyed carry-forward in
     `preserve()` only fires for repositories ABSENT from disk, so it cannot
     save either of the two shapes a re-capture can silently drop for a repo
     that is STILL there:
@@ -445,21 +495,63 @@ def _unshrunk(previous, survivor):
     Either way the row would be relabelled `kind: "ref"` -- "everything is
     pushed" -- while the only copy of that unpushed work is an orphaned
     attachment. Carry both across instead.
+
+    A fresh capture that produced its OWN patch occupies the single top-level
+    `path`/`sha256`/`bytes`/`sidecar` slot -- any surviving repository being
+    dirty is enough -- so a recorded pointer cannot simply be merged into it:
+    testing `not survivor.get(key)` dropped exactly the case where the recorded
+    patch is the only copy of a VANISHED repository's work. Keep BOTH, with
+    the already-recorded pointer holding the slot: its path and sha256 were
+    published in the completion's own `result` line and are what `kanban_db`
+    reports, so relocating it would break a pointer already handed out, while
+    the fresh one has not been published yet. The displaced pointers live in
+    `patches`, which `_patch_pointers()` reads back, so a colliding slot costs
+    an entry in a list rather than the artifact.
     """
     if not survivor or not previous:
         return survivor
-    carried = {key: previous[key] for key in ("path", "sha256", "bytes", "sidecar")
-               if previous.get(key) and not survivor.get(key)}
+    carry = _patch_carry(previous, survivor)
+    # The recorded pointers keep the slot in recorded order, then the fresh
+    # ones; `carry` is empty whenever the fresh row already holds everything
+    # the previous row did, and this is then a no-op.
+    union = carry + _patch_pointers(survivor) if carry else []
+    carried = {k: v for k, v in union[0].items() if v} if union else {}
+    displaced = union[1:]
     kept = {b.get("repository") for b in (survivor.get("bundles") or ())
             if isinstance(b, dict)}
     bundles = [b for b in (previous.get("bundles") or ())
                if isinstance(b, dict) and b.get("repository") not in kept]
-    if not carried and not bundles:
+    # A repository the fresh row does not name at all is one this write would
+    # drop. The fresh entry always wins for a repository BOTH name -- it was
+    # derived from the checkout as it is now, and `_merge_refs()` resolves the
+    # same way -- so this can only extend.
+    refs = [r for r in (previous.get("refs") or ())
+            if isinstance(r, dict) and r.get("repository") not in _vouched_repositories(survivor)]
+    if not carried and not bundles and not refs:
         return survivor
-    survivor = dict(survivor, **carried, notice="NOT PUSHED")
+    if carried:
+        # Replace the slot wholesale: a partial overwrite would leave the
+        # fresh capture's `sha256` beside the recorded `path`, i.e. a pointer
+        # that fails its own integrity check.
+        survivor = {k: v for k, v in survivor.items() if k not in _PATCH_KEYS}
+        survivor.update(carried)
+    else:
+        survivor = dict(survivor)
+    if carried or bundles:
+        survivor["notice"] = "NOT PUSHED"
+    if displaced:
+        survivor["patches"] = [{k: v for k, v in pointer.items() if v}
+                               for pointer in displaced]
+    elif carried:
+        survivor.pop("patches", None)
     if bundles:
         survivor["bundles"] = list(survivor.get("bundles") or ()) + bundles
-    survivor["kind"] = "bundle" if survivor.get("bundles") else "patch"
+    if refs:
+        survivor["refs"] = list(survivor.get("refs") or ()) + refs
+    if survivor.get("bundles"):
+        survivor["kind"] = "bundle"
+    elif _patch_pointers(survivor):
+        survivor["kind"] = "patch"
     return survivor
 
 
@@ -478,6 +570,19 @@ def _merge_refs(fresh, recorded):
 
 
 def _record(conn, task_id, survivor, previous):
+    """The ONLY writer of the survivor column -- and therefore the only place
+    the non-shrink invariant can be enforced for every exit at once.
+
+    `_unshrunk()` used to be applied at the call sites, and only on the
+    `cleanup` pass. Three of `preserve()`'s exits write this row and two of
+    them were unguarded: re-completing a card (`cleanup=False`) whose recorded
+    patch covered a now-published repository, and the workspace-MISSING exit,
+    which records the operator's `explicit` ref and dropped the recorded
+    patch, bundles and other repositories' refs outright. The invariant is not
+    "reclamation may not shrink the index" but "nothing may", so it belongs on
+    the write, not on one caller's pass.
+    """
+    survivor = _unshrunk(previous, survivor)
     with kb.write_txn(conn):
         conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
@@ -707,8 +812,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # not in this function's `except` tuple, so it would escape
                 # past `_hold()` and skip the fail-closed contract entirely.
                 merged = dict(external, refs=_merge_refs(refs, external.get("refs") or []))
-                return _record(conn, task_id, _unshrunk(previous, merged) if cleanup else merged,
-                               previous)
+                return _record(conn, task_id, merged, previous)
             if loose:
                 raise SurvivorUnavailable(
                     "survivor_unavailable: workspace holds files outside any repository that "
@@ -732,8 +836,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # became JSON `null` while `held_reason` was cleared. The invariant
             # is not "reclamation may not shrink the index" but "nothing may".
             survivor = previous
-        return _record(conn, task_id, _unshrunk(previous, survivor) if cleanup else survivor,
-                       previous)
+        return _record(conn, task_id, survivor, previous)
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: capture failed"
         _hold(conn, task_id, reason)

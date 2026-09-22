@@ -11,6 +11,7 @@ These tests pin the remedy AND the guard: an operator-named, remote-VERIFIED
 survivor satisfies the card; anything less still fails closed.
 """
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -1367,3 +1368,205 @@ def test_the_unrepresentable_remedy_reaches_the_refusal_message(board, remote, t
         survivor.preserve(board, tid, workspace=ws, survivor_pr=PR)
 
     assert "no qualified form exists" in str(excinfo.value), str(excinfo.value)
+
+
+# --- NOTHING may shrink the recovery index, on ANY write -------------------
+#
+# Argus round 6 / FleetReview 4xP1 (#842 @ 1e114149f9): `_unshrunk()` was
+# applied at two of the three `_record()` call sites and only when `cleanup`,
+# and it carried a recorded patch pointer only when the fresh capture had
+# produced none. Both halves are the same defect -- the guard was keyed on the
+# CALLER's pass instead of on the write -- so it now lives inside `_record()`,
+# the single writer of the survivor column, and the colliding top-level patch
+# slot costs an entry in `patches` rather than the artifact.
+
+
+def _sidecar_patch_survivor(tmp_path, refs, *, sidecar_repos, name="recorded"):
+    """A recorded patch whose sidecar manifest really exists on disk, so
+    `_sidecar_repositories()` can read it (the helper above writes no file)."""
+    import hashlib
+    attach = tmp_path / f"{name}-attachments"
+    attach.mkdir(parents=True, exist_ok=True)
+    patch = attach / "implementation.patch"
+    patch.write_bytes(b"the ONLY copy of gone's unpushed work\n")
+    sidecar = attach / "implementation.json"
+    sidecar.write_text(json.dumps(
+        {"repositories": [{"repository": k, "base_sha": STALE} for k in sidecar_repos]}))
+    return {"kind": "patch", "notice": "NOT PUSHED", "path": str(patch),
+            "sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
+            "bytes": patch.stat().st_size, "sidecar": str(sidecar),
+            "refs": list(refs), "bundles": []}
+
+
+def test_a_recorded_patch_survives_a_recapture_that_emits_its_own_patch(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION (P1-A :451, Argus round 6). `gone` vanished and is vouched
+    for ONLY by the recorded patch's sidecar; `kept` survives but is DIRTY, so
+    the re-capture emits a patch of its own and takes the single top-level
+    slot. The recorded pointer -- the only copy of `gone`'s work -- was
+    dropped, shrinking the index on a card that completed.
+
+    The shipped carry tests both seed the surviving repo CLEAN, so the
+    re-capture yields only a ref and this arm was never exercised.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="recorded patch vs recaptured patch")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "collide-kept.git")
+    (ws / "kept" / "a.py").write_text("value = 2  # uncommitted at cleanup\n")
+
+    recorded = _sidecar_patch_survivor(tmp_path, [], sidecar_repos=["gone"])
+    _seed_survivor(board, tid, ws, {"kept": kept_head, "gone": STALE}, recorded)
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    saved = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["survivor"])
+    assert "gone" in survivor._vouched_repositories(saved), (
+        f"`gone` dropped from the recovery index; saved={saved}")
+    assert saved["sidecar"] == recorded["sidecar"], (
+        "the recorded sidecar -- the ONLY thing keying the patch to `gone` -- "
+        f"was overwritten by the re-capture's own: {saved.get('sidecar')}")
+    assert saved["path"] == recorded["path"] and saved["sha256"] == recorded["sha256"], (
+        f"the recorded pointer must keep the published slot intact: {saved}")
+    assert out == saved, "the returned survivor must be what was stored"
+    # ...and the fresh capture is KEPT too, displaced rather than discarded:
+    # the invariant is never-shrink, in both directions.
+    assert len(survivor._patch_pointers(saved)) == 2, saved
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is None
+
+
+def test_a_recompletion_may_not_shrink_the_index_either(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION (P1-B :710, the `cleanup=False` sibling). `_unshrunk()` was
+    applied only `if cleanup`, so re-completing a card -- a review approval on
+    an already-completed one -- ran the SAME capture with the guard off. The
+    recorded patch covering `gone` was dropped and the row relabelled `ref`,
+    i.e. "everything is pushed".
+
+    This reproduces on BASE too: it is the pre-existing half of the class, in
+    scope because the invariant is "no write may shrink", not "no reclaim may".
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="re-completion drops the recorded patch")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "recomplete-kept.git")
+    recorded = _sidecar_patch_survivor(tmp_path, [], sidecar_repos=["gone"],
+                                       name="recomplete")
+    _seed_survivor(board, tid, ws, {"kept": kept_head, "gone": STALE}, recorded)
+
+    # No `cleanup`: this is the completion path, with an operator survivor for
+    # the repository `bases` says vanished.
+    out = survivor.preserve(board, tid, workspace=ws,
+                            survivor_pr=f"gone={PR}",
+                            metadata={"changed_files": ["a.py"]})
+
+    saved = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["survivor"])
+    assert saved["path"] == recorded["path"], (
+        f"a re-completion dropped the recorded patch pointer: {saved}")
+    assert saved["sidecar"] == recorded["sidecar"], saved
+    assert saved["kind"] != "ref", (
+        f"a row still holding unpushed work must not be relabelled `ref`: {saved}")
+    assert out == saved
+
+
+def test_the_workspace_missing_exit_may_not_shrink_the_index(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION (P1-C :525, the third `_record()` site -- it had NO guard at
+    all). The workspace directory is gone and the operator names a verified
+    PR; that exit recorded `explicit` alone, so the recorded patch, the
+    recorded bundle and every other repository's ref were all overwritten out
+    of existence -- on a card whose work no longer has a checkout anywhere.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="workspace missing, operator PR")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    recorded = dict(_sidecar_patch_survivor(
+        tmp_path,
+        [{"repository": "other", "sha": HEAD, "pr": "example/other#9", "external": True}],
+        sidecar_repos=["gone"], name="wsmissing"),
+        kind="bundle",
+        bundles=[{"repository": "gone", "path": str(tmp_path / "gone.bundle"),
+                  "sha256": "b" * 64, "bytes": 256}])
+    _seed_survivor(board, tid, ws, {"gone": STALE}, recorded)
+    shutil.rmtree(ws, ignore_errors=True)
+    assert not ws.exists(), "this exit requires the workspace directory to be absent"
+
+    out = survivor.preserve(board, tid, workspace=ws, survivor_pr=PR)
+
+    saved = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["survivor"])
+    assert saved["path"] == recorded["path"] and saved["sidecar"] == recorded["sidecar"], (
+        f"the workspace-missing exit dropped the recorded patch pointer: {saved}")
+    assert [b["repository"] for b in (saved.get("bundles") or ())] == ["gone"], (
+        f"the recorded bundle -- the only unpushed history for `gone` -- was dropped: {saved}")
+    by_repo = {r["repository"]: r for r in saved["refs"]}
+    assert "other" in by_repo, (
+        f"a repository the operator's claim does not name was dropped: {saved['refs']}")
+    assert by_repo["other"]["pr"] == "example/other#9", saved["refs"]
+    assert out == saved
+
+
+def test_the_non_shrink_guard_lives_on_the_write_not_the_caller(board, tmp_path):
+    """TEETH for the class sweep: every write of the survivor row goes through
+    `_record()`, and `_record()` itself applies the guard. A future exit added
+    to `preserve()` inherits it by construction rather than by remembering.
+
+    Asserted structurally (no `preserve()` exit may pre-apply it, and the sole
+    writer must) AND behaviourally, by calling `_record()` directly with a
+    shrinking row -- which is what a new call site would look like.
+    """
+    import inspect
+
+    from hermes_cli import kanban_survivor as survivor
+
+    source = inspect.getsource(survivor.preserve)
+    assert "_unshrunk" not in source, (
+        "`preserve()` must not apply the guard per-exit: that is the defect "
+        "(two of three sites were missed, and only on the `cleanup` pass)"
+    )
+    assert "_unshrunk(" in inspect.getsource(survivor._record), (
+        "the single writer must apply the guard"
+    )
+
+    tid = kb.create_task(board, title="direct _record shrink")
+    recorded = _sidecar_patch_survivor(tmp_path, [], sidecar_repos=["gone"],
+                                       name="direct")
+    stored = survivor._record(board, tid, {"kind": "ref", "refs": []}, recorded)
+
+    assert stored["path"] == recorded["path"], (
+        f"a bare `_record()` of a shrinking row must still be guarded: {stored}")
+    assert "gone" in survivor._vouched_repositories(stored), stored
+
+
+def test_a_recorded_row_re_recorded_unchanged_does_not_accumulate(board, tmp_path):
+    """TEETH: carrying is keyed on the stored PATH, so re-recording the same
+    row (reclamation runs more than once over a card's life) must not append a
+    duplicate pointer to the same artifact each time.
+    """
+    from hermes_cli import kanban_survivor as survivor
+
+    tid = kb.create_task(board, title="idempotent re-record")
+    recorded = _sidecar_patch_survivor(tmp_path, [], sidecar_repos=["gone"],
+                                       name="idempotent")
+
+    stored = recorded
+    for _ in range(3):
+        stored = survivor._record(board, tid, stored, stored)
+
+    assert survivor._patch_pointers(stored) == survivor._patch_pointers(recorded), stored
+    assert "patches" not in stored, stored
