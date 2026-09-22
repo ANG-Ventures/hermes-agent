@@ -8770,10 +8770,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             holder,
                         )
                         same_process_contention_logged = True
-                except sqlite3.Error:
-                    # Diagnostics must not turn lock pressure into a turn
-                    # failure; the normal acquisition retry remains authoritative.
-                    pass
+                except Exception:
+                    # Diagnostics must never fail the wait: not on lock
+                    # pressure (sqlite3.Error) and not on a DB handle that
+                    # cannot serve reads (test doubles, half-initialised or
+                    # closed instances). The acquisition retry above remains
+                    # the only authoritative path. Log once and stop probing.
+                    logger.debug(
+                        "session turn lease contention diagnostic failed",
+                        exc_info=True,
+                    )
+                    same_process_contention_logged = True
             now = time.monotonic()
             remaining = deadline - now
             if remaining <= 0:
