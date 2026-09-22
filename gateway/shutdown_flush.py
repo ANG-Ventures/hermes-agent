@@ -190,8 +190,15 @@ def _fence_spool_lane_at_exit() -> None:
     The lane exists to keep an unbounded rename off the event loop, but the
     payloads it carries are messages the in-memory cap already evicted -- if
     the process exits with work still queued, that data is gone for good.
-    Registered at import time so EVERY shutdown path is covered, rather than
-    depending on any particular caller remembering to fence.
+
+    ``atexit`` alone is NOT sufficient: the gateway's own exit funnel
+    (``gateway.run._exit_after_graceful_shutdown``) ends in ``os._exit``,
+    which bypasses ``atexit`` entirely -- measured, the queued payload was
+    lost 5/5 at every hold >= 0.1s on that path.  That funnel therefore calls
+    :func:`fence_lanes_for_hard_exit` explicitly, beside its other hand-rolled
+    ``atexit`` replacements.  This registration still covers the paths that DO
+    finalize the interpreter (``sys.exit``, an unhandled exception, an
+    embedding host), and is idempotent with the explicit call.
     """
     if not fence_spool_lane(timeout=10.0):
         logger.warning(
@@ -333,10 +340,13 @@ def _fence_flush_lane_at_exit() -> None:
     """Drain queued pending-message flushes before the interpreter exits.
 
     A flush that is still in the lane when the process goes away takes the
-    only surviving copy of those messages with it (#72680).  Registered at
-    import time so EVERY exit path is covered, including the one where the
-    awaiting coroutine was cancelled at its deadline and nobody is left to
-    wait for the write.
+    only surviving copy of those messages with it (#72680).
+
+    ``atexit`` alone is NOT sufficient -- see
+    :func:`_fence_spool_lane_at_exit`.  The gateway hard-exits through
+    ``os._exit``, which never runs this; the explicit
+    :func:`fence_lanes_for_hard_exit` call in that funnel is what covers the
+    cancelled-at-deadline case where nobody is left to await the write.
     """
     if not fence_flush_lane(timeout=10.0):
         logger.warning(
@@ -348,10 +358,43 @@ def _fence_flush_lane_at_exit() -> None:
 atexit.register(_fence_flush_lane_at_exit)
 
 
+def fence_lanes_for_hard_exit(timeout: float = 10.0) -> bool:
+    """Drain BOTH durability lanes for an exit that bypasses ``atexit``.
+
+    ``gateway.run._exit_after_graceful_shutdown`` ends in ``os._exit`` to stay
+    wedge-proof (#53107), and therefore hand-rolls every cleanup that would
+    otherwise be an ``atexit`` handler.  This is that replacement for the two
+    write lanes in this module.  Without it the shielded write introduced for
+    the deadline-cancel path never lands: measured on the production funnel,
+    payload files on disk after process death were 0/5 at every hold, against
+    5/5 on a ``sys.exit`` control.
+
+    *timeout* is the budget for the call as a WHOLE, not per lane.  The two
+    fences run in sequence, so passing it to each would make the real worst
+    case ``2 * timeout`` -- measured 4.01s for a 2.0s request before this was
+    a shared deadline.  That matters here and nowhere else: this runs inside
+    the funnel whose entire reason to exist is that a wedged thread must not
+    be able to hold shutdown open (#53107).  A wedged first lane therefore
+    spends the budget and leaves the second one a non-negative remainder,
+    which fences instantly if that lane is already idle.
+
+    Returns ``True`` only when both lanes drained within *timeout*.  Safe and
+    idempotent: a drained lane fences instantly, and calling it from a lane
+    thread is a no-op rather than a deadlock.
+    """
+    deadline = time.monotonic() + timeout
+    # Both, unconditionally -- no short-circuit, or a wedged first lane would
+    # silently skip the second one's drain.
+    flushed = fence_flush_lane(timeout=timeout)
+    spooled = fence_spool_lane(timeout=max(0.0, deadline - time.monotonic()))
+    return flushed and spooled
+
+
 async def flush_pending_to_file_async(
     pending: Dict[str, Any],
     *,
     reason: str = "shutdown",
+    drain: bool = False,
 ) -> int:
     """Event-loop-safe :func:`flush_pending_to_file`.
 
@@ -370,13 +413,27 @@ async def flush_pending_to_file_async(
     take (#72680), and the caller is about to ``.clear()`` the dict they
     came from — so the caller must not resume until the write has landed.
 
+    Pass ``drain=True`` to make the take atomic.  Offloading introduced an
+    await point the synchronous form never had, and a message that arrives
+    during that await is not in the snapshot — so a caller that clears
+    *after* the await destroys it (``base.py:7994`` / ``run.py:10605`` /
+    ``yuanbao.py:1115`` all re-populate the slot during teardown).  With
+    ``drain=True`` the snapshot and the clear happen together, before any
+    await, so a late arrival lands in a now-empty slot and is still there
+    for a later flush.  The clear belongs HERE rather than at each call
+    site: it is the await that creates the window, and only this function
+    knows where the await is.
+
     Durability must survive cancellation.  ``cancel_background_tasks()`` is
     awaited through ``_bounded_adapter_teardown`` /
     ``_await_adapter_cleanup_with_timeout``, which ``task.cancel()``s it at
     the per-adapter deadline — an await point the synchronous form never
     had.  So the lane work is ``shield``-ed: the awaiter unwinds as
     ``CancelledError`` (the deadline still forces shutdown forward), while
-    the already-snapshotted payload still reaches disk, fenced at exit.
+    the already-snapshotted payload still reaches disk.  That write is
+    fenced by ``fence_lanes_for_hard_exit`` in
+    ``gateway.run._exit_after_graceful_shutdown`` — NOT by ``atexit``,
+    which the gateway's ``os._exit`` never runs.
 
     Returns the number of sessions flushed; 0 if the offload itself fails,
     matching the best-effort contract of the sync form.
@@ -387,6 +444,10 @@ async def flush_pending_to_file_async(
     # caller may mutate (adapter teardown clears it right after this await),
     # and the snapshot is what makes the shielded write safe to outlive us.
     snapshot = dict(pending)
+    if drain:
+        # Atomic with the snapshot above: no await between them, so nothing
+        # can arrive into the slot and be lost to a clear it predates.
+        pending.clear()
     global _FLUSH_SUBMITTED, _FLUSH_COMPLETED
     try:
         with _FLUSH_PROGRESS:

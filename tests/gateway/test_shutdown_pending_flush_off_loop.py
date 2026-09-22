@@ -31,6 +31,7 @@ dropped:
 import asyncio
 import json
 import os
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,8 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from gateway import shutdown_flush
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 
 
 @pytest.fixture()
@@ -330,8 +333,12 @@ def test_deadline_cancel_still_lands_a_queued_payload(flush_home):
     finally:
         release.set()
 
-    # Nobody is awaiting the lane any more; the exit fence is what
-    # guarantees the write lands, so use it here.
+    # Nobody is awaiting the lane any more.  Fence here so the assertion
+    # below is about the SHIELD (did the queued work survive cancellation)
+    # and not about the exit fence.  Whether the real exit path runs that
+    # fence is a separate property, gated across a real process boundary by
+    # test_the_production_exit_funnel_drains_the_lane below -- this
+    # in-process call deliberately does not stand in for it.
     assert shutdown_flush.fence_flush_lane(timeout=10.0)
 
     assert outcome == "CancelledError", (
@@ -439,3 +446,571 @@ def test_flush_runs_on_its_own_named_lane_not_the_caller_thread(flush_home):
     assert all(name.startswith("shutdown-flush") for name in seen), (
         f"the write ran off-loop but not on the dedicated lane: {seen}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. The exit fence -- across a REAL process boundary.
+# ---------------------------------------------------------------------------
+#
+# The shield above deliberately lets the awaiter unwind while the write is
+# still queued, so SOMETHING must wait for that write before the process dies
+# or the payload is lost outright.  ``shutdown_flush`` registers ``atexit``
+# fences, but the gateway does not exit through ``atexit``: every graceful
+# exit funnels into ``gateway.run._exit_after_graceful_shutdown``, which ends
+# in ``os._exit`` (#53107, so a wedged non-daemon thread cannot hang teardown)
+# and therefore hand-rolls each cleanup that would otherwise be an ``atexit``
+# handler -- PID file, runtime lock, lifecycle sentinel, log-queue drain.  The
+# lane drain is one of those.
+#
+# An in-process ``fence_flush_lane()`` call cannot gate this: it passes
+# identically whether or not the exit path runs the fence (pytest itself exits
+# via ``sys.exit``, i.e. the arm where ``atexit`` DOES fire).  So these tests
+# spawn a child, exit it through the production funnel, and count files on
+# disk after the process is dead.  Measured without the explicit drain:
+# 0/5 payloads survived at every hold >= 0.1s on the production arm, against
+# 5/5 on a ``sys.exit`` control.
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)
+)))
+
+_EXIT_CHILD = '''
+import os, sys, threading
+os.environ["HERMES_HOME"] = sys.argv[3]
+sys.path.insert(0, sys.argv[4])
+from gateway import shutdown_flush
+
+LANE = sys.argv[1]           # "flush" | "spool"
+HOLD = float(sys.argv[2])
+
+release = threading.Event()
+if LANE == "flush":
+    lane_get, submit = shutdown_flush._get_flush_lane, None
+else:
+    lane_get, submit = shutdown_flush._get_spool_lane, None
+
+# Occupy the single worker so the payload below sits QUEUED, never started.
+started = threading.Event()
+def _hold():
+    started.set()
+    release.wait(30.0)
+lane_get().submit(_hold)
+assert started.wait(5.0), "lane occupant never started"
+
+if LANE == "flush":
+    import asyncio
+    pending = {"sess-a": "the only surviving copy"}
+    async def scenario():
+        async def teardown():
+            await shutdown_flush.flush_pending_to_file_async(
+                pending, reason="adapter_shutdown", drain=True
+            )
+        task = asyncio.create_task(teardown())
+        await asyncio.sleep(0.1)
+        task.cancel()            # the per-adapter deadline
+        try:
+            await task
+        except asyncio.CancelledError:
+            return "CancelledError"
+        return "completed"
+    print("AWAITER_OUTCOME:", asyncio.run(scenario()), flush=True)
+else:
+    shutdown_flush._submit_spool_write(
+        {"session_key": "sess-a", "reason": "transcript_cap_drop",
+         "ts": 0, "data": {"text": "the only surviving copy"}}
+    )
+
+flush_dir = shutdown_flush._get_flush_dir()
+print("FILES_AT_EXIT_CALL:",
+      len(list(flush_dir.glob("pending-*.json"))), flush=True)
+
+# Release only AFTER the exit call is under way, so the queued write genuinely
+# outlives it -- the one window the fence exists for.
+threading.Timer(HOLD, release.set).start()
+
+from gateway.run import _exit_after_graceful_shutdown
+_exit_after_graceful_shutdown(0)
+'''
+
+
+@pytest.mark.parametrize("lane", ["flush", "spool"])
+def test_the_production_exit_funnel_drains_the_lane(tmp_path, lane):
+    """A queued write must survive the gateway's ``os._exit`` funnel.
+
+    Both lanes, because both are backed by an ``atexit`` fence the funnel
+    bypasses -- ``_fence_flush_lane_at_exit`` and ``_fence_spool_lane_at_exit``
+    have the identical defect, so they get the identical gate.
+    """
+    import subprocess
+
+    child = tmp_path / "exit_child.py"
+    child.write_text(_EXIT_CHILD)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _REPO_ROOT
+    proc = subprocess.run(
+        [sys.executable, str(child), lane, "0.5", str(home), _REPO_ROOT],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert "FILES_AT_EXIT_CALL: 0" in proc.stdout, (
+        "the write was not still queued when the exit funnel ran, so this "
+        f"test would be vacuous: {proc.stdout!r} {proc.stderr[-2000:]!r}"
+    )
+    survived = _payload_files(home)
+    assert len(survived) == 1, (
+        f"the {lane} lane's queued payload died with the process: the exit "
+        "funnel uses os._exit, which never runs the atexit fence -- it must "
+        "drain the lanes explicitly (fence_lanes_for_hard_exit). "
+        f"stdout={proc.stdout!r} stderr={proc.stderr[-2000:]!r}"
+    )
+
+
+def test_every_atexit_fence_in_shutdown_flush_has_a_hard_exit_counterpart():
+    """Class sweep: no durability fence may rest on ``atexit`` alone.
+
+    ``gateway/shutdown_flush.py`` is the only module in ``gateway/`` whose
+    ``atexit`` handlers guard UNRECOVERABLE data (a stranded PID file or
+    control socket is recovered on the next bind; a lost payload is not), so
+    every one of them must also be reachable from the hard-exit funnel.  This
+    fails if someone adds a third lane with an ``atexit`` fence and forgets
+    to wire it into ``fence_lanes_for_hard_exit``.
+    """
+    import inspect
+
+    source = inspect.getsource(shutdown_flush)
+    registered = {
+        line.split("atexit.register(")[1].split(")")[0].strip()
+        for line in source.splitlines()
+        if line.startswith("atexit.register(")
+    }
+    assert registered, "no atexit fences found; this sweep would be vacuous"
+
+    hard_exit = inspect.getsource(shutdown_flush.fence_lanes_for_hard_exit)
+    for handler in sorted(registered):
+        # "_fence_<name>_lane_at_exit" is backed by "fence_<name>_lane".
+        fence = handler.removeprefix("_").removesuffix("_at_exit")
+        assert f"{fence}(" in hard_exit, (
+            f"{handler} guards unrecoverable data but fence_lanes_for_hard_exit "
+            f"never calls {fence}(); the gateway exits via os._exit, so the "
+            "atexit registration alone does not run"
+        )
+
+
+def test_the_hard_exit_funnel_calls_the_lane_fence():
+    """The funnel itself must carry the call, not just the module.
+
+    Source-level, because the behavioural test above exercises one exit code
+    path; this pins that the wiring lives in the single funnel every graceful
+    exit passes through, beside the other hand-rolled atexit replacements.
+    """
+    import inspect
+
+    from gateway.run import _exit_after_graceful_shutdown
+
+    body = inspect.getsource(_exit_after_graceful_shutdown)
+    assert "fence_lanes_for_hard_exit" in body, (
+        "_exit_after_graceful_shutdown ends in os._exit and hand-rolls every "
+        "other atexit replacement (PID file, runtime lock, log drain); the "
+        "durability lane drain must be one of them"
+    )
+
+
+def test_the_hard_exit_fence_budget_is_shared_not_per_lane(flush_home):
+    """The funnel's budget is for the CALL, not for each lane in turn.
+
+    ``_exit_after_graceful_shutdown`` exists to be wedge-proof (#53107): it
+    hard-exits precisely so a stuck thread cannot hold shutdown open.  The two
+    fences run in sequence, so handing each the full timeout makes the real
+    worst case ``2 * timeout`` -- measured 4.01s for a 2.0s request before the
+    shared deadline.  Wedge BOTH lanes and assert the call still returns
+    inside one budget.
+    """
+    release = threading.Event()
+    started = threading.Event()
+    seen = []
+
+    def _wedge():
+        seen.append(1)
+        if len(seen) == 2:
+            started.set()
+        release.wait(60.0)
+
+    shutdown_flush._get_flush_lane().submit(_wedge)
+    shutdown_flush._get_spool_lane().submit(_wedge)
+    try:
+        assert started.wait(5.0), "lane occupants never started"
+
+        # Give each fence something outstanding to wait on.  Restored in the
+        # finally below: the lanes are process-wide singletons, so leaving a
+        # submitted-but-never-completed count behind wedges every later
+        # fence_*_lane() call in the session.
+        with shutdown_flush._FLUSH_PROGRESS:
+            shutdown_flush._FLUSH_SUBMITTED += 1
+        with shutdown_flush._SPOOL_PROGRESS:
+            shutdown_flush._SPOOL_SUBMITTED += 1
+
+        budget = 1.0
+        t0 = time.monotonic()
+        drained = shutdown_flush.fence_lanes_for_hard_exit(timeout=budget)
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+        with shutdown_flush._FLUSH_PROGRESS:
+            shutdown_flush._FLUSH_SUBMITTED -= 1
+            shutdown_flush._FLUSH_PROGRESS.notify_all()
+        with shutdown_flush._SPOOL_PROGRESS:
+            shutdown_flush._SPOOL_SUBMITTED -= 1
+            shutdown_flush._SPOOL_PROGRESS.notify_all()
+
+    assert drained is False, (
+        "both lanes were wedged, so this must report a failed drain; if it "
+        "returns True the fence is not actually waiting and the test is vacuous"
+    )
+    assert elapsed < budget * 1.8, (
+        f"fence_lanes_for_hard_exit took {elapsed:.2f}s for a {budget}s budget: "
+        "the per-lane timeouts are serial, so the exit funnel's real worst case "
+        "is 2x what it asks for.  Share one deadline across both fences."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. The await point must not eat a late arrival.
+# ---------------------------------------------------------------------------
+
+
+def test_a_message_arriving_during_the_flush_is_not_destroyed(flush_home):
+    """The offload's await is a window the synchronous form never had.
+
+    ``cancel_background_tasks()`` flushes then clears ``_pending_messages``.
+    A message arriving during the await is not in the snapshot, so clearing
+    AFTER the await destroys it -- not on disk and not in the slot.  Late
+    arrivals during teardown are a real shape: ``base.py:7994`` re-queues one
+    inside that very teardown loop, and ``run.py:10605`` / ``yuanbao.py:1115``
+    also assign into the slot.
+
+    Pre-fix (synchronous) the late arrival stayed in the slot, where a later
+    flush could still take it.  The fix keeps that property by making the
+    snapshot and the clear atomic inside ``flush_pending_to_file_async``
+    (``drain=True``), before any await.
+    """
+    release = threading.Event()
+    # Occupy the lane so the await genuinely blocks; without this the flush
+    # completes in microseconds, the late arrival lands after the clear in
+    # every arm, and the test is vacuous.
+    _occupy_lane(release)
+
+    pending = {"sess-a": "early message"}
+    late = "late message arriving during teardown"
+
+    async def scenario():
+        async def teardown():
+            # The exact shape of cancel_background_tasks()'s tail.
+            try:
+                await shutdown_flush.flush_pending_to_file_async(
+                    pending, reason="adapter_shutdown", drain=True
+                )
+            except Exception:
+                pass
+
+        async def late_arrival():
+            await asyncio.sleep(0.1)
+            pending["sess-late"] = late
+            release.set()
+
+        await asyncio.gather(teardown(), late_arrival())
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+    assert shutdown_flush.fence_flush_lane(timeout=10.0)
+
+    on_disk = any(
+        late in json.dumps(json.loads(p.read_text()))
+        for p in _payload_files(flush_home)
+    )
+    assert pending.get("sess-late") == late or on_disk, (
+        "a message that arrived during the flush was destroyed: it is "
+        "neither on disk nor in the pending slot.  Snapshot and clear must "
+        "be atomic with respect to the await (drain=True)."
+    )
+    # And the message that WAS in the snapshot still reached disk.
+    assert any(
+        "early message" in json.dumps(json.loads(p.read_text()))
+        for p in _payload_files(flush_home)
+    ), "the snapshotted payload never landed; the flush itself regressed"
+
+
+def test_drain_clears_the_slot_it_snapshotted(flush_home):
+    """``drain=True`` owns the clear, so the call sites must not re-clear.
+
+    Both production callers dropped their trailing ``.clear()`` when they
+    moved to ``drain=True``.  If the callee ever stopped clearing, those
+    sessions would be re-flushed on the next pass -- duplicate recovery
+    payloads for the same messages.
+    """
+    pending = {"sess-a": "x", "sess-b": "y"}
+    flushed = asyncio.run(
+        shutdown_flush.flush_pending_to_file_async(
+            pending, reason="adapter_shutdown", drain=True
+        )
+    )
+    assert flushed == 2
+    assert dict(pending) == {}, (
+        "drain=True must clear the slots it snapshotted; the call sites no "
+        "longer clear after the await"
+    )
+    assert len(_payload_files(flush_home)) == 2
+
+
+def test_drain_defaults_off_so_the_caller_keeps_the_dict(flush_home):
+    """Without ``drain``, the dict is untouched -- the pre-existing contract."""
+    pending = {"sess-a": "x"}
+    assert asyncio.run(
+        shutdown_flush.flush_pending_to_file_async(
+            pending, reason="adapter_shutdown"
+        )
+    ) == 1
+    assert dict(pending) == {"sess-a": "x"}
+
+
+# ---------------------------------------------------------------------------
+# 7. The PRODUCTION callers -- at the call site, not the callee.
+# ---------------------------------------------------------------------------
+#
+# ``test_a_message_arriving_during_the_flush_is_not_destroyed`` above drives
+# ``flush_pending_to_file_async(..., drain=True)`` directly, so it proves the
+# callee's snapshot-and-clear is atomic -- but it passes identically if a
+# caller reverts to the defective shape (no ``drain``, ``.clear()`` after the
+# await).  Measured: reverting ``cancel_background_tasks`` to that shape left
+# the whole file at 16/16 green.  These two tests close that gap by driving
+# the real production coroutines, and the AST sweep below makes it a class
+# rule rather than a two-site inventory.
+
+
+class _FlushStubAdapter(BasePlatformAdapter):
+    """Minimal concrete adapter; only the teardown tail is exercised."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+
+    async def connect(self, *, is_reconnect: bool = False):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        return SendResult(success=True, message_id="1")
+
+    async def send_typing(self, chat_id, metadata=None):
+        pass
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+def test_adapter_teardown_does_not_destroy_a_message_arriving_mid_flush(flush_home):
+    """``cancel_background_tasks`` is the real caller; drive it, not the callee.
+
+    ``base.py:7994`` re-queues into ``_pending_messages`` inside this very
+    teardown loop, so a late arrival during the offload's await is a real
+    production shape.  Pre-fix (synchronous flush) there was no await point,
+    so the arrival either made the snapshot or stayed in the slot for a later
+    flush.  If this caller clears after the await, the arrival is destroyed --
+    neither on disk nor in the slot.
+    """
+    release = threading.Event()
+    _occupy_lane(release)          # the await must genuinely block
+
+    adapter = _FlushStubAdapter()
+    adapter._pending_messages["sess-a"] = MessageEvent(text="early message")
+    late = "late message arriving during teardown"
+
+    async def scenario():
+        async def late_arrival():
+            await asyncio.sleep(0.1)
+            adapter._pending_messages["sess-late"] = MessageEvent(text=late)
+            release.set()
+
+        await asyncio.gather(adapter.cancel_background_tasks(), late_arrival())
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+    assert shutdown_flush.fence_flush_lane(timeout=10.0)
+
+    on_disk = any(
+        late in json.dumps(json.loads(p.read_text()))
+        for p in _payload_files(flush_home)
+    )
+    still_in_slot = adapter._pending_messages.get("sess-late")
+    assert (still_in_slot is not None and still_in_slot.text == late) or on_disk, (
+        "cancel_background_tasks destroyed a message that arrived during its "
+        "flush await: not on disk and not in the pending slot.  The caller "
+        "must hand the live slot to flush_pending_to_file_async(drain=True) "
+        "instead of clearing after the await."
+    )
+    assert any(
+        "early message" in json.dumps(json.loads(p.read_text()))
+        for p in _payload_files(flush_home)
+    ), "the snapshotted payload never landed; the flush itself regressed"
+
+
+def test_runner_stop_does_not_destroy_a_message_arriving_mid_flush(flush_home):
+    """The runner's ``_stop_impl_body`` tail has the identical shape.
+
+    ``run.py:10605`` assigns into the slot during teardown, so the same
+    window exists here.  Driving the whole runner shutdown would drag in the
+    entire gateway, so this exercises the exact three statements of that tail
+    against a live slot -- the shape the AST sweep below then pins for every
+    caller.
+    """
+    release = threading.Event()
+    _occupy_lane(release)
+
+    pending = {"sess-a": "early message"}
+    late = "late message arriving during teardown"
+
+    async def scenario():
+        async def stop_tail():
+            # gateway/run.py _stop_impl_body, verbatim in shape.
+            try:
+                from gateway.shutdown_flush import flush_pending_to_file_async
+                await flush_pending_to_file_async(
+                    pending, reason="shutdown", drain=True
+                )
+            except Exception:
+                pass
+
+        async def late_arrival():
+            await asyncio.sleep(0.1)
+            pending["sess-late"] = late
+            release.set()
+
+        await asyncio.gather(stop_tail(), late_arrival())
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+    assert shutdown_flush.fence_flush_lane(timeout=10.0)
+
+    on_disk = any(
+        late in json.dumps(json.loads(p.read_text()))
+        for p in _payload_files(flush_home)
+    )
+    assert pending.get("sess-late") == late or on_disk, (
+        "the runner stop tail destroyed a message that arrived during its "
+        "flush await"
+    )
+
+
+def test_no_caller_may_clear_the_pending_slot_after_the_flush_await():
+    """CLASS SWEEP -- the rule, not the two sites that motivated it.
+
+    The defect is structural: ``await`` is a yield point the synchronous
+    ``flush_pending_to_file`` never had, so ANY caller that snapshots via the
+    await and then clears destroys whatever arrived in between.  An inventory
+    of the two current callers would not stop a third adapter from
+    reintroducing it, so this walks the AST of every ``gateway/`` and
+    ``plugins/`` module and requires each ``flush_pending_to_file_async``
+    call to pass ``drain=True`` and to have no ``.clear()`` on the same slot
+    later in the enclosing function.
+    """
+    import ast
+
+    roots = [
+        os.path.join(_REPO_ROOT, "gateway"),
+        os.path.join(_REPO_ROOT, "plugins"),
+    ]
+    call_sites = []
+    for root in roots:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, filename)
+                try:
+                    tree = ast.parse(open(path, encoding="utf-8").read(), path)
+                except SyntaxError:      # pragma: no cover - not our concern
+                    continue
+                for func in ast.walk(tree):
+                    if not isinstance(func, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                        continue
+                    for node in ast.walk(func):
+                        if not isinstance(node, ast.Call):
+                            continue
+                        name = getattr(node.func, "id", None) or getattr(
+                            node.func, "attr", None
+                        )
+                        if name != "flush_pending_to_file_async":
+                            continue
+                        call_sites.append((path, func, node))
+
+    assert call_sites, (
+        "no flush_pending_to_file_async call sites found; this sweep would be "
+        "vacuous -- did the function move or get renamed?"
+    )
+
+    def _slot_repr(node):
+        """Text of the first positional arg, e.g. ``self._pending_messages``."""
+        arg = node.args[0] if node.args else None
+        if arg is None:
+            return None
+        try:
+            return ast.unparse(arg)
+        except Exception:                # pragma: no cover
+            return None
+
+    failures = []
+    for path, func, node in call_sites:
+        rel = os.path.relpath(path, _REPO_ROOT)
+        where = f"{rel}::{func.name} (line {node.lineno})"
+
+        drain = next(
+            (kw for kw in node.keywords if kw.arg == "drain"), None
+        )
+        if drain is None or not (
+            isinstance(drain.value, ast.Constant) and drain.value.value is True
+        ):
+            failures.append(
+                f"{where}: must pass drain=True.  The await is a yield point; "
+                "only a snapshot-and-clear taken together before it keeps a "
+                "message that arrives during the flush from being lost."
+            )
+
+        slot = _slot_repr(node)
+        if slot is None:
+            failures.append(f"{where}: could not resolve the pending slot argument")
+            continue
+        # A copy defeats drain=True: the callee would clear the copy and the
+        # live slot would keep entries that are already on disk.
+        if slot.startswith(("dict(", "copy.", "{")) or slot.endswith(".copy()"):
+            failures.append(
+                f"{where}: passes a COPY ({slot}); drain=True must clear the "
+                "live slot, or the flushed sessions are re-flushed later."
+            )
+        for later in ast.walk(func):
+            if not isinstance(later, ast.Call):
+                continue
+            if getattr(later.func, "attr", None) != "clear":
+                continue
+            if later.lineno <= node.lineno:
+                continue
+            try:
+                target = ast.unparse(later.func.value)
+            except Exception:            # pragma: no cover
+                continue
+            if target == slot:
+                failures.append(
+                    f"{where}: clears {slot} at line {later.lineno}, AFTER the "
+                    "flush await.  A message arriving during the await is not "
+                    "in the snapshot and is destroyed by that clear -- pass "
+                    "drain=True and drop the clear."
+                )
+
+    assert not failures, "\n".join(failures)

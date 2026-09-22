@@ -20324,10 +20324,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # without flushing causes permanent data loss.
             # Off-loop: each payload ends in an unbounded os.replace, and
             # this runs inside the timed shutdown path.
+            # Pass the LIVE view with drain=True rather than a dict() copy:
+            # the offload's await is a window in which a message can arrive
+            # (run.py:10605 re-queues into this slot), and only an atomic
+            # snapshot-and-clear before that await keeps it from being wiped
+            # unflushed.  The view's clear() resets one field per session,
+            # never a wholesale dict swap, so a concurrent writer on another
+            # session can't lose its entry.
             try:
                 from gateway.shutdown_flush import flush_pending_to_file_async
                 await flush_pending_to_file_async(
-                    dict(self._pending_messages), reason="shutdown"
+                    self._pending_messages, reason="shutdown", drain=True
                 )
             except Exception:
                 pass
@@ -20339,7 +20346,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts.clear()
             if hasattr(self, "_active_session_leases"):
                 self._active_session_leases.clear()
-            self._pending_messages.clear()
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
                 self._busy_ack_ts.clear()
@@ -39649,6 +39655,20 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
         release_gateway_runtime_lock()
+    except Exception:
+        pass
+    # Drain the shutdown-flush and transcript-spool lanes. Same reason as the
+    # releases above: os._exit skips atexit, so shutdown_flush's own
+    # atexit-registered fences never run on this path -- and unlike a stranded
+    # lock, a queued write that dies with the process is UNRECOVERABLE user
+    # data. The deadline-cancel path (_await_adapter_cleanup_with_timeout
+    # cancels cancel_background_tasks() at the per-adapter budget) deliberately
+    # leaves a shielded write running with nobody awaiting it; this is the only
+    # thing that waits for it. Bounded at 10s, and a no-op when the lanes are
+    # empty or were never created.
+    try:
+        from gateway.shutdown_flush import fence_lanes_for_hard_exit
+        fence_lanes_for_hard_exit(timeout=10.0)
     except Exception:
         pass
     # Mark this life cleanly exited in the lifecycle sentinel (NS-608). This
