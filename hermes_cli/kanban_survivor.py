@@ -388,6 +388,33 @@ def _rev_list(repo, head, shas, *args):
     return _git(repo, "rev-list", *args, "--stdin", check=False, input=payload)
 
 
+def _first_containing(repo, head, candidates):
+    """The first ref in ``candidates`` that contains ``head``, in ~log2(N) calls.
+
+    Naming the ref is where the per-ref loop survived its first removal: the
+    containment QUESTION was already set-based, but the ANSWER still walked
+    `merge-base --is-ancestor` per ref, so a clean workspace parked behind a
+    branch tip (HEAD contained in the set but not itself a tip) paid the full
+    O(N) cost the card was filed about. Measured on the real board at 5 -> 41
+    refs: 24 -> 96 git spawns, slope 2.000/ref, projecting 1,424 s at the real
+    workspace's 7,937 refs -- half of it BEFORE the durable write.
+
+    `contained in candidates[:k]` is MONOTONE in k, so the first containing ref
+    is a binary search over prefixes using the same `_rev_list ... --count`
+    test, not a scan. Order is preserved, so the ref named is bit-for-bit the
+    one the per-ref loop named.
+    """
+    low, high = 0, len(candidates)  # invariant: not contained in [:low]
+    while low < high:
+        mid = (low + high) // 2
+        counted = _rev_list(repo, head, [c["sha"] for c in candidates[:mid + 1]], "--count")
+        if counted.returncode == 0 and counted.stdout.strip() == b"0":
+            high = mid
+        else:
+            low = mid + 1
+    return candidates[low] if low < len(candidates) else None
+
+
 def _remote_survivor(repo, head, published):
     # Reachability from a SET is the union of reachability from each member,
     # so "HEAD is contained in some published ref" == "HEAD has no commit that
@@ -395,19 +422,18 @@ def _remote_survivor(repo, head, published):
     # (measured 0.04 s vs 721 s projected for the per-ref loop).
     covered = [ref for ref in published if ref["sha"] == head]
     if not covered:
-        present = _present_commits(repo, sorted({ref["sha"] for ref in published}))
+        present = set(_present_commits(repo, sorted({ref["sha"] for ref in published})))
         if not present:
             return None
-        counted = _rev_list(repo, head, present, "--count")
+        # A sha the local store lacks can never contain HEAD; the per-ref loop
+        # skipped those via check=False, so dropping them here keeps the same
+        # answer AND keeps `rev-list ^<unknown>` from aborting the whole walk.
+        candidates = [ref for ref in published if ref["sha"] in present]
+        counted = _rev_list(repo, head, [ref["sha"] for ref in candidates], "--count")
         if counted.returncode or counted.stdout.strip() != b"0":
             return None
-        # HEAD is contained somewhere in the set; name the specific ref, which
-        # only needs a scan of the (now known non-empty) candidate set.
-        for ref in published:
-            if _git(repo, "merge-base", "--is-ancestor", head, ref["sha"],
-                    check=False).returncode == 0:
-                return dict(ref, head=head)
-        return None
+        ref = _first_containing(repo, head, candidates)
+        return dict(ref, head=head) if ref else None
     return dict(covered[0], head=head)
 
 

@@ -92,6 +92,59 @@ def _workspace_with_published_heads(conn, nheads):
     return tid, ws
 
 
+def _workspace_contained_behind_a_tip(conn, nheads):
+    """A CLEAN workspace whose HEAD is a STRICT ANCESTOR of a published ref.
+
+    The ordinary shape of a worker parked a commit behind a branch tip with
+    nothing uncommitted -- a worktree at an upstream PR branch's parent, or a
+    card whose branch merged so HEAD is now an ancestor of the merge commit.
+
+    `_workspace_with_published_heads` cannot reach this branch: it always
+    leaves an unpushed commit on HEAD, so `_remote_survivor` returns on the
+    "HEAD has commits outside the set" fast path and the naming step is never
+    entered. The decoys here are DIVERGENT siblings (they do NOT contain HEAD)
+    named to sort BEFORE the single carrier branch that does, which is the
+    refname order `ls-remote --heads` produces -- so a scan pays for every
+    decoy before it finds the answer.
+    """
+    tid = kb.create_task(conn, title=f"contained refs={nheads}")
+    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws.mkdir(exist_ok=True)
+    git(ws, "init", "-b", "main")
+    git(ws, "config", "user.name", "Test")
+    git(ws, "config", "user.email", "test@example.invalid")
+    (ws / "code.py").write_text("value = 0\n")
+    git(ws, "add", ".")
+    git(ws, "commit", "-m", "root")
+    root = git(ws, "rev-parse", "HEAD")
+
+    remote = Path.home() / f"{tid}.git"
+    git(ws, "init", "--bare", str(remote))
+    git(ws, "remote", "add", "origin", str(remote))
+
+    (ws / "impl.py").write_text("implementation = True\n")
+    git(ws, "add", "impl.py")
+    git(ws, "commit", "-m", "the commit that will be HEAD")
+    head = git(ws, "rev-parse", "HEAD")
+
+    (ws / "more.py").write_text("more = True\n")
+    git(ws, "add", "more.py")
+    git(ws, "commit", "-m", "advanced past HEAD")
+    git(ws, "push", "-q", "origin", "HEAD:refs/heads/zzz-carrier")
+
+    for i in range(nheads):
+        git(ws, "checkout", "-q", "--detach", root)
+        (ws / "decoy.py").write_text(f"decoy = {i}\n")
+        git(ws, "add", "decoy.py")
+        git(ws, "commit", "-q", "-m", f"decoy {i}")
+        git(ws, "push", "-q", "origin", f"HEAD:refs/heads/aaa-decoy-{i:04d}")
+
+    git(ws, "checkout", "-q", "--detach", head)
+    git(ws, "clean", "-qfd")
+    kb.set_workspace_path(conn, tid, ws)
+    return tid, ws, head
+
+
 def _count_git_spawns(monkeypatch, fn):
     """Number of `git` subprocesses ``fn`` issues, and its return value."""
     spawns = []
@@ -211,3 +264,81 @@ def test_missing_advertised_object_does_not_abort_the_scan(board):
 
     head = survivor._git(repo, "rev-parse", "--verify", "HEAD").stdout.decode().strip()
     assert survivor._remote_survivor(repo, head, [*published, phantom]) is None
+
+
+def test_contained_head_capture_is_flat_in_ref_count(board, monkeypatch):
+    """SIBLING CASE: HEAD contained in the published set but not itself a tip.
+
+    The first fix made the containment QUESTION set-based but left the step
+    that NAMES the containing ref as a `merge-base --is-ancestor` scan, so this
+    shape still paid the full per-ref cost the card was filed about. Measured
+    through the real `complete_task` at 5 -> 41 refs before the naming fix:
+    24 -> 96 git spawns, slope 2.000/ref -> 1,424 s projected at 7,937 refs,
+    half of it BEFORE the durable write.
+
+    Driven through `kb.complete_task`, not the helper, so it gates the live
+    transition the card is about -- and asserts the card reaches `done`.
+    """
+    few_tid, few_ws, few_head = _workspace_contained_behind_a_tip(board, 4)
+    many_tid, many_ws, many_head = _workspace_contained_behind_a_tip(board, 40)
+
+    few_spawns, few_ok = _count_git_spawns(
+        monkeypatch,
+        lambda: kb.complete_task(board, few_tid, summary="done",
+                                 metadata={"changed_files": ["impl.py"]}),
+    )
+    many_spawns, many_ok = _count_git_spawns(
+        monkeypatch,
+        lambda: kb.complete_task(board, many_tid, summary="done",
+                                 metadata={"changed_files": ["impl.py"]}),
+    )
+
+    # The transition itself, not just the duration: this is what was lost.
+    assert few_ok is True and many_ok is True
+    assert kb.get_task(board, many_tid).status == "done"
+    # REGRESSION: the recovery index must still be recorded, unheld. A "fix"
+    # that skipped capture would satisfy the spawn bound and lose the pointer.
+    row = board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (many_tid,),
+    ).fetchone()
+    assert row is not None, "completion dropped the survivor row"
+    assert row["held_reason"] is None, f"survivor HELD: {row['held_reason']}"
+
+    assert many_spawns < few_spawns * 3, (
+        f"contained-HEAD capture scales with published ref count: "
+        f"{few_spawns} spawns at 5 refs vs {many_spawns} at 41 refs — the "
+        f"per-ref merge-base loop is back in the ref-naming step"
+    )
+
+
+def test_contained_head_names_the_same_ref_as_the_per_ref_scan(board):
+    """Parity for the naming step: binary search must pick the SAME ref.
+
+    Speed is not the contract. The bisect keeps `published` order, so it must
+    return bit-for-bit what the old `for ref in published: merge-base
+    --is-ancestor` scan returned -- including WHICH of several containing refs
+    wins when more than one qualifies.
+    """
+    tid, ws, head = _workspace_contained_behind_a_tip(board, 6)
+    repo = ws.resolve()
+    # A SECOND containing ref, sorting after the first, so "first wins" is
+    # actually being tested rather than "only one candidate exists". The
+    # carrier lives only on the remote here (the workspace is detached), so
+    # name it by sha.
+    carrier = next(r["sha"] for r in survivor._published_refs(repo, repo)
+                   if r["branch"] == "zzz-carrier")
+    git(ws, "push", "-q", "origin", f"{carrier}:refs/heads/zzz-carrier-2")
+    published = list(survivor._published_refs(repo, repo))
+
+    per_ref = None
+    for ref in published:
+        if ref["sha"] == head or survivor._git(
+            repo, "merge-base", "--is-ancestor", head, ref["sha"], check=False
+        ).returncode == 0:
+            per_ref = dict(ref, head=head)
+            break
+    assert per_ref is not None, "fixture is not case (c): nothing contains HEAD"
+    assert per_ref["sha"] != head, "fixture HEAD is itself a tip, not contained"
+
+    assert survivor._remote_survivor(repo, head, published) == per_ref

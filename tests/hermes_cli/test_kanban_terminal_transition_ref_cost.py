@@ -134,3 +134,109 @@ def test_other_terminal_transitions_never_reach_the_ref_scan(
         f"published heads — it has acquired the starvation hole "
         f"kanban_complete had"
     )
+
+
+def _card_contained_behind_a_tip(conn):
+    """A CLEAN card whose HEAD is a strict ancestor of a published ref.
+
+    `_card_with_many_published_heads` always leaves an unpushed commit, so it
+    only ever drives `_remote_survivor`'s "HEAD has outside commits" fast path.
+    This shape reaches the step that NAMES the containing ref -- which is where
+    a per-ref `merge-base --is-ancestor` scan survived the first fix and where,
+    measured on the real 7,939-ref workspace, the old form cost 6,082 spawns /
+    653.6 s against the new form's 13 / 2.4 s (same ref, exact parity).
+    """
+    tid = kb.create_task(conn, title="contained HEAD under many refs")
+    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws.mkdir(exist_ok=True)
+    git(ws, "init", "-b", "main")
+    git(ws, "config", "user.name", "Test")
+    git(ws, "config", "user.email", "test@example.invalid")
+    (ws / "code.py").write_text("value = 1\n")
+    git(ws, "add", ".")
+    git(ws, "commit", "-m", "base")
+    root = git(ws, "rev-parse", "HEAD")
+    remote = Path.home() / f"{tid}.git"
+    git(ws, "init", "--bare", str(remote))
+    git(ws, "remote", "add", "origin", str(remote))
+
+    (ws / "impl.py").write_text("implementation = True\n")
+    git(ws, "add", "impl.py")
+    git(ws, "commit", "-m", "the commit that will be HEAD")
+    head = git(ws, "rev-parse", "HEAD")
+    (ws / "more.py").write_text("more = True\n")
+    git(ws, "add", "more.py")
+    git(ws, "commit", "-m", "advanced past HEAD")
+    git(ws, "push", "-q", "origin", "HEAD:refs/heads/zzz-carrier")
+
+    # Divergent decoys sorting BEFORE the carrier: a scan pays for all of them.
+    for i in range(NHEADS):
+        git(ws, "checkout", "-q", "--detach", root)
+        (ws / "decoy.py").write_text(f"decoy = {i}\n")
+        git(ws, "add", "decoy.py")
+        git(ws, "commit", "-q", "-m", f"decoy {i}")
+        git(ws, "push", "-q", "origin", f"HEAD:refs/heads/aaa-decoy-{i:04d}")
+    git(ws, "checkout", "-q", "--detach", head)
+    git(ws, "clean", "-qfd")
+    kb.set_workspace_path(conn, tid, ws)
+    return tid, ws
+
+
+def test_complete_is_not_starved_before_or_after_the_durable_write(
+    board, monkeypatch
+):
+    """Attribute the spawns to PRE-write and POST-write, and bound both.
+
+    Severity depends on the split. Spawns before `write_txn` burn the caller's
+    ceiling *before* the transition is durable, so the worker reaches no
+    terminal state at all — the card's exact defect. Spawns after it are
+    best-effort cleanup (`_cleanup_workspace` -> `remove_workspace_dir`, a
+    SECOND `_remote_survivor` call site) and must not be able to starve the
+    caller either, per the card's required outcome #3.
+
+    Measured with the per-ref naming loop restored: 12 -> 48 spawns from 5 to
+    41 refs in EACH phase, slope 1.000/ref, 712 s projected per phase at 7,939
+    refs. Both now sit at the fixed bound regardless of ref count.
+    """
+    tid, ws = _card_contained_behind_a_tip(board)
+
+    phase = ["pre"]
+    spawns = {"pre": [], "post": []}
+    real_git, real_txn = survivor._git, kb.write_txn
+
+    def counting(repo, *args, **kwargs):
+        spawns[phase[0]].append(args[0] if args else "?")
+        return real_git(repo, *args, **kwargs)
+
+    def marking_txn(conn):
+        phase[0] = "post"
+        return real_txn(conn)
+
+    monkeypatch.setattr(survivor, "_git", counting)
+    monkeypatch.setattr(kb, "write_txn", marking_txn)
+    try:
+        ok = kb.complete_task(
+            board, tid, summary="done", metadata={"changed_files": ["impl.py"]},
+        )
+    finally:
+        monkeypatch.setattr(survivor, "_git", real_git)
+        monkeypatch.setattr(kb, "write_txn", real_txn)
+
+    assert ok is True
+    assert kb.get_task(board, tid).status == "done"
+    assert len(spawns["pre"]) < SPAWN_CEILING, (
+        f"{len(spawns['pre'])} git spawns BEFORE the durable write against "
+        f"{NHEADS + 1} published heads — the ceiling burns before the "
+        f"transition lands and the worker reaches no terminal state"
+    )
+    assert len(spawns["post"]) < SPAWN_CEILING, (
+        f"{len(spawns['post'])} git spawns in post-write cleanup against "
+        f"{NHEADS + 1} published heads — best-effort cleanup can starve the "
+        f"caller (remove_workspace_dir is a second _remote_survivor call site)"
+    )
+    row = board.execute(
+        "SELECT survivor, held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,),
+    ).fetchone()
+    assert row is not None and row["survivor"], "survivor row must still be recorded"
+    assert row["held_reason"] is None
