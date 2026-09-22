@@ -3329,6 +3329,7 @@ from gateway.restart import (
     resolve_launchd_capped_drain,
     resolve_max_actionable_teardown_reserve_s,
     resolve_replace_takeover_grace_s,
+    resolve_stop_drain_deadline_s,
 )
 
 
@@ -19893,6 +19894,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the reserve. At the live geometry (clamp 60, drain 30, armed
             # 50) an 8s marking loop left a 12s window for a 15s reserve.
             # The cron branch below does the same thing for the same reason.
+            # THE ONE DEADLINE, resolved once here from the value the
+            # watchdog was ACTUALLY armed with, then consumed by BOTH the
+            # drain fit below and the cron leash further down. Two sites
+            # consuming one deadline is the whole point of #838's close-out;
+            # a site that re-derives it drifts from the instant os._exit
+            # really fires.
+            _stop_deadline_s = resolve_stop_drain_deadline_s(
+                effective_stop_drain_timeout(self),
+                getattr(self, "_launchd_exit_timeout_s", None),
+                signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+                armed_deadline_s=getattr(self, "_armed_shutdown_deadline_s", None),
+            )
             timeout = resolve_elapsed_adjusted_drain(
                 timeout,
                 getattr(self, "_launchd_exit_timeout_s", None),
@@ -19921,9 +19935,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cron_drain_cfg = getattr(
                 self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
             )
-            # Under launchd the real leash is launchd's own exit timeout, not
-            # our watchdog (drain + grace): a signal-driven stop that lets
-            # cron work push past it is SIGKILLed before cleanup runs.
+            # Under launchd the real leash is the ARMED watchdog deadline —
+            # the instant os._exit fires — minus the post-drain teardown
+            # reserve, i.e. THE ONE DEADLINE computed above. Clamping to the
+            # raw ExitTimeOut (launchd's SIGKILL wall) and holding back only
+            # CRON_DRAIN_CLEANUP_RESERVE_S was the #838 defect: it let the
+            # cron floor raise the budget back up to the hard-exit instant,
+            # silently undoing the elapsed adjustment made three statements
+            # earlier and consuming the whole teardown reserve.
             _cron_leash = resolve_shutdown_watchdog_delay(timeout)
             _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
             if getattr(self, "_stop_requested_by_signal", False) and _launchd_budget:
@@ -19933,6 +19952,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cron_drain_cfg,
                 watchdog_delay=_cron_leash,
                 elapsed=_phase_elapsed(),
+                # Consumed, not re-derived. None off the launchd signal path
+                # (or in tests that never arm), where the watchdog_delay
+                # leash above remains the honest answer.
+                deadline_s=_stop_deadline_s,
             )
             if _cron_at_start and _cron_timeout > timeout:
                 logger.info(

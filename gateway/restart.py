@@ -690,6 +690,7 @@ def resolve_cron_drain_budget(
     watchdog_delay: float,
     elapsed: float = 0.0,
     cleanup_reserve_s: float = CRON_DRAIN_CLEANUP_RESERVE_S,
+    deadline_s: float | None = None,
 ) -> float:
     """Seconds the shutdown drain may spend waiting on in-flight cron work.
 
@@ -702,9 +703,32 @@ def resolve_cron_drain_budget(
     would swap a cleanly-interrupted job for a SIGKILL that leaves it
     wedged mid-run — strictly worse than the bug being fixed.
 
+    ``deadline_s`` is THE ONE DEADLINE from
+    :func:`resolve_stop_drain_deadline_s` — the absolute instant (measured
+    from the start of ``stop()``) the drain must END by. When it is
+    supplied it REPLACES the ``watchdog_delay``/``cleanup_reserve_s``
+    derivation entirely, and the ceiling becomes exactly the
+    ``deadline - elapsed`` that :func:`resolve_elapsed_adjusted_drain`
+    fits the non-cron drain to. Passing it is how the cron branch stops
+    being a second derivation.
+
+    That re-derivation was the #838 defect: the cron leash clamped to the
+    RAW ``ExitTimeOut`` (launchd's SIGKILL wall) rather than the armed
+    hard-exit instant, and held back only the 10s
+    ``CRON_DRAIN_CLEANUP_RESERVE_S`` instead of
+    ``max(LAUNCHD_STOP_CLEANUP_RESERVE_S, last_teardown_s)`` — so three
+    statements after the drain was fitted to the deadline, the cron path
+    raised it back to the hard-exit instant and consumed the whole
+    teardown reserve (clamp 60 / cron floor 30 / elapsed 20: the drain
+    resolver returned 15, the cron branch returned 30, i.e. +50s absolute,
+    exactly when ``os._exit`` fires).
+
     Never returns less than ``drain_timeout``: the cron floor only ever
     extends the wait, so an operator who deliberately configured a long
-    ``restart_drain_timeout`` keeps it.
+    ``restart_drain_timeout`` keeps it. With ``deadline_s`` supplied that
+    is not a loophole — ``drain_timeout`` is itself already fitted to the
+    same deadline by :func:`resolve_elapsed_adjusted_drain`, so the
+    ``max()`` cannot reach past it.
     """
 
     def _seconds(value: object, fallback: float = 0.0) -> float:
@@ -717,11 +741,16 @@ def resolve_cron_drain_budget(
     floor = _seconds(cron_drain_timeout)
     if floor <= 0.0:
         return drain
-    ceiling = (
-        _seconds(watchdog_delay)
-        - _seconds(elapsed)
-        - _seconds(cleanup_reserve_s, CRON_DRAIN_CLEANUP_RESERVE_S)
-    )
+    if deadline_s is not None:
+        # THE ONE DEADLINE binds. No watchdog_delay/cleanup_reserve_s
+        # arithmetic here — that second derivation is the defect.
+        ceiling = _seconds(deadline_s) - _seconds(elapsed)
+    else:
+        ceiling = (
+            _seconds(watchdog_delay)
+            - _seconds(elapsed)
+            - _seconds(cleanup_reserve_s, CRON_DRAIN_CLEANUP_RESERVE_S)
+        )
     return max(drain, min(floor, ceiling))
 
 
