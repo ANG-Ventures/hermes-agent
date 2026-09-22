@@ -819,3 +819,94 @@ def test_cleanup_accepts_a_bundle_shaped_survivor_for_the_vanished_repo(board, r
     assert board.execute(
         "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
         (tid,)).fetchone()["held_reason"] is None
+
+
+# --- the loose-files guard is keyed on EVIDENCE, not on survivor shape ------
+#
+# Both `_loose_files()` call sites -- the relaxation's own exit (partial loss)
+# and the `elif claimed:` arm (total loss) -- were pinned for a REF-shaped
+# recorded survivor only. Measured on this tree: two mutants that skip the
+# guard whenever `previous["kind"] == "bundle"` leave all 84 tests GREEN while
+# flipping four cells from fail-closed HOLD to reapable, handing loose reviewer
+# evidence to `rmtree`. A bundle vouches for the REPOSITORY it names; it says
+# nothing about `qa-output/verdict.md` sitting beside it, so the guard must
+# fire for it exactly as it does for a ref.
+
+
+def test_a_bundle_shaped_survivor_does_not_buy_a_delete_for_loose_evidence(
+        board, remote, tmp_path, monkeypatch):
+    """TOTAL loss, bundle-vouched, loose evidence beside it -> still HELD.
+
+    This pins the guard as a pair, which is what the class note asks for.
+    Traced (sys.settrace pinned to the module): this call raises at the
+    relaxation's own `_loose_files()` exit, so neither single-site mutant kills
+    it -- skipping the guard there alone still meets the `elif claimed:` site,
+    and skipping it in `elif claimed:` alone never gets past the first. Only
+    the combined mutant (both sites waived for `kind == "bundle"`) reaches
+    `rmtree`, and this test is what fails then. That is the property worth
+    pinning: the bundle shape must not walk out through EITHER exit.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid, ws = stale_card(board)  # loose=True: qa-output/verdict.md, no repo on disk
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, survivor) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET survivor = excluded.survivor",
+            (tid, json.dumps({"kind": "bundle", "notice": "NOT PUSHED", "refs": [],
+                              "bundles": [{"repository": ".", "path": "/x.bundle",
+                                           "sha256": "0" * 64, "bytes": 1}]})),
+        )
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert "outside any repository" in str(excinfo.value), str(excinfo.value)
+    assert (ws / "qa-output" / "verdict.md").is_file()
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is not None
+
+
+def test_partial_loss_holds_for_loose_evidence_under_a_bundle_shaped_survivor(
+        board, remote, tmp_path, monkeypatch):
+    """PARTIAL loss, bundle-vouched, loose evidence -> still HELD.
+
+    The sibling of `test_partial_loss_at_cleanup_still_holds_for_loose_...`
+    on the other survivor shape. Mutant that stays green without this:
+    `if _loose_files(...) and previous["kind"] != "bundle":` on the relaxation's
+    own exit -- measured to flip bundle/partial/loose and mixed/partial/loose
+    from HOLD to a reclaim that deletes the evidence.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="bundle-vouched partial loss with loose evidence")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "bundle-loose-kept.git")
+    evidence = ws / "qa-output" / "verdict.md"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text("APPROVED\n")
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases, "
+            "survivor = excluded.survivor",
+            (tid, json.dumps({"kept": kept_head, "gone": STALE}),
+             json.dumps({"kind": "bundle", "notice": "NOT PUSHED", "refs": [],
+                         "bundles": [{"repository": "gone",
+                                      "path": str(tmp_path / "implementation-0.bundle"),
+                                      "sha256": "f" * 64, "bytes": 42}]})),
+        )
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert "outside any repository" in str(excinfo.value), str(excinfo.value)
+    assert evidence.is_file(), "loose reviewer evidence must survive a bundle-vouched reclaim"
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is not None
