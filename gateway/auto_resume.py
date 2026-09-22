@@ -206,6 +206,44 @@ def has_resumable_work(messages: Iterable[dict[str, Any]]) -> bool:
     return content in (None, [], {}, "")
 
 
+def user_stop_blocks_resume(
+    stopped_at_message_id: int | None,
+    messages: Iterable[dict[str, Any]],
+) -> bool:
+    """True when an explicit ``/stop`` still governs this transcript.
+
+    ``has_resumable_work`` judges the persisted TAIL, and a ``/stop``ped turn
+    whose transcript ends mid-tool-call is byte-identical to one a restart
+    amputated — so the tail alone re-prompts a turn the user deliberately
+    killed (2026-09-20: "one of them ``/stop``ped"). The durable
+    ``user_stopped`` marker is the missing evidence, and this is where it is
+    weighed.
+
+    The marker is superseded by the user's NEXT message, not by a clock: a
+    non-empty human row persisted AFTER the marker's ``last_message_id``
+    proves the conversation continued past the stop, so a later interruption
+    resumes normally. Comparing rowids rather than timestamps keeps the
+    decision correct across clock skew and across the marker-clearing path
+    failing (a SIGKILL between the user's message landing and the clear).
+
+    Fails CLOSED on the marker, which is the opposite of every other gate in
+    this module and is deliberate: the ruling is that a ``/stop``ped turn is
+    NEVER auto-resumed. An unknown ``stopped_at_message_id`` therefore blocks
+    until a real user message clears the marker.
+    """
+    if stopped_at_message_id is None:
+        return True
+    for row in messages:
+        if not isinstance(row, dict):
+            continue
+        if not _is_nonempty_human_message(row):
+            continue
+        rowid = _message_id(row)
+        if rowid is not None and rowid > stopped_at_message_id:
+            return False
+    return True
+
+
 def _message_id(row: dict[str, Any]) -> int | None:
     value = row.get("id")
     if isinstance(value, bool) or not isinstance(value, (int, str)):

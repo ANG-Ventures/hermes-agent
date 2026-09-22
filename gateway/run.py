@@ -15402,7 +15402,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return 0
 
-        from gateway.auto_resume import RESUME_KIND_SELF, has_resumable_work
+        from gateway.auto_resume import (
+            RESUME_KIND_SELF,
+            has_resumable_work,
+            user_stop_blocks_resume,
+        )
 
         checked = 0
         for entry in entries:
@@ -15411,6 +15415,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source = getattr(entry, "origin", None)
             if platform is not None and getattr(source, "platform", None) != platform:
                 continue
+            # RULING (2026-09-21): an interrupted turn always auto-resumes —
+            # EXCEPT one the user ended with /stop, which must NEVER resume.
+            # This gate runs BEFORE the SELF-kind exemption and before the
+            # transcript read below, because it is not a "is there work?"
+            # question: the user answered that question by hand. A session
+            # carrying the marker is denied unless a real user message has
+            # landed since (checked by rowid, below), and denial is recorded
+            # as a False decision so the scheduler skips and retires the hedge
+            # exactly as it does for a finished turn.
+            _stopped_at_id = getattr(entry, "user_stopped_message_id", None)
+            _has_stop_marker = getattr(entry, "user_stopped_at", None) is not None
+            if _has_stop_marker:
+                _stop_rows: list[dict[str, Any]] = []
+                _stop_session_id = getattr(entry, "session_id", None)
+                if self._session_db is not None and _stop_session_id:
+                    try:
+                        _stop_rows = await self._session_db.get_messages(
+                            _stop_session_id,
+                            preserve_unparseable_tool_calls=True,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "user_stopped supersession check failed for %s; "
+                            "honouring the stop: %s",
+                            entry.session_key,
+                            exc,
+                        )
+                        _stop_rows = []
+                if user_stop_blocks_resume(_stopped_at_id, _stop_rows):
+                    decisions[entry.session_key] = False
+                    checked += 1
+                    continue
             # A deliberate SELF resume is NOT a hedge: the session asked for
             # the restart (safe-restart/safe-reboot watcher via the dropbox,
             # or the typed deferred-restart rail) and its tail is SUPPOSED to
@@ -16595,13 +16631,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if getattr(self, "_boot_resume_has_work", {}).get(
                 entry.session_key, True
             ) is False:
+                # Two causes land here and they mean different things to an
+                # operator: a hedge on a finished turn, versus a turn the user
+                # deliberately killed with /stop. Both skip; name which.
+                _skip_cause = (
+                    "user_stopped"
+                    if getattr(entry, "user_stopped_at", None) is not None
+                    else "no_unfinished_work"
+                )
                 logger.warning(
                     "PHASE=boot_resume_skipped key=%s reason=%s platform=%s "
-                    "kind=%s cause=no_unfinished_work",
+                    "kind=%s cause=%s",
                     entry.session_key,
                     getattr(entry, "resume_reason", None),
                     getattr(getattr(source, "platform", None), "value", None),
                     getattr(entry, "resume_kind", None),
+                    _skip_cause,
                 )
                 try:
                     self.session_store.clear_resume_pending(entry.session_key)
@@ -24618,6 +24663,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
         session_key = session_entry.session_key
+        # A real inbound user message supersedes any /stop marker: the user
+        # resumed the conversation by hand, so a LATER interruption of this
+        # session must auto-resume normally. Internal/synthetic events (boot
+        # resumes, kanban wakes) are not the user speaking and must not clear
+        # it. Correctness does not rest on this call landing — the boot gate
+        # independently supersedes the marker by rowid — so it is best-effort.
+        if (
+            not getattr(event, "internal", False)
+            and getattr(session_entry, "user_stopped_at", None) is not None
+        ):
+            try:
+                await self.async_session_store.clear_user_stopped(session_key)
+            except Exception:
+                logger.debug(
+                    "clear_user_stopped failed for %s", session_key, exc_info=True
+                )
 
         # Persisted route identity is a security/billing boundary (fork
         # contract). Resolve its tri-state immediately after session lookup,
@@ -34211,6 +34272,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _mark_user_stopped(self, session_key: str) -> bool:
+        """Durably record that ``session_key``'s turn was ended by ``/stop``.
+
+        The rowid stamped here is the session's newest persisted message at
+        stop time. The boot gate supersedes the marker when a non-empty USER
+        row ABOVE that id exists, so the rowid — not a timestamp — is what
+        makes "stop, then the user speaks again, then a restart interrupts"
+        resume correctly.
+
+        An unreadable transcript stamps ``None``, which fails CLOSED (never
+        resume) rather than open: the ruling is that a stopped turn must never
+        be re-prompted, and a real user message still clears the marker
+        through ``clear_user_stopped`` on the inbound path.
+        """
+        last_message_id: Optional[int] = None
+        entry = None
+        try:
+            entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+        except Exception:
+            entry = None
+        session_id = getattr(entry, "session_id", None)
+        if self._session_db is not None and session_id:
+            try:
+                rows = await self._session_db.get_messages(
+                    session_id,
+                    preserve_unparseable_tool_calls=True,
+                )
+                for row in reversed(rows or []):
+                    if not isinstance(row, dict):
+                        continue
+                    rowid = row.get("id")
+                    if isinstance(rowid, int) and not isinstance(rowid, bool):
+                        last_message_id = rowid
+                        break
+            except Exception:
+                logger.debug(
+                    "user_stopped rowid lookup failed for %s", session_key, exc_info=True
+                )
+        boot_id = None
+        try:
+            boot_id = self._current_boot_id()
+        except Exception:
+            boot_id = None
+        marked = await self.async_session_store.mark_user_stopped(
+            session_key,
+            boot_id=boot_id,
+            last_message_id=last_message_id,
+        )
+        logger.info(
+            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s",
+            session_key,
+            boot_id,
+            last_message_id,
+            marked,
+        )
+        return bool(marked)
+
     async def _interrupt_and_clear_session(
         self,
         session_key: str,
@@ -34358,6 +34476,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # An explicit stop consumes restart-recovery intent. Otherwise the next
         # real user message re-enters _is_resume_pending and receives the same
         # recovery note even though the user deliberately cancelled that turn.
+        #
+        # A /stop must ALSO leave durable evidence that the turn was ended on
+        # purpose. Clearing resume_pending alone is not enough: the boot gate
+        # re-marks sessions wholesale (pre-drain hedge, suspend_recently_active)
+        # and then judges the persisted TAIL, and a /stop'd turn cut mid-tool-
+        # call is byte-identical to an amputated one — so it was re-prompted on
+        # the next boot (2026-09-20). Write the marker BEFORE this coroutine
+        # returns, which is before /stop acknowledges, so a SIGKILL in the gap
+        # cannot lose it. /new is excluded: it resets the session outright.
+        if str(invalidation_reason or "").startswith("stop_command"):
+            try:
+                await self._mark_user_stopped(session_key)
+            except Exception:
+                logger.warning(
+                    "Failed to persist user_stopped marker for stopped session %s",
+                    session_key,
+                    exc_info=True,
+                )
         try:
             await self.async_session_store.clear_resume_pending(session_key)
         except Exception:
