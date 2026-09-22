@@ -744,14 +744,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
-    p_complete.add_argument("--survivor-ref", default=None, metavar="URL#SHA",
+    p_complete.add_argument("--survivor-ref", default=None, action="append", metavar="[REPO=]URL#SHA",
                             help="Name an external survivor when the implementation lives on a "
                                  "remote, not in the workspace. Verified with git ls-remote; "
-                                 "an unverifiable claim refuses the completion.")
-    p_complete.add_argument("--survivor-pr", default=None, metavar="OWNER/REPO#N",
+                                 "an unverifiable claim refuses the completion. Repeatable: "
+                                 "qualify each claim as <workspace-relative-repo>=<claim> when "
+                                 "more than one recorded repository vanished.")
+    p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
                                  "gh pr view (state OPEN or MERGED); an unverifiable claim "
-                                 "refuses the completion.")
+                                 "refuses the completion. Repeatable; same <repo>= qualifier "
+                                 "as --survivor-ref.")
 
     p_edit = sub.add_parser(
         "edit",
