@@ -516,6 +516,23 @@ def _build_moa_pricing_calls(
     return calls
 
 
+def _compressor_usage_dict(usage: Any) -> dict[str, Any]:
+    """The context-occupancy payload for ``update_from_response``.
+
+    Only the three legacy aggregate keys the compressor actually reads
+    (``agent/context_compressor.py::update_from_response``). Built from ONE
+    usage object so the prompt/completion/total it stores cannot come from
+    different sources — which is the whole point at the MoA call site, where the
+    turn's REPORTED counts are the aggregator+advisor fold but the window
+    occupancy is the aggregator's alone (r6 round-4 finding 2).
+    """
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+
+
 def _canonical_usage_from_response(
     response: Any, *, provider: str | None, api_mode: str | None
 ) -> CanonicalUsage:
@@ -596,6 +613,71 @@ def _session_cost_status_with_known_spend(
     return "partial" if has_known_spend else "unknown"
 
 
+# Completeness ordering for a SESSION's cost label. Lower is more complete.
+# ``included`` is complete AND free; ``actual``/``estimated`` are complete but
+# priced; ``partial`` is a known-calls-only subtotal; ``unknown`` is nothing.
+_SESSION_STATUS_COMPLETENESS = {
+    "included": 0,
+    "actual": 1,
+    "estimated": 1,
+    "priced_zero": 1,
+    "partial": 2,
+    "unknown": 3,
+}
+
+
+def merge_session_cost_status(
+    previous: Any, incoming: str, *, prior_api_calls: Any = None
+) -> str:
+    """Worst-of merge: a session's label can never get MORE complete over time.
+
+    ``session_cost_status`` is a property of the whole session, but it is
+    written once per provider call from that call's own verdict, which makes
+    the last call's completeness the session's — in both directions.
+
+    The priced-then-unknown direction was already handled (by
+    ``_session_cost_status_with_known_spend``: an unpriceable call beside real
+    accumulated dollars is ``partial``). The mirror was not (r6 round-4
+    finding 13): an unpriceable call FOLLOWED by a priced one overwrote the
+    session back to ``estimated`` — a label that claims a complete total — even
+    though that total still omits the first call's unpriceable spend. Since
+    this PR now persists usage-less calls rather than dropping them, the
+    session really does know it is missing something, and must keep saying so.
+
+    The algebra: an incomplete session cannot become complete by spending more
+    money, so ``partial`` and ``unknown`` absorb. A prior ``unknown`` meeting a
+    later COMPLETE label degrades to ``partial``, not back to ``unknown``: the
+    session does now hold priced dollars, just not all of them. That is the
+    same rule ``_session_cost_status_with_known_spend`` applies within one
+    call, and it keeps the row inside the repricing allowlist instead of
+    stranding it (``unknown`` is filtered out of reprice forever).
+
+    ``prior_api_calls`` is the load-bearing discriminator, NOT a convenience.
+    A fresh agent initialises to ``session_cost_status = "unknown"``
+    (``agent/agent_init.py``) with zero calls accounted — that is *unstarted*,
+    not *incomplete*, and treating it as incomplete would permanently pin every
+    session's first priced call to ``partial``. When no call has been accounted
+    yet there is no previous session state to merge with, so ``incoming`` wins
+    outright. Callers pass the count taken BEFORE this call's increment.
+    """
+    try:
+        if prior_api_calls is not None and int(prior_api_calls or 0) <= 0:
+            return incoming
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        pass
+    prev = str(previous or "").strip()
+    if prev not in _SESSION_STATUS_COMPLETENESS:
+        return incoming
+    prev_rank = _SESSION_STATUS_COMPLETENESS[prev]
+    incoming_rank = _SESSION_STATUS_COMPLETENESS.get(incoming, 3)
+    if incoming_rank >= prev_rank:
+        return incoming
+    # Incoming claims MORE completeness than the session has earned.
+    if prev == "unknown" and incoming_rank <= 1:
+        return "partial"
+    return prev
+
+
 def _moa_session_cost_status(
     cost_result: Any,
     advisor_calls: list[dict[str, Any]],
@@ -609,14 +691,38 @@ def _moa_session_cost_status(
 
     The mirror case is reconciled here too: an unpriceable AGGREGATOR beside
     priced advisors is ``partial``, not ``unknown`` — the turn really did
-    spend the advisor dollars that line 5014 adds to the session total. For a
-    non-MoA turn (no advisor calls, no advisor cost) ``any_known`` stays False,
-    so the existing ``unknown`` is still returned.
+    spend the advisor dollars that the advisor-cost addition below adds to the
+    session total. For a non-MoA turn (no advisor calls, no advisor cost)
+    ``any_known`` stays False, so the existing ``unknown`` is still returned.
+
+    UNPRICEABLE IS NOT THE SAME QUESTION AS UNMEASURED (r6 round-4 finding 1).
+    An advisor is just as commonly unpriceable with fully MEASURED usage: an
+    uncatalogued route makes ``estimate_usage_cost`` return
+    ``amount_usd=None, status="unknown"`` with every token count real and no
+    unknown FLAG set. ``moa_loop._run_reference`` already priced each advisor at
+    its own route and ``MoAChatCompletions`` sums only non-None advisor costs,
+    so those real dollars never enter ``advisor_cost`` — and skipping the
+    flagless advisors here let the session lane report ``estimated`` (a
+    COMPLETE label) for a total missing them, while ``plugins/blackbox/cost.py``
+    called the same turn ``partial``. So each advisor's OWN pricing verdict is
+    consulted, and the usage flags are only the fallback for an advisor that
+    carries no verdict at all.
     """
     any_unpriceable = cost_result.amount_usd is None
     any_known = cost_result.amount_usd is not None or advisor_cost is not None
     for call in advisor_calls:
         if not isinstance(call, dict):
+            continue
+        if "cost_usd" in call or "cost_status" in call:
+            # This advisor's own verdict from its own route. `cost_usd is None`
+            # covers BOTH ways it can be unpriceable — unmeasured tokens and an
+            # uncatalogued route — so no separate flag/route check is needed.
+            # A subscription-included advisor prices at a real Decimal("0"), so
+            # it lands in `any_known` here exactly as it does below.
+            if call.get("cost_usd") is None or call.get("cost_status") == "unknown":
+                any_unpriceable = True
+            else:
+                any_known = True
             continue
         usage_unknown = any(bool(call.get(key)) for key in USAGE_UNKNOWN_FIELDS)
         if not usage_unknown:
@@ -4869,12 +4975,30 @@ def run_conversation(
                     # discard a perfectly good prompt reading. Still consume
                     # the pending compaction verdict either way so preflight
                     # deferral cannot stay latched.
+                    #
+                    # MoA: read the PRE-FOLD aggregator usage, exactly as the
+                    # usage anchor immediately below already does (r6 round-4
+                    # finding 2). `canonical_usage` at this point is
+                    # `aggregator + advisor fan-out`, and `CanonicalUsage.__add__`
+                    # makes every unknown flag ABSORBING — so one advisor that
+                    # returned no payload (seeded `fully_unknown()` by
+                    # `moa_loop._run_reference`) set `input_tokens_unknown` on the
+                    # fold and blanked a complete, measured AGGREGATOR prompt
+                    # count. What this site feeds the compressor is THIS
+                    # conversation's window occupancy; advisor fan-out tokens were
+                    # never part of this prompt, so both the gate and the payload
+                    # have to be the aggregator's own numbers. On a non-MoA turn
+                    # `aggregator_usage is canonical_usage`, so nothing changes.
                     _usage_payload = getattr(response, "usage", None)
                     _prompt_measured = bool(_usage_payload) and not prompt_tokens_unknown(
-                        canonical_usage
+                        aggregator_usage
                     )
                     if _prompt_measured:
-                        agent.context_compressor.update_from_response(usage_dict)
+                        agent.context_compressor.update_from_response(
+                            usage_dict
+                            if aggregator_usage is canonical_usage
+                            else _compressor_usage_dict(aggregator_usage)
+                        )
                     elif getattr(
                         agent.context_compressor,
                         "awaiting_real_usage_after_compression",
@@ -4983,12 +5107,46 @@ def run_conversation(
                     agent.session_prompt_tokens += prompt_tokens
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
+                    # Taken BEFORE the increment: `merge_session_cost_status`
+                    # needs "had any call been accounted before this one?" to
+                    # tell an UNSTARTED session (fresh agent, initial
+                    # `session_cost_status = "unknown"`, zero calls) from a
+                    # genuinely INCOMPLETE one. Without it the first priced
+                    # call of every session would merge against that initial
+                    # placeholder and pin the session to `partial` forever.
+                    _prior_api_calls = agent.session_api_calls
                     agent.session_api_calls += 1
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                    # ABSORBING session-level unknown latch, incremented in
+                    # lockstep with the five counters above so it describes the
+                    # same aggregate they do.
+                    #
+                    # The counters are plain ints: an unmeasured call adds the
+                    # canonical 0 and leaves no trace. Before this latch the
+                    # only unknown signal any session-total consumer had was
+                    # `agent.last_turn_usage`, which — despite the name — is
+                    # rewritten on EVERY provider call a few lines below. A
+                    # per-call flag on a cumulative total is wrong in both
+                    # directions (r6 round-4 finding 7 / finding 4): an earlier
+                    # unmeasured call followed by a measured one renders an
+                    # exact-looking total that silently omits real spend, and a
+                    # measured session whose final call was unmeasured collapses
+                    # hundreds of thousands of genuinely measured tokens to
+                    # `unknown`.
+                    #
+                    # Per-BUCKET, not one boolean: narrow readers gate on
+                    # individual buckets (`output_tokens_unknown` alone drives
+                    # the thin card's out= line), so a single flag would leave
+                    # them reading a measured zero. Absorbing: once a session
+                    # has missed a measurement, no later call can restore it.
+                    # Cleared with the counters in `reset_session_state`.
+                    for _flag, _set in usage_flags.items():
+                        if _set:
+                            setattr(agent, f"session_{_flag}", True)
                     # Keep the final successful provider-call usage available for
                     # `/context` / `/usage` style surfaces. The session_* counters
                     # above are cumulative; this snapshot preserves the last turn's
@@ -5132,7 +5290,11 @@ def run_conversation(
                             agent.session_estimated_cost_usd += float(_moa_ref_cost)
                         except (TypeError, ValueError):  # pragma: no cover - defensive
                             pass
-                    agent.session_cost_status = _cost_status
+                    agent.session_cost_status = merge_session_cost_status(
+                        getattr(agent, "session_cost_status", None),
+                        _cost_status,
+                        prior_api_calls=_prior_api_calls,
+                    )
                     agent.session_cost_source = cost_result.source
 
                     # Persist token counts to session DB for /insights.
@@ -9146,9 +9308,18 @@ def run_conversation(
                     # core of the complaint.
                     _streak_cost = _empty_guard.streak_cost_usd(agent)
                     if _streak_cost is not None:
+                        # A floored figure is a LOWER BOUND (some bucket was
+                        # declared unmeasured and only the measured ones could
+                        # be priced). Say "at least" rather than present it as
+                        # the estimate of the whole.
+                        _cost_prefix = (
+                            "at least ~$"
+                            if _empty_guard.streak_cost_is_floor(agent)
+                            else "~$"
+                        )
                         agent._buffer_status(
                             f"ℹ️ Estimated cost of these empty attempts: "
-                            f"~${_streak_cost:.2f} (input tokens are billed "
+                            f"{_cost_prefix}{_streak_cost:.2f} (input tokens are billed "
                             f"per attempt even when no answer is produced)"
                         )
                     agent._flush_status_buffer()

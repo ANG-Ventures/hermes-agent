@@ -381,6 +381,15 @@ def test_f8_resident_snapshot_flags_make_the_renderer_refuse_a_zero_total():
 
     This is the seam the finding named: the producer built five flagless ints,
     so the renderer's unknown branches were dead code on this lane.
+
+    TEST-REPIN (r6 round-4 finding 4, superseding this test's original
+    `last_turn_usage` fixture): the discriminators now come from the ABSORBING
+    SESSION-LEVEL latch (`agent.session_*_unknown`), not from
+    `agent.last_turn_usage`. `last_turn_usage` is rewritten on every provider
+    call, so it described the last CALL while the five numbers describe the whole
+    SESSION — and finding 4 showed the original fixture (session totals equal to
+    its last turn) could not tell the two apart, so it pinned the per-call read.
+    The MIXED orderings that discriminate them are pinned below.
     """
     from gateway.slash_commands import (
         _resident_thin_snapshot, render_thin_last_turn_lines,
@@ -390,11 +399,8 @@ def test_f8_resident_snapshot_flags_make_the_renderer_refuse_a_zero_total():
         session_input_tokens=0, session_output_tokens=0,
         session_cache_read_tokens=0, session_cache_write_tokens=0,
         session_reasoning_tokens=0,
-        last_turn_usage={
-            "input_tokens": 0, "output_tokens": 0,
-            "input_tokens_unknown": True, "output_tokens_unknown": True,
-            "usage_unknown": True,
-        },
+        session_input_tokens_unknown=True, session_output_tokens_unknown=True,
+        session_usage_unknown=True,
     )
     snap = _resident_thin_snapshot(unmeasured_agent)
     assert snap.get("output_tokens_unknown") is True, (
@@ -403,6 +409,95 @@ def test_f8_resident_snapshot_flags_make_the_renderer_refuse_a_zero_total():
     flagged = "\n".join(render_thin_last_turn_lines(snap, "test"))
     assert "Total (billed in+out): 0" not in flagged
     assert "unknown" in flagged
+
+
+def test_f4_earlier_unmeasured_call_is_not_erased_by_a_later_measured_one():
+    """Mode 1 of finding 4: the flag must survive a later MEASURED call.
+
+    The per-call read could not see this: `last_turn_usage` carries the FINAL
+    call's clean verdict, so the cumulative total — which really is missing the
+    earlier call's tokens — rendered as an exact-looking number. The absorbing
+    session latch is what makes the order irrelevant.
+    """
+    from gateway.slash_commands import (
+        _resident_thin_snapshot, render_thin_last_turn_lines,
+    )
+
+    agent = SimpleNamespace(
+        session_input_tokens=400_000, session_output_tokens=12_338,
+        session_cache_read_tokens=0, session_cache_write_tokens=0,
+        session_reasoning_tokens=0,
+        # The latch, set by the EARLIER unmeasured call and never cleared.
+        session_input_tokens_unknown=True, session_output_tokens_unknown=True,
+        session_usage_unknown=False,
+        # The final call was measured — this is exactly what the old per-call
+        # read consulted, and why it reported the total as exact.
+        last_turn_usage={
+            "input_tokens": 400_000, "output_tokens": 12_338,
+            "input_tokens_unknown": False, "output_tokens_unknown": False,
+            "usage_unknown": False,
+        },
+    )
+    snap = _resident_thin_snapshot(agent)
+    assert snap.get("input_tokens_unknown") is True
+    assert snap.get("output_tokens_unknown") is True
+    text = "\n".join(render_thin_last_turn_lines(snap, "test"))
+    assert "412,338" not in text, (
+        "a cumulative total missing an unmeasured call must not read as exact"
+    )
+    assert "Total (billed in+out): unknown" in text
+
+
+def test_f4_a_measured_session_is_not_collapsed_by_one_unmeasured_last_call():
+    """Mode 2 of finding 4: 412k MEASURED tokens must not read as `unknown`.
+
+    The mirror failure of the per-call read. Nothing here sets the session latch,
+    so the session's own numbers stand even though the most recent CALL was
+    unmeasured — the latch is a property of the aggregate, and this aggregate
+    never lost a measurement.
+    """
+    from gateway.slash_commands import (
+        _resident_thin_snapshot, render_thin_last_turn_lines,
+    )
+
+    agent = SimpleNamespace(
+        session_input_tokens=400_000, session_output_tokens=12_338,
+        session_cache_read_tokens=0, session_cache_write_tokens=0,
+        session_reasoning_tokens=0,
+        session_input_tokens_unknown=False, session_output_tokens_unknown=False,
+        session_usage_unknown=False,
+        last_turn_usage={
+            "input_tokens": 0, "output_tokens": 0,
+            "input_tokens_unknown": True, "output_tokens_unknown": True,
+            "usage_unknown": True,
+        },
+    )
+    snap = _resident_thin_snapshot(agent)
+    assert not any(k.endswith("_unknown") for k in snap)
+    text = "\n".join(render_thin_last_turn_lines(snap, "test"))
+    assert "Total (billed in+out): 412,338" in text
+    assert "unknown" not in text
+
+
+def test_f4_the_session_latch_is_cleared_by_reset_session_state():
+    """The latch is absorbing WITHIN a session, not across a reset.
+
+    `reset_session_state` zeroes the five counters, so it must clear their
+    discriminator too — otherwise a fresh session's genuinely measured totals
+    inherit the old session's `unknown` forever.
+    """
+    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS
+    from gateway.slash_commands import _resident_thin_snapshot
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    for flag in USAGE_UNKNOWN_FIELDS:
+        setattr(agent, f"session_{flag}", True)
+    AIAgent.reset_session_state(agent)
+
+    for flag in USAGE_UNKNOWN_FIELDS:
+        assert getattr(agent, f"session_{flag}") is False, flag
+    assert not any(k.endswith("_unknown") for k in _resident_thin_snapshot(agent))
 
 
 def test_f8_narrowness_a_measured_resident_session_still_renders_numbers():
@@ -414,11 +509,8 @@ def test_f8_narrowness_a_measured_resident_session_still_renders_numbers():
         session_input_tokens=4000, session_output_tokens=120,
         session_cache_read_tokens=0, session_cache_write_tokens=0,
         session_reasoning_tokens=0,
-        last_turn_usage={
-            "input_tokens": 4000, "output_tokens": 120,
-            "input_tokens_unknown": False, "output_tokens_unknown": False,
-            "usage_unknown": False,
-        },
+        session_input_tokens_unknown=False, session_output_tokens_unknown=False,
+        session_usage_unknown=False,
     )
     snap = _resident_thin_snapshot(measured_agent)
     assert not any(k.endswith("_unknown") for k in snap), (

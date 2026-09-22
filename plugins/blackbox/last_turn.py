@@ -271,7 +271,10 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     # is just ~2 structural tokens/call). See Obsidian "Hermes Telemetry —
     # Token Terminology & Accounting".
     in_billed = cache_r + cache_w + in_tok
-    from agent.usage_pricing import prompt_tokens_unknown
+    from agent.usage_pricing import (
+        last_call_prompt_unknown as _last_call_prompt_unknown,
+        prompt_tokens_unknown,
+    )
     input_unknown = prompt_tokens_unknown(rec)
     if input_unknown:
         lines.append(f"• Tokens in: {_humanize_tok(0, unknown=True)} billed")
@@ -327,9 +330,10 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     # measured final call just because call #2 of the turn returned no usage
     # (r6 finding 9). `last_call_prompt_unknown` is NULL on rows written before
     # that column existed; those fall back to the turn-level flag, i.e. exactly
-    # the behaviour they already had.
-    _lc_flag = rec.get("last_call_prompt_unknown")
-    last_call_unknown = input_unknown if _lc_flag is None else bool(_lc_flag)
+    # the behaviour they already had. That NULL fallback and the flag read both
+    # live in the shared callable so `card.py` — the other renderer over this
+    # same record — cannot answer differently (r6 round-4 finding 6).
+    last_call_unknown = _last_call_prompt_unknown(rec)
     # Change 3 (Ace 2026-06-14): the last-call cache split gets its OWN line
     # framed as the final call's billed input, ABOVE the occupancy line. The
     # split sums to context_used, so "Last call: {used} billed (split)" uses the

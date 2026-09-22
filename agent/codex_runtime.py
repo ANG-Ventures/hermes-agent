@@ -116,6 +116,11 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     Even when Codex omits usage for a turn, Hermes should still count that turn
     as one API call for session/status accounting.
     """
+    # Taken BEFORE the increment: `merge_session_cost_status` (below) needs
+    # "had any call been accounted before this one?" to tell an UNSTARTED
+    # session from a genuinely INCOMPLETE one. Same contract as the
+    # chat-completions lane in agent/conversation_loop.py.
+    _prior_api_calls = agent.session_api_calls
     agent.session_api_calls += 1
 
     usage = getattr(turn, "token_usage_last", None)
@@ -199,6 +204,18 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+    # Same absorbing session-level unknown latch the chat-completions lane
+    # maintains (agent/conversation_loop.py). This lane increments the same
+    # cumulative counters, so it owes the same discriminator — otherwise a
+    # codex session's totals silently lose the UNKNOWN the other lane records.
+    # The app-server usage shape carries no unknown discriminators today, so
+    # this reads False in practice; wiring it here is what keeps the latch a
+    # property of the counters rather than of one call path.
+    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS as _USAGE_UNKNOWN_FIELDS
+
+    for _usage_flag in _USAGE_UNKNOWN_FIELDS:
+        if getattr(canonical_usage, _usage_flag, False):
+            setattr(agent, f"session_{_usage_flag}", True)
 
     cost_result = estimate_usage_cost(
         agent.model,
@@ -209,7 +226,17 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     )
     if cost_result.amount_usd is not None:
         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
-    agent.session_cost_status = cost_result.status
+    # Worst-of merge, same rule as the chat-completions lane: a session's cost
+    # label can never get MORE complete over time. `_prior_api_calls` was taken
+    # before this lane's own increment (above), so a fresh agent's initial
+    # "unknown" placeholder does not poison its first priced call.
+    from agent.conversation_loop import merge_session_cost_status
+
+    agent.session_cost_status = merge_session_cost_status(
+        getattr(agent, "session_cost_status", None),
+        cost_result.status,
+        prior_api_calls=_prior_api_calls,
+    )
     agent.session_cost_source = cost_result.source
 
     if agent._session_db and agent.session_id:

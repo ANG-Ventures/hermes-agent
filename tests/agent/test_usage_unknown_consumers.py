@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.usage_pricing import (
-    USAGE_UNKNOWN_FIELDS, normalize_usage, prompt_tokens_unknown,
+    USAGE_UNKNOWN_FIELDS, CanonicalUsage, normalize_usage, prompt_tokens_unknown,
     cache_stats_line, verbose_token_usage_log_args,
 )
 
@@ -50,11 +50,25 @@ def test_moa_physical_calls_preserve_unknown_into_blackbox(wire):
 @pytest.mark.parametrize("wire", WIRES + [
     {"prompt_tokens": 100, "completion_tokens": 50,
      "prompt_tokens_details": {"cached_tokens": 100, "cache_creation_tokens": 0}},
+    # The aggregate-only shape, reachable in production but not producible by
+    # `normalize_usage` (it suppresses `usage_unknown` whenever a bucket flag is
+    # set), so it is constructed directly. It is what forced this test to mirror
+    # production's ORDERING (r6 round-4 finding 5): `cache_stats_line` returns
+    # None for `usage_unknown` BEFORE its `prompt_tokens_unknown` check, while
+    # `prompt_tokens_unknown` ORs `usage_unknown` in — so asking the wrong
+    # predicate first evaluated `"unknown" in None` and raised TypeError instead
+    # of failing readably.
+    CanonicalUsage(input_tokens=150, output_tokens=20, usage_unknown=True),
 ])
 def test_console_cache_block_honors_unknown(wire):
-    usage = normalize_usage(wire)
+    usage = wire if isinstance(wire, CanonicalUsage) else normalize_usage(wire)
     text = cache_stats_line(usage, usage.prompt_tokens)
-    if prompt_tokens_unknown(usage):
+    if usage.usage_unknown:
+        # No usage payload at all: there is no cache-specific fact to report and
+        # the turn card already says the turn is unmeasured, so this per-CALL
+        # line stays silent rather than adding one noise line per call.
+        assert text is None
+    elif prompt_tokens_unknown(usage):
         assert "unknown" in text
         assert "% hit" not in text
         assert "0 written" not in text
@@ -93,15 +107,29 @@ def test_real_moa_advisor_execution(wire, monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("wire", WIRES)
 def test_verbose_log_honors_unknown(wire):
+    """Each wire asserts once in EACH direction (r6 round-4 finding 11).
+
+    Every assertion used to be guarded by an `if`, so `WIRES[4]` (the genuinely
+    measured all-zero wire) asserted nothing at all — a parametrized case that
+    could only fail by raising. The `else` legs are the missing half: they pin
+    that a MEASURED bucket keeps rendering its number, which is what catches the
+    renderer regressing to `"unknown"` for measured values.
+    """
     usage = normalize_usage(wire)
     prompt, completion, total = verbose_token_usage_log_args(
         usage, usage.prompt_tokens, usage.output_tokens, usage.total_tokens)
     if prompt_tokens_unknown(usage):
         assert prompt == "unknown"
-    if usage.output_tokens_unknown:
+    else:
+        assert prompt == f"{usage.prompt_tokens:,}"
+    if usage.output_tokens_unknown or usage.usage_unknown:
         assert completion == "unknown"
+    else:
+        assert completion == f"{usage.output_tokens:,}"
     if usage.total_tokens_unknown:
         assert total == "unknown"
+    else:
+        assert total == f"{usage.total_tokens:,}"
 
 
 @pytest.mark.parametrize("flag", USAGE_UNKNOWN_FIELDS)

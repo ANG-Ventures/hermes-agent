@@ -216,19 +216,27 @@ _RESIDENT_UNKNOWN_FLAGS = (
 def _resident_thin_snapshot(agent, as_int=None) -> dict:
     """The resident ``/usage`` lane's thin snapshot, WITH its UNKNOWN flags.
 
-    The five ``session_*`` counters are plain ints with no companion
-    discriminators — they are incremented with the canonical ``0`` for an
-    unmeasured call and no ``session_*_unknown`` attribute exists anywhere in
-    the tree. Handing the renderer those five keys alone made every UNKNOWN
-    branch dead code on this lane, so a session whose provider returned no
-    usage payload rendered ``Total (billed in+out): 0`` — an unmeasured value
-    presented as a measurement, the exact defect class this work removes
-    (r6 finding 8).
+    The five ``session_*`` counters are plain ints: an unmeasured call adds the
+    canonical ``0`` and leaves no trace. Handing the renderer those five keys
+    alone made every UNKNOWN branch dead code on this lane, so a session whose
+    provider returned no usage payload rendered ``Total (billed in+out): 0`` —
+    an unmeasured value presented as a measurement, the exact defect class this
+    work removes (r6 finding 8).
 
-    ``agent.last_turn_usage`` DOES carry the flags, so propagate the most
-    recent turn's verdict: it is the only unknown signal this lane has, and a
-    session whose latest turn was unmeasured must not present its running
-    total as exact.
+    The discriminators come from the ABSORBING SESSION-LEVEL latch
+    (``agent.session_*_unknown``, set beside the counter increments in
+    ``agent/conversation_loop.py``), NOT from ``agent.last_turn_usage``.
+    ``last_turn_usage`` is rewritten on every provider call, so it carries the
+    last CALL's provenance; stamping it onto a cumulative total was wrong in
+    both directions (r6 round-4 finding 7):
+
+    1. earlier call unmeasured, final call measured → no flag → an exact-looking
+       ``Total (billed in+out): 412,338`` that silently omits real spend, which
+       is finding 8 displaced by one call; and
+    2. final call unmeasured, 99 earlier calls measured → every row collapses to
+       ``unknown``, discarding hundreds of thousands of measured tokens.
+
+    A flag describing an aggregate has to be latched over that same aggregate.
     """
     if as_int is None:
         def _coerce(v):
@@ -245,11 +253,9 @@ def _resident_thin_snapshot(agent, as_int=None) -> dict:
         "cache_write_tokens": as_int(getattr(agent, "session_cache_write_tokens", 0)),
         "reasoning_tokens": as_int(getattr(agent, "session_reasoning_tokens", 0)),
     }
-    last_turn = getattr(agent, "last_turn_usage", None)
-    if isinstance(last_turn, dict):
-        for flag in _RESIDENT_UNKNOWN_FLAGS:
-            if last_turn.get(flag):
-                snap[flag] = True
+    for flag in _RESIDENT_UNKNOWN_FLAGS:
+        if getattr(agent, f"session_{flag}", False):
+            snap[flag] = True
     return snap
 
 

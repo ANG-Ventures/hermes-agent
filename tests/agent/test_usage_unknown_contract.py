@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import pytest
 
+from decimal import Decimal
+
 from agent.usage_pricing import (
     UNKNOWN_TOKENS_LABEL,
     CanonicalUsage,
@@ -682,6 +684,174 @@ def test_unpriceable_moa_aggregator_beside_priced_advisors_is_partial():
     assert _moa_session_cost_status(aggregator, []) == "unknown"
 
 
+def test_a_measured_but_route_unpriceable_advisor_is_not_skipped():
+    """r6 round-4 finding 1 — UNPRICEABLE is not the same question as UNMEASURED.
+
+    The loop used to `continue` on any advisor whose usage flags were all False,
+    so the only unpriceable advisor it could detect was one with UNKNOWN usage.
+    But an advisor is just as commonly unpriceable with fully MEASURED tokens:
+    an uncatalogued route makes `estimate_usage_cost` return
+    `amount_usd=None, status="unknown"` with no flag set anywhere. Its real
+    dollars never enter `advisor_cost` (only non-None advisor costs are summed),
+    so the session lane reported `estimated` — a COMPLETE label — for a total
+    that omits them, while `plugins/blackbox/cost.py` called the same turn
+    `partial`. Two surfaces, one turn, and the optimistic one is what users read.
+    """
+    from agent.conversation_loop import _moa_session_cost_status
+
+    aggregator = estimate_usage_cost(
+        "claude-sonnet-4-5",
+        CanonicalUsage(input_tokens=100, output_tokens=20),
+        provider="anthropic",
+    )
+    assert aggregator.amount_usd is not None
+
+    # Fully measured, no unknown flag anywhere — and unpriceable all the same.
+    unpriceable_advisor = {
+        "model": "some-uncatalogued-model",
+        "provider": "someproxy",
+        "input_tokens": 100_000,
+        "output_tokens": 2_000,
+        "cost_usd": None,
+        "cost_status": "unknown",
+    }
+    assert not any(
+        unpriceable_advisor.get(k) for k in ("input_tokens_unknown", "usage_unknown")
+    )
+    assert _moa_session_cost_status(aggregator, [unpriceable_advisor]) == "partial", (
+        "an advisor whose real spend cannot enter the total makes the total "
+        "incomplete, whether its tokens were measured or not"
+    )
+
+
+def test_a_priced_advisor_verdict_keeps_the_complete_label():
+    """NARROWNESS control for the verdict read.
+
+    Consulting each advisor's own verdict must not manufacture a `partial` out
+    of a turn where every advisor really was priced.
+    """
+    from agent.conversation_loop import _moa_session_cost_status
+
+    aggregator = estimate_usage_cost(
+        "claude-sonnet-4-5",
+        CanonicalUsage(input_tokens=100, output_tokens=20),
+        provider="anthropic",
+    )
+    priced_advisor = {
+        "model": "claude-sonnet-4-5",
+        "provider": "anthropic",
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cost_usd": Decimal("0.0012"),
+        "cost_status": "estimated",
+    }
+    assert (
+        _moa_session_cost_status(aggregator, [priced_advisor], 0.0012)
+        == aggregator.status
+    )
+
+
+def test_a_subscription_included_advisor_verdict_is_known_not_unpriceable():
+    """An included route prices at a real $0 — that is KNOWN, not missing.
+
+    `estimate_usage_cost` returns `amount_usd=Decimal("0"), status="included"`
+    for a subscription route ABOVE its unknown-usage refusal, so the verdict
+    read must class it with the priced advisors. This is the same ordering the
+    flag-based fallback below already applies via `resolve_billing_route`.
+    """
+    from agent.conversation_loop import _moa_session_cost_status
+
+    aggregator = estimate_usage_cost(
+        "claude-sonnet-4-5",
+        CanonicalUsage.fully_unknown(),
+        provider="anthropic",
+    )
+    assert aggregator.amount_usd is None
+    included_advisor = {
+        "model": "gpt-5.4",
+        "provider": "openai-codex",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "usage_unknown": True,
+        "cost_usd": Decimal("0"),
+        "cost_status": "included",
+    }
+    assert _moa_session_cost_status(aggregator, [included_advisor]) == "partial", (
+        "the included advisor is KNOWN (free), the aggregator is not — partial"
+    )
+
+
+def test_an_advisor_without_a_verdict_still_falls_back_to_its_usage_flags():
+    """Back-compat: a call record predating the carried verdict.
+
+    `_build_moa_pricing_calls` copies advisor dicts through, and Blackbox
+    re-prices them itself, so a record without `cost_usd`/`cost_status` keys
+    must keep the original flag+route behaviour rather than silently reading a
+    missing key as priced.
+    """
+    from agent.conversation_loop import _moa_session_cost_status
+
+    aggregator = estimate_usage_cost(
+        "claude-sonnet-4-5",
+        CanonicalUsage(input_tokens=100, output_tokens=20),
+        provider="anthropic",
+    )
+    verdictless_unmeasured = {
+        "model": "claude-sonnet-4-5",
+        "provider": "anthropic",
+        "input_tokens": 100,
+        "output_tokens": 0,
+        "output_tokens_unknown": True,
+    }
+    assert "cost_usd" not in verdictless_unmeasured
+    assert _moa_session_cost_status(aggregator, [verdictless_unmeasured]) == "partial"
+
+
+def test_the_moa_loop_really_carries_each_advisors_own_verdict(tmp_path, monkeypatch):
+    """The producer half, by execution — the consumer above needs these keys.
+
+    Drives the real `MoAClient` and reads the pricing-call records it emits, so
+    the fix cannot be green on a consumer that no producer ever feeds.
+    """
+    from types import SimpleNamespace
+
+    from agent.moa_loop import MoAClient
+
+    (tmp_path / "config.yaml").write_text(
+        "moa:\n  default_preset: default\n  presets:\n    default:\n"
+        "      enabled: true\n      reference_models:\n"
+        "        - provider: anthropic\n          model: claude-sonnet-4-5\n"
+        "      aggregator:\n        provider: anthropic\n"
+        "        model: claude-sonnet-4-5\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "agent.moa_loop.call_llm",
+        lambda **kw: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="advice", tool_calls=[]),
+                    finish_reason="stop",
+                )
+            ],
+            usage={"prompt_tokens": 100, "completion_tokens": 20},
+            model="claude-sonnet-4-5",
+        ),
+    )
+    client = MoAClient("default")
+    client.chat.completions.create(
+        model="default", messages=[{"role": "user", "content": "test"}]
+    )
+    calls = client.consume_reference_pricing_calls()
+
+    assert len(calls) == 1
+    assert "cost_usd" in calls[0], "the advisor's own verdict must ride the record"
+    assert "cost_status" in calls[0]
+    # This advisor IS catalogued, so its verdict is a real priced amount.
+    assert calls[0]["cost_usd"] is not None
+    assert calls[0]["cost_status"] != "unknown"
+
+
 def test_an_omitted_payload_sets_every_discriminator_not_just_the_aggregate():
     """r4 finding 9 — the arm that was green without this pin.
 
@@ -750,3 +920,77 @@ def test_a_measured_cache_count_suppresses_a_null_alias_in_the_other_location():
         api_mode="chat_completions",
     )
     assert flagged.cache_read_tokens_unknown is True
+
+
+def test_the_compressor_payload_is_built_from_one_usage_object():
+    """r6 round-4 finding 2 — window occupancy is the AGGREGATOR's, pre-fold.
+
+    `canonical_usage` at the compressor call site is `aggregator + advisor
+    fan-out`, and `CanonicalUsage.__add__` makes every unknown flag ABSORBING.
+    So one advisor that returned no payload (seeded `fully_unknown()` by
+    `moa_loop._run_reference`) set `input_tokens_unknown` on the fold and made
+    the gate refuse a complete, MEASURED aggregator prompt count — leaving
+    `context_compressor.last_prompt_tokens`, `turn_finalizer`'s `context_used`
+    and the persisted occupancy carrying the previous call's reading.
+
+    The anchor immediately below that site already reads `aggregator_usage` for
+    exactly this reason. These pin the gate's predicate AND its payload.
+    """
+    from agent.conversation_loop import _compressor_usage_dict
+    from agent.usage_pricing import prompt_tokens_unknown
+
+    aggregator = CanonicalUsage(input_tokens=4000, output_tokens=120)
+    unmeasured_advisor = CanonicalUsage.fully_unknown()
+    folded = aggregator + unmeasured_advisor
+
+    # The fold really is absorbing — this is what the gate used to be asked.
+    assert prompt_tokens_unknown(folded) is True
+    assert prompt_tokens_unknown(aggregator) is False
+
+    payload = _compressor_usage_dict(aggregator)
+    assert payload["prompt_tokens"] == 4000, (
+        "the compressor must see THIS conversation's prompt, not a blanked fold"
+    )
+    assert payload["completion_tokens"] == 120
+    assert payload["total_tokens"] == aggregator.total_tokens
+    # Only the three legacy aggregate keys the compressor actually reads.
+    assert set(payload) == {"prompt_tokens", "completion_tokens", "total_tokens"}
+
+
+def test_the_compressor_payload_does_not_carry_advisor_fanout_tokens():
+    """NARROWNESS control: the fix must not swap one wrong number for another.
+
+    Reading the fold would also have DOUBLE-COUNTED advisor fan-out into window
+    occupancy whenever every advisor was measured — tokens that were never part
+    of this conversation's prompt.
+    """
+    from agent.conversation_loop import _compressor_usage_dict
+    from agent.usage_pricing import prompt_tokens_unknown
+
+    aggregator = CanonicalUsage(input_tokens=4000, output_tokens=120)
+    measured_advisor = CanonicalUsage(input_tokens=90_000, output_tokens=2_000)
+    folded = aggregator + measured_advisor
+
+    assert prompt_tokens_unknown(folded) is False, "both measured — the gate passes"
+    assert folded.prompt_tokens == 94_000
+    assert _compressor_usage_dict(aggregator)["prompt_tokens"] == 4000, (
+        "advisor fan-out is not window occupancy"
+    )
+
+
+def test_a_usageless_aggregator_still_refuses_the_compressor_update():
+    """The r6-finding-7 direction is untouched by the pre-fold read.
+
+    An UNMEASURED aggregator must still be refused — otherwise a placeholder
+    zero overwrites the previous real occupancy reading. The pre-fold read
+    narrows WHICH usage answers, not WHETHER unknown is refused.
+    """
+    from agent.usage_pricing import prompt_tokens_unknown
+
+    assert prompt_tokens_unknown(CanonicalUsage.fully_unknown()) is True
+    assert (
+        prompt_tokens_unknown(
+            CanonicalUsage(input_tokens=0, input_tokens_unknown=True)
+        )
+        is True
+    )

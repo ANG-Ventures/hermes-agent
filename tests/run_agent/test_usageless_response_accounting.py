@@ -98,6 +98,14 @@ def captured_turn_usage(monkeypatch):
     def _fake_invoke_hook(name, **kwargs):
         if name == "on_session_end":
             seen["turn_usage"] = kwargs.get("turn_usage")
+        # `invoke_hook` is declared `-> List[Any]` (hermes_cli/lifecycle.py) and
+        # `agent/turn_finalizer.py` iterates the result. Returning None made two
+        # hook legs (pre_llm_call, transform_llm_output) raise TypeError into
+        # their bare `except Exception`, so these end-to-end tests exercised the
+        # error handler instead of the shipped path while still reporting PASSED
+        # (r6 round-4 finding 12). `[]` is exactly what the real invoke_hook
+        # returns when no plugin handles a hook.
+        return []
 
     monkeypatch.setattr(lifecycle, "invoke_hook", _fake_invoke_hook)
     return seen
@@ -368,3 +376,119 @@ def test_no_call_normalization_still_means_a_known_zero():
     assert no_call.usage_unknown is False
     assert no_call.total_tokens_unknown is False
     assert no_call.total_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# r6 round-4 finding 13 — `session_cost_status` must not get MORE complete.
+#
+# r4's finding fixed the priced-then-unknown order (pinned above as
+# `test_usageless_turn_does_not_relabel_a_session_with_priced_dollars`). The
+# MIRROR was not covered: because this PR now persists a usage-less call rather
+# than dropping it, an unpriceable call FOLLOWED by a priced one overwrote the
+# session label back to `estimated` — a label that claims a complete total,
+# over a total that omits the first call's unpriceable spend.
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_then_priced_does_not_relabel_the_session_complete(real_session_db):
+    agent = _make_agent(real_session_db, _response(usage=None))
+    agent.run_conversation("turn one")
+
+    assert agent.session_cost_status == "unknown"
+    assert agent.session_estimated_cost_usd == 0
+
+    _set_response(agent, _response(usage=_MEASURED))
+    agent.run_conversation("turn two")
+
+    assert agent.session_estimated_cost_usd > 0, "turn two really was priced"
+    assert agent.session_cost_status == "partial", (
+        "the session now holds real priced dollars but still omits turn one's "
+        "unpriceable spend — `estimated` would claim a complete total. "
+        "`partial` is also what keeps the row inside the reprice allowlist "
+        "that `unknown` is filtered out of forever"
+    )
+
+
+def test_a_sessions_first_priced_call_is_not_pinned_partial_by_the_initial_placeholder(
+    real_session_db,
+):
+    """The `prior_api_calls` discriminator, by execution.
+
+    A fresh agent initialises `session_cost_status = "unknown"` with zero calls
+    accounted. That is UNSTARTED, not incomplete — merging against it would pin
+    every session's very first priced call to `partial` forever.
+    """
+    agent = _make_agent(real_session_db, _response(usage=_MEASURED))
+    assert agent.session_cost_status == "unknown"
+    assert agent.session_api_calls == 0
+
+    agent.run_conversation("turn one")
+
+    assert agent.session_cost_status == "estimated"
+
+
+def test_two_measured_turns_keep_the_complete_label(real_session_db):
+    """Control: the worst-of merge must not degrade an all-measured session."""
+    agent = _make_agent(real_session_db, _response(usage=_MEASURED))
+    agent.run_conversation("turn one")
+    _set_response(
+        agent,
+        _response(usage={"prompt_tokens": 50, "completion_tokens": 9, "total_tokens": 59}),
+    )
+    agent.run_conversation("turn two")
+
+    assert agent.session_cost_status == "estimated"
+
+
+# ---------------------------------------------------------------------------
+# r6 round-4 finding 4/7 — the SESSION-level unknown latch, end to end.
+#
+# The five `session_*` counters are plain ints: an unmeasured call adds the
+# canonical 0 and leaves no trace. `agent.last_turn_usage` — despite the name —
+# is rewritten on every provider CALL, so stamping its flags onto a cumulative
+# total was wrong in both directions. These pins drive the real loop over the
+# orderings that discriminate a per-call flag from a session-scoped one.
+# ---------------------------------------------------------------------------
+
+
+def test_the_session_unknown_latch_survives_a_later_measured_turn(real_session_db):
+    """Mode 1: an earlier unmeasured call must not be erased by a later one."""
+    from gateway.slash_commands import _resident_thin_snapshot, render_thin_last_turn_lines
+
+    agent = _make_agent(real_session_db, _response(usage=None))
+    agent.run_conversation("turn one")
+    assert agent.session_usage_unknown is True
+
+    _set_response(agent, _response(usage=_MEASURED))
+    agent.run_conversation("turn two")
+
+    # The last CALL was measured — the old per-call read would report exact.
+    assert agent.last_turn_usage["usage_unknown"] is False
+    assert agent.session_usage_unknown is True, "the latch is absorbing"
+    assert agent.session_input_tokens == 4000
+
+    snap = _resident_thin_snapshot(agent)
+    assert snap.get("usage_unknown") is True
+    text = "\n".join(render_thin_last_turn_lines(snap, "resident"))
+    assert "Total (billed in+out): unknown" in text
+    assert "Total (billed in+out): 4,120" not in text, (
+        "a cumulative total missing an unmeasured call must not read as exact"
+    )
+
+
+def test_a_fully_measured_session_never_acquires_the_latch(real_session_db):
+    """Mode 2 control: measured totals must keep rendering their real numbers."""
+    from gateway.slash_commands import _resident_thin_snapshot, render_thin_last_turn_lines
+
+    agent = _make_agent(real_session_db, _response(usage=_MEASURED))
+    agent.run_conversation("turn one")
+    agent.run_conversation("turn two")
+
+    assert agent.session_usage_unknown is False
+    assert agent.session_input_tokens == 8000
+
+    snap = _resident_thin_snapshot(agent)
+    assert not any(k.endswith("_unknown") for k in snap)
+    text = "\n".join(render_thin_last_turn_lines(snap, "resident"))
+    assert "Total (billed in+out): 8,240" in text
+    assert "unknown" not in text

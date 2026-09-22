@@ -1757,6 +1757,35 @@ def prompt_tokens_unknown(usage: Any) -> bool:
     ))
 
 
+def last_call_prompt_unknown(record: Any) -> bool:
+    """Was the FINAL call's prompt count unmeasured? The one gate, for every renderer.
+
+    ``context_used`` and the ``last_cache_*`` split describe the final call
+    ONLY. The turn-level ``*_unknown`` flags are absorbing (``any()`` over every
+    call of the turn, ``agent/turn_finalizer.py::_rollup_turn_usage``), so they
+    answer a different question and would blank a fully measured final call just
+    because call #2 returned no usage (r6 finding 9).
+
+    Two shapes reach this, and both must agree — ``plugins/blackbox/last_turn.py``
+    renders a raw ``SELECT *`` dict row, ``plugins/blackbox/card.py`` renders a
+    hydrated ``TurnRecord``. Duplicating the rule per renderer is how the two
+    drifted in the first place (r6 round-4 finding 6: ``• Context: 0/200k 🟢``
+    on the same record ``/context`` read as ``unknown``), so it lives here once.
+
+    NULL is not False. ``plugins/blackbox/store.py`` ALTERs this column in
+    without a DEFAULT, so rows written before it existed hold SQL NULL — and
+    ``TurnRecord.last_call_prompt_unknown`` is typed ``bool`` but carries that
+    ``None`` straight through ``_record_from_row``. A bare truth test on
+    ``None`` silently asserts "the final call was measured" about every historic
+    row. Those rows fall back to the turn-level flag, i.e. exactly the behaviour
+    they already had before the column existed.
+    """
+    flag = _usage_get(record, "last_call_prompt_unknown", None)
+    if flag is None:
+        return prompt_tokens_unknown(record)
+    return bool(flag)
+
+
 def _usage_has(obj: Any, name: str) -> bool:
     """True when a usage object carries ``name`` at all (even as None)."""
     if isinstance(obj, dict):
@@ -2544,9 +2573,25 @@ def normalize_usage(
         _usage_has(response_usage, key) and _usage_get(response_usage, key) is not None
         for key in _OUTPUT_COUNT_KEYS
     )
-    _payload_measured = input_measured and output_measured and not (
-        input_unknown or output_unknown
-    )
+    # The CACHE buckets are input-side. `cache_read`/`cache_write` are
+    # components of the prompt, so whether a top-level cache null means "no
+    # caching on this request" is answered by the INPUT side alone. Requiring a
+    # measured OUTPUT too made a payload with a measured prompt, an explicitly
+    # unmeasured output (`completion_tokens: null` + `output_tokens_unavailable`)
+    # and a unified-schema `cache_read_input_tokens: null` mark the cache
+    # UNKNOWN — which ORs into `prompt_tokens_unknown` and
+    # `last_call_prompt_unknown`, so the compressor skipped a real prompt
+    # occupancy update and Blackbox blanked the window numbers, for a call whose
+    # window WAS measured (r6 round-4 finding 9, the claude-bpx parallel-batch
+    # shape). The turn is already correctly unpriceable via
+    # `output_tokens_unknown`; nothing is gained by also losing the prompt.
+    #
+    # This narrows ONLY the top-level-alias case. Both settled contracts are
+    # untouched: a null details CONTAINER is still no-cache-breakdown → measured
+    # zeros, and a null count INSIDE a present container is still UNKNOWN (the
+    # provider is speaking the cache dialect and declined to fill in the
+    # number) — `_cache_bucket_is_unknown` decides those before consulting this.
+    _prompt_side_measured = input_measured and not input_unknown
     # A null details CONTAINER is not an unknown COUNT. ``"prompt_tokens_details":
     # null`` is the ordinary serialization of an OpenAI-compatible server that has
     # no cache breakdown to report (any encoder without ``exclude_none`` emits it,
@@ -2566,7 +2611,7 @@ def normalize_usage(
         response_usage,
         ("cache_read_tokens_unavailable",),
         container=details,
-        payload_measured=_payload_measured,
+        payload_measured=_prompt_side_measured,
     )
     cache_write_unknown = _cache_bucket_is_unknown(
         (
@@ -2576,7 +2621,7 @@ def normalize_usage(
         response_usage,
         ("cache_write_tokens_unavailable",),
         container=details,
-        payload_measured=_payload_measured,
+        payload_measured=_prompt_side_measured,
     )
     if mode != "anthropic_messages" and provider_name != "anthropic":
         input_unknown = input_unknown or cache_read_unknown or cache_write_unknown
@@ -2888,6 +2933,74 @@ def estimate_usage_cost(
         cost_cache_read_usd=cost_cache_read,
         cost_cache_write_usd=cost_cache_write,
     )
+
+
+def measured_cost_floor(
+    model_name: str,
+    usage: CanonicalUsage,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[Decimal]:
+    """A LOWER BOUND on what this call bills, priced from the MEASURED buckets only.
+
+    ``estimate_usage_cost`` refuses any usage with ``total_tokens_unknown`` and
+    that refusal is correct and settled: a total missing a term is not a total,
+    and a partial number must never be persisted or displayed as the turn's
+    cost. This is deliberately NOT that number. It is a floor, for decisions —
+    "is one attempt already over the ceiling?" — and it is never persisted,
+    never rendered, and never fed back into ``cost_status``.
+
+    Why it has to exist (r6 round-4 finding 3). The deterministic-empty guard
+    correctly stopped classifying a declared-unmeasured output as a measured
+    zero, but the cost-aware guard beside it was ALREADY inert for the same
+    payloads: it asks ``estimate_usage_cost``, gets ``None``, and falls back to
+    the full 3-retry budget. So a bridge that declares only its OUTPUT
+    unmeasured (``completion_tokens: null`` + ``output_tokens_unavailable``,
+    prompt fully measured) lost both protections at once, and every unsignaled
+    empty re-sent the whole prompt three times — the exact "charged ~$2.33 for
+    an empty answer" incident class ``agent/empty_response_guard.py`` exists to
+    prevent, except now at whatever the prompt actually costs.
+
+    The data is right there: the INPUT buckets are measured in that payload,
+    and input is what an empty attempt actually bills. Pricing what is known
+    and omitting what is not gives a number that is wrong only in the safe
+    direction — it can never exceed the real bill, so a ceiling that trips on
+    it cannot trip early.
+
+    Returns ``None`` when nothing can be priced: no measured bucket, no pricing
+    entry, or a rate missing for a measured bucket. A subscription-included
+    route floors at ``0`` — its marginal cost is $0 by definition of the route.
+    """
+    zeroed = CanonicalUsage(
+        input_tokens=0 if usage.input_tokens_unknown or usage.usage_unknown else usage.input_tokens,
+        output_tokens=(
+            0 if usage.output_tokens_unknown or usage.usage_unknown else usage.output_tokens
+        ),
+        cache_read_tokens=(
+            0
+            if usage.cache_read_tokens_unknown or usage.usage_unknown
+            else usage.cache_read_tokens
+        ),
+        cache_write_tokens=(
+            0
+            if usage.cache_write_tokens_unknown or usage.usage_unknown
+            else usage.cache_write_tokens
+        ),
+        reasoning_tokens=usage.reasoning_tokens,
+        request_count=usage.request_count,
+    )
+    if zeroed.total_tokens <= 0:
+        # Nothing measured survived; there is no floor to state. (A genuinely
+        # all-zero MEASURED usage does not reach here — it has no unknown flag,
+        # so estimate_usage_cost prices it directly.)
+        route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+        return _ZERO if route.billing_mode == "subscription_included" else None
+    result = estimate_usage_cost(
+        model_name, zeroed, provider=provider, base_url=base_url, api_key=api_key
+    )
+    return result.amount_usd
 
 
 def has_known_pricing(

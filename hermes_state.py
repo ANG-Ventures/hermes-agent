@@ -9894,9 +9894,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    END,
                    cost_status = CASE
                        WHEN ? IS NULL THEN cost_status
-                       WHEN ? = 'unknown' AND (
-                           COALESCE(?, 0) > 0 OR COALESCE(actual_cost_usd, 0) > 0
-                       ) THEN 'partial'
+                       WHEN ? IN ('unknown', 'partial') THEN (
+                           CASE WHEN COALESCE(?, 0) > 0
+                                     OR CASE WHEN ? IS NULL
+                                             THEN COALESCE(actual_cost_usd, 0)
+                                             ELSE ? END > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
                        ELSE ?
                    END,
                    cost_source = COALESCE(?, cost_source),
@@ -9926,10 +9930,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    END,
                    cost_status = CASE
                        WHEN ? IS NULL THEN cost_status
-                       WHEN ? = 'unknown' AND (
-                           COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0) > 0
-                           OR COALESCE(actual_cost_usd, 0) > 0
-                       ) THEN 'partial'
+                       WHEN ? IN ('unknown', 'partial') THEN (
+                           CASE WHEN COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0) > 0
+                                     OR CASE WHEN ? IS NULL
+                                             THEN COALESCE(actual_cost_usd, 0)
+                                             ELSE COALESCE(actual_cost_usd, 0) + ? END > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
                        ELSE ?
                    END,
                    cost_source = COALESCE(?, cost_source),
@@ -9959,11 +9966,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             estimated_cost_usd,
             actual_cost_usd,
             actual_cost_usd,
-            # cost_status CASE: (is it NULL?), (is it 'unknown'?), the dollars
-            # this write contributes, and the value to store otherwise.
+            # cost_status CASE: (is it NULL?), (is it incomplete?), the
+            # estimated dollars this write contributes, (is actual NULL?), the
+            # actual dollars this write contributes, and the value to store
+            # otherwise.
+            #
+            # Both incomplete labels are judged, and both are judged against the
+            # POST-update estimated AND actual (r6 round-4 finding 10). The old
+            # shape asked only `= 'unknown'` against incoming estimated + OLD
+            # actual, so: a NULL-keep write relabelled a row holding retained
+            # catalog spend as 'unknown' (stranding it — 'unknown' is outside
+            # the reprice allowlist); a first actual of $5 arriving with
+            # 'unknown' stayed 'unknown' because this statement's own actual was
+            # invisible to the test; and an incoming 'partial' fell to the ELSE
+            # arm and was stored verbatim even after a $0 replace left the row
+            # with no dollars to be partial about. Same rule the model-usage
+            # upsert below already applies.
             cost_status,
             cost_status,
             estimated_cost_usd,
+            actual_cost_usd,
+            actual_cost_usd,
             cost_status,
             cost_source,
             pricing_version,

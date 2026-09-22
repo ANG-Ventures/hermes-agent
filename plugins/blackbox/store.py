@@ -350,8 +350,27 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         _status_guard = (
             " AND cost_status = 'unknown'" if "cost_status" in _existing else ""
         )
+        # All five columns, not just the aggregate (r6 round-4 finding 8). A
+        # migrated row IS the shape `CanonicalUsage.fully_unknown()` describes —
+        # the provider measured NO bucket — and that classmethod's docstring
+        # states why the aggregate alone is insufficient: consumers read these
+        # flags NARROWLY. `plugins/blackbox/card.py::_tokens_out_line` and the
+        # thin `/usage` card gate the output line on `output_tokens_unknown`
+        # ALONE, and `prompt_tokens_unknown` ORs only the three input flags.
+        # Setting `usage_unknown` by itself therefore left every migrated row
+        # still rendering `0 out` as a measurement on exactly the surfaces this
+        # latch exists to correct.
+        #
+        # Same `_existing` guard as the counts above: an old DB that never
+        # gained a column cannot be updated on it, and naming it would abort the
+        # whole migration with "no such column". Note `_existing` is the
+        # PRE-ALTER snapshot, so it CANNOT be used here — in the migration case
+        # it is precisely the set that lacks these columns. The ALTERs above run
+        # unconditionally for all five and re-raise anything other than
+        # "duplicate column", so reaching this line means all five exist.
+        _set_clause = ", ".join(f"{c} = 1" for c in sorted(unknown_columns))
         conn.execute(
-            "UPDATE turns SET usage_unknown = 1 "
+            f"UPDATE turns SET {_set_clause} "
             "WHERE cost_usd IS NULL "
             "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
             "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"

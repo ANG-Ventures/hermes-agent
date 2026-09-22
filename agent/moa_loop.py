@@ -2208,6 +2208,19 @@ class MoAChatCompletions:
                                 "cache_read_tokens": _acct.usage.cache_read_tokens,
                                 "cache_write_tokens": _acct.usage.cache_write_tokens,
                                 "reasoning_tokens": _acct.usage.reasoning_tokens,
+                                # This advisor's OWN pricing verdict, from the
+                                # estimate_usage_cost call `_run_reference`
+                                # already made at its own route. Carried so the
+                                # session lane can see a MEASURED-but-unpriceable
+                                # advisor — an uncatalogued route returns
+                                # amount_usd=None with fully measured tokens, so
+                                # no unknown FLAG is set and the advisor's real
+                                # dollars silently never enter the session total
+                                # (r6 round-4 finding 1). Ignored by
+                                # plugins/blackbox/cost.py, which re-prices these
+                                # calls itself.
+                                "cost_usd": _acct.cost_usd,
+                                "cost_status": _acct.cost_status,
                             })
                     if _acct.cost_usd is not None:
                         _ref_cost = (_ref_cost or 0) + _acct.cost_usd

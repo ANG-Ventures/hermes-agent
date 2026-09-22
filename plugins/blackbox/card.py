@@ -97,8 +97,21 @@ def _session_line(platform: str, chat_id: str, chat_name: str) -> str:
 
 
 def _context_line(record: TurnRecord) -> str:
+    from agent.usage_pricing import last_call_prompt_unknown
+
     used = int(record.context_used or 0)
     length = int(record.context_length or 0)
+    # `context_used` is the FINAL call's provider prompt count
+    # (agent/turn_finalizer.py:944 reads context_compressor.last_prompt_tokens).
+    # When THAT call returned no usage payload the stored value is a
+    # placeholder, so dividing it by the window fabricates a measurement —
+    # `• Context: 0/200k 🟢 (0% of model max)` for exactly the turns the
+    # provider declined to measure. Same gate `last_turn.py` renders this record
+    # through, via the one shared callable, so the two renderers over one record
+    # cannot disagree (r6 round-4 finding 6).
+    if last_call_prompt_unknown(record):
+        suffix = f"/{humanize_tokens(length)}" if length > 0 else ""
+        return f"{humanize_tokens(0, unknown=True)}{suffix}"
     if length <= 0:
         return humanize_tokens(used)
     pct = used / length * 100

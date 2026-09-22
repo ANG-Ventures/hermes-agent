@@ -184,3 +184,236 @@ def test_f6_extracted_helpers_are_callable_without_parsing_source():
         "120,000", "8,000", "128,000")
     assert cache_stats_line(
         normalize_usage({"prompt_tokens": 100, "completion_tokens": 50}), 100) is None
+
+
+# ===========================================================================
+# r6 round-4 finding 3 — the cost of the F5 trade, pinned AT REAL CONTEXT SIZE.
+#
+# The F5 hunk above is deliberate and correct: a declared-unmeasured output is
+# not a measured zero, so it must not classify as a deterministic empty. But it
+# removed the LAST protection for those payloads, because the cost-aware guard
+# beside it was ALREADY inert for them — `empty_retry_budget` asks
+# `estimate_usage_cost`, which REFUSES any usage with `total_tokens_unknown`,
+# gets None, and falls back to the full 3-retry budget.
+#
+# So a bridge that declares only its OUTPUT unmeasured lost both protections at
+# once, and every unsignaled empty re-sent the whole prompt three times — the
+# "charged ~$2.33 for an empty answer" incident class that module's own
+# docstring names. The F5 pin above could not see it: at `prompt_tokens: 150`
+# the cost is nil, so the trade read as free.
+#
+# The recovery is `measured_cost_floor` — price the MEASURED buckets only, for
+# a DECISION, never for display or persistence. It can only understate the bill,
+# so a ceiling that trips on it cannot trip early.
+# ===========================================================================
+
+_REALISTIC_PROMPT = 400_000
+# The bridge route this PR targets, speaking the OpenAI-compatible dialect the
+# wire below uses. The dialect matters: normalize_usage(provider="anthropic")
+# reads `input_tokens`, not `prompt_tokens`, so an anthropic-labelled route over
+# this wire normalizes the prompt to 0 and the fixture silently proves nothing.
+_PRICED_ROUTE = {"model": "claude-opus-5", "provider": "claude-bpx-1"}
+
+
+def _cost_agent():
+    return SimpleNamespace(
+        model=_PRICED_ROUTE["model"],
+        provider=_PRICED_ROUTE["provider"],
+        api_mode="chat_completions",
+        base_url=None,
+        api_key=None,
+        _empty_content_retries=0,
+    )
+
+
+def _unsignaled_empty_wire(prompt_tokens):
+    """The bridge shape: measured prompt, explicitly UNMEASURED output."""
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "output_tokens_unavailable": True,
+    }
+
+
+def test_f3_fixture_soundness_the_wire_really_normalizes_to_a_measured_prompt():
+    """Guard the fixture itself — a 0-normalized prompt makes every F3 pin vacuous.
+
+    These pins only mean something if the wire's 400k really survives
+    `normalize_usage` on the route under test AND the output really is declared
+    unmeasured. Get the dialect wrong (e.g. label the route `anthropic`, which
+    reads `input_tokens` rather than `prompt_tokens`) and the prompt silently
+    normalizes to 0 — both arms then agree for the wrong reason and the suite
+    reports a regression as fixed.
+    """
+    usage = normalize_usage(
+        _unsignaled_empty_wire(_REALISTIC_PROMPT),
+        provider=_PRICED_ROUTE["provider"],
+        api_mode="chat_completions",
+    )
+    assert usage.prompt_tokens == _REALISTIC_PROMPT, "dialect mismatch — pins vacuous"
+    assert usage.output_tokens_unknown is True
+    assert usage.total_tokens_unknown is True
+    assert usage.input_tokens_unknown is False
+
+
+def test_f3_the_cost_ceiling_bites_on_an_unmeasured_output_at_real_context_size():
+    """The regression the 150-token pin could not see.
+
+    At 400k measured input on a catalogued route, ONE empty attempt is already
+    far over the cost threshold — so the budget must drop to 1, not stay at 3.
+    Three full re-sends of a 400k prompt is the whole incident class.
+    """
+    from agent.empty_response_guard import (
+        DEFAULT_EMPTY_RETRY_BUDGET,
+        REDUCED_EMPTY_RETRY_BUDGET,
+        empty_retry_budget,
+    )
+
+    agent = _cost_agent()
+    response = SimpleNamespace(usage=_unsignaled_empty_wire(_REALISTIC_PROMPT))
+
+    budget = empty_retry_budget(agent, response)
+    assert budget == REDUCED_EMPTY_RETRY_BUDGET, (
+        "an unmeasured OUTPUT must not buy the full retry budget for a 400k "
+        "MEASURED prompt — the input is what an empty attempt actually bills"
+    )
+    assert budget != DEFAULT_EMPTY_RETRY_BUDGET
+
+
+def test_f3_a_cheap_prompt_still_gets_the_full_budget():
+    """NARROWNESS control — and the reason the old pin read as free.
+
+    The floor must not collapse the budget for every unmeasured output; it is a
+    COST ceiling, so a small prompt keeps its retries. This is the same 150-token
+    shape `test_f5_unknown_output_does_not_classify_as_deterministic_empty`
+    pins, asserted on the cost lane.
+    """
+    from agent.empty_response_guard import DEFAULT_EMPTY_RETRY_BUDGET, empty_retry_budget
+
+    agent = _cost_agent()
+    response = SimpleNamespace(usage=_unsignaled_empty_wire(150))
+
+    assert empty_retry_budget(agent, response) == DEFAULT_EMPTY_RETRY_BUDGET
+
+
+def test_f3_the_floor_understates_and_never_exceeds_the_real_bill():
+    """The floor's safety property, by execution.
+
+    `measured_cost_floor` prices what is known and omits what is not, so it is
+    wrong only in the safe direction. A ceiling comparison against it can never
+    trip EARLY — which is what makes it legitimate for a decision even though
+    `estimate_usage_cost` correctly refuses to state this usage's cost at all.
+    """
+    from agent.usage_pricing import measured_cost_floor
+
+    unmeasured_output = CanonicalUsage(
+        input_tokens=_REALISTIC_PROMPT, output_tokens=0, output_tokens_unknown=True
+    )
+    # The settled contract is untouched: the real cost is still refused.
+    assert estimate_usage_cost(
+        _PRICED_ROUTE["model"], unmeasured_output, provider=_PRICED_ROUTE["provider"]
+    ).amount_usd is None
+
+    floor = measured_cost_floor(
+        _PRICED_ROUTE["model"], unmeasured_output, provider=_PRICED_ROUTE["provider"]
+    )
+    assert floor is not None and floor > 0
+
+    # Same call had its output been measured at a plausible size: strictly more.
+    with_output = CanonicalUsage(input_tokens=_REALISTIC_PROMPT, output_tokens=2_000)
+    real = estimate_usage_cost(
+        _PRICED_ROUTE["model"], with_output, provider=_PRICED_ROUTE["provider"]
+    ).amount_usd
+    assert real is not None
+    assert floor <= real, "a floor that exceeds the bill would trip the ceiling early"
+
+
+def test_f3_nothing_measured_has_no_floor_to_state():
+    """A wholly unmeasured usage yields None, not a fabricated 0.
+
+    Inventing a $0 floor here would be the silent-zero defect in the decision
+    lane — it would read as "this attempt is free" and restore the full budget
+    under a different name.
+    """
+    from agent.usage_pricing import measured_cost_floor
+
+    assert (
+        measured_cost_floor(
+            _PRICED_ROUTE["model"],
+            CanonicalUsage.fully_unknown(),
+            provider=_PRICED_ROUTE["provider"],
+        )
+        is None
+    )
+
+
+def test_f3_the_streak_line_says_at_least_when_the_figure_is_a_floor():
+    """A floor must not be presented to the user as the estimate of the whole.
+
+    The streak line is user-facing money. Showing a measured-buckets-only lower
+    bound as `~$X` is an UNKNOWN rendered as an exact figure — the same defect
+    class this PR removes, one level down.
+    """
+    from agent.empty_response_guard import (
+        record_empty_attempt,
+        streak_cost_is_floor,
+        streak_cost_usd,
+    )
+
+    agent = _cost_agent()
+    for i in range(2):
+        agent._empty_content_retries = i
+        record_empty_attempt(
+            agent,
+            finish_reason="stop",
+            response=SimpleNamespace(usage=_unsignaled_empty_wire(_REALISTIC_PROMPT)),
+        )
+
+    assert streak_cost_usd(agent) is not None
+    assert streak_cost_is_floor(agent) is True
+
+    # MEASURED control: a fully measured streak is an estimate, not a floor.
+    measured = _cost_agent()
+    for i in range(2):
+        measured._empty_content_retries = i
+        record_empty_attempt(
+            measured,
+            finish_reason="stop",
+            response=SimpleNamespace(
+                usage={
+                    "prompt_tokens": _REALISTIC_PROMPT,
+                    "completion_tokens": 0,
+                    "total_tokens": _REALISTIC_PROMPT,
+                }
+            ),
+        )
+    assert streak_cost_usd(measured) is not None
+    assert streak_cost_is_floor(measured) is False
+
+
+def test_f3_the_f5_trade_itself_is_preserved():
+    """The hunk F3 is about is NOT reverted — both guards now hold at once.
+
+    F5 stays: a declared-unmeasured output still refuses to classify as a
+    deterministic empty (that would be a measured-zero claim). F3 restores the
+    OTHER protection beside it, so the payload is no longer unguarded.
+    """
+    from agent.empty_response_guard import (
+        REDUCED_EMPTY_RETRY_BUDGET,
+        deterministic_empty,
+        empty_retry_budget,
+        record_empty_attempt,
+    )
+
+    agent = _cost_agent()
+    wire = _unsignaled_empty_wire(_REALISTIC_PROMPT)
+    for i in range(2):
+        agent._empty_content_retries = i
+        record_empty_attempt(agent, finish_reason="stop", response=SimpleNamespace(usage=wire))
+
+    assert deterministic_empty(agent) is False, "F5's trade stands"
+    assert (
+        empty_retry_budget(agent, SimpleNamespace(usage=wire))
+        == REDUCED_EMPTY_RETRY_BUDGET
+    ), "but the cost ceiling is no longer inert for the same payload"
