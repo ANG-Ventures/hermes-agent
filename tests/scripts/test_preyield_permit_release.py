@@ -664,6 +664,265 @@ def test_guard_does_not_demand_a_release_from_a_swallowing_arm():
     assert violations == []
 
 
+# --------------------------------------------------------------------------
+# 3b. Reachability: "can control reach the end of this arm?", not "is the last
+#     statement a bare raise/return?".  Every shape below is a MEASURED
+#     1-permit leak (real asyncio.Semaphore, synchronous fault at the pre-yield
+#     log) that was CLEAN on both the #860 guard and the #863 candidate.
+# --------------------------------------------------------------------------
+
+
+def _sibling_arm_source(narrow_arm: str) -> str:
+    """A two-arm gate: a narrow arm under test + a correct BaseException arm.
+
+    The sibling matters: with only the narrow arm the try has no
+    ``BaseException`` coverage and is flagged for that reason instead, so the
+    fixture would pass for the wrong reason.  The correct sibling is what makes
+    the narrow arm's own classification the thing under test.
+    """
+    return textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager, suppress
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+        {arm}
+            except BaseException:
+                sem.release()
+                raise
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    ).replace("{arm}", textwrap.indent(textwrap.dedent(narrow_arm), "    ").rstrip())
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        ("if cond: raise", "except Boom:\n    if surface:\n        raise\n"),
+        (
+            "raise inside an inner try/finally",
+            "except Boom:\n    try:\n        raise\n    finally:\n        pass\n",
+        ),
+        (
+            "raise inside a with",
+            "except Boom:\n    with suppress(ValueError):\n        raise\n",
+        ),
+        ("raise inside a for", "except Boom:\n    for _ in (1,):\n        raise\n"),
+        ("if cond: return", "except Boom:\n    if surface:\n        return\n"),
+    ],
+)
+def test_guard_flags_a_conditionally_exiting_arm_that_does_not_release(shape, arm):
+    """FINDING 1: an arm that exits through a COMPOUND statement still owes.
+
+    The old rule read ``reversed(handler.body)`` and returned True only on a
+    BARE trailing ``Raise``/``Return``, breaking on any other statement type.
+    So each shape here was classified as swallowing and excused from
+    releasing, while the correct ``BaseException`` sibling made the chain look
+    satisfied.  All five are measured 1-permit leaks.
+    """
+    guard = _load_guard()
+    _sites, violations = guard.scan_source(_sibling_arm_source(arm), "new.py")
+    assert [v["function"] for v in violations] == ["gate"], (
+        f"an arm that exits via {shape} must be asked to release"
+    )
+
+
+def test_conditionally_exiting_arm_is_accepted_once_it_releases():
+    """The discriminator's other side: releasing first clears the same shape.
+
+    Argus's CONTROL I6 — measured NOT to leak — so the new rule must not flag
+    it, or the fixture above would pass by flagging everything.
+    """
+    guard = _load_guard()
+    releasing = "except Boom:\n    sem.release()\n    if surface:\n        raise\n"
+    _sites, violations = guard.scan_source(_sibling_arm_source(releasing), "new.py")
+    assert violations == []
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        (
+            "nested def",
+            "except BaseException:\n    def _later():\n        sem.release()\n    raise\n",
+        ),
+        (
+            "if False",
+            "except BaseException:\n    if False:\n        sem.release()\n    raise\n",
+        ),
+        (
+            "loop over an empty literal",
+            "except BaseException:\n    for _ in []:\n        sem.release()\n    raise\n",
+        ),
+    ],
+)
+def test_guard_does_not_credit_an_unreachable_release(shape, arm):
+    """FINDING 2: ``ast.walk`` counted a release that can never run.
+
+    A release buried in a nested ``def`` (its own lifecycle), under
+    ``if False:``, or in the body of a loop over an empty literal is textually
+    present and never executes.  All three are measured 1-permit leaks.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+        {arm}
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    ).replace("{arm}", textwrap.indent(textwrap.dedent(arm), "    ").rstrip())
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert [v["function"] for v in violations] == ["gate"], (
+        f"a release reachable only via {shape} must not satisfy the check"
+    )
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        ("under a runtime condition", "if surface:\n    sem.release()\n"),
+        ("in a loop over a non-empty literal", "for _ in (1,):\n    sem.release()\n"),
+        ("in a with body", "with suppress(ValueError):\n    sem.release()\n"),
+    ],
+)
+def test_guard_still_credits_a_conditionally_reachable_release(shape, arm):
+    """The reachability narrowing must not reject releases that CAN run.
+
+    Only statically-dead paths lose credit; anything the compiler cannot
+    settle stays creditable, or the finding-2 fixture would pass by rejecting
+    every non-trivial release.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager, suppress
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+            except BaseException:
+        {arm}
+                raise
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    ).replace("{arm}", textwrap.indent(textwrap.dedent(arm), "        ").rstrip())
+    # Two releases: the one under test in the handler, and the finally around
+    # the yield. If the fixture ever loses one, it is no longer the shape.
+    assert source.count("sem.release()") == 2
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert violations == [], f"a release {shape} is reachable and must count"
+
+
+def test_guard_does_not_flag_a_sole_swallowing_baseexception_arm():
+    """FINDING 3: ``except BaseException: pass`` as the ONLY arm is SAFE.
+
+    The arm swallows and control proceeds to the yield still legitimately
+    holding the permit — measured NOT to leak.  The old code asked for a
+    ``BaseException`` among the EXITING arms only, so a chain whose sole arm
+    swallows produced an empty exiting-set and was reported as unprotected,
+    contradicting the guard's own swallow rationale.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+            except BaseException:
+                pass
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    )
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert violations == []
+
+
+def test_guard_does_not_flag_a_narrow_releasing_arm_beside_a_swallowing_base():
+    """FINDING 3 (H2): narrow arm releases+raises, BaseException swallows.
+
+    Neither path leaks — the narrow arm hands the permit back before exiting,
+    and the BaseException arm falls through to the yield still holding it.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+            except ValueError:
+                sem.release()
+                raise
+            except BaseException:
+                pass
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    )
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert violations == []
+
+
+def test_swallowing_chain_still_needs_baseexception_coverage():
+    """A swallow-only chain that does NOT cover BaseException is still a leak.
+
+    ``except ValueError: pass`` catches nothing a cancel raises, so the window
+    remains unprotected — finding 3's relaxation must not extend to it.
+    """
+    guard = _load_guard()
+    source = textwrap.dedent(
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def gate(sem, surface):
+            await sem.acquire()
+            try:
+                _LOG.info("admitted %s", surface)
+            except ValueError:
+                pass
+            try:
+                yield
+            finally:
+                sem.release()
+        """
+    )
+    _sites, violations = guard.scan_source(source, "new.py")
+    assert [v["function"] for v in violations] == ["gate"]
+
+
 def test_guard_enumerates_both_permits_at_the_live_turn_admission_site():
     """Positive coverage on the REAL multi-permit site, named not counted."""
     guard = _load_guard()
