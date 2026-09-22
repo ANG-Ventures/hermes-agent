@@ -14880,6 +14880,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             PriorLifeVerdict,
             classify_prior_life,
             read_last_event_loop_blocked_site,
+            read_planned_restart,
         )
 
         home = getattr(self, "_unclean_restart_home", None)
@@ -14895,7 +14896,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             site = getattr(self, "_unclean_restart_site", None)
             if site is None:
                 site = read_last_event_loop_blocked_site(home)
-            verdict = classify_prior_life(sentinel, site=site)
+            planned = None
+            try:
+                _ended = (sentinel or {}).get("prior_exited_at") or (sentinel or {}).get("prior_started_at")
+                planned = read_planned_restart(_ended, home)
+            except Exception:
+                planned = None
+            verdict = classify_prior_life(sentinel, site=site, planned=planned)
         except Exception:
             logger.debug("Prior-life verdict unavailable", exc_info=True)
             verdict = PriorLifeVerdict(unclean=False)
@@ -14934,6 +14941,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             verdict = self._prior_life_verdict()
             message = format_restart_notice(verdict)
             if not message:
+                if verdict.unclean and verdict.planned:
+                    logger.info(
+                        "PHASE=unclean_restart_notice_suppressed key=%s reason=%s planned_by=%s",
+                        session_key, verdict.exit_reason or verdict.killer or "unclean",
+                        verdict.planned_by or "safe-restart",
+                    )
                 return
             # Idempotent per (boot, session): a re-scheduled resume or a crash
             # loop must not spam the channel. The claim does an atomic rename,
