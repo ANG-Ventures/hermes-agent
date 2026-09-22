@@ -560,6 +560,36 @@ _STATE_DB_GUARD_BYPASS_ENV = "HERMES_STATE_DB_GUARD_BYPASS"
 _STATE_DB_GUARD_EXTRA_DENY_ROOTS: Tuple[Path, ...] = ()
 
 
+def _os_account_home() -> Optional[Path]:
+    """The OS ACCOUNT's home directory, immune to an in-process ``$HOME`` swap.
+
+    ``$HOME`` is per-process environment state, and redirecting it to a tmpdir
+    (``monkeypatch.setenv("HOME", tmp_path)``) is THE hermetic-isolation idiom
+    in this repo — 51 test files do it.  The passwd database is a property of
+    the UID, so it keeps naming the operator's real home across that redirect.
+
+    That difference is the entire discriminator this guard needs: it is what
+    separates "this root is production" from "a test moved ``$HOME`` here".
+
+    Returns ``None`` when ``pwd`` is unavailable (Windows, stripped installs)
+    or names a home that does not exist on disk (service accounts with a
+    ``/nonexistent`` entry, some container images); callers fall back to
+    ``os.path.expanduser`` there, i.e. to the previous behaviour on hosts
+    where no better answer exists.  Falling back matters more than being
+    clever: an unusable anchor would point the deny-list at a root nothing
+    ever resolves to, silently disarming the guard.
+    """
+    try:
+        import pwd
+
+        home = pwd.getpwuid(os.getuid()).pw_dir.strip()  # windows-footgun: ok — POSIX-only module inside try/except
+        if home and os.path.isdir(home):
+            return Path(home)
+    except Exception:
+        pass
+    return None
+
+
 def _real_platform_state_root() -> Optional[Path]:
     """Resolve the REAL platform-default Hermes root for the guard.
 
@@ -568,19 +598,37 @@ def _real_platform_state_root() -> Optional[Path]:
     is often imported lazily *while* such a patch is active — resolving
     through the patched callable would misidentify the test's own hermetic
     home as "production" (false positive) or, worse, miss the real one
-    (false negative).  ``os.path.expanduser`` reads the HOME environment
-    variable / passwd entry, which the hermetic conftest never rewrites.
+    (false negative).
+
+    Anchored on the OS ACCOUNT home (:func:`_os_account_home`) rather than
+    ``os.path.expanduser("~")``, which on POSIX is just ``$HOME``.  Reading
+    ``$HOME`` made this function answer "production" for the tmpdir of any
+    test using the hermetic ``monkeypatch.setenv("HOME", tmp_path)`` idiom —
+    so a hermetic board at ``<tmp>/.hermes/kanban.db`` WAS, to the guard, the
+    live board, and both guards refused it (2026-09-21: 2 files / 24 tests
+    red).  A guard that fires on the standard isolation idiom teaches people
+    to disarm it globally, which is how the previous two opt-in mitigations
+    died; keeping it precise is what keeps it armed.
+
+    The account home is still not monkeypatchable from inside a test, so the
+    property the old comment was protecting is preserved — it is simply read
+    from the passwd entry, which ``$HOME`` only aliases when nothing has
+    redirected it.
     """
     try:
+        account_home = _os_account_home()
         if sys.platform == "win32":
             base = os.environ.get("LOCALAPPDATA", "").strip()
             root = (
                 Path(base) / "hermes"
                 if base
-                else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
+                else (account_home or Path(os.path.expanduser("~")))
+                / "AppData"
+                / "Local"
+                / "hermes"
             )
         else:
-            root = Path(os.path.expanduser("~")) / ".hermes"
+            root = (account_home or Path(os.path.expanduser("~"))) / ".hermes"
         return root.resolve()
     except Exception:
         return None
