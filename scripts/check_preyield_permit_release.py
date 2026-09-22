@@ -96,6 +96,13 @@ DOES NOT COVER (stated boundary, not a hidden gap)
     assignment itself is a raise-capable node in the window), so this errs
     toward a false positive, not a miss; a new spelling is WONTFIX unless it
     appears in production code.
+  * **A release whose REACHABILITY depends on runtime values.**  Two measured
+    1-permit leaks sit here and are not caught by any build of this guard: a
+    release that runs only in a nested ``except ValueError`` that never fires,
+    and a release under a runtime-false condition.  The check credits any path
+    the compiler cannot settle (see ``_released_in_stmt``); narrowing that
+    would reject the legitimate ``if acquired: release()`` shape the live
+    multi-permit site uses.  Static reachability is the declared line.
 
 NO LONGER A GAP: releasing the WRONG object used to satisfy the check, because
 matching was by method name.  Release is now matched by RECEIVER
@@ -328,36 +335,79 @@ def _falls_through(stmt: ast.stmt) -> bool:
     return True
 
 
-def _handler_may_exit(handler: ast.ExceptHandler) -> bool:
-    """True if ANY path through this arm can leave via ``raise``/``return``.
+def _inert_expr(node: ast.AST) -> bool:
+    """True only for an expression that provably cannot raise.
 
-    An arm that provably SWALLOWS (no reachable ``raise``/``return`` at all)
-    continues on to the yield with the permit still legitimately held —
-    demanding a release there would be a false positive, and acting on it
-    would be a double release.
-
-    The previous rule asked a much narrower question: "is the LAST statement a
-    bare ``raise``/``return``?", scanning ``reversed(handler.body)`` and
-    breaking on any other statement type.  That excused every arm that exits
-    through a compound statement — ``if cond: raise``, ``raise`` inside an
-    inner ``try``/``with``/``for``, ``if cond: return`` — each a measured
-    1-permit leak.  Asking "can it exit?" instead of "does its last statement
-    exit?" covers the nested forms too.
-
-    Deliberately conservative: a ``raise`` that a nested handler swallows still
-    counts as a possible exit, so such an arm is asked to release.  That is a
-    false positive at worst; the other direction is a missed leak.  Nested
-    function/lambda bodies do not count — they run on their own lifecycle.
+    Deliberately a WHITELIST.  Anything not listed here — a call, an attribute
+    load, a subscript, an ``await``, arithmetic on a name — can leave the arm
+    by raising, and must therefore keep the arm in the "may exit" class.
     """
-    stack: list[ast.AST] = list(handler.body)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.Raise, ast.Return)):
-            return True
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            continue
-        stack.extend(ast.iter_child_nodes(node))
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Name):
+        # A local load can raise NameError only in code that is already broken;
+        # treating it as inert keeps `x = y` out of the exit class.
+        return isinstance(node.ctx, (ast.Load, ast.Store))
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_inert_expr(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            k is not None and _inert_expr(k) for k in node.keys
+        ) and all(_inert_expr(v) for v in node.values)
     return False
+
+
+def _inert_stmt(stmt: ast.stmt) -> bool:
+    """True only for a statement that provably cannot leave the arm."""
+    if isinstance(stmt, (ast.Pass, ast.Break, ast.Continue, ast.Global, ast.Nonlocal)):
+        return True
+    if isinstance(stmt, ast.Expr):
+        return _inert_expr(stmt.value)
+    if isinstance(stmt, ast.Assign):
+        return all(_inert_expr(t) for t in stmt.targets) and _inert_expr(stmt.value)
+    if isinstance(stmt, ast.AnnAssign):
+        return _inert_expr(stmt.target) and (
+            stmt.value is None or _inert_expr(stmt.value)
+        )
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        # Defining a nested callable does not run it; its body is its own
+        # lifecycle.  The `def` statement itself cannot leave the arm.
+        return not stmt.decorator_list
+    return False
+
+
+def _handler_may_exit(handler: ast.ExceptHandler) -> bool:
+    """True unless every statement in this arm PROVABLY cannot leave it.
+
+    An arm that provably SWALLOWS continues on to the yield with the permit
+    still legitimately held — demanding a release there would be a false
+    positive, and acting on it would be a double release.
+
+    Two rules have been wrong here, in opposite directions:
+
+    * "is the LAST statement a bare ``raise``/``return``?" (scanning
+      ``reversed(handler.body)``, breaking on any other statement type) excused
+      every arm that exits through a compound statement — ``if cond: raise``,
+      ``raise`` inside an inner ``try``/``with``/``for``, ``if cond: return`` —
+      each a measured 1-permit leak.
+    * "does it contain an ``ast.Raise``/``ast.Return`` node?" excused every arm
+      that leaves for a reason that is not a ``raise`` STATEMENT: a call that
+      raises, an ``assert``, arithmetic that divides by zero, or a plain
+      logging call given a bad format argument.  All four are measured
+      1-permit leaks that the pre-#873 guard caught.
+
+    "This arm swallows" is not decidable from the AST — the SAME arm text is
+    safe with a benign logger and leaks with a bad format argument.  So the
+    question is inverted and answered on a whitelist: an arm is excused only
+    when every statement in it is provably inert (``pass``, a bare constant, an
+    assignment between names/constants, a nested ``def``).  Anything else keeps
+    the arm in the "may exit" class and owes the permit back.  That is a false
+    positive at worst; the other direction is a missed leak.
+
+    This makes the arm check ask the same question as the window check, which
+    has always treated a call/attribute/subscript/await as raise-capable.
+    """
+    return not all(_inert_stmt(stmt) for stmt in handler.body)
 
 
 def _build_parent_map(fn: ast.AST) -> dict[int, tuple[ast.AST, str]]:

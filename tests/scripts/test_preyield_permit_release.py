@@ -637,7 +637,13 @@ def test_guard_does_not_demand_a_release_from_a_swallowing_arm():
     """An arm that SWALLOWS falls through to the yield still holding the permit.
 
     Demanding a release there would be a false positive, and acting on it would
-    double-release — so only arms that exit (raise/return) owe the permit back.
+    double-release — so only arms that can exit owe the permit back.
+
+    The arm body must be PROVABLY inert.  This fixture used to hold
+    ``_LOG.warning("tolerated; still admitted")``, which is not: driven with a
+    benign logger that arm leaks 0, and with a bad format argument — identical
+    AST — it leaks 1.  A fixture whose safety depends on runtime values cannot
+    state the property, so it is narrowed to statements that cannot leave.
     """
     guard = _load_guard()
     source = textwrap.dedent(
@@ -650,7 +656,8 @@ def test_guard_does_not_demand_a_release_from_a_swallowing_arm():
             try:
                 _LOG.info("admitted %s", key)
             except ValueError:
-                _LOG.warning("tolerated; still admitted")
+                tolerated = True
+                pass
             except BaseException:
                 sem.release()
                 raise
@@ -662,6 +669,58 @@ def test_guard_does_not_demand_a_release_from_a_swallowing_arm():
     )
     _sites, violations = guard.scan_source(source, "new.py")
     assert violations == []
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        ("a call that raises", "except BaseException:\n    _reraise()\n"),
+        ("an assert", "except BaseException:\n    assert surface\n"),
+        ("arithmetic", "except BaseException:\n    x = 1 / surface\n"),
+        ("a logging call", 'except BaseException:\n    _LOG.info("swallowed")\n'),
+        ("an attribute load", "except BaseException:\n    x = surface.depth\n"),
+        ("a subscript", "except BaseException:\n    x = surface[0]\n"),
+        ("an await", "except BaseException:\n    await _drain()\n"),
+    ],
+)
+def test_guard_flags_an_arm_that_can_leave_without_a_raise_statement(shape, arm):
+    """An arm leaves for many reasons that are not an ``ast.Raise`` node.
+
+    Asking "does this arm contain a ``raise``/``return`` STATEMENT?" excused a
+    call that raises, an ``assert``, arithmetic that divides by zero, and a
+    plain logging call given a bad format argument.  Each is a measured
+    1-permit leak.  The window check has always treated a call / attribute /
+    subscript / await as raise-capable; the arm check now agrees.
+    """
+    guard = _load_guard()
+    _sites, violations = guard.scan_source(_sibling_arm_source(arm), "new.py")
+    assert [v["function"] for v in violations] == ["gate"], (
+        f"an arm that can leave via {shape} must be asked to release"
+    )
+
+
+@pytest.mark.parametrize(
+    "shape,arm",
+    [
+        ("pass", "except BaseException:\n    pass\n"),
+        ("a bare constant", 'except BaseException:\n    "swallowed"\n'),
+        ("an assignment between names", "except BaseException:\n    x = surface\n"),
+        ("a constant assignment", "except BaseException:\n    x = 0\n"),
+        (
+            "a nested def",
+            "except BaseException:\n    def _later():\n        sem.release()\n",
+        ),
+    ],
+)
+def test_guard_still_excuses_a_provably_inert_arm(shape, arm):
+    """The other side: an arm that provably cannot leave still owes nothing.
+
+    Without this the swallow exemption would collapse to "never excuse
+    anything" and the finding-3 false-positive fix would be undone.
+    """
+    guard = _load_guard()
+    _sites, violations = guard.scan_source(_sibling_arm_source(arm), "new.py")
+    assert violations == [], f"an arm holding only {shape} cannot leave"
 
 
 # --------------------------------------------------------------------------
