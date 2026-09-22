@@ -323,10 +323,10 @@ VALID_HOOKS: Set[str] = {
     # reclaim/accounting txn has committed. Exit visibility latency is
     # bounded by the dispatcher tick interval. Adds:
     #   worker_pid: int,
-    #   exit_kind: "clean_exit" | "rate_limited" | "nonzero_exit"
-    #              | "signaled" | "unknown",
+    #   exit_kind: "clean_exit" | "rate_limited" | "infra_unavailable"
+    #              | "nonzero_exit" | "signaled" | "unknown",
     #   exit_code: int | None,
-    #   outcome: "crashed" | "rate_limited",
+    #   outcome: "crashed" | "rate_limited" | "infra_unavailable",
     #   retry_status: str  (the phase the task was released back to).
     "on_kanban_worker_exited",
     # on_kanban_worker_stale_claim fires when release_stale_claims reclaims
