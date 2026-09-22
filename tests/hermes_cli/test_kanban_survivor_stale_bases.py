@@ -33,13 +33,26 @@ def board(tmp_path, monkeypatch):
 
 @pytest.fixture
 def remote(monkeypatch):
-    """Answer remote lookups affirmatively; the gate must not rely on a network failure."""
-    state = {"state": "OPEN", "headRefOid": HEAD, "mergeCommit": None}
+    """Answer remote lookups affirmatively; the gate must not rely on a network failure.
+
+    ``state["missing"]`` makes the PR lookup fail the way a nonexistent PR does,
+    and ``state["tips"]`` is what a bare ``git ls-remote <url>`` advertises --
+    empty by default, so a ``--survivor-ref`` resolves to nothing. Both are
+    stubbed rather than left to the network so these tests never reach out.
+    """
+    state = {"state": "OPEN", "headRefOid": HEAD, "mergeCommit": None,
+             "missing": False, "tips": ""}
     real = subprocess.run
 
     def run(args, **kwargs):
         if args[0] == "gh":
-            return subprocess.CompletedProcess(args, 0, json.dumps(state).encode(), b"")
+            if state["missing"]:
+                return subprocess.CompletedProcess(args, 1, b"", b"not found")
+            payload = {k: state[k] for k in ("state", "headRefOid", "mergeCommit")}
+            return subprocess.CompletedProcess(args, 0, json.dumps(payload).encode(), b"")
+        # `_ext` shells out as `git ls-remote ...`; `_git` always passes `-C`.
+        if args[0] == "git" and len(args) > 1 and args[1] == "ls-remote":
+            return subprocess.CompletedProcess(args, 0, state["tips"].encode(), b"")
         return real(args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -162,13 +175,8 @@ def test_cli_successful_completion_exits_zero_and_says_so(board, remote, monkeyp
     assert kb.get_task(board, tid).status == "done"
 
 
-def test_partial_loss_keeps_both_the_surviving_repo_and_the_operator_ref(board, remote, tmp_path, monkeypatch):
-    """Only SOME recorded repos vanished: neither survivor may be dropped.
-
-    The surviving repo resolves its own remote ref, which on its own would
-    satisfy the completion and silently discard the operator's ref for the repo
-    that is gone -- leaving that work pointed at nothing.
-    """
+def partial_loss_card(conn, tmp_path, monkeypatch):
+    """One recorded repo published and on disk ("kept"), one vanished ("gone")."""
     import hermes_cli.kanban_survivor as survivor
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
@@ -177,8 +185,8 @@ def test_partial_loss_keeps_both_the_surviving_repo_and_the_operator_ref(board, 
             "git", "-C", str(repo), *args
         ], capture_output=True, check=True).stdout.decode().strip()
 
-    tid = kb.create_task(board, title="partial loss")
-    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    tid = kb.create_task(conn, title="partial loss")
+    ws = kb.resolve_workspace(kb.get_task(conn, tid))
     kept = ws / "kept"
     kept.mkdir(parents=True)
     git(kept, "init", "-b", "main")
@@ -190,13 +198,24 @@ def test_partial_loss_keeps_both_the_surviving_repo_and_the_operator_ref(board, 
     git(kept, "init", "--bare", str(tmp_path / "kept.git"))
     git(kept, "remote", "add", "origin", str(tmp_path / "kept.git"))
     git(kept, "push", "origin", "HEAD:main")
-    kb.set_workspace_path(board, tid, ws)
-    with kb.write_txn(board):
-        board.execute(
+    kb.set_workspace_path(conn, tid, ws)
+    with kb.write_txn(conn):
+        conn.execute(
             "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
             "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases",
             (tid, json.dumps({"kept": git(kept, "rev-parse", "HEAD"), "gone": STALE})),
         )
+    return tid, ws
+
+
+def test_partial_loss_keeps_both_the_surviving_repo_and_the_operator_ref(board, remote, tmp_path, monkeypatch):
+    """Only SOME recorded repos vanished: neither survivor may be dropped.
+
+    The surviving repo resolves its own remote ref, which on its own would
+    satisfy the completion and silently discard the operator's ref for the repo
+    that is gone -- leaving that work pointed at nothing.
+    """
+    tid, _ = partial_loss_card(board, tmp_path, monkeypatch)
 
     assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
 
@@ -208,4 +227,89 @@ def test_partial_loss_keeps_both_the_surviving_repo_and_the_operator_ref(board, 
     # path instead of resolving here appends a SECOND copy of the operator ref
     # under repository ".", which does not correspond to anything on disk.
     assert len(saved["refs"]) == 2, saved["refs"]
+    assert set(by_repo) == {"gone", "kept"}, saved["refs"]
+
+
+# --- PARTIAL LOSS x UNVERIFIABLE SURVIVOR ----------------------------------
+#
+# The intersection the two blocks above each miss. The test immediately above
+# covers partial loss with a VERIFIED survivor;
+# `test_stale_bases_with_an_unverifiable_survivor_pr_still_refuses` covers an
+# unverifiable survivor on the ALL-GONE path. Nothing pinned partial loss WITH
+# an unverifiable survivor, and that is the branch with no verification of its
+# own: it builds `recovered` straight out of `explicit` and feeds it into the
+# `len(refs) == len(repos) + 1` arithmetic that decides completion. The ONLY
+# thing standing between an operator's CLOSED/fake PR and a durably stored
+# survivor is the single `_verified_explicit()` raise upstream at
+# `preserve()`. These tests pin that dependency, so a refactor that moves,
+# inlines, narrows, or short-circuits that raise goes RED here instead of
+# silently completing partial-loss cards on a survivor that points nowhere.
+
+
+def _assert_partial_loss_refused(board, tid, ws, excinfo):
+    """Refusal is not enough: nothing unverifiable may be stored either."""
+    assert "survivor_unavailable" in str(excinfo.value)
+    assert kb.get_task(board, tid).status != "done"
+    assert (ws / "kept" / "a.py").is_file(), "held workspace must survive"
+    row = board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?", (tid,)
+    ).fetchone()
+    saved = json.loads(row[0]) if row and row[0] else None
+    # Shape, not just outcome: no unverifiable ref recorded, and in particular
+    # no bogus `repository: "."` entry from a fall-through to the external path.
+    assert saved is None, saved
+    run = kb.latest_run(board, tid)
+    assert run is None or (run.metadata or {}).get("survivor") is None, run.metadata
+
+
+def test_partial_loss_with_a_closed_survivor_pr_still_refuses(board, remote, tmp_path, monkeypatch):
+    """A CLOSED-unmerged PR is not authority, partial loss or not."""
+    remote["state"] = "CLOSED"
+    tid, ws = partial_loss_card(board, tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
+
+    assert "could not verify --survivor-pr" in str(excinfo.value)
+    _assert_partial_loss_refused(board, tid, ws, excinfo)
+
+
+def test_partial_loss_with_a_nonexistent_survivor_pr_still_refuses(board, remote, tmp_path, monkeypatch):
+    """A PR that does not resolve at all buys nothing either."""
+    remote["missing"] = True
+    tid, ws = partial_loss_card(board, tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
+
+    assert "could not verify --survivor-pr" in str(excinfo.value)
+    _assert_partial_loss_refused(board, tid, ws, excinfo)
+
+
+def test_partial_loss_with_an_unresolvable_survivor_ref_still_refuses(board, remote, tmp_path, monkeypatch):
+    """Cover the OTHER flag: a SHA that is not a tip on the named remote."""
+    tid, ws = partial_loss_card(board, tmp_path, monkeypatch)
+    claim = f"https://github.com/example/project.git#{'b2' * 20}"
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, summary="approved", survivor_ref=claim)
+
+    assert "could not verify --survivor-ref" in str(excinfo.value)
+    _assert_partial_loss_refused(board, tid, ws, excinfo)
+
+
+def test_partial_loss_with_a_verified_survivor_ref_completes(board, remote, tmp_path, monkeypatch):
+    """Teeth for the three above: the same `--survivor-ref` path DOES complete
+    once the SHA is an advertised tip, so those refusals are about verification
+    and not about the flag being inert on this branch."""
+    sha = "b2" * 20
+    remote["tips"] = f"{sha}\trefs/heads/work\n"
+    tid, _ = partial_loss_card(board, tmp_path, monkeypatch)
+    claim = f"https://github.com/example/project.git#{sha}"
+
+    assert kb.complete_task(board, tid, summary="approved", survivor_ref=claim)
+
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    by_repo = {ref["repository"]: ref for ref in saved["refs"]}
+    assert by_repo["gone"]["sha"] == sha
     assert set(by_repo) == {"gone", "kept"}, saved["refs"]
