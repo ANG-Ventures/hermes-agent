@@ -3365,6 +3365,9 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # New-install recommendation; raw configs omitting the turn cap stay unbounded.
+        "max_concurrent_turns": 8,
+        "startup_resume_concurrency": 3,
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
