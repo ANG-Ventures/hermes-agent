@@ -1643,6 +1643,142 @@ def test_stop_threads_the_one_deadline_into_both_the_drain_and_the_cron_leash(
     assert deadline == pytest.approx(armed - 22.0)
 
 
+def test_drain_consumes_the_REARMED_deadline_at_the_inner_leash_geometry(
+    monkeypatch, tmp_path
+):
+    """The consumed deadline must differ from what re-derivation would give.
+
+    The sibling call-site test above runs at the production clamp 60, where
+    the OUTER ``min()`` of the arming expression binds. There, consuming
+    ``_armed_shutdown_deadline_s`` and re-deriving it from ``exit_timeout -
+    hard_exit_reserve_s`` produce the SAME number (28), so that test passes
+    just as happily with ``armed_deadline_s=None`` hard-wired at the call
+    site — the exact re-derivation that is finding 1 of the #838 review.
+    A gate that only measures the geometry where the two agree cannot
+    detect the defect it is named for; this is the #838 root pattern
+    reproduced one level up, in the test suite.
+
+    This pins the geometry where they diverge: clamp 300 (system-domain
+    launchd is not gui-clamped), configured 180, measured teardown 70, plus
+    a real pre-drain cost so the re-arm actually extends the deadline.
+
+    Hand-computed, independent of every resolver::
+
+        capped drain    = 180                       (fits under the wall)
+        armed at t=0    = min(180 + max(60, 70), 290)          = 250
+        re-armed        = min(0.9 + 180 + 70, 290)             = 250.9
+        deadline CONSUMED  = 250.9 - 70                        = 180.9
+        deadline REDERIVED = 250   - 70                        = 180
+
+    Re-derivation silently discards the pre-drain cost the re-arm just
+    bought back and hands it to the teardown reserve instead.
+    """
+    import asyncio
+
+    from gateway import run as run_mod
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 180.0
+    runner._cron_drain_timeout = 30.0
+    runner._launchd_exit_timeout_s = 300.0
+    runner._stop_requested_by_signal = True
+    runner._last_shutdown_teardown_s = 70.0
+    adapter.disconnect = AsyncMock()
+
+    # A real pre-drain cost, past the 0.5s re-arm hysteresis.
+    PRE_DRAIN_S = 0.9
+
+    async def _slow_notify():
+        await asyncio.sleep(PRE_DRAIN_S)
+
+    monkeypatch.setattr(runner, "_notify_active_sessions_of_shutdown", _slow_notify)
+
+    # In-flight cron work, so the cron leash is exercised too.
+    monkeypatch.setattr(
+        run_mod.GatewayRunner, "_active_cron_job_count", lambda _self: 1
+    )
+
+    drain_kwargs: list[dict] = []
+    real_drain_resolver = run_mod.resolve_elapsed_adjusted_drain
+
+    def _drain_spy(*a, **kw):
+        drain_kwargs.append(dict(kw))
+        return real_drain_resolver(*a, **kw)
+
+    cron_kwargs: list[dict] = []
+    real_cron_resolver = run_mod.resolve_cron_drain_budget
+
+    def _cron_spy(*a, **kw):
+        cron_kwargs.append(dict(kw))
+        return real_cron_resolver(*a, **kw)
+
+    monkeypatch.setattr(run_mod, "resolve_elapsed_adjusted_drain", _drain_spy)
+    monkeypatch.setattr(run_mod, "resolve_cron_drain_budget", _cron_spy)
+    monkeypatch.setattr(
+        run_mod,
+        "arm_shutdown_watchdog",
+        lambda delay, **kw: kw.get("done_event") or threading.Event(),
+    )
+
+    async def _fake_drain(_self, timeout, cron_timeout=None):
+        return ({}, False)
+
+    monkeypatch.setattr(run_mod.GatewayRunner, "_drain_active_agents", _fake_drain)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"):
+        asyncio.run(runner.stop())
+
+    assert len(drain_kwargs) == 1, f"expected one drain fit, got {drain_kwargs}"
+    assert len(cron_kwargs) == 1, f"expected one cron leash, got {cron_kwargs}"
+
+    armed = drain_kwargs[0]["armed_deadline_s"]
+    assert armed is not None, (
+        "the drain fit received armed_deadline_s=None — it is re-deriving "
+        "the deadline instead of consuming the value the watchdog was "
+        "armed with (finding 1 of the #838 review)"
+    )
+    # The RE-ARMED value, i.e. the t=0 250 extended by the measured cost.
+    assert armed == pytest.approx(250.0 + PRE_DRAIN_S, abs=0.5), (
+        f"armed deadline {armed} is not the re-armed 250.9 — the drain is "
+        f"consuming a stale or re-derived deadline, not the one os._exit "
+        f"actually fires at"
+    )
+    # 🔴 THE DISCRIMINATING ASSERTION: re-derivation from the hard-exit wall
+    # gives 250 here, not 250.9. Hard-wiring armed_deadline_s=None at the
+    # call site passes the clamp-60 sibling test and fails this one.
+    assert armed > 250.0 + 0.25, (
+        f"armed deadline {armed} equals the t=0 arming (250) — the pre-drain "
+        f"elapsed the re-arm bought back was discarded, which is exactly "
+        f"what a re-derived deadline yields at this geometry"
+    )
+
+    deadline = cron_kwargs[0]["deadline_s"]
+    assert deadline is not None, (
+        "the cron leash received deadline_s=None — it is re-deriving from "
+        "the raw SIGKILL wall (finding 2 of the #838 review)"
+    )
+    # armed minus the measured 70s teardown reserve, hand-computed.
+    assert deadline == pytest.approx(180.0 + PRE_DRAIN_S, abs=0.5), (
+        f"cron deadline {deadline} is not armed({armed}) - reserve(70)"
+    )
+    assert deadline > 180.0 + 0.25, (
+        f"cron deadline {deadline} collapsed to the re-derived 180 — the "
+        f"elapsed adjustment was silently undone at the cron call site"
+    )
+    # ONE deadline: both consumers, same armed value, same reserve.
+    assert deadline == pytest.approx(armed - 70.0, abs=0.01)
+
+    # And the deadline still sits a full teardown reserve inside the wall.
+    assert armed <= 300.0 - 10.0, (
+        f"armed deadline {armed} reaches past exit_timeout - hard_exit_reserve"
+    )
+
+
 def test_hard_exit_backstop_ignores_blocked_daemon_threads(monkeypatch, tmp_path):
     from gateway import shutdown_watchdog
 
