@@ -83,6 +83,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             last_cache_read INT,
             last_cache_write INT,
             last_uncached INT,
+            last_call_prompt_unknown INT DEFAULT 0,
             comp_sys_tokens INT,
             comp_tool_schema_tokens INT,
             comp_history_tokens INT,
@@ -197,6 +198,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} INT")
             except sqlite3.OperationalError:
                 pass  # raced with another writer; column now exists
+    # Last-CALL prompt discriminator (r6 finding 9). Deliberately NULLable with
+    # no DEFAULT on the migration path: NULL means "this row predates the
+    # column, so its final-call provenance was never recorded", and the
+    # renderer falls back to the absorbing turn-level flag for those rows —
+    # exactly the behaviour they have today. A DEFAULT 0 here would instead
+    # assert "the final call WAS measured" about every historical row,
+    # including genuinely unmeasured ones, and render their placeholder zeros
+    # as real window numbers. New rows always bind an explicit 0/1.
+    if "last_call_prompt_unknown" not in _existing:
+        try:
+            conn.execute("ALTER TABLE turns ADD COLUMN last_call_prompt_unknown INT")
+        except sqlite3.OperationalError:
+            pass  # raced with another writer; column now exists
     # Request-composition columns (fixed vs non-fixed breakdown of the final
     # call). Same guarded additive pattern. INT for the token buckets, TEXT for
     # the per-call composition JSON blob.
@@ -440,6 +454,7 @@ _INSERT_TURN_COLUMNS = (
     "api_calls", "tools", "input_tokens", "output_tokens", "cache_read",
     "cache_write", "reasoning", "context_used", "context_length",
     "last_cache_read", "last_cache_write", "last_uncached",
+    "last_call_prompt_unknown",
     "comp_sys_tokens", "comp_tool_schema_tokens", "comp_history_tokens",
     "comp_history_message_count",
     "comp_tool_result_tokens", "comp_tool_arg_tokens", "comp_tool_result_count",
@@ -499,6 +514,7 @@ def insert_turn(record: TurnRecord) -> None:
                     _int_or_none(record.last_cache_read_tokens),
                     _int_or_none(record.last_cache_write_tokens),
                     _int_or_none(record.last_uncached_tokens),
+                    _bool_int(record.last_call_prompt_unknown),
                     _int_or_none(record.comp_sys_tokens),
                     _int_or_none(record.comp_tool_schema_tokens),
                     _int_or_none(record.comp_history_tokens),

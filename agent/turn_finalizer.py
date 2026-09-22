@@ -909,6 +909,17 @@ def finalize_turn(
                 _last_cache_read = int(_last_call.get("cache_read_tokens", 0) or 0)
                 _last_cache_write = int(_last_call.get("cache_write_tokens", 0) or 0)
                 _last_uncached = int(_last_call.get("input_tokens", 0) or 0)
+                # Discriminator for the four FINAL-call figures (the split above
+                # plus context_used). The turn-level flags in _rollup_turn_usage
+                # are absorbing across every call, so they answer "did ANY call
+                # go unmeasured", not "is this split real" — a turn whose call
+                # #2 returned no usage would otherwise blank a fully measured
+                # final call's window numbers (r6 finding 9).
+                _last_call_prompt_unknown = any(
+                    bool(_last_call.get(k))
+                    for k in ("input_tokens_unknown", "cache_read_tokens_unknown",
+                              "cache_write_tokens_unknown", "usage_unknown")
+                )
                 # Request composition of the FINAL call — the char/4 fixed vs
                 # non-fixed breakdown of the exact payload that produced the
                 # window occupancy (context_used). This is the authoritative
@@ -938,6 +949,7 @@ def finalize_turn(
                     "last_cache_read_tokens": _last_cache_read,
                     "last_cache_write_tokens": _last_cache_write,
                     "last_uncached_tokens": _last_uncached,
+                    "last_call_prompt_unknown": _last_call_prompt_unknown,
                     # Real request composition (fixed vs non-fixed, char/4) of
                     # the final call + per-call history. See compose_request_breakdown.
                     "last_composition": _last_composition,

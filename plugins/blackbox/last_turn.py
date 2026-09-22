@@ -320,13 +320,23 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     lc_write = rec.get("last_cache_write_tokens", rec.get("last_cache_write"))
     lc_unc = rec.get("last_uncached_tokens", rec.get("last_uncached"))
     _have_split = lc_read is not None and lc_write is not None and lc_unc is not None
+    # The last-call rows below (and the Context-window line) describe the FINAL
+    # call only, so they gate on the final call's own discriminator, not on the
+    # turn-level `input_unknown` — which is an absorbing OR over every call
+    # (agent/turn_finalizer.py::_rollup_turn_usage) and would blank a fully
+    # measured final call just because call #2 of the turn returned no usage
+    # (r6 finding 9). `last_call_prompt_unknown` is NULL on rows written before
+    # that column existed; those fall back to the turn-level flag, i.e. exactly
+    # the behaviour they already had.
+    _lc_flag = rec.get("last_call_prompt_unknown")
+    last_call_unknown = input_unknown if _lc_flag is None else bool(_lc_flag)
     # Change 3 (Ace 2026-06-14): the last-call cache split gets its OWN line
     # framed as the final call's billed input, ABOVE the occupancy line. The
     # split sums to context_used, so "Last call: {used} billed (split)" uses the
     # same headline as the window line — two framings of one number. The
     # Context-window line keeps ONLY the occupancy (suffix removed). When the
     # split is absent (old rows / blackbox-off) the Last-call line is omitted.
-    if _have_split and used > 0 and not input_unknown:
+    if _have_split and used > 0 and not last_call_unknown:
         lines.append(
             f"• Last call: {_humanize_tok(used)} billed "
             f"({_humanize_tok(int(lc_read or 0))} cache-read + "
@@ -339,14 +349,18 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     cache_r = int(rec.get("cache_read", 0) or 0)
     cache_w = int(rec.get("cache_write", 0) or 0)
     prompt_total = in_tok + cache_r + cache_w
+    # This row IS turn-level — `cache_read` / `input_tokens` are the whole
+    # turn's summed billing — so the absorbing turn-level flag is the right
+    # gate here and stays (contrast the last-call rows above).
     if prompt_total > 0 and cache_r and not input_unknown:
         cpct = cache_r / prompt_total * 100
         lines.append(f"• Cached: {_humanize_tok(cache_r)}/{_humanize_tok(prompt_total)} {_cache_health(cpct)} {cpct:.0f}%")
 
-    if input_unknown:
-        # ``context_used`` is the final call's provider prompt count. When that
-        # count is unmeasured, a normalized zero or partial cache component is
-        # not a context-window measurement and must not produce a numeric %.
+    if last_call_unknown:
+        # ``context_used`` is the final call's provider prompt count. When THAT
+        # call's count is unmeasured, a normalized zero or partial cache
+        # component is not a context-window measurement and must not produce a
+        # numeric %. Gated on the final call's own flag, not the turn-level OR.
         suffix = f"/{_humanize_tok(length)}" if length > 0 else ""
         lines.append(
             f"• Context window (last call): {_humanize_tok(0, unknown=True)}{suffix}"

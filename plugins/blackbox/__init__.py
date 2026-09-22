@@ -401,6 +401,7 @@ def _build_record(
         last_cache_read_tokens=_int_or_none_value(usage.get("last_cache_read_tokens")),
         last_cache_write_tokens=_int_or_none_value(usage.get("last_cache_write_tokens")),
         last_uncached_tokens=_int_or_none_value(usage.get("last_uncached_tokens")),
+        last_call_prompt_unknown=bool(usage.get("last_call_prompt_unknown")),
         comp_sys_tokens=_comp_get(usage, "sys_tokens"),
         comp_tool_schema_tokens=_comp_get(usage, "tool_schema_tokens"),
         comp_history_tokens=_comp_get(usage, "history_tokens"),

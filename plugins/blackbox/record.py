@@ -56,6 +56,13 @@ class TurnRecord:
     last_cache_read_tokens: Optional[int] = None
     last_cache_write_tokens: Optional[int] = None
     last_uncached_tokens: Optional[int] = None
+    # Discriminator for the three columns ABOVE and for ``context_used`` — all
+    # four describe the FINAL call only. The turn-level ``*_unknown`` flags are
+    # absorbing (`any()` across every call, agent/turn_finalizer.py), so they
+    # cannot answer "was the last call measured?": a 5-call turn whose call #2
+    # returned no usage sets them even when the final call is fully measured.
+    # Renderers of last-call data must gate on THIS flag (r6 finding 9).
+    last_call_prompt_unknown: bool = False
     # Request composition of the FINAL call (char/4 fixed vs non-fixed buckets).
     # Distinct from the cache split above: this decomposes the request PAYLOAD
     # by source (system / tool schemas / history / tool results / tool args),

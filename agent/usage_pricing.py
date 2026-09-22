@@ -1854,9 +1854,23 @@ def cache_stats_line(canonical_usage: Any, prompt_tokens: Any) -> Optional[str]:
     UNKNOWN wins over the hit-rate render: a hit percentage computed from an
     unmeasured prompt total is a fabricated measurement, so an unknown input
     reports ``unknown`` and suppresses both the ``% hit`` and ``written`` terms.
+
+    But UNKNOWN only wins where the line would have SPOKEN. The inline code this
+    replaced printed nothing at all when there was no cache activity, and this
+    runs per API CALL — so an unconditional unknown branch adds one noise line
+    per call for any provider that routinely omits ``usage`` (r6 finding 3).
+    The discriminator is ``usage_unknown`` ALONE: it means the call carried NO
+    usage payload at all, so there is no cache-specific fact to report and the
+    turn card already says the turn is unmeasured. Every narrower unknown is
+    still news and still prints ``unknown`` — a present payload that declares
+    its prompt unmeasured, a null cache bucket inside a present container, or
+    measured cache counts beside an unmeasured prompt total. In those cases the
+    percentage that would otherwise print is the fabrication being refused.
     """
     cached = canonical_usage.cache_read_tokens
     written = canonical_usage.cache_write_tokens
+    if _usage_get(canonical_usage, "usage_unknown", False):
+        return None
     if prompt_tokens_unknown(canonical_usage):
         return f"💾 Cache: {format_token_count(None, unknown=True)}"
     if not (cached or written):

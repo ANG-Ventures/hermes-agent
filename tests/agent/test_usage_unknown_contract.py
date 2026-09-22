@@ -79,6 +79,31 @@ class _ModelExtraUsage:
             setattr(self, key, value)
 
 
+def _production_row(store, turn_id):
+    """The stored turn in the shape PRODUCTION hands the renderer.
+
+    `store.get_turn` routes through `_row_to_dict`, which RENAMES columns
+    (`cache_read` -> `cache_read_tokens`, likewise cache_write/reasoning). The
+    production caller `plugins/blackbox/last_turn.py::compute_last_turn_record`
+    does a raw `SELECT *` and passes the UNRENAMED keys — which is why the
+    renderer reads `rec.get("cache_read", 0)`. Feeding it the `get_turn` shape
+    silently resolves every cache lookup to 0, so the `• Cached:` row is never
+    emitted and any assertion about cache or last-call lines would be testing a
+    row shape that never occurs at runtime (r6 finding 12).
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(store._db_path())
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM turns WHERE turn_id = ?", (turn_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row is not None else None
+
+
 def test_uc1_null_plus_unavailable_is_unknown_not_zero():
     usage = normalize_usage(
         BRIDGE_UNKNOWN_WIRE, provider="custom", api_mode="chat_completions"
@@ -419,8 +444,13 @@ def test_bridge_input_and_full_unknown(wire, input_unknown, output_unknown, tmp_
     assert rec is not None
     monkeypatch.setattr(store, "_db_path", lambda: tmp_path / "turns.db")
     store.insert_turn(rec)
-    row = store.get_turn(rec.turn_id)
+    row = _production_row(store, rec.turn_id)
     assert row is not None
+    # Shape assertion (r6 finding 12): the renderer below reads the RAW column
+    # names, so this round-trip must hand it the raw `SELECT *` shape that
+    # production produces. `store.get_turn` renames these away via
+    # `_row_to_dict`, silently resolving every cache lookup to 0.
+    assert "cache_read" in row and "cache_write" in row
     assert bool(row["input_tokens_unknown"]) is input_unknown
     assert bool(row["output_tokens_unknown"]) is output_unknown
     assert (row["cost_usd"] is None) is (input_unknown or output_unknown)
@@ -466,7 +496,12 @@ def test_new_unknown_flags_survive_blackbox(flag, tmp_path, monkeypatch):
     assert rec.cost_status == "unknown"
     monkeypatch.setattr(store, "_db_path", lambda: tmp_path / "turns.db")
     store.insert_turn(rec)
-    row = store.get_turn(rec.turn_id)
+    row = _production_row(store, rec.turn_id)
+    assert "cache_read" in row and "cache_write" in row, (
+        "must be the raw SELECT * shape production renders (r6 finding 12); "
+        "store.get_turn renames these and the renderer's lookups silently "
+        "resolve to 0"
+    )
     assert row[flag] == 1
     # Assert the TOKEN line, not just "unknown" anywhere in the block: a
     # cost_status of "unknown" already emits "• Turn Cost: n/a (unknown)", so a
