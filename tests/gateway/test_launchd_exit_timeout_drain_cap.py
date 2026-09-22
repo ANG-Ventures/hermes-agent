@@ -1514,21 +1514,34 @@ def test_stop_rearms_the_watchdog_with_REMAINING_time_not_the_absolute_deadline(
         f"the geometry no longer exercises the re-arm"
     )
     published = runner._armed_shutdown_deadline_s
-    assert published == pytest.approx(250.0 + PRE_DRAIN_S, abs=0.5), (
-        f"published absolute deadline {published} should be the t=0 value "
-        f"extended by the measured pre-drain cost"
+    assert published is not None, "the re-arm never published a deadline"
+    # Load-immune: the published deadline is the t=0 value EXTENDED by
+    # whatever the pre-drain really cost (min(elapsed + 250, 290)). Assert
+    # the direction and the wall, not a stopwatch reading — under load the
+    # sleep overshoots and any `approx(250.9)` bound is a coin flip.
+    assert published > 250.0, (
+        f"published absolute deadline {published} was not extended past the "
+        f"t=0 arming of 250 — the pre-drain elapsed was not absorbed"
+    )
+    assert published <= 300.0 - 10.0, (
+        f"published deadline {published} reaches past the hard-exit wall"
     )
 
-    # THE ASSERTION: what was ARMED is the remaining time, which is ~250 —
-    # the absolute deadline MINUS the elapsed already spent. Passing the
-    # absolute value through would arm ~250.9 and fire at ~251.8 from the
-    # stop start, i.e. the elapsed counted twice.
-    assert second == pytest.approx(250.0, abs=0.35), (
+    # THE ASSERTION: what was ARMED is the REMAINING time, not the absolute
+    # deadline. Correct behaviour arms `published - elapsed_now`, which is
+    # at most the t=0 value of 250 (it is exactly 250 minus the scheduling
+    # delta between the fit and the re-arm). Handing the absolute value
+    # through arms `published` itself — strictly GREATER than 250 — and
+    # fires at `elapsed + published`, i.e. the elapsed counted twice.
+    # A `<=` bound is immune to load: jitter only makes `second` smaller.
+    assert second <= 250.0, (
         f"re-arm handed arm_shutdown_watchdog {second}; the absolute "
-        f"deadline is {published} and ~{PRE_DRAIN_S}s is already spent, so "
-        f"the RELATIVE delay must be ~250. Arming the absolute value "
-        f"double-counts the elapsed and pushes os._exit past the wall"
+        f"deadline is {published} and the pre-drain cost is already spent, "
+        f"so the RELATIVE delay must be at most the t=0 value of 250. "
+        f"Arming the absolute value double-counts the elapsed and pushes "
+        f"os._exit past the wall"
     )
+    assert second > 0.0, f"re-arm armed a non-positive delay {second}"
     assert second < published, (
         "the armed delay must be strictly less than the absolute deadline "
         "once any time has been spent"
@@ -1737,24 +1750,26 @@ def test_drain_consumes_the_REARMED_deadline_at_the_inner_leash_geometry(
     assert len(cron_kwargs) == 1, f"expected one cron leash, got {cron_kwargs}"
 
     armed = drain_kwargs[0]["armed_deadline_s"]
+    # The RE-ARMED value, i.e. the t=0 250 extended by the measured cost.
+    # 🔴 THE DISCRIMINATING ASSERTION, and load-immune by construction:
+    # re-derivation from the hard-exit wall gives exactly 250.0 here, so any
+    # value STRICTLY GREATER than 250 proves the consumed deadline is the
+    # re-armed one. Scheduling jitter only makes the elapsed larger, which
+    # pushes this further from 250, never toward it. Hard-wiring
+    # armed_deadline_s=None at the call site passes the clamp-60 sibling
+    # test and fails this one.
     assert armed is not None, (
         "the drain fit received armed_deadline_s=None — it is re-deriving "
         "the deadline instead of consuming the value the watchdog was "
         "armed with (finding 1 of the #838 review)"
     )
-    # The RE-ARMED value, i.e. the t=0 250 extended by the measured cost.
-    assert armed == pytest.approx(250.0 + PRE_DRAIN_S, abs=0.5), (
-        f"armed deadline {armed} is not the re-armed 250.9 — the drain is "
-        f"consuming a stale or re-derived deadline, not the one os._exit "
-        f"actually fires at"
+    assert armed > 250.0, (
+        f"armed deadline {armed} did not exceed the t=0 arming (250) — the "
+        f"pre-drain elapsed the re-arm bought back was discarded, which is "
+        f"exactly what a re-derived deadline yields at this geometry"
     )
-    # 🔴 THE DISCRIMINATING ASSERTION: re-derivation from the hard-exit wall
-    # gives 250 here, not 250.9. Hard-wiring armed_deadline_s=None at the
-    # call site passes the clamp-60 sibling test and fails this one.
-    assert armed > 250.0 + 0.25, (
-        f"armed deadline {armed} equals the t=0 arming (250) — the pre-drain "
-        f"elapsed the re-arm bought back was discarded, which is exactly "
-        f"what a re-derived deadline yields at this geometry"
+    assert armed <= 300.0 - 10.0, (
+        f"armed deadline {armed} reaches past exit_timeout - hard_exit_reserve"
     )
 
     deadline = cron_kwargs[0]["deadline_s"]
@@ -1762,21 +1777,14 @@ def test_drain_consumes_the_REARMED_deadline_at_the_inner_leash_geometry(
         "the cron leash received deadline_s=None — it is re-deriving from "
         "the raw SIGKILL wall (finding 2 of the #838 review)"
     )
-    # armed minus the measured 70s teardown reserve, hand-computed.
-    assert deadline == pytest.approx(180.0 + PRE_DRAIN_S, abs=0.5), (
-        f"cron deadline {deadline} is not armed({armed}) - reserve(70)"
-    )
-    assert deadline > 180.0 + 0.25, (
+    # Same shape: re-derivation collapses this to exactly 180.0.
+    assert deadline > 180.0, (
         f"cron deadline {deadline} collapsed to the re-derived 180 — the "
         f"elapsed adjustment was silently undone at the cron call site"
     )
-    # ONE deadline: both consumers, same armed value, same reserve.
+    # ONE deadline: both consumers, same armed value, same 70s reserve.
+    # Exact, and independent of how long anything actually took.
     assert deadline == pytest.approx(armed - 70.0, abs=0.01)
-
-    # And the deadline still sits a full teardown reserve inside the wall.
-    assert armed <= 300.0 - 10.0, (
-        f"armed deadline {armed} reaches past exit_timeout - hard_exit_reserve"
-    )
 
 
 def test_hard_exit_backstop_ignores_blocked_daemon_threads(monkeypatch, tmp_path):
