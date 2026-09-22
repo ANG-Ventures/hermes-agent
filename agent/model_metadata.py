@@ -709,6 +709,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # silently resolved at 256,000 — a HALF-SIZE window that never errors, it
     # just compacts ~2x too early forever. Keep each new frontier grok here on
     # the day it ships; the "grok-4" entry is for grok-4/grok-4-0709 only.
+    "grok-4.7": 500000,         # grok-4.7, grok-4.7-latest — 500K (docs.x.ai, GA 2026-09-21)
     "grok-4.6": 500000,         # grok-4.6, grok-4.6-latest — 500K (OpenRouter / docs.x.ai)
     "grok-4.5": 500000,         # grok-4.5, grok-4.5-latest — 500K context per docs.x.ai
     "grok-4.3": 1000000,        # grok-4.3, grok-4.3-latest — 1M context per docs.x.ai
@@ -807,6 +808,12 @@ _GROK_EFFORT_CAPABLE_PREFIXES = (
     # conservative default sends no effort dial at all, silently dropping
     # reasoning-effort control for every 4.6 lane.
     "grok-4.6",
+    # grok-4.7: verified live against /v1/responses 2026-09-22 — same shape as
+    # grok-4.5/4.6 (low/medium/high ACCEPTED; "none" 400s with "This model does
+    # not support `reasoning_effort` value `none`"). docs.x.ai advertises
+    # "configurable reasoning" for 4.7, but this entry records the measurement,
+    # not the claim.
+    "grok-4.7",
 )
 
 

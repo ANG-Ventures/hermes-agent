@@ -113,6 +113,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("google/gemini-3.1-pro-preview",          ""),
     ("google/gemini-3.7-flash",                ""),
     # xAI
+    ("x-ai/grok-4.7",                          ""),
     ("x-ai/grok-4.6",                          ""),
     ("x-ai/grok-4.5",                          ""),
     # DeepSeek
@@ -208,7 +209,7 @@ def _codex_curated_models() -> list[str]:
 # (grok-4, grok-4-0709, grok-4-fast{,-reasoning,-non-reasoning},
 #  grok-4-1-fast{,-reasoning,-non-reasoning}, grok-code-fast-1 → grok-4.3).
 _XAI_STATIC_FALLBACK: list[str] = [
-    "grok-4.6",
+    "grok-4.7",
     "grok-build-0.1",
     "grok-4.6",
     "grok-4.5",
@@ -220,13 +221,14 @@ _XAI_STATIC_FALLBACK: list[str] = [
 
 # Callable via xAI OAuth but omitted from models.dev and /v1/models listings.
 _XAI_CURATED_EXTRAS: list[str] = [
+    "grok-4.7",  # GA 2026-09-21 — kept until the models.dev disk cache refreshes
     "grok-4.6",  # GA 2026-08-12 — kept until the models.dev disk cache refreshes
     "grok-4.5",  # GA 2026-07 — kept until the models.dev disk cache refreshes
     "grok-composer-2.5-fast",
 ]
 
 
-_XAI_TOP_MODEL = "grok-4.6"
+_XAI_TOP_MODEL = "grok-4.7"
 
 
 def _xai_promote_top(ids: list[str]) -> list[str]:
