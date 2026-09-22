@@ -1965,3 +1965,51 @@ def test_cleanup_reclaims_when_every_missing_repository_is_vouched_for(
     assert board.execute(
         "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
         (tid,)).fetchone()["held_reason"] is None
+
+
+# --- carrying a ref must not cost the bundle beside it ---------------------
+#
+# `carried` (refs) and `carried_bundles` are two independent collections read
+# out of the SAME recorded survivor. Every existing partial-loss test loses a
+# repository vouched for by exactly ONE of them, so a mutant that keeps the
+# bundle carry-forward but disables it whenever a ref is ALSO being carried
+# (`carried_bundles = [] if carried else [...]`) leaves all 30 tests on this
+# file GREEN -- while the MIXED shape silently drops the bundle and relabels
+# the record `kind: "ref"`, telling an operator the work is pushed when the
+# only copy of it is an orphaned bundle attachment.
+
+
+def test_a_mixed_shaped_survivor_carries_the_ref_AND_the_bundle(
+        board, remote, tmp_path, monkeypatch):
+    """PARTIAL loss, two vanished repos, one vouched by a ref and one by a
+    bundle: both must survive the rewrite, and `kind` must stay `bundle`.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="mixed partial loss")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "mixed-kept.git")
+    bundle = {"repository": "gone_bundle", "path": str(tmp_path / "implementation-0.bundle"),
+              "sha256": "e" * 64, "bytes": 11}
+    _seed_survivor(board, tid, ws,
+                   {"kept": kept_head, "gone_bundle": STALE, "gone_ref": STALE},
+                   {"kind": "bundle", "notice": "NOT PUSHED", "bundles": [bundle],
+                    "refs": [{"repository": "gone_ref", "pr": PR, "sha": HEAD}]})
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert [b["repository"] for b in out.get("bundles") or ()] == ["gone_bundle"], out
+    assert out["bundles"][0]["path"] == bundle["path"], "the stored bundle pointer must survive"
+    assert {ref["repository"] for ref in out["refs"]} == {"gone_ref", "kept"}, out
+    assert out["kind"] == "bundle", (
+        "carrying a ref must not relabel a survivor whose unpushed history is a bundle"
+    )
+    saved = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["survivor"])
+    assert [b["repository"] for b in saved["bundles"]] == ["gone_bundle"], saved
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is None
