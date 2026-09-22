@@ -89,7 +89,6 @@ def _repo_root() -> Path:
 # annotated `# noqa: atomic-write-on-loop <reason>`), then DELETE its line here.
 REACHABLE_BASELINE = frozenset({
     "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
-    "gateway/platforms/base.py cancel_background_tasks -> atomic_json_write",
     "gateway/platforms/weixin.py _poll_loop -> atomic_json_write",
     "gateway/platforms/weixin.py qr_login -> atomic_json_write",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
