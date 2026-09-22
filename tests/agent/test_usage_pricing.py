@@ -255,6 +255,9 @@ def test_notional_anthropic_has_known_pricing():
 _XAI_GROK_CASES = [
     # (model, in$/Mtok, out$/Mtok)  — 1M in + 1M out = in+out
     ("grok-build-0.1", 1.00, 2.00),
+    # grok-4.7 GA 2026-09-21 — docs.x.ai short-context rate (<200k prompt tokens).
+    ("grok-4.7", 2.00, 6.00),
+    ("grok-4.6", 2.00, 6.00),
     ("grok-4.5", 2.00, 6.00),
     ("grok-4.3", 1.25, 2.50),
     ("grok-4.20", 1.25, 2.50),
