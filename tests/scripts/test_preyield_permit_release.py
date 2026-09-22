@@ -753,12 +753,24 @@ def test_conditionally_exiting_arm_is_accepted_once_it_releases():
             "except BaseException:\n    def _later():\n        sem.release()\n    raise\n",
         ),
         (
+            "nested def under a condition",
+            "except BaseException:\n    if surface:\n        def _later():\n            sem.release()\n    raise\n",
+        ),
+        (
+            "lambda under a condition",
+            "except BaseException:\n    if surface:\n        _later = lambda: sem.release()\n    raise\n",
+        ),
+        (
             "if False",
             "except BaseException:\n    if False:\n        sem.release()\n    raise\n",
         ),
         (
             "loop over an empty literal",
             "except BaseException:\n    for _ in []:\n        sem.release()\n    raise\n",
+        ),
+        (
+            "after an unconditional raise",
+            "except BaseException:\n    raise\n    sem.release()\n",
         ),
     ],
 )
