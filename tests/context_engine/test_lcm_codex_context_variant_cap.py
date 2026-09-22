@@ -9,6 +9,9 @@ cron that had opted into the large window.
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 from agent import model_metadata
@@ -86,3 +89,28 @@ def test_every_host_context_variant_family_is_uncapped() -> None:
 def test_non_codex_route_unaffected() -> None:
     assert codex_routing._codex_oauth_context_cap("gpt-5.6-sol-900k", "openrouter") is None
     assert codex_routing._codex_oauth_context_cap("gpt-5.6-sol", "openai-api") is None
+
+
+def _install_host_helper(monkeypatch, predicate):
+    mod = types.ModuleType("agent.model_metadata")
+    mod.is_codex_context_variant = predicate
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", mod)
+
+
+def test_helper_missing_falls_back_to_table(monkeypatch):
+    """Upstream CI stub / older host: no helper -> conservative table applies."""
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", None)  # import raises
+    assert codex_routing._codex_oauth_context_cap("gpt-5.6-sol-900k", "openai-codex") == 272_000
+
+
+def test_helper_raising_is_fail_open_to_table(monkeypatch):
+    def _boom(_m):
+        raise RuntimeError("host helper exploded")
+
+    _install_host_helper(monkeypatch, _boom)
+    assert codex_routing._codex_oauth_context_cap("gpt-5.6-sol-900k", "openai-codex") == 272_000
+
+
+def test_helper_rejecting_slug_keeps_table(monkeypatch):
+    _install_host_helper(monkeypatch, lambda m: False)
+    assert codex_routing._codex_oauth_context_cap("gpt-5.6-sol-900k", "openai-codex") == 272_000
