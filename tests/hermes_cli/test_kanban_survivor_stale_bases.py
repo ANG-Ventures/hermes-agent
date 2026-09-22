@@ -39,9 +39,15 @@ def remote(monkeypatch):
     and ``state["tips"]`` is what a bare ``git ls-remote <url>`` advertises --
     empty by default, so a ``--survivor-ref`` resolves to nothing. Both are
     stubbed rather than left to the network so these tests never reach out.
+
+    ``headRefName`` starts UNRELATED to any card on purpose. Existence is not
+    relevance: an explicit ``--survivor-pr`` must corroborate the card that
+    names it, so a test wanting the happy path calls :func:`names_card` and one
+    wanting the refusal leaves this alone.
     """
     state = {"state": "OPEN", "headRefOid": HEAD, "mergeCommit": None,
-             "missing": False, "tips": ""}
+             "missing": False, "tips": "",
+             "headRefName": "someone/unrelated-work", "title": "", "body": ""}
     real = subprocess.run
 
     def run(args, **kwargs):
@@ -57,6 +63,12 @@ def remote(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", run)
     return state
+
+
+def names_card(remote, tid):
+    """Make the claimed PR corroborate THIS card, the way a real one would."""
+    remote["headRefName"] = f"operator/{tid}-landed-elsewhere"
+    return remote
 
 
 def stale_card(conn, *, title="review lane"):
@@ -78,6 +90,7 @@ def stale_card(conn, *, title="review lane"):
 def test_stale_bases_with_a_verified_survivor_pr_completes(board, remote):
     """The case that was impossible: dir exists, repo gone, operator names a PR."""
     tid, ws = stale_card(board)
+    names_card(remote, tid)
 
     assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
 
@@ -165,6 +178,7 @@ def test_cli_refusal_exits_non_zero_with_the_reason_and_hint(board, remote, monk
 def test_cli_successful_completion_exits_zero_and_says_so(board, remote, monkeypatch, capsys):
     """Teeth for the test above: the happy path must stay quiet and green."""
     tid, _ = stale_card(board)
+    names_card(remote, tid)
 
     rc = _cli(board, monkeypatch,
               ["kanban", "complete", tid, "--summary", "ok", "--survivor-pr", PR])
@@ -216,6 +230,7 @@ def test_partial_loss_keeps_both_the_surviving_repo_and_the_operator_ref(board, 
     that is gone -- leaving that work pointed at nothing.
     """
     tid, _ = partial_loss_card(board, tmp_path, monkeypatch)
+    names_card(remote, tid)
 
     assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
 
