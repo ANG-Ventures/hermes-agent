@@ -481,6 +481,22 @@ def resolve_stop_drain_deadline_s(
     ``ExitTimeOut``) is unchanged; passing the captured value makes the
     deadline provably the armed one rather than a second derivation that
     has to be argued equal. ``gateway.run`` passes it.
+
+    🔴 A caller-supplied ``armed_deadline_s`` is CLAMPED to the same wall
+    the recomputation branch is structurally bounded by, because the
+    published value is only wall-clamped when the arming itself ran with
+    ``signal_driven=True``. An in-band restart (``stop(restart=True)``)
+    arms with that flag False, so
+    :func:`resolve_launchd_shutdown_watchdog_delay` short-circuits and the
+    published deadline is the RAW inner leash (drain 180 + grace 60 = 240
+    at clamp 60). If a supervisor SIGTERM then lands mid-stop the handler
+    sets ``_stop_requested_by_signal = True``, and the reads below see
+    ``signal_driven=True`` together with that stale unclamped 240 —
+    yielding a deadline of 225 against an uncatchable SIGKILL at 60, i.e.
+    a drain fitted ~190s past the wall. The extend-only re-arm cannot
+    rescue it either: the fresh value (50) is EARLIER, so it fails the
+    extend-only guard and 240 stays in force. Clamping here is inert on
+    every path where the armed value is already inside the wall.
     """
     if not signal_driven or launchd_exit_timeout_s is None:
         return None
@@ -496,6 +512,22 @@ def resolve_stop_drain_deadline_s(
             armed = max(float(armed_deadline_s), 0.0)
         except (TypeError, ValueError):
             armed = None
+        if armed is not None:
+            # Bound the passthrough by the SAME wall the recomputation
+            # branch below is structurally bounded by. The published value
+            # can be a raw, unclamped inner leash (see the docstring), and
+            # a deadline past the hard exit fits the drain past launchd's
+            # uncatchable SIGKILL. Inert whenever the armed value is
+            # already inside the wall, which is every non-raced path.
+            armed = min(
+                armed,
+                resolve_launchd_shutdown_watchdog_delay(
+                    budget,
+                    budget,
+                    signal_driven=True,
+                    hard_exit_reserve_s=hard_exit_reserve_s,
+                ),
+            )
     if armed is None:
         armed = resolve_armed_shutdown_watchdog_delay(
             drain_timeout,

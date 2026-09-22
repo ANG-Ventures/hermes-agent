@@ -19831,6 +19831,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 would answer with SIGKILL anyway). When the wall already
                 binds there is nothing to extend and this is a no-op.
 
+                🔴 LAUNCHD-ONLY, because that bound only EXISTS there.
+                ``resolve_launchd_shutdown_watchdog_delay`` short-circuits
+                when there is no live ``ExitTimeOut`` (systemd, Docker/s6,
+                ``--external-supervisor``, foreground), so off launchd the
+                new deadline is a plainly uncapped
+                ``elapsed + drain + max(grace, reserve)`` and the re-arm
+                would push ``os._exit`` later on every SIGTERM that spends
+                >0.5s pre-drain, bounded by nothing. There is also nothing
+                to buy back there: ``resolve_stop_drain_deadline_s``
+                returns ``None`` without a launchd budget, so the drain and
+                the cron leash are never elapsed-charged in the first place
+                and finding 4's defect does not arise. Cost without
+                correctness — so the re-arm is gated to the path whose
+                invariant the docstring above actually states.
+
                 🔴 UNIT MISMATCH, handled here and nowhere else: ``delay_s``
                 and ``_armed_shutdown_deadline_s`` are ABSOLUTE, measured
                 from the start of ``stop()``, but ``arm_shutdown_watchdog``
@@ -19845,8 +19860,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 elapsed 40: fires at 330 against a SIGKILL at 300). So the
                 absolute deadline is PUBLISHED for the drain and cron sites
                 and the REMAINING time is what gets armed.
+
+                🔴 FAIL-SAFE ORDERING. The replacement backstop is armed
+                BEFORE any shutdown state is committed and before the old
+                one is retired, and the whole body is contained: if arming
+                raises, ``stop()`` continues under the watchdog it already
+                had rather than unwinding at drain-fit — which would skip
+                drain, persist and teardown while the outer ``finally`` set
+                every event and disarmed the original too, leaving nothing
+                to ``os._exit`` before launchd's SIGKILL.
                 """
                 if os.environ.get("PYTEST_CURRENT_TEST"):
+                    return
+                # No live ExitTimeOut => no wall => no cap and no benefit.
+                _budget = getattr(self, "_launchd_exit_timeout_s", None)
+                if not getattr(self, "_stop_requested_by_signal", False) or not _budget:
                     return
                 try:
                     _new = max(float(delay_s), 0.0)
@@ -19876,17 +19904,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
                 _prev = self._shutdown_watchdog_done
                 _fresh = threading.Event()
-                self._shutdown_watchdog_done = _fresh
+                # Registered for cleanup BEFORE arming: if arming succeeds
+                # the outer finally must be able to retire the thread, and
+                # if it fails setting an event nothing waits on is a no-op.
                 _watchdog_events.append(_fresh)
+                try:
+                    # Arm the replacement FIRST. Nothing about the shutdown
+                    # state is committed and the old backstop is still in
+                    # force until this returns, so a failure here leaves
+                    # stop() exactly as it was.
+                    arm_shutdown_watchdog(
+                        _remaining,
+                        done_event=_fresh,
+                        snapshot_fn=_shutdown_watchdog_snapshot,
+                        exit_code=1,
+                    )
+                except Exception:
+                    # Contained on purpose: propagating would unwind
+                    # _stop_impl_body at the drain fit — before drain,
+                    # persist and teardown — and the outer finally would
+                    # then set every event, disarming the ORIGINAL watchdog
+                    # too. That trades a missed deadline extension for an
+                    # unpersisted shutdown with no backstop at all.
+                    logger.warning(
+                        "Shutdown watchdog re-arm failed; continuing under "
+                        "the watchdog already armed at stop()+%.1fs",
+                        float(_cur) if _cur is not None else -1.0,
+                        exc_info=True,
+                    )
+                    return
+                # Replacement is live — now commit, then retire the old one,
+                # so there is never an instant with no backstop at all.
+                self._shutdown_watchdog_done = _fresh
                 self._armed_shutdown_deadline_s = _new
-                arm_shutdown_watchdog(
-                    _remaining,
-                    done_event=_fresh,
-                    snapshot_fn=_shutdown_watchdog_snapshot,
-                    exit_code=1,
-                )
-                # Disarm the superseded thread only AFTER the replacement is
-                # armed, so there is no instant with no backstop at all.
                 if _prev is not None:
                     _prev.set()
                 logger.info(
