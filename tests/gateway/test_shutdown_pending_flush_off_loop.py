@@ -387,7 +387,15 @@ def test_cancellation_propagates_as_cancelled_error_not_the_worker_error(
 def test_a_failing_write_is_best_effort_and_never_breaks_shutdown(
     flush_home, monkeypatch
 ):
-    """The sync form swallows per-session failures; the async form must too."""
+    """The sync form swallows per-session failures; the async form must too.
+
+    NOTE the seam this does NOT cover -- ``flush_pending_to_file`` catches
+    per-session exceptions itself, so a raising ``_write_payload`` never
+    reaches the async wrapper's own handler.  Measured: making that wrapper
+    ``raise`` instead of returning 0 left this whole file at 20/20 green.
+    ``test_a_failing_lane_submission_is_best_effort`` below gates the
+    wrapper's handler directly.
+    """
 
     def _boom(*a, **kw):
         raise RuntimeError("payload write failed")
@@ -401,6 +409,64 @@ def test_a_failing_write_is_best_effort_and_never_breaks_shutdown(
     )
     assert flushed == 0
     assert _payload_files(flush_home) == []
+
+
+def test_a_failing_lane_submission_is_best_effort(flush_home, monkeypatch):
+    """The wrapper's OWN failure must not break shutdown either.
+
+    The lane can fail where the sync form cannot: a rejected ``submit``
+    (interpreter shutting down, lane already shut), or the worker raising
+    out of ``_run_on_flush_lane`` rather than inside the per-session loop.
+    Both surface at the wrapper, and the caller is ``cancel_background_tasks``
+    inside a bare ``except Exception: pass`` -- so an escaping exception would
+    silently skip the rest of adapter teardown.
+    """
+    class _RejectingLane:
+        def submit(self, *a, **kw):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(
+        shutdown_flush, "_get_flush_lane", lambda: _RejectingLane(), raising=True
+    )
+
+    assert asyncio.run(
+        shutdown_flush.flush_pending_to_file_async(
+            {"sess-a": "x"}, reason="adapter_shutdown"
+        )
+    ) == 0
+
+    # A rejected submit must not strand the fence: nothing was queued, so a
+    # later drain has to return immediately rather than wait out its timeout
+    # on a completion that can never arrive.
+    t0 = time.monotonic()
+    assert shutdown_flush.fence_flush_lane(timeout=5.0)
+    assert time.monotonic() - t0 < 1.0, (
+        "a rejected lane submission left the submitted/completed counters "
+        "unbalanced; every later fence now blocks for its full timeout"
+    )
+
+
+def test_a_worker_exception_reaches_the_wrapper_as_best_effort(
+    flush_home, monkeypatch
+):
+    """An exception raised out of the LANE BODY must be swallowed, not raised.
+
+    Unlike ``_write_payload``, this one is not caught by the sync form's
+    per-session loop, so it is the wrapper's handler that has to hold.
+    """
+    def _boom(*a, **kw):
+        raise RuntimeError("lane body failed")
+
+    monkeypatch.setattr(
+        shutdown_flush, "flush_pending_to_file", _boom, raising=True
+    )
+
+    assert asyncio.run(
+        shutdown_flush.flush_pending_to_file_async(
+            {"sess-a": "x"}, reason="adapter_shutdown"
+        )
+    ) == 0
+    assert shutdown_flush.fence_flush_lane(timeout=5.0)
 
 
 def test_empty_pending_is_a_noop(flush_home):
