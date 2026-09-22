@@ -744,14 +744,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
-    p_complete.add_argument("--survivor-ref", default=None, metavar="URL#SHA",
+    p_complete.add_argument("--survivor-ref", default=None, action="append", metavar="[REPO=]URL#SHA",
                             help="Name an external survivor when the implementation lives on a "
                                  "remote, not in the workspace. Verified with git ls-remote "
                                  "AND required to name this task: the SHA must resolve to a "
                                  "single branch or tag tip whose ref name contains the task id. "
                                  "An unverifiable claim, or one on an unrelated-looking ref, "
-                                 "refuses the completion (see --survivor-unbound).")
-    p_complete.add_argument("--survivor-pr", default=None, metavar="OWNER/REPO#N",
+                                 "refuses the completion (see --survivor-unbound). Repeatable: "
+                                 "qualify each claim as <workspace-relative-repo>=<claim> when "
+                                 "more than one recorded repository vanished.")
+    p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
                                  "gh pr view (state OPEN or MERGED) AND required to name this "
                                  "task; an unverifiable claim refuses the completion. Naming "
@@ -759,7 +761,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  "only in the PR title or body is a mention, not a tie to this "
                                  "card's work, so it is recorded as an unbound claim (see "
                                  "--survivor-unbound) and never becomes standing authority to "
-                                 "delete the workspace later.")
+                                 "delete the workspace later. Repeatable; same <repo>= qualifier "
+                                 "as --survivor-ref.")
     p_complete.add_argument("--survivor-unbound", action="store_true",
                             help="Operator override: accept a --survivor-ref/--survivor-pr that "
                                  "is live but does NOT name this task, for the case where the "

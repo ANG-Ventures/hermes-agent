@@ -347,8 +347,8 @@ def test_the_override_also_distinguishes_a_blip_from_a_verdict(board, flaky):
 # --- the help must describe the gate that will refuse the operator ----------
 
 @pytest.mark.parametrize("flag,metavar,ends_at", [
-    ("--survivor-ref", "URL#SHA", "--survivor-pr"),
-    ("--survivor-pr", "OWNER/REPO#N", "--survivor-unbound"),
+    ("--survivor-ref", "[REPO=]URL#SHA", "--survivor-pr"),
+    ("--survivor-pr", "[REPO=]OWNER/REPO#N", "--survivor-unbound"),
 ])
 def test_the_help_documents_the_task_naming_requirement(flag, metavar, ends_at, capsys):
     """Both claim flags enforce the binding, so both must say so.

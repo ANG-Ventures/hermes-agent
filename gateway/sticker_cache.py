@@ -8,9 +8,11 @@ sticker image on every send. Descriptions are concise (1-2 sentences).
 Cache location: ~/.hermes/sticker_cache.json
 """
 
+import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 from typing import Optional
 
@@ -34,6 +36,20 @@ def _load_cache() -> dict:
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
+
+
+# Serializes the read-modify-write in ``cache_sticker_description``.
+#
+# ``atomic_replace`` makes each individual WRITE atomic; it does not make the
+# load/mutate/save TRIPLE atomic.  On the pre-existing inline code path the
+# event loop happened to serialize every caller, so the race could not be
+# observed.  ``cache_sticker_description_async`` below moves the write to a
+# worker thread, which removes that accidental serialization -- so the lock has
+# to be added in the SAME change that introduces the concurrency, or two
+# stickers described at once silently drop one of the two descriptions.
+#
+# Re-entrant because the async wrapper dispatches straight into the sync form.
+_CACHE_LOCK = threading.RLock()
 
 
 def _save_cache(cache: dict) -> None:
@@ -82,14 +98,36 @@ def cache_sticker_description(
         emoji:          Associated emoji (e.g. "😀").
         set_name:       Sticker set name if available.
     """
-    cache = _load_cache()
-    cache[file_unique_id] = {
-        "description": description,
-        "emoji": emoji,
-        "set_name": set_name,
-        "cached_at": time.time(),
-    }
-    _save_cache(cache)
+    with _CACHE_LOCK:
+        cache = _load_cache()
+        cache[file_unique_id] = {
+            "description": description,
+            "emoji": emoji,
+            "set_name": set_name,
+            "cached_at": time.time(),
+        }
+        _save_cache(cache)
+
+
+async def cache_sticker_description_async(
+    file_unique_id: str,
+    description: str,
+    emoji: str = "",
+    set_name: str = "",
+) -> None:
+    """Off-loop form of :func:`cache_sticker_description`.
+
+    ``_save_cache`` ends in ``os.fsync`` + ``os.replace``, whose duration is
+    unbounded under filesystem pressure -- the exact tail that blocked the
+    Apollo event loop for 30s on 2026-09-20.  Telegram's ``_handle_sticker``
+    is an inbound-message coroutine, so it must not pay that inline.
+
+    The sync form keeps its exact contract for the non-loop callers (it is the
+    public API and is what this wrapper dispatches to), so it is not removed.
+    """
+    await asyncio.to_thread(
+        cache_sticker_description, file_unique_id, description, emoji, set_name
+    )
 
 
 def build_sticker_injection(
