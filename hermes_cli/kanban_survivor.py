@@ -56,11 +56,13 @@ def _git(repo, *args, env=None, check=True):
 def _alternates(repo):
     """Object stores this repo BORROWS from, newest-first as Git reads them.
 
-    A clone made from a local path (`git clone ../cold`, `--shared`,
-    `--reference`) does not copy objects: it records the lender here. When the
-    lender is later pruned or reaped the borrower silently becomes unreadable,
-    which is the upstream cause of a broken object store inside a scratch
-    workspace -- so the lender's path is the single most useful thing to name.
+    A clone made from a local path with `--shared` or `--reference` does not
+    copy the lender's objects: it records the lender here. (A plain
+    `git clone <local-path>` does NOT -- measured on git 2.53.0, it hardlinks
+    and writes no alternates file at all.) When the lender is later pruned or
+    reaped the borrower silently becomes unreadable, which is the upstream
+    cause of a broken object store inside a scratch workspace -- so the
+    lender's path is the single most useful thing to name.
     """
     location = _git(repo, "rev-parse", "--path-format=absolute", "--git-path",
                     "objects/info/alternates", check=False)
@@ -68,7 +70,7 @@ def _alternates(repo):
         return []
     path = location.stdout.decode("utf-8", "replace").strip()
     try:
-        lines = Path(path).read_text("utf-8", "replace").splitlines() if path else []
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines() if path else []
     except OSError:
         return []
     return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
@@ -139,7 +141,7 @@ def _object_store_broken(repo):
     )
 
 
-def _explain_broken_object_store(repo, key, workspace):
+def _explain_broken_object_store(repo, key, workspace, bases=()):
     """Re-raise a failed capture with a diagnosis instead of the bare constant.
 
     `_git(check=True)` collapses every non-zero rc into
@@ -171,6 +173,16 @@ def _explain_broken_object_store(repo, key, workspace):
         remedy = (f"HEAD {sha[:12]} is advertised at {published['remote']}/{published['branch']}, "
                   "so its committed work is published; if the remaining local changes are "
                   f"disposable, MOVE {where} out of the workspace (never delete it) and retry")
+        if key in bases:
+            # `preserve` has a SECOND fail-closed gate: a repo recorded at
+            # dispatch that is no longer present raises "recorded repository
+            # missing", which says nothing about the quarantine that caused it.
+            # Following the MOVE advice alone would just trade one refusal for
+            # a more confusing one, so the remedy has to name both steps. The
+            # gate itself stays closed -- only the message gets honest.
+            remedy += (f" -- {where} was recorded at dispatch, so the retry must PAIR the move "
+                       "with --survivor-pr <owner/repo#N> or --survivor-ref <repo-url>#<sha> "
+                       "or it will refuse again with 'recorded repository missing'")
     else:
         remedy = (f"HEAD {sha[:12]} is not advertised on any durable remote -- do not delete "
                   f"{where}; restore the missing objects first")
@@ -545,7 +557,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # bare constant. Classify it before it escapes: if this repo's
                 # store is broken, say WHICH repo, WHICH lender and what to do.
                 # Anything else re-raises unchanged.
-                _explain_broken_object_store(repo, key, workspace)
+                _explain_broken_object_store(repo, key, workspace, bases)
                 raise
             if ref:
                 refs.append(dict(ref, repository=key))
