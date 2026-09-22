@@ -2789,6 +2789,176 @@ def assert_is_board_db(db_path: Path, conn: sqlite3.Connection) -> None:
         )
 
 
+class LiveBoardWriteRefused(RuntimeError):
+    """Raised when a test/probe process tries to open the PRODUCTION board rw.
+
+    See :func:`_assert_live_board_write_allowed`.
+    """
+
+
+def _production_kanban_roots() -> list[Path]:
+    """The Hermes roots whose ``kanban.db`` is the LIVE board.
+
+    Delegates to :func:`hermes_state._production_state_roots` rather than
+    computing its own answer. That list is the fleet's single definition of
+    "this is production": the platform-default root resolved WITHOUT
+    ``Path.home()`` / ``hermes_constants`` (both of which tests monkeypatch),
+    plus ``_STATE_DB_GUARD_EXTRA_DENY_ROOTS``, into which ``tests/conftest.py``
+    injects the pre-sandbox production root so custom-``HERMES_HOME``
+    deployments are covered too.
+
+    Sharing it is the point. ``state.db`` and ``kanban.db`` are the same class
+    of live store reached the same way, and the 2026-07-24 state.db incident
+    and the 2026-08-08 / 2026-09-21 kanban incidents are the same bug. A second
+    root definition here would be free to drift from the one the rest of the
+    guard class uses, which is how the first member got fixed while this one
+    kept leaking.
+    """
+    from hermes_state import _production_state_roots
+    return list(_production_state_roots())
+
+
+def _in_test_context() -> bool:
+    """True when this process is a test run, by environment OR by ancestry.
+
+    Re-exported from the leaf module ``hermes_test_context`` — the same single
+    definition ``hermes_state``'s guard uses. Deliberately NOT a local
+    ``PYTEST_CURRENT_TEST`` check: that misses a child spawned with a rebuilt
+    environment, which loses ``PYTEST_*`` and ``HERMES_HOME`` together and is
+    precisely the state in which it writes to production (#82770).
+    """
+    from hermes_test_context import _in_test_context as _impl
+    return _impl()
+
+
+def _is_production_board_db(resolved: Path, root: Path) -> bool:
+    """True when *resolved* is a LIVE board DB of the production root *root*.
+
+    Mirrors :func:`hermes_state._is_production_state_db` and covers the two
+    on-disk board layouts :func:`_board_db_path_ignoring_pin` produces:
+
+    * ``<root>/kanban.db`` — the ``default`` board (back-compat path);
+    * ``<root>/kanban/boards/<slug>/kanban.db`` — every named board.
+
+    Deliberately narrow. Anything deeper or elsewhere under the root is NOT a
+    board — notably ``~/.hermes/hermes-agent/...`` worktrees and
+    ``~/.hermes/kanban/workspaces/<task>/...`` scratch dirs, where hermetic
+    tests and workers legitimately create throwaway DBs. A containment-only
+    check (``is_relative_to(root)``) would refuse all of those.
+    """
+    if resolved == root / "kanban.db":
+        return True
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    return (
+        len(parts) == 4
+        and parts[0] == "kanban"
+        and parts[1] == "boards"
+        and parts[3] == "kanban.db"
+    )
+
+
+def _assert_live_board_write_allowed(path: Path) -> None:
+    """Refuse a READ-WRITE open of the LIVE board by a test/probe process.
+
+    The structural half of the 2026-08-08 / 2026-09-21 incidents. Until now the
+    only thing standing between a fixture card and the live board was
+    ``tests/conftest.py``'s env scrub, which is PATH-SCOPED: it loads when
+    pytest collects a file under ``tests/``, so a probe script sitting anywhere
+    else keeps the dispatcher-injected ``HERMES_KANBAN_DB`` pin and writes to
+    production. On 2026-09-21 that put three fixture cards on the live board and
+    burned three real worker runs against them.
+
+    A doc line and an opt-in flag cannot fix that — they require the probe's
+    author to remember. This gate sits at the ``connect()`` choke point instead,
+    so it covers every entry path regardless of where the ``.py`` file lives.
+
+    This is deliberately the SAME guard ``state.db`` has carried since the
+    2026-07-24 WAL incident (:func:`hermes_state._ensure_test_isolation`): same
+    production-root list, same test-context predicate, same fail-before-open
+    placement. Two stores, one class, one definition.
+
+    Two independent refusals, each covering a leak shape the other misses:
+
+    * **R1 (test context).** The process is a test run — by env *or* by process
+      ancestry (:func:`hermes_test_context._in_test_context`) — and is opening a
+      live board. This is the 16:05 shape: a probe under pytest from outside
+      ``tests/``, inheriting the worker's pin, ``HERMES_HOME`` still the real
+      profile. R2 cannot see it; nothing was redirected.
+    * **R2 (redirected home).** ``HERMES_HOME`` declares a root that is NOT a
+      production root — the caller sandboxed its Hermes state — yet kanban
+      resolved to a live board anyway, because a ``HERMES_KANBAN_*`` pin
+      outranks ``HERMES_HOME``. This is the 16:30 shape: bare
+      ``python probe.py`` under a throwaway probe home with no pytest marker at
+      all, so R1 cannot see it. This is the exact contradiction
+      :func:`_warn_if_override_escapes_hermes_home` has only ever WARNED about.
+
+    Neither condition can hold for a production writer. The fleet runs with
+    ``HERMES_HOME`` unset, ``=~/.hermes``, or ``=~/.hermes/profiles/<name>``,
+    all of which resolve ``kanban_home()`` to the production root (R2 false),
+    and no fleet component is a test context (R1 false). The gate is inert in
+    production and costs one ``Path.resolve()``.
+
+    A deliberate operator pin to a board outside every production root — the
+    documented ``HERMES_KANBAN_DB`` use — is untouched.
+    """
+    try:
+        target = path.expanduser().resolve(strict=False)
+    except OSError:  # pragma: no cover - resolution failure is not a leak
+        return
+    live_root: Optional[Path] = None
+    for root in _production_kanban_roots():
+        if _is_production_board_db(target, root):
+            live_root = root
+            break
+    if live_root is None:
+        return  # not a live board — nothing this guard is about.
+
+    reason: Optional[str] = None
+    if _in_test_context():
+        reason = (
+            f"this process is a TEST context and {target} is the LIVE board "
+            f"(under real Hermes root {live_root})"
+        )
+    else:
+        declared = os.environ.get("HERMES_HOME", "").strip()
+        if declared:
+            try:
+                declared_root = kanban_home().expanduser().resolve(strict=False)
+            except OSError:  # pragma: no cover - diagnostic only
+                declared_root = live_root
+            if declared_root not in {
+                r for r in _production_kanban_roots()
+            }:
+                reason = (
+                    f"HERMES_HOME={declared} declares the kanban root "
+                    f"{declared_root}, but a HERMES_KANBAN_* path pin "
+                    f"outranked it and resolved to {target} — the LIVE board "
+                    f"under {live_root}"
+                )
+    if reason is None:
+        return
+    pins = ", ".join(
+        f"{k}={os.environ[k]}"
+        for k in (*_KANBAN_PATH_PIN_ENV_VARS, "HERMES_KANBAN_BOARD")
+        if os.environ.get(k, "").strip()
+    ) or "<none>"
+    raise LiveBoardWriteRefused(
+        f"kanban live-system guard: refusing to open the live board "
+        f"read-write — {reason}. Writes from here create REAL cards that the "
+        f"dispatcher claims and spawns real workers against (3 fixture cards + "
+        f"3 burned runs on 2026-09-21). Active path pins: {pins}. To run "
+        f"against a throwaway board: HERMES_KANBAN_SANDBOX=1 "
+        f"HERMES_HOME=$(mktemp -d) — the flag neutralises every "
+        f"HERMES_KANBAN_* pin so kanban resolves under your temp home. "
+        f"Read-only inspection of the live board is still allowed via "
+        f"connect_readonly()."
+    )
+
+
 def connect_readonly(
     db_path: Optional[Path] = None,
     *,
@@ -3306,6 +3476,13 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    # Structural live-board guard. Placed BEFORE the mkdir so a refused open
+    # cannot create board directories, and before every cache fast-path so a
+    # second connect() in the same process cannot skip it. It covers an
+    # explicit ``db_path=`` too: a probe that hands connect() the live path
+    # directly is the same leak through a different door. ``init_db`` routes
+    # through here, so it is covered as well.
+    _assert_live_board_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
