@@ -54,7 +54,12 @@ def remote(monkeypatch):
         if args[0] == "gh":
             if state["missing"]:
                 return subprocess.CompletedProcess(args, 1, b"", b"not found")
-            payload = {k: state[k] for k in ("state", "headRefOid", "mergeCommit")}
+            # Forward every PR field the verifier may consult -- not just the
+            # three this file's own assertions read. `--survivor-pr` now
+            # corroborates the card against `headRefName`/`title`/`body`, so
+            # narrowing the payload here would make `names_card` inert and
+            # silently turn the happy-path tests into refusal tests.
+            payload = {k: v for k, v in state.items() if k not in ("missing", "tips")}
             return subprocess.CompletedProcess(args, 0, json.dumps(payload).encode(), b"")
         # `_ext` shells out as `git ls-remote ...`; `_git` always passes `-C`.
         if args[0] == "git" and len(args) > 1 and args[1] == "ls-remote":
@@ -318,8 +323,11 @@ def test_partial_loss_with_a_verified_survivor_ref_completes(board, remote, tmp_
     once the SHA is an advertised tip, so those refusals are about verification
     and not about the flag being inert on this branch."""
     sha = "b2" * 20
-    remote["tips"] = f"{sha}\trefs/heads/work\n"
     tid, _ = partial_loss_card(board, tmp_path, monkeypatch)
+    # The advertised ref must NAME the card: an explicit `--survivor-ref` is
+    # bound the same way `--survivor-pr` is, so `refs/heads/work` alone would
+    # be refused here as an unrelated branch rather than as an unverified SHA.
+    remote["tips"] = f"{sha}\trefs/heads/operator/{tid}-landed-elsewhere\n"
     claim = f"https://github.com/example/project.git#{sha}"
 
     assert kb.complete_task(board, tid, summary="approved", survivor_ref=claim)
