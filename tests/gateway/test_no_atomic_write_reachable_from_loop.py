@@ -88,7 +88,6 @@ def _repo_root() -> Path:
 # To fix one: move the call off-loop (or behind a loop-conditional dispatch,
 # annotated `# noqa: atomic-write-on-loop <reason>`), then DELETE its line here.
 REACHABLE_BASELINE = frozenset({
-    "gateway/lifecycle_ledger.py record_startup_async -> atomic_json_write",
     "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
     "gateway/platforms/base.py cancel_background_tasks -> atomic_json_write",
     "gateway/platforms/weixin.py _poll_loop -> atomic_json_write",
