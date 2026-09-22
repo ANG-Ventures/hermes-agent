@@ -25,12 +25,26 @@ custom_instructions) — same as mem0 cloud. The worker is the client-side relia
 from __future__ import annotations
 
 import logging
+import os
 import re as _re
 import threading
 import time
+import weakref
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# A gateway caches many provider instances, but they all drain the same durable
+# queue. Exactly one process-local owner per queue avoids N cached agents
+# polling and contending on the same SQLite file.
+_ACTIVE_DRAIN_LOCK = threading.Lock()
+_ACTIVE_DRAINS: Dict[str, "CaptureDrainWorker"] = {}
+# Every worker that has been start()ed and not yet stop()ed, keyed by queue. Exactly one of them
+# owns the drain thread; the others are standbys. Ownership must SURVIVE the shutdown of any one
+# cached provider: without a handoff, stopping the owner leaves the siblings started-but-threadless
+# and strands already-pending rows until an unrelated later enqueue or a process restart.
+# WeakSet so a provider that is garbage-collected without stop() does not pin its worker.
+_DRAIN_MEMBERS: Dict[str, "weakref.WeakSet"] = {}
 
 # HTTP status appearing in an add() error string. Two anchored shapes, so a stray 3-digit number in
 # the body (a memory id fragment, a byte count) can't be misread as a status:
@@ -113,6 +127,7 @@ class CaptureDrainWorker:
         router: Optional[Any] = None,
     ):
         self._q = queue
+        self._queue_key = os.path.realpath(os.path.abspath(queue.db_path))
         self._add = add_fn
         self._recall_idem = recall_idem_fn
         self._scrub = scrub_fn
@@ -137,26 +152,96 @@ class CaptureDrainWorker:
         self._scrub_backoff_cap_s = 3600.0
         self._scrub_alert_after = max(self._max_attempts, 3)
         self._thread: Optional[threading.Thread] = None
+        self._thread_lock = threading.Lock()
+        self._accepting_work = False
         self._stop = threading.Event()
         # observability counters (read by the digest). scrub_dead = a secret MAY be live in the store.
         self.stats = {"drained": 0, "dead": 0, "retried": 0, "reaped": 0, "scrubbed": 0, "scrub_dead": 0}
 
     # ---- lifecycle ---------------------------------------------------------
+    def _members(self) -> "weakref.WeakSet":
+        """Live standby set for this queue. Caller MUST hold _ACTIVE_DRAIN_LOCK."""
+        members = _DRAIN_MEMBERS.get(self._queue_key)
+        if members is None:
+            members = weakref.WeakSet()
+            _DRAIN_MEMBERS[self._queue_key] = members
+        return members
+
+    def _become_owner_locked(self) -> None:
+        """Take drain ownership for this queue and spawn the loop. Caller holds _ACTIVE_DRAIN_LOCK."""
+        with self._thread_lock:
+            if self._accepting_work and self._thread and self._thread.is_alive():
+                _ACTIVE_DRAINS[self._queue_key] = self
+                return
+            stop_event = threading.Event()
+            self._stop = stop_event
+            self._accepting_work = True
+            self._thread = threading.Thread(
+                target=self._loop,
+                args=(stop_event,),
+                daemon=True,
+                name="mem0-capture-drain",
+            )
+            _ACTIVE_DRAINS[self._queue_key] = self
+            self._thread.start()
+
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="mem0-capture-drain")
-        self._thread.start()
+        with _ACTIVE_DRAIN_LOCK:
+            # Register as a standby FIRST: even when another worker owns the thread, this worker
+            # must be promotable if that owner is shut down while queue work remains.
+            self._members().add(self)
+            owner = _ACTIVE_DRAINS.get(self._queue_key)
+            if owner is not None and owner is not self:
+                with owner._thread_lock:
+                    if owner._accepting_work and owner._thread and owner._thread.is_alive():
+                        return
+            self._become_owner_locked()
 
     def stop(self, timeout: float = 5.0) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=timeout)
+        with _ACTIVE_DRAIN_LOCK:
+            self._members().discard(self)
+            with self._thread_lock:
+                stop_event = self._stop
+                self._accepting_work = False
+                thread = self._thread
+            was_owner = _ACTIVE_DRAINS.get(self._queue_key) is self
+            if was_owner:
+                _ACTIVE_DRAINS.pop(self._queue_key, None)
+        stop_event.set()
+        if thread:
+            thread.join(timeout=timeout)
+        if was_owner:
+            self._promote_successor()
+
+    def _promote_successor(self) -> None:
+        """Hand ownership to a surviving standby when the owner stops with queue work outstanding.
+
+        One cached provider shutting down must not strand rows the shared durable queue still holds:
+        the sole owner is leaving, so a sibling that already returned from start() (threadless by
+        design) has to pick the thread up without waiting for an unrelated later enqueue.
+        """
+        try:
+            counts = self._q.counts()
+        except Exception as e:
+            logger.debug("capture successor check failed: %s", e)
+            return
+        if counts.get("pending", 0) == 0 and counts.get("inflight", 0) == 0:
+            return
+        with _ACTIVE_DRAIN_LOCK:
+            owner = _ACTIVE_DRAINS.get(self._queue_key)
+            if owner is not None and owner is not self:
+                with owner._thread_lock:
+                    if owner._accepting_work and owner._thread and owner._thread.is_alive():
+                        return
+            for candidate in list(self._members()):
+                if candidate is self:
+                    continue
+                candidate._become_owner_locked()
+                return
 
     # ---- the loop ----------------------------------------------------------
-    def _loop(self) -> None:
-        while not self._stop.is_set():
+    def _loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
             try:
                 worked = self.drain_once()
             except Exception as e:  # a loop iteration must never kill the worker
@@ -170,7 +255,26 @@ class CaptureDrainWorker:
             except Exception as e:
                 logger.debug("reaper error: %s", e)
             if not worked:
-                self._stop.wait(self._poll)
+                # Cached gateway agents can live for an hour. Do not keep one
+                # poller per cached Mem0 provider after the durable queue is
+                # fully drained. The lock pairs this final queue check with
+                # start(): an enqueue racing this exit either appears in the
+                # count or observes _accepting_work=False and starts a successor.
+                try:
+                    with _ACTIVE_DRAIN_LOCK:
+                        with self._thread_lock:
+                            counts = self._q.counts()
+                            if (
+                                counts.get("pending", 0) == 0
+                                and counts.get("inflight", 0) == 0
+                            ):
+                                self._accepting_work = False
+                                if _ACTIVE_DRAINS.get(self._queue_key) is self:
+                                    _ACTIVE_DRAINS.pop(self._queue_key, None)
+                                return
+                except Exception as e:
+                    logger.debug("capture idle-exit check failed: %s", e)
+                stop_event.wait(self._poll)
 
     def drain_once(self) -> bool:
         """Process at most one due row. Returns True if a row was handled."""

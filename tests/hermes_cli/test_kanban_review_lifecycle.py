@@ -84,7 +84,7 @@ def test_request_review_transitions_running_to_review(kanban_home: Path) -> None
         ok = kb.request_review(
             conn, tid,
             summary="Implementation complete\nfull details below",
-            reviewer="reviewer",
+            reviewer="argus",
             expected_run_id=run_id,
         )
         assert ok is True
@@ -106,7 +106,7 @@ def test_request_review_transitions_running_to_review(kanban_home: Path) -> None
         assert len(rr) == 1
         payload = rr[0][1]
         assert payload["implementer"] == "worker"
-        assert payload["reviewer"] == "reviewer"
+        assert payload["reviewer"] == "argus"
         # First line of the summary rides the event payload.
         assert payload["summary"] == "Implementation complete"
         # No block / triage events were emitted.
@@ -233,7 +233,7 @@ def test_request_review_malformed_provenance_gets_distinct_reason(
         tid = kb.create_task(conn, title="provenance", assignee="builder")
         claimed = kb.claim_task(conn, tid)
         assert kb.request_review(
-            conn, tid, summary="v1", reviewer="reviewer",
+            conn, tid, summary="v1", reviewer="argus",
             expected_run_id=claimed.current_run_id,
         )
         review = kb.claim_review_task(conn, tid)
@@ -259,7 +259,7 @@ def test_request_review_malformed_provenance_gets_distinct_reason(
         assert reason is not None and "provenance" in reason
         # Passing reviewer explicitly recovers, as the reason instructs.
         assert kb.request_review(
-            conn, tid, summary="v2", reviewer="reviewer",
+            conn, tid, summary="v2", reviewer="argus",
             expected_run_id=retry.current_run_id,
         ) is True
 
@@ -437,7 +437,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
 
     with kb.connect() as conn:
         # Review-lane task with a fresh PR comment.
-        review_id = kb.create_task(conn, title="review me", assignee="reviewer")
+        review_id = kb.create_task(conn, title="review me", assignee="argus")
         claimed = kb.claim_task(conn, review_id)
         assert claimed is not None
         kb.add_comment(conn, review_id, author="worker", body=pr_comment)
@@ -464,7 +464,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         with kb.write_txn(conn):
             conn.execute(
                 "INSERT INTO task_runs (task_id, profile, status, outcome, "
-                "started_at, ended_at) VALUES (?, 'reviewer', 'rate_limited', "
+                "started_at, ended_at) VALUES (?, 'argus', 'rate_limited', "
                 "'rate_limited', ?, ?)",
                 # ended_at strictly after the review-handoff run so the
                 # "latest run" query deterministically picks this one.
@@ -497,7 +497,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         task_id = kb.create_task(
             conn,
             title="domain review",
-            assignee="reviewer",
+            assignee="argus",
             skills=["domain-specific-review"],
         )
         implementation = kb.claim_task(conn, task_id)
@@ -548,7 +548,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
 
         review_ids: list[str] = []
         for title in ("review one", "review two"):
-            task_id = kb.create_task(conn, title=title, assignee="reviewer")
+            task_id = kb.create_task(conn, title=title, assignee="argus")
             implementation = kb.claim_task(conn, task_id)
             assert implementation is not None
             assert kb.request_review(
@@ -609,13 +609,13 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
         tid = kb.create_task(conn, title="reopen me", assignee="worker")
         kb.claim_task(conn, tid)
         kb.request_review(
-            conn, tid, summary="v1", reviewer="reviewer",
+            conn, tid, summary="v1", reviewer="argus",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         reviewing = kb.get_task(conn, tid)
         assert reviewing is not None
         assert reviewing.status == "review"
-        assert reviewing.assignee == "reviewer"
+        assert reviewing.assignee == "argus"
 
         ok = kb.reopen_review_task(conn, tid)
         assert ok is True
@@ -700,11 +700,11 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
         ok = kb.request_review(
-            conn, tid, summary="v1", reviewer="lead-reviewer",
+            conn, tid, summary="v1", reviewer="momus",
             expected_run_id=claimed.current_run_id,
         )
         assert ok is True
-        assert kb.get_task(conn, tid).assignee == "lead-reviewer"
+        assert kb.get_task(conn, tid).assignee == "momus"
         ev = _events(conn, tid, kind="review_requested")[0][1]
-        assert ev["reviewer"] == "lead-reviewer"
+        assert ev["reviewer"] == "momus"
         assert ev["implementer"] == "worker"

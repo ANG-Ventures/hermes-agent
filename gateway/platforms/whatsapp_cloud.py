@@ -586,7 +586,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # agent would never learn what the user was replying to. Best-effort;
         # rich_sent_store swallows all errors.
         if last_message_id:
-            rich_sent_store.record(chat_id, last_message_id, formatted)
+            await rich_sent_store.record_async(chat_id, last_message_id, formatted)
 
         return SendResult(success=True, message_id=last_message_id)
 
@@ -2097,7 +2097,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # resolve the quoted text (Meta's webhook context carries only
             # the id). Mirrors the outbound record in send(). Best-effort.
             if body:
-                rich_sent_store.record(chat_id, wamid, body)
+                await rich_sent_store.record_async(chat_id, wamid, body)
 
         return MessageEvent(
             text=body,

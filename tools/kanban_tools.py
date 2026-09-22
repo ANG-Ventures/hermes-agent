@@ -822,6 +822,14 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    survivor_pr, survivor_ref = args.get("survivor_pr"), args.get("survivor_ref")
+    for value, name in ((survivor_pr, "survivor_pr"), (survivor_ref, "survivor_ref")):
+        if value is not None and not isinstance(value, str):
+            return tool_error(
+                f"{name} must be a string, got {type(value).__name__}"
+            )
+    survivor_pr = (survivor_pr or "").strip() or None
+    survivor_ref = (survivor_ref or "").strip() or None
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -851,6 +859,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    survivor_pr=survivor_pr, survivor_ref=survivor_ref,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -2019,6 +2028,33 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task in-flight so you can fix the path and retry."
                 ),
             },
+            "survivor_pr": {
+                "type": "string",
+                "description": (
+                    "Only when completion already REFUSED with "
+                    "``survivor_unavailable``: name the pull request that "
+                    "holds this task's implementation, as "
+                    "``owner/repo#123`` or its github.com URL. The kernel "
+                    "verifies it against the remote (it must exist and be "
+                    "OPEN or MERGED) and records it as the durable "
+                    "survivor; an unverifiable claim still refuses. This "
+                    "is the ``--survivor-pr`` escape hatch that error "
+                    "names. Never pass it speculatively — it authorises "
+                    "deleting a workspace whose work is not pushed."
+                ),
+            },
+            "survivor_ref": {
+                "type": "string",
+                "description": (
+                    "Alternative to ``survivor_pr`` when the work landed "
+                    "on a branch or tag rather than a PR: "
+                    "``<repo-url>#<sha>``. The SHA must be a current "
+                    "branch/tag tip on that remote or the completion "
+                    "still refuses. Use a clean clone URL — a URL "
+                    "carrying credentials is rejected, and is redacted "
+                    "before the rejection is echoed or logged."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": [],
@@ -2099,8 +2135,13 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
             "reviewer": {
                 "type": "string",
                 "description": (
-                    "Optional reviewer profile. When provided, the task is "
-                    "reassigned to that profile before review dispatch."
+                    "Reviewer profile to reassign the task to before review "
+                    "dispatch. Must be a REAL installed profile (the fleet "
+                    "verifier is 'argus') or the explicit sentinel 'human' / "
+                    "'human:<name>' for a deliberate human lane. A "
+                    "placeholder like 'reviewer' is refused — such a card can "
+                    "never be spawned and would wait forever. Omit to use "
+                    "config kanban.review_assignee."
                 ),
             },
             "metadata": {

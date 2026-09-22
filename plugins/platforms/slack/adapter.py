@@ -2112,7 +2112,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         lock_acquired = False
         try:
-            if not self._acquire_platform_lock(
+            if not await self._acquire_platform_lock_async(
                 "slack-app-token", app_token, "Slack app token"
             ):
                 return False

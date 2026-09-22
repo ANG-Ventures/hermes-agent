@@ -36,6 +36,33 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
       void refreshBackgroundProcesses(sessionId)
     } else if (sessionId && payload?.kind === 'goal') {
       applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
+    } else if (sessionId && payload?.kind === 'confab_notice') {
+      // The provider caught and removed self-fabricated scaffold text from
+      // the reply that is landing right now. The CLI prints this and the Ink
+      // TUI shows it as a system line; the desktop has neither, and generic
+      // `lifecycle` status text renders nothing here — so without this the
+      // LIVE half of the triage contract is invisible on desktop.
+      //
+      // Persistent system row, not a toast: the signal is load-bearing for
+      // triage and must not be missable. The reloaded-history half is
+      // handled by `confabNoticeFromRow` in chat-messages/hydration.
+      const text = coerceGatewayText(payload?.text).trim()
+
+      if (text) {
+        flushQueuedDeltas(sessionId)
+        updateSessionState(sessionId, state => ({
+          ...state,
+          messages: [
+            ...state.messages,
+            {
+              id: `confab-notice-${occurredAt ?? Date.now()}`,
+              role: 'system',
+              parts: [textPart(text, occurredAt)],
+              timestamp: occurredAt
+            }
+          ]
+        }))
+      }
     }
 
     return true

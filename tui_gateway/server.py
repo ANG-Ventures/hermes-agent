@@ -2978,10 +2978,18 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     # drivers (desktop app) can show an explicit "Summarizing…" indicator —
     # otherwise a mid-turn compaction looks like the transcript reset itself.
     if out_kind == "lifecycle":
+        from agent.confab_notice import CONFAB_NOTICE_TEXT
         from agent.conversation_compression import COMPACTION_STATUS_MARKER
 
         if COMPACTION_STATUS_MARKER in body:
             out_kind = "compacting"
+        elif CONFAB_NOTICE_TEXT in body:
+            # Same reason: the confab notice also arrives as a generic
+            # "lifecycle" status, and the desktop status handler renders
+            # nothing for lifecycle text — so the live half of the triage
+            # contract would be silently invisible there. Re-tag it to its
+            # own kind so a driver can surface it explicitly.
+            out_kind = "confab_notice"
     _emit("status.update", sid, {"kind": out_kind, "text": body})
 
 

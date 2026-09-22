@@ -77,7 +77,9 @@ can opt into fail-*closed* semantics with ``fail_closed: true``
 (``failClosed`` also accepted for Cursor/Claude-Code config compat) —
 spawn errors, timeouts, abnormal exits, empty/malformed stdout, and callback
 errors then BLOCK the tool call
-with ``hook <command> failed closed: <reason>``.  Use this for
+with ``hook <name>#<digest> failed closed: <reason>``, where the name is a
+secret-free identifier derived from the command (see ``hook_display_name``) —
+the raw command goes to the log only, never to the model.  Use this for
 security-gating hooks (secret scanners, policy checks) where a crashed
 hook must not silently allow the action.  On non-blocking events
 ``fail_closed`` is ignored with a warning. A successful fail-closed hook must
@@ -140,6 +142,7 @@ emitted by each built-in hook site.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import logging
 import os
@@ -540,10 +543,24 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
     Returns a diagnostic dict with the same keys for every outcome
     (``returncode``, ``stdout``, ``stderr``, ``timed_out``,
-    ``elapsed_seconds``, ``error``).  This is the single place the
-    subprocess is actually invoked — both the live callback path
+    ``elapsed_seconds``, ``error``, ``error_detail``).  This is the single
+    place the subprocess is actually invoked — both the live callback path
     (:func:`_make_callback`) and the CLI test helper (:func:`run_once`)
     go through it.
+
+    TWO error channels, because they have opposite requirements:
+
+    * ``error`` is REDACTED and model-facing. It reaches the model through
+      :func:`_evaluate_result` -> :func:`_fail_closed_block`, so it carries
+      the failure's exception CLASS only — never the raw command, argv, or
+      ``str(exc)``, any of which can hold an inline credential.
+    * ``error_detail`` is the OPERATOR channel: the full diagnostic text, for
+      the log and for ``hermes hooks test`` / ``hermes doctor``. Without it a
+      shlex ``No closing quotation`` and a spawn ``EACCES``/``ENOEXEC`` are
+      indistinguishable to whoever has to fix the hook. It is ``None`` when
+      there is nothing to add beyond ``error``.
+
+    ``error_detail`` must never be routed to a model-facing string.
     """
     result: Dict[str, Any] = {
         "returncode": None,
@@ -552,6 +569,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         "timed_out": False,
         "elapsed_seconds": 0.0,
         "error": None,
+        "error_detail": None,
     }
     try:
         # Windows-safe: plain shlex.split eats backslashes in paths (#78293).
@@ -559,7 +577,17 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
         argv = split_command_line(os.path.expanduser(spec.command))
     except ValueError as exc:
-        result["error"] = f"command {spec.command!r} cannot be parsed: {exc}"
+        # `error` reaches the MODEL via _evaluate_result -> _fail_closed_block,
+        # so it must never carry the raw command or exception text derived from
+        # it: an unparseable command is exactly the shape that still holds an
+        # inline credential (`sh -c 'export TOK=…` with the quote left open).
+        # Name the hook by its digest and the failure by its exception CLASS.
+        # The raw command stays on the log channel only (_evaluate_result).
+        result["error"] = (
+            f"command cannot be parsed ({type(exc).__name__})"
+        )
+        # Operator channel only — `exc` stringifies the offending command text.
+        result["error_detail"] = f"command cannot be parsed: {exc}"
         return result
     if not argv:
         result["error"] = "empty command"
@@ -593,7 +621,13 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         result["error"] = "command not executable"
         return result
     except Exception as exc:  # pragma: no cover — defensive
-        result["error"] = str(exc)
+        # Same channel as the parse failure above: spawn exceptions routinely
+        # embed argv (OSError stringifies the program path), and argv[0] can be
+        # the credential itself. Exception CLASS only.
+        result["error"] = f"spawn failed ({type(exc).__name__})"
+        # Operator channel only — OSError stringifies argv/the program path,
+        # and this is what distinguishes EACCES from ENOEXEC from EMFILE.
+        result["error_detail"] = f"spawn failed: {exc}"
         return result
 
     try:
@@ -616,7 +650,11 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             proc.communicate(timeout=1)
         except Exception:
             pass
-        result["error"] = str(exc)
+        # Model-facing via _fail_closed_block — exception CLASS only, never
+        # text that may carry argv or payload content.
+        result["error"] = f"communication failed ({type(exc).__name__})"
+        # Operator channel only — may carry argv or payload content.
+        result["error_detail"] = f"communication failed: {exc}"
         return result
 
     result["returncode"] = proc.returncode
@@ -649,16 +687,82 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
                 return _fail_closed_block(spec, f"callback error ({type(exc).__name__})")
             return None
 
-    _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
+    # The dispatcher reads __name__ into user-facing refusal messages returned
+    # to the MODEL (hermes_cli/plugins.py), so it must never carry the raw
+    # command — hook commands routinely embed credentials inline. The raw
+    # command stays on the log channel only, via `spec.command` above.
+    _callback.__name__ = f"shell_hook[{spec.event}:{hook_display_name(spec.command)}]"
     _callback.__qualname__ = _callback.__name__
+    # The outer plugin callback budget can expire before the shell hook's own
+    # subprocess timeout under severe scheduler contention. Preserve this
+    # individual hook's configured failure policy at that outer boundary.
+    setattr(_callback, "_hermes_timeout_fail_closed", spec.fail_closed)
     return _callback
 
 
+# A display label may ONLY be a plain basename-shaped token. This is an
+# ALLOWLIST on purpose: blocklisting "unsafe" command shapes means every shape
+# nobody anticipated (``env TOK=secret prog``, ``https://user:secret@host``,
+# an unbalanced quote) silently becomes a label and smuggles its content out.
+# Anything that does not match is dropped and identity falls to the digest.
+_HOOK_LABEL_ALLOWED = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
+
+# Leading tokens that are launchers rather than the hook's own identity: keep
+# looking past them for the script that actually names the hook, since real
+# configs read ``/usr/bin/python3 /path/to/my-guard.py``.
+_HOOK_LAUNCHER_STEMS = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "env",
+    "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun",
+    "uv", "uvx", "npx", "pwsh", "powershell",
+})
+
+
+def hook_display_name(command: str) -> str:
+    """Return a stable, secret-free identifier for a hook *command*.
+
+    A hook command is operator-supplied and routinely carries credentials
+    inline (``sh -c 'export TOK=…; …'``). The raw command must therefore never
+    reach a model-visible channel; only the log gets it. This yields
+    ``<label>#<digest>``, where *label* is a plain basename-shaped token taken
+    from the front of the command and *digest* is a short stable hash of the
+    whole command so two hooks are always distinguishable even when their
+    labels collide (or when no token qualifies as a label at all).
+    """
+    digest = hashlib.sha256(command.encode("utf-8", "replace")).hexdigest()[:8]
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        # Unbalanced quotes — fall back to whitespace splitting. The allowlist
+        # below is what keeps this safe, not the quality of the parse.
+        tokens = command.split()
+    label = ""
+    for token in tokens:
+        if token.startswith("-"):
+            # A flag; anything after it may be an inline program body
+            # (``-c 'export TOK=…'``). Never walk into that.
+            break
+        base = os.path.basename(token)
+        if not _HOOK_LABEL_ALLOWED.match(base):
+            break
+        if base.split(".")[0].lower() in _HOOK_LAUNCHER_STEMS:
+            label = base  # remember the launcher, prefer a script after it
+            continue
+        label = base
+        break
+    return f"{label or 'hook'}#{digest}"
+
+
 def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:
-    """Canonical block shape for a ``fail_closed`` hook that failed."""
+    """Canonical block shape for a ``fail_closed`` hook that failed.
+
+    Names the hook by its :func:`hook_display_name`, never by ``spec.command``:
+    this message is returned to the model, and hook commands carry secrets.
+    """
     return {
         "action": "block",
-        "message": f"hook {spec.command} failed closed: {reason}",
+        "message": (
+            f"hook {hook_display_name(spec.command)} failed closed: {reason}"
+        ),
     }
 
 
@@ -689,9 +793,12 @@ def _evaluate_result(
     fail_closed = spec.fail_closed and blocking_event
 
     if r["error"]:
+        # Log/operator channel gets the DETAILED reason when there is one; the
+        # model-facing block below keeps the redacted `error`. This log line
+        # already carries `spec.command`, so it is not a new disclosure.
         logger.warning(
             "shell hook failed (event=%s command=%s): %s",
-            spec.event, spec.command, r["error"],
+            spec.event, spec.command, r.get("error_detail") or r["error"],
         )
         if fail_closed:
             return _fail_closed_block(spec, r["error"])

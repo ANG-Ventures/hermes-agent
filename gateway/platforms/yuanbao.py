@@ -3191,7 +3191,7 @@ class ConnectionManager:
                 pass
 
         # Acquire platform-scoped lock to prevent duplicate connections
-        if not adapter._acquire_platform_lock(
+        if not await adapter._acquire_platform_lock_async(
             'yuanbao-app-key', adapter._app_key, 'Yuanbao app key'
         ):
             return False

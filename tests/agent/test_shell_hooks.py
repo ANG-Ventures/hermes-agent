@@ -9,6 +9,9 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -139,12 +142,122 @@ class TestMatcher:
         assert spec.matches_tool("anything")
 
 
+class TestHookDisplayName:
+    """``hook_display_name`` is the secret boundary for model-facing text."""
+
+    # Each entry is (command, secret embedded in it). The secret must never
+    # survive into the display name, whatever shape the command takes.
+    SECRET_BEARING = [
+        ("/bin/sh -c 'export TOK={s}; sleep 30'", "hunter2PRODSup3rSecret"),
+        ('bash -c "curl -H \'Bearer {s}\' https://x"', "sk-abc123"),
+        ("guard.sh --token={s}", "SECRET123"),
+        ("env TOK={s} /opt/hooks/g.py", "SEKRET"),
+        ("env  TOK={s}  python3 /opt/hooks/g.py", "SEKRET"),
+        ("/x/y/hook.py --token {s}", "SEKRET"),
+        ("https://user:{s}@host/path", "SEKRET"),
+        ("./run {s}", "SEKRET"),
+        ("python3 -c 'import os; print(os.environ[\"{s}\"])'", "SEKRET"),
+        ("unclosed 'quote --tok={s}", "SEKRET"),  # shlex raises; still safe
+    ]
+
+    @pytest.mark.parametrize("template,secret", SECRET_BEARING)
+    def test_secret_never_survives_into_display_name(self, template, secret):
+        command = template.format(s=secret)
+        assert secret not in shell_hooks.hook_display_name(command)
+
+    def test_names_the_script_not_the_interpreter(self):
+        """Real configs are ``<interpreter> <script>`` — identify the script.
+
+        Both live pre_tool_call hooks share ``/usr/bin/python3``; collapsing
+        them to "python3" would make refusals unattributable.
+        """
+        sleep_guard = shell_hooks.hook_display_name(
+            "/usr/bin/python3 /home/u/.hermes/hooks/sleep-ttl-guard.py"
+        )
+        vision_guard = shell_hooks.hook_display_name(
+            "/usr/bin/python3 /home/u/.hermes/hooks/vision-dedup-guard.py"
+        )
+
+        assert sleep_guard.startswith("sleep-ttl-guard.py#")
+        assert vision_guard.startswith("vision-dedup-guard.py#")
+        assert sleep_guard != vision_guard
+
+    def test_distinguishes_hooks_that_share_a_label(self):
+        """Two ``sh -c`` hooks must not collapse to the same identifier."""
+        a = shell_hooks.hook_display_name("/bin/sh -c 'one'")
+        b = shell_hooks.hook_display_name("/bin/sh -c 'two'")
+
+        assert a != b
+
+    def test_is_stable_across_calls(self):
+        """The same command always yields the same name (log correlation)."""
+        command = "/usr/bin/python3 /home/u/.hermes/hooks/test-guard.py"
+
+        assert shell_hooks.hook_display_name(
+            command
+        ) == shell_hooks.hook_display_name(command)
+
+    @pytest.mark.parametrize("command", ["", "   "])
+    def test_degenerate_commands_still_yield_a_name(self, command):
+        name = shell_hooks.hook_display_name(command)
+
+        assert name.startswith("hook#")
+
+
 # ── End-to-end subprocess behaviour ───────────────────────────────────────
 
 
 class TestCallbackSubprocess:
 
+    def test_callback_carries_timeout_failure_policy(self):
+        advisory = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(event="pre_tool_call", command="true")
+        )
+        enforcing = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(
+                event="pre_tool_call", command="true", fail_closed=True
+            )
+        )
 
+        assert getattr(advisory, "_hermes_timeout_fail_closed") is False
+        assert getattr(enforcing, "_hermes_timeout_fail_closed") is True
+
+    def test_callback_name_omits_the_raw_command(self):
+        """__name__ reaches model-facing refusals — it must not carry secrets.
+
+        The dispatcher interpolates the callback's ``__name__`` into the
+        pre_tool_call block message returned to the model, so a command with
+        an inline credential must not be reconstructible from it.
+        """
+        planted = "hunter2PRODSup3rSecret"
+        cb = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(
+                event="pre_tool_call",
+                command=f"/bin/sh -c 'export TOK={planted}; sleep 30'",
+                fail_closed=True,
+            )
+        )
+
+        assert planted not in cb.__name__
+        assert planted not in cb.__qualname__
+        # Still identifies the hook and its event.
+        assert cb.__name__.startswith("shell_hook[pre_tool_call:")
+
+    def test_fail_closed_block_message_omits_the_raw_command(self):
+        """The fail_closed refusal is returned to the model — no secrets."""
+        planted = "hunter2PRODSup3rSecret"
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            command=f"/bin/sh -c 'export TOK={planted}; exit 3'",
+            fail_closed=True,
+        )
+
+        block = shell_hooks._fail_closed_block(spec, "hook exited 3")
+
+        assert block["action"] == "block"
+        assert planted not in block["message"]
+        assert "failed closed" in block["message"]
+        assert "hook exited 3" in block["message"]
 
     def test_block_translation_end_to_end(self, tmp_path):
         """v1 schema-bug regression gate.
@@ -545,9 +658,137 @@ def _spawn_result(**overrides):
         "timed_out": False,
         "elapsed_seconds": 0.1,
         "error": None,
+        "error_detail": None,
     }
     base.update(overrides)
     return base
+
+
+class TestErrorChannelSplit:
+    """``error`` is redacted for the model; ``error_detail`` is for operators.
+
+    Collapsing the model-facing reason to an exception CLASS closed a real
+    disclosure, but it also blinded ``hermes hooks test`` / ``doctor`` and the
+    log: a shlex ``No closing quotation`` and a spawn ``ENOEXEC`` became
+    indistinguishable to whoever has to fix the hook. Where a diagnostic
+    exists beyond the redacted reason, the two channels must carry different
+    text and only the redacted one may reach the model.
+
+    Note the asymmetry these tests pin: ``EACCES`` is handled by its own
+    ``PermissionError`` arm whose fixed reason ("command not executable") is
+    already the whole diagnostic, so it carries NO ``error_detail``. The
+    generic ``OSError`` arm — ENOEXEC, EMFILE — is the one that populates it.
+    """
+
+    def test_unparseable_command_detail_is_operator_only(self):
+        planted = "hunter2PRODSup3rSecret"
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            command=f"/bin/sh -c 'export TOK={planted}; echo hi",
+            fail_closed=True,
+        )
+
+        r = shell_hooks._spawn(spec, "{}")
+
+        # Operator channel keeps the diagnostic reason ...
+        assert r["error_detail"], "the operator channel lost the failure reason"
+        assert "No closing quotation" in r["error_detail"], (
+            "the operator can no longer tell WHY the command failed to parse"
+        )
+        # ... while the model-facing channel stays exception-class only.
+        assert r["error"] == "command cannot be parsed (ValueError)"
+        assert planted not in r["error"]
+
+        decision = shell_hooks._evaluate_result(spec, r)
+        assert decision is not None and decision["action"] == "block"
+        assert planted not in decision["message"], (
+            "error_detail leaked into the model-facing refusal"
+        )
+        assert "No closing quotation" not in decision["message"], (
+            "the refusal carried operator-channel text to the model"
+        )
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX x-bit semantics (EACCES)")
+    def test_spawn_eacces_is_named_exactly_and_adds_no_detail(self, tmp_path):
+        """A non-executable hook (EACCES) is fully described by the redacted channel.
+
+        ``_spawn`` special-cases ``PermissionError`` with a fixed, already
+        operator-legible reason and deliberately leaves ``error_detail`` unset —
+        there is nothing to add beyond "command not executable", and the raw
+        ``OSError`` text would only re-introduce argv. Asserted exactly so the
+        branch cannot silently start emitting a detail (or stop naming EACCES).
+        """
+        not_executable = tmp_path / "hook.sh"
+        not_executable.write_text("#!/bin/sh\necho hi\n")
+        not_executable.chmod(0o644)
+
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=str(not_executable), fail_closed=True,
+        )
+        r = shell_hooks._spawn(spec, "{}")
+
+        assert r["error"] == "command not executable"
+        assert r["error_detail"] is None, (
+            "EACCES must stay detail-free; a detail here means argv text is "
+            "being copied onto the operator channel for no diagnostic gain"
+        )
+
+    def test_spawn_enoexec_detail_distinguishes_errno(self, monkeypatch):
+        """ENOEXEC must reach the operator channel with the errno, not just the class.
+
+        This is the branch that actually populates ``error_detail`` on a spawn
+        failure. ``Popen`` is monkeypatched so the test asserts the contract on
+        every platform rather than depending on the loader rejecting a crafted
+        binary.
+        """
+        planted = "/tmp/hook-with-s3cr3t-in-argv.sh"
+
+        def _raise_enoexec(*args, **kwargs):
+            raise OSError(8, "Exec format error", planted)
+
+        monkeypatch.setattr(subprocess, "Popen", _raise_enoexec)
+
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=planted, fail_closed=True,
+        )
+        r = shell_hooks._spawn(spec, "{}")
+
+        # Model-facing channel: exception CLASS only, no argv.
+        assert r["error"] == "spawn failed (OSError)"
+        assert planted not in r["error"]
+        # Operator channel: carries the errno that separates ENOEXEC from
+        # EACCES/EMFILE, and is strictly more informative than `error`.
+        assert r["error_detail"] is not None, (
+            "the operator channel lost the spawn failure reason"
+        )
+        assert "Exec format error" in r["error_detail"]
+        assert "Errno 8" in r["error_detail"]
+        assert r["error_detail"] != r["error"]
+
+        # ...and the detail must not ride out to the model on the refusal.
+        decision = shell_hooks._evaluate_result(spec, r)
+        assert decision is not None and decision["action"] == "block"
+        assert "Exec format error" not in decision["message"]
+        assert planted not in decision["message"]
+
+    def test_evaluate_result_logs_detail_but_blocks_with_redacted(self, caplog):
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command="/tmp/h.sh", fail_closed=True,
+        )
+        r = _spawn_result(
+            error="spawn failed (OSError)",
+            error_detail="spawn failed: [Errno 13] Permission denied: '/tmp/h.sh'",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            decision = shell_hooks._evaluate_result(spec, r)
+
+        assert "Errno 13" in caplog.text, "the log lost the operator detail"
+        assert decision is not None and decision["action"] == "block"
+        assert "Errno 13" not in decision["message"], (
+            "the model-facing refusal carried operator-channel detail"
+        )
+        assert "spawn failed (OSError)" in decision["message"]
 
 
 class TestEvaluateResult:

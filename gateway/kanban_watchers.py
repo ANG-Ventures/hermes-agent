@@ -302,6 +302,14 @@ _FAULT_FIELDS = (
 )
 
 
+def _format_parent_satisfied_sticky_summary(task_ids) -> str:
+    """Count and name explicit holds whose dependencies are already done."""
+    ids = sorted(str(task_id) for task_id in (task_ids or []))
+    if not ids:
+        return "parents_done_sticky=0"
+    return f"parents_done_sticky={len(ids)} ({', '.join(ids)})"
+
+
 def _format_respawn_guarded_summary(guarded) -> str:
     """Format guarded task ids by reason for the per-tick gateway log."""
     entries = list(guarded or [])
@@ -2272,14 +2280,19 @@ class GatewayKanbanWatchersMixin:
                     for slug, res in (results or []):
                         spawned = getattr(res, "spawned", None) if res is not None else None
                         guarded = getattr(res, "respawn_guarded", None) if res is not None else None
+                        parent_satisfied_sticky = (
+                            getattr(res, "parent_satisfied_sticky", None)
+                            if res is not None else None
+                        )
                         if spawned:
                             any_spawned = True
-                        if res is not None and (spawned or guarded):
+                        if res is not None and (spawned or guarded or parent_satisfied_sticky):
                             # Quiet by default — log only actionable tick activity,
-                            # including guarded tasks that would otherwise be silent.
+                            # including guarded tasks and satisfied dependency graphs
+                            # still held by an explicit worker/operator block.
                             logger.info(
                                 "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s",
+                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s %s",
                                 slug,
                                 len(spawned or []),
                                 res.reclaimed,
@@ -2288,6 +2301,7 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                                 _format_respawn_guarded_summary(guarded),
+                                _format_parent_satisfied_sticky_summary(parent_satisfied_sticky),
                             )
                         # Stranded subtrees: children held in ``todo`` behind a
                         # parent only a human can clear. This CANNOT reach the

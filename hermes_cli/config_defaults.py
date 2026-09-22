@@ -3014,6 +3014,10 @@ DEFAULT_CONFIG = {
         "failure_limit": 2,
         # Quota releases are not task failures. Defer the next attempt this long.
         "rate_limit_cooldown_seconds": 300,
+        # Case-insensitive substrings that may not be used for Kanban workers
+        # without a logged flagship override. None uses model_policy's shared
+        # FLAGSHIP_MODEL_SUBSTRINGS; a non-empty list replaces that default.
+        "banned_worker_model_substrings": None,
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
         # CPU scheduling priority for dispatcher-spawned worker gateways, and
@@ -3361,6 +3365,9 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # New-install recommendation; raw configs omitting the turn cap stay unbounded.
+        "max_concurrent_turns": 8,
+        "startup_resume_concurrency": 3,
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,

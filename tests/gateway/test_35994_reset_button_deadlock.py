@@ -126,6 +126,14 @@ async def test_reset_does_not_block_event_loop_during_cleanup():
         await asyncio.sleep(0.005)
     assert close_started.is_set(), "close() never ran"
 
+    # This path abandons the worker on timeout, so it must use the isolated
+    # housekeeping pool. Running it on the turn pool reproduces the 2026-09-20
+    # starvation: N wedged /new cleanups retire N turn slots indefinitely.
+    assert getattr(runner, "_executor", None) is None
+    housekeeping_pool = getattr(runner, "_housekeeping_executor", None)
+    assert housekeeping_pool is not None
+    assert len(housekeeping_pool._threads) == 1
+
     # Now sample ticks while close() is STILL blocking. If the loop were
     # frozen (pre-fix inline call), this stays ~0.
     ticks_at_block = ticks["n"]

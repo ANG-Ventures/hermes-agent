@@ -39,7 +39,7 @@ import pytest
 
 from tests.gateway.test_boot_resume_attempt_cap import (
     _INTERRUPTED_TAIL,
-    _boot,
+    _dispatched_boot,
     _remark,
     _runner,
     _seed,
@@ -69,12 +69,12 @@ def _make_unwritable(runner) -> None:
     store._persist_proven = False
 
 
-def _drive_boots(runner, db, entry, boots: int) -> list[int]:
+async def _drive_boots(runner, db, entry, boots: int) -> list[int]:
     """Run ``boots`` consecutive boots, re-marking the session each time."""
     scheduled: list[int] = []
     for _ in range(boots):
         _remark(runner, entry)
-        scheduled.append(_boot(runner))
+        scheduled.append(await _dispatched_boot(runner))
     return scheduled
 
 
@@ -98,7 +98,7 @@ async def test_unreadable_store_does_not_cap_a_session_that_never_resumed(
     _remark(runner, entry)
     await runner._prepare_boot_resume_work_check()
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        assert _boot(runner) == 1, "a never-resumed session must still resume"
+        assert await _dispatched_boot(runner) == 1, "a never-resumed session must still resume"
 
     messages = [record.getMessage() for record in caplog.records]
     assert not any("cause=attempt_cap" in m for m in messages)
@@ -120,7 +120,7 @@ async def test_unreadable_store_leaves_the_resume_pending_marker_intact(
 
     _remark(runner, entry)
     await runner._prepare_boot_resume_work_check()
-    _boot(runner)
+    await _dispatched_boot(runner)
 
     refreshed = runner.session_store._entries[entry.session_key]
     assert refreshed.resume_pending is True
@@ -144,7 +144,7 @@ async def test_unreadable_store_does_not_starve_every_session_on_the_host(
     _remark(runner, alice)
     _remark(runner, bob)
     await runner._prepare_boot_resume_work_check()
-    assert _boot(runner) == 2
+    assert await _dispatched_boot(runner) == 2
     db.close()
 
 
@@ -167,7 +167,7 @@ async def test_unreadable_store_still_bounds_the_replay_across_ten_boots(
     _poison(runner)
     await runner._prepare_boot_resume_work_check()
 
-    scheduled = _drive_boots(runner, db, entry, 10)
+    scheduled = await _drive_boots(runner, db, entry, 10)
 
     assert sum(scheduled) == 3, f"expected the cap to bound the replay, got {scheduled}"
     assert scheduled[:3] == [1, 1, 1]
@@ -199,7 +199,7 @@ async def test_unwritable_store_does_not_replay_ten_times(
     _make_unwritable(runner)
 
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        scheduled = _drive_boots(runner, db, entry, 10)
+        scheduled = await _drive_boots(runner, db, entry, 10)
 
     assert sum(scheduled) == 0, f"a store that cannot count must not replay: {scheduled}"
     messages = [record.getMessage() for record in caplog.records]
@@ -228,13 +228,13 @@ async def test_unwritable_store_keeps_the_marker_so_the_denial_is_reversible(
     _make_unwritable(runner)
 
     _remark(runner, entry)
-    assert _boot(runner) == 0
+    assert await _dispatched_boot(runner) == 0
     assert runner.session_store._entries[entry.session_key].resume_pending is True
 
     # Disk fixed: a fresh store instance (i.e. the next gateway process) resumes
     # the session normally, with no manual marker surgery.
     runner._auto_resume_attempt_store = None
-    assert _boot(runner) == 1
+    assert await _dispatched_boot(runner) == 1
     db.close()
 
 
@@ -253,7 +253,7 @@ async def test_healthy_store_bounds_the_incident_at_the_cap(tmp_path, monkeypatc
     _seed(db, entry, _INTERRUPTED_TAIL)
     await runner._prepare_boot_resume_work_check()
 
-    scheduled = _drive_boots(runner, db, entry, 10)
+    scheduled = await _drive_boots(runner, db, entry, 10)
 
     assert scheduled == [1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
     db.close()

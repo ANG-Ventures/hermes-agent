@@ -319,7 +319,16 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  # Optional replacement for the built-in [fable, astra] worker-model ban.
+  banned_worker_model_substrings: [fable, astra]
 ```
+
+Model matching is case-insensitive and applies to CLI, dashboard/API, and
+dispatcher paths. `hermes kanban create` and `set-model` refuse a matching
+model unless `--allow-flagship "<reason>"` is supplied; the reason is recorded
+as a `flagship override:` task comment. The dispatcher independently refuses
+direct database bypasses and records a `flagship dispatch refused:` comment,
+leaving the card queued until an explicit override comment is present.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway

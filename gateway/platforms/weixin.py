@@ -1313,7 +1313,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return False
 
         try:
-            if not self._acquire_platform_lock('weixin-bot-token', self._token, 'Weixin bot token'):
+            if not await self._acquire_platform_lock_async('weixin-bot-token', self._token, 'Weixin bot token'):
                 return False
         except Exception as exc:
             logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)

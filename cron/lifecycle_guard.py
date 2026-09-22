@@ -1571,6 +1571,43 @@ def _iter_option_values(
             yield token[len(prefix):]
 
 
+def _is_unscannable_non_executable_file(path: Path) -> bool:
+    """True when *path* is an OVERSIZED regular file lacking the execute bit.
+
+    Two facts have to hold together before the guard may drop a reference:
+
+    * The shell could not execute it at command position — ``./file`` on a
+      0644 regular file is "Permission denied", never a script run.
+    * It is unscannable, so keeping the reference means fail-closing rather
+      than scanning. A *scannable* non-executable file is still scanned: a
+      ``chmod +x x.sh && ./x.sh`` one-liner is scanned while the file is
+      still 0644, so skipping every non-executable file would be a bypass.
+
+    The cloud-placeholder refusal is repeated here, BEFORE any syscall, so an
+    evicted FileProvider path is never stat'ed on the way to this answer
+    (#88052 contract). A placeholder returns False, leaving the reference for
+    ``_read_referenced_script`` to fail closed lexically.
+
+    Anything else — directories, missing paths, FIFOs, devices, symlink loops,
+    unreadable parents — returns False and keeps its existing behaviour.
+    """
+    if _is_cloud_placeholder_path(path):
+        return False
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, ValueError):
+        resolved = path
+    if _is_cloud_placeholder_path(resolved):
+        return False
+    try:
+        metadata = os.stat(path)
+    except (OSError, ValueError):
+        return False
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o111:
+        return False
+    return metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES
+
+
 def _references_at(
     segment: list[str], index: int, cwd: Optional[str]
 ) -> Iterator[Path]:
@@ -1621,7 +1658,25 @@ def _references_at(
     if executable.strip("/"):
         if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
             resolved = _resolve_terminal_script_path(executable, cwd)
-            if resolved is not None:
+            # A regular file WITHOUT the execute bit cannot be run at command
+            # position (`./file` → "Permission denied"), so when it is also
+            # too large to scan it is not a script reference — it is a data
+            # file, and fail-closing on it blocked every command that merely
+            # NAMES one inside a nested script or heredoc. A
+            # `sqlite3.connect(os.path.expanduser('~/.hermes/kanban.db'))`
+            # line parses to a lone path token at command position, and the
+            # 31 MB DB (no shebang, no binary magic, over the size cap) came
+            # back "oversized script" → blocked. Same class as the bare `/`
+            # token (#77131) and the directory token (pc-fb1bd018).
+            # Deliberately narrow: an oversized EXECUTABLE file still fails
+            # closed (the real unscannable-script case), a scannable
+            # non-executable file is still scanned (`chmod +x x.sh && ./x.sh`
+            # is scanned while x.sh is still 0644), and this branch is the
+            # ONLY one affected — `bash file` and `source file` execute
+            # without the x bit and must keep being scanned.
+            if resolved is not None and not _is_unscannable_non_executable_file(
+                resolved
+            ):
                 yield resolved
 
 
