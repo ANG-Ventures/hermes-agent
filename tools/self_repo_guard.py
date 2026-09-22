@@ -9,6 +9,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from hermes_cli.cli_hint import hint_value
 from tools.approval import (
     _bash_exec_payload,
     _deobfuscate_shell_word_for_detection,
@@ -732,7 +733,7 @@ def _block_message(operation: str, root: Path) -> str:
         f"Blocked: `{operation}` would rewrite Hermes's live source checkout "
         f"({root}) and can mix module versions in this running process. "
         f"Use a separate worktree or a shared clone on real disk, e.g. "
-        f"`git clone --shared {root} {scratch}/<task>` — avoid /tmp for "
+        f"`git clone --shared {hint_value(root)} {scratch}/<task>` — avoid /tmp for "
         "clones that install node/python deps: /tmp is usually RAM-backed "
         "tmpfs and a few dependency installs can fill it and ENOSPC other "
         "work. Delete the clone when the branch is pushed. To change this "
