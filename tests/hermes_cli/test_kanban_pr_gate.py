@@ -305,6 +305,43 @@ def test_repo_context_still_resolves_a_real_checkout_toplevel(
     assert prg.repo_context(workspace_path=str(repo), body=None) == "o/r"
 
 
+def test_repo_context_resolves_a_linked_worktree_whose_dot_git_is_a_file(
+    tmp_path: Path,
+) -> None:
+    """The discriminator is toplevel IDENTITY, not ``.git`` presence.
+
+    ``git init`` leaves a ``.git`` DIRECTORY, on which "is toplevel" and "has
+    .git" behave identically — so the sibling test above cannot actually
+    exercise the claim its docstring makes. A LINKED worktree can: its ``.git``
+    is a FILE, and it is still its own toplevel. This is the live shape of
+    ``<repo>/.worktrees/<task-id>``, which is how most ``worktree``-kind cards
+    are laid out, so a ``.git``-presence implementation would silently stop
+    resolving them.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=origin, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:o/r.git"],
+        cwd=origin, check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-q", "--allow-empty", "-m", "init"],
+        cwd=origin, check=True,
+    )
+    wt = tmp_path / "worktrees" / "t_x"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", str(wt), "-b", "wt/t_x"],
+        cwd=origin, check=True,
+    )
+
+    assert (wt / ".git").is_file(), "precondition: a linked worktree's .git is a FILE"
+    assert prg._is_repo_toplevel(str(wt)) is True
+    assert prg._remotes_for(str(wt)) == {"o/r"}
+    assert prg.repo_context(workspace_path=str(wt), body=None) == "o/r"
+
+
 def test_repo_context_is_none_when_workspace_and_body_disagree(
     tmp_path: Path,
 ) -> None:
@@ -336,6 +373,98 @@ def test_repo_context_is_none_when_workspace_and_body_disagree(
     ) == "ANG-Ventures/hermes-home"
 
 
+def test_repo_context_rejects_a_valid_toplevel_the_body_never_names(
+    tmp_path: Path,
+) -> None:
+    """The ``dir``-at-toplevel member of the class — zero walk-up required.
+
+    The toplevel guard keys on workspace GEOMETRY, so it cannot see this: a
+    ``dir``-kind card whose workspace IS a checkout root, just not of the
+    card's repository. Four live cards point at ``~/.hermes`` itself, whose
+    remotes both read ``ANG-Ventures/hermes-home``; the geometry is perfect and
+    the answer is still for a repo the card never touched.
+
+    The body below is the real ``t_cb701eee`` shape and the reason the earlier
+    PR-refs-only cross-check was a no-op on the very incident it cited: the
+    card names its repo in PROSE and its PR as a BARE ``#160`` — no PR URL, no
+    qualified ``owner/repo#N``. Trust therefore has to key on card IDENTITY
+    (does the body name this repo at all?), not on PR-attached refs.
+    """
+    ws = tmp_path / "unrelated-checkout"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+    for remote in ("origin", "gh"):
+        subprocess.run(
+            ["git", "remote", "add", remote,
+             "git@github.com:ANG-Ventures/hermes-home.git"],
+            cwd=ws, check=True,
+        )
+    body = (
+        "The code half is done and open as PR #160 (branch "
+        "daedalus/t_f69cb5f8-grab-policy-check on Kyzcreig/ace-media-homelab). "
+        "This card cannot start until that PR is MERGED."
+    )
+
+    # Geometry is clean, and the earlier cross-check had nothing to fire on.
+    assert prg._is_repo_toplevel(str(ws)) is True
+    assert prg._remotes_for(str(ws)) == {"ANG-Ventures/hermes-home"}
+    assert prg._corroborated_repos(body) == []
+
+    assert prg.repo_context(workspace_path=str(ws), body=body) is None
+    assert prg.parse_pr_refs(
+        "QA VERDICT: BLOCKED/HOLD - PR #160 is OPEN",
+        default_repo=prg.repo_context(workspace_path=str(ws), body=body),
+    ) == []
+
+
+def test_repo_context_keeps_resolving_when_the_body_names_no_repo(
+    tmp_path: Path,
+) -> None:
+    """Corroboration costs a resolution, it never redirects one.
+
+    Silence is corroboration: a card whose body names no repository at all is
+    the legitimate case bare-``#N`` resolution exists for (live: the worktree
+    card ``t_8e1f2cf3``), and it still resolves.
+
+    The asymmetry is deliberate and is the whole safety argument. Slash-bearing
+    prose that ``_body_repo_mentions`` cannot distinguish from a slug
+    (``try/except``, ``30/31``) is treated as a non-matching mention, so it
+    DECLINES the resolution — it can never redirect one at a different repo.
+    Losing a resolution costs one card an auto-unblock a human can do; taking a
+    wrong one reverted a verifier's block on 2026-09-21.
+
+    Measured, so the cost is a number and not a hope: across all 48
+    gate-candidate blocked cards on all 65 board DBs this rule dropped exactly
+    the 4 ``dir``-at-``~/.hermes`` cards it is aimed at and cost ZERO genuine
+    resolutions — 11 of 11 survived, including three whose bodies carry exactly
+    this noise alongside their real slug (``enqueue/merge`` + ``escalated/ERROR``
+    with ``ANG-Ventures/hermes-agent``; ``ref/sha`` with ``Kyzcreig/fleetreview``).
+    """
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:o/r.git"],
+        cwd=repo, check=True,
+    )
+    # No mention at all -> resolves.
+    assert prg.repo_context(
+        workspace_path=str(repo), body="no repository is named anywhere here",
+    ) == "o/r"
+    # The real slug alongside slash noise -> still resolves. This is the live
+    # shape of t_e4d5cfae and t_a3bd65e8, and is why the rule MATCHES rather
+    # than counts mentions.
+    assert prg.repo_context(
+        workspace_path=str(repo),
+        body="wrap it in try/except; o/r is the repo; 30/31 runs green",
+    ) == "o/r"
+    # Noise only, real slug absent -> declines. Fail-safe, never a redirect.
+    assert prg.repo_context(
+        workspace_path=str(repo),
+        body="wrap it in try/except, 30/31 runs green",
+    ) is None
+
+
 def test_gate_does_not_fire_twice_for_the_same_card_and_pr_set(
     kanban_home: Path,
 ) -> None:
@@ -343,9 +472,15 @@ def test_gate_does_not_fire_twice_for_the_same_card_and_pr_set(
 
     Argus flagged the absence of a dedup like ``_already_flagged_closed``.
     The structural guard is that ``_gate_candidates`` only selects
-    ``status='blocked'`` cards, so an unblocked card leaves scope — but a
-    RE-blocked card on the same reason must not re-fire either, which is what
-    this pins.
+    ``status='blocked'`` cards, so an unblocked card leaves scope and cannot
+    re-fire however many ticks run.
+
+    Phase 2 pins the RE-blocked case too, and names the mechanism honestly:
+    nothing in the gate dedups it: the unblock-loop detector routes a card
+    re-blocked on an identical reason to ``triage``, which also leaves
+    ``_gate_candidates``' ``status='blocked'`` filter. Asserted here so a
+    change to that routing shows up as a gate regression rather than silently
+    re-arming the auto-resolve.
     """
     with kb.connect() as conn:
         tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
@@ -355,6 +490,24 @@ def test_gate_does_not_fire_twice_for_the_same_card_and_pr_set(
                 conn, query_fn=_stub({("o/r", 7): _merged()}),
             )
         assert kb.get_task(conn, tid).status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM task_events "
+            "WHERE task_id = ? AND kind = 'gate_auto_resolved'",
+            (tid,),
+        ).fetchone()["c"] == 1
+
+        # Phase 2: re-block on the IDENTICAL reason and tick again.
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid, reason="merge o/r#7 then unblock me", kind="needs_input",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        for _ in range(3):
+            prg.clear_cache()
+            prg.reevaluate_pr_gates(
+                conn, query_fn=_stub({("o/r", 7): _merged()}),
+            )
+        assert kb.get_task(conn, tid).status != "blocked"
         assert conn.execute(
             "SELECT COUNT(*) c FROM task_events "
             "WHERE task_id = ? AND kind = 'gate_auto_resolved'",

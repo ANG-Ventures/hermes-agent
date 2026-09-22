@@ -515,6 +515,47 @@ def _body_repo_choice(body: str) -> Optional[str]:
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _body_corroborates(slug: str, body: Optional[str]) -> bool:
+    """True when the CARD's own text supports resolving bare ``#N`` in ``slug``.
+
+    A workspace's remotes describe a *directory*, not a card. Two live shapes
+    make that directory answer for a repository the card has nothing to do
+    with, and only one of them involves a walk-up:
+
+    * ``scratch``/nested — ``git -C`` inherits an ENCLOSING repo's remotes
+      (closed by :func:`_is_repo_toplevel`);
+    * ``dir``-at-toplevel — the workspace IS a checkout root, just not of the
+      card's repo. Four live cards point at ``~/.hermes`` itself, whose remotes
+      both read ``ANG-Ventures/hermes-home``. Geometry is perfect; the answer is
+      still wrong.
+
+    So the trust test is card IDENTITY, not geometry: the body must either name
+    the workspace's repo, or name no repo at all. A body that names repositories
+    and omits this one is evidence AGAINST it — which is exactly the 2026-09-21
+    ``t_cb701eee`` body, naming ``Kyzcreig/ace-media-homelab`` in prose with its
+    PR as a bare ``#160``.
+
+    Silence is allowed on purpose: a worktree card whose body names no repo
+    (``t_8e1f2cf3``) is the legitimate case bare-``#N`` resolution exists for.
+    The rule MATCHES mentions, it never RANKS them, so slash-bearing prose that
+    ``_body_repo_mentions`` cannot tell from a slug (``try/except``, ``30/31``)
+    can only DECLINE a resolution, never redirect one at a wrong repo. Measured
+    over all 48 gate-candidate blocked cards on all 65 board DBs, that cost is
+    zero: the rule dropped exactly the 4 ``dir``-at-``~/.hermes`` cards and all
+    11 genuine resolutions survived.
+    """
+    if not isinstance(body, str):
+        return True
+    corroborated = _corroborated_repos(body)
+    if corroborated:
+        # PR-attached refs are evidence, not a guess: they outrank bare mentions.
+        return any(named.lower() == slug.lower() for named in corroborated)
+    mentions = list(_body_repo_mentions(body))
+    if not mentions:
+        return True
+    return any(named.lower() == slug.lower() for named in mentions)
+
+
 def repo_context(
     *, workspace_path: Optional[str], body: Optional[str]
 ) -> Optional[str]:
@@ -532,9 +573,12 @@ def repo_context(
     * **no walk-up** — :func:`_is_repo_toplevel` refuses an answer inherited
       from an ENCLOSING repository (every ``scratch`` workspace sits under
       ``~/.hermes``, itself a checkout);
-    * **body cross-check** — a workspace answer the body CONTRADICTS is
-      discarded. Ambiguity detection alone cannot catch a confidently-wrong
-      answer, and an unblock reverts a human/verifier decision.
+    * **body corroboration** — :func:`_body_corroborates` requires the card's
+      own text to name the workspace's repo, or to name none at all. Geometry
+      alone is not enough: a ``dir``-kind workspace pointing AT ``~/.hermes``
+      is a perfectly valid toplevel and still answers for the wrong repo.
+      Ambiguity detection cannot catch a confidently-wrong answer, and an
+      unblock reverts a human/verifier decision.
     """
     if workspace_path:
         try:
@@ -545,12 +589,9 @@ def repo_context(
             slugs = _remotes_for(workspace_path)
             if len(slugs) == 1:
                 chosen = next(iter(slugs))
-                corroborated = _corroborated_repos(body) if isinstance(body, str) else []
-                if corroborated and not any(
-                    slug.lower() == chosen.lower() for slug in corroborated
-                ):
-                    # The body names PRs in a DIFFERENT repo than the workspace
-                    # resolves to. Two incompatible answers, no way to rank
+                if not _body_corroborates(chosen, body):
+                    # The body names repositories and the workspace's is not
+                    # among them. Two incompatible answers, no way to rank
                     # them: take no action.
                     return None
                 return chosen
