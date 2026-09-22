@@ -33766,7 +33766,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # would swallow a later turn's delivery ack.
                 if registered and adapter is not None:
                     try:
-                        adapter.cancel_delivery_ack_callback(session_key)
+                        adapter.cancel_delivery_ack_callback(
+                            session_key, generation=generation
+                        )
                     except Exception:
                         logger.debug(
                             "delivery barrier cleanup skipped for %s",

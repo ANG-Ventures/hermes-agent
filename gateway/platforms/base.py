@@ -6108,6 +6108,16 @@ class BasePlatformAdapter(ABC):
         else:
             self._post_delivery_callbacks[session_key] = (int(generation), callback)
 
+    @staticmethod
+    def _delivery_barrier_generation(entry: Any) -> int | None:
+        """Return the generation a registry entry belongs to, or ``None``."""
+        if isinstance(entry, tuple) and len(entry) == 2:
+            try:
+                return int(entry[0])
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def register_delivery_ack_callback(
         self,
         session_key: str,
@@ -6115,18 +6125,64 @@ class BasePlatformAdapter(ABC):
         *,
         generation: int | None = None,
     ) -> None:
-        """Register a one-shot callback for successful final-send acceptance."""
+        """Register a one-shot callback for successful final-send acceptance.
+
+        GENERATION-ORDERED.  The registry is one slot per ``session_key``, so
+        an unconditional write clobbers whatever is there.  A double release
+        for the same session -- two arms racing, or a re-arm after a retry --
+        would therefore replace a LIVE barrier belonging to an older, still
+        in-flight generation: that arm's ``delivered`` event is then never
+        set and it blocks until its delivery timeout expires with UNKNOWN
+        delivery state.
+
+        So a registration is refused when the slot already holds a strictly
+        NEWER generation.  Same or older loses to the newcomer, which is the
+        pre-existing behaviour and is what a legitimate re-arm needs.  An
+        ungenerationed registration (``generation=None``) keeps its original
+        unconditional semantics: there is no ordering information to honour.
+        """
         if not session_key or not callable(callback):
             return
         if generation is None:
             self._delivery_ack_callbacks[session_key] = callback
-        else:
-            self._delivery_ack_callbacks[session_key] = (int(generation), callback)
+            return
+        existing_generation = self._delivery_barrier_generation(
+            self._delivery_ack_callbacks.get(session_key)
+        )
+        if existing_generation is not None and existing_generation > int(generation):
+            logger.debug(
+                "not replacing delivery barrier for %s: generation %d is "
+                "older than the live generation %d",
+                session_key,
+                int(generation),
+                existing_generation,
+            )
+            return
+        self._delivery_ack_callbacks[session_key] = (int(generation), callback)
 
-    def cancel_delivery_ack_callback(self, session_key: str) -> bool:
-        """Drop a delivery barrier registered for a turn that never armed."""
+    def cancel_delivery_ack_callback(
+        self,
+        session_key: str,
+        *,
+        generation: int | None = None,
+    ) -> bool:
+        """Drop a delivery barrier registered for a turn that never armed.
+
+        GENERATION-SCOPED.  The caller is cleaning up after ITS OWN arm that
+        did not happen.  Popping by ``session_key`` alone deletes whatever is
+        in the slot -- including a newer turn's live barrier, whose delivery
+        ack is then silently dropped and whose arm waits out its full
+        timeout.  Passing the generation confines the cleanup to the entry the
+        caller actually registered.
+        """
         if not session_key:
             return False
+        if generation is not None:
+            existing = self._delivery_ack_callbacks.get(session_key)
+            if existing is None:
+                return False
+            if self._delivery_barrier_generation(existing) != int(generation):
+                return False
         return self._delivery_ack_callbacks.pop(session_key, None) is not None
 
     def acknowledge_response_delivery(
