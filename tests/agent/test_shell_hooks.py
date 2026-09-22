@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -667,9 +669,15 @@ class TestErrorChannelSplit:
 
     Collapsing the model-facing reason to an exception CLASS closed a real
     disclosure, but it also blinded ``hermes hooks test`` / ``doctor`` and the
-    log: a shlex ``No closing quotation`` and a spawn ``EACCES``/``ENOEXEC``
-    became indistinguishable to whoever has to fix the hook. The two channels
-    must carry different text, and only the redacted one may reach the model.
+    log: a shlex ``No closing quotation`` and a spawn ``ENOEXEC`` became
+    indistinguishable to whoever has to fix the hook. Where a diagnostic
+    exists beyond the redacted reason, the two channels must carry different
+    text and only the redacted one may reach the model.
+
+    Note the asymmetry these tests pin: ``EACCES`` is handled by its own
+    ``PermissionError`` arm whose fixed reason ("command not executable") is
+    already the whole diagnostic, so it carries NO ``error_detail``. The
+    generic ``OSError`` arm — ENOEXEC, EMFILE — is the one that populates it.
     """
 
     def test_unparseable_command_detail_is_operator_only(self):
@@ -700,8 +708,16 @@ class TestErrorChannelSplit:
             "the refusal carried operator-channel text to the model"
         )
 
-    def test_spawn_failure_detail_distinguishes_errno(self, tmp_path):
-        """EACCES vs ENOEXEC must stay distinguishable on the operator channel."""
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX x-bit semantics (EACCES)")
+    def test_spawn_eacces_is_named_exactly_and_adds_no_detail(self, tmp_path):
+        """A non-executable hook (EACCES) is fully described by the redacted channel.
+
+        ``_spawn`` special-cases ``PermissionError`` with a fixed, already
+        operator-legible reason and deliberately leaves ``error_detail`` unset —
+        there is nothing to add beyond "command not executable", and the raw
+        ``OSError`` text would only re-introduce argv. Asserted exactly so the
+        branch cannot silently start emitting a detail (or stop naming EACCES).
+        """
         not_executable = tmp_path / "hook.sh"
         not_executable.write_text("#!/bin/sh\necho hi\n")
         not_executable.chmod(0o644)
@@ -711,12 +727,49 @@ class TestErrorChannelSplit:
         )
         r = shell_hooks._spawn(spec, "{}")
 
-        assert r["error"], "a non-executable hook should fail"
-        # Whatever the platform raises, the operator channel must name it more
-        # specifically than the redacted channel does.
-        if r["error_detail"] is not None:
-            assert r["error_detail"] != r["error"]
-            assert len(r["error_detail"]) > len(r["error"])
+        assert r["error"] == "command not executable"
+        assert r["error_detail"] is None, (
+            "EACCES must stay detail-free; a detail here means argv text is "
+            "being copied onto the operator channel for no diagnostic gain"
+        )
+
+    def test_spawn_enoexec_detail_distinguishes_errno(self, monkeypatch):
+        """ENOEXEC must reach the operator channel with the errno, not just the class.
+
+        This is the branch that actually populates ``error_detail`` on a spawn
+        failure. ``Popen`` is monkeypatched so the test asserts the contract on
+        every platform rather than depending on the loader rejecting a crafted
+        binary.
+        """
+        planted = "/tmp/hook-with-s3cr3t-in-argv.sh"
+
+        def _raise_enoexec(*args, **kwargs):
+            raise OSError(8, "Exec format error", planted)
+
+        monkeypatch.setattr(subprocess, "Popen", _raise_enoexec)
+
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=planted, fail_closed=True,
+        )
+        r = shell_hooks._spawn(spec, "{}")
+
+        # Model-facing channel: exception CLASS only, no argv.
+        assert r["error"] == "spawn failed (OSError)"
+        assert planted not in r["error"]
+        # Operator channel: carries the errno that separates ENOEXEC from
+        # EACCES/EMFILE, and is strictly more informative than `error`.
+        assert r["error_detail"] is not None, (
+            "the operator channel lost the spawn failure reason"
+        )
+        assert "Exec format error" in r["error_detail"]
+        assert "Errno 8" in r["error_detail"]
+        assert r["error_detail"] != r["error"]
+
+        # ...and the detail must not ride out to the model on the refusal.
+        decision = shell_hooks._evaluate_result(spec, r)
+        assert decision is not None and decision["action"] == "block"
+        assert "Exec format error" not in decision["message"]
+        assert planted not in decision["message"]
 
     def test_evaluate_result_logs_detail_but_blocks_with_redacted(self, caplog):
         spec = shell_hooks.ShellHookSpec(
