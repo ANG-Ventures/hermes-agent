@@ -636,12 +636,16 @@ def test_the_production_exit_funnel_drains_the_lane(tmp_path, lane):
 def test_every_atexit_fence_in_shutdown_flush_has_a_hard_exit_counterpart():
     """Class sweep: no durability fence may rest on ``atexit`` alone.
 
-    ``gateway/shutdown_flush.py`` is the only module in ``gateway/`` whose
-    ``atexit`` handlers guard UNRECOVERABLE data (a stranded PID file or
-    control socket is recovered on the next bind; a lost payload is not), so
-    every one of them must also be reachable from the hard-exit funnel.  This
-    fails if someone adds a third lane with an ``atexit`` fence and forgets
-    to wire it into ``fence_lanes_for_hard_exit``.
+    ``gateway/shutdown_flush.py`` holds two of the lanes whose ``atexit``
+    handlers guard UNRECOVERABLE data (a stranded PID file or control socket
+    is recovered on the next bind; a lost payload is not), so every one of
+    them must also be reachable from the hard-exit funnel.  This fails if
+    someone adds a third lane here with an ``atexit`` fence and forgets to
+    register it.
+
+    The REPO-WIDE version of this rule is
+    ``test_no_durability_lane_rests_on_atexit_alone`` below; this one stays
+    because it is the cheap, precise check on the module that owns the funnel.
     """
     import inspect
 
@@ -653,15 +657,97 @@ def test_every_atexit_fence_in_shutdown_flush_has_a_hard_exit_counterpart():
     }
     assert registered, "no atexit fences found; this sweep would be vacuous"
 
-    hard_exit = inspect.getsource(shutdown_flush.fence_lanes_for_hard_exit)
+    names = {name for name, _ in shutdown_flush._HARD_EXIT_FENCES}
     for handler in sorted(registered):
         # "_fence_<name>_lane_at_exit" is backed by "fence_<name>_lane".
-        fence = handler.removeprefix("_").removesuffix("_at_exit")
-        assert f"{fence}(" in hard_exit, (
-            f"{handler} guards unrecoverable data but fence_lanes_for_hard_exit "
-            f"never calls {fence}(); the gateway exits via os._exit, so the "
-            "atexit registration alone does not run"
+        lane = handler.removeprefix("_fence_").removesuffix("_lane_at_exit")
+        assert lane in names, (
+            f"{handler} guards unrecoverable data but no hard-exit fence is "
+            f"registered under {lane!r}; the gateway exits via os._exit, so "
+            "the atexit registration alone does not run"
         )
+
+
+def test_no_durability_lane_rests_on_atexit_alone():
+    """Repo-wide rule: an ``atexit`` lane fence needs a hard-exit counterpart.
+
+    The two-lane sweep above only reads ``gateway/shutdown_flush.py``, so it
+    is blind to a lane defined anywhere else -- and the third one is not in
+    that module: ``gateway/platforms/weixin.py`` owns the long-poll cursor /
+    credential lane.  Measured on the production funnel before it was
+    registered, its queued write was lost (0 payload files on disk after
+    process death at every hold >= 0.5s) against 1/1 on a ``sys.exit`` control.
+
+    So the rule is stated over the tree, not over one module: any module that
+    registers an ``atexit`` handler whose name looks like a lane fence
+    (``_fence_*_at_exit``) must also call ``register_hard_exit_fence``.  That
+    is what makes this a rule rather than a three-entry inventory -- a fourth
+    lane in a fourth module fails here without anyone remembering to add it.
+    """
+    import ast
+    from pathlib import Path
+
+    repo = Path(_REPO_ROOT)
+    offenders = []
+    scanned = 0
+    for path in sorted(repo.glob("gateway/**/*.py")) + sorted(
+        repo.glob("plugins/**/*.py")
+    ):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "atexit.register(" not in text:
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        scanned += 1
+        lane_fences = []
+        registers_hard_exit = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            target = ast.unparse(node.func)
+            if target == "atexit.register" and node.args:
+                arg = ast.unparse(node.args[0])
+                if arg.startswith("_fence_") and arg.endswith("_at_exit"):
+                    lane_fences.append(arg)
+            if target.endswith("register_hard_exit_fence"):
+                registers_hard_exit = True
+        if lane_fences and not registers_hard_exit:
+            offenders.append(
+                f"{path.relative_to(repo)}: {sorted(lane_fences)} registered "
+                "at exit, but the module never calls register_hard_exit_fence"
+            )
+
+    assert scanned >= 2, (
+        f"only {scanned} module(s) with atexit.register were scanned; the "
+        "sweep is degenerate and would pass vacuously"
+    )
+    assert not offenders, (
+        "durability lane fence(s) rest on atexit alone. The gateway's exit "
+        "funnel (gateway.run._exit_after_graceful_shutdown) ends in os._exit, "
+        "which never runs atexit -- a queued write dies with the process and "
+        "is unrecoverable. Call "
+        "gateway.shutdown_flush.register_hard_exit_fence(<name>, <fence>) "
+        "beside the atexit.register:\n" + "\n".join(f"  {o}" for o in offenders)
+    )
+
+
+def test_the_weixin_lane_is_registered_with_the_hard_exit_funnel():
+    """The third lane must actually be in the funnel's registry.
+
+    The sweep above is structural (it reads source); this one imports the
+    adapter and asserts the registration really happened at import time, so a
+    call that is present in the AST but unreachable still fails.
+    """
+    from gateway.platforms import weixin  # noqa: F401  (import registers)
+
+    names = {name for name, _ in shutdown_flush._HARD_EXIT_FENCES}
+    assert "weixin" in names, (
+        "importing gateway.platforms.weixin did not register its write-lane "
+        f"fence for the hard-exit funnel; registered={sorted(names)}"
+    )
+
 
 
 def test_the_hard_exit_funnel_calls_the_lane_fence():
