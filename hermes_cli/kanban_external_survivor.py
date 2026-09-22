@@ -36,29 +36,53 @@ def _safe_url(url):
             and not (parsed.username and parsed.scheme != "ssh"))
 
 
+class RemoteUnavailable(Exception):
+    """The remote did not answer. This says NOTHING about the claim.
+
+    ``None`` from a ``verify_*`` means "the remote answered and the claim does
+    not hold up". A subprocess that exits non-zero, times out, or dies means
+    the question was never asked -- an ordinary rate limit, auth hiccup or
+    network blip. Collapsing the two lets a transient fault be reported, and
+    durably persisted, as a conclusion about relevance the kernel never
+    established (kanban card t_de2e348e, Argus round 3). Callers that only need
+    a candidate (:func:`discover`) treat this as "no", callers that state a
+    reason must say "could not verify" instead.
+    """
+
+
 def _query(args):
     try:
         result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
-        return result.stdout.decode() if result.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RemoteUnavailable(f"{args[0]} did not answer") from exc
+    if result.returncode != 0:
+        raise RemoteUnavailable(f"{args[0]} exited {result.returncode}")
+    try:
+        return result.stdout.decode()
+    except UnicodeError as exc:
+        raise RemoteUnavailable(f"{args[0]} returned undecodable output") from exc
 
 
 def verify_ref(claim, *, mined_for=None):
     """Resolve a ``<url>#<sha>`` claim against the remote's branch and tag tips.
 
-    An operator flag (``mined_for`` unset) is authority once the SHA is a tip.
-    A ref mined from handoff text is only a hint: every SHA in a handoff is
+    An operator flag is authority for the *identity* of the claim, never for
+    its relevance: ``mined_for`` is set on both the explicit and the mined path
+    so a SHA that is merely a tip somewhere is not accepted as THIS card's
+    work. Only the ``--survivor-unbound`` override passes ``mined_for=None``.
+    A mined ref is additionally only a hint: every SHA in a handoff is
     cross-producted with every remote URL, and "branched from <sha>" names the
     base, not the deliverable -- so a mined ref must sit on a branch that
     names the task.
+
+    ``None`` means the remote answered and the claim does not hold up; a
+    remote that did not answer raises :class:`RemoteUnavailable` instead, so a
+    caller never reports a blip as a statement about relevance.
     """
     url, sep, sha = claim.rpartition("#")
     if not sep or not re.fullmatch(_SHA, sha) or not _safe_url(url):
         return None
     output = _query(["git", "ls-remote", "--heads", "--tags", "--", url])
-    if output is None:
-        return None
     matches = {}
     for line in output.splitlines():
         oid, _, ref = line.partition("\t")
@@ -69,26 +93,50 @@ def verify_ref(claim, *, mined_for=None):
     oid, ref = next(iter(matches.items()))
     if mined_for and mined_for not in ref:
         return None
-    return {"remote": url, "branch": ref, "sha": oid, "external": True}
+    verified = {"remote": url, "branch": ref, "sha": oid, "external": True}
+    return dict(verified, corroborated_by="branch") if mined_for else verified
 
 
-def verify_pr(claim, shas=(), *, mined_for=None):
+def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
     """Resolve a PR claim against GitHub.
 
-    An operator flag (``mined_for`` unset) is authority once the PR exists and
-    is open or merged. A PR mined from handoff text is only a hint: it must be
+    Existence is not relevance. An OPEN/MERGED PR proves only that somebody
+    shipped something somewhere, so ``mined_for`` is applied on the explicit
+    operator/worker path too: the PR must corroborate the card by naming it.
+    Only the ``--survivor-unbound`` operator override passes ``mined_for=None``.
+
+    ``corroborate`` names the fields that may carry that naming, and the
+    default is deliberately the narrow one the mined path has always used --
+    the branch. The explicit path widens it to title and body, because those
+    are the PR's own claim about which card it implements and an operator
+    typing the number has already vouched for the PR's identity. Text on the
+    *card* is what cannot be trusted, and that is mined separately in
+    :func:`discover`; widening the mined path here would let a PR body that
+    merely mentions a card id verify itself.
+
+    ``corroborated_by`` reports WHICH signal answered, because the signals are
+    not equally strong and the caller must be able to tell them apart. A head
+    branch or a claimed SHA ties the PR's *content* to the card; a substring in
+    the title or body is only a mention, and an umbrella changelog or a
+    dependency note ("does not address t_...") satisfies it. Callers treat the
+    weak ones as an unbound claim (see ``kanban_survivor._verified_explicit``).
+
+    A PR mined from handoff text is additionally only a hint: it must be
     corroborated by a claimed SHA that is the PR head or squash merge, or --
-    with no SHA claimed -- by a PR branch that names the task. A bare
-    ``owner/repo#N`` mention proves nothing about THIS card's work.
+    with no SHA claimed -- by the same naming test. A bare ``owner/repo#N``
+    mention proves nothing about THIS card's work.
+
+    ``None`` means the remote answered and the claim does not hold up; a
+    remote that did not answer raises :class:`RemoteUnavailable` instead, so a
+    caller never reports a blip as a statement about relevance.
     """
     match = _PR.fullmatch(claim) or _PR_URL.fullmatch(claim)
     if not match:
         return None
     slug, number = match.groups()
     output = _query(["gh", "pr", "view", number, "--repo", slug,
-                     "--json", "state,headRefOid,headRefName,mergeCommit"])
-    if output is None:
-        return None
+                     "--json", "state,headRefOid,headRefName,mergeCommit,title,body"])
+    corroborated_by = None
     try:
         view = json.loads(output)
         state, head = view["state"], view["headRefOid"]
@@ -99,12 +147,21 @@ def verify_pr(claim, shas=(), *, mined_for=None):
         if shas:
             if not any(value and value.startswith(sha) for value in (head, merge) for sha in shas):
                 return None
-        elif mined_for and mined_for not in str(view.get("headRefName") or ""):
-            return None
+            corroborated_by = "sha"
+        elif mined_for:
+            corroborated_by = next(
+                (field for field in corroborate if mined_for in str(view.get(field) or "")),
+                None,
+            )
+            if corroborated_by is None:
+                return None
+            if corroborated_by == "headRefName":
+                corroborated_by = "branch"
     except (ValueError, TypeError, KeyError, AttributeError):
         return None
-    return {"remote": f"https://github.com/{slug}.git", "branch": f"refs/pull/{number}/head",
-            "sha": oid, "pr": f"{slug}#{number}", "state": state, "external": True}
+    verified = {"remote": f"https://github.com/{slug}.git", "branch": f"refs/pull/{number}/head",
+                "sha": oid, "pr": f"{slug}#{number}", "state": state, "external": True}
+    return dict(verified, corroborated_by=corroborated_by) if corroborated_by else verified
 
 
 def discover(conn, task_id, metadata, evidence, urls):
@@ -144,8 +201,15 @@ def discover(conn, task_id, metadata, evidence, urls):
             if len(seen) >= 6:
                 return None
             seen.add(key)
-            verified = (verify_pr(claim, shas, mined_for=task_id) if kind == "pr"
-                        else verify_ref(claim, mined_for=task_id))
+            try:
+                verified = (verify_pr(claim, shas, mined_for=task_id) if kind == "pr"
+                            else verify_ref(claim, mined_for=task_id))
+            except RemoteUnavailable:
+                # Mining only looks for a candidate; an unanswered remote is
+                # indistinguishable from "not this one" HERE, because discover
+                # states no reason. It is the reason-stating callers that must
+                # keep the two apart.
+                continue
             if verified:
                 return verified
     return None

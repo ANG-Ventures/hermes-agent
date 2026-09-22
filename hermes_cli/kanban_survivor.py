@@ -24,7 +24,16 @@ _log = logging.getLogger(__name__)
 
 
 class SurvivorUnavailable(ValueError):
-    """Completion/reclamation must retain the workspace for recovery."""
+    """Completion/reclamation must retain the workspace for recovery.
+
+    ``override_hint`` is deliberately NOT part of ``str(self)``. The refusal
+    text is persisted as ``held_reason`` and replayed to a worker's model by
+    ``kanban_show``, so anything baked into the message reaches readers the
+    raising process never inspected. The hint is rendered at the CLI boundary
+    instead, where the environment being tested is the one actually reading.
+    """
+
+    override_hint = ""
 
 
 log = logging.getLogger(__name__)
@@ -286,30 +295,105 @@ def _qualified_hint(keys):
     return f"--survivor-pr {sorted(keys)[0]}=owner/repo#N"
 
 
-def _verified_explicit(survivor_ref, survivor_pr):
-    """Operator-named survivors are claims: verify each or refuse the completion.
+def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
+    """An operator-named survivor is a claim: verify it is real AND is THIS card's work.
 
     Returns ``{repository-key-or-None: ref}``. Both flags are repeatable and
     each value may be qualified as ``<repo>=<claim>`` so a multi-repository
     loss has a reachable remedy that records TRUE provenance per repository.
     An unqualified claim maps to ``None`` -- "the one lost repository" -- and
     is resolved by the caller, which is the only place that knows which one.
+
+    "Live on GitHub" is not evidence about this card. Any unrelated OPEN or
+    MERGED PR satisfies existence, and ``preserve`` treats a verified explicit
+    survivor as authority for the branch that protects UNPUSHED implementation
+    work -- so an unbound claim authorises deleting a workspace whose bytes may
+    exist nowhere else. The claim therefore carries the same task-id binding
+    the text-mined path carries: the PR branch (or the remote ref) must name
+    the task.
+
+    The legitimate operator case -- a human who knows the work landed on a
+    differently-named branch -- keeps a path: ``--survivor-unbound`` accepts
+    the claim without the binding and records the override on the survivor, so
+    the authorisation is auditable rather than invisible.
+
+    The override is NOT an identity gate, and must not be mistaken for one.
+    Argus's round-1 review asked for one: refuse the flag unless the caller is
+    not a dispatched worker, plus an interactive tty. Measured on this host
+    (kanban card t_de2e348e, probe_r2_signals.py) that is not implementable -- a worker
+    runs as the SAME uid as the operator (502) and can forge every
+    process-local signal available:
+
+      * ``is_dispatcher_owned_worker_context()`` fails OPEN with no
+        ``HERMES_KANBAN_OWNER_PID``, so dropping the grant (``env -u``) reads
+        as an operator: predicate False inherited, True stripped;
+      * process ancestry survives one double-fork: the daemonized grandchild
+        reports ``ppid = 1``, so nothing above it looks like a worker;
+      * ``sys.stdin.isatty()`` is False in this worker and True in a
+        ``pty.fork`` child it spawns itself.
+
+    So the flag cannot be bounded by WHO calls it, and pretending otherwise
+    would ship a gate that reads as security and is not. It is bounded by
+    CAPABILITY instead -- see :func:`_reusable`: an unbound claim authorises
+    THIS completion and never becomes standing authority that a later
+    reclamation reuses without re-testing.
+
+    NOT every corroboration is the same strength, and the weak ones are held
+    to the same bound as the override. ``verify_pr`` reports WHICH field
+    answered: a head branch or a claimed SHA ties the PR's *content* to the
+    card, but a substring in the PR title or body is only a MENTION -- an
+    umbrella changelog, a dependency note, even "does not address t_..."
+    satisfies it. Accepting a mention as a bound survivor would make it
+    standing delete authority via :func:`_reusable`, which is the very thing
+    this card closed. So a title/body match is recorded as an unbound claim:
+    it still completes the card, and it still never buys a later delete.
     """
     resolved, unqualified = {}, None
-    for claims, flag, verify in (
-        (survivor_ref, "--survivor-ref", _ext.verify_ref),
-        (survivor_pr, "--survivor-pr", _ext.verify_pr),
+    for claims, flag, verify, extra in (
+        (survivor_ref, "--survivor-ref", _ext.verify_ref, {}),
+        (survivor_pr, "--survivor-pr", _ext.verify_pr,
+         {"corroborate": ("headRefName", "title", "body")}),
     ):
         for claim in (claims if isinstance(claims, (list, tuple)) else [claims] if claims else []):
             if not claim:
                 continue
             key, value = _split_qualifier(claim)
-            ref = verify(value)
-            if ref is None:
-                # The claim is unverified and may carry a token: echo it redacted only.
+            # A remote that did not ANSWER is not evidence about the claim. Keep
+            # the two outcomes apart at the seam: ``None`` is a verdict from the
+            # remote, ``RemoteUnavailable`` is the absence of one. Collapsing them
+            # let a rate limit or network blip be reported -- and persisted to
+            # ``held_reason`` and the ``workspace_held`` event that ``kanban_show``
+            # replays -- as the false statement "is live but does not name <card>",
+            # whose offered remedy is to drop the very binding this path adds
+            # (kanban card t_de2e348e, Argus round 3).
+            try:
+                ref = verify(value, mined_for=None if unbound else task_id, **extra)
+                if ref is None:
+                    # The claim is unverified and may carry a token: echo it redacted only.
+                    if not unbound and verify(value, **extra) is not None:
+                        raise _refusal(
+                            f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
+                            f"name {task_id}, so it is not evidence of THIS card's work",
+                            hint=True,
+                        )
+                    raise SurvivorUnavailable(
+                        f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
+                        f"against the remote"
+                    )
+            except _ext.RemoteUnavailable as exc:
                 raise SurvivorUnavailable(
-                    f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} against the remote"
-                )
+                    f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
+                    f"against the remote ({_ext.redact(str(exc))})"
+                ) from exc
+            if unbound or ref.get("corroborated_by") in _WEAK_CORROBORATION:
+                # Record WHO authorised an unbound claim and WHY it is unbound:
+                # _record replays the survivor into the task's event log, so the
+                # authorisation is auditable.
+                ref = dict(ref, unbound=True, claimed_by=_claimant())
+                _log.warning("Unbound survivor accepted for task %s by %s (%s): %s",
+                             task_id, ref["claimed_by"],
+                             ref.get("corroborated_by") or "operator override",
+                             _ext.redact(claim))
             if key is None:
                 # An unqualified claim means "the one lost repository", so two
                 # of them are ambiguous in exactly the way the qualified/
@@ -339,6 +423,94 @@ def _verified_explicit(survivor_ref, survivor_pr):
             )
         return {None: unqualified}
     return resolved
+
+
+#: Corroboration that is only a MENTION of the card, never a tie to its work.
+_WEAK_CORROBORATION = frozenset({"title", "body"})
+
+
+def _refusal(message, *, hint=False):
+    """Build the refusal, keeping the override out of the PERSISTED text.
+
+    ``preserve`` writes the refusal to ``held_reason`` and to a
+    ``workspace_held`` event, and ``kanban_show`` replays events to a worker's
+    model. A hint baked into the message therefore reaches readers that the
+    raising process never inspected -- including a worker redispatched onto a
+    card an OPERATOR refused earlier. So the flag name is not in the string at
+    all; it rides on the exception and is rendered at the CLI boundary, where
+    the environment being tested belongs to the caller actually reading it.
+    """
+    exc = SurvivorUnavailable(message)
+    if hint:
+        exc.override_hint = (
+            "re-run with --survivor-unbound if the work really did land on an "
+            "unrelated-looking branch"
+        )
+    return exc
+
+
+def render_override_hint(exc):
+    """Append an exception's override hint for a caller entitled to read it.
+
+    A worker's environment carries the dispatcher's grant, so treat the mere
+    PRESENCE of that grant as "someone other than an operator is reading",
+    without asking whether the grant belongs to this process: for a hint,
+    unlike for an authority check, over-suppressing costs only an operator one
+    ``--help``.
+    """
+    hint = getattr(exc, "override_hint", "")
+    if not hint or any(
+        os.environ.get(key) for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID")
+    ):
+        return str(exc)
+    return f"{exc}; {hint}"
+
+
+def _claimant():
+    """Attribute an unbound claim to the OS user, not to a chosen string.
+
+    ``getpass.getuser()`` consults ``LOGNAME``/``USER``/``LNAME``/``USERNAME``
+    before the passwd database, so anything that can invoke the CLI can also
+    choose the name recorded against a workspace delete -- including a worker
+    writing ``claimed_by="operator"``. That is not attribution; the whole
+    safety argument for the override is that the authorisation is auditable.
+    Resolve the real uid instead, and record the number alongside the name so
+    the audit trail survives a host with no passwd entry at all.
+    """
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    if uid is None:
+        return "unknown"
+    try:
+        import pwd
+
+        return f"{pwd.getpwuid(uid).pw_name} (uid {uid})"
+    except (KeyError, OSError, ImportError):  # containers, CI, Windows
+        return f"uid {uid}"
+
+
+def _reusable(previous):
+    """Reclamation may reuse a RECORDED survivor only if it was bound to the card.
+
+    This is the bound on the override, and the reason it needs no identity
+    check. An unbound claim is a human assertion that work landed somewhere the
+    kernel cannot corroborate; ``preserve(cleanup=True)`` does not re-verify,
+    it reuses whatever completion recorded. So an unbound claim recorded once
+    would otherwise become STANDING authority to discard this workspace on
+    every later reclamation, without the claim ever being re-tested.
+
+    Measured on the workspace-missing reclamation branch, where ``previous`` is
+    the SOLE authority (kanban card t_de2e348e, probe_r2_branches.py, P1): an unbound
+    recorded claim HELDs, a bound one is REUSED, and no claim HELDs -- so the
+    gate discriminates on exactly the field it names and can still say yes.
+
+    Refusing the reuse cuts the override down to what the legitimate operator
+    case needs -- closing a card whose workspace is already gone -- and keeps
+    the fail-closed HOLD otherwise. A caller who wants a workspace discarded
+    must re-assert against the tree in front of them rather than inherit a
+    stale authorisation.
+    """
+    refs = (previous or {}).get("refs") or ()
+    return previous if not any(ref.get("unbound") for ref in refs) else None
 
 
 def _loose_files(workspace, repos):
@@ -377,12 +549,18 @@ def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cl
     a survivor is an error, and it never runs during reclamation -- cleanup
     reuses the survivor recorded at completion or holds. Re-mining a hint
     there would turn a fail-closed HOLD into a delete.
+
+    The recorded survivor is filtered through :func:`_reusable`: an UNBOUND
+    claim authorised one completion and is not standing authority to delete a
+    workspace a later reclamation can still see. This is the single place
+    ``previous`` becomes a delete authorisation, so the bound lives here rather
+    than at the two ``preserve`` call sites that pass it.
     """
     if explicit:
         return {"kind": "ref", "refs": [dict(ref, repository=key or ".")
                                         for key, ref in sorted(explicit.items(), key=lambda i: i[0] or "")]}
     if cleanup:
-        return previous
+        return _reusable(previous)
     ref = _ext.discover(conn, task_id, metadata, evidence, urls) if discover else None
     return {"kind": "ref", "refs": [dict(ref, repository=".")]} if ref else None
 
@@ -606,7 +784,7 @@ def _hold(conn, task_id, reason):
 
 
 def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
-             survivor_ref=None, survivor_pr=None, evidence=()):
+             survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=()):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
     bases, held, previous = _state(conn, task_id)
     if cleanup and held:
@@ -615,7 +793,8 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         task = kb.get_task(conn, task_id)
         if task is None:
             raise SurvivorUnavailable("survivor_unavailable: task missing")
-        explicit = _verified_explicit(survivor_ref, survivor_pr)
+        explicit = _verified_explicit(task_id, survivor_ref, survivor_pr,
+                                      unbound=survivor_unbound)
         claimed = bool((metadata or {}).get("changed_files"))
         # Review approval often has no new changed_files: inherit the implementer's claim.
         claimed = claimed or any(
@@ -839,8 +1018,11 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         return _record(conn, task_id, survivor, previous)
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: capture failed"
+        # `reason` is what gets PERSISTED (held_reason + a workspace_held event
+        # kanban_show replays to workers), so it must stay hint-free. The hint
+        # rides the re-raised exception instead, for the CLI to render.
         _hold(conn, task_id, reason)
-        raise SurvivorUnavailable(reason) from exc
+        raise _refusal(reason, hint=bool(getattr(exc, "override_hint", ""))) from exc
 
 
 def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False):

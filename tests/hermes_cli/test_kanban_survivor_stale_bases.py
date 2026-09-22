@@ -40,16 +40,27 @@ def remote(monkeypatch):
     and ``state["tips"]`` is what a bare ``git ls-remote <url>`` advertises --
     empty by default, so a ``--survivor-ref`` resolves to nothing. Both are
     stubbed rather than left to the network so these tests never reach out.
+
+    ``headRefName`` starts UNRELATED to any card on purpose. Existence is not
+    relevance: an explicit ``--survivor-pr`` must corroborate the card that
+    names it, so a test wanting the happy path calls :func:`names_card` and one
+    wanting the refusal leaves this alone.
     """
     state = {"state": "OPEN", "headRefOid": HEAD, "mergeCommit": None,
-             "missing": False, "tips": ""}
+             "missing": False, "tips": "",
+             "headRefName": "someone/unrelated-work", "title": "", "body": ""}
     real = subprocess.run
 
     def run(args, **kwargs):
         if args[0] == "gh":
             if state["missing"]:
                 return subprocess.CompletedProcess(args, 1, b"", b"not found")
-            payload = {k: state[k] for k in ("state", "headRefOid", "mergeCommit")}
+            # Forward every PR field the verifier may consult -- not just the
+            # three this file's own assertions read. `--survivor-pr` now
+            # corroborates the card against `headRefName`/`title`/`body`, so
+            # narrowing the payload here would make `names_card` inert and
+            # silently turn the happy-path tests into refusal tests.
+            payload = {k: v for k, v in state.items() if k not in ("missing", "tips")}
             return subprocess.CompletedProcess(args, 0, json.dumps(payload).encode(), b"")
         # `_ext` shells out as `git ls-remote ...`; `_git` always passes `-C`.
         if args[0] == "git" and len(args) > 1 and args[1] == "ls-remote":
@@ -58,6 +69,12 @@ def remote(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", run)
     return state
+
+
+def names_card(remote, tid):
+    """Make the claimed PR corroborate THIS card, the way a real one would."""
+    remote["headRefName"] = f"operator/{tid}-landed-elsewhere"
+    return remote
 
 
 def stale_card(conn, *, title="review lane", loose=True):
@@ -80,6 +97,7 @@ def stale_card(conn, *, title="review lane", loose=True):
 def test_stale_bases_with_a_verified_survivor_pr_completes(board, remote):
     """The case that was impossible: dir exists, repo gone, operator names a PR."""
     tid, ws = stale_card(board)
+    names_card(remote, tid)
 
     assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
 
@@ -167,6 +185,7 @@ def test_cli_refusal_exits_non_zero_with_the_reason_and_hint(board, remote, monk
 def test_cli_successful_completion_exits_zero_and_says_so(board, remote, monkeypatch, capsys):
     """Teeth for the test above: the happy path must stay quiet and green."""
     tid, _ = stale_card(board)
+    names_card(remote, tid)
 
     rc = _cli(board, monkeypatch,
               ["kanban", "complete", tid, "--summary", "ok", "--survivor-pr", PR])
@@ -218,6 +237,7 @@ def test_partial_loss_keeps_both_the_surviving_repo_and_the_operator_ref(board, 
     that is gone -- leaving that work pointed at nothing.
     """
     tid, _ = partial_loss_card(board, tmp_path, monkeypatch)
+    names_card(remote, tid)
 
     assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
 
@@ -305,8 +325,11 @@ def test_partial_loss_with_a_verified_survivor_ref_completes(board, remote, tmp_
     once the SHA is an advertised tip, so those refusals are about verification
     and not about the flag being inert on this branch."""
     sha = "b2" * 20
-    remote["tips"] = f"{sha}\trefs/heads/work\n"
     tid, _ = partial_loss_card(board, tmp_path, monkeypatch)
+    # The advertised ref must NAME the card: an explicit `--survivor-ref` is
+    # bound the same way `--survivor-pr` is, so `refs/heads/work` alone would
+    # be refused here as an unrelated branch rather than as an unverified SHA.
+    remote["tips"] = f"{sha}\trefs/heads/operator/{tid}-landed-elsewhere\n"
     claim = f"https://github.com/example/project.git#{sha}"
 
     assert kb.complete_task(board, tid, summary="approved", survivor_ref=claim)
@@ -331,6 +354,7 @@ def test_partial_loss_with_a_verified_survivor_ref_completes(board, remote, tmp_
 def test_a_recorded_survivor_clears_the_hold_it_satisfied(board, remote):
     """The bug: a SUCCESSFUL --survivor-pr completion left held_reason set."""
     tid, ws = stale_card(board, loose=False)
+    names_card(remote, tid)
 
     assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
 
@@ -347,6 +371,7 @@ def test_a_recorded_survivor_clears_the_hold_it_satisfied(board, remote):
 def test_the_satisfied_workspace_is_actually_reclaimed(board, remote):
     """Teeth for the assertion above: a held workspace is never reclaimed."""
     tid, ws = stale_card(board, loose=False)
+    names_card(remote, tid)
 
     assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
 
@@ -358,6 +383,7 @@ def test_reclamation_consults_the_recorded_survivor_not_the_dead_base(board, rem
     from hermes_cli import kanban_survivor as survivor
 
     tid, ws = stale_card(board, loose=False)
+    names_card(remote, tid)
     assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
     ws.mkdir(parents=True, exist_ok=True)  # a reaper re-examining a retained dir
 
@@ -402,6 +428,7 @@ def test_loose_evidence_is_still_not_reapable_on_a_satisfied_claim(board, remote
     reaper evidence that no survivor covers -- the workspace still HOLDS.
     """
     tid, ws = stale_card(board)  # loose=True: qa-output/verdict.md
+    names_card(remote, tid)
     evidence = ws / "qa-output" / "verdict.md"
 
     assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
@@ -644,6 +671,7 @@ def test_one_operator_survivor_cannot_vouch_for_two_vanished_repositories(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="two vanished repositories")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "two-kept.git")
@@ -674,6 +702,7 @@ def test_a_single_vanished_repository_is_still_covered_by_the_operator_flag(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="one vanished repository")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "one-kept.git")
@@ -940,6 +969,7 @@ def test_qualified_operator_survivors_cover_two_vanished_repositories(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="two vanished repositories, qualified claims")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "qual-kept.git")
@@ -975,6 +1005,7 @@ def test_a_partially_qualified_claim_still_fails_closed(board, remote, tmp_path,
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="partially qualified claim")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "partial-qual-kept.git")
@@ -1004,6 +1035,7 @@ def test_the_multi_repository_refusal_names_a_remedy_that_actually_works(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="unqualified claim, two vanished repositories")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "hint-kept.git")
@@ -1057,6 +1089,7 @@ def test_mixing_a_qualified_and_an_unqualified_claim_is_refused(board, remote):
     from hermes_cli import kanban_survivor as survivor
 
     tid, ws = stale_card(board, loose=False)
+    names_card(remote, tid)
 
     with pytest.raises(ValueError) as excinfo:
         survivor.preserve(board, tid, workspace=ws, survivor_pr=[PR, f"gone={PR}"])
@@ -1189,6 +1222,7 @@ def test_two_unqualified_operator_survivors_are_refused(board, remote):
     from hermes_cli import kanban_survivor as survivor
 
     tid, ws = stale_card(board, loose=False)
+    names_card(remote, tid)
 
     with pytest.raises(ValueError) as excinfo:
         survivor.preserve(board, tid, workspace=ws,
@@ -1205,6 +1239,7 @@ def test_a_single_unqualified_operator_survivor_is_still_accepted(board, remote)
     from hermes_cli import kanban_survivor as survivor
 
     tid, ws = stale_card(board, loose=False)
+    names_card(remote, tid)
 
     out = survivor.preserve(board, tid, workspace=ws, survivor_pr=[PR])
 
@@ -1224,6 +1259,7 @@ def test_a_qualifier_naming_a_repository_still_on_disk_is_refused(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="qualifier naming a live repository")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "intrude-kept.git")
@@ -1260,6 +1296,7 @@ def test_a_non_code_recompletion_never_erases_a_recorded_survivor(board, remote)
     from hermes_cli import kanban_survivor as survivor
 
     tid = kb.create_task(board, title="external implementation, re-completed")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     kb.set_workspace_path(board, tid, ws)
     if ws.is_dir():
@@ -1354,6 +1391,7 @@ def test_the_unrepresentable_remedy_reaches_the_refusal_message(board, remote, t
     from hermes_cli import kanban_survivor as survivor
 
     tid = kb.create_task(board, title="unrepresentable repository key")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kb.set_workspace_path(board, tid, ws)
@@ -1457,6 +1495,7 @@ def test_a_recompletion_may_not_shrink_the_index_either(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="re-completion drops the recorded patch")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     ws.mkdir(parents=True, exist_ok=True)
     kept_head = _seed_published_repo(ws / "kept", tmp_path / "recomplete-kept.git")
@@ -1493,6 +1532,7 @@ def test_the_workspace_missing_exit_may_not_shrink_the_index(
     monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
 
     tid = kb.create_task(board, title="workspace missing, operator PR")
+    names_card(remote, tid)
     ws = kb.resolve_workspace(kb.get_task(board, tid))
     recorded = dict(_sidecar_patch_survivor(
         tmp_path,
