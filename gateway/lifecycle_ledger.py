@@ -112,9 +112,12 @@ def read_last_teardown_seconds(
       than any launchd budget. Records written before this field existed
       are treated as unbudgeted for the same reason.
     * ``max_seconds`` rejects a sample too large to be *actionable* under
-      the live budget. A teardown that already exceeds the whole usable
-      window cannot be reserved for; honouring it would zero the drain and
-      drop in-flight sessions while still not making the teardown fit.
+      the live budget. A teardown that already meets or exceeds the whole
+      usable window cannot be reserved for; honouring it would zero the
+      drain and drop in-flight sessions while still not making the
+      teardown fit. The bound is inclusive — a sample exactly AT the
+      ceiling drives the drain to precisely zero, which is the
+      starvation this rejects, not a usable reserve.
 
     ``inf``/``nan`` are rejected outright: no completed teardown can
     produce them, so they only arrive from a corrupt or hand-edited file.
@@ -138,7 +141,7 @@ def read_last_teardown_seconds(
             ceiling = float(max_seconds)
         except (TypeError, ValueError):
             return value
-        if math.isfinite(ceiling) and value > ceiling:
+        if math.isfinite(ceiling) and value >= ceiling:
             return None
     return value
 
@@ -154,9 +157,12 @@ def record_teardown_timing(
     """Persist and diagnose one completed post-drain teardown measurement.
 
     ``budgeted`` marks a stop that ran under a supervisor deadline, i.e.
-    the only kind whose duration predicts the next SIGTERM. Unbudgeted
-    samples are still written for diagnostics but are never read back as
-    the teardown reserve (see :func:`read_last_teardown_seconds`).
+    the only kind whose duration predicts the next SIGTERM. An unbudgeted
+    sample is appended to the exit-diag log for diagnostics but must NOT
+    reach the single-slot reserve file: writing it there clobbers the last
+    actionable measurement (a manual ``hermes gateway stop`` between two
+    SIGTERMs would erase a recorded 40s teardown, so the next launchd stop
+    reserves the 15s default and can be SIGKILLed mid-persistence).
     """
     try:
         teardown = max(float(teardown_seconds), 0.0)
@@ -174,13 +180,14 @@ def record_teardown_timing(
         "budgeted": bool(budgeted),
     }
     path = get_teardown_timing_path(home)
-    try:
-        from utils import atomic_json_write
+    if budgeted:
+        try:
+            from utils import atomic_json_write
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json_write(path, record, indent=None)
-    except Exception:
-        logger.debug("Failed to persist teardown timing", exc_info=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(path, record, indent=None)
+        except Exception:
+            logger.debug("Failed to persist teardown timing", exc_info=True)
     _append_exit_diag(record, home)
 
 

@@ -3309,8 +3309,8 @@ from gateway.restart import (
     read_launchd_exit_timeout_s,
     resolve_armed_shutdown_watchdog_delay,
     resolve_cron_drain_budget,
+    resolve_elapsed_adjusted_drain,
     resolve_launchd_capped_drain,
-    resolve_launchd_shutdown_watchdog_delay,
     resolve_max_actionable_teardown_reserve_s,
     resolve_replace_takeover_grace_s,
 )
@@ -19703,6 +19703,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         signal_driven=getattr(
                             self, "_stop_requested_by_signal", False
                         ),
+                        last_teardown_s=getattr(
+                            self, "_last_shutdown_teardown_s", None
+                        ),
                     ),
                     "persistence_complete": False,
                     "phase_elapsed_s": (
@@ -19711,10 +19714,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
 
             if not os.environ.get("PYTEST_CURRENT_TEST"):
+                # The measured teardown must reach the arming site, not just
+                # the drain cap: the leash is max(grace, reserve), so without
+                # it a sample above the 60s grace silently collapses back to
+                # the grace (clamp 300 / measured 70 armed at 240 for a drain
+                # of 180 — a 60s window for a 70s teardown).
                 _watchdog_delay = resolve_armed_shutdown_watchdog_delay(
                     effective_stop_drain_timeout(self),
                     getattr(self, "_launchd_exit_timeout_s", None),
                     signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                    last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
                 )
                 arm_shutdown_watchdog(
                     _watchdog_delay,
@@ -19809,6 +19818,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._notify_restart_loop_suspended(_sk)
                 except Exception as _e:
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
+
+            # The watchdog was armed at the TOP of stop() with an ABSOLUTE
+            # deadline, but this drain is a RELATIVE budget that only starts
+            # HERE — after the notify/mark/cancel phases logged above AND
+            # after the pre-drain resume_pending marking loop just above
+            # (per-session SQLite writes plus notify sends, which under the
+            # load that produced the 09-21 SIGKILL is not a negligible term).
+            # Read the elapsed at the POINT OF USE, not at the top of the
+            # block: a snapshot taken before the marking loop charges that
+            # loop to neither the drain nor the teardown reserve, and the
+            # window between the drain and os._exit silently shrinks below
+            # the reserve. At the live geometry (clamp 60, drain 30, armed
+            # 50) an 8s marking loop left a 12s window for a 15s reserve.
+            # The cron branch below does the same thing for the same reason.
+            timeout = resolve_elapsed_adjusted_drain(
+                timeout,
+                getattr(self, "_launchd_exit_timeout_s", None),
+                signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                elapsed_s=_phase_elapsed(),
+                # Same measured sample effective_stop_drain_timeout() fed the
+                # cap. Both derive the SAME deadline, so they must see the
+                # same teardown reserve or the drain is fitted against a
+                # window the watchdog does not actually grant.
+                last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+            )
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
