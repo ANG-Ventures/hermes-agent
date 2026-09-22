@@ -366,7 +366,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         keys = {str(r.relative_to(workspace)) for r in repos}
         carried, carried_bundles = [], []
         missing = set(bases) - keys
-        if missing and cleanup:
+        if cleanup:
             # Reclamation is not a second chance to re-derive evidence. The
             # survivor recorded at completion is NEWER and better than the
             # checkout that has since vanished, and `bases` is never rewritten
@@ -375,14 +375,25 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # overwrote the `held_reason` `_record()` had just cleared. A card
             # completed via a verified `--survivor-pr` was left `done` and
             # permanently HELD, citing the very remedy the operator had used.
-            vouched = _vouched_repositories(previous)
-            if missing <= vouched:
+            #
+            # Key the carry-forward on what the RECORDED survivor vouches for
+            # and disk no longer holds, not on `bases`. The re-capture below can
+            # only see repositories that still exist and `_record()` overwrites
+            # the row with exactly what it captured, so anything absent is
+            # dropped from the recovery index unless carried across -- and
+            # `bases` is written once, before dispatch, so it does not know
+            # about a repository the worker cloned afterwards.
+            absent = _vouched_repositories(previous) - keys
+            # `missing <= absent` is the coverage test: every repository `bases`
+            # says vanished must be one the recorded survivor actually accounts
+            # for. A survivor vouching for some OTHER repository buys nothing.
+            if absent and missing <= absent:
                 if _loose_files(workspace, repos):
                     # The relaxation may honour a satisfied claim; it may never
                     # buy a delete for evidence no survivor covers. On a PARTIAL
                     # loss the surviving repos resolve their own refs and the
                     # capture returns before the `elif claimed:` arm below --
-                    # the one and only `_loose_files()` call site -- so the
+                    # the one and only other `_loose_files()` call site -- so the
                     # guard has to be applied on THIS exit too, or reclamation
                     # `rmtree`s loose files that previously forced a HOLD.
                     raise SurvivorUnavailable(
@@ -397,10 +408,13 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                     # (see `_vouched_repositories`), so it must be carried too
                     # -- otherwise `_record()` rewrites the row as `kind: ref`
                     # for a repo whose only unpushed history is that bundle.
+                    # With NO repo left the `elif claimed:` arm reinstates the
+                    # whole recorded survivor on its own; seeding here too would
+                    # record a second copy of every carried entry.
                     carried = [ref for ref in (previous or {}).get("refs") or ()
-                               if isinstance(ref, dict) and ref.get("repository") in missing]
+                               if isinstance(ref, dict) and ref.get("repository") in absent]
                     carried_bundles = [b for b in (previous or {}).get("bundles") or ()
-                                       if isinstance(b, dict) and b.get("repository") in missing]
+                                       if isinstance(b, dict) and b.get("repository") in absent]
                 missing = set()
                 # `bases` still attests that code work was expected here. Keep
                 # the claim so an empty in-tree capture routes through the
@@ -420,6 +434,16 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             if not explicit:
                 raise SurvivorUnavailable(
                     f"survivor_unavailable: recorded repository missing; {_ext.HINT}"
+                )
+            if len(missing) > 1:
+                # One `--survivor-pr` / `--survivor-ref` names ONE remote. It
+                # can only vouch for one repository; stamping it onto each of
+                # them would record provenance that is false for all but one,
+                # which is the same recovery-index corruption as dropping an
+                # entry, written deliberately. An incomplete claim fails closed.
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: one operator survivor cannot vouch for multiple "
+                    f"missing repositories ({', '.join(sorted(missing))}); {_ext.HINT}"
                 )
             # A vanished recorded repository is an unmet claim. Force the
             # external path below so the verified survivor is actually recorded,
@@ -488,7 +512,16 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 f"verifiable external survivor; {_ext.HINT}"
             )
         else:
-            survivor = None
+            # Nothing in-tree, nothing claimed. On the completion pass that is
+            # genuinely non-code work and None is correct. On RECLAMATION it is
+            # not: `_record()` does `SET survivor = excluded.survivor`, so
+            # writing None here erases a recovery index that a previous
+            # completion had already published, and returns a survivor-less
+            # verdict that lets the caller `rmtree` the directory. Reclamation
+            # may only ever keep or extend the recorded survivor, never shrink
+            # it -- a patch- or sidecar-shaped survivor keys no repository at
+            # all, so it never reaches the carry-forward above.
+            survivor = previous if cleanup else None
         return _record(conn, task_id, survivor, previous)
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: capture failed"

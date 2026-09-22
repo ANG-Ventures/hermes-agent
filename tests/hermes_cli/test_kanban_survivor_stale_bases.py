@@ -469,3 +469,204 @@ def test_a_bundle_vouched_missing_repo_is_carried_into_the_rewritten_survivor(
         "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
         (tid,)).fetchone()["survivor"])
     assert [b["repository"] for b in saved["bundles"]] == ["b"], saved
+
+
+# --- reclamation must never SHRINK the recovery index ----------------------
+#
+# FleetReview P1 (#842 @ 3afa9086), three instances of one class: the cleanup
+# re-capture can only see repositories still on disk, and `_record()` then
+# overwrites the row with exactly what it captured. Anything the recorded
+# survivor vouched for that is NOT on disk is therefore dropped unless it is
+# explicitly carried forward. The first fix keyed that carry-forward on
+# `set(bases) - keys`, which misses every repository `bases` never knew.
+
+
+def _seed_survivor(conn, tid, ws, bases, survivor):
+    kb.set_workspace_path(conn, tid, ws)
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases, survivor) VALUES (?, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases, survivor = excluded.survivor",
+            (tid, json.dumps(bases), json.dumps(survivor)),
+        )
+
+
+def test_reclamation_carries_a_survivor_for_a_repo_cloned_after_dispatch(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION: the carry-forward must be keyed on what is ABSENT FROM DISK,
+    not on `bases`.
+
+    `bases` is recorded once, before dispatch. A repository the worker cloned
+    afterwards is in the recorded survivor and in NO `bases` entry, so
+    `missing = set(bases) - keys` is empty, the relaxation never runs, and the
+    cleanup re-capture rewrites the row without it -- silently orphaning the
+    bundle that holds that repository's only unpushed history.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="repo cloned after dispatch")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "late-kept.git")
+    bundle = {"repository": "cloned", "path": str(tmp_path / "implementation-0.bundle"),
+              "sha256": "f" * 64, "bytes": 42}
+    # `cloned` is in the survivor, NOT in bases: it did not exist at dispatch.
+    _seed_survivor(board, tid, ws, {"kept": kept_head},
+                   {"kind": "bundle", "notice": "NOT PUSHED", "bundles": [bundle],
+                    "refs": [{"repository": "kept", "sha": kept_head, "remote": "origin"}]})
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert [b["repository"] for b in out.get("bundles") or ()] == ["cloned"], out
+    assert out["bundles"][0]["path"] == bundle["path"]
+    assert out["kind"] == "bundle", "unpushed history must not be relabelled `ref`"
+    saved = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["survivor"])
+    assert [b["repository"] for b in saved["bundles"]] == ["cloned"], saved
+
+
+def test_one_operator_survivor_cannot_vouch_for_two_vanished_repositories(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION: `--survivor-pr` names ONE remote. Stamping it onto every
+    vanished repository records provenance that is false for all but one of
+    them -- the same recovery-index corruption as the dropped bundle above,
+    written deliberately. The operator flag covered one repository, so a
+    multi-repository loss is an INCOMPLETE claim and must fail closed.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="two vanished repositories")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "two-kept.git")
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases",
+            (tid, json.dumps({"kept": kept_head, "gone1": STALE, "gone2": STALE})),
+        )
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, workspace=ws, survivor_pr=PR)
+
+    assert "gone1" in str(excinfo.value) and "gone2" in str(excinfo.value), str(excinfo.value)
+    assert ws.is_dir(), "the workspace must be retained, not reaped, on an incomplete claim"
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is not None
+
+
+def test_a_single_vanished_repository_is_still_covered_by_the_operator_flag(
+        board, remote, tmp_path, monkeypatch):
+    """Teeth for the test above: the refusal keys on the COUNT of vanished
+    repositories, not on partial loss. One lost repo still has its remedy.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="one vanished repository")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kept_head = _seed_published_repo(ws / "kept", tmp_path / "one-kept.git")
+    kb.set_workspace_path(board, tid, ws)
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases",
+            (tid, json.dumps({"kept": kept_head, "gone": STALE})),
+        )
+
+    out = survivor.preserve(board, tid, workspace=ws, survivor_pr=PR)
+
+    by_repo = {ref["repository"]: ref for ref in out["refs"]}
+    assert by_repo["gone"]["pr"] == PR
+    assert set(by_repo) == {"gone", "kept"}, out["refs"]
+
+
+def test_reclamation_never_erases_a_recorded_survivor_it_cannot_recapture(
+        board, remote, tmp_path, monkeypatch):
+    """REGRESSION: the no-survivor `else` wrote NULL over a RECORDED survivor.
+
+    `_record()` does `SET survivor = excluded.survivor`, so reaching the `else`
+    with a survivor already on the row erased the recovery index AND returned
+    None, handing `remove_workspace_dir` a green light to `rmtree` loose
+    evidence the recorded ref never vouched for.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="recorded survivor, nothing to recapture")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    evidence = ws / "qa-output" / "verdict.md"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text("APPROVED\n")
+    recorded = {"kind": "ref", "refs": [
+        {"repository": ".", "sha": HEAD, "pr": PR, "external": True}]}
+    _seed_survivor(board, tid, ws, {}, recorded)
+
+    with pytest.raises(ValueError) as excinfo:
+        survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert "outside any repository" in str(excinfo.value), str(excinfo.value)
+    assert evidence.is_file(), "loose evidence no survivor covers must not be reapable"
+    saved = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["survivor"])
+    assert saved == recorded, "the recorded survivor must survive the re-capture"
+
+
+def test_a_recorded_survivor_with_nothing_loose_is_kept_and_reclaimable(
+        board, remote, tmp_path, monkeypatch):
+    """Teeth for the test above: the hold keys on LOOSE FILES, not on having a
+    recorded survivor. With nothing unvouched the recorded survivor is returned
+    unchanged (never NULLed) and the workspace reclaims.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="recorded survivor, clean workspace")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    recorded = {"kind": "ref", "refs": [
+        {"repository": ".", "sha": HEAD, "pr": PR, "external": True}]}
+    _seed_survivor(board, tid, ws, {}, recorded)
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert out == recorded, out
+    saved = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["survivor"])
+    assert saved == recorded
+    assert board.execute(
+        "SELECT held_reason FROM task_workspace_survivors WHERE task_id = ?",
+        (tid,)).fetchone()["held_reason"] is None
+
+
+def test_the_carried_ref_is_never_recorded_twice(board, remote, tmp_path, monkeypatch):
+    """The carried entries seed `refs` AND are re-added by the external merge on
+    the `elif claimed:` arm. One repository must appear exactly once: a
+    duplicated entry makes the recovery index ambiguous about which is current.
+    """
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_temporary_roots", lambda: [tmp_path / "temporary"])
+
+    tid = kb.create_task(board, title="no in-tree capture, carried ref")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    recorded = {"kind": "ref", "refs": [
+        {"repository": "gone", "sha": HEAD, "pr": PR, "external": True}]}
+    # `gone` is in bases and vouched for; nothing at all is left on disk.
+    _seed_survivor(board, tid, ws, {"gone": STALE}, recorded)
+    with kb.write_txn(board):
+        board.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?",
+                      (json.dumps({"changed_files": ["a.py"]}), tid))
+
+    out = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    repos = [ref["repository"] for ref in out["refs"]]
+    assert len(repos) == len(set(repos)), f"duplicate refs: {out['refs']}"
