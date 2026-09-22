@@ -7939,6 +7939,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _loop_liveness_watchdog: Optional[Any] = None
     _gateway_started_at: float = 0.0
     _shutdown_watchdog_done: Optional["threading.Event"] = None
+    # Deadline (seconds from the start of stop()) the shutdown watchdog was
+    # armed with, published by _stop_impl for the drain and cron-leash sites
+    # to CONSUME. None until stop() arms it (and on the PYTEST_CURRENT_TEST
+    # path, which never arms) — consumers fall back to recomputing it.
+    _armed_shutdown_deadline_s: Optional[float] = None
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
 
@@ -19772,6 +19777,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     signal_driven=getattr(self, "_stop_requested_by_signal", False),
                     last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
                 )
+                # Publish the deadline the watchdog is ACTUALLY armed with so
+                # the drain and the cron leash below CONSUME it instead of
+                # re-deriving a variant. Re-derivation is the #838 defect
+                # class: the drain was fitted to `exit_timeout -
+                # hard_exit_reserve_s`, which equals the armed value only
+                # when the outer min() binds (the gui-clamped 60), and on a
+                # non-gui-clamped system-domain job the armed deadline is
+                # EARLIER — so the drain ran into the teardown window.
+                self._armed_shutdown_deadline_s = _watchdog_delay
                 arm_shutdown_watchdog(
                     _watchdog_delay,
                     done_event=_watchdog_done,
@@ -19889,6 +19903,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # same teardown reserve or the drain is fitted against a
                 # window the watchdog does not actually grant.
                 last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+                # The deadline the watchdog was ACTUALLY armed with, captured
+                # at the arming site above. Not a re-derivation: `os._exit`
+                # fires at this instant, so the drain must end a teardown
+                # reserve before it.
+                armed_deadline_s=getattr(self, "_armed_shutdown_deadline_s", None),
             )
 
             _cron_at_start = self._active_cron_job_count()
