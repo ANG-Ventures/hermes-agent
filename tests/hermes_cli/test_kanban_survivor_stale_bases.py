@@ -1365,13 +1365,20 @@ def test_an_unrepresentable_repository_key_gets_an_honest_remedy(board, remote):
     The grammar now admits any plain directory name (spaces, `@`, `+`, `~`,
     non-ASCII); only a name carrying `:`, `?`, `#` or `=` is unrepresentable,
     and for those the hint must say so rather than print a lie.
+
+    Whether the printed remedy PARSES is a separate contract, pinned by
+    round-tripping it through the real parser in
+    `tests/hermes_cli/test_cli_hint.py`; asserting a string shape here would
+    have re-pinned the exact bug that card t_c9e1a012 fixed.
     """
     from hermes_cli import kanban_survivor as survivor
 
     # Names that used to be rejected by the whitelist now round-trip.
     for key in ("qa output", "repo@v2", "a+b", "~scratch", "ünïcode", "-lead"):
         assert survivor._split_qualifier(f"{key}={PR}") == (key, PR), key
-        assert survivor._qualified_hint([key]) == f"--survivor-pr {key}=owner/repo#N"
+        hint = survivor._qualified_hint([key])
+        assert f"{key}=owner/repo#N" in hint, hint
+        assert "--survivor-pr" in hint, hint
 
     # And a genuinely unrepresentable one is admitted to, not papered over --
     # including when it sits BESIDE a representable key, since every key in
