@@ -2684,6 +2684,22 @@ def _current_max_iterations() -> int:
 
 from contextlib import contextmanager as _contextmanager
 
+# Per-path locks serializing read-modify-write cycles on the restart-failure
+# counts file.  Keyed on the resolved path so a test pointing the runner at a
+# tmpdir gets its own lock, and so two runners in one process sharing a home
+# share the lock.  See GatewayRunner._restart_failure_counts_rmw.
+_RESTART_FAILURE_COUNTS_LOCKS: dict[str, threading.Lock] = {}
+_RESTART_FAILURE_COUNTS_LOCKS_GUARD = threading.Lock()
+
+
+def _restart_failure_counts_lock(path) -> threading.Lock:
+    key = str(path)
+    with _RESTART_FAILURE_COUNTS_LOCKS_GUARD:
+        lock = _RESTART_FAILURE_COUNTS_LOCKS.get(key)
+        if lock is None:
+            lock = _RESTART_FAILURE_COUNTS_LOCKS[key] = threading.Lock()
+        return lock
+
 
 # Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
 # multiplexer the default profile owns the single shared listener and serves
@@ -13597,6 +13613,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _restart_failure_counts_path(self) -> Path:
         return _hermes_home / self._STUCK_LOOP_FILE
 
+    @_contextmanager
+    def _restart_failure_counts_rmw(self):
+        """Serialize one load/mutate/save cycle on the restart-counts file.
+
+        ``atomic_json_write`` makes each WRITE atomic; it does not make the
+        read-modify-write PAIR atomic.  Every mutator of this file is a
+        load -> mutate -> save, and the deferred-restart arm now hands
+        ``_record_restart_replay_mark`` to ``asyncio.to_thread`` while
+        ``_clear_restart_replay_marks`` (from ``_handle_message_with_agent``)
+        and ``_increment_restart_failure_counts`` (from ``_stop_impl_body``)
+        stay loop-reachable.  Two overlapping cycles therefore each read the
+        pre-state and the later save clobbers the earlier one: a lost
+        ``replay_marks`` update either drops a real relapse (the breaker never
+        arms) or persists a stale snapshot (a spurious auto-suspend).
+
+        The lock is process-wide and keyed on the resolved path, because the
+        concurrency this guards against is in-process (worker threads vs. the
+        loop).  Cross-process writers still rely on ``atomic_json_write``'s
+        per-write atomicity, which is unchanged by this fix.
+
+        Yields the loaded ``counts`` dict; the (possibly mutated) dict is saved
+        on clean exit -- including an early ``return`` from the body, since
+        ``contextlib`` resumes the generator on a normal ``__exit__``.  The save
+        is skipped when the body left the dict unchanged, so the read-only and
+        already-recorded paths do not rewrite the file.  On an exception nothing
+        is written, so a half-applied mutation is never persisted.
+        """
+        path = self._restart_failure_counts_path()
+        lock = _restart_failure_counts_lock(path)
+        with lock:
+            import copy
+
+            counts = self._load_restart_failure_counts()
+            before = copy.deepcopy(counts)
+            yield counts
+            if counts != before:
+                self._save_restart_failure_counts(counts)
+
     @staticmethod
     def _decode_restart_failure_entry(value: Any) -> dict:
         return decode_restart_failure_entry(value)
@@ -13645,23 +13699,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Sessions NOT in active_session_keys are removed (they completed
         successfully, so the loop is broken).
         """
-        counts = self._load_restart_failure_counts()
-
-        # Increment active sessions, remove inactive ones (loop broken)
-        new_counts = {}
-        for key in active_session_keys:
-            entry = counts.get(key, {"count": 0, "replay_marks": [], "armed": False})
-            entry["count"] = int(entry.get("count", 0) or 0) + 1
-            new_counts[key] = entry
-        for key, entry in counts.items():
-            if key in new_counts:
-                continue
-            replay_marks = entry.get("replay_marks") or []
-            if replay_marks or entry.get("armed"):
-                entry["count"] = 0
+        with self._restart_failure_counts_rmw() as counts:
+            # Increment active sessions, remove inactive ones (loop broken)
+            new_counts = {}
+            for key in active_session_keys:
+                entry = counts.get(key, {"count": 0, "replay_marks": [], "armed": False})
+                entry["count"] = int(entry.get("count", 0) or 0) + 1
                 new_counts[key] = entry
+            for key, entry in counts.items():
+                if key in new_counts:
+                    continue
+                replay_marks = entry.get("replay_marks") or []
+                if replay_marks or entry.get("armed"):
+                    entry["count"] = 0
+                    new_counts[key] = entry
 
-        self._save_restart_failure_counts(new_counts)
+            counts.clear()
+            counts.update(new_counts)
 
     def _reset_stuck_loop_counts(self, session_keys: set) -> None:
         """Reset the stuck-loop restart COUNT for sessions that drained cleanly.
@@ -13681,21 +13735,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_keys:
             return
-        counts = self._load_restart_failure_counts()
-        changed = False
-        for key in session_keys:
-            entry = counts.get(key)
-            if entry is None:
-                continue
-            entry["count"] = 0
-            replay_marks = entry.get("replay_marks") or []
-            if replay_marks or entry.get("armed"):
-                counts[key] = entry  # keep replay-breaker state
-            else:
-                del counts[key]  # nothing left — prune
-            changed = True
-        if changed:
-            self._save_restart_failure_counts(counts)
+        with self._restart_failure_counts_rmw() as counts:
+            for key in session_keys:
+                entry = counts.get(key)
+                if entry is None:
+                    continue
+                entry["count"] = 0
+                replay_marks = entry.get("replay_marks") or []
+                if replay_marks or entry.get("armed"):
+                    counts[key] = entry  # keep replay-breaker state
+                else:
+                    del counts[key]  # nothing left — prune
 
     def _announce_and_persist_served_route(
         self,
@@ -13911,38 +13961,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not path.exists():
             return 0
 
-        counts = self._load_restart_failure_counts()
-
         suspended = 0
-        stuck_keys = [
-            key
-            for key, value in counts.items()
-            if int(value.get("count", 0) or 0) >= self._STUCK_LOOP_THRESHOLD
-        ]
+        with self._restart_failure_counts_rmw() as counts:
+            stuck_keys = [
+                key
+                for key, value in counts.items()
+                if int(value.get("count", 0) or 0) >= self._STUCK_LOOP_THRESHOLD
+            ]
 
-        for session_key in stuck_keys:
-            try:
-                entry = self.session_store._entries.get(session_key)
-                if entry and not entry.suspended:
-                    entry.suspended = True
-                    suspended += 1
-                    logger.warning(
-                        "Auto-suspended stuck session %s (active across %d "
-                        "consecutive restarts — likely a stuck loop)",
-                        session_key, counts[session_key]["count"],
-                    )
-            except Exception:
-                pass
+            for session_key in stuck_keys:
+                try:
+                    entry = self.session_store._entries.get(session_key)
+                    if entry and not entry.suspended:
+                        entry.suspended = True
+                        suspended += 1
+                        logger.warning(
+                            "Auto-suspended stuck session %s (active across %d "
+                            "consecutive restarts — likely a stuck loop)",
+                            session_key, counts[session_key]["count"],
+                        )
+                except Exception:
+                    pass
 
-        if suspended:
-            try:
-                self.session_store._save()
-            except Exception:
-                pass
+            if suspended:
+                try:
+                    self.session_store._save()
+                except Exception:
+                    pass
 
-        for session_key in stuck_keys:
-            counts.pop(session_key, None)
-        self._save_restart_failure_counts(counts)
+            for session_key in stuck_keys:
+                counts.pop(session_key, None)
 
         return suspended
 
@@ -13964,67 +14012,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         window = _restart_loop_window_secs()
         threshold = _restart_loop_threshold()
         cutoff = timestamp - window
-        counts = self._load_restart_failure_counts()
-        entry = counts.get(session_key, {"count": 0, "replay_marks": [], "armed": False})
-        request_ids = [
-            str(value) for value in entry.get("replay_request_ids", []) if value
-        ]
-        if request_id and request_id in request_ids:
-            return False
-        marks = [
-            float(mark)
-            for mark in entry.get("replay_marks", [])
-            if isinstance(mark, (int, float)) and float(mark) >= cutoff
-        ]
-        marks.append(timestamp)
-        entry["replay_marks"] = marks
-        if request_id:
-            request_ids.append(request_id)
-            entry["replay_request_ids"] = request_ids[-100:]
         alert = False
-        if len(marks) >= threshold:
-            try:
-                # ``_save`` is documented "while the caller holds ``_lock``" and
-                # this whole method now runs on a worker thread (the deferred
-                # SELF ``record_replay`` hands it to ``asyncio.to_thread``), so
-                # the single-threaded accident that made the bare call benign is
-                # gone: the read/mutate/persist must be one locked critical
-                # section or it can interleave with a loop-side store write and
-                # persist a torn snapshot. ``_lock`` is a plain, non-reentrant
-                # ``threading.Lock``, so this inlines ``suspend_session``'s body
-                # rather than calling it. Loading is deliberately NOT forced
-                # here: an unloaded store has no entry to suspend, which is the
-                # pre-existing behaviour of this branch.
-                with self.session_store._lock:  # noqa: SLF001 — locked RMW
-                    session_entry = self.session_store._entries.get(session_key)
-                    if session_entry and not session_entry.suspended:
-                        session_entry.suspended = True
-                        self.session_store._save()
-            except Exception:
-                pass
-            if not entry.get("armed", False):
-                alert = True
-            entry["armed"] = True
-            logger.warning(
-                "Auto-suspended replay-loop session %s (%d auto-resume relapse(s) in %.0fs)",
-                session_key,
-                len(marks),
-                window,
-            )
-        counts[session_key] = entry
-        self._save_restart_failure_counts(counts)
+        with self._restart_failure_counts_rmw() as counts:
+            entry = counts.get(session_key, {"count": 0, "replay_marks": [], "armed": False})
+            request_ids = [
+                str(value) for value in entry.get("replay_request_ids", []) if value
+            ]
+            if request_id and request_id in request_ids:
+                # Already recorded: leave `counts` untouched so the context
+                # manager writes it back unchanged.
+                return False
+            marks = [
+                float(mark)
+                for mark in entry.get("replay_marks", [])
+                if isinstance(mark, (int, float)) and float(mark) >= cutoff
+            ]
+            marks.append(timestamp)
+            entry["replay_marks"] = marks
+            if request_id:
+                request_ids.append(request_id)
+                entry["replay_request_ids"] = request_ids[-100:]
+            if len(marks) >= threshold:
+                try:
+                    # ``_save`` is documented "while the caller holds ``_lock``" and
+                    # this whole method now runs on a worker thread (the deferred
+                    # SELF ``record_replay`` hands it to ``asyncio.to_thread``), so
+                    # the single-threaded accident that made the bare call benign is
+                    # gone: the read/mutate/persist must be one locked critical
+                    # section or it can interleave with a loop-side store write and
+                    # persist a torn snapshot. ``_lock`` is a plain, non-reentrant
+                    # ``threading.Lock``, so this inlines ``suspend_session``'s body
+                    # rather than calling it. Loading is deliberately NOT forced
+                    # here: an unloaded store has no entry to suspend, which is the
+                    # pre-existing behaviour of this branch.
+                    with self.session_store._lock:  # noqa: SLF001 — locked RMW
+                        session_entry = self.session_store._entries.get(session_key)
+                        if session_entry and not session_entry.suspended:
+                            session_entry.suspended = True
+                            self.session_store._save()
+                except Exception:
+                    pass
+                if not entry.get("armed", False):
+                    alert = True
+                entry["armed"] = True
+                logger.warning(
+                    "Auto-suspended replay-loop session %s (%d auto-resume relapse(s) in %.0fs)",
+                    session_key,
+                    len(marks),
+                    window,
+                )
+            counts[session_key] = entry
         return alert
 
     def _clear_restart_replay_marks(self, session_key: str) -> None:
-        counts = self._load_restart_failure_counts()
-        entry = counts.get(session_key)
-        if not entry:
-            return
-        entry["replay_marks"] = []
-        entry["replay_request_ids"] = []
-        entry["armed"] = False
-        counts[session_key] = entry
-        self._save_restart_failure_counts(counts)
+        with self._restart_failure_counts_rmw() as counts:
+            entry = counts.get(session_key)
+            if not entry:
+                return
+            entry["replay_marks"] = []
+            entry["replay_request_ids"] = []
+            entry["armed"] = False
+            counts[session_key] = entry
 
     def _apply_post_turn_resume_gate(self, session_key: str) -> None:
         """Post-(clean-turn) replay-loop gate for the F2 circuit-breaker.
@@ -14317,11 +14365,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Offloaded to a thread because the caller (_handle_message_with_agent)
         runs on the event loop and atomic_json_write calls os.fsync.
         """
-        counts = self._load_restart_failure_counts()
-        if session_key not in counts:
-            return
-        del counts[session_key]
-        self._save_restart_failure_counts(counts)
+        with self._restart_failure_counts_rmw() as counts:
+            if session_key not in counts:
+                return
+            del counts[session_key]
 
     async def _launch_detached_restart_command(self) -> None:
         import shutil
