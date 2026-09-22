@@ -482,11 +482,20 @@ def _callback_label(callback: Any) -> str:
     credentials in its state — the canonical case is
     ``functools.partial(fn, api_token)``, whose repr renders every bound
     argument — would interpolate them straight into a model-visible string.
-    ``__name__``/``__qualname__`` are developer-chosen identifiers and safe;
-    anything without one is named by TYPE and identity instead.
+    ``__name__``/``__qualname__`` are usually developer-chosen identifiers, but
+    they are NOT safe by construction: this codebase synthesizes them from
+    operator config (``agent.shell_hooks`` and ``agent.outbound_webhooks`` both
+    do), and a third-party plugin can set any value through
+    ``register_hook()``. Each PRODUCER of a synthesized identity is therefore
+    responsible for sanitizing it at the source — see
+    :func:`agent.shell_hooks.hook_display_name` and
+    :attr:`agent.outbound_webhooks.WebhookTarget.display_label`. This function
+    is the last line of defence, not the only one: it refuses ``repr()`` so an
+    unsanitized callback still cannot render its bound state.
 
-    Mirrors :func:`agent.shell_hooks.hook_display_name`, which does the same
-    job for the other half of this class (shell-hook command lines).
+    Anything without a usable name is identified by TYPE plus a short digest of
+    that type — never ``id()``, whose value is a CPython heap address that
+    changes per process and is recycled after GC.
     """
     for attr in ("__qualname__", "__name__"):
         label = getattr(callback, attr, None)
@@ -501,7 +510,15 @@ def _callback_label(callback: Any) -> str:
             label = getattr(wrapped, attr, None)
             if isinstance(label, str) and label:
                 return f"{type(callback).__name__}({label})"
-    return f"<{type(callback).__name__}@{id(callback):x}>"
+    # Last resort: no usable name anywhere. Identify by TYPE plus a short
+    # digest of its fully-qualified type, NOT id() — a heap address differs
+    # between processes and is recycled after GC, so it is neither stable nor
+    # meaningful to whoever reads the refusal. The digest keeps two distinct
+    # anonymous callback types apart without disclosing any instance state.
+    cls = type(callback)
+    fqtn = f"{getattr(cls, '__module__', '?')}.{getattr(cls, '__qualname__', cls.__name__)}"
+    digest = hashlib.sha256(fqtn.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"<{cls.__name__}#{digest}>"
 
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
