@@ -87,10 +87,19 @@ def _repo_root() -> Path:
 #
 # To fix one: move the call off-loop (or behind a loop-conditional dispatch,
 # annotated `# noqa: atomic-write-on-loop <reason>`), then DELETE its line here.
+#
+# KNOWN BLIND SPOT -- this inventory is a floor, not a census.  ``build_index``
+# keys on ``(file, function_name)``, so two same-named methods in one file
+# collapse onto ONE entry and the walk sees only whichever ``ast.walk`` visited
+# last.  Measured on ``gateway/platforms/weixin.py``: ``ContextTokenStore.set``
+# and ``TypingTicketCache.set`` collapse, and the index reports
+# ``calls={'time.time','time'}`` -- the typing cache's body.  That hid a
+# PER-INBOUND-MESSAGE ``atomic_json_write`` (``_process_message`` -> ``set`` ->
+# ``_persist``) from this gate entirely; it was fixed and pinned directly by
+# ``tests/gateway/test_weixin_state_write_off_loop.py`` rather than via this
+# baseline.  Do not read "absent from REACHABLE_BASELINE" as "off the loop".
 REACHABLE_BASELINE = frozenset({
     "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
-    "gateway/platforms/weixin.py _poll_loop -> atomic_json_write",
-    "gateway/platforms/weixin.py qr_login -> atomic_json_write",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
     "gateway/run.py _handle_message -> atomic_replace",
     # Re-keyed, NOT introduced, by the transcript-spool fix: this coroutine's

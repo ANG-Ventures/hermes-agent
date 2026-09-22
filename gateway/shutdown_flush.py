@@ -358,36 +358,79 @@ def _fence_flush_lane_at_exit() -> None:
 atexit.register(_fence_flush_lane_at_exit)
 
 
+_HARD_EXIT_FENCES: "list[tuple[str, Any]]" = []
+_HARD_EXIT_FENCES_LOCK = threading.Lock()
+
+
+def register_hard_exit_fence(name: str, fence) -> None:
+    """Declare a durability lane that the hard-exit funnel must drain.
+
+    ``gateway.run._exit_after_graceful_shutdown`` ends in ``os._exit`` and so
+    hand-rolls every cleanup that would otherwise be an ``atexit`` handler.
+    A lane whose queued work is UNRECOVERABLE (a lost payload, unlike a
+    stranded lock or socket, has no next-boot recovery) must be one of them.
+
+    This is a registry rather than a hard-coded call list because the lanes do
+    not all live in this module: ``gateway/platforms/weixin.py`` owns a third
+    one carrying the long-poll cursor and account credentials.  A per-module
+    inventory in the funnel would have to be edited by whoever adds the fourth,
+    and nothing would fail if they forgot.  Registering beside the
+    ``atexit.register`` call means the wiring cannot be half-done.
+
+    *fence* takes a ``timeout`` keyword and returns ``True`` when the work
+    queued before the call has landed.  Registration is idempotent by *name*,
+    so a re-imported module does not double-drain.
+    """
+    with _HARD_EXIT_FENCES_LOCK:
+        if any(existing == name for existing, _ in _HARD_EXIT_FENCES):
+            return
+        _HARD_EXIT_FENCES.append((name, fence))
+
+
 def fence_lanes_for_hard_exit(timeout: float = 10.0) -> bool:
-    """Drain BOTH durability lanes for an exit that bypasses ``atexit``.
+    """Drain EVERY registered durability lane for an exit that skips ``atexit``.
 
     ``gateway.run._exit_after_graceful_shutdown`` ends in ``os._exit`` to stay
     wedge-proof (#53107), and therefore hand-rolls every cleanup that would
-    otherwise be an ``atexit`` handler.  This is that replacement for the two
-    write lanes in this module.  Without it the shielded write introduced for
-    the deadline-cancel path never lands: measured on the production funnel,
+    otherwise be an ``atexit`` handler.  This is that replacement for the
+    durability lanes.  Without it the shielded write introduced for the
+    deadline-cancel path never lands: measured on the production funnel,
     payload files on disk after process death were 0/5 at every hold, against
-    5/5 on a ``sys.exit`` control.
+    5/5 on a ``sys.exit`` control.  The weixin lane measured identically
+    (0 vs 1 payload at hold >= 0.5s) before it was registered here.
 
-    *timeout* is the budget for the call as a WHOLE, not per lane.  The two
-    fences run in sequence, so passing it to each would make the real worst
-    case ``2 * timeout`` -- measured 4.01s for a 2.0s request before this was
-    a shared deadline.  That matters here and nowhere else: this runs inside
-    the funnel whose entire reason to exist is that a wedged thread must not
-    be able to hold shutdown open (#53107).  A wedged first lane therefore
-    spends the budget and leaves the second one a non-negative remainder,
-    which fences instantly if that lane is already idle.
+    *timeout* is the budget for the call as a WHOLE, not per lane.  The fences
+    run in sequence, so passing it to each would make the real worst case
+    ``len(lanes) * timeout`` -- measured 4.01s for a 2.0s request across two
+    lanes before this was a shared deadline.  That matters here and nowhere
+    else: this runs inside the funnel whose entire reason to exist is that a
+    wedged thread must not be able to hold shutdown open (#53107).  A wedged
+    lane therefore spends the budget and leaves the rest a non-negative
+    remainder, which fences instantly if those lanes are already idle.
 
-    Returns ``True`` only when both lanes drained within *timeout*.  Safe and
+    Returns ``True`` only when every lane drained within *timeout*.  Safe and
     idempotent: a drained lane fences instantly, and calling it from a lane
     thread is a no-op rather than a deadlock.
     """
     deadline = time.monotonic() + timeout
-    # Both, unconditionally -- no short-circuit, or a wedged first lane would
-    # silently skip the second one's drain.
-    flushed = fence_flush_lane(timeout=timeout)
-    spooled = fence_spool_lane(timeout=max(0.0, deadline - time.monotonic()))
-    return flushed and spooled
+    with _HARD_EXIT_FENCES_LOCK:
+        fences = list(_HARD_EXIT_FENCES)
+    ok = True
+    # Every lane, unconditionally -- no short-circuit, or a wedged early lane
+    # would silently skip the drain of the ones behind it.
+    for name, fence in fences:
+        try:
+            if not fence(timeout=max(0.0, deadline - time.monotonic())):
+                ok = False
+        except Exception as exc:  # a broken fence must not wedge the funnel
+            logger.debug("hard-exit fence %s failed: %s", name, exc)
+            ok = False
+    return ok
+
+
+register_hard_exit_fence("flush", fence_flush_lane)
+register_hard_exit_fence("spool", fence_spool_lane)
+
 
 
 async def flush_pending_to_file_async(

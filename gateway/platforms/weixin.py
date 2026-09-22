@@ -13,6 +13,7 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
 import hashlib
 import json
@@ -24,8 +25,10 @@ import secrets
 import struct
 import tempfile
 import textwrap
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -251,6 +254,179 @@ def _headers(token: Optional[str], body: str) -> Dict[str, str]:
     return headers
 
 
+# ---------------------------------------------------------------------------
+# Off-loop durable-write lane
+# ---------------------------------------------------------------------------
+#
+# Every durable JSON write this adapter performs ends in the mkstemp + fsync +
+# os.replace tail of ``utils.atomic_json_write``, whose duration is unbounded
+# under filesystem pressure.  Three of those writes are driven from coroutines:
+#
+#   * ``ContextTokenStore._persist`` <- ``_process_message`` -- the PER-INBOUND
+#     MESSAGE path.  Every message carrying a ``context_token`` rewrites the
+#     account's token file inline on the loop.
+#   * ``_save_sync_buf``             <- ``_poll_loop``       -- the long-poll
+#     cursor, rewritten on every batch of updates.
+#   * ``save_weixin_account``        <- ``qr_login``         -- the QR confirm.
+#
+# On a loop thread that rename stalls EVERY other task in the process: the
+# 2026-09-20 incident class.  So the write moves to a single FIFO worker and
+# the coroutine returns immediately.
+#
+# Why one lane, not ``asyncio.to_thread`` per call: these writes are
+# LAST-WRITER-WINS over the same few files (the poll cursor especially).  A
+# pool would let two renames of the same path race and durably persist the
+# older cursor, which replays already-delivered messages.  One worker plus
+# payloads snapshotted on the CALLER's thread at submit time makes on-disk
+# order identical to call order.
+_WEIXIN_WRITE_LANE: Optional[ThreadPoolExecutor] = None
+_WEIXIN_WRITE_LANE_LOCK = threading.Lock()
+_WEIXIN_WRITE_LANE_STATE = threading.local()
+# Submit/complete counters.  ``fence_weixin_write_lane`` captures the submit
+# counter and waits for completions to reach it, so it waits for exactly the
+# work queued BEFORE the call -- not for global quiescence, which a steady
+# arrival rate could delay indefinitely.
+_WEIXIN_WRITE_PROGRESS = threading.Condition(threading.Lock())
+_WEIXIN_WRITE_SUBMITTED = 0
+_WEIXIN_WRITE_COMPLETED = 0
+
+
+def _get_weixin_write_lane() -> ThreadPoolExecutor:
+    """The single FIFO worker that owns every off-loop weixin write."""
+    global _WEIXIN_WRITE_LANE
+    with _WEIXIN_WRITE_LANE_LOCK:
+        if _WEIXIN_WRITE_LANE is None:
+            _WEIXIN_WRITE_LANE = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="weixin-write"
+            )
+        return _WEIXIN_WRITE_LANE
+
+
+def _loop_is_running() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _on_weixin_write_lane() -> bool:
+    return getattr(_WEIXIN_WRITE_LANE_STATE, "in_lane", False)
+
+
+def _submit_weixin_write(path: Path, payload: Dict[str, Any], *, chmod: int = 0) -> None:
+    """Queue one already-snapshotted payload on the FIFO lane."""
+    global _WEIXIN_WRITE_SUBMITTED, _WEIXIN_WRITE_COMPLETED
+
+    def _run() -> None:
+        global _WEIXIN_WRITE_COMPLETED
+        _WEIXIN_WRITE_LANE_STATE.in_lane = True
+        try:
+            _atomic_json_write_now(path, payload, chmod=chmod)
+        except Exception as exc:
+            logger.warning("weixin: off-loop write to %s failed: %s", path.name, exc)
+        finally:
+            _WEIXIN_WRITE_LANE_STATE.in_lane = False
+            with _WEIXIN_WRITE_PROGRESS:
+                _WEIXIN_WRITE_COMPLETED += 1
+                _WEIXIN_WRITE_PROGRESS.notify_all()
+
+    with _WEIXIN_WRITE_PROGRESS:
+        _WEIXIN_WRITE_SUBMITTED += 1
+    try:
+        _get_weixin_write_lane().submit(_run)
+    except RuntimeError:
+        # Executor refused the job (interpreter shutdown): write inline rather
+        # than silently drop a durable update, and publish the completion so a
+        # concurrent fence cannot wait forever on work that will never run.
+        _WEIXIN_WRITE_LANE_STATE.in_lane = True
+        try:
+            _atomic_json_write_now(path, payload, chmod=chmod)
+        except Exception as exc:
+            logger.warning("weixin: inline fallback write to %s failed: %s", path.name, exc)
+        finally:
+            _WEIXIN_WRITE_LANE_STATE.in_lane = False
+            with _WEIXIN_WRITE_PROGRESS:
+                _WEIXIN_WRITE_COMPLETED += 1
+                _WEIXIN_WRITE_PROGRESS.notify_all()
+
+
+def fence_weixin_write_lane(timeout: float = 30.0) -> bool:
+    """Block until every write queued BEFORE this call has landed.
+
+    Returns ``True`` when that work drained within *timeout*.  A no-op when
+    called from the lane thread itself, so a lane-initiated drain cannot
+    deadlock waiting on its own completion.
+    """
+    if _on_weixin_write_lane():
+        return True
+    with _WEIXIN_WRITE_PROGRESS:
+        target = _WEIXIN_WRITE_SUBMITTED
+        return _WEIXIN_WRITE_PROGRESS.wait_for(
+            lambda: _WEIXIN_WRITE_COMPLETED >= target, timeout=timeout
+        )
+
+
+def _fence_weixin_write_lane_at_exit() -> None:
+    """Drain queued writes before the interpreter tears down.
+
+    The lane exists to keep an unbounded rename off the event loop, but it
+    carries the poll cursor and credential state -- if the process exits with
+    work still queued, that update is lost and the next boot replays or
+    re-authenticates.  Registered at import time so EVERY shutdown path is
+    covered rather than depending on a caller remembering to fence.
+    """
+    if not fence_weixin_write_lane(timeout=10.0):
+        logger.warning(
+            "weixin: durable-write lane did not drain within 10s at exit; "
+            "queued state update(s) may be lost"
+        )
+
+
+atexit.register(_fence_weixin_write_lane_at_exit)
+# ...and the hard-exit funnel, which is the path that actually matters here.
+# ``gateway.run._exit_after_graceful_shutdown`` ends in ``os._exit`` and never
+# runs the registration above; measured on that funnel with the write still
+# queued, payload files on disk after process death were 0 at every hold
+# >= 0.5s, against 1/1 on a ``sys.exit`` control.  This lane carries the
+# long-poll cursor and account credentials, so a lost write replays delivered
+# messages or forces a re-authentication.  ``gateway.shutdown_flush`` imports
+# nothing from this module, so there is no cycle.
+from gateway.shutdown_flush import register_hard_exit_fence  # noqa: E402
+
+register_hard_exit_fence("weixin", fence_weixin_write_lane)
+
+
+
+def _atomic_json_write_now(path: Path, payload: Dict[str, Any], *, chmod: int = 0) -> None:
+    """The real, blocking write.  Always runs off the loop (lane or caller)."""
+    atomic_json_write(path, payload)
+    if chmod:
+        try:
+            path.chmod(chmod)
+        except OSError:
+            pass
+
+
+def _dispatch_weixin_json_write(  # noqa: atomic-write-on-loop loop-conditional dispatch: the durable write runs on the FIFO weixin lane whenever a loop is running
+    path: Path,
+    payload: Dict[str, Any],
+    *,
+    chmod: int = 0,
+) -> None:
+    """Write *payload* to *path*, off the event loop when one is running.
+
+    Off-loop callers (the setup wizard, CLI helpers, tests) keep the exact
+    synchronous contract they had before -- including propagating an ``OSError``
+    from the rename -- because there is no loop to protect.  A coroutine caller
+    gets the queued lane instead and does not block.
+    """
+    if _loop_is_running():
+        _submit_weixin_write(path, payload, chmod=chmod)
+        return
+    _atomic_json_write_now(path, payload, chmod=chmod)
+
+
 def _account_dir(hermes_home: str) -> Path:
     path = Path(hermes_home) / "weixin" / "accounts"
     path.mkdir(parents=True, exist_ok=True)
@@ -277,11 +453,9 @@ def save_weixin_account(
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     path = _account_file(hermes_home, account_id)
-    atomic_json_write(path, payload)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    # 0600: this payload carries the bot token.  The chmod rides with the write
+    # so it applies on the lane too, not just on the inline path.
+    _dispatch_weixin_json_write(path, payload, chmod=0o600)
 
 
 def load_weixin_account(hermes_home: str, account_id: str) -> Optional[Dict[str, Any]]:
@@ -340,7 +514,10 @@ class ContextTokenStore:
             if key.startswith(prefix)
         }
         try:
-            atomic_json_write(self._path(account_id), payload)
+            # Reached per inbound message via ``_process_message`` -> ``set``.
+            # The payload above is already a fresh dict built on the caller's
+            # thread, so the lane never observes a half-mutated cache.
+            _dispatch_weixin_json_write(self._path(account_id), payload)
         except Exception as exc:
             logger.warning("weixin: failed to persist context tokens for %s: %s", _safe_id(account_id), exc)
 
@@ -1031,7 +1208,7 @@ def _load_sync_buf(hermes_home: str, account_id: str) -> str:
 
 def _save_sync_buf(hermes_home: str, account_id: str, sync_buf: str) -> None:
     path = _sync_buf_path(hermes_home, account_id)
-    atomic_json_write(path, {"get_updates_buf": sync_buf})
+    _dispatch_weixin_json_write(path, {"get_updates_buf": sync_buf})
 
 
 async def qr_login(
@@ -1368,6 +1545,13 @@ class WeixinAdapter(BasePlatformAdapter):
         self._send_session = None
         self._release_platform_lock()
         self._mark_disconnected()
+        # The poll cursor and context tokens may still be queued on the write
+        # lane.  Fence off the loop (never inline: that is the block this PR
+        # exists to remove) so a reconnect cannot re-poll from a stale cursor.
+        try:
+            await asyncio.to_thread(fence_weixin_write_lane, 10.0)
+        except Exception as exc:
+            logger.debug("[%s] weixin write-lane fence failed: %s", self.name, exc)
         logger.info("[%s] Disconnected", self.name)
 
     async def _poll_loop(self) -> None:
