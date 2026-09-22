@@ -59,8 +59,15 @@ def worker_env(monkeypatch, tmp_path):
 
 @pytest.fixture
 def remote(monkeypatch):
-    """Answer remote lookups affirmatively; no gate may rest on a network failure."""
-    state = {"state": "MERGED", "headRefOid": HEAD, "mergeCommit": {"oid": MERGE}}
+    """Answer remote lookups affirmatively; no gate may rest on a network failure.
+
+    ``headRefName`` starts UNRELATED to any card on purpose. An explicit
+    ``--survivor-pr``/``survivor_pr`` must corroborate the card that names it
+    (kanban t_de2e348e), so existence is not relevance: a test wanting the
+    happy path calls :func:`names_card`, one wanting the refusal leaves it.
+    """
+    state = {"state": "MERGED", "headRefOid": HEAD, "mergeCommit": {"oid": MERGE},
+             "headRefName": "someone/unrelated-work", "title": "", "body": ""}
     calls = []
     real = subprocess.run
 
@@ -76,6 +83,12 @@ def remote(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", run)
     return state, calls
+
+
+def names_card(remote, tid):
+    """Make the claimed PR corroborate THIS card, the way a real one would."""
+    remote[0]["headRefName"] = f"operator/{tid}-landed-elsewhere"
+    return remote
 
 
 def stale_bases(tid):
@@ -112,6 +125,7 @@ def task_state(tid):
 def test_tool_survivor_pr_completes_a_stale_bases_card(worker_env, remote):
     """The case that was unreachable from the tool: dir exists, repo gone."""
     stale_bases(worker_env)
+    names_card(remote, worker_env)
 
     out = complete(summary="approved", survivor_pr=PR)
 
@@ -121,6 +135,46 @@ def test_tool_survivor_pr_completes_a_stale_bases_card(worker_env, remote):
     ref = run.metadata["survivor"]["refs"][0]
     assert ref["pr"] == PR and ref["sha"] == MERGE
     assert remote[1], "must consult the remote, not accept the tool argument"
+
+
+def test_the_tool_cannot_complete_on_a_pr_that_does_not_name_the_card(worker_env, remote):
+    """Teeth for the test above: existence is not relevance on the TOOL surface.
+
+    The fixture PR is live and MERGED but names some other branch. #848 binds
+    an explicit claim to the card, and the tool must inherit that binding
+    rather than be the softer path -- otherwise a worker closes its own card
+    against any live PR and the workspace's bytes lose their protection.
+    """
+    ws = stale_bases(worker_env)
+
+    out = complete(summary="approved", survivor_pr=PR)
+
+    assert "does not name" in out.get("error", ""), out
+    assert task_state(worker_env)[0].status != "done"
+    assert (ws / "qa-output" / "verdict.md").is_file(), "the workspace must survive"
+
+
+@pytest.mark.parametrize("smuggled", [
+    {"survivor_unbound": True},
+    {"unbound": True},
+    {"survivor_unbound": "1"},
+    {"metadata": {"survivor_unbound": True}},
+])
+def test_the_tool_cannot_smuggle_the_operator_override(worker_env, remote, smuggled):
+    """RUNTIME arm for the CLI-only override, not a source grep.
+
+    `--survivor-unbound` accepts a live PR with NO tie to the card. It is an
+    operator flag; the tool surface must have no expression of it at all, so
+    drive the real tool handler with each plausible spelling and assert the
+    binding still refuses.
+    """
+    ws = stale_bases(worker_env)
+
+    out = complete(summary="approved", survivor_pr=PR, **smuggled)
+
+    assert out.get("error"), out
+    assert task_state(worker_env)[0].status != "done"
+    assert (ws / "qa-output" / "verdict.md").is_file(), "the workspace must survive"
 
 
 def test_tool_survivor_pr_that_does_not_verify_still_refuses(worker_env, remote):
