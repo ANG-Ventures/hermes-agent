@@ -1405,6 +1405,220 @@ class TestForceReloadSymmetry:
         assert "shell_hook[pre_tool_call:" in timeout_msg
         assert "shell_hook[pre_tool_call:" in suppressed_msg
 
+    def test_refusals_do_not_disclose_a_callback_without_a_name(self, monkeypatch):
+        """A callback with no ``__name__`` must not be named by ``repr()``.
+
+        The sibling test above covers callbacks that HAVE a ``__name__``.
+        This is the other half of the class: ``functools.partial`` (and any
+        callable object) has no ``__name__``, so the old
+        ``getattr(cb, "__name__", repr(cb))`` fell through to ``repr()`` —
+        which renders every bound argument, credentials included, into a
+        MODEL-facing refusal.
+        """
+        import functools
+
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        planted = "hunter2PRODSup3rSecret"
+        release = threading.Event()
+
+        def _policy(token, **kwargs):
+            release.wait(10)
+            return None
+
+        callback = functools.partial(_policy, planted)
+        # A partial has no __name__; repr() renders the bound token.
+        assert not hasattr(callback, "__name__")
+        assert planted in repr(callback)
+        setattr(callback, "_hermes_timeout_fail_closed", True)
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [callback]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        try:
+            timeout_msg = resolve_pre_tool_block("web_search", {"query": "x"})
+            suppressed_msg = resolve_pre_tool_block("web_search", {"query": "y"})
+
+            # Both fail-closed paths still block (policy preserved) ...
+            assert timeout_msg is not None
+            assert suppressed_msg is not None
+            # ... and neither renders the callback's bound arguments.
+            assert planted not in timeout_msg, (
+                "the timeout refusal named the callback by repr(), "
+                "disclosing its bound credential to the model"
+            )
+            assert planted not in suppressed_msg, (
+                "the suppression refusal named the callback by repr(), "
+                "disclosing its bound credential to the model"
+            )
+            # The callback is still identifiable by its wrapped function.
+            assert "_policy" in timeout_msg
+            assert "_policy" in suppressed_msg
+        finally:
+            release.set()
+
+    def test_unparseable_hook_command_is_not_disclosed(self, monkeypatch):
+        """An unparseable hook command must not reach the fail-closed refusal.
+
+        ``_spawn`` cannot split a command with an unbalanced quote — and that
+        is precisely the shape that still holds an inline credential. The
+        parse failure previously went into ``result["error"]``, which
+        ``_evaluate_result`` hands to ``_fail_closed_block`` as the
+        model-facing reason.
+        """
+        from agent import shell_hooks
+
+        planted = "hunter2PRODSup3rSecret"
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            # Unbalanced quote — shlex cannot split this.
+            command=f"/bin/sh -c 'export TOK={planted}; echo hi",
+            fail_closed=True,
+        )
+
+        r = shell_hooks._spawn(spec, "{}")
+        assert r["error"], "the unbalanced quote should have failed the parse"
+        assert planted not in r["error"], (
+            "the parse failure carried the raw command, which flows to the "
+            "model-facing fail-closed refusal"
+        )
+
+        decision = shell_hooks._evaluate_result(spec, r)
+        assert decision is not None and decision["action"] == "block", (
+            "a fail_closed hook that cannot be parsed must still block"
+        )
+        assert planted not in decision["message"], (
+            "the fail-closed refusal disclosed the hook command to the model"
+        )
+        # The hook is still identifiable by its secret-free digest name.
+        assert shell_hooks.hook_display_name(spec.command) in decision["message"]
+
+    def test_webhook_url_is_not_disclosed_in_refusals(self, monkeypatch):
+        """A webhook target's URL must not reach a model-facing refusal.
+
+        ``WebhookTarget.label`` falls back to ``self.url`` when the optional
+        ``name:`` is omitted, and ``_make_callback`` synthesized ``__name__``
+        from it. ``_callback_label`` trusts ``__name__``, so the raw URL — a
+        bearer credential for Slack/Discord/Teams — was interpolated into both
+        fail-closed refusals. Third sibling of the shell-hook/partial pair.
+        """
+        from agent import outbound_webhooks
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        planted = "T00000000/B11111111/PLANTEDwebhookCredential0"
+        url = f"https://hooks.slack.com/services/{planted}"
+        release = threading.Event()
+
+        # Operator omitted the optional `name:` — the documented fallback.
+        target = outbound_webhooks.WebhookTarget(url=url, events=["pre_tool_call"])
+        assert target.label == url, "label must still expose the URL for the log"
+
+        # POSITIVE CONTROL: prove the leak is REACHABLE before proving it is
+        # closed. The pre-fix identity was built from `target.label`, which is
+        # the raw URL here — so the disclosure channel genuinely exists and
+        # this test is not vacuous.
+        assert planted in f"outbound_webhook[pre_tool_call:{target.label}]", (
+            "positive control failed: the pre-fix identity should contain the URL"
+        )
+
+        callback = outbound_webhooks._make_callback("pre_tool_call", target)
+        assert planted not in callback.__name__, (
+            "the synthesized callback identity carried the raw webhook URL"
+        )
+
+        def _hang(**kwargs):
+            release.wait(10)
+            return None
+
+        _hang.__name__ = callback.__name__
+        _hang.__qualname__ = callback.__qualname__
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [_hang]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        try:
+            timeout_msg = resolve_pre_tool_block("web_search", {"query": "x"})
+            suppressed_msg = resolve_pre_tool_block("web_search", {"query": "y"})
+
+            # Both fail-closed paths still block (policy preserved) ...
+            assert timeout_msg is not None
+            assert suppressed_msg is not None
+            # ... and neither discloses the webhook credential.
+            assert planted not in timeout_msg, (
+                "the timeout refusal disclosed the webhook URL to the model"
+            )
+            assert planted not in suppressed_msg, (
+                "the suppression refusal disclosed the webhook URL to the model"
+            )
+            # The target is still identifiable by its stable digest.
+            assert target.display_label in timeout_msg
+            assert target.display_label in suppressed_msg
+        finally:
+            release.set()
+
+    def test_webhook_display_label_prefers_configured_name(self):
+        """A configured ``name:`` is an operator identifier and is used as-is."""
+        from agent import outbound_webhooks
+
+        url = "https://hooks.slack.com/services/T0/B0/PLANTEDwebhookCredential0"
+        named = outbound_webhooks.WebhookTarget(
+            url=url, events=["pre_tool_call"], name="ci-dashboard",
+        )
+        assert named.display_label == "ci-dashboard"
+        assert named.label == "ci-dashboard"
+
+        anon = outbound_webhooks.WebhookTarget(url=url, events=["pre_tool_call"])
+        # Digest, never the URL — and stable across calls/instances.
+        assert anon.display_label.startswith("webhook#")
+        assert "PLANTEDwebhookCredential0" not in anon.display_label
+        assert anon.display_label == outbound_webhooks.WebhookTarget(
+            url=url, events=["pre_tool_call"],
+        ).display_label
+        # Distinct URLs stay distinguishable.
+        other = outbound_webhooks.WebhookTarget(
+            url=url + "x", events=["pre_tool_call"],
+        )
+        assert other.display_label != anon.display_label
+
+    def test_anonymous_callback_label_is_stable_not_a_heap_address(self):
+        """The no-name fallback must be reproducible, not ``id()``.
+
+        ``id()`` is a CPython heap address: it differs between processes and is
+        recycled after GC, so a refusal naming a callback that way is neither
+        stable nor meaningful to whoever reads it.
+        """
+        from hermes_cli.plugins import _callback_label
+
+        class _Anon:
+            def __call__(self, **kwargs):
+                return None
+
+        a, b = _Anon(), _Anon()
+        label_a = _callback_label(a)
+
+        # Two distinct instances of the same type get the same label ...
+        assert label_a == _callback_label(b)
+        # ... and no heap address appears in it.
+        assert f"{id(a):x}" not in label_a
+        assert "@" not in label_a
+        assert label_a.startswith("<_Anon#") and label_a.endswith(">")
+
     def test_pre_tool_call_timeout_does_not_reach_tool_handler(self, monkeypatch):
         """E2E: timed-out pre_tool_call blocks handle_function_call before dispatch."""
         import json

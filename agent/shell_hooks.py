@@ -543,10 +543,24 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
     Returns a diagnostic dict with the same keys for every outcome
     (``returncode``, ``stdout``, ``stderr``, ``timed_out``,
-    ``elapsed_seconds``, ``error``).  This is the single place the
-    subprocess is actually invoked — both the live callback path
+    ``elapsed_seconds``, ``error``, ``error_detail``).  This is the single
+    place the subprocess is actually invoked — both the live callback path
     (:func:`_make_callback`) and the CLI test helper (:func:`run_once`)
     go through it.
+
+    TWO error channels, because they have opposite requirements:
+
+    * ``error`` is REDACTED and model-facing. It reaches the model through
+      :func:`_evaluate_result` -> :func:`_fail_closed_block`, so it carries
+      the failure's exception CLASS only — never the raw command, argv, or
+      ``str(exc)``, any of which can hold an inline credential.
+    * ``error_detail`` is the OPERATOR channel: the full diagnostic text, for
+      the log and for ``hermes hooks test`` / ``hermes doctor``. Without it a
+      shlex ``No closing quotation`` and a spawn ``EACCES``/``ENOEXEC`` are
+      indistinguishable to whoever has to fix the hook. It is ``None`` when
+      there is nothing to add beyond ``error``.
+
+    ``error_detail`` must never be routed to a model-facing string.
     """
     result: Dict[str, Any] = {
         "returncode": None,
@@ -555,6 +569,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         "timed_out": False,
         "elapsed_seconds": 0.0,
         "error": None,
+        "error_detail": None,
     }
     try:
         # Windows-safe: plain shlex.split eats backslashes in paths (#78293).
@@ -562,7 +577,17 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
         argv = split_command_line(os.path.expanduser(spec.command))
     except ValueError as exc:
-        result["error"] = f"command {spec.command!r} cannot be parsed: {exc}"
+        # `error` reaches the MODEL via _evaluate_result -> _fail_closed_block,
+        # so it must never carry the raw command or exception text derived from
+        # it: an unparseable command is exactly the shape that still holds an
+        # inline credential (`sh -c 'export TOK=…` with the quote left open).
+        # Name the hook by its digest and the failure by its exception CLASS.
+        # The raw command stays on the log channel only (_evaluate_result).
+        result["error"] = (
+            f"command cannot be parsed ({type(exc).__name__})"
+        )
+        # Operator channel only — `exc` stringifies the offending command text.
+        result["error_detail"] = f"command cannot be parsed: {exc}"
         return result
     if not argv:
         result["error"] = "empty command"
@@ -596,7 +621,13 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         result["error"] = "command not executable"
         return result
     except Exception as exc:  # pragma: no cover — defensive
-        result["error"] = str(exc)
+        # Same channel as the parse failure above: spawn exceptions routinely
+        # embed argv (OSError stringifies the program path), and argv[0] can be
+        # the credential itself. Exception CLASS only.
+        result["error"] = f"spawn failed ({type(exc).__name__})"
+        # Operator channel only — OSError stringifies argv/the program path,
+        # and this is what distinguishes EACCES from ENOEXEC from EMFILE.
+        result["error_detail"] = f"spawn failed: {exc}"
         return result
 
     try:
@@ -619,7 +650,11 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             proc.communicate(timeout=1)
         except Exception:
             pass
-        result["error"] = str(exc)
+        # Model-facing via _fail_closed_block — exception CLASS only, never
+        # text that may carry argv or payload content.
+        result["error"] = f"communication failed ({type(exc).__name__})"
+        # Operator channel only — may carry argv or payload content.
+        result["error_detail"] = f"communication failed: {exc}"
         return result
 
     result["returncode"] = proc.returncode
@@ -758,9 +793,12 @@ def _evaluate_result(
     fail_closed = spec.fail_closed and blocking_event
 
     if r["error"]:
+        # Log/operator channel gets the DETAILED reason when there is one; the
+        # model-facing block below keeps the redacted `error`. This log line
+        # already carries `spec.command`, so it is not a new disclosure.
         logger.warning(
             "shell hook failed (event=%s command=%s): %s",
-            spec.event, spec.command, r["error"],
+            spec.event, spec.command, r.get("error_detail") or r["error"],
         )
         if fail_closed:
             return _fail_closed_block(spec, r["error"])

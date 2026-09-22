@@ -9,6 +9,7 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -655,9 +656,86 @@ def _spawn_result(**overrides):
         "timed_out": False,
         "elapsed_seconds": 0.1,
         "error": None,
+        "error_detail": None,
     }
     base.update(overrides)
     return base
+
+
+class TestErrorChannelSplit:
+    """``error`` is redacted for the model; ``error_detail`` is for operators.
+
+    Collapsing the model-facing reason to an exception CLASS closed a real
+    disclosure, but it also blinded ``hermes hooks test`` / ``doctor`` and the
+    log: a shlex ``No closing quotation`` and a spawn ``EACCES``/``ENOEXEC``
+    became indistinguishable to whoever has to fix the hook. The two channels
+    must carry different text, and only the redacted one may reach the model.
+    """
+
+    def test_unparseable_command_detail_is_operator_only(self):
+        planted = "hunter2PRODSup3rSecret"
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            command=f"/bin/sh -c 'export TOK={planted}; echo hi",
+            fail_closed=True,
+        )
+
+        r = shell_hooks._spawn(spec, "{}")
+
+        # Operator channel keeps the diagnostic reason ...
+        assert r["error_detail"], "the operator channel lost the failure reason"
+        assert "No closing quotation" in r["error_detail"], (
+            "the operator can no longer tell WHY the command failed to parse"
+        )
+        # ... while the model-facing channel stays exception-class only.
+        assert r["error"] == "command cannot be parsed (ValueError)"
+        assert planted not in r["error"]
+
+        decision = shell_hooks._evaluate_result(spec, r)
+        assert decision is not None and decision["action"] == "block"
+        assert planted not in decision["message"], (
+            "error_detail leaked into the model-facing refusal"
+        )
+        assert "No closing quotation" not in decision["message"], (
+            "the refusal carried operator-channel text to the model"
+        )
+
+    def test_spawn_failure_detail_distinguishes_errno(self, tmp_path):
+        """EACCES vs ENOEXEC must stay distinguishable on the operator channel."""
+        not_executable = tmp_path / "hook.sh"
+        not_executable.write_text("#!/bin/sh\necho hi\n")
+        not_executable.chmod(0o644)
+
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=str(not_executable), fail_closed=True,
+        )
+        r = shell_hooks._spawn(spec, "{}")
+
+        assert r["error"], "a non-executable hook should fail"
+        # Whatever the platform raises, the operator channel must name it more
+        # specifically than the redacted channel does.
+        if r["error_detail"] is not None:
+            assert r["error_detail"] != r["error"]
+            assert len(r["error_detail"]) > len(r["error"])
+
+    def test_evaluate_result_logs_detail_but_blocks_with_redacted(self, caplog):
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command="/tmp/h.sh", fail_closed=True,
+        )
+        r = _spawn_result(
+            error="spawn failed (OSError)",
+            error_detail="spawn failed: [Errno 13] Permission denied: '/tmp/h.sh'",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            decision = shell_hooks._evaluate_result(spec, r)
+
+        assert "Errno 13" in caplog.text, "the log lost the operator detail"
+        assert decision is not None and decision["action"] == "block"
+        assert "Errno 13" not in decision["message"], (
+            "the model-facing refusal carried operator-channel detail"
+        )
+        assert "spawn failed (OSError)" in decision["message"]
 
 
 class TestEvaluateResult:
