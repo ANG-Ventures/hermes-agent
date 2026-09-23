@@ -744,6 +744,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument("--superseded-by", default=None, metavar="CARD|PR|SHA",
+                            help="Evidence pointer for a card whose premise was already "
+                                 "satisfied elsewhere. Closes it done with outcome "
+                                 "'superseded'; no --result/--summary required, but the "
+                                 "pointer must be non-empty (an unnamed supersede is a "
+                                 "silent delete of the work).")
     p_complete.add_argument("--survivor-ref", default=None, action="append", metavar="[REPO=]URL#SHA",
                             help="Name an external survivor when the implementation lives on a "
                                  "remote, not in the workspace. Verified with git ls-remote "
@@ -2870,6 +2876,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     summary = getattr(args, "summary", None)
+    superseded_by = getattr(args, "superseded_by", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
@@ -2877,10 +2884,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_ref = getattr(args, "survivor_ref", None)
     survivor_pr = getattr(args, "survivor_pr", None)
     survivor_unbound = getattr(args, "survivor_unbound", None) or None
-    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr or survivor_unbound):
+    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
+                         or survivor_unbound or superseded_by):
         print(
-            "kanban: --summary / --metadata / --survivor-ref / --survivor-pr / "
-            "--survivor-unbound are per-task "
+            "kanban: --summary / --metadata / --superseded-by / --survivor-ref / "
+            "--survivor-pr / --survivor-unbound are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
@@ -2910,7 +2918,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            # A superseded close has no work for the judge to grade; gating it
+            # would push the worker back into exiting silently.
+            rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
             )
@@ -2923,16 +2933,23 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-                survivor_ref=survivor_ref,
-                survivor_pr=survivor_pr,
-                survivor_unbound=survivor_unbound,
-            ):
+            try:
+                done = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    survivor_ref=survivor_ref,
+                    survivor_pr=survivor_pr,
+                    survivor_unbound=survivor_unbound,
+                    superseded_by=superseded_by,
+                )
+            except kb.EmptySupersedeError as supersede_err:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
+                continue
+            if not done:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
