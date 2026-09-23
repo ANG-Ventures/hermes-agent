@@ -1315,6 +1315,162 @@ def test_enumeration_cannot_exhaust_a_later_addressing_refusal(
     assert _addressing_refuses("addressed-after-unscoped")
 
 
+def test_enumerated_slug_survives_the_extent_exiting_and_a_thread_hop(
+    _pin_contradiction_env,
+):
+    """The extent is scoped to a THREAD and a MOMENT; enumerated slugs are not.
+
+    Round-1 review of this card found the notifier's board-scoped
+    ``asyncio.to_thread`` offloads landing outside the extent. Reproducing it
+    showed a second, wider axis the thread framing missed: the notifier's
+    ``_collect()`` sweeps boards, stores ``{"board": slug}`` in a delivery dict
+    and RETURNS — so the extent has already exited before the delivery leg
+    addresses that slug, even single-threaded.
+
+    Measured on the pre-fix commit, both refused; under a raising guard that is
+    an outage on the notifier, not noise. Provenance therefore rides on the
+    slug VALUE, which is the thing that actually travels.
+    """
+    collected = [
+        meta["slug"] for meta in kb.enumerating_each(kb.list_boards(include_archived=False))
+    ]
+    assert collected, "fixture must expose at least the default board"
+    # The extent is gone here. This is the notifier's delivery leg.
+    assert kb._enumeration_depth() == 0
+
+    for slug in collected:
+        # (a) same thread, later in time.
+        kb.kanban_db_path(board=slug)
+        # (b) another thread entirely — no extent could have propagated.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(kb.kanban_db_path, slug).result()
+            # The nested internal re-resolve inside connect() too.
+            pool.submit(lambda s=slug: kb.connect(board=s).close()).result()
+
+
+def test_enumerated_provenance_does_not_weaken_the_addressing_refusal(
+    _pin_contradiction_env,
+):
+    """The mark must exempt ENUMERATORS without disarming the guard.
+
+    A slug that merely looks the same is still a caller naming a board, so it
+    must refuse. In particular the mark must not survive serialization: a slug
+    that round-trips through JSON comes back a plain ``str`` and re-arms the
+    guard, which is the fail-CLOSED direction.
+    """
+    enumerated = [
+        meta["slug"]
+        for meta in kb.enumerating_each(kb.list_boards(include_archived=False))
+    ]
+    # An unmarked slug naming a different board than the pin: still refused.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path(board="other-board")
+
+    # Same VALUE as an enumerated slug, but stripped of provenance.
+    for slug in enumerated:
+        plain = json.loads(json.dumps(slug))
+        assert not isinstance(plain, kb.EnumeratedBoardSlug)
+        if kb.kanban_db_path(board=kb.enumerated_slug(slug)) == _pin_contradiction_env:
+            # This slug genuinely agrees with the pin; it cannot demonstrate
+            # the refusal either way. Skip rather than assert a false positive.
+            continue
+        with pytest.raises(kb.KanbanPinDivergenceError):
+            kb.kanban_db_path(board=plain)
+
+
+def test_the_discovery_FALLBACK_also_survives_the_refusal(_pin_contradiction_env):
+    """``read_board_metadata`` is the fallback EVERY board sweep degrades to.
+
+    Round-1 review asked for a sweep over every path that carries a board slug
+    into resolution from outside the extent. The sweep turned up a shape the
+    thread framing missed, and it is not an offload at all::
+
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+
+    (``gateway/kanban_watchers.py`` x4, ``tui_gateway/server.py``,
+    ``plugins/kanban/dashboard/plugin_api.py``.) That branch is evaluated
+    BEFORE ``enumerating_each()`` gets a chance to stamp anything, so neither
+    the extent nor the value-provenance mark covered it — and
+    ``read_board_metadata`` documents "Never raises", which the refusal broke.
+    It is also precisely the already-degraded path, where a second failure is
+    least survivable.
+
+    Measured under the pre-fix guard: REFUSED on both arms below.
+    """
+    # The bare fallback call itself.
+    meta = kb.read_board_metadata(kb.DEFAULT_BOARD)
+    assert meta["slug"] == kb.DEFAULT_BOARD
+    assert meta["db_path"]
+
+    # The fallback LIST driven through the sweep, exactly as the callers do.
+    for board_meta in kb.enumerating_each([kb.read_board_metadata(kb.DEFAULT_BOARD)]):
+        slug = board_meta.get("slug") or kb.DEFAULT_BOARD
+        kb.kanban_db_path(slug)
+        kb.connect(board=slug).close()
+
+    # The guard is still armed for a caller that NAMES a board: reporting a
+    # board's db_path is not permission to address it.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path(board="other-board")
+
+
+def test_collected_slugs_survive_an_asyncio_to_thread_offload(_pin_contradiction_env):
+    """The notifier's real shape: collect in the loop, write from a worker thread.
+
+    ``gateway/kanban_watchers.py`` offloads every board-scoped write through
+    ``_to_thread_process_service`` -> ``asyncio.to_thread(Context().run, ...)``,
+    which crosses BOTH a thread boundary and a fresh-``Context`` boundary
+    (``_run_in_fresh_context`` deliberately drops the caller's ContextVars).
+    Ten call sites do this. A ``threading.local()`` extent reaches none of
+    them, and a ``ContextVar`` would not have survived the Context scrub
+    either — which is why provenance rides on the slug VALUE.
+
+    This is the cross-thread arm the round-1 review asked for; without it the
+    enumerator gate is single-threaded and structurally cannot see this axis.
+    """
+    import asyncio
+    import contextvars
+
+    def _run_in_fresh_context(func, /, *args):
+        # Verbatim shape of gateway/kanban_watchers.py::_run_in_fresh_context.
+        return contextvars.Context().run(func, *args)
+
+    def _collect():
+        # The notifier's _collect(): sweep, stash slugs, RETURN (extent exits).
+        return [
+            {"board": m.get("slug") or kb.DEFAULT_BOARD}
+            for m in kb.enumerating_each(kb.list_boards(include_archived=False))
+        ]
+
+    async def _tick():
+        deliveries = await asyncio.to_thread(_collect)
+        assert deliveries, "fixture must expose at least the default board"
+        # The extent is gone by here — this is the delivery leg.
+        assert kb._enumeration_depth() == 0
+        for d in deliveries:
+            slug = d["board"]
+            # The write leg, offloaded exactly as the notifier offloads it.
+            await asyncio.to_thread(_run_in_fresh_context, kb.kanban_db_path, slug)
+            await asyncio.to_thread(
+                _run_in_fresh_context, lambda s=slug: kb.connect(board=s).close()
+            )
+
+    asyncio.run(_tick())
+
+    # Same offload, but a caller-NAMED slug: must still refuse. A thread hop
+    # is not a way to launder provenance.
+    async def _named():
+        return await asyncio.to_thread(
+            _run_in_fresh_context, kb.kanban_db_path, "other-board"
+        )
+
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        asyncio.run(_named())
+
+
 def test_enumerating_each_scopes_the_whole_loop_body(_pin_contradiction_env):
     """The extent must cover the OPEN, not just the path resolve.
 
