@@ -180,8 +180,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- scan" is really an 80 MB read. Measured cold (macOS `purge` between
         -- trials, 10 real fleet ledgers, 24h window): 6.13 s SCAN -> 1.40 s
         -- SEARCH, identical 653 rows.
-        CREATE INDEX IF NOT EXISTS idx_blackbox_turns_ts_start
-            ON turns(ts_start);
+        -- (idx_blackbox_turns_ts_start is created BELOW, after the additive
+        -- column migration: a pre-ts_start legacy ledger must be migrated
+        -- before an index on that column can exist — #905 follow-up.)
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts
             ON turn_api_calls(ts);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
@@ -262,6 +263,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    # #905's rolling-window index. Only after the column exists (legacy fixtures /
+    # ledgers created before ts_start): CREATE INDEX on a missing column raises
+    # "no such column" and takes the whole _connect() down with it.
+    _existing = {row[1] for row in conn.execute("PRAGMA table_info(turns)").fetchall()}
+    if "ts_start" in _existing:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_blackbox_turns_ts_start ON turns(ts_start)")
     conn.commit()
 
 
