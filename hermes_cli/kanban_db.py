@@ -6629,6 +6629,7 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    receipt: Optional[dict] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -6640,10 +6641,34 @@ def reassign_task(
 
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
+
+    ``reclaim_first`` makes this a two-step operation whose FIRST step is
+    irreversible (SIGTERM to a live worker, claim released) and whose second
+    can still fail. Returning a bare ``False`` there is a lie by omission:
+    the caller reports "nothing happened / still running" while the worker is
+    already dead. Pass ``receipt`` — a dict this function fills with
+    ``reclaimed`` (bool) and, on failure, ``reclaim_error`` (str) — to report
+    what actually happened. The reclaim leg never raises through this
+    function for the same reason the set-model batch catches by position:
+    an irreversible effect that already fired must not take its own receipt
+    down with it.
     """
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
-        reclaim_task(conn, task_id, reason=reason or "reassign")
+        try:
+            reclaimed = bool(reclaim_task(conn, task_id, reason=reason or "reassign"))
+            if receipt is not None:
+                receipt["reclaimed"] = reclaimed
+        except BaseException as exc:  # noqa: BLE001 - see docstring
+            if receipt is None:
+                raise
+            receipt["reclaimed"] = False
+            receipt["reclaim_error"] = (
+                f"{exc.__class__.__name__}: {exc or 'no detail'}; "
+                "worker may already have been signalled or claim released — "
+                f"inspect task {task_id}"
+            )
+            return False
     # assign_task handles its own txn + the still-running guard.
     try:
         return assign_task(conn, task_id, profile)

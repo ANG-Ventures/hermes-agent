@@ -2553,6 +2553,78 @@ def _select_batch_tasks(
     return rows, None
 
 
+def _run_batch_reclaims(
+    conn,
+    tasks: list,
+    *,
+    reason: str,
+) -> tuple[list[tuple[str, bool]], dict[str, str]]:
+    """Reclaim every card of an already-committed route batch, never raising.
+
+    This runs AFTER ``apply_batch_route_writes`` has committed, because
+    ``reclaim_task`` SIGTERMs a live worker — an irreversible side effect a
+    rollback could not undo, so it must not live inside the route
+    transaction.
+
+    That ordering makes every failure down here a *post-commit* failure: the
+    routes are already durable, and an exception escaping this loop takes the
+    receipt naming them with it. The operator is then left believing nothing
+    happened while N cards carry a new route. Enumerating exception types is
+    not a fix for that — the previous version caught ``(ValueError,
+    RuntimeError)`` and a real ``sqlite3.OperationalError`` ("database is
+    locked") from ``reclaim_task``'s own ``BEGIN IMMEDIATE`` walked straight
+    past it. So this function catches by POSITION, not by type: anything
+    raised after the commit becomes a per-card refusal string and the caller
+    always gets a receipt.
+
+    ``BaseException`` is deliberate. ``KeyboardInterrupt`` / ``SystemExit``
+    mid-batch is the same honesty problem, so they are recorded, the loop
+    stops, the remaining cards are reported as not attempted, and the caller
+    still prints the receipt and exits non-zero.
+
+    Returns ``(applied, errors)`` where ``applied`` has one entry per task in
+    order and ``errors`` maps a task id to why its reclaim did not happen.
+    """
+    applied: list[tuple[str, bool]] = []
+    errors: dict[str, str] = {}
+    interrupted = False
+    for task in tasks:
+        if interrupted:
+            applied.append((task.id, False))
+            errors[task.id] = "reclaim not attempted (batch interrupted)"
+            continue
+        # A card that was not claimed at selection time has nothing to
+        # reclaim, and reclaim_task returning False for it is the designed
+        # no-op — not a race. Only a card we SAW claimed and then could not
+        # reclaim changed state underneath us, and that is worth naming.
+        was_claimed = task.status == "running" or task.claim_lock is not None
+        try:
+            redispatched = bool(kb.reclaim_task(conn, task.id, reason=reason))
+        except (KeyboardInterrupt, SystemExit) as exc:
+            interrupted = True
+            applied.append((task.id, False))
+            errors[task.id] = (
+                f"reclaim interrupted ({exc.__class__.__name__}); "
+                "the worker may already have been signalled"
+            )
+            continue
+        except BaseException as exc:  # noqa: BLE001 - see docstring
+            applied.append((task.id, False))
+            errors[task.id] = (
+                f"{exc.__class__.__name__}: {exc or 'no detail'} "
+                "(the worker may already have been signalled — check "
+                f"`hermes kanban show {task.id}`)"
+            )
+            continue
+        if not redispatched and was_claimed:
+            errors[task.id] = (
+                "card was claimed at selection but is no longer reclaimable "
+                "(status changed after selection)"
+            )
+        applied.append((task.id, redispatched))
+    return applied, errors
+
+
 # Any `t_*` token is treated as an INTENDED task id, not just well-formed hex.
 # Matching only `t_[0-9a-f]+` would silently reclassify a typo'd id (`t_nope`)
 # as the model name, so the command would "succeed" against the wrong thing
@@ -2694,6 +2766,16 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # Declared before the try so the post-commit receipt path below can still
+    # name what moved even if the `with` block raises after the routes were
+    # written.
+    tasks: list = []
+    inherited_models: dict[str, str] = {}
+    applied: list[tuple[str, bool]] = []
+    cleared_routes: dict[str, str] = {}
+    reclaim_errors: dict[str, str] = {}
+    batch_error: Optional[str] = None
+    committed = False
     try:
         with kb.connect_closing() as conn:
             tasks, select_error = _select_batch_tasks(
@@ -2708,7 +2790,6 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             # A provider-only object retains each card's current model. Resolve
             # the whole batch before writing so a missing profile route cannot
             # leave earlier cards half-updated.
-            inherited_models: dict[str, str] = {}
             if touch_model and provider and not model:
                 for task in tasks:
                     inherited = task.model_override or kb.effective_worker_route(task).split("/", 1)[-1]
@@ -2721,9 +2802,6 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                         print(f"kanban: {guard}", file=sys.stderr)
                         return 2
                     inherited_models[task.id] = inherited
-            applied: list[tuple[str, bool]] = []
-            cleared_routes: dict[str, str] = {}
-            reclaim_errors: dict[str, str] = {}
             # Build the WHOLE batch first, then commit it in one transaction.
             # Looping over individually-committing setters is what let a card
             # that changed status after selection (archived/claimed by another
@@ -2753,6 +2831,11 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 writes.append(write)
 
             kb.apply_batch_route_writes(conn, writes)
+            # PAST THIS LINE THE ROUTES ARE DURABLE. Nothing below may let an
+            # exception escape without the operator learning which cards
+            # moved — that is the whole honest-partial contract, and it is
+            # why the reclaim loop catches by position rather than by type.
+            committed = True
 
             # --reclaim runs only AFTER the route batch has committed, and
             # deliberately NOT inside it: reclaim_task SIGTERMs a live worker,
@@ -2766,31 +2849,38 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             # by releasing the claim so the next tick respawns on the new
             # route.
             #
-            # No status check here on purpose: reclaim_task is already the
-            # authority on what is reclaimable (it refuses anything not
-            # running/claimed, and preserves blocked/triage/scheduled
-            # rather than laundering them into ready). Re-testing status
-            # at this layer would be a second, drifting copy of that rule.
-            for task in tasks:
-                redispatched = False
-                if reclaim:
-                    try:
-                        redispatched = kb.reclaim_task(
-                            conn, task.id,
-                            reason=f"set-model reclaim -> {provider or ''}/{model or ''}".strip("/"),
-                        )
-                    except (ValueError, RuntimeError) as exc:
-                        # The routes are already committed and reclaim's
-                        # SIGTERM is irreversible, so there is no rollback to
-                        # take here. Report the one card that failed and keep
-                        # printing the receipt below — an operator must still
-                        # learn which routes moved. Silence here would be the
-                        # split-batch defect wearing a different hat.
-                        reclaim_errors[task.id] = str(exc)
-                applied.append((task.id, redispatched))
-    except (ValueError, RuntimeError) as exc:
-        print(f"kanban: {exc}", file=sys.stderr)
-        return 2
+            # No status re-check inside the loop on purpose: reclaim_task is
+            # already the authority on what is reclaimable (it refuses
+            # anything not running/claimed, and preserves
+            # blocked/triage/scheduled rather than laundering them into
+            # ready). Re-testing status at this layer would be a second,
+            # drifting copy of that rule.
+            if reclaim:
+                applied, reclaim_errors = _run_batch_reclaims(
+                    conn, tasks,
+                    reason=f"set-model reclaim -> {provider or ''}/{model or ''}".strip("/"),
+                )
+            else:
+                applied = [(task.id, False) for task in tasks]
+    except BaseException as exc:  # noqa: BLE001 - re-raised unless committed
+        if not committed:
+            # Nothing was written, so a bare error line is the whole truth.
+            # Non-(ValueError|RuntimeError) still propagates: an unexpected
+            # crash before any write has no receipt to protect, and
+            # swallowing it would hide a real bug.
+            if not isinstance(exc, (ValueError, RuntimeError)):
+                raise
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        # Committed. Something between the commit and the end of the `with`
+        # block failed anyway (connection teardown, an observer, an
+        # interrupt). The routes are durable, so fall through to the receipt
+        # instead of surfacing a bare error that names no card.
+        batch_error = (
+            f"{exc.__class__.__name__}: {exc or 'no detail'}"
+        )
+        if not applied:
+            applied = [(task.id, False) for task in tasks]
 
     # A single explicitly-named card keeps the original human sentences —
     # that is an established user-facing contract and the per-card flow reads
@@ -2798,6 +2888,10 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     # is what a BATCH needs, where one line per card is the whole point.
     single = len(applied) == 1 and bool(task_ids)
     for task_id, redispatched in applied:
+        # `--reclaim` asked for a redispatch. If it did not happen, saying
+        # `applies=next-dispatch` alone is technically true but reads as
+        # normal — the refusal line below is what names it, and this keeps
+        # the two consistent.
         applies = "redispatch" if redispatched else "next-dispatch"
         if single:
             if touch_model and (model or provider):
@@ -2837,7 +2931,16 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             f"kanban: {task_id}: route applied but reclaim failed: {message}",
             file=sys.stderr,
         )
-    return 1 if reclaim_errors else 0
+    if batch_error:
+        # Post-commit failure outside the per-card reclaim loop. The receipt
+        # above is still the truth about what was written; this names why the
+        # command is nonetheless not a success.
+        print(
+            "kanban: routes above were applied, but the batch did not finish "
+            f"cleanly: {batch_error}",
+            file=sys.stderr,
+        )
+    return 1 if (reclaim_errors or batch_error) else 0
 
 
 def _lane_label(assignee: Optional[str]) -> str:
@@ -3049,13 +3152,37 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
+    reclaim_first = bool(getattr(args, "reclaim", False))
+    # `--reclaim` SIGTERMs the live worker and releases the claim BEFORE the
+    # assign is attempted. If the assign then refuses, the old "cannot
+    # reassign (still running — pass --reclaim)" line was actively false: the
+    # reclaim had already happened and the worker was already dead. Carry the
+    # receipt so the failure path can say what really landed.
+    receipt: dict = {}
     with kb.connect_closing() as conn:
         ok = kb.reassign_task(
             conn, args.task_id, profile,
-            reclaim_first=bool(getattr(args, "reclaim", False)),
+            reclaim_first=reclaim_first,
             reason=getattr(args, "reason", None),
+            receipt=receipt,
         )
+    reclaimed = bool(receipt.get("reclaimed"))
     if not ok:
+        if receipt.get("reclaim_error"):
+            print(
+                f"kanban: {args.task_id}: reclaim failed, task NOT reassigned: "
+                f"{receipt['reclaim_error']}",
+                file=sys.stderr,
+            )
+            return 1
+        if reclaimed:
+            print(
+                f"kanban: {args.task_id}: claim WAS reclaimed (the worker was "
+                "signalled) but the reassign was refused — the card is no "
+                "longer running; re-run the reassign without --reclaim",
+                file=sys.stderr,
+            )
+            return 1
         print(
             f"cannot reassign {args.task_id} "
             f"(unknown id, or still running — pass --reclaim to release first)",
@@ -3065,7 +3192,7 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     print(
         f"Reassigned {args.task_id} to "
         f"{profile or '(unassigned)'}"
-        + (" (claim reclaimed)" if getattr(args, "reclaim", False) else "")
+        + (" (claim reclaimed)" if reclaimed else "")
     )
     return 0
 

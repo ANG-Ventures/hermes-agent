@@ -1423,16 +1423,40 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.assignee is not None:
                     try:
                         if payload.reclaim_first:
+                            # Irreversible SIGTERM before the assign — the
+                            # per-id receipt must say whether it fired, or a
+                            # bare "assign refused" hides a killed worker.
+                            reassign_receipt: dict = {}
                             ok = kanban_db.reassign_task(
                                 conn, tid, payload.assignee or None,
                                 reclaim_first=True,
+                                receipt=reassign_receipt,
                             )
+                            if reassign_receipt.get("reclaimed"):
+                                entry["reclaimed"] = True
+                            if not ok:
+                                entry.update(
+                                    ok=False,
+                                    error=(
+                                        "assign refused"
+                                        + (
+                                            f"; reclaim failed: "
+                                            f"{reassign_receipt['reclaim_error']}"
+                                            if reassign_receipt.get("reclaim_error")
+                                            else (
+                                                "; claim WAS reclaimed (worker signalled)"
+                                                if reassign_receipt.get("reclaimed")
+                                                else ""
+                                            )
+                                        )
+                                    ),
+                                )
                         else:
                             ok = kanban_db.assign_task(
                                 conn, tid, payload.assignee or None,
                             )
-                        if not ok:
-                            entry.update(ok=False, error="assign refused")
+                            if not ok:
+                                entry.update(ok=False, error="assign refused")
                     except RuntimeError as e:
                         entry.update(ok=False, error=str(e))
                 if payload.priority is not None:
@@ -1895,13 +1919,36 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        # `reclaim_first` fires an irreversible SIGTERM + claim release BEFORE
+        # the assign. A bare 409 after that tells the operator "still running"
+        # while the worker is already dead — same silent post-effect class as
+        # the set-model batch. The receipt makes the real outcome visible.
+        receipt: dict = {}
         ok = kanban_db.reassign_task(
             conn, task_id,
             payload.profile or None,
             reclaim_first=bool(payload.reclaim_first),
             reason=payload.reason,
+            receipt=receipt,
         )
         if not ok:
+            if receipt.get("reclaim_error"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"cannot reassign {task_id}: reclaim failed "
+                        f"({receipt['reclaim_error']}); task NOT reassigned"
+                    ),
+                )
+            if receipt.get("reclaimed"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"cannot reassign {task_id}: the claim WAS reclaimed "
+                        "(worker signalled) but the reassign was refused; the "
+                        "card is no longer running — retry without reclaim_first"
+                    ),
+                )
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1909,7 +1956,12 @@ def reassign_task_endpoint(
                     "running (pass reclaim_first=true to release the claim first)"
                 ),
             )
-        return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "assignee": payload.profile or None,
+            "reclaimed": bool(receipt.get("reclaimed")),
+        }
     finally:
         conn.close()
 

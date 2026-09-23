@@ -1192,6 +1192,56 @@ def test_reassign_endpoint_switches_profile(client):
         conn2.close()
 
 
+def test_reassign_endpoint_reports_reclaim_that_landed_before_assign_refused(
+    client, monkeypatch,
+):
+    """HTTP 409 must not say 'still running' after the worker was reclaimed."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="victim", assignee="worker-a")
+        assert kb.claim_task(conn, task_id, claimer="probe-claimer")
+
+    monkeypatch.setattr(kb, "assign_task", lambda conn, tid, profile: False)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/reassign",
+        json={"profile": "worker-b", "reclaim_first": True},
+    )
+
+    assert r.status_code == 409
+    assert "WAS reclaimed" in r.json()["detail"]
+    assert "still running" not in r.json()["detail"]
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT status, claim_lock, assignee FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is None
+        assert row["assignee"] == "worker-a"
+
+
+def test_bulk_reassign_reports_reclaim_that_landed_before_assign_refused(
+    client, monkeypatch,
+):
+    """The bulk endpoint's per-id receipt must expose the killed worker."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="victim", assignee="worker-a")
+        assert kb.claim_task(conn, task_id, claimer="probe-claimer")
+
+    monkeypatch.setattr(kb, "assign_task", lambda conn, tid, profile: False)
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [task_id], "assignee": "worker-b", "reclaim_first": True,
+        },
+    )
+
+    assert r.status_code == 200
+    entry = r.json()["results"][0]
+    assert entry["id"] == task_id
+    assert entry["ok"] is False
+    assert entry["reclaimed"] is True
+    assert "claim WAS reclaimed" in entry["error"]
+
+
 # ---------------------------------------------------------------------------
 # Diagnostics endpoint (/api/plugins/kanban/diagnostics)
 # ---------------------------------------------------------------------------
