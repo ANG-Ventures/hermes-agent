@@ -1913,6 +1913,34 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             if not isinstance(landed, list):
                 raise SurvivorUnavailable("survivor_unavailable: landed must be a list")
             survivor = {"kind": "landed", "landed": _verify_landed(landed, workspace)}
+            present = {entry["repository"] for claim in survivor["landed"]
+                       for entry in claim["workspace_repositories"]}
+            missing = set(bases) - present
+            if missing:
+                # A landed commit binds only repositories still on disk. A
+                # replacement root can ignore the files of a vanished child
+                # repository and appear clean while its work is still here.
+                refs = {}
+                if cleanup and _reusable(previous):
+                    refs = {ref["repository"]: ref for ref in (previous or {}).get("refs", ())
+                            if isinstance(ref, dict) and ref.get("repository") in missing}
+                if explicit:
+                    if None in explicit:
+                        if len(missing) != 1 or len(explicit) != 1:
+                            raise SurvivorUnavailable(
+                                "survivor_unavailable: qualify each missing repository survivor"
+                            )
+                        explicit = {next(iter(missing)): explicit[None]}
+                    if set(explicit) - missing:
+                        raise SurvivorUnavailable(
+                            "survivor_unavailable: operator survivors name repositories still present"
+                        )
+                    refs.update({key: dict(ref, repository=key) for key, ref in explicit.items()})
+                if missing - refs.keys():
+                    raise SurvivorUnavailable(
+                        f"survivor_unavailable: recorded repository missing; {_ext.HINT}"
+                    )
+                survivor["refs"] = [refs[key] for key in sorted(missing)]
             survivor["sidecar"] = _store(
                 conn, task_id, "implementation.json",
                 json.dumps(survivor, sort_keys=True).encode(), "application/json",

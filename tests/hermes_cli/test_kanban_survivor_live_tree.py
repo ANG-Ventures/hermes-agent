@@ -65,6 +65,59 @@ def restore_artifact(survivor, tmp_path, published):
     return restored
 
 
+def test_landed_refuses_missing_recorded_repo_even_when_replacement_ignores_its_files(board, tmp_path):
+    import hermes_cli.kanban_survivor as survivor_mod
+
+    tid = kb.create_task(board, title="missing recorded implementation")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    original = init(ws / "a")
+    commit(original, "lost_impl.py", "unpublished original implementation\n", "original")
+    kb.set_workspace_path(board, tid, ws)
+    survivor_mod.record_baseline(board, tid, ws)
+    assert set(survivor_mod._state(board, tid)[0]) == {"a"}
+
+    shutil.rmtree(original / ".git")
+    init(ws)
+    commit(ws, ".gitignore", "a/\n", "ignore original")
+    commit(ws, "replacement.txt", "replacement\n", "replacement")
+    live = tmp_path / "live-replacement"
+    git(tmp_path, "clone", "--no-local", str(ws), str(live))
+    assert not (live / "a" / "lost_impl.py").exists()
+    assert git(ws, "status", "--porcelain", "--untracked-files=all") == ""
+
+    with pytest.raises(ValueError, match="recorded repository missing"):
+        kb.complete_task(board, tid, metadata={
+            "changed_files": ["a/lost_impl.py", "replacement.txt"],
+            "landed": [{"repo_path": str(live), "sha": git(live, "rev-parse", "HEAD")}],
+        })
+    assert kb.get_task(board, tid).status != "done"
+    assert (original / "lost_impl.py").read_text() == "unpublished original implementation\n"
+    assert survivor_mod._state(board, tid)[1]
+
+
+def test_landed_covers_all_recorded_repositories_with_independent_live_trees(board, tmp_path):
+    import hermes_cli.kanban_survivor as survivor_mod
+
+    tid = kb.create_task(board, title="two landed repositories")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    entries = []
+    for key in ("a", "b"):
+        repo = init(ws / key)
+        sha = commit(repo, f"{key}.py", f"implementation {key}\n", "implementation")
+        live = tmp_path / f"live-{key}"
+        git(tmp_path, "clone", "--no-local", str(repo), str(live))
+        entries.append({"repo_path": str(live), "sha": sha})
+    kb.set_workspace_path(board, tid, ws)
+    survivor_mod.record_baseline(board, tid, ws)
+    assert set(survivor_mod._state(board, tid)[0]) == {"a", "b"}
+
+    assert kb.complete_task(board, tid, metadata={
+        "changed_files": ["a/a.py", "b/b.py"], "landed": entries,
+    })
+    assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "landed"
+    assert not ws.exists()
+
+
 @pytest.fixture
 def board(tmp_path, monkeypatch):
     import hermes_cli.kanban_survivor as survivor
