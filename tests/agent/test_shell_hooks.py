@@ -9,6 +9,9 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -655,9 +658,137 @@ def _spawn_result(**overrides):
         "timed_out": False,
         "elapsed_seconds": 0.1,
         "error": None,
+        "error_detail": None,
     }
     base.update(overrides)
     return base
+
+
+class TestErrorChannelSplit:
+    """``error`` is redacted for the model; ``error_detail`` is for operators.
+
+    Collapsing the model-facing reason to an exception CLASS closed a real
+    disclosure, but it also blinded ``hermes hooks test`` / ``doctor`` and the
+    log: a shlex ``No closing quotation`` and a spawn ``ENOEXEC`` became
+    indistinguishable to whoever has to fix the hook. Where a diagnostic
+    exists beyond the redacted reason, the two channels must carry different
+    text and only the redacted one may reach the model.
+
+    Note the asymmetry these tests pin: ``EACCES`` is handled by its own
+    ``PermissionError`` arm whose fixed reason ("command not executable") is
+    already the whole diagnostic, so it carries NO ``error_detail``. The
+    generic ``OSError`` arm — ENOEXEC, EMFILE — is the one that populates it.
+    """
+
+    def test_unparseable_command_detail_is_operator_only(self):
+        planted = "hunter2PRODSup3rSecret"
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            command=f"/bin/sh -c 'export TOK={planted}; echo hi",
+            fail_closed=True,
+        )
+
+        r = shell_hooks._spawn(spec, "{}")
+
+        # Operator channel keeps the diagnostic reason ...
+        assert r["error_detail"], "the operator channel lost the failure reason"
+        assert "No closing quotation" in r["error_detail"], (
+            "the operator can no longer tell WHY the command failed to parse"
+        )
+        # ... while the model-facing channel stays exception-class only.
+        assert r["error"] == "command cannot be parsed (ValueError)"
+        assert planted not in r["error"]
+
+        decision = shell_hooks._evaluate_result(spec, r)
+        assert decision is not None and decision["action"] == "block"
+        assert planted not in decision["message"], (
+            "error_detail leaked into the model-facing refusal"
+        )
+        assert "No closing quotation" not in decision["message"], (
+            "the refusal carried operator-channel text to the model"
+        )
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX x-bit semantics (EACCES)")
+    def test_spawn_eacces_is_named_exactly_and_adds_no_detail(self, tmp_path):
+        """A non-executable hook (EACCES) is fully described by the redacted channel.
+
+        ``_spawn`` special-cases ``PermissionError`` with a fixed, already
+        operator-legible reason and deliberately leaves ``error_detail`` unset —
+        there is nothing to add beyond "command not executable", and the raw
+        ``OSError`` text would only re-introduce argv. Asserted exactly so the
+        branch cannot silently start emitting a detail (or stop naming EACCES).
+        """
+        not_executable = tmp_path / "hook.sh"
+        not_executable.write_text("#!/bin/sh\necho hi\n")
+        not_executable.chmod(0o644)
+
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=str(not_executable), fail_closed=True,
+        )
+        r = shell_hooks._spawn(spec, "{}")
+
+        assert r["error"] == "command not executable"
+        assert r["error_detail"] is None, (
+            "EACCES must stay detail-free; a detail here means argv text is "
+            "being copied onto the operator channel for no diagnostic gain"
+        )
+
+    def test_spawn_enoexec_detail_distinguishes_errno(self, monkeypatch):
+        """ENOEXEC must reach the operator channel with the errno, not just the class.
+
+        This is the branch that actually populates ``error_detail`` on a spawn
+        failure. ``Popen`` is monkeypatched so the test asserts the contract on
+        every platform rather than depending on the loader rejecting a crafted
+        binary.
+        """
+        planted = "/tmp/hook-with-s3cr3t-in-argv.sh"
+
+        def _raise_enoexec(*args, **kwargs):
+            raise OSError(8, "Exec format error", planted)
+
+        monkeypatch.setattr(subprocess, "Popen", _raise_enoexec)
+
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=planted, fail_closed=True,
+        )
+        r = shell_hooks._spawn(spec, "{}")
+
+        # Model-facing channel: exception CLASS only, no argv.
+        assert r["error"] == "spawn failed (OSError)"
+        assert planted not in r["error"]
+        # Operator channel: carries the errno that separates ENOEXEC from
+        # EACCES/EMFILE, and is strictly more informative than `error`.
+        assert r["error_detail"] is not None, (
+            "the operator channel lost the spawn failure reason"
+        )
+        assert "Exec format error" in r["error_detail"]
+        assert "Errno 8" in r["error_detail"]
+        assert r["error_detail"] != r["error"]
+
+        # ...and the detail must not ride out to the model on the refusal.
+        decision = shell_hooks._evaluate_result(spec, r)
+        assert decision is not None and decision["action"] == "block"
+        assert "Exec format error" not in decision["message"]
+        assert planted not in decision["message"]
+
+    def test_evaluate_result_logs_detail_but_blocks_with_redacted(self, caplog):
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command="/tmp/h.sh", fail_closed=True,
+        )
+        r = _spawn_result(
+            error="spawn failed (OSError)",
+            error_detail="spawn failed: [Errno 13] Permission denied: '/tmp/h.sh'",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            decision = shell_hooks._evaluate_result(spec, r)
+
+        assert "Errno 13" in caplog.text, "the log lost the operator detail"
+        assert decision is not None and decision["action"] == "block"
+        assert "Errno 13" not in decision["message"], (
+            "the model-facing refusal carried operator-channel detail"
+        )
+        assert "spawn failed (OSError)" in decision["message"]
 
 
 class TestEvaluateResult:

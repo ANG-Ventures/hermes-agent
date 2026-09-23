@@ -15402,7 +15402,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return 0
 
-        from gateway.auto_resume import RESUME_KIND_SELF, has_resumable_work
+        from gateway.auto_resume import (
+            RESUME_KIND_SELF,
+            has_resumable_work,
+            user_stop_blocks_resume,
+        )
 
         checked = 0
         for entry in entries:
@@ -15411,6 +15415,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source = getattr(entry, "origin", None)
             if platform is not None and getattr(source, "platform", None) != platform:
                 continue
+            # RULING (2026-09-21): an interrupted turn always auto-resumes —
+            # EXCEPT one the user ended with /stop, which must NEVER resume.
+            # This gate runs BEFORE the SELF-kind exemption and before the
+            # transcript read below, because it is not a "is there work?"
+            # question: the user answered that question by hand. A session
+            # carrying the marker is denied unless a real user message has
+            # landed since (checked by rowid, below), and denial is recorded
+            # as a False decision so the scheduler skips and retires the hedge
+            # exactly as it does for a finished turn.
+            _stopped_at_id = getattr(entry, "user_stopped_message_id", None)
+            _has_stop_marker = getattr(entry, "user_stopped_at", None) is not None
+            if _has_stop_marker:
+                _stop_rows: list[dict[str, Any]] = []
+                _stop_session_id = getattr(entry, "session_id", None)
+                if self._session_db is not None and _stop_session_id:
+                    try:
+                        _stop_rows = await self._session_db.get_messages(
+                            _stop_session_id,
+                            preserve_unparseable_tool_calls=True,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "user_stopped supersession check failed for %s; "
+                            "honouring the stop: %s",
+                            entry.session_key,
+                            exc,
+                        )
+                        _stop_rows = []
+                if user_stop_blocks_resume(_stopped_at_id, _stop_rows):
+                    decisions[entry.session_key] = False
+                    checked += 1
+                    continue
             # A deliberate SELF resume is NOT a hedge: the session asked for
             # the restart (safe-restart/safe-reboot watcher via the dropbox,
             # or the typed deferred-restart rail) and its tail is SUPPOSED to
@@ -15591,14 +15627,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # for the whole restore cycle after a transient loop hiccup).
             acked.discard(key)
 
-    async def _send_startup_restore_ack(self, adapter: Any, chat_id: Any) -> None:
+    async def _send_startup_restore_ack(
+        self, adapter: Any, chat_id: Any, *, turn_slot_wait: bool = False,
+        metadata: Optional[dict] = None,
+    ) -> None:
         # Greptile #258: the ack is fire-and-forget, so by the time this task
         # runs the restore gate may already have released and the queued message
         # answered — an ack AFTER the real response reads as confusing noise.
         # Only send while the restore is still actually in progress.
-        if not getattr(self, "_startup_restore_in_progress", False):
+        if not turn_slot_wait and not getattr(self, "_startup_restore_in_progress", False):
             return
         try:
+            if turn_slot_wait:
+                await adapter.send(
+                    chat_id,
+                    "⏳ Busy with other conversations — your message is queued "
+                    "and will run as soon as a turn slot is free.",
+                    metadata={**(metadata or {}), "_interim_send": True},
+                )
+                return
             await adapter.send(
                 chat_id,
                 "⏳ Still starting up — your message is queued and I'll get to it "
@@ -16595,13 +16642,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if getattr(self, "_boot_resume_has_work", {}).get(
                 entry.session_key, True
             ) is False:
+                # Two causes land here and they mean different things to an
+                # operator: a hedge on a finished turn, versus a turn the user
+                # deliberately killed with /stop. Both skip; name which.
+                _skip_cause = (
+                    "user_stopped"
+                    if getattr(entry, "user_stopped_at", None) is not None
+                    else "no_unfinished_work"
+                )
                 logger.warning(
                     "PHASE=boot_resume_skipped key=%s reason=%s platform=%s "
-                    "kind=%s cause=no_unfinished_work",
+                    "kind=%s cause=%s",
                     entry.session_key,
                     getattr(entry, "resume_reason", None),
                     getattr(getattr(source, "platform", None), "value", None),
                     getattr(entry, "resume_kind", None),
+                    _skip_cause,
                 )
                 try:
                     self.session_store.clear_resume_pending(entry.session_key)
@@ -16766,13 +16822,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
             )
-            task = asyncio.create_task(
-                self._run_startup_resume_event(
-                    adapter,
-                    event,
-                    entry.session_key,
-                    getattr(entry, "resume_reason", None),
+            pool = getattr(self, "_startup_resume_pool", None)
+            if pool is None:
+                from gateway.turn_admission import StartupResumePool
+                concurrency = getattr(self.config, "startup_resume_concurrency", 3)
+                if type(concurrency) is not int or concurrency <= 0:
+                    logger.warning(
+                        "Invalid gateway.startup_resume_concurrency value %r; using 3",
+                        concurrency,
+                    )
+                    concurrency = 3
+                pool = self._startup_resume_pool = StartupResumePool(
+                    concurrency
                 )
+            task = pool.submit(
+                self._run_startup_resume_event, adapter, event, entry.session_key,
+                getattr(entry, "resume_reason", None),
             )
             # Track this scheduled resume so shutdown can tell a resume whose
             # turn NEVER STARTED (cancel + re-mark) from one that is genuinely
@@ -16853,6 +16918,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._startup_restore_tasks = tasks
                 tasks.append(task)
             scheduled += 1
+        pool = getattr(self, "_startup_resume_pool", None)
+        if scheduled and pool is not None and pool.pending:
+            logger.warning(
+                "PHASE=boot_resume_throttled pending=%s concurrency=%s",
+                len(pool.pending), pool.concurrency,
+            )
         if skipped:
             logger.info(
                 "Skipped auto-resume for %d session(s) whose last turn had "
@@ -20251,9 +20322,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # When FTS5 corruption prevents message persistence, the
             # in-memory pending text is the only surviving copy.  Clearing
             # without flushing causes permanent data loss.
+            # Off-loop: each payload ends in an unbounded os.replace, and
+            # this runs inside the timed shutdown path.
+            # Pass the LIVE view with drain=True rather than a dict() copy:
+            # the offload's await is a window in which a message can arrive
+            # (run.py:10605 re-queues into this slot), and only an atomic
+            # snapshot-and-clear before that await keeps it from being wiped
+            # unflushed.  The view's clear() resets one field per session,
+            # never a wholesale dict swap, so a concurrent writer on another
+            # session can't lose its entry.
             try:
-                from gateway.shutdown_flush import flush_pending_to_file
-                flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+                from gateway.shutdown_flush import flush_pending_to_file_async
+                await flush_pending_to_file_async(
+                    self._pending_messages, reason="shutdown", drain=True
+                )
             except Exception:
                 pass
             # On the real runner these are live SessionState views whose
@@ -20264,7 +20346,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts.clear()
             if hasattr(self, "_active_session_leases"):
                 self._active_session_leases.clear()
-            self._pending_messages.clear()
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
                 self._busy_ack_ts.clear()
@@ -24530,6 +24611,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+        # Claim admission BEFORE the transcript lease. Pending sentinels remain
+        # visible to inbound coalescing, but queued work cannot become a stale
+        # transcript-lease holder if /stop invalidates its generation.
+        async with self._get_turn_admission().slot(
+            _quick_key, internal=getattr(event, "internal", False),
+            ack=lambda: self._ack_turn_slot_wait(source),
+        ):
+            # Production dispatch creates this state immediately before calling
+            # us. Keep direct/internal callers that have no generation state on
+            # the legacy path while still dropping queued turns invalidated by
+            # /stop after they began waiting for admission.
+            if (
+                self._peek_session_state(_quick_key) is not None
+                and not self._is_session_run_current(_quick_key, run_generation)
+            ):
+                return None
+            return await self._handle_message_with_agent_admitted(
+                event, source, _quick_key, run_generation,
+            )
+
+    async def _handle_message_with_agent_admitted(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         # Detector (2026-09-20): a turn STARTING while shutdown is already in
@@ -24618,6 +24720,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
         session_key = session_entry.session_key
+        # A real inbound user message supersedes any /stop marker: the user
+        # resumed the conversation by hand, so a LATER interruption of this
+        # session must auto-resume normally. Internal/synthetic events (boot
+        # resumes, kanban wakes) are not the user speaking and must not clear
+        # it. Correctness does not rest on this call landing — the boot gate
+        # independently supersedes the marker by rowid — so it is best-effort.
+        if (
+            not getattr(event, "internal", False)
+            and getattr(session_entry, "user_stopped_at", None) is not None
+        ):
+            try:
+                await self.async_session_store.clear_user_stopped(session_key)
+            except Exception:
+                logger.debug(
+                    "clear_user_stopped failed for %s", session_key, exc_info=True
+                )
 
         # Persisted route identity is a security/billing boundary (fork
         # contract). Resolve its tri-state immediately after session lookup,
@@ -34211,6 +34329,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _mark_user_stopped(self, session_key: str) -> bool:
+        """Durably record that ``session_key``'s turn was ended by ``/stop``.
+
+        The rowid stamped here is the session's newest persisted message at
+        stop time. The boot gate supersedes the marker when a non-empty USER
+        row ABOVE that id exists, so the rowid — not a timestamp — is what
+        makes "stop, then the user speaks again, then a restart interrupts"
+        resume correctly.
+
+        An unreadable transcript stamps ``None``, which fails CLOSED (never
+        resume) rather than open: the ruling is that a stopped turn must never
+        be re-prompted, and a real user message still clears the marker
+        through ``clear_user_stopped`` on the inbound path.
+        """
+        last_message_id: Optional[int] = None
+        entry = None
+        try:
+            entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+        except Exception:
+            entry = None
+        session_id = getattr(entry, "session_id", None)
+        if self._session_db is not None and session_id:
+            try:
+                rows = await self._session_db.get_messages(
+                    session_id,
+                    preserve_unparseable_tool_calls=True,
+                )
+                for row in reversed(rows or []):
+                    if not isinstance(row, dict):
+                        continue
+                    rowid = row.get("id")
+                    if isinstance(rowid, int) and not isinstance(rowid, bool):
+                        last_message_id = rowid
+                        break
+            except Exception:
+                logger.debug(
+                    "user_stopped rowid lookup failed for %s", session_key, exc_info=True
+                )
+        boot_id = None
+        try:
+            boot_id = self._current_boot_id()
+        except Exception:
+            boot_id = None
+        marked = await self.async_session_store.mark_user_stopped(
+            session_key,
+            boot_id=boot_id,
+            last_message_id=last_message_id,
+        )
+        logger.info(
+            "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s",
+            session_key,
+            boot_id,
+            last_message_id,
+            marked,
+        )
+        return bool(marked)
+
     async def _interrupt_and_clear_session(
         self,
         session_key: str,
@@ -34358,6 +34533,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # An explicit stop consumes restart-recovery intent. Otherwise the next
         # real user message re-enters _is_resume_pending and receives the same
         # recovery note even though the user deliberately cancelled that turn.
+        #
+        # A /stop must ALSO leave durable evidence that the turn was ended on
+        # purpose. Clearing resume_pending alone is not enough: the boot gate
+        # re-marks sessions wholesale (pre-drain hedge, suspend_recently_active)
+        # and then judges the persisted TAIL, and a /stop'd turn cut mid-tool-
+        # call is byte-identical to an amputated one — so it was re-prompted on
+        # the next boot (2026-09-20). Write the marker BEFORE this coroutine
+        # returns, which is before /stop acknowledges, so a SIGKILL in the gap
+        # cannot lose it. /new is excluded: it resets the session outright.
+        if str(invalidation_reason or "").startswith("stop_command"):
+            try:
+                await self._mark_user_stopped(session_key)
+            except Exception:
+                logger.warning(
+                    "Failed to persist user_stopped marker for stopped session %s",
+                    session_key,
+                    exc_info=True,
+                )
         try:
             await self.async_session_store.clear_resume_pending(session_key)
         except Exception:
@@ -35981,7 +36174,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return get_hermes_home()
 
+    def _get_turn_admission(self):
+        from gateway.turn_admission import TurnAdmission
+        admission = getattr(self, "_turn_admission", None)
+        if admission is None:
+            cap = getattr(getattr(self, "config", None), "max_concurrent_turns", None)
+            if type(cap) is not int or cap <= 0:
+                if cap is not None and not (type(cap) is int and cap == 0):
+                    logger.warning(
+                        "Invalid gateway.max_concurrent_turns value %r; using unbounded",
+                        cap,
+                    )
+                cap = None
+            admission = self._turn_admission = TurnAdmission(cap)
+        return admission
+
+    async def _ack_turn_slot_wait(self, source):
+        adapter = self._adapter_for_source(source)
+        if adapter is not None:
+            await self._send_startup_restore_ack(
+                adapter, source.chat_id, turn_slot_wait=True,
+                metadata=self._thread_metadata_for_source(source),
+            )
+
     async def _run_agent_inner(
+        self, message, context_prompt, history, source, session_id, **kwargs,
+    ):
+        # Direct/recursive callers also pass this seam; the handler's permit is
+        # reused only in its own task, never by an independently spawned child.
+        async with self._get_turn_admission().slot(
+            kwargs.get("session_key"),
+            ack=lambda: self._ack_turn_slot_wait(source),
+        ):
+            return await self._run_agent_admitted(
+                message, context_prompt, history, source, session_id, **kwargs,
+            )
+
+    async def _run_agent_admitted(
         self,
         message: str,
         context_prompt: str,
@@ -36993,6 +37222,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
             )
+            self._get_turn_admission().retain_worker(_executor_task)
 
             _inactivity_timeout = False
 
@@ -39425,6 +39655,20 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
         release_gateway_runtime_lock()
+    except Exception:
+        pass
+    # Drain the shutdown-flush and transcript-spool lanes. Same reason as the
+    # releases above: os._exit skips atexit, so shutdown_flush's own
+    # atexit-registered fences never run on this path -- and unlike a stranded
+    # lock, a queued write that dies with the process is UNRECOVERABLE user
+    # data. The deadline-cancel path (_await_adapter_cleanup_with_timeout
+    # cancels cancel_background_tasks() at the per-adapter budget) deliberately
+    # leaves a shielded write running with nobody awaiting it; this is the only
+    # thing that waits for it. Bounded at 10s, and a no-op when the lanes are
+    # empty or were never created.
+    try:
+        from gateway.shutdown_flush import fence_lanes_for_hard_exit
+        fence_lanes_for_hard_exit(timeout=10.0)
     except Exception:
         pass
     # Mark this life cleanly exited in the lifecycle sentinel (NS-608). This

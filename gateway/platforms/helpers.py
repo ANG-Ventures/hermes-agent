@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict
@@ -238,6 +239,12 @@ class ThreadParticipationTracker:
     def __init__(self, platform_name: str, max_tracked: int = 500):
         self._platform = platform_name
         self._max_tracked = max_tracked
+        # Serializes the in-memory set against ``_save``'s trim.  ``mark_async``
+        # runs the persist on a worker thread, which removes the accidental
+        # serialization the event loop used to provide, so the lock has to be
+        # added in the SAME change that introduces the concurrency.  Re-entrant
+        # because ``mark`` takes it and then calls ``_save``, which takes it too.
+        self._lock = threading.RLock()
         self._threads: dict[str, None] = {
             str(thread_id): None for thread_id in self._load()
         }
@@ -258,24 +265,56 @@ class ThreadParticipationTracker:
         return []
 
     def _save(self) -> None:
-        path = self._state_path()
-        thread_list = list(self._threads)
-        if len(thread_list) > self._max_tracked:
-            thread_list = thread_list[-self._max_tracked:]
-            self._threads = dict.fromkeys(thread_list)
-        atomic_json_write(path, thread_list, indent=None)
+        with self._lock:
+            path = self._state_path()
+            thread_list = list(self._threads)
+            if len(thread_list) > self._max_tracked:
+                thread_list = thread_list[-self._max_tracked:]
+                self._threads = dict.fromkeys(thread_list)
+            atomic_json_write(path, thread_list, indent=None)
+
+    def _remember(self, thread_id: str) -> bool:
+        """Record *thread_id* in memory; ``True`` when a persist is still owed.
+
+        The in-memory half stays synchronous even for ``mark_async`` so that a
+        ``thread_id in tracker`` check immediately after marking is correct --
+        the gating logic in the adapters depends on that.
+        """
+        with self._lock:
+            if thread_id in self._threads:
+                return False
+            self._threads[thread_id] = None
+            return True
 
     def mark(self, thread_id: str) -> None:
-        """Mark *thread_id* as participated and persist."""
-        if thread_id not in self._threads:
-            self._threads[thread_id] = None
+        """Mark *thread_id* as participated and persist.
+
+        Blocking: ends in ``atomic_json_write`` -> ``os.replace``.  Coroutines
+        must use :meth:`mark_async`; ``tests/gateway/test_thread_tracker_mark_off_loop.py``
+        enforces that as an AST class sweep.
+        """
+        if self._remember(thread_id):
             self._save()
 
+    async def mark_async(self, thread_id: str) -> None:
+        """Off-loop form of :meth:`mark`.
+
+        ``_save`` ends in ``atomic_json_write`` -> ``os.replace``, whose
+        duration is unbounded under filesystem pressure.  Every caller of this
+        tracker sits on an inbound-message coroutine (Matrix
+        ``_resolve_message_context``, Discord ``_handle_message``), so the
+        rename must not be paid inline on the loop.
+        """
+        if self._remember(thread_id):
+            await asyncio.to_thread(self._save)
+
     def __contains__(self, thread_id: str) -> bool:
-        return thread_id in self._threads
+        with self._lock:
+            return thread_id in self._threads
 
     def clear(self) -> None:
-        self._threads.clear()
+        with self._lock:
+            self._threads.clear()
 
 
 # ─── Phone Number Redaction ──────────────────────────────────────────────────

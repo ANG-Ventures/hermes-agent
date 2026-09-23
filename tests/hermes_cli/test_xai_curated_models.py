@@ -9,9 +9,9 @@ from hermes_cli.models import (
 )
 
 
-def test_grok_4_6_is_default_pin():
+def test_grok_4_7_is_default_pin():
     models = _PROVIDER_MODELS["xai-oauth"]
-    assert models[0] == "grok-4.6"
+    assert models[0] == "grok-4.7"
 
 
 def test_xai_providers_are_models_dev_preferred():
@@ -26,7 +26,7 @@ def test_xai_oauth_picker_merges_models_dev_at_call_time():
         models = provider_model_ids("xai-oauth")
 
     mocked.assert_called()
-    assert models[0] == "grok-4.6"
+    assert models[0] == "grok-4.7"
     assert "grok-new-from-models-dev" in models
 
 
@@ -44,13 +44,13 @@ def test_xai_api_key_picker_merges_models_dev_when_live_unavailable():
 
     mocked.assert_called()
     assert "grok-new-from-models-dev" in models
-    assert models[0] == "grok-4.6"
+    assert models[0] == "grok-4.7"
 
 
 def test_xai_pin_survives_when_top_model_only_in_extras():
-    """If models.dev omits grok-4.6, curated extras + finalize still pin it."""
+    """If models.dev omits grok-4.7, curated extras + finalize still pin it."""
     mdev = ["grok-build-0.1", "grok-new-from-models-dev"]
     with patch("agent.models_dev.list_agentic_models", return_value=mdev):
         models = provider_model_ids("xai-oauth")
 
-    assert models[0] == "grok-4.6"
+    assert models[0] == "grok-4.7"

@@ -973,6 +973,8 @@ class GatewayConfig:
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
+    max_concurrent_turns: Optional[int] = None  # Missing/0 preserves unbounded legacy execution
+    startup_resume_concurrency: int = 3
 
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
     # When True, the default profile's gateway serves inbound messages for every
@@ -1156,6 +1158,8 @@ class GatewayConfig:
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
+            "max_concurrent_turns": self.max_concurrent_turns,
+            "startup_resume_concurrency": self.startup_resume_concurrency,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
@@ -1332,6 +1336,12 @@ class GatewayConfig:
             max_concurrent_raw,
             max_concurrent_key,
         )
+        turn_limits = {}
+        for key in ("max_concurrent_turns", "startup_resume_concurrency"):
+            raw = data[key] if key in data else nested_gateway.get(key)
+            turn_limits[key] = _coerce_optional_positive_int(
+                raw, key if key in data else f"gateway.{key}",
+            )
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -1374,6 +1384,8 @@ class GatewayConfig:
             liveness_starvation_load_factor=liveness_starvation_load_factor,
             liveness_starvation_max_hold_s=liveness_starvation_max_hold_s,
             max_concurrent_sessions=max_concurrent_sessions,
+            max_concurrent_turns=turn_limits["max_concurrent_turns"],
+            startup_resume_concurrency=turn_limits["startup_resume_concurrency"] or 3,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
@@ -1548,6 +1560,12 @@ def load_gateway_config() -> GatewayConfig:
 
             if "max_concurrent_sessions" in yaml_cfg:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
+
+            for key in ("max_concurrent_turns", "startup_resume_concurrency"):
+                if key in yaml_cfg:
+                    gw_data[key] = yaml_cfg[key]
+                elif isinstance(gateway_section, dict) and key in gateway_section:
+                    gw_data[key] = gateway_section[key]
 
             streaming_cfg = yaml_cfg.get("streaming")
             if not isinstance(streaming_cfg, dict) and isinstance(gateway_section, dict):

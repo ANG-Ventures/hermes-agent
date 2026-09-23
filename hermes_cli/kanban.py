@@ -744,14 +744,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
-    p_complete.add_argument("--survivor-ref", default=None, metavar="URL#SHA",
+    p_complete.add_argument("--survivor-ref", default=None, action="append", metavar="[REPO=]URL#SHA",
                             help="Name an external survivor when the implementation lives on a "
-                                 "remote, not in the workspace. Verified with git ls-remote; "
-                                 "an unverifiable claim refuses the completion.")
-    p_complete.add_argument("--survivor-pr", default=None, metavar="OWNER/REPO#N",
+                                 "remote, not in the workspace. Verified with git ls-remote "
+                                 "AND required to name this task: the SHA must resolve to a "
+                                 "single branch or tag tip whose ref name contains the task id. "
+                                 "An unverifiable claim, or one on an unrelated-looking ref, "
+                                 "refuses the completion (see --survivor-unbound). Repeatable: "
+                                 "qualify each claim as <workspace-relative-repo>=<claim> when "
+                                 "more than one recorded repository vanished.")
+    p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
-                                 "gh pr view (state OPEN or MERGED); an unverifiable claim "
-                                 "refuses the completion.")
+                                 "gh pr view (state OPEN or MERGED) AND required to name this "
+                                 "task; an unverifiable claim refuses the completion. Naming "
+                                 "the task in the PR's head BRANCH binds the claim. A match "
+                                 "only in the PR title or body is a mention, not a tie to this "
+                                 "card's work, so it is recorded as an unbound claim (see "
+                                 "--survivor-unbound) and never becomes standing authority to "
+                                 "delete the workspace later. Repeatable; same <repo>= qualifier "
+                                 "as --survivor-ref.")
+    p_complete.add_argument("--survivor-unbound", action="store_true",
+                            help="Operator override: accept a --survivor-ref/--survivor-pr that "
+                                 "is live but does NOT name this task, for the case where the "
+                                 "work really did land on an unrelated-looking branch. The claim "
+                                 "is still remote-verified; the override and the OS user (resolved "
+                                 "from the real uid, not $USER) are recorded on the survivor and "
+                                 "in the task event log. An unbound claim authorises THIS "
+                                 "completion only: a later reclamation will not reuse it.")
 
     p_edit = sub.add_parser(
         "edit",
@@ -1432,7 +1451,13 @@ def kanban_command(args: argparse.Namespace) -> int:
         try:
             return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
+            # A survivor refusal carries its operator-only hint on the
+            # exception, not in the persisted message, so render it HERE --
+            # at the boundary whose environment belongs to the caller actually
+            # reading the text. See kanban_survivor.render_override_hint.
+            from hermes_cli.kanban_survivor import render_override_hint
+
+            print(f"kanban: {render_override_hint(exc)}", file=sys.stderr)
             return 1
 
 
@@ -2809,12 +2834,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # Refuse instead of silently doing the wrong thing.
     survivor_ref = getattr(args, "survivor_ref", None)
     survivor_pr = getattr(args, "survivor_pr", None)
-    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr):
+    survivor_unbound = bool(getattr(args, "survivor_unbound", False))
+    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr or survivor_unbound):
         print(
-            "kanban: --summary / --metadata / --survivor-ref / --survivor-pr are per-task "
+            "kanban: --summary / --metadata / --survivor-ref / --survivor-pr / "
+            "--survivor-unbound are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
+            file=sys.stderr,
+        )
+        return 2
+    if survivor_unbound and not (survivor_ref or survivor_pr):
+        print(
+            "kanban: --survivor-unbound only relaxes the task-id binding on an explicit "
+            "--survivor-ref/--survivor-pr claim; pass one, or drop the flag.",
             file=sys.stderr,
         )
         return 2
@@ -2855,6 +2889,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
                 survivor_ref=survivor_ref,
                 survivor_pr=survivor_pr,
+                survivor_unbound=survivor_unbound,
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)

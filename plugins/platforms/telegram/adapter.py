@@ -10693,7 +10693,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         from gateway.sticker_cache import (
             get_cached_description,
-            cache_sticker_description,
+            cache_sticker_description_async,
             build_sticker_injection,
             build_animated_sticker_injection,
             STICKER_VISION_PROMPT,
@@ -10732,7 +10732,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             if result.get("success"):
                 description = result.get("analysis", "a sticker")
-                cache_sticker_description(sticker.file_unique_id, description, emoji, set_name)
+                await cache_sticker_description_async(sticker.file_unique_id, description, emoji, set_name)
                 event.text = build_sticker_injection(description, emoji, set_name)
             else:
                 # Vision failed -- use emoji as fallback

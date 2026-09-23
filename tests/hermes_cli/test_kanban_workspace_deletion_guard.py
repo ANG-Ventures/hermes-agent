@@ -516,6 +516,112 @@ def test_remove_board_archive_refuses_while_a_card_is_running(kanban_home):
     ), _audit_lines()
 
 
+def test_remove_board_refusal_leaves_the_active_board_pin_intact(kanban_home):
+    """A REFUSED removal must not silently re-point the operator at `default`.
+
+    FleetReview on #785: ``remove_board`` cleared ``<root>/kanban/current``
+    before running the liveness gate, so an operator who ran
+    ``boards switch mine`` then ``boards rm mine`` while a card was running
+    got the (correct) refusal -- and every subsequent ``kanban add`` / ``list``
+    / ``dispatch`` silently addressed the DEFAULT board, with no message
+    saying the pin had moved.
+    """
+    kb.create_board("pinned", name="Pinned")
+    kb.set_current_board("pinned")
+    assert kb.get_current_board() == "pinned"
+
+    with kb.connect_closing(board="pinned") as conn:
+        task_id = kb.create_task(conn, title="live", assignee="daedalus")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+
+    with pytest.raises(ValueError, match="running or holding"):
+        kb.remove_board("pinned", archive=True)
+
+    assert kb.board_dir("pinned").is_dir()
+    assert kb.get_current_board() == "pinned", (
+        "a refused removal reset the operator's active-board pin"
+    )
+
+
+@pytest.mark.parametrize("archive", [False, True], ids=["delete", "archive"])
+def test_remove_board_failure_leaves_the_active_board_pin_intact(
+    kanban_home, monkeypatch, archive
+):
+    """The pin moves only after the board directory actually goes away."""
+    kb.create_board("pinned", name="Pinned")
+    kb.set_current_board("pinned")
+    bdir = kb.board_dir("pinned")
+
+    if archive:
+        original_rename = Path.rename
+
+        def fail_board_rename(path, target):
+            if path == bdir:
+                raise OSError("forced archive failure")
+            return original_rename(path, target)
+
+        monkeypatch.setattr(Path, "rename", fail_board_rename)
+        expected = OSError
+    else:
+        monkeypatch.setattr(
+            "hermes_cli.kanban_survivor.remove_workspace_dir",
+            lambda *_args, **_kwargs: False,
+        )
+        expected = ValueError
+
+    with pytest.raises(expected):
+        kb.remove_board("pinned", archive=archive)
+
+    assert bdir.is_dir()
+    assert kb.get_current_board() == "pinned", (
+        "a failed removal reset the operator's active-board pin"
+    )
+
+
+@pytest.mark.parametrize("archive", [False, True], ids=["delete", "archive"])
+def test_successful_remove_board_clears_the_active_board_pin(kanban_home, archive):
+    """ALLOW control: a successful removal still reverts the pin to default."""
+    kb.create_board("pinned", name="Pinned")
+    kb.set_current_board("pinned")
+    bdir = kb.board_dir("pinned")
+
+    result = kb.remove_board("pinned", archive=archive)
+
+    assert result["action"] == ("archived" if archive else "deleted")
+    assert not bdir.exists()
+    assert kb.get_current_board() == "default"
+
+
+def test_board_liveness_gate_ignores_an_ambient_db_pin(kanban_home, monkeypatch):
+    """``HERMES_KANBAN_DB`` must not be able to answer for another board.
+
+    FleetReview on #785: ``_board_has_live_cards`` reached the board through
+    ``connect_closing(board=slug)``, and ``kanban_db_path`` gives the ambient
+    pin precedence even over an explicit board argument. In the routinely
+    pinned worker environment that means removing board B inspects board A's
+    tasks, concludes B is idle, and archives it out from under a live worker.
+    """
+    kb.create_board("busy", name="Busy")
+    kb.create_board("idle", name="Idle")
+    kb.init_db(board="idle")
+    with kb.connect_closing(board="busy") as conn:
+        task_id = kb.create_task(conn, title="live", assignee="daedalus")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+
+    # Pin the process at the IDLE board, as the dispatcher pins every worker.
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("idle") / "kanban.db"))
+
+    assert kb._board_has_live_cards("busy") == [task_id], (
+        "the ambient DB pin answered the liveness question for another board"
+    )
+    with pytest.raises(ValueError, match="running or holding"):
+        kb.remove_board("busy", archive=True)
+    assert kb.board_dir("busy").is_dir()
+
+
 def test_remove_board_archive_refuses_on_a_live_claim_lock(kanban_home):
     """Liveness is status OR an unexpired claim lock, on this branch too."""
     kb.create_board("locked", name="Locked")
@@ -1239,3 +1345,129 @@ def test_is_deletion_audit_path_recognises_every_durable_destination(kanban_home
         "workspace-deletions.txt",
     ):
         assert not kb.is_deletion_audit_path(Path("/any/dir") / name), name
+
+
+# ---------------------------------------------------------------------------
+# Cost. The choke point is on `kanban gc`'s hot path, once per archived
+# scratch row, and in steady state almost every one of those workspaces was
+# already removed at completion (FleetReview on PR #785).
+# ---------------------------------------------------------------------------
+
+def test_a_vanished_workspace_costs_no_owner_scan_and_no_audit_line(kanban_home):
+    """An absent directory must short-circuit before the expensive gates.
+
+    `_live_owners_of_path` opens a connection and full-scans `tasks`,
+    resolving every row's path. Running that for a path with nothing at it --
+    and appending a permanent REFUSED line to a log that is deliberately
+    never reaped -- turned `kanban gc` into minutes of syscalls and unbounded
+    audit noise for zero removals.
+    """
+    root = _scratch_root()
+    task_id = _mktask("already cleaned")
+    gone = root / task_id
+    assert not gone.exists()
+
+    before = len(_audit_lines())
+    scans = {"n": 0}
+    real = kb._live_owners_of_path
+
+    def counting(*a, **kw):
+        scans["n"] += 1
+        return real(*a, **kw)
+
+    kb._live_owners_of_path = counting
+    try:
+        with kb.connect_closing() as conn:
+            removed = kb.safe_remove_workspace_dir(
+                gone, task_id=task_id, reason="gc_archived", conn=conn,
+            )
+    finally:
+        kb._live_owners_of_path = real
+
+    assert removed is False
+    assert scans["n"] == 0, "a vanished workspace still paid for an owner scan"
+    assert len(_audit_lines()) == before, (
+        "a vanished workspace appended a permanent, never-reapable audit line"
+    )
+
+
+def test_owner_lookup_reuses_the_callers_connection_for_the_same_board(kanban_home):
+    """No second connection to a database the caller already has open.
+
+    Completion calls this while holding the completing task's connection; a
+    redundant connection to the same file is pure cost on that path.
+    """
+    root = _scratch_root()
+    task_id = _mktask("owner")
+    ws = root / task_id
+    ws.mkdir()
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), task_id)
+        )
+        conn.commit()
+
+        opened: list = []
+        real = kb.connect
+
+        def counting(*a, **kw):
+            opened.append(kw.get("board"))
+            return real(*a, **kw)
+
+        kb.connect = counting
+        try:
+            owners = kb._live_owners_of_path(ws, conn=conn, live_only=False)
+        finally:
+            kb.connect = real
+
+    assert owners == [task_id], owners
+    assert opened == [], f"opened a redundant connection: {opened}"
+
+
+def test_completion_commits_before_cleanup_so_the_workspace_is_removed(kanban_home):
+    """DISPUTE evidence for the "Completion cleanup gated" finding (#785).
+
+    The finding argued that `complete_task` passes the completing card's own
+    id into the new liveness gates, so if the terminal status and the claim
+    were not already committed, EVERY successful completion would silently
+    skip workspace removal and completed workspaces would accumulate.
+
+    Measured: they are. `complete_task` writes `status='done'`,
+    `claim_lock=NULL`, `claim_expires=NULL` inside `write_txn` BEFORE
+    `_cleanup_workspace` runs, so self-liveness is already False by then and
+    the directory is removed. This test pins that ORDERING, which is the load
+    bearing fact -- if a future change moves cleanup inside the transaction,
+    the gate really would refuse every completion and this goes red.
+    """
+    root = _scratch_root()
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="completes", assignee="daedalus", workspace_kind="scratch",
+        )
+        ws = root / task_id
+        ws.mkdir(parents=True)
+        (ws / "work.txt").write_text("ephemeral\n", encoding="utf-8")
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), task_id)
+        )
+        conn.commit()
+
+        # Claim it exactly as the dispatcher does: running + a live lock, the
+        # two conditions `_task_has_live_run` refuses on.
+        assert kb.claim_task(conn, task_id, claimer="probe:1", ttl_seconds=900)
+        assert kb.get_task(conn, task_id).status == "running"
+
+        assert kb.complete_task(conn, task_id, result="done", summary="s") is True
+
+        row = conn.execute(
+            "SELECT status, claim_expires FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+
+    assert row["status"] == "done"
+    assert row["claim_expires"] is None
+    assert not ws.exists(), (
+        "completion left its scratch workspace behind — the self-liveness "
+        "gate refused a card that had already been committed terminal"
+    )
+    lines = _audit_lines()
+    assert any("\tDELETE\t" in ln and "reason=complete_task" in ln for ln in lines), lines

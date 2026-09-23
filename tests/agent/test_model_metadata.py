@@ -1916,6 +1916,43 @@ class TestGrok46StaleCacheGuard:
         assert ctx == 500_000
 
 
+class TestGrok47StaleCacheGuard:
+    """grok-4.7 (GA 2026-09-21) is 500K. Without its own catalog entry it falls
+    through the generic 'grok-4' catch-all to 256,000 — a HALF-SIZE window that
+    never errors, it just compacts ~2x too early forever. Same failure the 4.6
+    guard above exists for; this pins the new flagship on the day it ships.
+    Official card: 500,000 context (docs.x.ai/developers/models/grok-4.7).
+    """
+
+    def test_grok_4_7_catalog_entry_is_500k(self):
+        from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+        assert DEFAULT_CONTEXT_LENGTHS.get("grok-4.7") == 500_000
+
+    def test_stale_grok_4_7_detected_by_generic_guard(self):
+        from agent.model_metadata import _stale_pre_catalog_cache_entry
+        # 256,000 is the old grok-4 catch-all value — stale for grok-4.7 (500K).
+        assert _stale_pre_catalog_cache_entry("grok-4.7", 256_000)
+        assert _stale_pre_catalog_cache_entry("xai/grok-4.7", 256_000)
+        assert _stale_pre_catalog_cache_entry("x-ai/grok-4.7", 256_000)
+        # Correct/probed values are never dropped.
+        assert not _stale_pre_catalog_cache_entry("grok-4.7", 500_000)
+        # Sibling slugs with correct catalog values are untouched.
+        assert not _stale_pre_catalog_cache_entry("grok-4", 256_000)
+        assert not _stale_pre_catalog_cache_entry("grok-4.6", 500_000)
+
+    def test_stale_grok_4_7_dropped_and_reresolves_to_500k(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        import agent.model_metadata as mm
+        importlib.reload(mm)
+        base = "https://api.x.ai/v1"
+        mm.save_context_length("grok-4.7", base, 256_000)
+        ctx = mm.get_model_context_length(
+            "grok-4.7", base_url=base, api_key="", provider="xai"
+        )
+        assert ctx == 500_000
+
+
 class TestGenericPreCatalogStaleGuard:
     """Generic _stale_pre_catalog_cache_entry guard: models whose catalog
     entry postdates a shorter catch-all (qwen3.6-plus, grok-4-fast,
