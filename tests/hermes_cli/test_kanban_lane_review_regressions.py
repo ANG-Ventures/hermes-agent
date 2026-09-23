@@ -1,0 +1,108 @@
+"""Independent review regressions for lane routing and batch controls."""
+import json
+
+import pytest
+
+from hermes_cli import kanban as kc, kanban_db as kb
+from tests.hermes_cli.test_kanban_batch_set_model import _create, kanban_home
+
+
+def test_explicit_batch_rejects_archived_atomically(kanban_home):
+    first = _create('first', 'worker')
+    second = _create('second', 'worker')
+    with kb.connect() as conn:
+        kb.archive_task(conn, second)
+    out = kc.run_slash(f'set-model {first} {second} model-a --provider batch-provider')
+    assert 'archived' in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, first).model_override is None
+
+
+def test_explicit_batch_rejects_malformed_id_atomically(kanban_home):
+    first = _create('first', 'worker')
+    out = kc.run_slash(f'set-model {first} t-broken model-a --provider batch-provider')
+    assert 't-broken' in out and ('invalid' in out or 'no such' in out)
+    with kb.connect() as conn:
+        assert kb.get_task(conn, first).model_override is None
+
+
+def test_json_override_round_trip_and_ttl_rejected_on_card(kanban_home):
+    first = _create('first', 'worker')
+    payload = json.dumps({'model': 'model-a', 'provider': 'batch-provider', 'reasoning_effort': 'high'}, separators=(',', ':'))
+    out = kc.run_slash(f"set-model {first} --model-json '{payload}'")
+    assert 'unrecognized arguments' not in out
+    with kb.connect() as conn:
+        task = kb.get_task(conn, first)
+        assert (task.model_override, task.provider_override, task.reasoning_effort) == ('model-a', 'batch-provider', 'high')
+    out = kc.run_slash(f'''set-model {first} --model-json '{{"model":"model-b","ttl":"2h"}}' ''')
+    assert 'ttl' in out.lower()
+    with kb.connect() as conn:
+        assert kb.get_task(conn, first).model_override == 'model-a'
+
+
+def test_model_flag_and_provider_only_json_preserve_model(kanban_home):
+    first = _create('first', 'worker')
+    assert 'model-a' in kc.run_slash(f'set-model {first} --model model-a --provider batch-provider')
+    assert 'model-a' in kc.run_slash(f'''set-model {first} --model-json '{{"provider":"batch-provider"}}' ''')
+    with kb.connect() as conn:
+        task = kb.get_task(conn, first)
+        assert (task.model_override, task.provider_override) == ('model-a', 'batch-provider')
+
+
+def test_lane_json_round_trip_and_firepower_guard(kanban_home):
+    payload = '{"model":"claude-fable-5","provider":"batch-provider","ttl":"2h","reasoning_effort":"high"}'
+    out = kc.run_slash(f"lane-model set --model-json '{payload}' --reason capacity")
+    assert 'firepower' in out.lower()
+    with kb.connect() as conn:
+        assert kb.get_lane_model_override(conn) is None
+    payload = '{"model":"model-a","provider":"batch-provider","ttl":"2h","reasoning_effort":"high"}'
+    out = kc.run_slash(f"lane-model set --model-json '{payload}' --reason capacity")
+    assert 'route=batch-provider/model-a' in out
+    with kb.connect() as conn:
+        assert kb.get_lane_model_override(conn).reasoning_effort == 'high'
+
+
+def test_lane_reason_and_effort_round_trip(kanban_home):
+    out = kc.run_slash('lane-model set --provider batch-provider --model model-a --ttl 2h')
+    assert 'reason' in out.lower()
+    with kb.connect() as conn:
+        assert kb.list_lane_model_overrides(conn) == []
+    out = kc.run_slash('lane-model set --provider batch-provider --model model-a --ttl 2h --reason test --effort high')
+    assert 'unrecognized arguments' not in out
+    with kb.connect() as conn:
+        row = kb.get_lane_model_override(conn)
+        assert row.reasoning_effort == 'high'
+
+
+def test_clear_reports_effective_lane_route(kanban_home):
+    first = _create('first', 'worker')
+    kc.run_slash('lane-model set batch-provider/model-a --ttl 2h --reason test')
+    kc.run_slash(f'set-model {first} model-b --provider batch-provider')
+    out = kc.run_slash(f'set-model {first} none')
+    assert 'batch-provider/model-a' in out
+
+
+def test_capped_profile_admits_healthy_lane_and_blocks_capped_effective_route(kanban_home, monkeypatch):
+    from hermes_cli import kanban_provider_health as health
+    import hermes_cli.profiles as profiles
+    profile = kanban_home / 'profiles' / 'worker'
+    profile.mkdir(parents=True)
+    (profile / 'config.yaml').write_text('model:\n  provider: profile-provider\n  default: profile-model\n')
+    monkeypatch.setattr(profiles, 'profile_exists', lambda _: True)
+    lane_only = _create('lane-only', 'worker')
+    pinned_profile = _create('pinned-profile', 'worker')
+    with kb.connect() as conn:
+        kb.set_model_override(conn, pinned_profile, 'profile-model', provider='profile-provider')
+        kb.set_lane_model_override(conn, provider='batch-provider', model='model-a', expires_at=9999999999, reason='capacity')
+    monkeypatch.setattr(health, 'configured_probes', lambda: {'profile-provider': 'http://health.invalid/'})
+
+    class Capped:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, count): return b'{"status":"all_capped"}'
+    monkeypatch.setattr(health.urllib.request, 'urlopen', lambda url, timeout=None: Capped())
+    launches = []
+    with kb.connect() as conn:
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace, **kw: launches.append(task.id) or 12345, max_spawn=20)
+    assert lane_only in launches
+    assert (pinned_profile, 'provider_capped') in result.respawn_guarded

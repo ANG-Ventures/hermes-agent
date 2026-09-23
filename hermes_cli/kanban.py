@@ -601,6 +601,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="One or more task ids. Omit when selecting with "
              "--where/--all-active. The LAST positional is the model.",
     )
+    p_set_model.add_argument("--model", default=None, help="Model id (alternative to the last positional).")
+    p_set_model.add_argument("--model-json", default=None, help="Unified override object as JSON.")
     p_set_model.add_argument(
         "--provider", default=None,
         help="Provider the model belongs to (worker is spawned with "
@@ -660,6 +662,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     _lane_set.add_argument("--provider", default=None)
     _lane_set.add_argument("--model", default=None)
+    _lane_set.add_argument("--model-json", default=None, help="Unified override object as JSON.")
+    _lane_set.add_argument("--effort", default=None, dest="reasoning_effort")
     _lane_set.add_argument(
         "--ttl", default=None, required=False, metavar="DURATION",
         help="How long the override lives (30m, 2h, 1d). Required — an "
@@ -2528,6 +2532,8 @@ def _select_batch_tasks(
             task = kb.get_task(conn, task_id)
             if task is None:
                 return [], f"no such task: {task_id}"
+            if task.status not in _ACTIVE_STATUSES:
+                return [], f"cannot set model override on {task.status} task {task_id}"
             tasks.append(task)
         return tasks, None
 
@@ -2554,6 +2560,32 @@ def _select_batch_tasks(
 _TASK_ID_RE = re.compile(r"^t_\w+$", re.IGNORECASE)
 
 
+def _cli_model_override(args, *, allow_ttl=False):
+    """Parse the shared override object; explicit flags may not conflict with JSON."""
+    from hermes_cli.model_override import parse_model_override
+
+    text = getattr(args, "model_json", None)
+    flags = {
+        key: value for key, value in (
+            ("model", getattr(args, "model", None)),
+            ("provider", getattr(args, "provider", None)),
+            ("reasoning_effort", getattr(args, "reasoning_effort", None)),
+            ("firepower", getattr(args, "firepower", None)),
+            ("ttl", getattr(args, "ttl", None)),
+        ) if value is not None and (allow_ttl or key != "ttl")
+    }
+    if text is not None:
+        if flags:
+            raise ValueError("--model-json cannot be combined with model override flags")
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--model-json: {exc}") from exc
+    else:
+        raw = flags or None
+    return parse_model_override(raw, field="model", allow_ttl=allow_ttl)
+
+
 def _split_ids_and_model(
     positionals: list[str],
 ) -> tuple[list[str], Optional[str], bool]:
@@ -2567,23 +2599,41 @@ def _split_ids_and_model(
 
     ids = [tok for tok in positionals if _TASK_ID_RE.match(tok)]
     rest = [tok for tok in positionals if not _TASK_ID_RE.match(tok)]
+    if len(rest) > 1 or (ids and any(tok.startswith("t-") or tok.startswith("t_") for tok in rest)):
+        raise ValueError(f"invalid task id or extra positional: {', '.join(rest)}")
     if not rest:
         return ids, None, False
-    return ids, rest[-1], True
+    return ids, rest[0], True
 
 
 def _cmd_set_model(args: argparse.Namespace) -> int:
     positionals = list(getattr(args, "task_ids", None) or [])
-    parsed_ids, raw_model, model_given = _split_ids_and_model(positionals)
+    try:
+        parsed_ids, raw_model, model_given = _split_ids_and_model(positionals)
+        if raw_model is not None and getattr(args, "model", None) is not None:
+            raise ValueError("model given both positionally and with --model")
+        if (getattr(args, "provider", None) and getattr(args, "reasoning_effort", None)
+                and not (raw_model or getattr(args, "model", None) or getattr(args, "model_json", None))):
+            raise ValueError("--provider requires a model when combined with --effort")
+        args.model = raw_model if model_given else getattr(args, "model", None)
+        if getattr(args, "reasoning_effort", None) is not None:
+            args.reasoning_effort = kb.normalize_reasoning_effort(args.reasoning_effort)
+        clearing = args.model is None or str(args.model).lower() in {"none", "-", "null", ""}
+        if clearing and not getattr(args, "model_json", None):
+            args.model = None
+        override = _cli_model_override(args) if (not clearing or getattr(args, "model_json", None)
+                                                 or getattr(args, "provider", None)
+                                                 or getattr(args, "reasoning_effort", None)) else None
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     args.task_ids = parsed_ids
-    args.model = raw_model
-    model = raw_model
-    if model is not None and model.lower() in {"none", "-", "null", ""}:
-        model = None
-    provider = getattr(args, "provider", None)
-    effort = getattr(args, "reasoning_effort", None)
+    model = override.model if override else None
+    provider = override.provider if override else getattr(args, "provider", None)
+    model_given = model_given or getattr(args, "model_json", None) is not None or bool(model) or bool(provider)
+    effort = override.reasoning_effort if override else getattr(args, "reasoning_effort", None)
     clear_effort = bool(getattr(args, "clear_effort", False))
-    firepower_reason = getattr(args, "firepower", None)
+    firepower_reason = override.firepower if override else getattr(args, "firepower", None)
     from hermes_cli.model_policy import (
         firepower_guard_error,
         format_firepower_audit,
@@ -2650,19 +2700,37 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             if not tasks:
                 print("kanban: selector matched no tasks", file=sys.stderr)
                 return 1
-            firepower = is_firepower_model(model)
-            audit_author = _profile_author() if firepower else None
-            audit_body = (
-                format_firepower_audit(model, provider, firepower_reason)
-                if firepower else None
-            )
+            # A provider-only object retains each card's current model. Resolve
+            # the whole batch before writing so a missing profile route cannot
+            # leave earlier cards half-updated.
+            inherited_models: dict[str, str] = {}
+            if touch_model and provider and not model:
+                for task in tasks:
+                    inherited = task.model_override or kb.effective_worker_route(task).split("/", 1)[-1]
+                    if not inherited or inherited == "unknown":
+                        print(f"kanban: cannot resolve model for {task.id}", file=sys.stderr)
+                        return 2
+                    guard = firepower_guard_error(inherited, firepower_reason)
+                    if guard:
+                        print(f"kanban: {guard}", file=sys.stderr)
+                        return 2
+                    inherited_models[task.id] = inherited
             applied: list[tuple[str, bool]] = []
+            cleared_routes: dict[str, str] = {}
             for task in tasks:
+                if touch_model and not model and not provider:
+                    lane = kb.get_lane_model_override(conn, assignee=task.assignee)
+                    cleared_routes[task.id] = lane.route if lane else "profile-default"
                 if touch_model:
+                    effective_model = model or inherited_models.get(task.id)
+                    firepower = is_firepower_model(effective_model)
                     ok = kb.set_model_override(
-                        conn, task.id, model, provider=provider,
-                        audit_comment_author=audit_author,
-                        audit_comment_body=audit_body,
+                        conn, task.id, effective_model, provider=provider,
+                        audit_comment_author=_profile_author() if firepower else None,
+                        audit_comment_body=(
+                            format_firepower_audit(effective_model, provider, firepower_reason)
+                            if firepower else None
+                        ),
                     )
                     if not ok:
                         print(f"no such task: {task.id}", file=sys.stderr)
@@ -2704,8 +2772,8 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     for task_id, redispatched in applied:
         applies = "redispatch" if redispatched else "next-dispatch"
         if single:
-            if touch_model and model:
-                label = f"{provider}:{model}" if provider else model
+            if touch_model and (model or provider):
+                label = f"{provider}:{model or inherited_models[task_id]}" if provider else model
                 suffix = (
                     " (reclaimed; redispatches now)" if redispatched
                     else " (applies on next dispatch)"
@@ -2713,7 +2781,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 print(f"Set model override on {task_id}: {label}{suffix}")
             elif touch_model:
                 print(f"Cleared model override on {task_id} "
-                      "(worker uses its profile default)")
+                      f"(next route={cleared_routes[task_id]})")
             if clear_effort:
                 print(f"Cleared reasoning effort on {task_id} "
                       "(worker uses its profile's agent.reasoning_effort)")
@@ -2721,12 +2789,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 print(f"Set reasoning effort on {task_id}: {effort} "
                       "(applies on next dispatch)")
             continue
-        if touch_model and model:
-            route = f"{provider}/{model}" if provider else model
+        if touch_model and (model or provider):
+            route = f"{provider}/{model or inherited_models[task_id]}" if provider else model
             print(f"{task_id}: route={route} applies={applies}")
         elif touch_model:
             print(
-                f"{task_id}: route=profile-default applies={applies} "
+                f"{task_id}: route={cleared_routes[task_id]} applies={applies} "
                 "(model override cleared)"
             )
         if clear_effort:
@@ -2759,6 +2827,9 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
     provider = getattr(args, "provider", None)
     model = getattr(args, "model", None)
     route = getattr(args, "route", None)
+    if route and (provider or model or getattr(args, "model_json", None)):
+        print("kanban: route cannot be combined with --model/--provider/--model-json", file=sys.stderr)
+        return 2
     if route:
         # `provider/model` is the primary spelling; the split is on the FIRST
         # slash so model ids that themselves contain slashes survive intact.
@@ -2770,6 +2841,16 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
             )
             return 2
         provider, model = head, tail
+    if route:
+        args.provider, args.model = provider, model
+    try:
+        parsed = _cli_model_override(args, allow_ttl=True)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    provider = parsed.provider if parsed else None
+    model = parsed.model if parsed else None
+    reasoning_effort = parsed.reasoning_effort if parsed else None
     if not provider or not model:
         print(
             "kanban: lane-model set needs <provider>/<model> "
@@ -2778,7 +2859,7 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
         )
         return 2
 
-    ttl_raw = getattr(args, "ttl", None)
+    ttl_raw = parsed.ttl if parsed else None
     if not ttl_raw:
         # The TTL is the whole point: it is what makes this different from
         # editing a profile's config.yaml and forgetting to revert it.
@@ -2799,14 +2880,17 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
         print(f"kanban: {provider_error}", file=sys.stderr)
         return 2
 
-    firepower_reason = getattr(args, "firepower", None)
+    firepower_reason = parsed.firepower if parsed else None
     guard_error = firepower_guard_error(model, firepower_reason)
     if guard_error:
         print(f"kanban: {guard_error}", file=sys.stderr)
         return 2
 
     assignee = getattr(args, "assignee", None)
-    reason = getattr(args, "reason", None)
+    reason = (getattr(args, "reason", None) or "").strip()
+    if not reason:
+        print("kanban: lane-model set requires --reason", file=sys.stderr)
+        return 2
     now = int(time.time())
     with kb.connect_closing() as conn:
         override = kb.set_lane_model_override(
@@ -2814,6 +2898,7 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
             provider=provider,
             model=model,
             expires_at=now + ttl_seconds,
+            reasoning_effort=reasoning_effort,
             reason=reason,
             assignee=assignee,
             firepower=firepower_reason,

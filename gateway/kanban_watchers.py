@@ -302,18 +302,24 @@ _FAULT_FIELDS = (
 )
 
 
-def _format_spawn_routes(routes) -> str:
-    """Format one explicit provider/model announcement per spawned task."""
+def _format_spawn_routes(routes, sources=None) -> str:
+    """Format provider/model and source for every spawned task."""
 
     from hermes_cli.model_policy import route_kind
 
     entries = dict(routes or {})
     if not entries:
         return "routes=-"
+    sources = dict(sources or {})
     return "routes=" + "; ".join(
-        f"{task_id} route={route} kind={route_kind(route)}"
+        f"{task_id} route={route} source={sources.get(task_id, 'profile-default')} "
+        f"kind={route_kind(route)}"
         for task_id, route in entries.items()
     )
+
+
+def _format_lane_expiry(lane, route) -> str:
+    return f"lane-model expired -> profile default ({lane}: {route})"
 
 
 def _format_respawn_guarded_summary(guarded) -> str:
@@ -2288,6 +2294,9 @@ class GatewayKanbanWatchersMixin:
                         guarded = getattr(res, "respawn_guarded", None) if res is not None else None
                         if spawned:
                             any_spawned = True
+                        expired = getattr(res, "expired_lane_models", None) if res is not None else None
+                        for lane, route in (expired or []):
+                            logger.info("kanban dispatcher [%s]: %s", slug, _format_lane_expiry(lane, route))
                         if res is not None and (spawned or guarded):
                             # Quiet by default — log only actionable tick activity,
                             # including guarded tasks that would otherwise be silent.
@@ -2302,7 +2311,8 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                                 _format_spawn_routes(
-                                    getattr(res, "spawn_routes", None)
+                                    getattr(res, "spawn_routes", None),
+                                    getattr(res, "spawn_route_sources", None),
                                 ),
                                 _format_respawn_guarded_summary(guarded),
                             )

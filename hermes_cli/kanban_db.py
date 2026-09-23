@@ -2251,6 +2251,7 @@ CREATE TABLE IF NOT EXISTS lane_model_overrides (
     assignee     TEXT PRIMARY KEY,   -- '' == board-wide lane (NULL can't be a PK)
     provider     TEXT NOT NULL,
     model        TEXT NOT NULL,
+    reasoning_effort TEXT,
     reason       TEXT,
     firepower    TEXT,               -- justification when the model is flagship-class
     created_by   TEXT,
@@ -3546,6 +3547,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # own agent.reasoning_effort, which is what existing rows were getting.
         _add_column_if_missing(
             conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
+        )
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lane_model_overrides'"
+    ).fetchone():
+        _add_column_if_missing(
+            conn, "lane_model_overrides", "reasoning_effort", "reasoning_effort TEXT"
         )
 
     if "goal_mode" not in cols:
@@ -13355,6 +13362,7 @@ def _dispatch_once_locked(
         if task is None:
             return False
         task.assignee = assignee
+        apply_lane_model_override(task, _lane_override_for(assignee), now=_tick_now)
         payload = capped_provider(task, health_probes, health_cache)
         if payload is None:
             return False
@@ -14190,6 +14198,7 @@ class LaneModelOverride:
     assignee: Optional[str]
     provider: str
     model: str
+    reasoning_effort: Optional[str] = None
     reason: Optional[str] = None
     firepower: Optional[str] = None
     created_by: Optional[str] = None
@@ -14212,6 +14221,7 @@ def _lane_model_row(row) -> LaneModelOverride:
         assignee=(row["assignee"] or None),
         provider=row["provider"],
         model=row["model"],
+        reasoning_effort=row["reasoning_effort"],
         reason=row["reason"],
         firepower=row["firepower"],
         created_by=row["created_by"],
@@ -14226,6 +14236,7 @@ def set_lane_model_override(
     provider: str,
     model: str,
     expires_at: int,
+    reasoning_effort: Optional[str] = None,
     reason: Optional[str] = None,
     assignee: Optional[str] = None,
     firepower: Optional[str] = None,
@@ -14243,22 +14254,23 @@ def set_lane_model_override(
     with write_txn(conn):
         conn.execute(
             "INSERT INTO lane_model_overrides "
-            "(assignee, provider, model, reason, firepower, created_by, "
+            "(assignee, provider, model, reasoning_effort, reason, firepower, created_by, "
             " created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(assignee) DO UPDATE SET "
             "  provider=excluded.provider, model=excluded.model, "
+            "  reasoning_effort=excluded.reasoning_effort, "
             "  reason=excluded.reason, firepower=excluded.firepower, "
             "  created_by=excluded.created_by, created_at=excluded.created_at, "
             "  expires_at=excluded.expires_at",
             (
-                key, provider, model, reason, firepower, created_by,
+                key, provider, model, reasoning_effort, reason, firepower, created_by,
                 created, int(expires_at),
             ),
         )
     return LaneModelOverride(
         assignee=(key or None), provider=provider, model=model,
-        reason=reason, firepower=firepower, created_by=created_by,
+        reasoning_effort=reasoning_effort, reason=reason, firepower=firepower, created_by=created_by,
         created_at=created, expires_at=int(expires_at),
     )
 
@@ -14377,6 +14389,8 @@ def apply_lane_model_override(
         return None
     task.model_override = override.model
     task.provider_override = override.provider
+    if task.reasoning_effort is None:
+        task.reasoning_effort = override.reasoning_effort
     return f"lane-override({override.ttl_remaining(now)}s remaining)"
 
 
