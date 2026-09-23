@@ -445,3 +445,87 @@ def test_migration_adds_perclass_columns_to_old_db(tmp_path, monkeypatch):
         assert col in cols2, f"{col} not migrated into the old-shape DB"
     # idempotent: a further open must not raise
     store._connect().close()
+
+
+# ---------------------------------------------------------------------------
+# Rolling-window reads must not SCAN the ledger (card t_93776e8f)
+# ---------------------------------------------------------------------------
+# The kanban budget brake sums cost_usd over a 24h ts_start window on EVERY
+# profile ledger, every dispatcher tick. Without an index on ts_start the
+# planner picks SCAN turns, and `turns` is overflow-page-heavy (user_text /
+# final_text previews), so a few-thousand-row table is tens of MB of read.
+# These gate the PLAN, not the mere presence of an index row: a named index
+# the planner never picks would be inert.
+
+BUDGET_QUERY = (
+    "SELECT cost_usd, user_text FROM turns "
+    "WHERE ts_start >= ? AND cost_usd IS NOT NULL AND user_text IS NOT NULL"
+)
+
+
+def _plan(conn, sql, params):
+    return " ".join(
+        str(r[-1]) for r in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+    )
+
+
+def test_budget_window_query_uses_the_ts_start_index(tmp_path, monkeypatch):
+    """The kanban-budget window read must SEARCH, never SCAN."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for i in range(200):
+        store.insert_turn(make_record(f"turn-window-{i}", ts_start=1000.0 + i))
+    conn = store._connect()
+    try:
+        conn.execute("ANALYZE")
+        plan = _plan(conn, BUDGET_QUERY, (1100,))
+    finally:
+        conn.close()
+    assert "idx_blackbox_turns_ts_start" in plan, plan
+    assert "SCAN turns" not in plan, plan
+
+
+def test_ts_start_index_is_migrated_into_a_preexisting_ledger(tmp_path, monkeypatch):
+    """A ledger created before the index exists gains it on the next connect.
+
+    The live fleet ledgers are all pre-existing, so the index is worthless
+    unless _ensure_schema adds it to an already-populated DB.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db_path = store._db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(str(db_path))
+    # Pre-index shape: the original column set, no ts_start index.
+    legacy.execute(
+        """
+        CREATE TABLE turns (
+            turn_id TEXT PRIMARY KEY, parent_turn_id TEXT, is_subagent INT,
+            ts_start REAL, ts_end REAL, profile TEXT, provider TEXT, model TEXT,
+            platform TEXT, chat_id TEXT, chat_name TEXT, api_calls INT, tools TEXT,
+            input_tokens INT, output_tokens INT, cache_read INT, cache_write INT,
+            reasoning INT, context_used INT, context_length INT, cost_usd REAL,
+            cost_status TEXT, interrupted INT, alerted INT DEFAULT 0,
+            user_text TEXT, final_text TEXT
+        )
+        """
+    )
+    legacy.executemany(
+        "INSERT INTO turns (turn_id, ts_start, cost_usd, user_text) "
+        "VALUES (?, ?, 1.0, 'work kanban task t_deadbeef')",
+        [(f"legacy-{i}", 1000.0 + i) for i in range(200)],
+    )
+    legacy.commit()
+    pre_plan = _plan(legacy, BUDGET_QUERY, (1100,))
+    legacy.close()
+    # RED control: without the index this same query scans.
+    assert "SCAN turns" in pre_plan, pre_plan
+
+    conn = store._connect()  # runs _ensure_schema
+    try:
+        names = {r[1] for r in conn.execute("PRAGMA index_list(turns)")}
+        conn.execute("ANALYZE")
+        post_plan = _plan(conn, BUDGET_QUERY, (1100,))
+    finally:
+        conn.close()
+    assert "idx_blackbox_turns_ts_start" in names, names
+    assert "idx_blackbox_turns_ts_start" in post_plan, post_plan
+    assert "SCAN turns" not in post_plan, post_plan
