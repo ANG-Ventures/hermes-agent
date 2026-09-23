@@ -136,3 +136,24 @@ def test_open_loop_rebound_callable_does_not_hide_log(tmp_path, prefix, inside):
         + "    d=json.loads(line)\n" + inside
     )
     assert guard(f"python3 - <<'PY'\n{body}PY", cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("binding,nested", [
+    ("match J():\n    case json: pass\n", False),
+    ("match [J()]:\n    case [*json]: pass\n", False),
+    ("match {'item': J()}:\n    case {**json}: pass\n", False),
+    ("try: raise J()\nexcept J as json:\n", True),
+    ("async def json(): pass\n", False),
+])
+def test_open_loop_non_name_binding_does_not_hide_log(tmp_path, binding, nested):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    loop = (
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    d=json.loads(line)\n"
+        "    print(d)\n"
+    )
+    assert not guard(f"python3 - <<'PY'\nimport json\n{loop}PY", cwd=str(tmp_path))
+    unsafe = "import json, os\nclass J(Exception):\n    loads=staticmethod(os.system)\n" + binding
+    unsafe += "".join("    " + line for line in loop.splitlines(keepends=True)) if nested else loop
+    assert guard(f"python3 - <<'PY'\n{unsafe}PY", cwd=str(tmp_path))
