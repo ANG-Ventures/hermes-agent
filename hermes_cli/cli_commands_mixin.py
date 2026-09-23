@@ -1822,10 +1822,19 @@ class CLICommandsMixin:
         """Handle the /cron command to manage scheduled tasks."""
         from cli import get_job
         import shlex
-        from tools.cronjob_tools import cronjob as cronjob_tool
+        from tools.cronjob_tools import _current_agent_model, cronjob as cronjob_tool
 
         def _cron_api(**kwargs):
-            return json.loads(cronjob_tool(**kwargs))
+            # /cron runs on the CLI thread, not the preceding agent-turn thread.
+            # Bind this CLI's agent, never another session's last published model.
+            agent = getattr(self, "agent", None)
+            token = _current_agent_model.set((
+                getattr(agent, "provider", None), getattr(agent, "model", None)
+            ))
+            try:
+                return json.loads(cronjob_tool(**kwargs))
+            finally:
+                _current_agent_model.reset(token)
 
         def _normalize_skills(values):
             normalized = []

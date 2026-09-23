@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -207,5 +208,55 @@ def test_interleaved_turn_cannot_auto_pin_other_agents_flagship(tmp_path, monkey
         else:
             assert not job.get("allow_flagship_reason")
             assert not any("flagship override: cron" in record.message for record in caplog.records)
+    finally:
+        ct.set_current_agent_model(None, None)
+
+
+@pytest.mark.parametrize("creator_model", ["claude-opus-5", "claude-fable-5"])
+def test_cli_cron_add_pins_own_agent_across_turn_thread(tmp_path, monkeypatch, caplog, capsys, creator_model):
+    from cron.jobs import load_jobs
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+    from tools import cronjob_tools as ct
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"cron": {"default_model": "auto"}})
+    cli = CLICommandsMixin.__new__(CLICommandsMixin)
+    setattr(cli, "agent", SimpleNamespace(provider="claude-apr", model=creator_model))
+    # The agent turn publishes in its daemon thread; /cron runs on the CLI thread.
+    turn = threading.Thread(target=ct.set_current_agent_model, args=("claude-apr", creator_model))
+    turn.start()
+    turn.join(timeout=5)
+    assert not turn.is_alive()
+    assert ct.get_current_agent_model() == (None, None)
+    with caplog.at_level(logging.INFO):
+        cli._handle_cron_command('/cron add "every 1h" "Check status"')
+    assert "Created job" in capsys.readouterr().out
+    job, = load_jobs()
+    assert (job["model"], job["provider"]) == (creator_model, "claude-apr")
+    if creator_model == "claude-fable-5":
+        assert job["allow_flagship_reason"].startswith("auto-pin:")
+        assert any("flagship override: cron" in record.message for record in caplog.records)
+    else:
+        assert not job.get("allow_flagship_reason")
+        assert not any("flagship override: cron" in record.message for record in caplog.records)
+    assert ct.get_current_agent_model() == (None, None)
+
+
+def test_cli_cron_add_without_agent_does_not_inherit_ambient_flagship(tmp_path, monkeypatch, capsys):
+    from cron.jobs import load_jobs
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+    from tools import cronjob_tools as ct
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"cron": {"default_model": "auto"}})
+    cli = CLICommandsMixin.__new__(CLICommandsMixin)
+    ct.set_current_agent_model("claude-apr", "claude-fable-5")
+    try:
+        cli._handle_cron_command('/cron add "every 1h" "Check status"')
+        assert "Created job" in capsys.readouterr().out
+        job, = load_jobs()
+        assert job["model"] is None
+        assert not job.get("allow_flagship_reason")
+        assert ct.get_current_agent_model() == ("claude-apr", "claude-fable-5")
     finally:
         ct.set_current_agent_model(None, None)
