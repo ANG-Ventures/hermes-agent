@@ -49,8 +49,9 @@ overrides still work:
   above so every kanban path resolves from ``HERMES_HOME``. Required to
   sandbox kanban: redirecting ``HERMES_HOME`` alone does NOT isolate a
   process from the live board, because the pins outrank it and the
-  dispatcher injects them into every worker env. See
-  :func:`kanban_db_path`.
+  dispatcher injects them into every worker env. Since 2026-09-21 that
+  combination does not silently write to the live board either — it
+  RAISES ``KanbanPinDivergenceError``. See :func:`kanban_db_path`.
 
 The dispatcher injects ``HERMES_KANBAN_TASK``, ``HERMES_KANBAN_DB``,
 ``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into worker
@@ -720,6 +721,59 @@ def _warn_if_sandbox_neutralises_pins() -> None:
     )
 
 
+# The ``HERMES_KANBAN_DB`` pin and ``HERMES_HOME`` as they were when this
+# module was first imported. Load-bearing for telling the INCIDENT shape apart
+# from a caller that legitimately pins a DB of its own.
+#
+# The incident is specifically: the pin arrives INHERITED (the dispatcher puts
+# it in every worker's env) and the process then redirects ``HERMES_HOME`` to
+# sandbox itself. The pin is unchanged from startup; ``HERMES_HOME`` is not.
+#
+# A test fixture or tool that sets ``HERMES_KANBAN_DB`` itself has *chosen* that
+# path — measured on tests/gateway/test_kanban_notifier.py and 8 sibling files,
+# which pin a per-test tmp DB while ``HERMES_HOME`` is a different tmp dir. That
+# is not a divergence to refuse; a blanket refusal broke 33 such tests.
+_PIN_AT_IMPORT = os.environ.get("HERMES_KANBAN_DB", "").strip()
+_HERMES_HOME_AT_IMPORT = os.environ.get("HERMES_HOME", "").strip()
+
+
+def _pin_divergence_is_a_hazard(target: Path) -> bool:
+    """True when a diverging pin is the INCIDENT shape, not a chosen path.
+
+    Both divergence guards gate on this one predicate, so they cannot drift on
+    which situations are dangerous.
+
+    Two shapes qualify, and between them they cover every recorded incident:
+
+    * **Inherited pin under a redirected HERMES_HOME** — the pin is byte-identical
+      to what this process started with (the dispatcher injects it into every
+      worker env) and ``HERMES_HOME`` has moved since. That is 2026-08-08 and
+      t_d2b884e7 exactly: a worker sandboxes itself by moving ``HERMES_HOME``
+      and the inherited pin silently keeps it on the live board.
+    * **The pin reaches this machine's native Hermes home** — catches the
+      variant with no in-process change to detect, e.g.
+      ``HERMES_HOME=$(mktemp -d) HERMES_KANBAN_DB=~/.hermes/kanban.db cmd``.
+      The pin points at production; refusing is right regardless of provenance.
+
+    Everything else is a caller that CHOSE its pin and is not being silently
+    un-sandboxed — every kanban test fixture does this (measured: a blanket
+    refusal broke 33 otherwise-passing tests across 9 files). Left alone.
+    """
+    # Shape 1: inherited pin, HERMES_HOME moved out from under it.
+    if _PIN_AT_IMPORT and os.environ.get(
+        "HERMES_KANBAN_DB", ""
+    ).strip() == _PIN_AT_IMPORT:
+        if os.environ.get("HERMES_HOME", "").strip() != _HERMES_HOME_AT_IMPORT:
+            return True
+    # Shape 2: the pin reaches the machine's real Hermes home.
+    try:
+        from hermes_constants import _get_platform_default_hermes_home
+        native = _get_platform_default_hermes_home().resolve(strict=False)
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return target.is_relative_to(native)
+
+
 class KanbanPinDivergenceError(RuntimeError):
     """Raised when the ``HERMES_KANBAN_*`` pins contradict what a caller asked.
 
@@ -765,13 +819,19 @@ def _refuse_if_override_escapes_hermes_home(override: Path) -> None:
     Redirecting ``HERMES_HOME`` is an unambiguous statement of intent to
     isolate. Having detected that the pin defeats it, we refuse rather than
     hand a live-board path to a caller that asked to be sandboxed.
+
+    Scoped to the genuinely hazardous shapes — see
+    :func:`_pin_divergence_is_a_hazard`. A caller that pins a DB of its own
+    choosing (every kanban test fixture does) is not making an isolation claim
+    it is then betrayed on, and is left alone: measured, a blanket refusal here
+    broke 33 otherwise-passing tests across 9 files.
     """
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
     if not hermes_home:
         return
     key = (hermes_home, str(override))
     if key in _CHECKED_OVERRIDE_ESCAPES:
-        return  # proven to live inside the HERMES_HOME-derived root already.
+        return  # proven safe already.
     try:
         root = kanban_home().resolve(strict=False)
         target = override.resolve(strict=False)
@@ -780,6 +840,12 @@ def _refuse_if_override_escapes_hermes_home(override: Path) -> None:
     if target.is_relative_to(root):
         _CHECKED_OVERRIDE_ESCAPES.add(key)
         return  # override lives inside the HERMES_HOME-derived root: normal.
+    if not _pin_divergence_is_a_hazard(target):
+        # The pin escapes the HERMES_HOME root, but it was chosen by this
+        # process and does not reach the machine's live board. Nobody is being
+        # silently un-sandboxed. Do NOT memoise: the hazard state is
+        # env-dependent and must be re-evaluated on every call.
+        return
     raise KanbanPinDivergenceError(
         f"HERMES_KANBAN_DB={target} resolves OUTSIDE the HERMES_HOME-derived "
         f"kanban root {root} — the override wins, so redirecting HERMES_HOME "
@@ -881,9 +947,11 @@ def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -
 
     Silent by design in the shapes that are not contradictions: ``board`` is
     None (the pin is then the intended source of truth), the pin already
-    resolves to the requested board's DB (the normal worker case), and the call
+    resolves to the requested board's DB (the normal worker case), the call
     happens inside an :func:`enumerating_boards` extent (a sweep over every
-    board on disk is not a claim to be addressing any one of them).
+    board on disk is not a claim to be addressing any one of them), and the
+    divergence is not hazardous per :func:`_pin_divergence_is_a_hazard` (the
+    caller chose its own pin and is not being silently put on production).
     """
     if board is None:
         return
@@ -906,6 +974,11 @@ def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -
     if requested == pinned:
         _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
         return  # pin agrees with the argument: the normal worker case.
+    if not _pin_divergence_is_a_hazard(pinned):
+        # Shares one predicate with the escape guard so the two cannot drift on
+        # what counts as dangerous. Not memoised: the hazard state depends on
+        # live env, so it must be re-evaluated every call.
+        return
     raise KanbanPinDivergenceError(
         f"kanban_db_path(board={slug!r}) would return the HERMES_KANBAN_DB pin "
         f"{pinned}, NOT that board's DB {requested} — the pin outranks the "
