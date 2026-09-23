@@ -392,6 +392,12 @@ _TURN_INDEXES = (
     ("idx_blackbox_turns_chat_end", ("platform", "chat_id", "ts_end")),
     ("idx_blackbox_turns_cost", ("cost_usd",)),
     ("idx_blackbox_turns_ts_start", ("ts_start",)),
+    # The skill-stats miner (skills-dashboard launchd, hourly) opens every
+    # ledger with `SELECT DISTINCT profile FROM turns`. Without an index on
+    # profile that is a full SCAN of the overflow-heavy table: measured 107 s on
+    # the 1.5 GB fleet ledger under I/O load (2026-09-23), past the miner's
+    # 180 s budget, so the Stats tab silently served last-good data.
+    ("idx_blackbox_turns_profile", ("profile",)),
 )
 
 
