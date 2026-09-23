@@ -9,12 +9,18 @@ import json
 import re
 import time
 
-from scripts.ci_overflow_plan import ARM, POOL, X64, JobPlacement, Plan
+from scripts.ci_overflow_plan import ARM, POOL, X64, JobPlacement, Plan, _object_pairs
 
 BRANCH = "ci-overflow-ledger"
 PATH = "state.json"
 SOFT_LIMIT = 400 * 1024
 HARD_LIMIT = 500 * 1024
+# Exact persisted shapes: a missing OR extra key is corruption, never a default.
+STATE_FIELDS = {"version", "attempts", "daily_totals"}
+ROW_FIELDS = {"admitted_on", "terminal_on", "jobs", "plan"}
+PLAN_FIELDS = {"jobs", "incidents", "summary"}
+JOB_FIELDS = {"job_id", "labels", "reserved_minutes", "reason", "released_unemitted"}
+RECEIPT = "release_receipt_sha256"
 
 
 @dataclass(frozen=True)
@@ -68,15 +74,17 @@ def _validate(state, today):
         if (type(ident) is not str or not re.fullmatch(r"[1-9]\d*:[1-9]\d*:[1-9]\d*", ident)
                 or type(row) is not dict):
             raise ValueError("corrupt admission")
-        _date(row.get("admitted_on"), today)
-        terminal = row.get("terminal_on")
+        if set(row) != ROW_FIELDS:
+            raise ValueError("corrupt admission fields")
+        _date(row["admitted_on"], today)
+        terminal = row["terminal_on"]
         if terminal is not None:
             _date(terminal, today)
             if terminal < row["admitted_on"]:
                 raise ValueError("corrupt admission")
         jobs = row.get("jobs")
         raw = row.get("plan")
-        if (type(jobs) is not list or len(jobs) > 18 or type(raw) is not dict
+        if (type(jobs) is not list or len(jobs) > 18 or type(raw) is not dict or set(raw) != PLAN_FIELDS
                 or type(raw.get("jobs")) is not list or type(raw.get("incidents")) is not list
                 or type(raw.get("summary")) is not dict or len(raw["jobs"]) != len(jobs)):
             raise ValueError("corrupt admission")
@@ -84,6 +92,8 @@ def _validate(state, today):
         for job, planned in zip(jobs, raw["jobs"]):
             if type(job) is not dict or type(planned) is not dict:
                 raise ValueError("corrupt job")
+            if set(job) != JOB_FIELDS | ({RECEIPT} if job.get("released_unemitted") is True else set()):
+                raise ValueError("corrupt job fields")
             name, labels, charge = job.get("job_id"), job.get("labels"), job.get("reserved_minutes")
             if (type(name) is not str or not name or name in seen
                     or set(planned) != {"job_id", "labels", "reserved_minutes", "reason"}
@@ -119,8 +129,10 @@ class Ledger:
             raise ValueError("invalid Contents response")
         # GitHub wraps Contents base64 at 60 columns with "\n"; drop only that whitespace,
         # then decode strictly so any other non-alphabet byte still fails closed.
-        data = json.loads(base64.b64decode("".join(content.split()), validate=True))
-        if (type(data) is not dict or data.get("version") != 1 or type(data.get("attempts")) is not dict
+        # Duplicate keys are refused: last-wins parsing could hide a recorded charge.
+        data = json.loads(base64.b64decode("".join(content.split()), validate=True), object_pairs_hook=_object_pairs)
+        if (type(data) is not dict or set(data) != STATE_FIELDS or type(data["version"]) is not int
+                or data["version"] != 1 or type(data.get("attempts")) is not dict
                 or type(data.get("daily_totals")) is not dict):
             raise ValueError("corrupt ledger")
         _validate(data, self._today())

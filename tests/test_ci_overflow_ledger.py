@@ -9,7 +9,7 @@ import threading
 import pytest
 
 from scripts.ci_overflow_plan import POOL, JobPlacement, Plan
-from scripts.ci_overflow_ledger import Ledger, Refusal, Reservation
+from scripts.ci_overflow_ledger import Ledger, Refusal, ReleaseResult, Reservation
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ci_overflow"
 CANONICAL = {"version": 1, "attempts": {}, "daily_totals": {}}
@@ -153,8 +153,21 @@ def test_canonical_ledger_control_caps_admission():
     ("plan-job-mismatch", lambda s: s["attempts"]["123:9:1"]["plan"]["jobs"][0].update(reserved_minutes=0)),
     ("wrong-attempt-key", lambda s: s["attempts"].update({"bad-key": s["attempts"].pop("123:9:1")})),
     ("released-without-receipt", lambda s: s["attempts"]["123:9:1"]["jobs"][0].update(released_unemitted=True)),
+    # Argus R3: every persisted field is required; an omitted key is corruption, not a default.
+    ("missing-terminal-field", lambda s: s["attempts"]["123:9:1"].pop("terminal_on")),
+    ("missing-admitted-field", lambda s: s["attempts"]["123:9:1"].pop("admitted_on")),
+    ("missing-released-flag", lambda s: s["attempts"]["123:9:1"]["jobs"][0].pop("released_unemitted")),
+    ("missing-plan-incidents", lambda s: s["attempts"]["123:9:1"]["plan"].pop("incidents")),
+    ("unknown-row-field", lambda s: s["attempts"]["123:9:1"].update(refund=35)),
+    ("unknown-job-field", lambda s: s["attempts"]["123:9:1"]["jobs"][0].update(credit=35)),
+    ("unknown-plan-field", lambda s: s["attempts"]["123:9:1"]["plan"].update(extra=[])),
+    ("unknown-top-level-field", lambda s: s.update(carry={"2026-09-23": -35})),
+    ("boolean-version", lambda s: s.update(version=True)),
+    ("float-version", lambda s: s.update(version=1.0)),
 ])
 def test_semantically_corrupt_ledger_refuses_without_put(name, change):
+    """Corrupt persisted state => ledger-unavailable on EVERY path: new-key reserve, same-key
+    replay, hosted reconcile and absent-job reconcile. Zero cloud, zero PUT, no exception."""
     api = Contents()
     baseline = ledger(api, day="2026-09-22", limit=35).reserve(key(9), proposed("old"))
     assert isinstance(baseline, Reservation)
@@ -162,8 +175,46 @@ def test_semantically_corrupt_ledger_refuses_without_put(name, change):
     change(api.state)
     denied = ledger(api, limit=35).reserve(key(), proposed("a", "b"))
     assert isinstance(denied, Refusal) and denied.incident == "ledger-unavailable", name
+    replay = ledger(api, limit=35).reserve(key(9), proposed("old"))
+    assert isinstance(replay, Refusal) and replay.incident == "ledger-unavailable", name
+    hosted = ledger(api).reconcile(key(9), evidence(run=9, jobs=[{
+        "name": "old", "status": "completed", "labels": ["ubuntu-latest"], "runner_name": "GitHub Actions"}]))
+    assert hosted == ReleaseResult(0, "ledger-unavailable"), name
     release = ledger(api).reconcile(key(9), evidence(run=9, jobs=[]))
-    assert release.incident == "ledger-unavailable", name
+    assert release == ReleaseResult(0, "ledger-unavailable"), name
+    assert api.writes == 0, name
+
+
+class RawContents(Contents):
+    """Serves exact raw JSON bytes (wrapped base64) so wire-level corruption reaches the parser."""
+    def __init__(self, raw):
+        super().__init__()
+        self.raw = raw
+    def get(self, path, params):
+        assert (path, params) == ("state.json", {"ref": "ci-overflow-ledger"})
+        return {"sha": self.sha, "encoding": "base64", "content": github_base64(self.raw.encode())}
+
+
+def test_raw_wire_clean_control_charges_recorded_total():
+    api = RawContents('{"version":1,"attempts":{},"daily_totals":{"2026-09-23":35}}')
+    result = ledger(api, limit=35).reserve(key(), proposed("a"))
+    assert isinstance(result, Reservation) and result.plan.jobs[0].reserved_minutes == 0
+    assert api.writes == 1
+
+
+@pytest.mark.parametrize("name,raw", [
+    ("duplicate-daily-totals", '{"version":1,"attempts":{},"daily_totals":{"2026-09-23":35},"daily_totals":{}}'),
+    ("duplicate-day-inside-totals", '{"version":1,"attempts":{},"daily_totals":{"2026-09-23":35,"2026-09-23":0}}'),
+    ("duplicate-version", '{"version":2,"version":1,"attempts":{},"daily_totals":{}}'),
+    ("duplicate-attempts", '{"version":1,"attempts":{"x":1},"attempts":{},"daily_totals":{}}'),
+    ("boolean-version", '{"version":true,"attempts":{},"daily_totals":{}}'),
+    ("float-version", '{"version":1.0,"attempts":{},"daily_totals":{}}'),
+])
+def test_raw_wire_corrupt_ledger_refuses_without_put(name, raw):
+    api = RawContents(raw)
+    denied = ledger(api, limit=35).reserve(key(), proposed("a"))
+    assert isinstance(denied, Refusal) and denied.incident == "ledger-unavailable", name
+    assert ledger(api).reconcile(key(), evidence(jobs=[])) == ReleaseResult(0, "ledger-unavailable"), name
     assert api.writes == 0, name
 
 
@@ -261,7 +312,10 @@ def test_underpriced_hosted_placement_cannot_be_committed():
 def test_oversized_essential_state_refuses_new_cloud():
     api = Contents()
     ledger(api, day="2026-09-22").reserve(key(9), proposed("old"))
-    api.state["attempts"]["123:9:1"]["pad"] = "z" * 520000
+    # Oversize through a schema-valid field (unknown fields are corruption, not padding).
+    row = api.state["attempts"]["123:9:1"]
+    for placement in (row["jobs"][0], row["plan"]["jobs"][0]):
+        placement["reason"] = "z" * 260000
     assert ledger(api).reserve(key(), proposed("a")).incident == "state-capacity"
 
 

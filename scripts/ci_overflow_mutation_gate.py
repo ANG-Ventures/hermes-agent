@@ -43,6 +43,16 @@ CASES = [
      "", "test_reserve_refuses_more_than_18_jobs", "tests/test_ci_overflow_ledger.py"),
     ("C30-no-semantic-validation", "scripts/ci_overflow_ledger.py", "        _validate(data, self._today())\n", "",
      "test_semantically_corrupt_ledger_refuses_without_put", "tests/test_ci_overflow_ledger.py"),
+    # Argus R3: restore the 586cd088 shape (no row key-set check, `row.get("terminal_on")`).
+    ("C31-terminal-presence-unchecked", "scripts/ci_overflow_ledger.py",
+     "        if set(row) != ROW_FIELDS:\n            raise ValueError(\"corrupt admission fields\")\n"
+     "        _date(row[\"admitted_on\"], today)\n        terminal = row[\"terminal_on\"]\n",
+     "        _date(row.get(\"admitted_on\"), today)\n        terminal = row.get(\"terminal_on\")\n",
+     "missing-terminal-field", "tests/test_ci_overflow_ledger.py"),
+    ("C32-duplicate-json-last-wins", "scripts/ci_overflow_ledger.py", "object_pairs_hook=_object_pairs)",
+     "object_pairs_hook=None)", "raw_wire_corrupt and duplicate", "tests/test_ci_overflow_ledger.py"),
+    ("C33-version-not-exact-int", "scripts/ci_overflow_ledger.py", " or type(data[\"version\"]) is not int\n", "\n",
+     "version", "tests/test_ci_overflow_ledger.py"),
 ]
 
 
@@ -61,7 +71,9 @@ def main():
             content = target.read_text(encoding="utf-8")
             assert content.count(before) == 1, (name, content.count(before))
             target.write_text(content.replace(before, after), encoding="utf-8")
-            result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-o", "addopts=", testfile,
+            # -B: the scratch dir is reused, and two same-size mutants written within one mtime
+            # second would otherwise import the PREVIOUS mutant's cached .pyc (false survivor).
+            result = subprocess.run([sys.executable, "-B", "-m", "pytest", "-q", "-o", "addopts=", testfile,
                                      "-k", test], cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL)
             print(f"{name}: exit={result.returncode}")
             for line in result.stdout.splitlines():
