@@ -447,3 +447,156 @@ def test_fenced_late_pid_never_overwrites_successor(conn):
     assert kb._set_worker_pid(conn, tid, 424242,
                               run_id=first.current_run_id) is False
     assert _row(conn, tid)["worker_pid"] == 434343
+
+
+# ---------------------------------------------------------------------------
+# Round-4 review: prior-owner shapes the ended-run scan could not see.
+# ---------------------------------------------------------------------------
+
+
+def _leak_open_run(conn, tid, status="ready"):
+    """A partial release: ownership columns cleared, the run left OPEN.
+
+    claim_task's invariant recovery closes such a run after the liveness check,
+    so the guard must inspect it before that happens."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?", (status, tid),
+        )
+
+
+def _run_ended_at(conn, run_id):
+    return conn.execute(
+        "SELECT ended_at FROM task_runs WHERE id=?", (run_id,),
+    ).fetchone()["ended_at"]
+
+
+def test_open_leaked_run_with_real_live_owner_blocks_dispatch(conn):
+    tid = kb.create_task(conn, title="leaked open run", assignee="worker")
+    first = kb.claim_task(conn, tid)
+    assert first is not None
+    proc = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        kb._set_worker_pid(conn, tid, proc.pid, run_id=first.current_run_id)
+        _leak_open_run(conn, tid)
+        assert _run_ended_at(conn, first.current_run_id) is None
+
+        spawned, _ = _dispatch(conn)
+        assert proc.poll() is None
+        assert tid not in spawned
+        rej = _events(conn, tid, "claim_rejected")[-1]
+        assert rej["reason"] == "prior_worker_still_alive"
+        assert rej["prev_pid"] == proc.pid and rej["prev_run_open"] is True
+        # Refused before invariant recovery: the live owner's run stays open.
+        assert _run_ended_at(conn, first.current_run_id) is None
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_open_leaked_run_with_dead_owner_is_recovered_and_dispatched(conn, monkeypatch):
+    tid, first = _live_claim(conn, "leaked open run, dead owner")
+    _leak_open_run(conn, tid)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    spawned, _ = _dispatch(conn)
+    assert tid in spawned
+    assert _run_ended_at(conn, first.current_run_id) is not None
+    assert _row(conn, tid)["current_run_id"] != first.current_run_id
+
+
+def test_open_leaked_run_live_owner_blocks_review_claim(conn, monkeypatch):
+    tid, first = _live_claim(conn, "leaked open run, review door")
+    _leak_open_run(conn, tid, status="review")
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 424242)
+
+    assert kb.claim_review_task(conn, tid) is None
+    rej = _events(conn, tid, "claim_rejected")[-1]
+    assert rej["source_status"] == "review" and rej["prev_run_open"] is True
+    assert _row(conn, tid)["status"] == "review"
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    assert kb.claim_review_task(conn, tid) is not None
+
+
+@pytest.mark.parametrize("alive_pid", [424242, 434343])
+def test_every_spawn_of_one_run_is_probed(conn, monkeypatch, alive_pid):
+    """A run stamped twice: whichever PID still lives blocks the claim; a dead
+    sibling stamp must not vouch for it (older- or newer-alive)."""
+    tid, first = _live_claim(conn, "double stamp")
+    kb._set_worker_pid(conn, tid, 434343, run_id=first.current_run_id)
+    assert len(_events(conn, tid, "spawned")) == 2
+    _external_release(conn, tid)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == alive_pid)
+
+    spawned, _ = _dispatch(conn)
+    assert tid not in spawned
+    assert _events(conn, tid, "claim_rejected")[-1]["prev_pid"] == alive_pid
+
+
+def test_double_stamped_run_with_all_owners_dead_is_dispatched(conn, monkeypatch):
+    tid, first = _live_claim(conn, "double stamp, both dead")
+    kb._set_worker_pid(conn, tid, 434343, run_id=first.current_run_id)
+    _external_release(conn, tid)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    spawned, _ = _dispatch(conn)
+    assert tid in spawned
+
+
+# ---------------------------------------------------------------------------
+# TTL expiry: the original missing-PID rule on the release_stale_claims path.
+# ---------------------------------------------------------------------------
+
+
+def _expire_claim(conn, tid):
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_expires=? WHERE id=?",
+            (int(time.time()) - 60, tid),
+        )
+
+
+def test_ttl_expiry_holds_host_local_claim_with_no_worker_pid(conn):
+    """No PID is unknown liveness, not death: TTL expiry must not requeue it
+    (and has nothing it could signal)."""
+    tid = kb.create_task(conn, title="ttl null pid", assignee="worker")
+    first = kb.claim_task(conn, tid)
+    assert first is not None and _row(conn, tid)["worker_pid"] is None
+    _expire_claim(conn, tid)
+    signals = []
+
+    assert kb.release_stale_claims(
+        conn, signal_fn=lambda pid, sig: signals.append((pid, sig)),
+    ) == 0
+    assert signals == []
+    row = _row(conn, tid)
+    assert row["status"] == "running" and row["claim_lock"] == first.claim_lock
+    assert row["current_run_id"] == first.current_run_id
+    assert not _events(conn, tid, "reclaimed")
+
+    spawned, _ = _dispatch(conn)
+    assert tid not in spawned
+    assert _row(conn, tid)["current_run_id"] == first.current_run_id
+
+
+def test_ttl_expiry_requeues_host_local_claim_whose_worker_is_proven_dead(
+    conn, monkeypatch,
+):
+    tid, first = _live_claim(conn, "ttl dead pid")
+    _expire_claim(conn, tid)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    def gone(pid, sig):
+        raise ProcessLookupError(pid)
+
+    assert kb.release_stale_claims(conn, signal_fn=gone) == 1
+    assert _row(conn, tid)["status"] == "ready"
+    reclaimed = _events(conn, tid, "reclaimed")[-1]
+    assert reclaimed["terminated"] is True and reclaimed["worker_pid"] == 424242
+
+    spawned, _ = _dispatch(conn)
+    assert tid in spawned
+    assert _row(conn, tid)["current_run_id"] != first.current_run_id
