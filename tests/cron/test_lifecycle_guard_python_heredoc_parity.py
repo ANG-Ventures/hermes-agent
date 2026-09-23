@@ -74,3 +74,11 @@ def test_shadowed_path_name_cannot_hide_executed_script(tmp_path):
     )
     heredoc, _ = _forms(tmp_path, body)
     assert guard(heredoc, cwd=str(tmp_path))
+
+
+def test_read_text_piped_to_os_system_is_executable(tmp_path):
+    data = tmp_path / "commands.txt"
+    data.write_text("hermes gateway " + "re" + "start\n")
+    body = f"from pathlib import Path\nimport os\nos.system(Path('{data}').read_text())\n"
+    heredoc, _ = _forms(tmp_path, body)
+    assert guard(heredoc, cwd=str(tmp_path))

@@ -1927,7 +1927,7 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
 
 
 def _mask_read_only_python_paths(body: str) -> str:
-    """Exclude only literal Path(...).read_* data reads from the shell walk.
+    """Exclude literal Path(...).read_* calls printed as diagnostic data.
 
     Unknown Python expressions retain the conservative referenced-script scan.
     A path handed to os.system/subprocess remains visible to that scan.
@@ -1943,11 +1943,11 @@ def _mask_read_only_python_paths(body: str) -> str:
         and any(alias.name == "Path" and alias.asname is None for alias in node.names)
         for node in ast.walk(tree)
     ) or any(
-        (isinstance(node, ast.Name) and node.id == "Path" and isinstance(node.ctx, ast.Store))
-        or (isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == "Path")
-        or (isinstance(node, ast.arg) and node.arg == "Path")
+        (isinstance(node, ast.Name) and node.id in {"Path", "print"} and isinstance(node.ctx, ast.Store))
+        or (isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in {"Path", "print"})
+        or (isinstance(node, ast.arg) and node.arg in {"Path", "print"})
         or (isinstance(node, ast.ImportFrom) and node.module != "pathlib"
-            and any(alias.asname == "Path" or alias.name == "Path" for alias in node.names))
+            and any(alias.asname in {"Path", "print"} or alias.name in {"Path", "print"} for alias in node.names))
         for node in ast.walk(tree)
     ):
         return body
@@ -1955,11 +1955,16 @@ def _mask_read_only_python_paths(body: str) -> str:
     offsets = [0]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     spans = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         if node.func.attr not in {"read_text", "read_bytes"}:
+            continue
+        parent = parents.get(node)
+        if not (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+                and parent.func.id == "print"):
             continue
         path_call = node.func.value
         if not (isinstance(path_call, ast.Call) and isinstance(path_call.func, ast.Name)
