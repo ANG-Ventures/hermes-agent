@@ -32,6 +32,15 @@ def configured_probes() -> dict:
         return {}
 
 
+def configured_min_eligible() -> int:
+    from hermes_cli.config import load_config
+    try:
+        value = int(load_config().get("kanban", {}).get("provider_health_min_eligible", 1))
+        return max(1, value)
+    except (TypeError, ValueError, AttributeError):
+        return 1
+
+
 def effective_provider(task) -> str | None:
     _, provider = model_override(task)
     if provider:
@@ -52,7 +61,7 @@ def effective_provider(task) -> str | None:
         return None
 
 
-def capped_provider(task, probes: dict, cache: dict) -> dict | None:
+def capped_provider(task, probes: dict, cache: dict, *, min_eligible: int = 1) -> dict | None:
     if not probes:
         return None
     provider = effective_provider(task)
@@ -65,7 +74,8 @@ def capped_provider(task, probes: dict, cache: dict) -> dict | None:
             with urllib.request.urlopen(url, timeout=1) as response:
                 data = json.loads(response.read(65536))
             if isinstance(data, dict) and (
-                (type(data.get("eligible_count")) in (int, float) and data["eligible_count"] == 0)
+                (type(data.get("eligible_count")) in (int, float)
+                 and 0 <= data["eligible_count"] < min_eligible)
                 or data.get("status") == "all_capped"
             ):
                 reset_at = data.get("reset_at")
@@ -75,4 +85,34 @@ def capped_provider(task, probes: dict, cache: dict) -> dict | None:
             _log.debug("kanban provider health unavailable for %s; admitting worker", provider)
     if cache[url] is not None:
         return {"reason": "provider_capped", "provider": provider, **cache[url]}
+    return None
+
+
+def available_profile_fallback(task, probes: dict, cache: dict, *, min_eligible: int = 1) -> tuple[str, str] | None:
+    """Pick a healthy configured profile rung without changing the task row."""
+    from hermes_cli.config import load_config
+    from hermes_cli.fallback_config import get_fallback_chain
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    try:
+        token = set_hermes_home_override(resolve_profile_env(task.assignee))
+        try:
+            chain = get_fallback_chain(load_config())
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        return None
+    from types import SimpleNamespace
+    for rung in chain:
+        provider, model = rung.get("provider"), rung.get("model")
+        if not isinstance(provider, str) or not isinstance(model, str) or not provider or not model:
+            continue
+        if provider == effective_provider(task):
+            continue
+        candidate = SimpleNamespace(
+            model_override=model, provider_override=provider, assignee=task.assignee,
+        )
+        if capped_provider(candidate, probes, cache, min_eligible=min_eligible) is None:
+            return model, provider
     return None

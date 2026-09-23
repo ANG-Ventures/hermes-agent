@@ -57,6 +57,45 @@ def test_no_configured_probe_preserves_spawn(board, monkeypatch):
     probe.assert_not_called()
 
 
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_capped_pool_uses_profile_fallback_per_run(board, monkeypatch, tmp_path, lane):
+    home = tmp_path / ".hermes" / "profiles" / "a"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(json.dumps({
+        "model": {"provider": "pool", "default": "primary"},
+        "fallback_providers": [{"provider": "openai-codex", "model": "gpt-5.5"}],
+    }))
+    # Root config owns the pool-health endpoint, not the profile's fallback list.
+    (tmp_path / ".hermes" / "config.yaml").write_text(json.dumps({
+        "kanban": {"provider_health_probes": {"pool": "http://localhost/health"}},
+    }))
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: io.BytesIO(b'{"eligible_count":0}'))
+    tid = kb.create_task(board, title="pool fallback", assignee="a")
+    board.execute("UPDATE tasks SET status=? WHERE id=?", (lane, tid))
+    board.commit()
+    observed = []
+    def spawn(task, workspace, **kwargs):
+        observed.append((task.model_override, task.provider_override))
+        return 777777
+    assert kb.dispatch_once(board, spawn_fn=spawn).spawned[0][0] == tid
+    assert observed == [("gpt-5.5", "openai-codex")]
+    persisted = kb.get_task(board, tid)
+    assert persisted.model_override is None and persisted.provider_override is None
+    event = board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='dispatch_provider_fallback'", (tid,)).fetchone()
+    assert json.loads(event[0])["to_provider"] == "openai-codex"
+
+
+def test_pool_below_configured_minimum_defers_without_fallback(board, monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {
+        "provider_health_probes": {"pool": "http://localhost/health"},
+        "provider_health_min_eligible": 2,
+    }})
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: io.BytesIO(b'{"eligible_count":1}'))
+    tid = kb.create_task(board, title="minimum", assignee="a", model_override="m", provider_override="pool")
+    assert kb.dispatch_once(board, spawn_fn=lambda *a: 777777).spawned == []
+    assert kb.get_task(board, tid).status == "ready"
+
+
 def quota_fixture(conn):
     tid = kb.create_task(conn, title="legacy quota breaker", assignee="a", max_retries=4)
     for i, stderr in enumerate(["HTTP 429 rate limit", "no eligible sub", "quota exceeded", "Traceback: real bug"]):

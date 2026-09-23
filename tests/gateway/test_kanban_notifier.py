@@ -81,6 +81,24 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def test_stalled_event_pages_subscription_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "stall-notify.db"))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="idle worker", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "stalled", {"progress_age_seconds": 900})
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert "stalled" in adapter.sent[0]["text"]
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+
+
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

@@ -3086,6 +3086,13 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Wrapper heartbeats do not prove worker progress. Warn after 15 min
+        # without log/process activity and reclaim after 25 min (0 disables).
+        "stall_minutes": 15,
+        "stall_reclaim_minutes": 25,
+        # For configured provider_health_probes, prefer a healthy fallback
+        # if fewer than this many pool seats can serve the selected model.
+        "provider_health_min_eligible": 1,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create

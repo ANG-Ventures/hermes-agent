@@ -698,7 +698,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "stalled", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -1097,6 +1097,13 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
+                            )
+                        elif kind == "stalled":
+                            age = int((ev.payload or {}).get("progress_age_seconds") or 0)
+                            msg = (
+                                f"⚠ {board_tag}{tag}Kanban {sub['task_id']} worker stalled "
+                                f"({age}s no progress despite heartbeats); "
+                                "dispatcher will reclaim if still idle"
                             )
                         elif kind == "status":
                             new_status = ""
