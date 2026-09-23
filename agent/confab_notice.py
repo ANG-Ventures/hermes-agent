@@ -233,6 +233,19 @@ def notice_from_display_row(
     return notice
 
 
+def is_metadata_only_tool_notice(row: Any) -> bool:
+    """Only validated, empty system tool events may be omitted from model/UI text."""
+    return (
+        isinstance(row, dict)
+        and row.get("role") == "system"
+        and row.get("content") in (None, "")
+        and row.get("api_content") in (None, "")
+        and bool(notice_from_display_row(
+            row.get("role"), row.get("display_kind"), row.get("display_metadata")
+        ))
+    )
+
+
 def should_announce_notice(agent: Any, notice: Any, turn_id: Any) -> bool:
     """Return ``True`` the FIRST time *notice* is seen within *turn_id*.
 

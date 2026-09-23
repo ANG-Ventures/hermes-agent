@@ -10140,8 +10140,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         role = m.get("role")
         if role not in {"user", "assistant", "tool", "system"}:
             continue
-        if role == "system" and m.get("display_kind") == "confab_notice":
-            from agent.confab_notice import confab_notice_status, notice_from_display_row
+        from agent.confab_notice import confab_notice_status, is_metadata_only_tool_notice, notice_from_display_row
+        if is_metadata_only_tool_notice(m):
 
             notice = notice_from_display_row(
                 role, m.get("display_kind"), m.get("display_metadata")

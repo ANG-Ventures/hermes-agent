@@ -42,7 +42,7 @@ from agent.context_engine import (
     call_with_messages as _call_with_messages,
 )
 from agent.display import KawaiiSpinner
-from agent.confab_notice import TOOL_CALL_NOTICE_TEXT, confab_notice_status, should_announce_notice
+from agent.confab_notice import TOOL_CALL_NOTICE_TEXT, confab_notice_status, is_metadata_only_tool_notice, should_announce_notice
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -2678,7 +2678,7 @@ def run_conversation(
         for idx, msg in enumerate(messages):
             # Metadata-only provider events are durable UI rows, never system
             # instructions in the provider request.
-            if msg.get("role") == "system" and msg.get("display_kind") == "confab_notice":
+            if is_metadata_only_tool_notice(msg):
                 continue
 
             # Structural clone, NOT msg.copy(): every in-place transform
@@ -8070,9 +8070,10 @@ def run_conversation(
             # restarted provider request_id can never suppress a later turn's
             # genuine warning. See agent/confab_notice.py.
             _confab_notice = getattr(normalized, "confab_notice", None)
-            if _confab_notice and should_announce_notice(
+            _new_confab_notice = _confab_notice and should_announce_notice(
                 agent, _confab_notice, turn_id
-            ):
+            )
+            if _new_confab_notice:
                 agent._emit_status(confab_notice_status(_confab_notice["kind"]))
             
             # Normalize content to string — some OpenAI-compatible servers
@@ -9013,7 +9014,7 @@ def run_conversation(
                 _tool_notice_nudge = TOOL_CALL_NOTICE_TEXT.get(
                     _confab_notice["kind"] if _confab_notice else None
                 )
-                if _tool_notice_nudge:
+                if _tool_notice_nudge and _new_confab_notice:
                     # Durable metadata-only UI event, not a model instruction.
                     _notice_msg = agent._build_assistant_message(assistant_message, finish_reason)
                     append_message(messages, {

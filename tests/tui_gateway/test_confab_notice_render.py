@@ -37,6 +37,19 @@ def _history(display_metadata):
 
 
 class TestGatewayRender:
+    @pytest.mark.parametrize("metadata", [
+        {CONFAB_NOTICE_KEY: {**NOTICE, "kind": "tool_call_as_text"}},
+        {CONFAB_NOTICE_KEY: {**NOTICE, "kind": "tool_call_as_text", "version": 99}},
+    ])
+    def test_tagged_system_content_is_not_lost(self, metadata):
+        sentinel = "QA-REPLAY-SYSTEM-CONTENT-ALLOWED"
+        out = _history_to_messages([{
+            "role": "system", "content": sentinel,
+            "display_kind": CONFAB_NOTICE_DISPLAY_KIND, "display_metadata": metadata,
+        }])
+        assert len(out) == 1
+        assert out[0]["text"] == sentinel
+
     @pytest.mark.parametrize("kind", ["tool_call_unparseable", "tool_call_as_text"])
     def test_metadata_only_tool_notice_is_visible(self, kind):
         notice = {**NOTICE, "kind": kind}

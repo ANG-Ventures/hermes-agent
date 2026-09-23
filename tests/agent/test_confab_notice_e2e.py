@@ -186,6 +186,43 @@ def _confab_statuses(statuses) -> list:
 
 @pytest.mark.parametrize("stream", [False, True], ids=["non_stream", "stream"])
 class TestConfabNoticeEndToEnd:
+    @pytest.mark.parametrize("metadata", [
+        {CONFAB_NOTICE_KEY: {**VALID_NOTICE, "kind": "tool_call_as_text"}},
+        {CONFAB_NOTICE_KEY: {**VALID_NOTICE, "kind": "tool_call_as_text", "version": 99}},
+    ])
+    def test_tagged_system_content_is_not_lost_on_replay(self, notice_env, stream, metadata):
+        make_agent, handler, db, sid, statuses = notice_env
+        sentinel = "QA-REPLAY-SYSTEM-CONTENT-ALLOWED"
+        history = [{
+            "role": "system", "content": sentinel,
+            "display_kind": CONFAB_NOTICE_DISPLAY_KIND,
+            "display_metadata": metadata,
+        }]
+        handler.response_queue.append(("Done.", None))
+        make_agent(stream=stream).run_conversation("hello", conversation_history=history, task_id="t1")
+        assert sentinel in json.dumps(_chat_requests(handler)[0]["messages"])
+
+    def test_valid_empty_tool_event_is_not_replayed(self, notice_env, stream):
+        make_agent, handler, db, sid, statuses = notice_env
+        history = [{
+            "role": "system", "content": "", "display_kind": CONFAB_NOTICE_DISPLAY_KIND,
+            "display_metadata": {CONFAB_NOTICE_KEY: {**VALID_NOTICE, "kind": "tool_call_as_text"}},
+        }]
+        handler.response_queue.append(("Done.", None))
+        make_agent(stream=stream).run_conversation("hello", conversation_history=history, task_id="t1")
+        assert not any(m.get("role") == "system" and m.get("content") == ""
+                       for m in _chat_requests(handler)[0]["messages"])
+
+    def test_same_request_id_retry_has_one_durable_event(self, notice_env, stream):
+        make_agent, handler, db, sid, statuses = notice_env
+        notice = {**VALID_NOTICE, "kind": "tool_call_as_text", "request_id": "same-rid"}
+        handler.response_queue.extend([("", notice), ("", notice), ("Done.", None)])
+        result = make_agent(stream=stream).run_conversation("hello", conversation_history=[], task_id="t1")
+        assert result["final_response"] == "Done."
+        assert len(_chat_requests(handler)) == 3
+        assert sum("Tool call not executed" in text for text in _lifecycle_texts(statuses)) == 1
+        assert len([r for r in db.get_messages(sid) if r["display_kind"] == CONFAB_NOTICE_DISPLAY_KIND]) == 1
+
     def test_scaffold_notice_preserves_in_band_tool_guard(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env
         guard = "Tool call not executed. Re-issue using the native interface."
