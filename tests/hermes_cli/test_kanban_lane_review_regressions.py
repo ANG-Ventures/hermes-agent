@@ -82,6 +82,30 @@ def test_clear_reports_effective_lane_route(kanban_home):
     assert 'batch-provider/model-a' in out
 
 
+def test_capped_lane_blocks_even_when_profile_is_healthy(kanban_home, monkeypatch):
+    from hermes_cli import kanban_provider_health as health
+    import hermes_cli.profiles as profiles
+    profile = kanban_home / 'profiles' / 'worker'
+    profile.mkdir(parents=True)
+    (profile / 'config.yaml').write_text('model:\n  provider: profile-provider\n  default: profile-model\n')
+    monkeypatch.setattr(profiles, 'profile_exists', lambda _: True)
+    lane_only = _create('lane-only', 'worker')
+    with kb.connect() as conn:
+        kb.set_lane_model_override(conn, provider='batch-provider', model='model-a', expires_at=9999999999, reason='capacity')
+    monkeypatch.setattr(health, 'configured_probes', lambda: {'batch-provider': 'http://health.invalid/'})
+
+    class Capped:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, count): return b'{"status":"all_capped"}'
+    monkeypatch.setattr(health.urllib.request, 'urlopen', lambda url, timeout=None: Capped())
+    launches = []
+    with kb.connect() as conn:
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace, **kw: launches.append(task.id) or 12345, max_spawn=20)
+    assert lane_only not in launches
+    assert (lane_only, 'provider_capped') in result.respawn_guarded
+
+
 def test_capped_profile_admits_healthy_lane_and_blocks_capped_effective_route(kanban_home, monkeypatch):
     from hermes_cli import kanban_provider_health as health
     import hermes_cli.profiles as profiles

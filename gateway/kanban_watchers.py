@@ -322,6 +322,33 @@ def _format_lane_expiry(lane, route) -> str:
     return f"lane-model expired -> profile default ({lane}: {route})"
 
 
+def _log_dispatch_tick(logger, slug, res) -> None:
+    """Log route choices and expiries, including ticks with no new workers."""
+    if res is None:
+        return
+    for lane, route in (getattr(res, "expired_lane_models", None) or []):
+        logger.info("kanban dispatcher [%s]: %s", slug, _format_lane_expiry(lane, route))
+    spawned = getattr(res, "spawned", None)
+    guarded = getattr(res, "respawn_guarded", None)
+    if spawned or guarded:
+        logger.info(
+            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s %s",
+            slug,
+            len(spawned or []),
+            res.reclaimed,
+            len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
+            len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
+            res.promoted,
+            len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+            _format_spawn_routes(
+                getattr(res, "spawn_routes", None),
+                getattr(res, "spawn_route_sources", None),
+            ),
+            _format_respawn_guarded_summary(guarded),
+        )
+
+
 def _format_respawn_guarded_summary(guarded) -> str:
     """Format guarded task ids by reason for the per-tick gateway log."""
     entries = list(guarded or [])
@@ -2291,31 +2318,9 @@ class GatewayKanbanWatchersMixin:
                     any_spawned = False
                     for slug, res in (results or []):
                         spawned = getattr(res, "spawned", None) if res is not None else None
-                        guarded = getattr(res, "respawn_guarded", None) if res is not None else None
                         if spawned:
                             any_spawned = True
-                        expired = getattr(res, "expired_lane_models", None) if res is not None else None
-                        for lane, route in (expired or []):
-                            logger.info("kanban dispatcher [%s]: %s", slug, _format_lane_expiry(lane, route))
-                        if res is not None and (spawned or guarded):
-                            # Quiet by default — log only actionable tick activity,
-                            # including guarded tasks that would otherwise be silent.
-                            logger.info(
-                                "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s %s",
-                                slug,
-                                len(spawned or []),
-                                res.reclaimed,
-                                len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                                len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                                res.promoted,
-                                len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
-                                _format_spawn_routes(
-                                    getattr(res, "spawn_routes", None),
-                                    getattr(res, "spawn_route_sources", None),
-                                ),
-                                _format_respawn_guarded_summary(guarded),
-                            )
+                        _log_dispatch_tick(logger, slug, res)
                         # Stranded subtrees: children held in ``todo`` behind a
                         # parent only a human can clear. This CANNOT reach the
                         # stall detector below — that gate requires a non-empty
