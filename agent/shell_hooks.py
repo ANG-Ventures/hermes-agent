@@ -85,6 +85,14 @@ hook must not silently allow the action.  On non-blocking events
 ``fail_closed`` is ignored with a warning. A successful fail-closed hook must
 emit a valid block, allow, or modify directive (or the legacy no-op ``{}``).
 
+A fail-closed hook that exits non-zero WITHOUT the exit-2 deny convention has
+MALFUNCTIONED rather than denied, and blocks with a distinct
+``hook <name>#<digest> CRASHED`` message carrying ``error_class:
+hook_internal_error`` — naming the exception class and, for an import failure,
+the missing module.  Both outcomes still fail closed; only the classification
+and the operator-facing text differ, so a broken hook is not mistaken for the
+policy it would have enforced.
+
 Per-event ``extra`` keys
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -766,6 +774,79 @@ def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:
     }
 
 
+# A crashed hook's stderr is NOT a model-facing channel — it is whatever the
+# process happened to print, and a hook command routinely holds credentials
+# that a traceback can echo back (an `os.environ` repr, an argv dump). So the
+# diagnosis below extracts only two ALLOWLISTED shapes: the exception CLASS
+# name and, for an import failure, the missing MODULE name. Both are bare
+# dotted identifiers by construction of these patterns; no free text from the
+# child crosses into the block message.
+_TRACEBACK_HEADER = "Traceback (most recent call last):"
+_MISSING_MODULE = re.compile(r"No module named ['\"]([A-Za-z0-9_.]+)['\"]")
+_EXCEPTION_LINE = re.compile(
+    r"\A(?P<cls>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+    r"(?:Error|Exception|Interrupt|Exit))\s*(?::|\Z)"
+)
+
+
+def _crash_diagnosis(stderr: str) -> Optional[str]:
+    """Name a hook's CRASH from its stderr, or ``None`` if it is not one.
+
+    A hook that dies is indistinguishable at the transport from a hook that
+    denies: both arrive as a block. Measured 2026-09-22 — a hook whose sibling
+    module was absent from the deployed tree surfaced only as ``hook exited
+    1``, naming the POLICY it would have enforced, so operators went looking
+    for the policy violation instead of the missing file, and the pressure was
+    to switch a working gate off for an unrelated reason.
+    """
+    if _TRACEBACK_HEADER not in stderr:
+        return None
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    for line in reversed(lines):
+        match = _EXCEPTION_LINE.match(line)
+        if not match:
+            continue
+        exc_class = match.group("cls")
+        module = _MISSING_MODULE.search(line)
+        if module:
+            return (
+                f"{exc_class}: the hook could not import `{module.group(1)}`, "
+                "so it never evaluated this call"
+            )
+        return f"{exc_class} raised before the hook could evaluate this call"
+    return None
+
+
+def _malfunction_block(
+    spec: ShellHookSpec, returncode: int, stderr: str,
+) -> Dict[str, Any]:
+    """Block for a fail-closed hook that MALFUNCTIONED rather than denied.
+
+    In this protocol a denial is exit 2 or a ``block`` directive on stdout. Any
+    other non-zero exit from a ``fail_closed`` hook is therefore a broken hook,
+    not a policy decision — and the operator-facing text has to say so, because
+    the two used to be worded identically. It still FAILS CLOSED; only the
+    classification and the message change.
+    """
+    diagnosis = _crash_diagnosis(stderr)
+    detail = diagnosis or (
+        f"exited {returncode} without emitting a policy directive"
+    )
+    return {
+        "action": "block",
+        "message": (
+            f"hook {hook_display_name(spec.command)} CRASHED — this is a BROKEN "
+            f"ENFORCEMENT HOOK, not a policy denial. {detail}. Failing closed, "
+            "so nothing was permitted that the hook would have refused. Fix the "
+            "hook itself (a missing module named above is usually a partial "
+            "deploy: restore it on the path the hook runs from, then retry). Do "
+            "NOT disable the guard to clear this — the policy did not object to "
+            "this call, the hook never ran."
+        ),
+        "error_class": "hook_internal_error",
+    }
+
+
 def _evaluate_result(
     spec: ShellHookSpec, r: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
@@ -845,7 +926,12 @@ def _evaluate_result(
         )
 
         if fail_closed:
-            return _fail_closed_block(spec, f"hook exited {r['returncode']}")
+            # A DENIAL is exit 2 (handled above) or a block directive on
+            # stdout. Any other non-zero exit is a MALFUNCTION, and saying
+            # "failed closed" for both is what sent an operator hunting a
+            # merge they never attempted while the real cause was an absent
+            # module. Same fail-closed outcome, self-describing message.
+            return _malfunction_block(spec, r["returncode"], stderr)
 
     stdout = (r["stdout"] or "").strip()
     parsed = _parse_response(spec.event, stdout)
