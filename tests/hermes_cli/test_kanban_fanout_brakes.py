@@ -204,7 +204,7 @@ def _install_notify(home: Path) -> Path:
     scripts = home / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
     path = scripts / "notify.py"
-    path.write_text("raise SystemExit(0)\n")
+    path.write_text("raise SystemExit(0)\n", encoding="utf-8")
     return path
 
 
@@ -266,7 +266,7 @@ def test_board_spend_tolerates_missing_and_broken_ledgers(kanban_home):
     # A file that is not a database.
     d = kanban_home / "profiles" / "broken" / "blackbox"
     d.mkdir(parents=True)
-    (d / "turns.db").write_text("not a database")
+    (d / "turns.db").write_text("not a database", encoding="utf-8")
     assert kanban_budget.board_spend_usd(
         kb.kanban_db_path(), window_hours=24, home=kanban_home,
     ) == 0.0
@@ -330,7 +330,7 @@ def test_dispatch_skips_spawn_over_ceiling_and_pages_once(
     assert res2.budget_paused is True
     marker = kb.board_dir(kb.DEFAULT_BOARD) / ".budget_paused.json"
     assert marker.exists()
-    data = json.loads(marker.read_text())
+    data = json.loads(marker.read_text(encoding="utf-8"))
     assert data["ceiling"] == 10.0
     assert data["spend"] == pytest.approx(25.0)
     assert "since" in data
@@ -386,7 +386,9 @@ def test_recovery_clears_marker_and_reports_once(
 
     marker = kb.board_dir(kb.DEFAULT_BOARD) / ".budget_paused.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"since": 1, "spend": 25.0, "ceiling": 10.0}))
+    marker.write_text(
+        json.dumps({"since": 1, "spend": 25.0, "ceiling": 10.0}), encoding="utf-8",
+    )
     spawns: list[str] = []
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="recovered", assignee="argus")

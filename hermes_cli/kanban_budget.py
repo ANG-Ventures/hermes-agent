@@ -251,7 +251,7 @@ def _marker_path(board_dir: Path) -> Path:
 def read_pause_marker(board_dir) -> Optional[dict]:
     path = _marker_path(Path(board_dir))
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -346,7 +346,7 @@ def evaluate_board_budget(
                 "window_hours": window,
             }
             _marker_path(board_dir).write_text(
-                json.dumps(payload, indent=2) + "\n"
+                json.dumps(payload, indent=2) + "\n", encoding="utf-8",
             )
         except Exception as exc:
             _log.warning(
