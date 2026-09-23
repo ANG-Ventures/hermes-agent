@@ -43,7 +43,7 @@ def test_guard_does_not_restrict_sub_flagship():
     assert firepower_guard_error("gpt-5.6-sol-900k", None) is None
     assert firepower_guard_error("claude-opus-5", None) is None
     assert route_kind("openai-codex/gpt-5.6-sol-900k") == "standard"
-    assert route_kind("openai-codex/gpt-6-astra-900k") == "firepower-override"
+    assert route_kind("openai-codex/gpt-6-astra-900k") == "firepower"
 
 
 def test_create_refuses_flagship_without_firepower_reason(kanban_home):

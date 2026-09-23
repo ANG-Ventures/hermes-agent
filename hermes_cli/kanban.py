@@ -2583,7 +2583,9 @@ def _cli_model_override(args, *, allow_ttl=False):
             raise ValueError(f"--model-json: {exc}") from exc
     else:
         raw = flags or None
-    return parse_model_override(raw, field="model", allow_ttl=allow_ttl)
+    # CLI checks the resolved per-card/per-lane route below, including
+    # provider-only inheritance; keep its actionable --firepower wording.
+    return parse_model_override(raw, field="model", allow_ttl=allow_ttl, enforce_firepower=False)
 
 
 def _split_ids_and_model(
@@ -2635,10 +2637,13 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     clear_effort = bool(getattr(args, "clear_effort", False))
     firepower_reason = override.firepower if override else getattr(args, "firepower", None)
     from hermes_cli.model_policy import (
+        canonical_model_pair,
         firepower_guard_error,
         format_firepower_audit,
         is_firepower_model,
     )
+    if model:
+        model, provider = canonical_model_pair(model, provider)
     # The two knobs are independent: with --effort/--clear-effort and no
     # positional model, the model override is left untouched (absent means
     # "unchanged" here, not "clear"). Without either effort flag the
@@ -2710,6 +2715,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     if not inherited or inherited == "unknown":
                         print(f"kanban: cannot resolve model for {task.id}", file=sys.stderr)
                         return 2
+                    inherited, _ = canonical_model_pair(inherited, provider)
                     guard = firepower_guard_error(inherited, firepower_reason)
                     if guard:
                         print(f"kanban: {guard}", file=sys.stderr)
@@ -2819,6 +2825,7 @@ def _cmd_lane_model(args: argparse.Namespace) -> int:
 
 def _cmd_lane_model_set(args: argparse.Namespace) -> int:
     from hermes_cli.model_policy import (
+        canonical_model_pair,
         firepower_guard_error,
         format_firepower_audit,
         is_firepower_model,
@@ -2848,8 +2855,9 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
-    provider = parsed.provider if parsed else None
-    model = parsed.model if parsed else None
+    provider, model = parsed.provider if parsed else None, parsed.model if parsed else None
+    if model:
+        model, provider = canonical_model_pair(model, provider)
     reasoning_effort = parsed.reasoning_effort if parsed else None
     if not provider or not model:
         print(

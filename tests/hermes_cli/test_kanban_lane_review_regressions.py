@@ -88,6 +88,70 @@ def test_lane_json_round_trip_and_firepower_guard(kanban_home):
         assert kb.get_lane_model_override(conn).reasoning_effort == 'high'
 
 
+@pytest.mark.parametrize('route_arg', [
+    'astra --provider batch-provider',
+    '--model astra --provider batch-provider',
+    '''--model-json '{"model":"astra","provider":"batch-provider"}' ''',
+])
+def test_card_alias_to_flagship_requires_firepower(kanban_home, route_arg):
+    with (kanban_home / 'config.yaml').open('a') as config:
+        config.write('model:\n  aliases:\n    astra: batch-provider/gpt-6-astra-900k\n')
+    card = _create('alias', 'worker')
+    out = kc.run_slash(f'set-model {card} {route_arg}')
+    assert 'firepower-only' in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, card).model_override is None
+        assert kb.list_comments(conn, card) == []
+    out = kc.run_slash(f'set-model {card} {route_arg} --firepower "urgent task"' if '--model-json' not in route_arg else
+                       f'''set-model {card} --model-json '{{"model":"astra","provider":"batch-provider","firepower":"urgent task"}}' ''')
+    assert 'gpt-6-astra-900k' in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, card).model_override == 'gpt-6-astra-900k'
+        assert 'batch-provider/gpt-6-astra-900k' in kb.list_comments(conn, card)[0].body
+
+
+@pytest.mark.parametrize('route_arg', [
+    'batch-provider/astra --ttl 2h',
+    '--model astra --provider batch-provider --ttl 2h',
+    '''--model-json '{"model":"astra","provider":"batch-provider","ttl":"2h"}' ''',
+])
+def test_lane_alias_to_flagship_requires_firepower(kanban_home, route_arg):
+    with (kanban_home / 'config.yaml').open('a') as config:
+        config.write('model:\n  aliases:\n    astra: batch-provider/gpt-6-astra-900k\n')
+    out = kc.run_slash(f'lane-model set {route_arg} --reason capacity')
+    assert 'firepower-only' in out
+    with kb.connect() as conn:
+        assert kb.get_lane_model_override(conn) is None
+    if '--model-json' in route_arg:
+        authorised = '''--model-json '{"model":"astra","provider":"batch-provider","ttl":"2h","firepower":"urgent task"}' '''
+    else:
+        authorised = f'{route_arg} --firepower "urgent task"'
+    out = kc.run_slash(f'lane-model set {authorised} --reason capacity')
+    assert 'route=batch-provider/gpt-6-astra-900k' in out
+    with kb.connect() as conn:
+        row = kb.get_lane_model_override(conn)
+        assert row.model == 'gpt-6-astra-900k'
+        assert row.firepower == 'urgent task'
+
+
+def test_provider_only_alias_in_profile_requires_firepower(kanban_home):
+    with (kanban_home / 'config.yaml').open('a') as config:
+        config.write('model:\n  aliases:\n    astra: batch-provider/gpt-6-astra-900k\n')
+    profile = kanban_home / 'profiles' / 'worker'
+    profile.mkdir(parents=True)
+    (profile / 'config.yaml').write_text('model:\n  provider: batch-provider\n  default: astra\n')
+    card = _create('provider-only alias', 'worker')
+    out = kc.run_slash(f'set-model {card} --provider batch-provider')
+    assert 'firepower-only' in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, card).model_override is None
+    out = kc.run_slash(f'set-model {card} --provider batch-provider --firepower "urgent task"')
+    assert 'gpt-6-astra-900k' in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, card).model_override == 'gpt-6-astra-900k'
+        assert 'batch-provider/gpt-6-astra-900k' in kb.list_comments(conn, card)[0].body
+
+
 def test_lane_reason_and_effort_round_trip(kanban_home):
     out = kc.run_slash('lane-model set --provider batch-provider --model model-a --ttl 2h')
     assert 'reason' in out.lower()

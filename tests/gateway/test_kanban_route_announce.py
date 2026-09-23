@@ -30,7 +30,7 @@ def test_spawn_route_summary_names_each_task_route():
     assert "t_a route=openai-codex/gpt-5.6-sol-900k source=profile-default kind=standard" in summary
     assert "t_b route=claude-apr/claude-opus-5 source=profile-default kind=standard" in summary
     assert (
-        "t_c route=openai-codex/gpt-6-astra-900k source=profile-default kind=firepower-override"
+        "t_c route=openai-codex/gpt-6-astra-900k source=profile-default kind=firepower"
         in summary
     )
 
