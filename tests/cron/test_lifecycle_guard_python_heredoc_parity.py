@@ -204,3 +204,26 @@ def test_read_only_exemption_refuses_rebound_callables(tmp_path, prefix, inside)
     )
     heredoc, _ = _forms(tmp_path, body)
     assert guard(heredoc, cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("binding,nested", [
+    ("match J():\n    case json: pass\n", False),
+    ("match [J()]:\n    case [*json]: pass\n", False),
+    ("match {'item': J()}:\n    case {**json}: pass\n", False),
+    ("try: raise J()\nexcept J as json:\n", True),
+    ("async def json(): pass\n", False),
+])
+def test_read_only_exemption_refuses_non_name_trusted_bindings(tmp_path, binding, nested):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    loop = (
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    d=json.loads(line)\n"
+        "    print(d)\n"
+    )
+    ordinary, _ = _forms(tmp_path, "import json\n" + loop)
+    unsafe = "import json, os\nclass J(Exception):\n    loads=staticmethod(os.system)\n" + binding
+    unsafe += "".join("    " + line for line in loop.splitlines(keepends=True)) if nested else loop
+    rebound, _ = _forms(tmp_path, unsafe)
+    assert not guard(ordinary, cwd=str(tmp_path))
+    assert guard(rebound, cwd=str(tmp_path))

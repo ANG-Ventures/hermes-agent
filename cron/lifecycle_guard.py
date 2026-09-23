@@ -1944,7 +1944,10 @@ def _mask_read_only_python_paths(body: str) -> str:
     if any(
         (isinstance(n, ast.Name) and n.id in trusted_names
          and not isinstance(n.ctx, ast.Load))
-        or (isinstance(n, (ast.FunctionDef, ast.ClassDef, ast.arg))
+        or (isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name in trusted_names)
+        or (isinstance(n, ast.MatchMapping) and n.rest in trusted_names)
+        or (isinstance(n, ast.ExceptHandler) and n.name in trusted_names)
+        or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.arg))
             and (n.name if not isinstance(n, ast.arg) else n.arg) in trusted_names)
         or (isinstance(n, (ast.Import, ast.ImportFrom)) and any(
             (a.asname or (a.name.split(".")[0] if isinstance(n, ast.Import) else a.name))
