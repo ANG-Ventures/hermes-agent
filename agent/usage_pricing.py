@@ -504,6 +504,48 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://developers.openai.com/api/docs/models/gpt-6-astra",
         pricing_version="openai-gpt-6-2026-09",
     ),
+    # ── OpenAI GPT-6 Sol / Luna ──────────────────────────────────────────
+    # GA 2026-09-22 (https://openai.com/index/introducing-gpt-6-sol-and-luna/):
+    # a 50% cut against the GPT-5.6 promotional rates. Sol $2/$10, Luna
+    # $0.10/$0.50 per 1M in/out. Cache read is the standard 0.1x input
+    # discount, cache write 1.25x input — both stated verbatim on the model
+    # docs pages, which also document a whole-request context tier: "Prompts
+    # with more than 272K input tokens are priced at 2x input and cache rates
+    # and 1.5x output for the full request."
+    # Source: https://developers.openai.com/api/docs/models/gpt-6-sol
+    (
+        "openai",
+        "gpt-6-sol",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("2.50"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/models/gpt-6-sol",
+        pricing_version="openai-gpt-6-sol-2026-09",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("4.00"),
+        output_cost_per_million_above=Decimal("15.00"),
+        cache_read_cost_per_million_above=Decimal("0.40"),
+    ),
+    # Source: https://developers.openai.com/api/docs/models/gpt-6-luna
+    (
+        "openai",
+        "gpt-6-luna",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.50"),
+        cache_read_cost_per_million=Decimal("0.01"),
+        cache_write_cost_per_million=Decimal("0.125"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/models/gpt-6-luna",
+        pricing_version="openai-gpt-6-luna-2026-09",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("0.20"),
+        output_cost_per_million_above=Decimal("0.75"),
+        cache_read_cost_per_million_above=Decimal("0.02"),
+    ),
     # ── Anthropic Claude Opus 5 ──────────────────────────────────────────
     # Released 2026-07-24, same $5/$25 base pricing as Opus 4.8 (announcement:
     # "priced at $5 per million input tokens and $25 per million output tokens
@@ -1436,6 +1478,15 @@ for _base_56 in ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
         ("openai", _base_56)
     ]
 del _base_56
+
+# GPT-6 Sol/Luna have no "-pro" variant (the 2026-09-22 launch shipped the
+# base slugs only), so alias ONLY the Hermes-side "-900k" Codex picker
+# variant — the suffix is stripped on the wire, so it is the same model.
+for _base_6 in ("gpt-6-sol", "gpt-6-luna"):
+    _OFFICIAL_DOCS_PRICING[("openai", f"{_base_6}-900k")] = _OFFICIAL_DOCS_PRICING[
+        ("openai", _base_6)
+    ]
+del _base_6
 
 # The direct Gemini provider currently exposes preview IDs for these two
 # models. Keep the official snapshot keyed by both their documented stable

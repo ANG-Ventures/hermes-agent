@@ -100,6 +100,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # OpenAI
     ("openai/gpt-6-astra",                     ""),
     ("openai/gpt-6-astra-pro",                 ""),
+    ("openai/gpt-6-sol",                       ""),
+    ("openai/gpt-6-luna",                      ""),
     ("openai/gpt-5.6-sol",                     ""),
     ("openai/gpt-5.6-sol-pro",                 ""),
     ("openai/gpt-5.6-terra",                   ""),
@@ -290,6 +292,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # OpenAI
         "openai/gpt-6-astra",
         "openai/gpt-6-astra-pro",
+        "openai/gpt-6-sol",
+        "openai/gpt-6-luna",
         "openai/gpt-5.6-sol",
         "openai/gpt-5.6-sol-pro",
         "openai/gpt-5.6-terra",
@@ -349,6 +353,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "openai-api": [
         "gpt-6-astra",
         "gpt-6-astra-pro",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-sol-pro",
         "gpt-5.6-terra",

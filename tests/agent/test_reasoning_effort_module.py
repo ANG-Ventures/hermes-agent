@@ -171,3 +171,42 @@ class TestRequestedEffort:
         assert requested_effort({"enabled": False, "effort": "high"}) is None
         assert requested_effort("not-a-dict") is None
         assert requested_effort({"effort": ""}) is None
+
+
+class TestGpt6SolLunaCodexEfforts:
+    """GPT-6 Sol/Luna document the gpt-5.6-era ladder verbatim: "none, low,
+    medium (default), high, xhigh, and max"
+    (developers.openai.com/api/docs/models/gpt-6-{sol,luna}, 2026-09-22)."""
+
+    def test_sol_and_luna_get_the_gpt56_vocabulary(self):
+        from agent.reasoning_effort import (
+            CODEX_GPT56_EFFORTS,
+            codex_supported_efforts,
+        )
+
+        assert codex_supported_efforts("gpt-6-sol") is CODEX_GPT56_EFFORTS
+        assert codex_supported_efforts("gpt-6-luna") is CODEX_GPT56_EFFORTS
+        # picker variants and vendor namespaces resolve the same way
+        assert codex_supported_efforts("gpt-6-sol-900k") is CODEX_GPT56_EFFORTS
+        assert codex_supported_efforts("openai/gpt-6-luna") is CODEX_GPT56_EFFORTS
+
+    def test_max_survives_the_clamp_for_sol_and_luna(self):
+        from agent.reasoning_effort import clamp_effort, codex_supported_efforts
+
+        for model in ("gpt-6-sol", "gpt-6-luna"):
+            supported = codex_supported_efforts(model)
+            assert clamp_effort("max", supported) == "max"
+            # ultra is Hermes-internal and never goes on the wire
+            assert clamp_effort("ultra", supported) == "max"
+            # minimal is rejected by the Codex backend; clamps down to low
+            assert clamp_effort("minimal", supported) == "low"
+
+    def test_gpt6_is_not_a_blanket_prefix(self):
+        """Each gpt-6 slug earns its vocabulary by its own evidence: an
+        unprobed descendant falls back to the conservative legacy set."""
+        from agent.reasoning_effort import (
+            CODEX_LEGACY_EFFORTS,
+            codex_supported_efforts,
+        )
+
+        assert codex_supported_efforts("gpt-6-terra") is CODEX_LEGACY_EFFORTS
