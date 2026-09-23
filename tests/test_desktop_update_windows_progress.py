@@ -14,7 +14,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from urllib.request import urlopen
@@ -25,22 +24,6 @@ pytestmark = pytest.mark.windows_only
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WINDOWS_UPDATE_PS1 = REPO_ROOT / "scripts" / "desktop-update" / "windows.ps1"
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _loaded_runner():
-    """Temporary CI-only contention probe; removed after the 20-case run."""
-    worker = subprocess.Popen(
-        [sys.executable, "-c", "import time\nend = time.monotonic() + 900\nwhile time.monotonic() < end: pass"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        yield
-    finally:
-        worker.terminate()
-        worker.wait(timeout=10)
 
 
 def _read_progress(url: str, deadline: float) -> dict[str, object]:
@@ -68,8 +51,7 @@ def _read_progress(url: str, deadline: float) -> dict[str, object]:
     )
 
 
-@pytest.mark.parametrize("trial", range(20))
-def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path, trial: int) -> None:
+def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None:
     powershell = shutil.which("powershell.exe")
     assert powershell, "Windows updater tests require Windows PowerShell."
 
