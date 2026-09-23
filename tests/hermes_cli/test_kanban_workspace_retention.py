@@ -16,6 +16,8 @@ These tests drive the real lanes against a sealed temp home.
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -134,6 +136,43 @@ def test_gc_reaps_old_done_workspaces_and_spares_every_protected_state(kanban_ho
         assert ws.is_dir(), f"gc removed a {st} card's workspace"
     audit = kb.workspace_deletion_log_path().read_text(encoding="utf-8")
     assert f"\tDELETE\ttask={old_done.name}\t" in audit, "no ledger line for the reaped workspace"
+
+
+@pytest.mark.parametrize("parent_kind", ["scratch", "worktree"])
+def test_gc_defers_linked_parent_until_child_finishes(kanban_home, parent_kind):
+    parent = _mktask("parent handoff")
+    ws = _scratch(parent, "done", finished_days_ago=5)
+    _set(parent, workspace_kind=parent_kind)
+    (ws / "handoff.txt").write_text("still needed", encoding="utf-8")
+    child = _mktask("active child")
+    _set(child, status="running", workspace_kind="dir", workspace_path=str(kanban_home),
+         claim_expires=int(time.time()) + 3600)
+    with kb.connect_closing() as conn:
+        kb.link_tasks(conn, parent, child)
+    assert _gc(done_retention_days=3) == 0
+    assert (ws / "handoff.txt").read_text(encoding="utf-8") == "still needed"
+    assert "active-children-need-handoff" in kb.workspace_deletion_log_path().read_text(encoding="utf-8")
+    if parent_kind == "scratch":
+        _set(child, status="done", claim_expires=None)
+        assert _gc(done_retention_days=3) == 0
+        assert not ws.exists()
+
+
+def test_live_home_dir_card_using_scratch_cwd_blocks_gc(kanban_home):
+    home_card = _home_rooted_dir_card(kanban_home, "running")
+    old = _scratch(_mktask("old done"), "done", finished_days_ago=5)
+    free = _scratch(_mktask("free old done"), "done", finished_days_ago=5)
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                               cwd=old, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert sleeper.poll() is None
+        assert kb._live_owners_of_path(old) == [home_card]
+        assert _gc(done_retention_days=3) == 0
+        assert old.is_dir() and not free.exists()
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=5)
 
 
 def test_gc_done_retention_negative_disables_the_done_sweep(kanban_home):
