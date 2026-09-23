@@ -16935,13 +16935,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pool = getattr(self, "_startup_resume_pool", None)
             if pool is None:
                 from gateway.turn_admission import StartupResumePool
-                concurrency = getattr(self.config, "startup_resume_concurrency", 3)
-                if type(concurrency) is not int or concurrency <= 0:
+                # Default UNBOUNDED (Ace ruling 2026-09-23 09:40): every
+                # restart-interrupted session resumes at once. #827 set 3 to
+                # pace resumes onto a 10-thread executor; #936 removed that
+                # executor cap, so the pacing has nothing left to protect and
+                # only delays the sessions Ace is waiting on. A positive
+                # gateway.startup_resume_concurrency is still honoured as an
+                # explicit operator throttle.
+                concurrency = getattr(self.config, "startup_resume_concurrency", None)
+                if concurrency is not None and (type(concurrency) is not int or concurrency <= 0):
                     logger.warning(
-                        "Invalid gateway.startup_resume_concurrency value %r; using 3",
+                        "Invalid gateway.startup_resume_concurrency value %r; using unbounded",
                         concurrency,
                     )
-                    concurrency = 3
+                    concurrency = None
                 pool = self._startup_resume_pool = StartupResumePool(
                     concurrency
                 )

@@ -3409,7 +3409,8 @@ DEFAULT_CONFIG = {
         # value; raise it alongside a larger max_concurrent_turns. 0 disables
         # the reserve. Clamped to [0, max_concurrent_turns - 1].
         "user_turn_reserve": 2,
-        "startup_resume_concurrency": 3,
+        # None = unbounded boot-resume fan-out; a positive int throttles.
+        "startup_resume_concurrency": None,
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
