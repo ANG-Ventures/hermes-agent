@@ -36186,7 +36186,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         cap,
                     )
                 cap = None
-            admission = self._turn_admission = TurnAdmission(cap)
+            reserve = getattr(
+                getattr(self, "config", None), "user_turn_reserve", 2,
+            )
+            if type(reserve) is not int or reserve < 0:
+                logger.warning(
+                    "Invalid gateway.user_turn_reserve value %r; using 2",
+                    reserve,
+                )
+                reserve = 2
+            admission = self._turn_admission = TurnAdmission(cap, reserve=reserve)
         return admission
 
     async def _ack_turn_slot_wait(self, source):

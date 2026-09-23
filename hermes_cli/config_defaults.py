@@ -3367,6 +3367,13 @@ DEFAULT_CONFIG = {
     "gateway": {
         # New-install recommendation; raw configs omitting the turn cap stay unbounded.
         "max_concurrent_turns": 8,
+        # Turn slots held back for USER turns. Internal turns (post-conversation
+        # memory/skill hooks, kind=internal) may occupy at most
+        # max_concurrent_turns - user_turn_reserve slots, so a burst of hooks
+        # can never queue a human behind them. 2 is the historical hard-coded
+        # value; raise it alongside a larger max_concurrent_turns. 0 disables
+        # the reserve. Clamped to [0, max_concurrent_turns - 1].
+        "user_turn_reserve": 2,
         "startup_resume_concurrency": 3,
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.

@@ -26,14 +26,24 @@ class TurnAdmission:
 
     warning_after = 5.0
     ack_after = 15.0
+    default_reserve = 2
 
-    def __init__(self, cap):
+    def __init__(self, cap, reserve=None):
         self.cap = cap
+        if reserve is None:
+            reserve = self.default_reserve
+        # Clamp into [0, cap - 1]: the reserve may never starve internal turns
+        # of their last slot, and a negative reserve just disables it.
+        reserve = min(max(int(reserve), 0), max(0, (cap or 1) - 1))
+        self.reserve = reserve
         self.total = asyncio.Semaphore(cap) if cap else None
-        self.internal = asyncio.Semaphore(max(1, cap - 2)) if cap else None
+        self.internal = asyncio.Semaphore(max(1, cap - reserve)) if cap else None
         self.in_flight = 0
         self.waiting = 0
         self._owners = {}
+        logger.info(
+            "PHASE=turn_admission_init cap=%s reserve=%s", cap, reserve,
+        )
 
     def retain_worker(self, future):
         """A cancelled/timed-out caller must not free a still-running executor."""

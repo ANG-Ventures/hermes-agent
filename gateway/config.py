@@ -205,6 +205,40 @@ def _coerce_optional_positive_int(value: Any, key: str) -> Optional[int]:
 _SYSTEMD_WATCHDOG_MAX_SECONDS = 2_147_483_647
 
 
+def _coerce_non_negative_int(value: Any, key: str, default: int) -> int:
+    """Coerce a non-negative integer config value, falling back on garbage.
+
+    Unlike :func:`_coerce_optional_positive_int`, 0 is a meaningful value here
+    (it disables the setting rather than being absent). Malformed or negative
+    values warn and degrade to ``default`` so a typo never blocks startup.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        parsed = None
+    else:
+        try:
+            if isinstance(value, float):
+                if not value.is_integer():
+                    raise ValueError(value)
+                parsed = int(value)
+            elif isinstance(value, str):
+                parsed = int(value.strip(), 10)
+            else:
+                parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = None
+    if parsed is None or parsed < 0:
+        logger.warning(
+            "Ignoring invalid %s=%r (expected a non-negative integer); using %r",
+            key,
+            value,
+            default,
+        )
+        return default
+    return parsed
+
+
 def coerce_systemd_watchdog_seconds(
     value: Any, key: str = "gateway.systemd_watchdog_seconds"
 ) -> int:
@@ -974,6 +1008,9 @@ class GatewayConfig:
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
     max_concurrent_turns: Optional[int] = None  # Missing/0 preserves unbounded legacy execution
+    # Turn slots held back for user turns so internal (hook/memory) turns can
+    # never occupy the whole cap. 2 is the historical hard-coded value.
+    user_turn_reserve: int = 2
     startup_resume_concurrency: int = 3
 
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
@@ -1159,6 +1196,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "max_concurrent_turns": self.max_concurrent_turns,
+            "user_turn_reserve": self.user_turn_reserve,
             "startup_resume_concurrency": self.startup_resume_concurrency,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
@@ -1342,6 +1380,13 @@ class GatewayConfig:
             turn_limits[key] = _coerce_optional_positive_int(
                 raw, key if key in data else f"gateway.{key}",
             )
+        _reserve_key = "user_turn_reserve"
+        user_turn_reserve = _coerce_non_negative_int(
+            data[_reserve_key] if _reserve_key in data
+            else nested_gateway.get(_reserve_key),
+            _reserve_key if _reserve_key in data else f"gateway.{_reserve_key}",
+            2,
+        )
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -1385,6 +1430,7 @@ class GatewayConfig:
             liveness_starvation_max_hold_s=liveness_starvation_max_hold_s,
             max_concurrent_sessions=max_concurrent_sessions,
             max_concurrent_turns=turn_limits["max_concurrent_turns"],
+            user_turn_reserve=user_turn_reserve,
             startup_resume_concurrency=turn_limits["startup_resume_concurrency"] or 3,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
@@ -1561,7 +1607,8 @@ def load_gateway_config() -> GatewayConfig:
             if "max_concurrent_sessions" in yaml_cfg:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
 
-            for key in ("max_concurrent_turns", "startup_resume_concurrency"):
+            for key in ("max_concurrent_turns", "startup_resume_concurrency",
+                        "user_turn_reserve"):
                 if key in yaml_cfg:
                     gw_data[key] = yaml_cfg[key]
                 elif isinstance(gateway_section, dict) and key in gateway_section:
