@@ -1099,6 +1099,9 @@ def init_agent(
     # agent was doing when it was killed, and by the "still working"
     # notifications to show progress.
     agent._last_activity_ts: float = time.time()
+    # Last REAL progress (API call, stream chunk, tool call) — wait tickers
+    # refresh _last_activity_ts only. Read by the kanban stall detector.
+    agent._last_progress_ts: float = agent._last_activity_ts
     agent._last_activity_desc: str = "initializing"
     # Default / unmigrated paths and _touch_activity stamp unknown; named
     # provenances are stamped by compression writers (heartbeat / timeout / cooldown).

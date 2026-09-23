@@ -12228,6 +12228,8 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    progress_stalled: list[str] = field(default_factory=list)
+    """Task ids reclaimed after fresh wrapper heartbeats but no worker activity."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -12730,8 +12732,13 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    progress_at: Optional[float] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+
+    ``progress_at`` is the agent's last real progress time (API call,
+    stream chunk, tool call). It rides on the event payload so the stall
+    detector can tell a live wrapper from a progressing model loop.
 
     Called by long-running workers as a liveness signal orthogonal to
     the PID check. A worker that forks a long-lived child (train loop,
@@ -12767,9 +12774,14 @@ def heartbeat_worker(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
                 (now, run_id),
             )
+        payload: dict[str, Any] = {}
+        if note:
+            payload["note"] = note
+        if progress_at is not None:
+            payload["progress_at"] = int(progress_at)
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            payload or None,
             run_id=run_id,
         )
     return True
@@ -12918,6 +12930,154 @@ def enforce_max_runtime(
 # the ``dispatch_stale_timeout_seconds`` threshold.  Hardcoded at 1 hour
 # to match the original spec (">4h started + no commits in 1h").
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
+
+
+def _worker_cpu_active(pid: int) -> bool:
+    """Veto only: a worker burning CPU right now is evidence against a stall.
+
+    This probe can never *authorize* a reclaim on its own -- a worker blocked
+    on an in-flight provider request reads 0% CPU, exactly like a dead
+    socket. The stall decision comes from the agent's own progress timestamp
+    (:func:`_run_progress_at`); this sample can only cancel it. Child
+    processes are deliberately NOT a veto: workers hold persistent idle
+    children (execute_code kernels, LSP servers) for their whole life, and a
+    healthy long tool call already advances ``progress_at`` through the tool
+    keepalive tickers. Unknown process state (``ps`` missing/failing/
+    unparseable) returns True so it never authorizes a kill.
+    """
+    import subprocess
+    try:
+        ps = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid=,pcpu="],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
+            check=True,
+        )
+        for line in ps.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 3:
+                continue
+            proc, cpu = int(fields[0]), float(fields[2])
+            if proc == pid and cpu > 0:
+                return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True  # Unknown process state must not authorize a kill.
+    return False
+
+
+def _run_progress_at(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[int]:
+    """Latest agent-reported progress time for ``run_id``, or None if unknown.
+
+    The worker's heartbeat bridge (``heartbeat_current_worker_from_env``)
+    stamps ``progress_at`` -- the agent's last API-call start/finish, stream
+    chunk, tool start/finish or retry -- onto its heartbeat events. Pure
+    provider-wait tickers refresh the heartbeat but NOT ``progress_at``, so a
+    fresh heartbeat with an old ``progress_at`` is the run 7914 shape. A run
+    that never reported ``progress_at`` (older worker, non-agent worker) is
+    unknown and must never be reclaimed by the stall detector.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='heartbeat' AND payload LIKE '%progress_at%' "
+        "ORDER BY id DESC LIMIT 5",
+        (task_id, run_id),
+    ).fetchall()
+    for row in rows:
+        try:
+            value = json.loads(row["payload"] or "null").get("progress_at")
+            if value is not None:
+                return int(value)
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return None
+
+
+def detect_progress_stalls(
+    conn: sqlite3.Connection, *, stall_seconds: int = 900,
+    reclaim_seconds: int = 1500, board: Optional[str] = None,
+) -> list[str]:
+    """Detect a silent model loop even while its wrapper sends heartbeats.
+
+    A run is stalled only when the agent's own progress timestamp (plus
+    worker-log growth) has been stale for the whole window; a single
+    idle process sample is never sufficient, only a veto.
+    """
+    now = int(time.time())
+    reclaimed = []
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.claim_lock, t.current_run_id, "
+        "t.last_heartbeat_at, t.assignee, r.started_at FROM tasks t "
+        "JOIN task_runs r ON r.id=t.current_run_id WHERE t.status='running'"
+    ).fetchall()
+    for row in rows:
+        if row["started_at"] is None or row["worker_pid"] is None:
+            continue
+        start = int(row["started_at"])
+        hb = row["last_heartbeat_at"]
+        if hb is None or now - int(hb) >= _STALE_HEARTBEAT_GAP_SECONDS:
+            continue
+        pid = int(row["worker_pid"])
+        lock = row["claim_lock"]
+        if not lock or not str(lock).startswith(f"{_claimer_id().split(':', 1)[0]}:"):
+            continue
+        rid = row["current_run_id"]
+        progress_at = _run_progress_at(conn, row["id"], rid)
+        if progress_at is None:
+            continue  # No agent progress signal: unknown, never reclaim.
+        try:
+            log_time = int(worker_log_path(row["id"], board=board).stat().st_mtime)
+        except OSError:
+            log_time = start
+        age = now - max(start, log_time, progress_at)
+        if age < stall_seconds:
+            continue
+        if _worker_cpu_active(pid):
+            continue
+        evidence = {
+            "progress_age_seconds": age, "heartbeat_age_seconds": now - int(hb),
+            "agent_progress_age_seconds": now - progress_at,
+            "log_age_seconds": now - log_time, "worker_pid": pid,
+            "oldest_age_seconds": max(now - progress_at, now - log_time),
+            "signals": ["no_agent_progress", "no_log_growth", "no_cpu"],
+        }
+        prior = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='stalled' LIMIT 1",
+            (row["id"], rid),
+        ).fetchone()
+        if not prior:
+            with write_txn(conn):
+                _append_event(conn, row["id"], "stalled", evidence, run_id=rid)
+        if age < reclaim_seconds:
+            continue
+        termination = _terminate_reclaimed_worker(pid, lock)
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, row["id"], lock, now, termination, reason="progress_stalled_worker_alive",
+            )
+            continue
+        attempts = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND outcome='stalled'",
+            (row["id"],),
+        ).fetchone()[0]
+        escalate = attempts >= 2
+        reason = f"worker progress stalled for {age}s; {evidence['signals']}; heartbeat age {evidence['heartbeat_age_seconds']}s"
+        with write_txn(conn):
+            status = "blocked" if escalate else _retry_status_for_run(conn, row["id"])
+            cur = conn.execute(
+                "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+                "worker_pid=NULL, last_heartbeat_at=NULL, block_kind=? "
+                "WHERE id=? AND status='running' AND current_run_id=? AND claim_lock=?",
+                (status, "capability" if escalate else None, row["id"], rid, lock),
+            )
+            if cur.rowcount != 1:
+                continue
+            ended = _end_run(
+                conn, row["id"], outcome="stalled", status="stalled",
+                error=reason, metadata={**evidence, **termination},
+            )
+            _append_event(conn, row["id"], "blocked" if escalate else "stalled_reclaimed",
+                          {"reason": reason, **evidence}, run_id=ended)
+        reclaimed.append(row["id"])
+    return reclaimed
 
 
 def detect_stale_running(
@@ -15284,6 +15444,18 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
+    try:
+        from hermes_cli.config import load_config as _load_stall_config
+        stall_cfg = (_load_stall_config() or {}).get("kanban") or {}
+        stall_seconds = int(stall_cfg.get("stall_minutes", 15)) * 60
+        reclaim_seconds = int(stall_cfg.get("stall_reclaim_minutes", 25)) * 60
+    except (TypeError, ValueError, OSError):
+        stall_seconds, reclaim_seconds = 900, 1500
+    if stall_seconds > 0 and reclaim_seconds > stall_seconds and not dry_run:
+        result.progress_stalled = detect_progress_stalls(
+            conn, stall_seconds=stall_seconds,
+            reclaim_seconds=reclaim_seconds, board=board,
+        )
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -15465,25 +15637,45 @@ def _dispatch_once_locked(
     reported_collision_scopes: Optional[dict[str, set[str]]] = None
     collision_scope_load_failed = False
     spawned = 0
-    from hermes_cli.kanban_provider_health import capped_provider, configured_probes
+    from hermes_cli.kanban_provider_health import (
+        available_profile_fallback, capped_provider, configured_min_eligible,
+        configured_probes,
+    )
     health_probes = configured_probes()
+    min_eligible = configured_min_eligible()
     health_cache: dict = {}
 
-    def provider_deferred(task_id, assignee):
+    def provider_admission(task_id, assignee):
         if not health_probes:
-            return False
+            return False, None
         task = get_task(conn, task_id)
         if task is None:
-            return False
+            return False, None
         task.assignee = assignee
-        payload = capped_provider(task, health_probes, health_cache)
+        payload = capped_provider(task, health_probes, health_cache, min_eligible=min_eligible)
         if payload is None:
-            return False
+            return False, None
+        fallback = available_profile_fallback(
+            task, health_probes, health_cache, min_eligible=min_eligible,
+        )
+        if fallback is not None:
+            return False, (fallback, payload)
         result.respawn_guarded.append((task_id, "provider_capped"))
         if not dry_run:
             with write_txn(conn):
                 _append_event(conn, task_id, "deferred", payload)
-        return True
+        return True, None
+
+    def apply_dispatch_fallback(claimed, selection):
+        if selection is None:
+            return
+        (model, provider), capped = selection
+        claimed.model_override, claimed.provider_override = model, provider
+        with write_txn(conn):
+            _append_event(conn, claimed.id, "dispatch_provider_fallback", {
+                "from_provider": capped["provider"], "to_provider": provider,
+                "to_model": model,
+            }, run_id=claimed.current_run_id)
 
     try:
         from hermes_cli.config import load_config as _load_dispatch_config
@@ -15683,7 +15875,8 @@ def _dispatch_once_locked(
                         {"reason": guard_reason, **guard_detail},
                     )
             continue
-        if provider_deferred(row["id"], row_assignee):
+        deferred, fallback_selection = provider_admission(row["id"], row_assignee)
+        if deferred:
             continue
         if reported_collision_scopes is None and not collision_scope_load_failed:
             try:
@@ -15730,6 +15923,7 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        apply_dispatch_fallback(claimed, fallback_selection)
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -15893,7 +16087,8 @@ def _dispatch_once_locked(
                         {"reason": guard_reason, **guard_detail},
                     )
             continue
-        if provider_deferred(row["id"], row["assignee"]):
+        deferred, fallback_selection = provider_admission(row["id"], row["assignee"])
+        if deferred:
             continue
         if _workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
@@ -15908,6 +16103,7 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        apply_dispatch_fallback(claimed, fallback_selection)
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
