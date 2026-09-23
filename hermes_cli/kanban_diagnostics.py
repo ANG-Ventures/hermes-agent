@@ -699,7 +699,7 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed", "blocked"}:
+        elif outcome in {"completed", "superseded", "reclaimed", "blocked"}:
             # A clean termination breaks the streak. ``completed``/``reclaimed``
             # are obvious; ``blocked`` counts too because a worker that reaches
             # ``kanban_block`` demonstrably SPAWNED and RAN its logic to a

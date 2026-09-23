@@ -24,6 +24,7 @@ import gateway.run as gateway_run
 import hermes_state
 from gateway.auto_resume import user_stop_blocks_resume
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, SessionStore
 from hermes_state import AsyncSessionDB, SessionDB
 from tests.gateway.restart_test_helpers import make_restart_runner
@@ -275,6 +276,156 @@ async def test_clear_user_stopped_restores_normal_marking(tmp_path, monkeypatch)
         is True
     )
     db.close()
+
+
+class _HungAgent:
+    def __init__(self) -> None:
+        self.interrupted = False
+
+    def interrupt(self, *_a, **_k) -> bool:
+        self.interrupted = True
+        return True
+
+
+@pytest.mark.parametrize(
+    "invalidation_reason",
+    [
+        "stop_command",
+        "stop_command_pending",
+        "stop_command_handler",
+        "stop_command_thread_sibling",
+    ],
+)
+@pytest.mark.asyncio
+async def test_every_stop_variant_persists_the_marker(
+    tmp_path, monkeypatch, invalidation_reason
+):
+    """The marker is owed by the CLASS of stop reasons, not one call site.
+
+    ``/stop`` reaches ``_interrupt_and_clear_session`` under four distinct
+    invalidation reasons (the busy-path intercept, the pending-sentinel
+    branch, the normal handler, and the thread-sibling fan-out). Each one is
+    a user ending the turn on purpose, so each must leave the marker; a guard
+    keyed to a single literal would silently miss three of them.
+    """
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    entry = runner.session_store.get_or_create_session(_source())
+    _seed(db, entry, _MID_TOOL_TAIL)
+
+    await runner._interrupt_and_clear_session(
+        entry.session_key,
+        _source(),
+        interrupt_reason=gateway_run._INTERRUPT_REASON_STOP,
+        invalidation_reason=invalidation_reason,
+    )
+
+    marked = runner.session_store._entries[entry.session_key]
+    assert marked.user_stopped_at is not None, invalidation_reason
+    assert marked.user_stopped_message_id == db.get_messages(entry.session_id)[-1]["id"]
+    assert marked.resume_pending is False
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_new_command_does_not_persist_the_marker(tmp_path, monkeypatch):
+    """Negative control on the same seam: ``/new`` resets outright.
+
+    ``/new`` shares ``_interrupt_and_clear_session`` with ``/stop``. It is not
+    a stop, and marking it would wrongly suppress the auto-resume of the FRESH
+    turn the user starts next.
+    """
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    entry = runner.session_store.get_or_create_session(_source())
+    _seed(db, entry, _MID_TOOL_TAIL)
+
+    await runner._interrupt_and_clear_session(
+        entry.session_key,
+        _source(),
+        interrupt_reason=gateway_run._INTERRUPT_REASON_RESET,
+        invalidation_reason="new_command",
+    )
+
+    assert runner.session_store._entries[entry.session_key].user_stopped_at is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_real_stop_command_handler_marks_then_boot_refuses(tmp_path, monkeypatch):
+    """The WIRING, end to end, driven by the actual ``/stop`` handler.
+
+    Every other test in this file calls ``_mark_user_stopped`` (or
+    ``_interrupt_and_clear_session``) itself, which proves the mechanism but
+    assumes the wiring. Deleting the marker-persisting branch from
+    ``_interrupt_and_clear_session`` left all of them green — the fix was
+    inert and nothing said so. This test enters at
+    ``_handle_stop_command`` with a real running agent, so the marker is a
+    CONSEQUENCE of a user typing ``/stop``, then proves a fresh boot reading
+    the reloaded-from-disk store refuses to resume.
+    """
+    monkeypatch.delenv("HERMES_RESUME_INTERRUPTED_TURNS", raising=False)
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    entry = runner.session_store.get_or_create_session(_source())
+    _seed(db, entry, _MID_TOOL_TAIL)
+    last_id = db.get_messages(entry.session_id)[-1]["id"]
+    assert runner.session_store.mark_resume_pending(entry.session_key, "shutdown_timeout")
+
+    # A hung agent is present, so /stop takes the interrupt-and-clear branch.
+    runner._running_agents[entry.session_key] = _HungAgent()
+    await runner._handle_stop_command(
+        MessageEvent(text="/stop", source=_source(), user_id="u1")
+    )
+
+    marked = runner.session_store._entries[entry.session_key]
+    assert marked.user_stopped_at is not None
+    assert marked.user_stopped_message_id == last_id
+    assert marked.resume_pending is False
+
+    # Reload from disk — what a SIGKILL plus a reboot actually does.
+    reloaded = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    revived = reloaded.get_or_create_session(_source())
+    assert revived.user_stopped_at is not None
+    assert revived.user_stopped_message_id == last_id
+
+    reloaded_db = reloaded._db
+    assert isinstance(reloaded_db, SessionDB)
+    runner2, adapter2 = make_restart_runner()
+    runner2.config = runner.config
+    runner2.session_store = reloaded
+    runner2._session_db = AsyncSessionDB(reloaded_db)
+    runner2.adapters = {Platform.TELEGRAM: adapter2}
+    monkeypatch.setattr(runner2, "_run_startup_resume_event", _noop_resume_event)
+    # Force the hedge back on, as the boot-time wholesale re-mark would.
+    forced = reloaded._entries[revived.session_key]
+    forced.resume_pending = True
+    forced.resume_reason = "shutdown_timeout"
+    forced.last_resume_marked_at = None
+
+    assert await runner2._prepare_boot_resume_work_check() == 1
+    assert runner2._boot_resume_has_work[revived.session_key] is False
+    assert runner2._schedule_resume_pending_sessions() == 0
+    assert runner2._background_tasks == set()
+    db.close()
+
+
+async def _noop_resume_event(_adapter, _event, _session_key, *_rest):
+    return None
+
+
+def test_stop_rowid_is_exclusive_not_inclusive():
+    """The stamped row is the stop's OWN anchor — it cannot supersede itself.
+
+    ``_mark_user_stopped`` stamps the session's NEWEST persisted row. When
+    ``/stop`` lands before the assistant row has flushed, that newest row is
+    the user's own message — the one that STARTED the turn being stopped. A
+    ``>=`` comparison would let that row count as "the user spoke again",
+    clearing the marker at the instant it was written and resuming exactly the
+    turn the user killed. The boundary must be strict.
+    """
+    rows = [{"id": 1, "role": "user", "content": "go"}]
+    assert user_stop_blocks_resume(1, rows) is True
+    # And the NEXT user row, one rowid later, does supersede it.
+    rows.append({"id": 2, "role": "user", "content": "actually, continue"})
+    assert user_stop_blocks_resume(1, rows) is False
 
 
 def test_marker_survives_sigkill_written_before_ack(tmp_path, monkeypatch):
