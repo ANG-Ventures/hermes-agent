@@ -2436,16 +2436,17 @@ def _known_providers() -> set[str]:
 def _validate_provider(provider: Optional[str]) -> Optional[str]:
     """Return an error message when ``provider`` isn't routable, else None.
 
-    A typo'd provider is otherwise invisible until a worker spawns and fails,
-    so refuse loudly at the command. Fail-open when the registry can't be
-    read at all — refusing every provider because discovery broke would be
-    worse than the typo we're guarding.
+    A typo'd provider is otherwise invisible until a worker spawns and fails.
+    If discovery yields no providers, refuse instead of persisting an
+    unvalidated route; configured custom providers remain usable.
     """
 
     if not provider:
         return None
     known = _known_providers()
-    if not known or provider in known:
+    if not known:
+        return "provider discovery unavailable (registry and configured providers are empty); refusing unvalidated route"
+    if provider in known:
         return None
     suggestions = difflib.get_close_matches(provider, sorted(known), n=3, cutoff=0.6)
     hint = f" (did you mean: {', '.join(suggestions)}?)" if suggestions else ""

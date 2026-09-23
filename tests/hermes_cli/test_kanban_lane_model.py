@@ -216,6 +216,40 @@ def test_cli_lane_model_refuses_unknown_provider(kanban_home):
         assert kb.list_lane_model_overrides(conn) == []
 
 
+@pytest.mark.parametrize("discovery", ["raises", "empty"])
+def test_cli_lane_model_refuses_unvalidated_provider_when_registry_unavailable(
+    kanban_home, monkeypatch, discovery,
+):
+    import providers
+
+    (kanban_home / "config.yaml").write_text("providers: {}\n", encoding="utf-8")
+    if discovery == "raises":
+        def broken_registry():
+            raise RuntimeError("registry unavailable")
+        monkeypatch.setattr(providers, "list_providers", broken_registry)
+    else:
+        monkeypatch.setattr(providers, "list_providers", lambda: [])
+    out = kc.run_slash(
+        "lane-model set typo-provider-zz/model-a --ttl 2h --reason capacity"
+    )
+    assert "provider" in out.lower() and ("unknown" in out.lower() or "discover" in out.lower()), out
+    with kb.connect() as conn:
+        assert kb.list_lane_model_overrides(conn) == []
+
+
+def test_cli_lane_model_accepts_configured_provider_when_registry_fails(
+    kanban_home, monkeypatch,
+):
+    import providers
+
+    _configure_provider(kanban_home)
+    def broken_registry():
+        raise RuntimeError("registry unavailable")
+    monkeypatch.setattr(providers, "list_providers", broken_registry)
+    out = kc.run_slash("lane-model set test-lane/model-a --ttl 2h --reason capacity")
+    assert "route=test-lane/model-a" in out
+
+
 def test_cli_lane_model_firepower_requires_reason_beyond_reason_flag(kanban_home):
     _configure_provider(kanban_home)
     out = kc.run_slash(

@@ -177,6 +177,39 @@ def test_set_model_provider_validation_is_atomic_for_batch(kanban_home):
         assert kb.get_task(conn, second).model_override is None
 
 
+@pytest.mark.parametrize("selector", ["ids", "where", "all-active", "reclaim"])
+@pytest.mark.parametrize("discovery", ["raises", "empty"])
+def test_set_model_refuses_unvalidated_provider_when_registry_unavailable(
+    kanban_home, monkeypatch, selector, discovery,
+):
+    import providers
+
+    first = _create("first", "worker")
+    second = _create("second", "worker")
+    (kanban_home / "config.yaml").write_text("providers: {}\n", encoding="utf-8")
+    if discovery == "raises":
+        def broken_registry():
+            raise RuntimeError("registry unavailable")
+        monkeypatch.setattr(providers, "list_providers", broken_registry)
+    else:
+        monkeypatch.setattr(providers, "list_providers", lambda: [])
+    if selector == "reclaim":
+        with kb.connect() as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (first,))
+    commands = {
+        "ids": f"set-model {first} {second} model-a",
+        "where": "set-model model-a --where status=running,ready assignee=worker",
+        "all-active": "set-model model-a --all-active",
+        "reclaim": "set-model model-a --all-active --reclaim",
+    }
+    out = kc.run_slash(f"{commands[selector]} --provider typo-provider-zz")
+    assert "provider" in out.lower() and ("unknown" in out.lower() or "discover" in out.lower()), out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, first).model_override is None
+        assert kb.get_task(conn, second).model_override is None
+        assert kb.get_task(conn, first).status == ("running" if selector == "reclaim" else "ready")
+
+
 def test_set_model_batch_firepower_gate_is_atomic(kanban_home):
     first = _create("first", "worker")
     second = _create("second", "worker")
