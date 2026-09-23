@@ -59,6 +59,18 @@ HOSTILE = [
     "quo'te", 'dou"ble', "back\\slash",
     # shell layer: tilde expansion
     "~scratch", "~",
+    # shell layer: COMBINED features -- THE discriminator. Every token above
+    # carries exactly ONE hostile feature, and a quoter that merely SELECTS a
+    # quote style by scanning for an apostrophe is byte-correct on all of them:
+    # it emits '$HOME' for the expansion-only token and "quo'te" for the
+    # apostrophe-only token, and bash returns both unchanged. Python's repr()
+    # is exactly that quoter. It takes an apostrophe AND an expansion in the
+    # SAME token to force the choice -- repr picks double quotes for the
+    # apostrophe, and double quotes do not stop expansion, so `Ace's $(id)`
+    # EXECUTES. Measured: repr is correct for 11/15 of this list and wrong for
+    # precisely the combined four (card t_f5323218).
+    "don't $HOME", "Ace's $(id)", "it's `id`", 'say "hi" $USER',
+    "don't back\\slash",
 ]
 PLAIN = ["plain", "with/slash", "repo@v2", "a+b", "under_score", "repo.name", "CAPS"]
 
@@ -126,7 +138,14 @@ def test_hint_value_survives_a_real_shell_as_one_unchanged_word(token, hostile_c
 
 
 @requires_bash
-@pytest.mark.parametrize("title", ["$HOME", "`id`", "a b", "quo'te", "plain"])
+@pytest.mark.parametrize(
+    "title",
+    ["$HOME", "`id`", "a b", "quo'te", "plain",
+     # COMBINED: apostrophe AND expansion in one title. See the HOSTILE list's
+     # note -- the single-feature titles above cannot tell shlex.quote from a
+     # quoter that merely picks a quote style by looking for an apostrophe.
+     "don't $HOME", "Ace's $(id)", "it's `id`"],
+)
 def test_the_resume_hint_does_not_expand_a_session_title(title, hostile_cwd,
                                                          monkeypatch, capsys):
     """SIBLING SITE (same class, different spelling): the session-resume hints
