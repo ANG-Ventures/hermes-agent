@@ -779,7 +779,9 @@ def _pin_divergence_is_a_hazard(target: Path) -> bool:
         native = _get_platform_default_hermes_home().resolve(strict=False)
     except Exception:  # pragma: no cover - defensive
         return False
-    return target.is_relative_to(native)
+    # Spelling-blind: a pin naming the live home in another case/firmlink
+    # spelling still reaches production (card t_ee808d83 class sweep).
+    return _same_tree(target, native)
 
 
 class KanbanPinDivergenceError(RuntimeError):
@@ -7844,7 +7846,10 @@ def _persist_scratch_completion_artifacts(
             persisted.append(artifact)
             continue
 
-        if not resolved_src.is_relative_to(workspace_root):
+        # Spelling-blind: an artifact inside the workspace but spelled in
+        # another case/firmlink form must still be copied out before the
+        # workspace is removed (card t_ee808d83 class sweep).
+        if not _same_tree(resolved_src, workspace_root):
             persisted.append(artifact)
             continue
 
@@ -8034,8 +8039,92 @@ _CWD_SNAPSHOT_SCOPE: ContextVar[Optional[list]] = ContextVar(
 )
 
 
+#: macOS spells every path on the Data volume twice: ``/Users/...`` and the
+#: firmlinked ``/System/Volumes/Data/Users/...``. Only used to decide whether
+#: two spellings are worth asking the kernel about (:func:`_same_tree`).
+_FIRMLINK_DATA_PREFIX = "/System/Volumes/Data"
+
+
+def _kernel_path(p) -> Optional[Path]:
+    """Return the kernel's own spelling of existing path *p*.
+
+    ``Path.resolve()`` follows symlinks only. On case-insensitive APFS it keeps
+    the caller's case, NFC vs NFD, and ``/System/Volumes/Data`` firmlink
+    spellings, while ``lsof`` prints the kernel's canonical name -- so a
+    string compare of the two misses a live cwd (card t_ee808d83, Argus
+    round 1). The kernel answers from an open descriptor: ``F_GETPATH`` on
+    macOS, ``/proc/self/fd`` on Linux, which is the same name source lsof
+    uses. Returns ``None`` on platforms with neither; raises ``OSError`` when
+    the path cannot be opened or named, so callers choose their fail-closed
+    answer.
+    """
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        return None
+    fd = os.open(os.fspath(p), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if sys.platform == "darwin":
+            import fcntl
+
+            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+            name = os.fsdecode(raw.split(b"\0", 1)[0])
+        else:
+            name = os.readlink(f"/proc/self/fd/{fd}")
+            if name.endswith(" (deleted)"):
+                raise FileNotFoundError(name)
+    finally:
+        os.close(fd)
+    if not name.startswith("/"):
+        raise OSError(f"kernel returned a non-absolute path for {p}: {name!r}")
+    return Path(name)
+
+
+def _loose_spelling(p: Path) -> Path:
+    """Fold the spelling axes the kernel may canonicalise (case, Unicode
+    normalisation, the Data-volume firmlink). A cheap pre-filter only: it
+    decides when :func:`_same_tree` should pay for a kernel lookup."""
+    import unicodedata
+
+    s = unicodedata.normalize("NFC", str(p)).casefold()
+    prefix = _FIRMLINK_DATA_PREFIX.casefold()
+    if s == prefix or s.startswith(prefix + "/"):
+        s = s[len(prefix):] or "/"
+    return Path(s)
+
+
+def _same_tree(child: Path, parent: Path, memo: Optional[dict] = None) -> bool:
+    """True when *child* is *parent* or lies beneath it, however either is spelled.
+
+    Both arguments are ``resolve()``d paths from different sources (the
+    board DB, the environment, a candidate). An exact match answers at once.
+    Otherwise only pairs that agree once case / Unicode / firmlink spelling is
+    folded are re-compared by their kernel names, so unrelated rows (NAS
+    mounts, other projects) are never opened. A path the kernel cannot name
+    keeps its literal spelling: a missing path cannot physically contain or
+    sit inside an existing one under another name.
+    """
+    if child == parent or child.is_relative_to(parent):
+        return True
+    if not _loose_spelling(child).is_relative_to(_loose_spelling(parent)):
+        return False
+
+    def canon(p: Path) -> Path:
+        key = str(p)
+        if memo is not None and key in memo:
+            return memo[key]
+        try:
+            got = _kernel_path(p) or p
+        except (OSError, ValueError):
+            got = p
+        if memo is not None:
+            memo[key] = got
+        return got
+
+    c, q = canon(child), canon(parent)
+    return c == q or c.is_relative_to(q)
+
+
 def _scan_process_cwds() -> Optional[frozenset]:
-    """Return every process cwd on the machine, resolved, or None on failure.
+    """Return every process cwd on the machine as lsof names it, or None.
 
     One ``lsof -d cwd -Fn`` lists only the cwd descriptor of each process, so
     its cost scales with the process count, not with the size of any tree.
@@ -8044,6 +8133,11 @@ def _scan_process_cwds() -> Optional[frozenset]:
     timeout (card t_ee808d83). A machine-wide scan always contains at least
     this process's own cwd, so a non-zero exit or an empty listing is a
     failed scan, never "nothing found"; callers must fail closed on None.
+
+    Names are kept exactly as lsof prints them -- the kernel's canonical
+    spelling -- and are not touched on disk: resolving ~200 cwds here would
+    sit outside the lsof timeout and could hang on a dead network mount.
+    :func:`_process_cwd_within` canonicalises the CANDIDATE instead.
     """
     try:
         result = subprocess.run(
@@ -8058,15 +8152,7 @@ def _scan_process_cwds() -> Optional[frozenset]:
            if line.startswith("n") and len(line) > 1}
     if not raw:
         return None
-    cwds = set()
-    for name in raw:
-        try:
-            # lsof reports real paths on macOS (/private/var); resolve anyway
-            # so both sides of the prefix match are canonical.
-            cwds.add(Path(name).resolve(strict=False))
-        except (OSError, RuntimeError, ValueError):
-            return None
-    return frozenset(cwds)
+    return frozenset(Path(name) for name in raw)
 
 
 @contextlib.contextmanager
@@ -8108,10 +8194,15 @@ def _process_cwd_within(path: Path) -> bool:
     if cwds is None:
         return True
     try:
-        target = Path(path).resolve(strict=False)
+        targets = {Path(path).resolve(strict=False)}
+        # lsof prints kernel spellings; match against the candidate's kernel
+        # spelling too (case / NFC-NFD / firmlink). Unnameable => fail closed.
+        canonical = _kernel_path(path)
     except (OSError, RuntimeError, ValueError):
         return True
-    return any(cwd == target or cwd.is_relative_to(target) for cwd in cwds)
+    if canonical is not None:
+        targets.add(canonical)
+    return any(cwd == t or cwd.is_relative_to(t) for cwd in cwds for t in targets)
 
 
 def _live_owners_of_path(
@@ -8156,12 +8247,21 @@ def _live_owners_of_path(
         return ["<unresolvable-owner>"] if live_only else []
 
     candidates: set = set()
+    managed_root: Optional[Path] = None
     if is_managed:
         # A nested checkout belongs to the enclosing card too; testing only
         # resolved.name would miss <root>/<live-card>/repo.
         for parent in (resolved, *resolved.parents):
-            if _TASK_DIR_NAME_RE.fullmatch(parent.name) and _is_managed_scratch_path(parent):
-                candidates.add(parent.name)
+            if _is_managed_scratch_path(parent):
+                if _TASK_DIR_NAME_RE.fullmatch(parent.name):
+                    candidates.add(parent.name)
+            else:
+                managed_root = parent  # the workspaces root itself
+                break
+    # Stored rows and the candidate come from different sources and may spell
+    # the same directory differently (case, NFC/NFD, firmlink); compare them
+    # through _same_tree, sharing kernel lookups across rows.
+    spelling_memo: dict = {}
 
     found: set = set()
     all_owners: set = set()
@@ -8200,21 +8300,24 @@ def _live_owners_of_path(
                     ).expanduser().resolve(strict=False)
                 except Exception:
                     return ["<unresolvable-owner-path>"] if live_only else []
-                if (is_managed and stored != resolved
-                        and resolved.is_relative_to(stored)
-                        and not _is_managed_scratch_path(stored)):
-                    # A broad dir:home row owns a scratch workspace only when
-                    # it is live AND a process actually has its cwd there.
-                    # Unrelated home-rooted cards must not pin all workspaces.
+                stored_in = _same_tree(stored, resolved, spelling_memo)
+                path_in = _same_tree(resolved, stored, spelling_memo)
+                if not (stored_in or path_in):
+                    continue
+                if (is_managed and path_in and not stored_in
+                        and managed_root is not None
+                        and _same_tree(managed_root, stored, spelling_memo)):
+                    # A broad dir:home row (at or above the workspaces root)
+                    # owns a scratch workspace only when it is live AND a
+                    # process actually has its cwd there. Unrelated
+                    # home-rooted cards must not pin all workspaces.
                     if not (live_only and _task_has_live_run(c, row["id"])):
                         continue
                     if cwd_in_path is None:
                         cwd_in_path = _process_cwd_within(resolved)
                     if not cwd_in_path:
                         continue
-                if (stored == resolved or stored.is_relative_to(resolved)
-                        or resolved.is_relative_to(stored)):
-                    ids.add(row["id"])
+                ids.add(row["id"])
             all_owners.update(ids)
             for tid in ids:
                 if not live_only or _task_has_live_run(c, tid):
@@ -8337,7 +8440,7 @@ def _durable_audit_log_path(target: Path, board: Optional[str]) -> Path:
         except OSError:
             continue
         try:
-            if resolved == target or resolved.is_relative_to(target):
+            if _same_tree(resolved, target):
                 continue  # would be destroyed by the deletion it records
         except (ValueError, OSError):
             pass

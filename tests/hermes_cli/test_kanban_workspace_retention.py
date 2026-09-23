@@ -273,19 +273,14 @@ def test_live_home_card_without_cwd_in_candidate_reaps_it(kanban_home, monkeypat
     assert not old.exists()
 
 
-@pytest.mark.parametrize("via_symlink", [False, True])
-def test_nested_cwd_in_candidate_retains_it(kanban_home, monkeypatch, tmp_path, via_symlink):
+def test_nested_cwd_in_candidate_retains_it(kanban_home, monkeypatch):
     home_card = _home_rooted_dir_card(kanban_home, "running")
     old = _scratch(_mktask("old done"), "done", finished_days_ago=5)
     free = _scratch(_mktask("free old done"), "done", finished_days_ago=5)
     nested = old / "repo" / "src" / "pkg"
     nested.mkdir(parents=True)
-    reported = nested
-    if via_symlink:
-        # lsof may report a path through a symlink (/var vs /private/var).
-        alias = tmp_path / "alias"
-        alias.symlink_to(old)
-        reported = alias / "repo" / "src" / "pkg"
+    # Real lsof prints the kernel's spelling of a cwd; mirror that.
+    reported = kb._kernel_path(nested) or nested
     _fake_lsof(monkeypatch, _listing("/", str(reported)))
 
     assert kb._live_owners_of_path(old) == [home_card]
@@ -320,3 +315,113 @@ def test_gc_run_scans_process_cwds_once(kanban_home, monkeypatch):
     assert not any(w.exists() for w in ws)
     assert len(calls) == 1, calls
     assert "+D" not in calls[0], "per-path tree walk is back"
+
+
+# -- spelling-blind cwd match (card t_ee808d83, Argus round 1) ---------------
+#
+# ``Path.resolve()`` follows symlinks only: on case-insensitive APFS it keeps
+# the caller's case, NFC vs NFD, and the /System/Volumes/Data firmlink
+# spelling, while lsof prints the kernel's canonical name. A string compare of
+# the two failed OPEN and gc deleted a workspace a live process was inside.
+# Every arm below uses a REAL process and the real lsof.
+
+
+def _sleeper(cwd: Path) -> subprocess.Popen:
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                            cwd=cwd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.2)
+    assert proc.poll() is None
+    return proc
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    proc.wait(timeout=5)
+
+
+def _variant(real: Path, axis: str) -> Path:
+    import unicodedata
+
+    if axis == "case":
+        alt = real.parent / real.name.upper()
+    elif axis == "nfc":
+        alt = real.parent / unicodedata.normalize("NFC", real.name)
+    else:  # firmlink
+        alt = Path("/System/Volumes/Data" + str(real))
+    if str(alt) == str(real) or not alt.exists():
+        pytest.skip(f"filesystem does not alias the {axis} spelling here")
+    return alt
+
+
+@pytest.mark.parametrize("axis", ["case", "nfc", "firmlink"])
+def test_cwd_probe_matches_candidate_spelled_differently(tmp_path, axis):
+    import unicodedata
+
+    base = tmp_path.resolve()
+    name = unicodedata.normalize("NFD", "t_caf\u00e9") if axis == "nfc" else "t_abc123"
+    real = base / name
+    (real / "sub").mkdir(parents=True)
+    sibling = base / (name + "x")
+    sibling.mkdir()
+    query = _variant(real, axis)
+    proc = _sleeper(real / "sub")
+    try:
+        assert kb._process_cwd_within(query) is True, f"{axis} spelling failed open"
+        assert kb._process_cwd_within(sibling) is False, "sibling negative control"
+    finally:
+        _stop(proc)
+
+
+def test_cwd_probe_fails_closed_when_candidate_cannot_be_named(monkeypatch, tmp_path):
+    def boom(p):
+        raise PermissionError(p)
+
+    _fake_lsof(monkeypatch, _listing("/"))
+    monkeypatch.setattr(kb, "_kernel_path", boom)
+    assert kb._process_cwd_within(tmp_path) is True
+
+
+@pytest.mark.parametrize("row_spelling", ["env", "disk"])
+def test_gc_retains_candidate_when_home_env_is_spelled_differently(
+        tmp_path, monkeypatch, row_spelling):
+    """Argus's E2E repro: HERMES_HOME in another case than the on-disk home.
+
+    ``disk`` also stores the dir:home row in the OTHER spelling from the
+    candidates, so the home-rooted exemption must still recognise it (the
+    free control is reaped) while the live cwd still retains."""
+    on_disk = tmp_path / "home_dir"
+    on_disk.mkdir()
+    spelled = tmp_path / "HOME_DIR"
+    if not spelled.exists():
+        pytest.skip("case-sensitive filesystem")
+    monkeypatch.setenv("HERMES_HOME", str(spelled))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    _home_rooted_dir_card(spelled if row_spelling == "env" else on_disk, "running")
+    old = _scratch(_mktask("old done"), "done", finished_days_ago=10)
+    free = _scratch(_mktask("free old done"), "done", finished_days_ago=10)
+    (old / "sub").mkdir()
+    (old / "sub" / "work.txt").write_text("unretained\n", encoding="utf-8")
+    proc = _sleeper(old / "sub")
+    try:
+        assert _gc(done_retention_days=3) == 0
+        assert (old / "sub" / "work.txt").exists(), "gc deleted a live process's cwd"
+        assert not free.exists(), "control: the unrelated candidate is still reaped"
+    finally:
+        _stop(proc)
+    audit = kb.workspace_deletion_log_path().read_text(encoding="utf-8")
+    assert f"REFUSED\ttask={old.name}\t" in audit and "owner-has-live-run" in audit
+
+
+def test_owner_row_spelled_differently_still_owns(kanban_home):
+    """Class sweep: a stored workspace_path in another case is the same dir."""
+    root = kb.workspaces_root()
+    root.mkdir(parents=True, exist_ok=True)
+    custom = root / "custom"
+    (custom / "repo").mkdir(parents=True)
+    alt = _variant(custom, "case")
+    live = _mktask("live custom-dir card, other spelling")
+    _set(live, status="running", workspace_kind="dir", workspace_path=str(alt),
+         claim_expires=int(time.time()) + 3600)
+    assert kb._live_owners_of_path(custom / "repo") == [live]
