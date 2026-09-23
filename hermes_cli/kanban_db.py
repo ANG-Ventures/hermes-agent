@@ -8111,6 +8111,20 @@ def _live_owners_of_path(
                     ).expanduser().resolve(strict=False)
                 except Exception:
                     return ["<unresolvable-owner-path>"] if live_only else []
+                if (is_managed and stored != resolved
+                        and resolved.is_relative_to(stored)
+                        and not _is_managed_scratch_path(stored)):
+                    # An enclosing path that is NOT itself a managed scratch
+                    # dir contains the whole workspaces root (a `dir:` card
+                    # rooted at the kanban home, e.g. ``dir:~/.hermes``). It
+                    # does not own the per-card scratch dirs the kanban hands
+                    # out beneath it. Counting it made every such card an
+                    # owner of EVERY scratch workspace, so completion cleanup
+                    # was refused as owner-has-live-run / <ambiguous-owner>
+                    # for all of them (measured 2026-09-23: 307 done-card
+                    # workspaces, 65 GB, retained). An enclosing card's own
+                    # scratch dir (<root>/<card>/repo) is still an owner.
+                    continue
                 if (stored == resolved or stored.is_relative_to(resolved)
                         or resolved.is_relative_to(stored)):
                     ids.add(row["id"])
