@@ -9,6 +9,7 @@ violation + retries. ``superseded_by`` closes the card ``done`` with
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -118,20 +119,26 @@ def test_plain_completion_outcome_is_unchanged(kanban_home):
 # ---------------------------------------------------------------------------
 
 
-def _drive_clean_exit(conn, tid, fake_pid, worker_output):
+def _drive_clean_exit(
+    conn, tid, fake_pid, worker_output, *, model_turn_completed=True,
+):
     """One clean-exit (rc=0) reaper pass driving the REAL append-mode producer.
 
     Deliberately does NOT monkeypatch ``_worker_log_stderr_tail`` or the
     segmenter: it stamps the run boundary exactly as ``_default_spawn`` does,
     appends ``worker_output`` to the real per-task log the same way the child's
-    inherited fd would, and lets ``detect_crashed_workers`` read it back. The
-    previous mocked version made per-run output identical/distinct BY
-    CONSTRUCTION, which is precisely how the append-mode defects survived.
+    inherited fd would, publishes the real run-scoped exit-receipt shape, and
+    lets ``detect_crashed_workers`` read both back. The previous mocked version
+    made per-run output identical/distinct BY CONSTRUCTION, which is precisely
+    how the append-mode defects survived.
     """
     import hermes_cli.kanban_db as _kb
+    from hermes_cli.kanban_worker_exit import exit_file
 
     host_prefix = _kb._claimer_id().split(":", 1)[0]
     assert _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock") is not None
+    task = _kb.get_task(conn, tid)
+    assert task is not None and task.current_run_id is not None
     _kb._set_worker_pid(conn, tid, fake_pid)
 
     log_dir = _kb.worker_logs_dir()
@@ -142,7 +149,21 @@ def _drive_clean_exit(conn, tid, fake_pid, worker_output):
         with open(log_path, "ab") as fh:
             fh.write(worker_output.encode("utf-8") + b"\n")
 
-    _kb._record_worker_exit(fake_pid, 0)  # os.W_EXITCODE(0, 0) == 0
+    db_path = Path(
+        next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+    )
+    receipt = exit_file(db_path, tid, task.current_run_id)
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text(
+        json.dumps({
+            "exit_code": 0,
+            "failure_reason": None,
+            "exit_class": None,
+            "model_turn_completed": model_turn_completed,
+        }),
+        encoding="utf-8",
+    )
+    _kb._record_worker_exit(fake_pid, 0)  # receipt outranks this PID fallback
     original_alive = _kb._pid_alive
     _kb._pid_alive = lambda p: False
     try:
@@ -231,6 +252,52 @@ def test_differing_clean_exits_keep_the_full_retry_budget(kanban_home):
         payload = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"][0].payload or {}
         assert payload.get("stopped_early") is None
         assert payload.get("protocol_violations") == kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "infra_abort",
+    [
+        (
+            "⚠️  Primary auth failed — switching to fallback: claude-apr / "
+            "claude-opus-5\nAPI call failed after 3 retries: HTTP 429 Too Many Requests"
+        ),
+        "API call failed after 3 retries: HTTP 503 Service Unavailable",
+        'API call failed after 3 retries: HTTP 503 {"error":"no eligible sub"}',
+        'API call failed after 3 retries: HTTP 503 {"error":"pool at capacity"}',
+    ],
+    ids=["auth-fallback-429", "upstream-503", "no-eligible-sub", "pool-at-capacity"],
+)
+def test_pre_model_infra_abort_never_trips_reproduced_clean_exit(
+    kanban_home, infra_abort,
+):
+    """Identical pre-model failures are not evidence of reproduced worker work.
+
+    The discriminator is positive and class-wide: the run-scoped receipt says a
+    model turn completed. Error wording is deliberately not parsed here, so 429,
+    503, relay-pool exhaustion, and future pre-model aborts all remain ineligible.
+    The append-mode producer and segment reader are real; only the process itself
+    is represented by the same exit receipt it atomically publishes in production.
+    """
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="provider unavailable", assignee="coder")
+        for i in range(2):
+            _drive_clean_exit(
+                conn,
+                tid,
+                997100 + i,
+                _run_output(infra_abort, f"20260922_00000{i}_infra{i}"),
+                model_turn_completed=False,
+            )
+            task = kb.get_task(conn, tid)
+            assert task is not None and task.status == "ready"
+
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert gave_up == []
+        runs = kb.list_runs(conn, tid)
+        assert len(runs) == 2
+        assert all(
+            not (run.metadata or {}).get("run_output_fingerprint") for run in runs
+        )
 
 
 @pytest.mark.parametrize("per_run_bytes", [1024, 2048, 2600, 3343, 4096, 8192])

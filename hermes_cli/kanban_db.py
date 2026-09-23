@@ -11691,6 +11691,21 @@ def _run_exit_class(conn, task_id, run_id) -> Optional[str]:
     return None
 
 
+def _run_model_turn_completed(conn, task_id, run_id) -> bool:
+    """Positive receipt evidence that this run produced a model response.
+
+    A clean process exit alone is insufficient: provider/bootstrap failures
+    have historically returned rc=0 before a worker ever received a turn.
+    Legacy or missing receipts therefore fail closed to ``False``.
+    """
+    from hermes_cli.kanban_worker_exit import exit_file, read_model_turn_completed
+
+    db_path = next(r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main")
+    if db_path and run_id is not None:
+        return read_model_turn_completed(exit_file(Path(db_path), task_id, run_id))
+    return False
+
+
 def _pid_alive(pid: Optional[int]) -> bool:
     """Return True if ``pid`` is still running on this host.
 
@@ -12428,9 +12443,10 @@ def detect_crashed_workers(
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    ``kanban_complete`` / ``kanban_block``). It gets a bounded retry budget;
+    only two identical, boundary-delimited worker responses can stop it early.
+    Clean exits without positive receipt evidence of a model response (for
+    example a pre-model provider abort) can never take that shortcut.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -12510,19 +12526,28 @@ def detect_crashed_workers(
                 }
                 # The worker's own last words are what distinguishes a
                 # REPRODUCED no-op ("nothing to implement, already on main")
-                # from three unrelated paperwork misses. The per-task log is
-                # APPEND-mode across runs, so a raw tail of it is a slice of
-                # every run concatenated; fingerprint the boundary-delimited
-                # segment for THIS run instead. An unsegmentable run yields no
-                # fingerprint at all, which keeps the early trip off.
+                # from three unrelated paperwork misses. Positive receipt
+                # evidence that a model response was produced is mandatory:
+                # bootstrap/provider failures have historically returned rc=0,
+                # and identical infrastructure text is not worker work. The
+                # per-task log is APPEND-mode across runs, so a raw tail of it
+                # is a slice of every run concatenated; fingerprint the
+                # boundary-delimited segment for THIS run instead. A legacy or
+                # missing receipt, or an unsegmentable run, yields no fingerprint
+                # and therefore keeps the early trip off.
                 stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
                 if stderr_tail:
                     event_payload["stderr_tail"] = stderr_tail
-                run_fingerprint = _run_output_fingerprint(
-                    _worker_log_run_segment(row["id"], board=board)
+                model_turn_completed = _run_model_turn_completed(
+                    conn, row["id"], row["current_run_id"]
                 )
-                if run_fingerprint:
-                    event_payload["run_output_fingerprint"] = run_fingerprint
+                event_payload["model_turn_completed"] = model_turn_completed
+                if model_turn_completed:
+                    run_fingerprint = _run_output_fingerprint(
+                        _worker_log_run_segment(row["id"], board=board)
+                    )
+                    if run_fingerprint:
+                        event_payload["run_output_fingerprint"] = run_fingerprint
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
