@@ -120,6 +120,25 @@ class TestExitSummaryResumeHint:
             "q?mark",
             # tilde expansion
             "~",
+            # COMBINED features: an apostrophe AND an expansion in the SAME
+            # title. Every fixture above carries exactly ONE hostile feature,
+            # and that is not enough to pin correct quoting: a quoter that only
+            # SELECTS a quote style by scanning for an apostrophe (Python's
+            # repr() is exactly that) emits '$HOME' for the expansion-only
+            # title and "quo'te" for the apostrophe-only title, and bash hands
+            # both back unchanged — so it passes the 12 fixtures above while
+            # `Ace's $(id)` EXECUTES `id`. Combining the two features forces
+            # the choice: repr picks double quotes for the apostrophe, and
+            # double quotes do not stop expansion. Card t_f5323218; kept in
+            # lockstep with the twin's HOSTILE list in
+            # tests/hermes_cli/test_cli_hint.py, because drift between these
+            # two vocabularies is what produced t_0c5ac29a and t_e484ec2d.
+            "don't $HOME",
+            "Ace's $(id)",
+            "it's `id`",
+            'say "hi" $USER',
+            "back\\slash",
+            "don't back\\slash",
         ],
     )
     def test_title_resume_hint_round_trips_through_a_real_shell(
