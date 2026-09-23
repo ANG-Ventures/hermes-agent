@@ -111,9 +111,8 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
         publish_deadline = time.monotonic() + 10
         try:
             first = _read_progress(shim_url, publish_deadline)
-        except AssertionError:
-            assert process.poll() is None, "self-test exited before release file was written"
-            raise
+        except AssertionError as exc:
+            raise AssertionError("self-test listener closed before release file was written") from exc
         while first.get("message") != held_stage and time.monotonic() < publish_deadline:
             time.sleep(0.1)
             first = _read_progress(shim_url, publish_deadline)
