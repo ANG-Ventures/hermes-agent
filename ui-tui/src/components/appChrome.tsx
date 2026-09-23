@@ -603,7 +603,14 @@ export function StatusRule({
   // Cache-hit % + rolling latency / tokens-per-sec — mirrored from the classic
   // CLI bar (PR #98250). The server omits the keys when no data exists (zero
   // cache reads, Codex app-server with no latency), so these self-hide.
-  const cacheHitText = typeof usage.cache_hit_pct === 'number' ? `◎ ${usage.cache_hit_pct}%` : ''
+  // UNKNOWN != 0: when a call in the window went unmeasured the server sends
+  // cache_hit_unknown and NO pct — say "unknown" rather than hide it, so the
+  // segment does not read as "no cache activity".
+  const cacheHitText = usage.cache_hit_unknown
+    ? '◎ unknown'
+    : typeof usage.cache_hit_pct === 'number'
+      ? `◎ ${usage.cache_hit_pct}%`
+      : ''
   const showCacheHit = segs.cacheHit && ok('cache_hit') && !!cacheHitText && fits(SEP + stringWidth(cacheHitText))
   const latencyText = typeof usage.avg_latency_s === 'number' ? `◷ ${usage.avg_latency_s.toFixed(1)}s` : ''
   const showLatency = segs.latency && ok('latency') && !!latencyText && fits(SEP + stringWidth(latencyText))
@@ -738,11 +745,13 @@ export function StatusRule({
             {' │ '}
             <Text
               color={
-                usage.cache_hit_pct! >= 70
-                  ? t.color.statusGood
-                  : usage.cache_hit_pct! >= 40
-                    ? t.color.statusWarn
-                    : t.color.muted
+                usage.cache_hit_unknown
+                  ? t.color.muted
+                  : usage.cache_hit_pct! >= 70
+                    ? t.color.statusGood
+                    : usage.cache_hit_pct! >= 40
+                      ? t.color.statusWarn
+                      : t.color.muted
               }
             >
               {cacheHitText}

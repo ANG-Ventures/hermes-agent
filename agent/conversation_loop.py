@@ -563,7 +563,8 @@ def _last_turn_snapshot_kwargs(usage: Any) -> dict[str, Any]:
 
     These are SNAPSHOT columns, written ``COALESCE(?, existing)``
     (``hermes_state._TOKEN_DELTA_SNAPSHOT_FIELDS``), and the sessions schema
-    has no ``*_unknown`` companion columns — so a 0 written here is
+    has no per-bucket VALUE-preserving companion (the ``*_unknown`` flags record
+    provenance, not the value) — so a 0 written here is
     indistinguishable from a measured 0 and, because ``COALESCE(0, existing)``
     is ``0``, it also DESTROYS the previous turn's real persisted split. An
     unmeasured call must therefore write ``None`` and leave the last real
@@ -5348,6 +5349,26 @@ def run_conversation(
                                 model=agent.model,
                                 api_call_count=1,
                                 **_last_turn_snapshot_kwargs(canonical_usage),
+                                # UNKNOWN != 0. The cumulative flags are
+                                # ABSORBING in the store (one unmeasured call
+                                # latches the session total); the last_turn_*
+                                # ones are last-write-wins, mirroring the
+                                # snapshot counters they discriminate.
+                                **usage_flags,
+                                # The last_turn_* discriminators move WITH the
+                                # snapshot they qualify: when the snapshot is
+                                # withheld (None -> COALESCE keeps the prior
+                                # real split), the flags are withheld too, or
+                                # they would stamp "unknown" over a measured
+                                # split that belongs to an earlier turn.
+                                **{
+                                    f"last_turn_{key}": (
+                                        None
+                                        if bool(getattr(canonical_usage, "total_tokens_unknown", False))
+                                        else value
+                                    )
+                                    for key, value in usage_flags.items()
+                                },
                             )
                         except Exception as e:
                             # Log token persistence failures so they're

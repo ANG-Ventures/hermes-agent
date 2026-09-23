@@ -1786,6 +1786,33 @@ def last_call_prompt_unknown(record: Any) -> bool:
     return bool(flag)
 
 
+# Cumulative session counters live on the agent under a ``session_`` prefix
+# (agent/agent_init.py, run_agent.py) and carry ABSORBING unknown provenance:
+# one unmeasured call latches the flag for the whole window.
+_SESSION_FLAG_PREFIX = "session_"
+
+
+def session_usage_unknown_flags(agent: Any) -> dict[str, bool]:
+    """Read an agent's cumulative UNKNOWN provenance as unprefixed flags.
+
+    Returns the same key shape ``CanonicalUsage`` uses, so the SAME display
+    rules (``prompt_tokens_unknown``, ``format_token_count``) apply to a
+    session-wide total as to one turn. Forking a second rule for cumulative
+    figures is how the two drift; this exists so they cannot.
+
+    An agent that predates the flags (or is a stub) reads as fully measured.
+    """
+    return {
+        key: bool(getattr(agent, _SESSION_FLAG_PREFIX + key, False))
+        for key in USAGE_UNKNOWN_FIELDS
+    }
+
+
+def session_total_tokens_unknown(agent: Any) -> bool:
+    """True when a session-wide TOTAL is missing at least one measured term."""
+    return any(session_usage_unknown_flags(agent).values())
+
+
 def _usage_has(obj: Any, name: str) -> bool:
     """True when a usage object carries ``name`` at all (even as None)."""
     if isinstance(obj, dict):

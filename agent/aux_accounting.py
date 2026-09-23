@@ -100,13 +100,23 @@ def record_aux_usage(
         if raw_usage is None:
             return
 
-        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+        from agent.usage_pricing import (
+            USAGE_UNKNOWN_FIELDS, estimate_usage_cost, normalize_usage,
+        )
 
         usage = normalize_usage(raw_usage, provider=provider)
+        unknown_flags = {
+            key: bool(getattr(usage, key, False)) for key in USAGE_UNKNOWN_FIELDS
+        }
         if not (
             usage.input_tokens or usage.output_tokens
             or usage.cache_read_tokens or usage.cache_write_tokens
             or usage.reasoning_tokens
+            # UNKNOWN != 0: an all-zero canonical usage that carries a
+            # discriminator is an UNMEASURED call, not an empty one. Returning
+            # early here would drop the only evidence the aux ledger has that
+            # its totals are incomplete.
+            or any(unknown_flags.values())
         ):
             return
 
@@ -133,6 +143,7 @@ def record_aux_usage(
             cache_write_tokens=usage.cache_write_tokens,
             reasoning_tokens=usage.reasoning_tokens,
             estimated_cost_usd=estimated_cost,
+            **unknown_flags,
         )
     except Exception:
         logger.debug("Aux usage recording failed (non-fatal)", exc_info=True)

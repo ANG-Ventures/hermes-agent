@@ -213,6 +213,12 @@ export interface Usage {
   avg_tps?: number
   /** Session prompt-cache hit ratio (cache_read / prompt tokens, %). */
   cache_hit_pct?: number
+  /**
+   * UNKNOWN != 0. True when a call in the window reported an unmeasured token
+   * term, making the cumulative ratio unmeasurable. `cache_hit_pct` is absent
+   * in that case — show the unknown label rather than a number.
+   */
+  cache_hit_unknown?: boolean
   calls: number
   compressions?: number
   context_max?: number
