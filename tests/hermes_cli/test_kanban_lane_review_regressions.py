@@ -1,10 +1,26 @@
 """Independent review regressions for lane routing and batch controls."""
 import json
+from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban as kc, kanban_db as kb
-from tests.hermes_cli.test_kanban_batch_set_model import _create, kanban_home
+from tests.hermes_cli.test_kanban_batch_set_model import _create
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / '.hermes'
+    home.mkdir()
+    monkeypatch.setenv('HERMES_KANBAN_SANDBOX', '1')
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    assert kb.kanban_db_path().resolve().is_relative_to(home.resolve())
+    kb.init_db()
+    (home / 'config.yaml').write_text(
+        'providers:\n  batch-provider:\n    base_url: http://127.0.0.1:9999/v1\n    api_key: test\n'
+    )
+    return home
 
 
 def test_explicit_batch_rejects_archived_atomically(kanban_home):
