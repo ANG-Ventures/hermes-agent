@@ -6485,7 +6485,7 @@ def _prior_worker_still_alive(
         "SELECT id, status FROM task_runs WHERE task_id = ? "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    if row is None or row["status"] != "reclaimed":
+    if row is None or row["status"] not in {"reclaimed", "timed_out", "stale", "crashed"}:
         return None
 
     # _end_run clears task_runs.worker_pid when reclaiming. The durable
@@ -6494,27 +6494,35 @@ def _prior_worker_still_alive(
     # current_run_id was already NULL, so _set_worker_pid emitted it with
     # run_id=NULL. Accept both the normal pre-reclaim event tied to the old
     # run and this late-spawn shape, never an older run's event.
-    reclaimed = conn.execute(
+    # Reclaim records the old lock explicitly; other failure paths retain it
+    # on their claimed event. In both cases inspect only the latest run.
+    reclaimed = row["status"] == "reclaimed"
+    boundary = conn.execute(
         "SELECT id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'reclaimed' AND run_id = ? ORDER BY id DESC LIMIT 1",
-        (task_id, row["id"]),
+        "AND kind = ? AND run_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id, "reclaimed" if reclaimed else "claimed", row["id"]),
     ).fetchone()
-    if reclaimed is None:
+    if boundary is None:
         return None
     try:
-        detail = json.loads(reclaimed["payload"] or "{}")
-        lock = detail.get("prev_lock") or ""
+        detail = json.loads(boundary["payload"] or "{}")
+        lock = (detail.get("prev_lock") if reclaimed else detail.get("lock")) or ""
     except (TypeError, ValueError):
         return None
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     if not str(lock).startswith(host_prefix):
         return None
+    if reclaimed:
+        spawn_filter = "((run_id = ? AND id < ?) OR (run_id IS NULL AND id > ?))"
+        spawn_args = (row["id"], boundary["id"], boundary["id"])
+    else:
+        spawn_filter = "run_id = ? AND id > ?"
+        spawn_args = (row["id"], boundary["id"])
     spawned = conn.execute(
         "SELECT id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'spawned' AND "
-        "((run_id = ? AND id < ?) OR (run_id IS NULL AND id > ?)) "
+        f"AND kind = 'spawned' AND {spawn_filter} "
         "ORDER BY id DESC LIMIT 1",
-        (task_id, row["id"], reclaimed["id"], reclaimed["id"]),
+        (task_id, *spawn_args),
     ).fetchone()
     if spawned is None:
         return None
@@ -6524,7 +6532,7 @@ def _prior_worker_still_alive(
         return None
     if _pid_alive(pid):
         return {"prev_pid": pid, "prev_lock": lock,
-                "late_spawn": spawned["id"] > reclaimed["id"],
+                "late_spawn": reclaimed and spawned["id"] > boundary["id"],
                 "needs_attention": True}
     return None
 
@@ -12562,6 +12570,24 @@ def enforce_max_runtime(
                     killed = True
                 except (ProcessLookupError, OSError):
                     pass
+
+        if _pid_alive(pid):
+            # Signal delivery (including SIGKILL) is not proof of death.
+            # Keep the owner and run intact until a later tick proves it gone.
+            with write_txn(conn):
+                current = conn.execute(
+                    "SELECT current_run_id FROM tasks WHERE id=? AND status='running' "
+                    "AND worker_pid=? AND claim_lock IS ?",
+                    (tid, pid, row["claim_lock"]),
+                ).fetchone()
+                if current and not conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id=? AND kind='timeout_refused' "
+                    "AND run_id=? LIMIT 1", (tid, current["current_run_id"]),
+                ).fetchone():
+                    _append_event(conn, tid, "timeout_refused",
+                                  {"pid": pid, "sigkill": killed, "needs_attention": True},
+                                  run_id=current["current_run_id"])
+            continue
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)

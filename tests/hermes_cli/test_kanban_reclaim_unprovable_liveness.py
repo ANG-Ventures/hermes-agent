@@ -230,6 +230,50 @@ def test_reclaim_holds_a_worker_that_survived_termination(conn, monkeypatch):
     assert row["claim_lock"] == lock
 
 
+def test_timeout_survivor_keeps_claim_and_rejects_a_second_claim(conn, monkeypatch):
+    """SIGKILL delivery is not death proof; a live timed-out owner must hold."""
+    tid = kb.create_task(conn, title="timeout survivor", assignee="daedalus-opus",
+                         max_runtime_seconds=1)
+    first = kb.claim_task(conn, tid)
+    assert first is not None
+    kb._set_worker_pid(conn, tid, 424242)
+    old_run = first.current_run_id
+    conn.execute("UPDATE task_runs SET started_at=? WHERE id=?",
+                 (int(time.time()) - 500, old_run))
+    conn.commit()
+    signals = []
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
+    assert kb.enforce_max_runtime(conn, signal_fn=lambda pid, sig: signals.append(sig)) == []
+    assert len(signals) == 2
+    assert _row(conn, tid)["status"] == "running"
+    assert _row(conn, tid)["current_run_id"] == old_run
+    assert kb.claim_task(conn, tid) is None
+
+
+def test_timeout_second_claim_guard_after_unsafe_requeue(conn, monkeypatch):
+    """Defence in depth if an old dispatcher has already released the claim."""
+    tid = kb.create_task(conn, title="unsafe timeout release", assignee="daedalus-opus",
+                         max_runtime_seconds=1)
+    first = kb.claim_task(conn, tid)
+    assert first is not None
+    kb._set_worker_pid(conn, tid, 424242)
+    run_id = first.current_run_id
+    # Model an older binary that timed out a process without proving death.
+    conn.execute("UPDATE task_runs SET status='timed_out', outcome='timed_out', "
+                 "ended_at=?, worker_pid=NULL WHERE id=?", (int(time.time()), run_id))
+    conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+                 "worker_pid=NULL, current_run_id=NULL WHERE id=?", (tid,))
+    conn.commit()
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    assert kb.claim_task(conn, tid) is None
+    spawned = []
+    kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 999999)
+    assert tid not in spawned
+    assert _row(conn, tid)["status"] == "ready"
+    assert _events(conn, tid, "claim_rejected")[-1]["reason"] == "prior_worker_still_alive"
+
+
 def test_non_host_local_claim_is_still_reclaimable(conn):
     """A remote host's claim is not ours to prove dead or alive.
 
