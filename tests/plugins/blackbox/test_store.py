@@ -529,3 +529,30 @@ def test_ts_start_index_is_migrated_into_a_preexisting_ledger(tmp_path, monkeypa
     assert "idx_blackbox_turns_ts_start" in names, names
     assert "idx_blackbox_turns_ts_start" in post_plan, post_plan
     assert "SCAN turns" not in post_plan, post_plan
+
+
+def test_ensure_schema_opens_a_ledger_missing_every_indexed_column(tmp_path, monkeypatch):
+    """A ledger predating the indexed columns must still open.
+
+    _ensure_schema creates indexes on turns(ts_start), turns(cost_usd) and
+    turns(platform, chat_id, ts_end). CREATE INDEX raises "no such column" on a
+    table that lacks them, and the whole open fails -- so the blackbox plugin
+    would crash on any DB older than those columns. Opening must degrade to
+    "index skipped", never to an exception.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db_path = store._db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(str(db_path))
+    # Oldest conceivable shape: the primary key and nothing the indexes touch.
+    legacy.execute("CREATE TABLE turns (turn_id TEXT PRIMARY KEY, user_text TEXT)")
+    legacy.commit()
+    legacy.close()
+
+    conn = store._connect()  # must not raise
+    try:
+        names = {r[1] for r in conn.execute("PRAGMA index_list(turns)")}
+    finally:
+        conn.close()
+    # The indexes whose columns are absent are skipped, not fabricated.
+    assert "idx_blackbox_turns_ts_start" not in names, names

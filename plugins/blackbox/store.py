@@ -168,20 +168,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(turn_id, seq)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_blackbox_turns_chat_end
-            ON turns(platform, chat_id, ts_end);
-        CREATE INDEX IF NOT EXISTS idx_blackbox_turns_cost
-            ON turns(cost_usd);
-        -- Rolling-window reads (hermes_cli/kanban_budget.py's per-tick spend
-        -- sum, daily-journal, /tokens) all filter on a ts_start/ts_end lower
-        -- bound. Without this they SCAN the whole table, and `turns` rows are
-        -- overflow-heavy (user_text/final_text previews): the 836 MB fleet
-        -- ledger stores ~5k rows across ~20k overflow pages, so a "5k-row
-        -- scan" is really an 80 MB read. Measured cold (macOS `purge` between
-        -- trials, 10 real fleet ledgers, 24h window): 6.13 s SCAN -> 1.40 s
-        -- SEARCH, identical 653 rows.
-        CREATE INDEX IF NOT EXISTS idx_blackbox_turns_ts_start
-            ON turns(ts_start);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts
             ON turn_api_calls(ts);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
@@ -262,6 +248,32 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    # Indexes on `turns` LAST, and only over columns the table actually has.
+    # CREATE INDEX raises "no such column" (it is not covered by IF NOT
+    # EXISTS), so creating them inside the schema script above would make
+    # _ensure_schema — and therefore every blackbox open — crash on any ledger
+    # whose `turns` predates an indexed column. Re-read table_info here so the
+    # guard sees the columns the migrations just added.
+    #
+    # idx_blackbox_turns_ts_start: rolling-window reads (kanban_budget.py's
+    # per-tick spend sum) filter on a ts_start lower bound. Without it they
+    # SCAN the whole table, and `turns` rows are overflow-heavy (user_text /
+    # final_text previews): the 836 MB fleet ledger stores ~5k rows across
+    # ~20k overflow pages, so a "5k-row scan" is really an 80 MB read.
+    # Measured cold (macOS `purge` between trials, 10 real fleet ledgers,
+    # 24h window): 6.13 s SCAN -> 1.40 s SEARCH, identical 653 rows.
+    _cols = {row[1] for row in conn.execute("PRAGMA table_info(turns)").fetchall()}
+    _turn_indexes = (
+        ("idx_blackbox_turns_chat_end", ("platform", "chat_id", "ts_end")),
+        ("idx_blackbox_turns_cost", ("cost_usd",)),
+        ("idx_blackbox_turns_ts_start", ("ts_start",)),
+    )
+    for _name, _index_cols in _turn_indexes:
+        if not set(_index_cols).issubset(_cols):
+            continue
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS {_name} ON turns({', '.join(_index_cols)})"
+        )
     conn.commit()
 
 
