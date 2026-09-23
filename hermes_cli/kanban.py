@@ -763,10 +763,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  "--survivor-unbound) and never becomes standing authority to "
                                  "delete the workspace later. Repeatable; same <repo>= qualifier "
                                  "as --survivor-ref.")
-    p_complete.add_argument("--survivor-unbound", action="store_true",
+    p_complete.add_argument("--survivor-unbound", action="append", nargs="?", const=True,
+                            default=None, metavar="REPO",
                             help="Operator override: accept a --survivor-ref/--survivor-pr that "
-                                 "is live but does NOT name this task, for the case where the "
-                                 "work really did land on an unrelated-looking branch. The claim "
+                                 "is live but does NOT name this task (including one that names "
+                                 "it only in a PR title or body, which is a mention), for the "
+                                 "case where the work really did land on an unrelated-looking "
+                                 "branch. PER-CLAIM: pass it bare for a single-claim completion, "
+                                 "or repeat it with the <repo>= qualifier of each claim being "
+                                 "overridden when there is more than one -- overriding one claim "
+                                 "must not silently accept the others. The claim "
                                  "is still remote-verified; the override and the OS user (resolved "
                                  "from the real uid, not $USER) are recorded on the survivor and "
                                  "in the task event log. An unbound claim authorises THIS "
@@ -2834,7 +2840,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # Refuse instead of silently doing the wrong thing.
     survivor_ref = getattr(args, "survivor_ref", None)
     survivor_pr = getattr(args, "survivor_pr", None)
-    survivor_unbound = bool(getattr(args, "survivor_unbound", False))
+    survivor_unbound = getattr(args, "survivor_unbound", None) or None
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr or survivor_unbound):
         print(
             "kanban: --summary / --metadata / --survivor-ref / --survivor-pr / "
