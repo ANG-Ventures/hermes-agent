@@ -142,39 +142,72 @@ def test_claim_naming_the_card_in_its_branch_is_bound(board, unrelated):
 
 
 @pytest.mark.parametrize("field", ["title", "body"])
-def test_a_mention_in_the_title_or_body_is_recorded_unbound(board, unrelated, field):
+def test_a_mention_in_the_title_or_body_is_refused(board, unrelated, field, monkeypatch):
     """A card id in PR prose is a MENTION, not a tie to this card's work.
 
     An umbrella changelog, a dependency note, even "does not address t_..."
-    satisfies a substring test. Such a claim may still close the card -- the
-    operator typed the number -- but it must not become the standing delete
-    authority a bound claim becomes via ``_reusable``.
+    satisfies a substring test. #848's round-5 FleetReview found that recording
+    such a claim `unbound` and letting it COMPLETE anyway closed only half the
+    hole: ``_reusable`` guards the recorded row on the ``cleanup=True`` pass and
+    never sees a claim arriving through ``_external``'s ``explicit`` arm, so the
+    completion path could still delete unpushed work on a mention alone. A
+    mention now takes the same refusal an unrelated live claim takes.
     """
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(key, raising=False)
     tid = _claimed_card(board)
     unrelated[0][field] = f"follow-up to {tid}; does not address it"
-    assert kb.complete_task(board, tid, survivor_pr=PR,
-                            metadata={"changed_files": ["code.py"]})
-    ref = kb.latest_run(board, tid).metadata["survivor"]["refs"][0]
-    assert ref["corroborated_by"] == field
-    assert ref["unbound"] is True, "a mention must not buy standing delete authority"
-    assert ref["claimed_by"]
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, survivor_pr=PR, metadata={"changed_files": ["code.py"]})
+
+    message = str(excinfo.value)
+    assert f"only in its {field}" in message and "mention" in message
+    assert "--survivor-unbound" not in message, "the flag must not be in the persisted text"
+    assert excinfo.value.override_hint, "the override must still be reachable for a renderer"
+    assert kb.get_task(board, tid).status != "done"
 
 
 @pytest.mark.parametrize("field", ["title", "body"])
-def test_a_mention_is_not_reusable_as_reclamation_authority(board, unrelated, field):
-    """The CONSEQUENCE of the line above, measured on the reclamation branch.
+def test_a_mention_does_not_delete_the_workspace(board, unrelated, field):
+    """The CONSEQUENCE, not the return value: the bytes must survive a mention.
 
-    The expectation is computed independently of the function under test:
-    ``_reusable`` is never called here, the real ``preserve(cleanup=True)`` is
-    driven on the dir-ABSENT branch where the recorded survivor is the sole
-    authority, and the assertion is that it HOLDs.
+    This is the arm ``_reusable`` could never cover. The expectation is computed
+    independently of the function under test -- the file is written here and
+    read back here -- and the path driven is the real ``complete_task``.
+    """
+    tid = _claimed_card(board)
+    unrelated[0][field] = f"mentions {tid} in passing"
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    kb.set_workspace_path(board, tid, ws)
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "implementation.py").write_text("work that lives nowhere else\n")
+
+    with pytest.raises(ValueError):
+        kb.complete_task(board, tid, survivor_pr=PR, metadata={"changed_files": ["code.py"]})
+
+    assert (ws / "implementation.py").read_text() == "work that lives nowhere else\n"
+    assert kb.get_task(board, tid).status != "done"
+
+
+@pytest.mark.parametrize("field", ["title", "body"])
+def test_a_mention_the_operator_vouches_for_is_accepted_but_stays_unbound(
+        board, unrelated, field):
+    """Anti-vacuity: the override is the door, and it is still only one-shot.
+
+    The operator who typed the number may still vouch for it. What they buy is
+    THIS completion -- never standing delete authority, which ``_reusable``
+    refuses on the recorded ``unbound`` flag.
     """
     from hermes_cli import kanban_survivor as ks
 
     tid = _claimed_card(board)
-    unrelated[0][field] = f"mentions {tid} in passing"
-    assert kb.complete_task(board, tid, survivor_pr=PR,
+    unrelated[0][field] = f"follow-up to {tid}"
+    assert kb.complete_task(board, tid, survivor_pr=PR, survivor_unbound=True,
                             metadata={"changed_files": ["code.py"]})
+    ref = kb.latest_run(board, tid).metadata["survivor"]["refs"][0]
+    assert ref["unbound"] is True and ref["claimed_by"]
+
     ws = _reclaimable(board, tid)
     with pytest.raises(ValueError, match="no verifiable external survivor"):
         ks.preserve(board, tid, cleanup=True, workspace=ws)
@@ -214,8 +247,12 @@ def test_the_wider_corroboration_is_explicit_only(board, unrelated):
     with pytest.raises(ValueError, match="survivor-pr"):
         kb.complete_task(board, tid, result=f"Shipped {PR}",
                          metadata={"changed_files": ["code.py"]})
-    # ... while naming it explicitly is accepted on the same PR body.
-    assert kb.complete_task(board, tid, survivor_pr=PR,
+    # ... naming it explicitly is still a MENTION and is refused too (#848 r5) ...
+    with pytest.raises(ValueError, match="only in its body"):
+        kb.complete_task(board, tid, survivor_pr=PR,
+                         metadata={"changed_files": ["code.py"]})
+    # ... and the operator override is what accepts it.
+    assert kb.complete_task(board, tid, survivor_pr=PR, survivor_unbound=True,
                             metadata={"changed_files": ["code.py"]})
 
 

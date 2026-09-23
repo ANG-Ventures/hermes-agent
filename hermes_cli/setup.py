@@ -155,6 +155,7 @@ from hermes_cli.config import (
 )
 # display_hermes_home imported lazily at call sites (stale-module safety during hermes update)
 
+from hermes_cli.cli_hint import hint_value
 from hermes_cli.colors import Colors, color
 
 
@@ -3347,7 +3348,7 @@ def _run_setup_wizard_impl(args):
     if _backup_path and _backup_path.exists():
         print_info(f"Previous config backed up to: {_backup_path}")
         print_info("If setup changed a value you customized, restore it with:")
-        print_info(f"  cp {_backup_path} {config_path}")
+        print_info(f"  cp {hint_value(_backup_path)} {hint_value(config_path)}")
     _print_setup_summary(config, hermes_home)
 
 
