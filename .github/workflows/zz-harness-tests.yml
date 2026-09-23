@@ -1,0 +1,442 @@
+name: Tests
+
+# Test-impact rule: a pull request whose entire diff is confined to one
+# plugins/<name>/ tree (plus tests/plugins/<name>/) runs that plugin's tests
+# and one pinned gateway/session/config smoke slice. Any other, uncertain,
+# cross-plugin, conftest, pyproject, or workflow path fails open to the full
+# slice_count matrix. merge_group is scoped the same way, over the batch's
+# three-dot diff from the target branch (base_ref...head_sha, NOT base_sha,
+# which is the previous chained candidate); every other non-PR event runs full.
+on:
+  workflow_call:
+    inputs:
+      slice_count:
+        description: Number of parallel test slices
+        type: number
+        default: 8
+      test_scope:
+        description: Isolated plugin scope from detect-changes, or full.
+        type: string
+        default: full
+      sim_event:
+        description: HARNESS ONLY - stands in for github.event_name
+        type: string
+        required: true
+      force:
+        description: HARNESS ONLY - none|fail|skip placement
+        type: string
+        default: none
+
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same ref
+concurrency:
+  group: harness-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    name: "Generate slices"
+    # Local Python + GitHub cache only; start hosted overflow without the pool.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      # Legacy/original matrix: the ONLY matrix non-merge_group events run.
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      # CI overflow (spec §5.1): the same slices with every runs_on forced to
+      # the local X64 pool — the merge_group fallback when placement has no
+      # validated plan. Never the legacy matrix: that one may already carry
+      # unreserved hosted labels.
+      local_matrix: ${{ steps.overflow.outputs.local_matrix }}
+      request_digest: ${{ steps.request.outputs.artifact-digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Restore duration cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations
+          # Saves use test-durations-${run_id}, so the exact key above never
+          # matches — without this prefix fallback the cache ALWAYS missed,
+          # LPT slicing ran on no data, and unbalanced slices pushed heavy
+          # files toward the per-file timeout under load.
+          restore-keys: |
+            test-durations-
+
+      - name: Generate test slices
+        id: matrix
+        env:
+          # Per-slice runner routing. Slices 1..CI_SELF_HOSTED_SLOTS are
+          # stamped with CI_RUNNER_LABELS; the rest spill to ubuntu-latest.
+          # GitHub will not overflow a full self-hosted pool onto hosted
+          # runners by itself, and one `runs-on` for the whole matrix cannot
+          # express the split.
+          #
+          # Measured on merge_group run 35517572423 (2026-09-20, 30 real jobs):
+          # 26 of them wanted the 17-slot self-hosted pool — 16 test slices
+          # plus 10 non-test jobs — so mean job queue-wait was 4.6 min and max
+          # 14.4 min against a mean job RUN of 3.3 min. Jobs waited longer than
+          # they ran: the limiter was SLOT COUNT, not slice speed. Hosted
+          # minutes are free on this public repo (20 concurrent jobs), so the
+          # overflow tail costs nothing and the matrix starts in one wave.
+          #
+          # Both vars are optional and fail SAFE: unset CI_SELF_HOSTED_SLOTS
+          # means no cap (every slice self-hosted, i.e. today's behaviour),
+          # and unset/garbage CI_RUNNER_LABELS falls back to ubuntu-latest —
+          # so the existing rollback (point CI_RUNNER_LABELS at ubuntu-latest
+          # to route everything hosted) still works unchanged.
+          CI_SELF_HOSTED_SLOTS: ${{ vars.CI_SELF_HOSTED_SLOTS }}
+          CI_RUNNER_LABELS: ${{ vars.CI_RUNNER_LABELS }}
+          # Optional trial: overrides routing for the N lightest non-core slices.
+          CI_ARM_HOSTED_SLICES: ${{ vars.CI_ARM_HOSTED_SLICES }}
+        run: |
+          MATRIX=$(python3 scripts/run_tests_parallel.py \
+            --generate-slices ${{ inputs.slice_count }} \
+            --test-scope '${{ inputs.test_scope }}' \
+            --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
+            --self-hosted-labels "$CI_RUNNER_LABELS" \
+            --arm-hosted-slices="$CI_ARM_HOSTED_SLICES")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          # A full matrix (~350 KB) exceeds Linux's 128 KB per-env-string limit
+          # (E2BIG), so overflow tooling reads it from a file, never env/argv.
+          mkdir -p ci-overflow
+          printf '%s' "$MATRIX" > ci-overflow/matrix.json
+
+      - name: Build CI overflow request and local matrix
+        # Relabels the matrix above; never recomputes membership. The request
+        # holds slice ids, core flag and duration weights only — no files,
+        # no test contents, no shell. The external ci-overflow-controller reads
+        # it with its own credential; nothing privileged enters this workflow.
+        id: overflow
+        env:
+          EVENT_NAME: ${{ inputs.sim_event }}
+        run: |
+          python3 scripts/ci_overflow_request.py --matrix-file ci-overflow/matrix.json --out-dir ci-overflow --event "$EVENT_NAME"
+          echo "local_matrix=$(cat ci-overflow/local_matrix.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CI overflow request
+        id: request
+        # A failed upload only means no plan: placement falls back to local.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-overflow-request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-overflow/request.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload local matrix for placement
+        # Placement's input (too large for env). Not the controller's request.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-overflow-local-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-overflow/local_matrix.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # Read-only consumer of the external controller's ledger plan (spec §5.1).
+  # merge_group only; any failure/timeout/mismatch leaves plan_valid unset or
+  # false and the test/e2e jobs below select generate.local_matrix instead.
+  placement:
+    name: Placement
+    needs: generate
+    if: inputs.sim_event == 'merge_group' && inputs.force != 'skip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # A dead placement (checkout/runner failure, 5-min kill) must not fail the
+    # required check: the fallback already ran every slice locally. Only a
+    # validated plan ever writes plan_valid=true, so this cannot admit one.
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      e2e_runs_on: ${{ steps.plan.outputs.e2e_runs_on }}
+      plan_valid: ${{ steps.plan.outputs.plan_valid }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download local matrix
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-overflow-local-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-overflow
+
+      - name: HARNESS forced placement failure
+        if: inputs.force == 'fail'
+        run: exit 1
+
+      - name: Read validated plan from ci-overflow-ledger
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_REPOSITORY_ID: ${{ github.repository_id }}
+          CI_RUN_ID: ${{ github.run_id }}
+          CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CI_HEAD_SHA: ${{ github.sha }}
+          CI_REQUEST_DIGEST: ${{ needs.generate.outputs.request_digest }}
+          CI_MATRIX_FILE: ci-overflow/local_matrix.json
+        run: python3 scripts/ci_overflow_placement.py place
+
+  test:
+    name: Run tests ${{ matrix.slice.name }}
+    needs: [generate, placement]
+    # always(): run even though placement is skipped (non-merge_group) or
+    # failed/timed out (merge_group local fallback). Placement changes labels
+    # only; membership always comes from generate.
+    if: always() && !cancelled() && needs.generate.result == 'success'
+    # Per-slice runner class, stamped by the generate job (see its
+    # `Generate test slices` step for the measurement and the fail-safe
+    # semantics). Not `vars.CI_RUNNER_LABELS` directly: one label set for the
+    # whole matrix cannot spill, and GitHub will not overflow a full
+    # self-hosted pool onto hosted runners by itself.
+    runs-on: ${{ fromJSON(matrix.slice.runs_on) }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # non-merge_group: original matrix (policy=legacy, excluded from the
+      # overflow budget). merge_group: the validated placement matrix, else the
+      # all-local matrix. No branch can hand fromJSON a missing output.
+      matrix: ${{ fromJSON(inputs.sim_event != 'merge_group' && needs.generate.outputs.matrix || needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.matrix || needs.generate.outputs.local_matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install ripgrep (prebuilt binary)
+        run: bash .github/scripts/install-ci-tool.sh ripgrep
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          # Pin the uv version: unpinned, setup-uv resolves "latest" by
+          # fetching a manifest from raw.githubusercontent.com on EVERY job —
+          # a transient fetch failure fails the whole job (2026-07-28 slice-5
+          # incident). Pinned, the binary downloads directly; no manifest hop.
+          version: "0.9.28"
+          # Persist uv's download/wheel cache (~/.cache/uv) across runs.
+          # Keyed on the dependency manifests, so the cache is reused until
+          # pyproject.toml or uv.lock changes. `uv sync` still runs every
+          # time, but resolves from the warm cache instead of re-downloading
+          # and re-building wheels.
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        # `uv sync --locked` installs the exact pinned set from uv.lock (and
+        # fails if the lock is out of sync with pyproject.toml), giving a
+        # reproducible env. It also creates .venv itself, so no separate
+        # `uv venv` step is needed.
+        #
+        # The trailing extras beyond all/dev are the lazy-install features
+        # (tools/lazy_deps.py) that tests exercise for real: provider.anthropic,
+        # stt/tts.mistral, image.fal, terminal.modal, terminal.daytona,
+        # memory.hindsight, search.parallel. The hermetic test env forbids
+        # mid-run pip installs (HERMES_DISABLE_LAZY_INSTALLS=1 in
+        # tests/conftest.py), so the SDKs those tests need must be in the
+        # venv up front — resolved from uv.lock like everything else, which
+        # also honors the exact supply-chain pins these extras carry.
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Minimize uv cache
+        # Optimized for CI: prunes pre-built wheels that are cheap to
+        # re-download, keeping the persisted cache small and fast to restore.
+        run: uv cache prune --ci
+
+      - name: Run tests (${{ matrix.slice.name }})
+        # Per-file isolation via scripts/run_tests.sh: each test file runs
+        # in its own freshly-spawned `python -m pytest <file>` subprocess
+        # with bounded parallelism. No xdist, no shared workers, no
+        # module-level state leakage between files.
+        #
+        # File list is pre-computed by the generate job (--generate-slices)
+        # which runs LPT distribution once and passes the file list to each
+        # matrix job via --files. Previously each job re-discovered files and
+        # re-ran LPT independently — redundant N times.
+        run: |
+          source .venv/bin/activate
+          # Verbose pytest output lets timeout verdicts name the last test reached.
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}' -- -v
+        env:
+          # Ensure tests don't accidentally call real APIs
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          # Subprocess-per-file is import/IO-bound, not CPU-bound: workers spend
+          # most of their wall time in interpreter boot + module import, not
+          # computing. This is a CEILING, not an absolute — run_tests_parallel.py
+          # clamps it to max(2, effective_cpus*2) where effective_cpus comes from
+          # the cgroup CPU quota, not nproc. So a 4-vCPU hosted runner still gets
+          # 8, while a --cpus=2 self-hosted container gets 4 instead of 12.
+          # (12 on 2 CPUs was 6x oversubscription: CFS throttling blew wall-clock
+          # windows and sqlite busy-timeouts, ejecting merge-queue entries.)
+          # HERMES_TEST_WORKERS_FORCE=1 bypasses the clamp.
+          HERMES_TEST_WORKERS: "12"
+
+      - name: Upload per-slice durations
+        # Advisory artifact (feeds slice balancing) — a transient artifact-
+        # service blip must not fail an otherwise-green test slice.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-durations-slice-${{ matrix.slice.index }}
+          path: test_durations.json
+          retention-days: 1
+
+  # Merge per-slice duration data into a single cache, so future runs
+  # (including PRs) get balanced slicing.
+  save-durations:
+    needs: test
+    if: needs.test.result == 'success' && github.ref == 'refs/heads/main'
+    # Artifact/cache plumbing needs no LAN or self-hosted test slot.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download all slice durations
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: test-durations-slice-*
+          path: durations
+          # NO merge-multiple: every slice uploads the SAME inner filename
+          # (test_durations.json), so merging them into one directory makes
+          # 10 concurrent extractions race on one path — observed corrupt
+          # concatenated JSON ("Extra data", run 29165269635) and, even when
+          # it "works", silent last-writer-wins data loss of 9/10 slices.
+          # Without merge-multiple each artifact lands in its own
+          # durations/test-durations-slice-N/ subdir — no shared paths.
+
+      - name: Merge into single durations file
+        run: |
+          python3 -c "
+          import json, glob, os, sys
+          merged = {}
+          files = sorted(glob.glob('durations/**/test_durations.json', recursive=True))
+          bad = 0
+          for f in files:
+            try:
+              with open(f) as fh:
+                merged.update(json.load(fh))
+            except (json.JSONDecodeError, OSError) as e:
+              # One unreadable slice must not sink the aggregate cache —
+              # but zero readable slices should fail loudly.
+              bad += 1
+              print(f'WARNING: skipping unreadable {f}: {e}', file=sys.stderr)
+          if not files:
+            sys.exit('no slice duration files found — artifact pattern matched nothing')
+          if bad == len(files):
+            sys.exit(f'all {bad} slice duration files unreadable')
+          with open('test_durations.json', 'w') as fh:
+            json.dump(merged, fh, indent=2, sort_keys=True)
+          print(f'Merged {len(merged)} file durations from {len(files) - bad}/{len(files)} slices')
+          "
+
+      - name: Save merged duration cache
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations-${{ github.run_id }}
+
+  e2e:
+    needs: [generate, placement]
+    if: always() && !cancelled() && needs.generate.result == 'success'
+    # non-merge_group keeps the legacy expression (self-hosted e2e requires
+    # X64; hosted fallback keeps its standard label). merge_group REPLACES it:
+    # the validated plan's e2e labels (never ARM), else the fixed local pool.
+    runs-on: ${{ inputs.sim_event != 'merge_group' && (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON('["ubuntu-latest"]')) || fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.e2e_runs_on || '["self-hosted","Linux","X64","hermes-ci"]') }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install ripgrep (prebuilt binary)
+        run: bash .github/scripts/install-ci-tool.sh ripgrep
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          # Pin the uv version: unpinned, setup-uv resolves "latest" by
+          # fetching a manifest from raw.githubusercontent.com on EVERY job —
+          # a transient fetch failure fails the whole job (2026-07-28 slice-5
+          # incident). Pinned, the binary downloads directly; no manifest hop.
+          version: "0.9.28"
+          # Persist uv's download/wheel cache (~/.cache/uv) across runs.
+          # Keyed on the dependency manifests, so the cache is reused until
+          # pyproject.toml or uv.lock changes. `uv sync` still runs every
+          # time, but resolves from the warm cache instead of re-downloading
+          # and re-building wheels.
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        # `uv sync --locked` installs the exact pinned set from uv.lock (and
+        # fails if the lock is out of sync with pyproject.toml), giving a
+        # reproducible env. It also creates .venv itself, so no separate
+        # `uv venv` step is needed.
+        #
+        # Same extras as the test job's sync above: the hermetic test env
+        # forbids mid-run pip installs (HERMES_DISABLE_LAZY_INSTALLS=1 in
+        # tests/conftest.py), so lazy-install SDKs exercised by tests must be
+        # in the venv up front.
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Minimize uv cache
+        # Optimized for CI: prunes pre-built wheels that are cheap to
+        # re-download, keeping the persisted cache small and fast to restore.
+        run: uv cache prune --ci
+
+      - name: Run e2e tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/e2e/ -v --tb=short -o faulthandler_timeout=120
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+  # Required-work aggregate for this workflow. A reusable workflow whose inner
+  # jobs were SKIPPED still reports success to ci.yaml's all-checks-pass, so a
+  # skipped test/e2e (e.g. a broken fallback predicate) would be
+  # skipped-success. This job turns any non-success generate/test/e2e result
+  # into a visible failure (spec §3.7).
+  tests-complete:
+    name: Tests complete
+    needs: [generate, placement, test, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Fail on skipped or failed required tests
+        # Results only: toJSON(needs) carries both matrices (~700 KB) and
+        # exceeds the 128 KB per-env-string limit (E2BIG, run 35892732551).
+        env:
+          GENERATE_RESULT: ${{ needs.generate.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: python3 scripts/ci_overflow_placement.py gate
