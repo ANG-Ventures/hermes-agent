@@ -239,3 +239,38 @@ class TestNormalizeModelForProvider:
         # Uses first from available list
         assert cli.model == "gpt-5.3-codex"
 
+
+
+def test_gpt6_sol_luna_are_curated_with_900k_variants():
+    """Ace's standing rule is that every codex seat uses the ``-900k``
+    picker variant, so `/model gpt-6-sol-900k` must resolve. Both slugs are
+    live on the Codex OAuth catalog (visibility=list, 2026-09-22)."""
+    model_ids = get_codex_model_ids()  # offline curated path
+
+    for base in ("gpt-6-sol", "gpt-6-luna"):
+        assert base in DEFAULT_CODEX_MODELS
+        assert base in model_ids
+        assert f"{base}-900k" in model_ids
+        assert model_ids.index(f"{base}-900k") == model_ids.index(base) + 1
+
+
+def test_gpt6_sol_luna_have_forward_compat_templates():
+    """An account whose live catalog predates the launch still sees them."""
+    from hermes_cli.codex_models import _finalize_codex_models
+
+    templates = dict(_FORWARD_COMPAT_TEMPLATE_MODELS)
+    assert "gpt-6-sol" in templates
+    assert "gpt-6-luna" in templates
+
+    out = _finalize_codex_models(["gpt-5.6-sol", "gpt-5.6-luna"])
+    assert "gpt-6-sol" in out
+    assert "gpt-6-luna" in out
+
+
+def test_gpt6_terra_is_never_synthesized():
+    """GPT-6 Terra does not exist; nothing may conjure it."""
+    from hermes_cli.codex_models import _finalize_codex_models
+
+    out = _finalize_codex_models(["gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra"])
+    assert "gpt-6-terra" not in out
+    assert "gpt-6-terra-900k" not in out

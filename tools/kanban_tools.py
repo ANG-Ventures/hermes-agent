@@ -1518,6 +1518,7 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    from hermes_cli import kanban_worker_policy as _worker_policy
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1593,6 +1594,9 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                forced_status=_worker_policy.resolve_park_status(
+                    initial_status=str(initial_status), triage=bool(triage),
+                ),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -2509,7 +2513,12 @@ KANBAN_CREATE_SCHEMA = {
                     "Initial card status. Use 'blocked' for tasks that "
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
-                    "'running', which preserves the usual dispatch path."
+                    "'running', which preserves the usual dispatch path. "
+                    "NOTE: when YOU are a dispatched Kanban worker, a "
+                    "default/'running' create is parked in "
+                    "kanban.worker_created_status (default 'triage') instead "
+                    "of auto-dispatching — a human promotes it. The response "
+                    "reports the status the card actually landed in."
                 ),
             },
             "skills": {

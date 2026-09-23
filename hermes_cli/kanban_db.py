@@ -391,6 +391,8 @@ def _fire_dispatch_tick_hook(
         outcome = "ok"
         if result.skipped_locked:
             outcome = "skipped_locked"
+        elif result.workspace_refused:
+            outcome = "workspace_refused"
         elif not any((
             result.spawned,
             result.reclaimed,
@@ -1284,20 +1286,35 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
     Anchored per-board so workspaces don't leak between projects.
-    ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly (highest
-    precedence) — the dispatcher injects this into worker env. Ignored
-    when ``HERMES_KANBAN_SANDBOX`` is set — see :func:`kanban_db_path`.
+    ``kanban.workspaces_root`` is the canonical placement policy. The
+    dispatcher injects its board-qualified result as
+    ``HERMES_KANBAN_WORKSPACES_ROOT`` into worker env; when both are visible,
+    disagreement fails closed. The environment override remains available for
+    tests and deployments without configured policy, and is ignored when
+    ``HERMES_KANBAN_SANDBOX`` is set — see :func:`kanban_db_path`.
 
     ``default`` keeps the legacy path ``<root>/kanban/workspaces/`` so
     that existing scratch workspaces from before the boards feature are
     preserved. Other boards use ``<root>/kanban/boards/<slug>/workspaces/``.
     """
+    from hermes_cli.kanban_workspace_policy import (
+        WorkspaceUnavailable, configured_root, validate_mount,
+    )
+
     override = _kanban_path_override("HERMES_KANBAN_WORKSPACES_ROOT")
-    if override:
-        return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
+    root, require_mount = configured_root()
+    if root is not None:
+        if require_mount:
+            validate_mount(root)
+        resolved = root / slug
+        if override and Path(override).expanduser() != resolved:
+            raise WorkspaceUnavailable("workspaces_root_invalid: board pin disagrees with config")
+        return resolved
+    if override:
+        return Path(override).expanduser()
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "workspaces"
     return board_dir(slug) / "workspaces"
@@ -2358,6 +2375,12 @@ CREATE TABLE IF NOT EXISTS task_comments (
     created_at  INTEGER NOT NULL
 );
 
+-- Retained across config rollback so old volatile paths stay fenced.
+CREATE TABLE IF NOT EXISTS workspace_mount_roots (
+    root       TEXT PRIMARY KEY,
+    mount_path TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -2973,6 +2996,176 @@ def assert_is_board_db(db_path: Path, conn: sqlite3.Connection) -> None:
         )
 
 
+class LiveBoardWriteRefused(RuntimeError):
+    """Raised when a test/probe process tries to open the PRODUCTION board rw.
+
+    See :func:`_assert_live_board_write_allowed`.
+    """
+
+
+def _production_kanban_roots() -> list[Path]:
+    """The Hermes roots whose ``kanban.db`` is the LIVE board.
+
+    Delegates to :func:`hermes_state._production_state_roots` rather than
+    computing its own answer. That list is the fleet's single definition of
+    "this is production": the platform-default root resolved WITHOUT
+    ``Path.home()`` / ``hermes_constants`` (both of which tests monkeypatch),
+    plus ``_STATE_DB_GUARD_EXTRA_DENY_ROOTS``, into which ``tests/conftest.py``
+    injects the pre-sandbox production root so custom-``HERMES_HOME``
+    deployments are covered too.
+
+    Sharing it is the point. ``state.db`` and ``kanban.db`` are the same class
+    of live store reached the same way, and the 2026-07-24 state.db incident
+    and the 2026-08-08 / 2026-09-21 kanban incidents are the same bug. A second
+    root definition here would be free to drift from the one the rest of the
+    guard class uses, which is how the first member got fixed while this one
+    kept leaking.
+    """
+    from hermes_state import _production_state_roots
+    return list(_production_state_roots())
+
+
+def _in_test_context() -> bool:
+    """True when this process is a test run, by environment OR by ancestry.
+
+    Re-exported from the leaf module ``hermes_test_context`` — the same single
+    definition ``hermes_state``'s guard uses. Deliberately NOT a local
+    ``PYTEST_CURRENT_TEST`` check: that misses a child spawned with a rebuilt
+    environment, which loses ``PYTEST_*`` and ``HERMES_HOME`` together and is
+    precisely the state in which it writes to production (#82770).
+    """
+    from hermes_test_context import _in_test_context as _impl
+    return _impl()
+
+
+def _is_production_board_db(resolved: Path, root: Path) -> bool:
+    """True when *resolved* is a LIVE board DB of the production root *root*.
+
+    Mirrors :func:`hermes_state._is_production_state_db` and covers the two
+    on-disk board layouts :func:`_board_db_path_ignoring_pin` produces:
+
+    * ``<root>/kanban.db`` — the ``default`` board (back-compat path);
+    * ``<root>/kanban/boards/<slug>/kanban.db`` — every named board.
+
+    Deliberately narrow. Anything deeper or elsewhere under the root is NOT a
+    board — notably ``~/.hermes/hermes-agent/...`` worktrees and
+    ``~/.hermes/kanban/workspaces/<task>/...`` scratch dirs, where hermetic
+    tests and workers legitimately create throwaway DBs. A containment-only
+    check (``is_relative_to(root)``) would refuse all of those.
+    """
+    if resolved == root / "kanban.db":
+        return True
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    return (
+        len(parts) == 4
+        and parts[0] == "kanban"
+        and parts[1] == "boards"
+        and parts[3] == "kanban.db"
+    )
+
+
+def _assert_live_board_write_allowed(path: Path) -> None:
+    """Refuse a READ-WRITE open of the LIVE board by a test/probe process.
+
+    The structural half of the 2026-08-08 / 2026-09-21 incidents. Until now the
+    only thing standing between a fixture card and the live board was
+    ``tests/conftest.py``'s env scrub, which is PATH-SCOPED: it loads when
+    pytest collects a file under ``tests/``, so a probe script sitting anywhere
+    else keeps the dispatcher-injected ``HERMES_KANBAN_DB`` pin and writes to
+    production. On 2026-09-21 that put three fixture cards on the live board and
+    burned three real worker runs against them.
+
+    A doc line and an opt-in flag cannot fix that — they require the probe's
+    author to remember. This gate sits at the ``connect()`` choke point instead,
+    so it covers every entry path regardless of where the ``.py`` file lives.
+
+    This is deliberately the SAME guard ``state.db`` has carried since the
+    2026-07-24 WAL incident (:func:`hermes_state._ensure_test_isolation`): same
+    production-root list, same test-context predicate, same fail-before-open
+    placement. Two stores, one class, one definition.
+
+    Two independent refusals, each covering a leak shape the other misses:
+
+    * **R1 (test context).** The process is a test run — by env *or* by process
+      ancestry (:func:`hermes_test_context._in_test_context`) — and is opening a
+      live board. This is the 16:05 shape: a probe under pytest from outside
+      ``tests/``, inheriting the worker's pin, ``HERMES_HOME`` still the real
+      profile. R2 cannot see it; nothing was redirected.
+    * **R2 (redirected home).** ``HERMES_HOME`` declares a root that is NOT a
+      production root — the caller sandboxed its Hermes state — yet kanban
+      resolved to a live board anyway, because a ``HERMES_KANBAN_*`` pin
+      outranks ``HERMES_HOME``. This is the 16:30 shape: bare
+      ``python probe.py`` under a throwaway probe home with no pytest marker at
+      all, so R1 cannot see it. This is the exact contradiction
+      :func:`_warn_if_override_escapes_hermes_home` has only ever WARNED about.
+
+    Neither condition can hold for a production writer. The fleet runs with
+    ``HERMES_HOME`` unset, ``=~/.hermes``, or ``=~/.hermes/profiles/<name>``,
+    all of which resolve ``kanban_home()`` to the production root (R2 false),
+    and no fleet component is a test context (R1 false). The gate is inert in
+    production and costs one ``Path.resolve()``.
+
+    A deliberate operator pin to a board outside every production root — the
+    documented ``HERMES_KANBAN_DB`` use — is untouched.
+    """
+    try:
+        target = path.expanduser().resolve(strict=False)
+    except OSError:  # pragma: no cover - resolution failure is not a leak
+        return
+    live_root: Optional[Path] = None
+    for root in _production_kanban_roots():
+        if _is_production_board_db(target, root):
+            live_root = root
+            break
+    if live_root is None:
+        return  # not a live board — nothing this guard is about.
+
+    reason: Optional[str] = None
+    if _in_test_context():
+        reason = (
+            f"this process is a TEST context and {target} is the LIVE board "
+            f"(under real Hermes root {live_root})"
+        )
+    else:
+        declared = os.environ.get("HERMES_HOME", "").strip()
+        if declared:
+            try:
+                declared_root = kanban_home().expanduser().resolve(strict=False)
+            except OSError:  # pragma: no cover - diagnostic only
+                declared_root = live_root
+            if declared_root not in {
+                r for r in _production_kanban_roots()
+            }:
+                reason = (
+                    f"HERMES_HOME={declared} declares the kanban root "
+                    f"{declared_root}, but a HERMES_KANBAN_* path pin "
+                    f"outranked it and resolved to {target} — the LIVE board "
+                    f"under {live_root}"
+                )
+    if reason is None:
+        return
+    pins = ", ".join(
+        f"{k}={os.environ[k]}"
+        for k in (*_KANBAN_PATH_PIN_ENV_VARS, "HERMES_KANBAN_BOARD")
+        if os.environ.get(k, "").strip()
+    ) or "<none>"
+    raise LiveBoardWriteRefused(
+        f"kanban live-system guard: refusing to open the live board "
+        f"read-write — {reason}. Writes from here create REAL cards that the "
+        f"dispatcher claims and spawns real workers against (3 fixture cards + "
+        f"3 burned runs on 2026-09-21). Active path pins: {pins}. To run "
+        f"against a throwaway board: HERMES_KANBAN_SANDBOX=1 "
+        f"HERMES_HOME=$(mktemp -d) — the flag neutralises every "
+        f"HERMES_KANBAN_* pin so kanban resolves under your temp home. "
+        f"Read-only inspection of the live board is still allowed via "
+        f"connect_readonly()."
+    )
+
+
 def connect_readonly(
     db_path: Optional[Path] = None,
     *,
@@ -3490,6 +3683,13 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    # Structural live-board guard. Placed BEFORE the mkdir so a refused open
+    # cannot create board directories, and before every cache fast-path so a
+    # second connect() in the same process cannot skip it. It covers an
+    # explicit ``db_path=`` too: a probe that hands connect() the live path
+    # directly is the same leak through a different door. ``init_db`` routes
+    # through here, so it is covered as well.
+    _assert_live_board_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -4413,6 +4613,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    forced_status: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -4699,6 +4900,22 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif forced_status:
+                    # Fan-out brake: a policy layer (kanban_worker_policy) has
+                    # decided this creation must PARK rather than queue — e.g.
+                    # a dispatched worker creating a child card. Parent ids are
+                    # still validated so the link rows can't dangle, but no
+                    # parent-gated promotion applies: the card sits until a
+                    # human moves it.
+                    if forced_status not in VALID_STATUSES:
+                        raise ValueError(
+                            f"forced_status must be one of {sorted(VALID_STATUSES)}"
+                        )
+                    task_status = forced_status
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                 elif triage:
                     task_status = "triage"
                 else:
@@ -4819,6 +5036,18 @@ def create_task(
                         task_id,
                         flagship_override_author or created_by or "operator",
                         override_comment(flagship_override_reason),
+                    )
+                if forced_status and task_status == forced_status:
+                    # Audit the brake on the card itself so the park is
+                    # explicable without reading config: WHY this card is not
+                    # in ``ready``, and which knob restores the old behaviour.
+                    from hermes_cli import kanban_worker_policy as _kwp
+
+                    _append_event(
+                        conn,
+                        task_id,
+                        "parked_by_policy",
+                        _kwp.park_event_payload(task_status),
                     )
                 if task_status == "blocked":
                     # Tag the source so dependency resolution can distinguish
@@ -10844,6 +11073,146 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+@dataclass(frozen=True)
+class _WorkspaceAdmission:
+    root: Path
+    mount_path: Path
+
+
+def _validate_workspace_admission(
+    task: Task, *, board: Optional[str] = None, conn=None, dry_run=False,
+) -> Optional[_WorkspaceAdmission]:
+    from hermes_cli.kanban_workspace_policy import (
+        WorkspaceUnavailable, configured_root, validate_mount,
+        validate_persisted, validate_target,
+    )
+
+    root, require_mount = configured_root()
+    if conn is None:
+        with connect_closing(board=board) as owned:
+            return _validate_workspace_admission(task, board=board, conn=owned, dry_run=dry_run)
+    roots = {
+        Path(row["root"]): Path(row["mount_path"])
+        for row in conn.execute("SELECT root, mount_path FROM workspace_mount_roots")
+    }
+    if root is not None and require_mount:
+        expected_mount = roots.get(root)
+        mount_path = validate_mount(root, expected_mount=expected_mount)
+        if expected_mount is None:
+            roots[root] = mount_path
+            if not dry_run:
+                with write_txn(conn):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO workspace_mount_roots(root, mount_path) "
+                        "VALUES (?, ?)",
+                        (str(root), str(mount_path)),
+                    )
+
+    def resolved(candidate: Path) -> Path:
+        try:
+            return candidate.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise WorkspaceUnavailable(
+                f"workspaces_root_invalid: cannot resolve: {candidate}"
+            ) from exc
+
+    if task.workspace_path:
+        path = Path(task.workspace_path).expanduser()
+        for protected, mount_path in sorted(
+            roots.items(), key=lambda item: len(item[0].parts), reverse=True,
+        ):
+            path_resolved = resolved(path)
+            protected_resolved = resolved(protected)
+            if path.is_relative_to(protected) or path_resolved.is_relative_to(protected_resolved):
+                validate_mount(protected, expected_mount=mount_path)
+                if not path.is_relative_to(protected) or path_resolved != path.absolute():
+                    raise WorkspaceUnavailable("workspaces_root_invalid: workspace symlink escape")
+                validate_target(protected, path)
+                validate_persisted(path)
+                return _WorkspaceAdmission(protected, mount_path)
+    elif task.workspace_kind in (None, "scratch"):
+        target = workspaces_root(board=board) / task.id
+        if require_mount:
+            assert root is not None
+            validate_target(root, target)
+            return _WorkspaceAdmission(root, roots[root])
+    return None
+
+
+def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+
+    task = get_task(conn, task_id)
+    if task is None:
+        return True
+    try:
+        _validate_workspace_admission(task, board=board, conn=conn, dry_run=dry_run)
+    except WorkspaceUnavailable as exc:
+        reason = str(exc)
+        # Only a spawnable lane refusal is a dispatcher fault. Startup
+        # reconciliation also scans todo/running tasks so their lost path is
+        # durable and visible, but must not make unrelated ready work look stuck.
+        spawnable_lane = task.status in ("ready", "review")
+        if spawnable_lane and not any(
+            item[0] == task_id for item in result.workspace_refused
+        ):
+            result.workspace_refused.append((task_id, reason))
+        stranded = bool(task.workspace_path) and reason.startswith((
+            "stranded_by_mount_loss:", "workspaces_root_unmounted:",
+        ))
+        if stranded and task_id not in result.stranded_by_mount_loss:
+            result.stranded_by_mount_loss.append(task_id)
+        event_kind = "stranded_by_mount_loss" if stranded else "workspace_refused"
+        _log.warning("kanban dispatch: %s task=%s", reason, task_id)
+        if not dry_run:
+            with write_txn(conn):
+                previous = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? "
+                    "AND kind=? ORDER BY id DESC LIMIT 1",
+                    (task_id, event_kind),
+                ).fetchone()
+                payload = {"reason": reason}
+                if previous is None or json.loads(previous[0]) != payload:
+                    _append_event(conn, task_id, event_kind, payload)
+        return True
+    return False
+
+
+def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
+    """Undo a claim when the mount changes during the claim/resolve window."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return
+    if not any(item[0] == task_id for item in result.workspace_refused):
+        result.workspace_refused.append((task_id, reason))
+    stranded = bool(task.workspace_path) and reason.startswith((
+        "stranded_by_mount_loss:", "workspaces_root_unmounted:",
+    ))
+    if stranded and task_id not in result.stranded_by_mount_loss:
+        result.stranded_by_mount_loss.append(task_id)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        run_id = row["current_run_id"] if row else None
+        retry_status = _retry_status_for_run(conn, task_id, run_id)
+        conn.execute(
+            "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=? AND current_run_id=?",
+            (retry_status, task_id, run_id),
+        )
+        closed_run_id = _end_run(
+            conn, task_id, outcome="workspace_refused",
+            status="workspace_refused", error=reason[:500],
+            metadata={"retry_status": retry_status},
+        )
+        _append_event(
+            conn, task_id,
+            "stranded_by_mount_loss" if stranded else "workspace_refused",
+            {"reason": reason}, run_id=closed_run_id,
+        )
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -10870,6 +11239,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
     """
+    protected = _validate_workspace_admission(task, board=board)
     kind = task.workspace_kind or "scratch"
     if kind == "scratch":
         if task.workspace_path:
@@ -10884,7 +11254,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 )
         else:
             p = workspaces_root(board=board) / task.id
-        p.mkdir(parents=True, exist_ok=True)
+        if protected is not None and not task.workspace_path:
+            from hermes_cli.kanban_workspace_policy import create_scratch
+            create_scratch(
+                protected.root, p, expected_mount=protected.mount_path,
+            )
+        elif protected is None:
+            p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "dir":
         if not task.workspace_path:
@@ -11450,6 +11826,9 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    stranded_by_mount_loss: list[str] = field(default_factory=list)
+    workspace_refused: list[tuple[str, str]] = field(default_factory=list)
+    """Mount or persisted-workspace failures, refused BEFORE claiming a run."""
     spawn_failed: list[str] = field(default_factory=list)
     """Task ids whose spawn attempt failed THIS tick — recorded on every
     failure (workspace resolution or worker launch), whether or not it was
@@ -11496,6 +11875,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    budget_paused: bool = False
+    """True when this board spawned nothing because its rolling-window worker
+    spend has reached ``kanban.budget.usd_per_24h``. Reclaim / promotion /
+    bookkeeping still ran — only NEW spawns are withheld, and they resume
+    automatically once the window rolls the spend back under the ceiling."""
     parent_satisfied_sticky: list[str] = field(default_factory=list)
     """Explicitly blocked task ids that have one or more ``blocks`` parents
     and whose parents are all terminal. The graph is satisfied, but the
@@ -11566,6 +11950,10 @@ _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 _worker_processes: dict = {}
 _worker_processes_lock = threading.Lock()
+# Startup stranding is a boot/restart reconciliation pass, not a per-tick
+# mount-probe fan-out. Ready/review candidates are still checked every tick
+# immediately before claim.
+_workspace_startup_scanned: set[str] = set()
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -14132,6 +14520,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    budget_cache: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -14169,6 +14558,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             pr_gate_prefetch=pr_gate_prefetch,
+            budget_cache=budget_cache,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -14193,6 +14583,7 @@ def dispatch_once(
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
                 pr_gate_prefetch=pr_gate_prefetch,
+                budget_cache=budget_cache,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -14262,6 +14653,7 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     pr_gate_prefetch=None,
+    budget_cache: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -14303,6 +14695,20 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    # First tick after process start: mark lost persisted paths before reapers
+    # can make them spawnable. Do not repeat O(active tasks) DB transactions and
+    # write probes every tick; candidates are rechecked just before claim below.
+    startup_key = str(kanban_db_path(board))
+    if dry_run or startup_key not in _workspace_startup_scanned:
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE workspace_path IS NOT NULL "
+            "AND status IN ('todo', 'ready', 'running', 'review')"
+        ).fetchall():
+            _workspace_admission_refused(
+                conn, row["id"], result, board=board, dry_run=dry_run,
+            )
+        if not dry_run:
+            _workspace_startup_scanned.add(startup_key)
     pr_cycle_key = _pr_state_cache_key(kanban_db_path(board))
     pr_nonterminal_cache, pr_cycle_skip = _pr_state_caches_for_board(pr_cycle_key)
     pr_state_resolver = _PrStateResolver(
@@ -14365,6 +14771,36 @@ def _dispatch_once_locked(
     # Computed AFTER recompute_ready so anything promotable this tick has
     # already left ``todo`` and can't be mis-reported as stranded.
     result.stranded_by_triage = find_stranded_by_triage(conn)
+
+    # Fan-out brake: per-board rolling-window USD ceiling. Evaluated AFTER all
+    # reclaim/promotion bookkeeping so a paused board stays accurate on the
+    # dashboard, and BEFORE any spawn decision so the pause actually withholds
+    # workers. Fail-open by construction (see evaluate_board_budget): a cost
+    # measurement fault must never halt the host.
+    #
+    # Skipped entirely under ``dry_run``: the documented SAFE probe must not
+    # write a pause marker or fire a real page about a tick it only observes.
+    # (Same rule the review-stale detector follows.)
+    if not dry_run:
+        try:
+            from hermes_cli import kanban_budget as _kbudget
+
+            # Single-board addressing, NOT enumeration — do not wrap in
+            # enumerating_boards(); that would suppress exactly the pin-vs-board
+            # contradiction warning this lookup should surface.
+            if _kbudget.evaluate_board_budget(
+                board,
+                kanban_db_path(board=board),
+                board_dir(board),
+                cache=budget_cache,
+            ):
+                result.budget_paused = True
+                return result
+        except Exception as exc:
+            _log.warning(
+                "kanban dispatch: budget gate failed (%s: %s); continuing tick",
+                type(exc).__name__, exc,
+            )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -14723,6 +15159,8 @@ def _dispatch_once_locked(
                     "dispatch continues",
                     row["id"],
                 )
+        if _workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -14738,12 +15176,29 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        from hermes_cli.kanban_workspace_policy import (
+            WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
+        )
         try:
+            protected = _validate_workspace_admission(
+                claimed, board=board, conn=conn,
+            )
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+            if protected is not None:
+                validate_mount(
+                    protected.root, expected_mount=protected.mount_path,
+                )
+                validate_target(protected.root, workspace)
+                validate_persisted(workspace)
+        except WorkspaceUnavailable as exc:
+            _release_claim_for_workspace_refusal(
+                conn, claimed.id, result, str(exc),
+            )
+            continue
         except Exception as exc:
             # A workspace anchor that can never resolve (bare repo, non-repo
             # path, missing default_workdir) is a capability wall: retrying it
@@ -14880,6 +15335,8 @@ def _dispatch_once_locked(
             continue
         if provider_deferred(row["id"], row["assignee"]):
             continue
+        if _workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
@@ -14891,12 +15348,29 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        from hermes_cli.kanban_workspace_policy import (
+            WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
+        )
         try:
+            protected = _validate_workspace_admission(
+                claimed, board=board, conn=conn,
+            )
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+            if protected is not None:
+                validate_mount(
+                    protected.root, expected_mount=protected.mount_path,
+                )
+                validate_target(protected.root, workspace)
+                validate_persisted(workspace)
+        except WorkspaceUnavailable as exc:
+            _release_claim_for_workspace_refusal(
+                conn, claimed.id, result, str(exc),
+            )
+            continue
         except Exception as exc:
             # A workspace anchor that can never resolve (bare repo, non-repo
             # path, missing default_workdir) is a capability wall: retrying it

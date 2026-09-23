@@ -22,7 +22,9 @@ import importlib
 import importlib.util
 import logging
 import sys
+import os
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -40,6 +42,9 @@ logger = logging.getLogger(__name__)
 # back to the built-in compressor — a silent, intermittent partial-import race.
 # RLock (not Lock) guards against any reentrant load during module exec.
 _LOAD_LOCK = threading.RLock()
+# Engine construction slower than this is logged as PHASE=context_engine_load_slow.
+# Healthy init on the fleet's largest DB (10.9 GB) measures 0.14 s; 5 s is 35x that.
+ENGINE_LOAD_SLOW_S = float(os.environ.get("HERMES_ENGINE_LOAD_SLOW_S", "5"))
 
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
 
@@ -185,8 +190,37 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
     runs. Without this lock a concurrent caller could grab a half-initialized
     module and silently fall back to the built-in compressor.
     """
-    with _LOAD_LOCK:
-        return _load_engine_from_dir_locked(engine_dir)
+    # Everything under this lock is on EVERY turn's critical path: while one
+    # thread builds the engine, every other turn's init_agent() waits here.
+    # Measured 2026-09-22 (Mac Studio, default gateway): two one-time SQL
+    # backfills in the LCM store ran as full-table scans of a 10.9 GB
+    # messages table at every boot, ~21-25 min each, and all 8-10 in-flight
+    # turns sat in this exact `with` for the duration — the user saw "Apollo
+    # is frozen" with no log line anywhere naming the cause. Time the hold and
+    # say so out loud when it is slow; a stall behind this lock must never
+    # again be silent.
+    t0 = time.monotonic()
+    waited_for_lock = 0.0
+    acquired = _LOAD_LOCK.acquire(blocking=False)
+    if not acquired:
+        _LOAD_LOCK.acquire()
+        waited_for_lock = time.monotonic() - t0
+    try:
+        t1 = time.monotonic()
+        result = _load_engine_from_dir_locked(engine_dir)
+        held = time.monotonic() - t1
+        if held >= ENGINE_LOAD_SLOW_S or waited_for_lock >= ENGINE_LOAD_SLOW_S:
+            logger.warning(
+                "PHASE=context_engine_load_slow engine=%s held=%.1fs waited_for_lock=%.1fs "
+                "threshold=%.0fs — every concurrent turn was blocked behind this load; "
+                "if held is large, something in engine init scales with data size "
+                "(see plugins/context_engine/lcm/store.py _init_db and the "
+                "init-path lint in tests/context_engine/test_lcm_backfill_cost.py)",
+                engine_dir.name, held, waited_for_lock, ENGINE_LOAD_SLOW_S,
+            )
+        return result
+    finally:
+        _LOAD_LOCK.release()
 
 
 def _load_engine_from_dir_locked(engine_dir: Path) -> Optional["ContextEngine"]:

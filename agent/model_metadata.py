@@ -606,7 +606,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     # _CODEX_OAUTH_CONTEXT_FALLBACK). Listed explicitly rather than relying on
     # a "gpt-6" family prefix so the longest-key-first substring lookup can
     # never fall through to a coarser entry.
+    # GPT-6 Sol/Luna (GA 2026-09-22) — both documented at a 1,050,000 window
+    # (developers.openai.com/api/docs/models/gpt-6-{sol,luna}), same as Astra
+    # and the 5.6 series. Listed explicitly for the same reason as Astra.
     "gpt-6-astra": 1050000,
+    "gpt-6-sol": 1050000,
+    "gpt-6-luna": 1050000,
     "gpt-5.6-luna": 1050000,
     "gpt-5.6-terra": 1050000,
     "gpt-5.6-sol": 1050000,
@@ -2827,6 +2832,8 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.2-codex": 272_000,
     "gpt-5.4-mini": 272_000,
     "gpt-6-astra": 272_000,
+    "gpt-6-sol": 272_000,
+    "gpt-6-luna": 272_000,
     "gpt-5.6-sol": 272_000,
     "gpt-5.6-terra": 272_000,
     "gpt-5.6-luna": 272_000,
@@ -2878,6 +2885,14 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
     # max_context_window=872,000 (measured 2026-09-04). EXACT, not a
     # "gpt-6" family prefix: no other gpt-6 slug has been probed.
     "gpt-6-astra": 872_000,
+    # GPT-6 Sol/Luna: same shape, measured 2026-09-22 against
+    # chatgpt.com/backend-api/codex/models (client_version=0.156.0) —
+    # visibility=list, context_window=272,000, max_context_window=872,000
+    # for both slugs. Listed EXACTLY, not under a "gpt-6" family prefix:
+    # each gpt-6 slug earns its entry by its own catalog measurement, so an
+    # unprobed future gpt-6 descendant can never inherit this cap.
+    "gpt-6-sol": 872_000,
+    "gpt-6-luna": 872_000,
 }
 
 # The advertised value the verified-above table is allowed to override.
@@ -2895,6 +2910,8 @@ CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"
 # via _CODEX_900K_SNAPSHOT_RE.
 _CODEX_900K_ELIGIBLE_BASES = frozenset({
     "gpt-6-astra",                # measured max_context_window 872,000
+    "gpt-6-sol",                  # measured max_context_window 872,000
+    "gpt-6-luna",                 # measured max_context_window 872,000
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",

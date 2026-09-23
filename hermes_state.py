@@ -59,6 +59,7 @@ from hermes_state_ext import (
     _session_title_search_score,
     _sql_placeholders,
 )
+from hermes_cli.cli_hint import hint_value
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
@@ -560,6 +561,36 @@ _STATE_DB_GUARD_BYPASS_ENV = "HERMES_STATE_DB_GUARD_BYPASS"
 _STATE_DB_GUARD_EXTRA_DENY_ROOTS: Tuple[Path, ...] = ()
 
 
+def _os_account_home() -> Optional[Path]:
+    """The OS ACCOUNT's home directory, immune to an in-process ``$HOME`` swap.
+
+    ``$HOME`` is per-process environment state, and redirecting it to a tmpdir
+    (``monkeypatch.setenv("HOME", tmp_path)``) is THE hermetic-isolation idiom
+    in this repo — 51 test files do it.  The passwd database is a property of
+    the UID, so it keeps naming the operator's real home across that redirect.
+
+    That difference is the entire discriminator this guard needs: it is what
+    separates "this root is production" from "a test moved ``$HOME`` here".
+
+    Returns ``None`` when ``pwd`` is unavailable (Windows, stripped installs)
+    or names a home that does not exist on disk (service accounts with a
+    ``/nonexistent`` entry, some container images); callers fall back to
+    ``os.path.expanduser`` there, i.e. to the previous behaviour on hosts
+    where no better answer exists.  Falling back matters more than being
+    clever: an unusable anchor would point the deny-list at a root nothing
+    ever resolves to, silently disarming the guard.
+    """
+    try:
+        import pwd
+
+        home = pwd.getpwuid(os.getuid()).pw_dir.strip()  # windows-footgun: ok — POSIX-only module inside try/except
+        if home and os.path.isdir(home):
+            return Path(home)
+    except Exception:
+        pass
+    return None
+
+
 def _real_platform_state_root() -> Optional[Path]:
     """Resolve the REAL platform-default Hermes root for the guard.
 
@@ -568,19 +599,37 @@ def _real_platform_state_root() -> Optional[Path]:
     is often imported lazily *while* such a patch is active — resolving
     through the patched callable would misidentify the test's own hermetic
     home as "production" (false positive) or, worse, miss the real one
-    (false negative).  ``os.path.expanduser`` reads the HOME environment
-    variable / passwd entry, which the hermetic conftest never rewrites.
+    (false negative).
+
+    Anchored on the OS ACCOUNT home (:func:`_os_account_home`) rather than
+    ``os.path.expanduser("~")``, which on POSIX is just ``$HOME``.  Reading
+    ``$HOME`` made this function answer "production" for the tmpdir of any
+    test using the hermetic ``monkeypatch.setenv("HOME", tmp_path)`` idiom —
+    so a hermetic board at ``<tmp>/.hermes/kanban.db`` WAS, to the guard, the
+    live board, and both guards refused it (2026-09-21: 2 files / 24 tests
+    red).  A guard that fires on the standard isolation idiom teaches people
+    to disarm it globally, which is how the previous two opt-in mitigations
+    died; keeping it precise is what keeps it armed.
+
+    The account home is still not monkeypatchable from inside a test, so the
+    property the old comment was protecting is preserved — it is simply read
+    from the passwd entry, which ``$HOME`` only aliases when nothing has
+    redirected it.
     """
     try:
+        account_home = _os_account_home()
         if sys.platform == "win32":
             base = os.environ.get("LOCALAPPDATA", "").strip()
             root = (
                 Path(base) / "hermes"
                 if base
-                else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
+                else (account_home or Path(os.path.expanduser("~")))
+                / "AppData"
+                / "Local"
+                / "hermes"
             )
         else:
-            root = Path(os.path.expanduser("~")) / ".hermes"
+            root = (account_home or Path(os.path.expanduser("~"))) / ".hermes"
         return root.resolve()
     except Exception:
         return None
@@ -600,16 +649,85 @@ from hermes_test_context import (  # noqa: F401
 )
 
 
+def _deployed_hermes_home_root() -> Optional[Path]:
+    """The root ``HERMES_HOME`` names, when it is a real DEPLOYMENT's root.
+
+    Card t_5bfcbf14. :func:`_real_platform_state_root` unconditionally appends
+    ``.hermes`` to the account home, but ``hermes_constants.get_default_hermes_root``
+    — the resolver that actually PICKS the store — returns ``HERMES_HOME``
+    itself when it points outside ``~/.hermes``.  The repo's own container image
+    is exactly that shape (``Dockerfile``: ``useradd -u 10000 -m -d /opt/data
+    hermes`` + ``ENV HERMES_HOME=/opt/data``), so the live board sits at
+    ``/opt/data/kanban.db`` while the deny-list only ever named
+    ``/opt/data/.hermes``.  Measured verdict on that host: ALLOWED — the whole
+    guard class is structurally unable to fire in the official image, while
+    reading green on every developer Mac where ``$HOME/.hermes`` genuinely IS
+    the root.
+
+    The deny-list must therefore agree with the resolver.  It cannot simply
+    trust ``HERMES_HOME``, though: redirecting it to a tmpdir is the hermetic
+    isolation idiom (766 test files), and classifying that as production is the
+    t_c64b9d44 false positive — a guard that fires on the standard idiom gets
+    disarmed globally, which is how the previous two mitigations died.
+
+    The discriminator is the OS ACCOUNT home, the same one
+    :func:`_os_account_home` already provides and the same one a test cannot
+    move.  It is matched EXACTLY, not by containment: a real deployment
+    declares either the account home itself (``/opt/data`` IS uid 10000's
+    passwd ``pw_dir`` in the image) or a profile directly under it
+    (``<account>/profiles/<name>``, the Docker profile layout
+    ``get_default_hermes_root`` walks up).  A hermetic root is a tmpdir, and a
+    tmpdir is never the passwd entry.
+
+    Containment (``account in root.parents``) was tried first and is WRONG: it
+    promotes ``~/.hermes/hermes-agent/<worktree>`` and any tmpdir that happens
+    to sit under the account home to "a production root", and a mutation run
+    showed the false-positive tests then pass only by accident of where
+    ``--basetemp`` was placed.  Exact equality has no such dependence.
+
+    Returns ``None`` when ``HERMES_HOME`` is unset, when the account home is
+    unknowable (Windows, stripped installs, a container UID with no passwd
+    entry), or when the declared root is neither of the two accepted shapes —
+    every one of which leaves the previous behaviour exactly as it was.
+
+    Deliberately reimplemented here rather than imported: ``hermes_state``
+    avoids ``hermes_constants`` because tests monkeypatch it (and
+    ``Path.home``), and a guard that resolves through a patched callable
+    misidentifies the patcher's own tmpdir as production.
+    """
+    declared = os.environ.get("HERMES_HOME", "").strip()
+    if not declared:
+        return None
+    account_home = _os_account_home()
+    if account_home is None:
+        return None
+    try:
+        root = Path(declared).expanduser().resolve()
+        account = account_home.resolve()
+    except Exception:
+        return None
+    if root.parent.name == "profiles":
+        root = root.parent.parent
+    if root != account:
+        return None  # a redirected/hermetic HERMES_HOME, not a deployment
+    return root
+
+
 def _production_state_roots() -> List[Path]:
     roots: List[Path] = []
     real_root = _real_platform_state_root()
     if real_root is not None:
         roots.append(real_root)
+    deployed_root = _deployed_hermes_home_root()
+    if deployed_root is not None and deployed_root not in roots:
+        roots.append(deployed_root)
     for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
         try:
-            roots.append(Path(extra).expanduser().resolve())
+            resolved_extra = Path(extra).expanduser().resolve()
         except Exception:
             continue
+        if resolved_extra not in roots:
+            roots.append(resolved_extra)
     return roots
 
 
@@ -2522,7 +2640,8 @@ def _persistent_repair_exhausted_error(db_path: Path) -> str:
         f"{_MAX_PERSISTENT_REPAIR_ATTEMPTS} times on this exact file — "
         "the corruption is beyond the schema/FTS repair strategies "
         "(likely b-tree page damage). Manual recovery required: restore "
-        f"a backup, or salvage with `sqlite3 {db_path} \".recover\"`. "
+        "a backup, or salvage with "
+        f'`sqlite3 {hint_value(str(db_path))} ".recover"`. '
         f"Delete {_repair_ledger_path(db_path).name} to force another "
         "automatic attempt."
     )
@@ -2721,8 +2840,8 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                     f"only {usage.free / 1e9:.2f}GB free on {db_path.parent}; "
                     f"copying the damaged DB needs {need / 1e9:.2f}GB and must "
                     f"leave {headroom / 1e9:.2f}GB headroom. Free disk space, "
-                    f"then retry (or recover manually with `sqlite3 {db_path} "
-                    '".recover"`).'
+                    "then retry (or recover manually with "
+                    f'`sqlite3 {hint_value(str(db_path))} ".recover"`).'
                 )
                 logger.error("Refusing forensic backup of %s: %s", db_path, reason)
                 return None, reason
@@ -2736,7 +2855,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                 f"could not determine free space on {db_path.parent} ({exc}); "
                 "refusing the forensic copy rather than risk filling the "
                 f"volume. Free disk space, then retry (or recover manually "
-                f'with `sqlite3 {db_path} ".recover"`).'
+                f'with `sqlite3 {hint_value(str(db_path))} ".recover"`).'
             )
             logger.error("Refusing forensic backup of %s: %s", db_path, reason)
             return None, reason

@@ -73,6 +73,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
+from hermes_cli.cli_hint import hint_value
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from gateway.fork_ext.restart_codec import (
@@ -4263,7 +4264,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
                     install_path = f"official/{'/'.join(parts)}"
                     return (
                         f"The **{command_name}** skill is available but not installed.\n"
-                        f"Install it with: `hermes skills install {install_path}`"
+                        f"Install it with: `hermes skills install {hint_value(install_path)}`"
                     )
     except Exception:
         pass
@@ -12720,10 +12721,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Tell the user the truth: a restart happened and recovery is
             # running. The generic "Interrupting current task" ack hid both
             # facts (2026-07-10).
+            # ONE restart message per boot, and it is the boot notice
+            # (fork_ext.unclean_restart_notice: names who restarted us and
+            # why, planned or not). This ack must not re-announce the restart
+            # — 2026-09-22 Ace saw "I was restarted", "Gateway restarted —
+            # resuming", and the watcher's line for the same bounce and
+            # asked to consolidate. Say only what is NEW here: queued.
             message = (
-                f"🔄 Gateway restarted — I'm resuming the work that was "
-                f"interrupted{status_detail}. Your message is queued and "
-                f"folds in right after (use /stop to cancel the recovery)."
+                f"⏳ Still finishing the interrupted work{status_detail} — "
+                f"your message is queued and folds in right after "
+                f"(use /stop to cancel the recovery)."
             )
         elif is_queue_mode and demoted_for_compression:
             message = (
@@ -14880,6 +14887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             PriorLifeVerdict,
             classify_prior_life,
             read_last_event_loop_blocked_site,
+            read_planned_restart,
         )
 
         home = getattr(self, "_unclean_restart_home", None)
@@ -14895,7 +14903,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             site = getattr(self, "_unclean_restart_site", None)
             if site is None:
                 site = read_last_event_loop_blocked_site(home)
-            verdict = classify_prior_life(sentinel, site=site)
+            planned = None
+            try:
+                _ended = (sentinel or {}).get("prior_exited_at") or (sentinel or {}).get("prior_started_at")
+                planned = read_planned_restart(_ended, home)
+            except Exception:
+                planned = None
+            verdict = classify_prior_life(sentinel, site=site, planned=planned)
         except Exception:
             logger.debug("Prior-life verdict unavailable", exc_info=True)
             verdict = PriorLifeVerdict(unclean=False)
@@ -14968,9 +14982,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     str(source.chat_id), message, metadata=metadata
                 )
                 logger.warning(
-                    "PHASE=unclean_restart_notice key=%s reason=%s",
+                    "PHASE=restart_notice key=%s reason=%s planned=%s by=%s",
                     session_key,
                     verdict.exit_reason or verdict.killer or "unclean",
+                    verdict.planned, verdict.planned_by or "-",
                 )
         except Exception as exc:
             # Never let a transport failure eat the resumed turn.
@@ -28343,7 +28358,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if "pynacl" in err_lower or "nacl" in err_lower or "davey" in err_lower:
                 return (
                     "Voice dependencies are missing (PyNaCl / davey). "
-                    f"Install with: `{sys.executable} -m pip install PyNaCl`"
+                    f"Install with: `{hint_value(sys.executable)} -m pip install PyNaCl`"
                 )
             return f"Failed to join voice channel: {e}"
 
@@ -36186,7 +36201,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         cap,
                     )
                 cap = None
-            admission = self._turn_admission = TurnAdmission(cap)
+            reserve = getattr(
+                getattr(self, "config", None), "user_turn_reserve", 2,
+            )
+            if type(reserve) is not int or reserve < 0:
+                logger.warning(
+                    "Invalid gateway.user_turn_reserve value %r; using 2",
+                    reserve,
+                )
+                reserve = 2
+            admission = self._turn_admission = TurnAdmission(cap, reserve=reserve)
         return admission
 
     async def _ack_turn_slot_wait(self, source):

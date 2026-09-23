@@ -75,7 +75,15 @@ CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
 #: Slugs whose Codex wire vocabulary is the wider gpt-5.6-era set (i.e. they
 #: accept ``max``). gpt-6-astra was verified to expose the same
 #: low/medium/high/xhigh/max/ultra ladder as gpt-5.6-sol (2026-09-04).
-_CODEX_MAX_EFFORT_SLUGS: tuple[str, ...] = ("gpt-5.6", "gpt-6-astra")
+#: gpt-6-sol / gpt-6-luna document the same ladder minus nothing —
+#: "reasoning.effort supports none, low, medium (default), high, xhigh, and
+#: max" (developers.openai.com/api/docs/models/gpt-6-{sol,luna}, 2026-09-22),
+#: which is exactly CODEX_GPT56_EFFORTS. A bare ``gpt-6`` prefix is
+#: deliberately NOT used: Astra's vocabulary differs (no wire-level
+#: none/minimal), so each gpt-6 slug is listed on its own evidence.
+_CODEX_MAX_EFFORT_SLUGS: tuple[str, ...] = (
+    "gpt-5.6", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+)
 
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:

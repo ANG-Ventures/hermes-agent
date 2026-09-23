@@ -168,10 +168,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(turn_id, seq)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_blackbox_turns_chat_end
-            ON turns(platform, chat_id, ts_end);
-        CREATE INDEX IF NOT EXISTS idx_blackbox_turns_cost
-            ON turns(cost_usd);
+        -- Rolling-window reads (hermes_cli/kanban_budget.py's per-tick spend
+        -- sum, daily-journal, /tokens) all filter on a ts_start/ts_end lower
+        -- bound. Without this they SCAN the whole table, and `turns` rows are
+        -- overflow-heavy (user_text/final_text previews): the 836 MB fleet
+        -- ledger stores ~5k rows across ~20k overflow pages, so a "5k-row
+        -- scan" is really an 80 MB read. Measured cold (macOS `purge` between
+        -- trials, 10 real fleet ledgers, 24h window): 6.13 s SCAN -> 1.40 s
+        -- SEARCH, identical 653 rows.
+        -- (turns indexes are created AFTER the additive column migration below,
+        -- guarded on the indexed columns existing -- see _ensure_turn_indexes.)
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts
             ON turn_api_calls(ts);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
@@ -252,7 +258,31 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    _ensure_turn_indexes(conn)
     conn.commit()
+
+
+# Indexes on `turns` must be created AFTER the additive column migration and
+# only when every indexed column exists: `CREATE INDEX IF NOT EXISTS` inside the
+# schema executescript raised `no such column: ts_start` on any legacy ledger
+# whose `turns` table predates that column (CREATE TABLE IF NOT EXISTS skips the
+# table, the index then references a column the table never gained), aborting
+# the whole script BEFORE the guarded ALTERs ran -- a pre-#905 ledger could not
+# be opened at all (t_71ae3a75). A column the table lacks simply gets no index.
+_TURN_INDEXES = (
+    ("idx_blackbox_turns_chat_end", ("platform", "chat_id", "ts_end")),
+    ("idx_blackbox_turns_cost", ("cost_usd",)),
+    ("idx_blackbox_turns_ts_start", ("ts_start",)),
+)
+
+
+def _ensure_turn_indexes(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(turns)").fetchall()}
+    for name, cols in _TURN_INDEXES:
+        if all(c in existing for c in cols):
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {name} ON turns({', '.join(cols)})"
+            )
 
 
 def _int(value: Any) -> int:

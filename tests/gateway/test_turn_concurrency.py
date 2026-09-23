@@ -680,3 +680,135 @@ def test_config_unset_and_top_level_precedence():
     })
     assert config.max_concurrent_turns is None
     assert config.startup_resume_concurrency == 6
+
+
+def test_default_user_turn_reserve_preserves_legacy_internal_capacity():
+    """Default reserve=2 must reproduce the old hard-coded ``cap - 2``."""
+    from gateway.turn_admission import TurnAdmission
+
+    for cap in (1, 2, 3, 8, 100):
+        admission = TurnAdmission(cap)
+        assert admission.reserve == min(2, max(0, cap - 1))
+        assert admission.internal._value == max(1, cap - 2)
+
+
+@pytest.mark.parametrize("cap,reserve,expected_internal,expected_reserve", [
+    (100, 2, 98, 2),       # default at the new cap
+    (100, 20, 80, 20),     # a real reserve
+    (4, 0, 4, 0),          # 0 disables the reserve entirely
+    (4, 9, 1, 3),          # clamped to cap - 1
+    (4, -5, 4, 0),         # clamped to 0
+])
+def test_user_turn_reserve_is_clamped_into_range(
+    cap, reserve, expected_internal, expected_reserve,
+):
+    from gateway.turn_admission import TurnAdmission
+
+    admission = TurnAdmission(cap, reserve=reserve)
+    assert admission.reserve == expected_reserve
+    assert admission.internal._value == expected_internal
+
+
+@pytest.mark.asyncio
+async def test_internal_waiters_cannot_take_the_reserved_user_slots():
+    """With reserve=N, internal turns may never occupy the last N slots."""
+    from gateway.turn_admission import TurnAdmission
+
+    cap, reserve = 4, 2
+    admission = TurnAdmission(cap, reserve=reserve)
+    release = asyncio.Event()
+    internal_entered = []
+
+    async def internal_turn(index):
+        async with admission.slot(f"internal-{index}", internal=True):
+            internal_entered.append(index)
+            await release.wait()
+
+    tasks = [asyncio.create_task(internal_turn(i)) for i in range(cap)]
+    for _ in range(200):
+        if len(internal_entered) >= cap - reserve and admission.waiting == reserve:
+            break
+        await asyncio.sleep(0)
+
+    # Exactly cap - reserve internal turns admitted; the rest are still waiting.
+    assert len(internal_entered) == cap - reserve
+    assert admission.in_flight == cap - reserve
+
+    # A user turn is admitted immediately despite saturated internal demand.
+    user_entered = asyncio.Event()
+
+    async def user_turn():
+        async with admission.slot("user", internal=False):
+            user_entered.set()
+
+    await asyncio.wait_for(user_turn(), 5)
+    assert user_entered.is_set()
+
+    release.set()
+    await asyncio.gather(*tasks)
+    assert admission.in_flight == 0
+    assert admission.total._value == cap
+    assert admission.internal._value == cap - reserve
+
+
+def test_turn_admission_logs_resolved_cap_and_reserve_once(caplog):
+    import gateway.turn_admission as turn_admission
+
+    with caplog.at_level(logging.INFO, logger=turn_admission.logger.name):
+        turn_admission.TurnAdmission(100, reserve=20)
+
+    lines = [
+        record.getMessage() for record in caplog.records
+        if "PHASE=turn_admission_init" in record.getMessage()
+    ]
+    assert lines == ["PHASE=turn_admission_init cap=100 reserve=20"]
+
+
+@pytest.mark.parametrize("value,expected", [
+    (5, 5), ("7", 7), (0, 0), (None, 2), ("bad", 2), (True, 2), (-1, 2),
+])
+@pytest.mark.parametrize("nested", [False, True])
+def test_user_turn_reserve_config_roundtrip(
+    tmp_path, monkeypatch, value, expected, nested,
+):
+    import yaml
+    key = "user_turn_reserve"
+    data = {} if value is None else (
+        {"gateway": {key: value}} if nested else {key: value}
+    )
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(data))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = load_gateway_config()
+    assert config.user_turn_reserve == expected
+    assert GatewayConfig.from_dict(config.to_dict()).user_turn_reserve == expected
+
+
+def test_runtime_user_turn_reserve_reaches_admission():
+    runner = object.__new__(GatewayRunner)
+    runner.__dict__["config"] = GatewayConfig(
+        max_concurrent_turns=100, user_turn_reserve=20,
+    )
+
+    admission = runner._get_turn_admission()
+
+    assert admission.cap == 100
+    assert admission.reserve == 20
+    assert admission.internal._value == 80
+
+
+def test_runtime_non_integer_user_turn_reserve_falls_back_and_warns(caplog):
+    runner = object.__new__(GatewayRunner)
+    runner.__dict__["config"] = SimpleNamespace(
+        max_concurrent_turns=8, user_turn_reserve=object(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        admission = runner._get_turn_admission()
+
+    assert admission.reserve == 2
+    assert admission.internal._value == 6
+    warnings = [
+        record for record in caplog.records
+        if "Invalid gateway.user_turn_reserve" in record.message
+    ]
+    assert len(warnings) == 1

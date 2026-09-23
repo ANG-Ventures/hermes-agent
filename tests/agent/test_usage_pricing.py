@@ -1758,3 +1758,91 @@ def test_flat_entries_unaffected_by_tier_machinery():
     )
     # 250k * $0.25/M + 10k * $1.50/M
     assert result.amount_usd == Decimal("0.0775")
+
+
+# ── GPT-6 Sol / Luna (GA 2026-09-22) ─────────────────────────────────────
+# Published rates: Sol $2/$10, Luna $0.10/$0.50 per 1M in/out; cache read
+# 0.1x input, cache write 1.25x input; whole-request 2x input / 1.5x output
+# tier above 272K prompt tokens.
+# https://developers.openai.com/api/docs/models/gpt-6-sol (and .../gpt-6-luna)
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [("gpt-6-sol", Decimal("2.00")), ("gpt-6-luna", Decimal("0.10"))],
+)
+def test_gpt6_sol_luna_price_from_official_snapshot(model, expected):
+    entry = get_pricing_entry(model, provider="openai")
+    assert entry is not None
+    assert entry.source == "official_docs_snapshot"
+    assert entry.input_cost_per_million == expected
+
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        # 1M input tokens. This prompt is above the documented 272K tier, so
+        # the whole-request 2x input rate applies: Sol $4/M, Luna $0.20/M.
+        ("gpt-6-sol", Decimal("4.00")),
+        ("gpt-6-luna", Decimal("0.20")),
+    ],
+)
+def test_gpt6_sol_luna_nonzero_cost_on_codex_lane(model, expected):
+    """The fleet's codex turns carry provider="openai-codex"; that notional
+    route must resolve the curated snapshot rather than $0/unknown."""
+    result = estimate_usage_cost(
+        model,
+        CanonicalUsage(input_tokens=1_000_000),
+        provider="openai-codex",
+    )
+    assert result.amount_usd == expected
+    assert result.amount_usd > 0
+
+
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+def test_gpt6_sol_luna_900k_variant_prices_like_base(model):
+    """The Hermes-side ``-900k`` picker suffix is stripped on the wire, so
+    the variant must price identically instead of falling through."""
+    variant = estimate_usage_cost(
+        f"{model}-900k",
+        CanonicalUsage(input_tokens=1_000_000),
+        provider="openai-codex",
+    )
+    base = estimate_usage_cost(
+        model,
+        CanonicalUsage(input_tokens=1_000_000),
+        provider="openai-codex",
+    )
+    assert variant.amount_usd == base.amount_usd
+    assert variant.amount_usd > 0
+
+
+def test_gpt6_sol_above_272k_uses_whole_request_tier():
+    """Docs: "Prompts with more than 272K input tokens are priced at 2x input
+    and cache rates and 1.5x output for the full request." """
+    below = estimate_usage_cost(
+        "gpt-6-sol",
+        CanonicalUsage(input_tokens=272_000, output_tokens=10_000),
+        provider="openai",
+    )
+    # 272k * $2/M + 10k * $10/M
+    assert below.amount_usd == Decimal("0.644")
+
+    above = estimate_usage_cost(
+        "gpt-6-sol",
+        CanonicalUsage(input_tokens=300_000, output_tokens=10_000),
+        provider="openai",
+    )
+    # 300k * $4/M + 10k * $15/M
+    assert above.amount_usd == Decimal("1.35")
+
+
+def test_gpt6_luna_cache_read_discount_and_tier():
+    entry = get_pricing_entry("gpt-6-luna", provider="openai")
+    assert entry is not None
+    assert entry.cache_read_cost_per_million == Decimal("0.01")
+    assert entry.cache_write_cost_per_million == Decimal("0.125")
+    assert entry.tier_threshold_tokens == 272_000
+    assert entry.cache_read_cost_per_million_above == Decimal("0.02")

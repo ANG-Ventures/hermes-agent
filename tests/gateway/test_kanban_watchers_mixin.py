@@ -40,7 +40,11 @@ from dataclasses import dataclass, field  # noqa: E402
 
 from gateway.kanban_watchers import (  # noqa: E402
     _format_parent_satisfied_sticky_summary,
+    _WorkspaceRefusalOutageNotifier,
     _format_respawn_guarded_summary,
+    _format_workspace_refused_summary,
+    _observe_workspace_refusal_outages,
+    _send_workspace_refusal_alert,
     _stall_streak_is_bad,
 )
 
@@ -57,6 +61,7 @@ class _FakeResult:
     skipped_locked: bool = False
     spawn_failed: list = field(default_factory=list)
     auto_blocked: list = field(default_factory=list)
+    workspace_refused: list = field(default_factory=list)
 
 
 def test_stall_idle_queue_is_not_bad():
@@ -105,6 +110,99 @@ def test_gateway_tick_summary_counts_and_names_parent_satisfied_sticky_cards():
     )
 
 
+def test_gateway_workspace_refused_summary_names_reason_and_tasks():
+    summary = _format_workspace_refused_summary([
+        ("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch/kanban-workspaces"),
+        ("t_stranded", "stranded_by_mount_loss: /Volumes/ramscratch/kanban-workspaces/t_stranded"),
+    ])
+    assert summary == (
+        "workspace_refused=2 (stranded_by_mount_loss: t_stranded; "
+        "workspaces_root_unmounted: t_missing)"
+    )
+
+
+def test_workspace_refusal_notifier_delivers_once_per_outage_and_rearms():
+    notifier = _WorkspaceRefusalOutageNotifier()
+    deliveries = []
+
+    def send(board, summary):
+        deliveries.append((board, summary))
+        return True
+
+    refused = [("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch")]
+    assert notifier.observe("default", [], send) is False
+    assert len(deliveries) == 0
+    assert notifier.observe("default", refused, send) is True
+    assert len(deliveries) == 1
+    assert notifier.observe("default", refused, send) is False
+    assert len(deliveries) == 1
+    assert notifier.observe("default", [], send) is False
+    assert notifier.observe("default", refused, send) is True
+    assert len(deliveries) == 2
+
+
+def test_workspace_refusal_notifier_retries_until_delivery_succeeds():
+    notifier = _WorkspaceRefusalOutageNotifier()
+    outcomes = iter([False, True])
+    attempts = []
+
+    def send(board, summary):
+        attempts.append((board, summary))
+        return next(outcomes)
+
+    refused = [("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch")]
+    assert notifier.observe("default", refused, send) is False
+    assert notifier.observe("default", refused, send) is True
+    assert len(attempts) == 2
+
+
+def test_workspace_refusal_tick_observer_uses_delivery_latch(monkeypatch):
+    import gateway.kanban_watchers as kw
+
+    deliveries = []
+
+    def send(board, summary):
+        deliveries.append((board, summary))
+        return True
+
+    monkeypatch.setattr(kw, "_send_workspace_refusal_alert", send)
+    notifier = _WorkspaceRefusalOutageNotifier()
+    refused = _FakeResult(workspace_refused=[
+        ("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch"),
+    ])
+    healthy = _FakeResult()
+
+    assert _observe_workspace_refusal_outages(notifier, [("default", refused)]) == 1
+    assert _observe_workspace_refusal_outages(notifier, [("default", refused)]) == 0
+    assert len(deliveries) == 1
+    assert _observe_workspace_refusal_outages(notifier, [("default", healthy)]) == 0
+    assert _observe_workspace_refusal_outages(notifier, [("default", refused)]) == 1
+    assert len(deliveries) == 2
+
+
+def test_workspace_refusal_sender_uses_default_profile_error_route(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    script = tmp_path / ".hermes" / "scripts" / "notify.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("gateway.kanban_watchers.subprocess.run", run)
+    assert _send_workspace_refusal_alert("default", "workspace_refused=1")
+    argv, kwargs = calls[0]
+    assert argv[argv.index("--profile") + 1] == "default"
+    assert argv[argv.index("--sev") + 1] == "error"
+    assert kwargs["stdin"] is subprocess.DEVNULL
+
+
 def test_stall_respawn_guard_is_benign_not_bad():
     res = _FakeResult(respawn_guarded=[("t1", "recent_success")])
     assert _stall_streak_is_bad(True, False, [("b", res)]) is False
@@ -134,6 +232,14 @@ def test_stall_early_spawn_failure_IS_bad_even_with_benign_sibling():
     early_fail = _FakeResult(spawn_failed=["t1"])  # not yet auto_blocked
     rate_limited = _FakeResult(rate_limited=["t2"])
     assert _stall_streak_is_bad(True, False, [("A", early_fail), ("B", rate_limited)]) is True
+
+
+def test_stall_workspace_refusal_IS_bad_even_with_benign_sibling():
+    refused = _FakeResult(workspace_refused=[
+        ("t1", "workspaces_root_unmounted: /Volumes/ramscratch"),
+    ])
+    capped = _FakeResult(skipped_per_profile_capped=[("t2", "athena", 2)])
+    assert _stall_streak_is_bad(True, False, [("A", refused), ("B", capped)]) is True
 
 
 def test_stall_none_results_bare_stall_is_bad():
