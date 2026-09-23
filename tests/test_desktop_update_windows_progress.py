@@ -109,7 +109,11 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
         # stage to actually land, THEN start the stability window.
         held_stage = "Testing quiet update"
         publish_deadline = time.monotonic() + 10
-        first = _read_progress(shim_url, publish_deadline)
+        try:
+            first = _read_progress(shim_url, publish_deadline)
+        except AssertionError:
+            assert process.poll() is None, "self-test exited before release file was written"
+            raise
         while first.get("message") != held_stage and time.monotonic() < publish_deadline:
             time.sleep(0.1)
             first = _read_progress(shim_url, publish_deadline)
