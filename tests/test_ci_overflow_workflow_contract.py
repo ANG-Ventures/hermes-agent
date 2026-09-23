@@ -307,6 +307,7 @@ def test_matrices_never_travel_through_env():
         for step in job.get("steps", []):
             for key, value in (step.get("env") or {}).items():
                 assert "outputs.matrix" not in value and "outputs.local_matrix" not in value, (key, value)
+                assert "toJSON(needs" not in value, (key, value)  # measured E2BIG, run 35892732551
 
 
 def test_fromjson_never_fed_a_possibly_missing_output():
@@ -316,6 +317,18 @@ def test_fromjson_never_fed_a_possibly_missing_output():
         if "needs.placement.outputs" in expr:
             assert "needs.placement.result == 'success'" in expr and "plan_valid == 'true'" in expr
             assert expr.rstrip().endswith(("local_matrix", "'[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]'"))
+
+
+def test_gate_cli_reads_results_from_env(tmp_path):
+    base = {"PATH": "/usr/bin:/bin", "GENERATE_RESULT": "success", "TEST_RESULT": "success", "E2E_RESULT": "success"}
+    run = lambda env: subprocess.run([sys.executable, str(ROOT / "scripts/ci_overflow_placement.py"), "gate"],
+                                     env=env, capture_output=True, text=True, timeout=60, cwd=ROOT).returncode
+    assert run(base) == 0
+    assert run({**base, "TEST_RESULT": "skipped"}) == 1
+    assert run({**base, "E2E_RESULT": ""}) == 1
+    step = _tests_yml()["jobs"]["tests-complete"]["steps"][-1]
+    assert step["env"] == {"GENERATE_RESULT": "${{ needs.generate.result }}", "TEST_RESULT": "${{ needs.test.result }}",
+                           "E2E_RESULT": "${{ needs.e2e.result }}"}
 
 
 def test_aggregate_fails_skipped_required_work():

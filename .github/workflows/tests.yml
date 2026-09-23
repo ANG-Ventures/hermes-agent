@@ -421,6 +421,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Fail on skipped or failed required tests
+        # Results only: toJSON(needs) carries both matrices (~700 KB) and
+        # exceeds the 128 KB per-env-string limit (E2BIG, run 35892732551).
         env:
-          NEEDS: ${{ toJSON(needs) }}
+          GENERATE_RESULT: ${{ needs.generate.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
         run: python3 scripts/ci_overflow_placement.py gate

@@ -210,7 +210,7 @@ def gate(needs: dict) -> list[str]:
 
 
 def cmd_gate(_args) -> int:
-    problems = gate(json.loads(os.environ["NEEDS"]))
+    problems = gate({job: {"result": os.environ.get(f"{job.upper()}_RESULT")} for job in ("generate", "test", "e2e")})
     for p in problems:
         print(f"::error::required tests job not successful: {p}")
     return 1 if problems else 0
