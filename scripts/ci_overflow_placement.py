@@ -177,7 +177,7 @@ def cmd_place(args) -> int:
     out = os.environ["GITHUB_OUTPUT"]
     placement, reason = None, "generate outputs unusable"
     try:
-        matrix = json.loads(os.environ["CI_MATRIX"])
+        matrix = json.loads(Path(os.environ["CI_MATRIX_FILE"]).read_text(encoding="utf-8"))
         digest = os.environ.get("CI_REQUEST_DIGEST", "").strip()
         if digest and not digest.startswith("sha256:"):
             digest = "sha256:" + digest

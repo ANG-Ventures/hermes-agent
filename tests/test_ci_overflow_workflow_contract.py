@@ -300,6 +300,15 @@ def test_generate_emits_local_matrix_and_request_artifact():
     assert upload["with"]["path"] == "ci-overflow/request.json"
 
 
+def test_matrices_never_travel_through_env():
+    """A full matrix is ~350 KB; one env string over 128 KB fails the step with E2BIG
+    (measured: PR run 35892008853, `Argument list too long`)."""
+    for job in _tests_yml()["jobs"].values():
+        for step in job.get("steps", []):
+            for key, value in (step.get("env") or {}).items():
+                assert "outputs.matrix" not in value and "outputs.local_matrix" not in value, (key, value)
+
+
 def test_fromjson_never_fed_a_possibly_missing_output():
     """Every fromJSON over placement/local outputs is guarded or ends in a literal/total output."""
     text = (WORKFLOWS / "tests.yml").read_text(encoding="utf-8")
@@ -388,8 +397,10 @@ def test_local_matrix_membership_identical_real_generator(tmp_path, scope):
         scope = f"plugin:{plugin}"
     original = _generate(scope)
     out = tmp_path / "o"
-    proc = subprocess.run([sys.executable, str(ROOT / "scripts/ci_overflow_request.py"), "--matrix",
-                           json.dumps(original), "--out-dir", str(out)], capture_output=True, text=True,
+    src = tmp_path / "matrix.json"
+    src.write_text(json.dumps(original), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts/ci_overflow_request.py"), "--matrix-file",
+                           str(src), "--out-dir", str(out)], capture_output=True, text=True,
                           stdin=subprocess.DEVNULL, timeout=60, cwd=ROOT)
     assert proc.returncode == 0, proc.stderr
     local = json.loads((out / "local_matrix.json").read_text(encoding="utf-8"))
@@ -516,8 +527,9 @@ def test_outputs_invalid_emits_no_matrix(tmp_path):
 
 
 def test_place_without_digest_falls_back_without_network(tmp_path):
-    out, summ = tmp_path / "out", tmp_path / "summary"
-    env = {"GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summ), "CI_MATRIX": json.dumps(MATRIX),
+    out, summ, mfile = tmp_path / "out", tmp_path / "summary", tmp_path / "local_matrix.json"
+    mfile.write_text(json.dumps(MATRIX), encoding="utf-8")
+    env = {"GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summ), "CI_MATRIX_FILE": str(mfile),
            "CI_REPOSITORY": "ANG-Ventures/hermes-agent", "CI_REPOSITORY_ID": "1", "CI_RUN_ID": "2",
            "CI_RUN_ATTEMPT": "1", "CI_HEAD_SHA": "a" * 40, "CI_REQUEST_DIGEST": "", "PATH": "/usr/bin:/bin"}
     proc = subprocess.run([sys.executable, str(ROOT / "scripts/ci_overflow_placement.py"), "place"], env=env,

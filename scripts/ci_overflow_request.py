@@ -57,11 +57,11 @@ def build_request(matrix: dict, durations: dict, e2e_files: list[str]) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--matrix", required=True, help="generate's matrix JSON")
+    parser.add_argument("--matrix-file", type=Path, required=True, help="generate's matrix JSON file")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--event", default="", help="github.event_name (legacy note off merge_group)")
     args = parser.parse_args(argv)
-    matrix = json.loads(args.matrix)
+    matrix = json.loads(args.matrix_file.read_text(encoding="utf-8"))
     durations = rtp._load_durations(ROOT)
     e2e_files = [rtp._format_file(p, ROOT) for p in rtp._discover_files([ROOT / "tests" / "e2e"])]
     args.out_dir.mkdir(parents=True, exist_ok=True)
