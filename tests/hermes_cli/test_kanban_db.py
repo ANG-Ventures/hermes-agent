@@ -1471,6 +1471,40 @@ def test_collected_slugs_survive_an_asyncio_to_thread_offload(_pin_contradiction
         asyncio.run(_named())
 
 
+def test_list_boards_stamps_at_the_SOURCE_for_consumers_that_skip_the_helper(
+    _pin_contradiction_env,
+):
+    """``list_boards()`` must stamp its own entries, not rely on the iterator.
+
+    Not every consumer goes through :func:`enumerating_each`. Two real ones
+    take the list and index it directly::
+
+        hermes_cli/kanban.py:2032                  all_boards = kb.list_boards(...)
+        plugins/kanban/dashboard/plugin_api.py:2521 boards = kanban_db.list_boards(...)
+
+    Those never enter the extent and never get stamped by the iterator, so the
+    stamp has to happen at the SOURCE. Without this arm, removing the
+    ``list_boards`` stamp is a surviving mutant: the ``enumerating_each`` tests
+    all still pass because the helper re-stamps on the way past.
+    """
+    boards = kb.list_boards(include_archived=False)
+    assert boards, "fixture must expose at least the default board"
+    for meta in boards:
+        assert isinstance(meta["slug"], kb.EnumeratedBoardSlug), (
+            f"list_boards() returned an unstamped slug {meta['slug']!r}; a "
+            f"consumer that skips enumerating_each() would refuse on it"
+        )
+
+    # Consumed raw, with no extent anywhere: must resolve and open.
+    for meta in boards:
+        kb.kanban_db_path(meta["slug"])
+        kb.connect(board=meta["slug"]).close()
+
+    # Still armed for a caller-named board.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path(board="other-board")
+
+
 def test_enumerating_each_scopes_the_whole_loop_body(_pin_contradiction_env):
     """The extent must cover the OPEN, not just the path resolve.
 
