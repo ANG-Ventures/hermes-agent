@@ -2479,7 +2479,9 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         task = kb.get_task(conn, args.task_id) if ok else None
     if not ok:
         print(
-            f"cannot reclaim {args.task_id} (not running or unknown id)",
+            f"cannot reclaim {args.task_id} (not running, unknown id, or "
+            "worker not proven dead — inspect 'hermes kanban tail' for "
+            "reclaim_refused)",
             file=sys.stderr,
         )
         return 1

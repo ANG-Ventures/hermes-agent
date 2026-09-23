@@ -1924,10 +1924,14 @@ def test_respawn_guard_still_defers_open_pr_after_automatic_reclaim(
         worker = kb.claim_task(conn, task_id)
         assert worker is not None and worker.worker_pid is None
         assert worker.claim_expires is not None
+        kb._set_worker_pid(conn, task_id, 999999)  # worker has exited
         kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
 
+        def absent_process(_pid, _sig):
+            raise ProcessLookupError
+
         now = worker.claim_expires + 1
-        assert kb.release_stale_claims(conn) == 1
+        assert kb.release_stale_claims(conn, signal_fn=absent_process) == 1
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "ready"
         reclaimed = next(e for e in kb.list_events(conn, task_id) if e.kind == "reclaimed")
@@ -1945,10 +1949,14 @@ def test_respawn_guard_allows_open_pr_after_manual_reclaim(kanban_home, monkeypa
         worker = kb.claim_task(conn, task_id)
         assert worker is not None and worker.worker_pid is None
         assert worker.claim_expires is not None
+        kb._set_worker_pid(conn, task_id, 999999)  # worker has exited
         kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
 
+        def absent_process(_pid, _sig):
+            raise ProcessLookupError
+
         now = worker.claim_expires + 1
-        assert kb.reclaim_task(conn, task_id, reason="Amend the existing PR")
+        assert kb.reclaim_task(conn, task_id, reason="Amend the existing PR", signal_fn=absent_process)
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "ready"
         reclaimed = next(e for e in kb.list_events(conn, task_id) if e.kind == "reclaimed")
