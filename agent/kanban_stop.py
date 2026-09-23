@@ -215,7 +215,12 @@ def build_kanban_stop_nudge(
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
         "is done, `kanban_request_review(summary=...)` for a review handoff, "
         "`kanban_request_changes(reason=...)` to return a review for rework, "
-        "OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "OR `kanban_block(reason=...)` if you are blocked.\n"
+        "3. If you found the work ALREADY DONE on current main — nothing left "
+        "to implement and no blocker — that is still a terminal outcome, not a "
+        "reason to stop silently: call "
+        "`kanban_complete(superseded_by=\"<card|PR|sha>\", summary=\"how you "
+        "verified it\")`.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )
