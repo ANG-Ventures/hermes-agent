@@ -591,6 +591,21 @@ def test_budget_window_query_uses_the_ts_start_index(tmp_path, monkeypatch):
     assert "SCAN turns" not in plan, plan
 
 
+def test_distinct_profile_query_uses_the_profile_index(tmp_path, monkeypatch):
+    """The skill-stats miner's per-ledger attribution read must not SCAN turns."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for i in range(200):
+        store.insert_turn(make_record(f"turn-profile-{i}", ts_start=1000.0 + i))
+    conn = store._connect()
+    try:
+        conn.execute("ANALYZE")
+        plan = _plan(conn, "SELECT DISTINCT profile FROM turns", ())
+    finally:
+        conn.close()
+    assert "idx_blackbox_turns_profile" in plan, plan
+    assert "SCAN turns" not in plan or "COVERING INDEX" in plan, plan
+
+
 def test_ts_start_index_is_migrated_into_a_preexisting_ledger(tmp_path, monkeypatch):
     """A ledger created before the index exists gains it on the next connect.
 
