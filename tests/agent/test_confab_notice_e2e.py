@@ -213,6 +213,32 @@ class TestConfabNoticeEndToEnd:
         assert not any(m.get("role") == "system" and m.get("content") == ""
                        for m in _chat_requests(handler)[0]["messages"])
 
+    def test_db_reloaded_tool_event_is_not_sent_in_iteration_summary(self, notice_env, stream):
+        make_agent, handler, db, sid, statuses = notice_env
+        notice = {**VALID_NOTICE, "kind": "tool_call_as_text", "request_id": "summary-event"}
+        handler.response_queue.extend([("", notice), ("One.", None)])
+        assert make_agent(stream=stream).run_conversation(
+            "hello", conversation_history=[], task_id="t1"
+        )["final_response"] == "One."
+
+        history = db.get_messages_as_conversation(sid)
+        assert len([m for m in history if m.get("display_kind") == CONFAB_NOTICE_DISPLAY_KIND]) == 1
+        handler.captured_requests = []
+        handler.response_queue.extend([("Trying.", None, "tool_calls"), ("Summary.", None)])
+        agent = make_agent(stream=stream)
+        agent.max_iterations = 1
+        assert agent.run_conversation(
+            "again", conversation_history=history, task_id="t2"
+        )["final_response"] == "Summary."
+
+        requests = _chat_requests(handler)
+        assert len(requests) == 2
+        summary_messages = requests[-1]["messages"]
+        assert sum(m.get("role") == "system" for m in summary_messages) == 1
+        assert not any(m.get("role") == "system" and not m.get("content") for m in summary_messages)
+        assert all("display_kind" not in m and "display_metadata" not in m for m in summary_messages)
+        assert notice["request_id"] not in json.dumps(summary_messages)
+
     def test_same_request_id_retry_has_one_durable_event(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env
         notice = {**VALID_NOTICE, "kind": "tool_call_as_text", "request_id": "same-rid"}
