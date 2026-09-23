@@ -2630,7 +2630,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     args.task_ids = parsed_ids
     model = override.model if override else None
     provider = override.provider if override else getattr(args, "provider", None)
-    model_given = model_given or getattr(args, "model_json", None) is not None or bool(model) or bool(provider)
+    model_given = model_given or bool(model) or bool(provider)
     effort = override.reasoning_effort if override else getattr(args, "reasoning_effort", None)
     clear_effort = bool(getattr(args, "clear_effort", False))
     firepower_reason = override.firepower if override else getattr(args, "firepower", None)

@@ -56,6 +56,16 @@ def test_json_override_round_trip_and_ttl_rejected_on_card(kanban_home):
         assert kb.get_task(conn, first).model_override == 'model-a'
 
 
+def test_json_effort_only_preserves_card_model(kanban_home):
+    first = _create('first', 'worker')
+    kc.run_slash(f'set-model {first} model-a --provider batch-provider')
+    out = kc.run_slash(f'''set-model {first} --model-json '{{"reasoning_effort":"low"}}' ''')
+    assert 'low' in out
+    with kb.connect() as conn:
+        task = kb.get_task(conn, first)
+        assert (task.model_override, task.provider_override, task.reasoning_effort) == ('model-a', 'batch-provider', 'low')
+
+
 def test_model_flag_and_provider_only_json_preserve_model(kanban_home):
     first = _create('first', 'worker')
     assert 'model-a' in kc.run_slash(f'set-model {first} --model model-a --provider batch-provider')
