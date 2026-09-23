@@ -576,7 +576,7 @@ async def test_boot_resume_claims_all_slots_but_runs_three(
 
 
 @pytest.mark.asyncio
-async def test_runtime_non_integer_startup_resume_cap_defaults_to_three(
+async def test_runtime_non_integer_startup_resume_cap_defaults_to_unbounded(
     monkeypatch, caplog,
 ):
     runner, _ = make_restart_runner()
@@ -601,12 +601,17 @@ async def test_runtime_non_integer_startup_resume_cap_defaults_to_three(
 
     tasks = list(runner._background_tasks)
     try:
-        assert runner._startup_resume_pool.concurrency == 3
+        assert runner._startup_resume_pool.concurrency is None
         warnings = [
             record for record in caplog.records
             if "Invalid gateway.startup_resume_concurrency" in record.message
         ]
         assert len(warnings) == 1
+        assert "using unbounded" in warnings[0].message
+        # Unbounded: all four resumes are admitted at once, none queued.
+        await asyncio.sleep(0)
+        assert len(runner._startup_resume_pool.running) == 4
+        assert not runner._startup_resume_pool.pending
     finally:
         release.set()
         await asyncio.gather(*tasks)
@@ -658,8 +663,8 @@ async def test_boot_resume_pool_does_not_extend_restore_gate_timeout(monkeypatch
     ("max_concurrent_turns", 0, None), ("max_concurrent_turns", "bad", None),
     ("max_concurrent_turns", True, None),
     ("startup_resume_concurrency", 5, 5),
-    ("startup_resume_concurrency", "bad", 3),
-    ("startup_resume_concurrency", 0, 3),
+    ("startup_resume_concurrency", "bad", None),
+    ("startup_resume_concurrency", 0, None),
 ])
 @pytest.mark.parametrize("nested", [False, True])
 def test_config_loader_roundtrip(tmp_path, monkeypatch, key, value, expected, nested):
@@ -812,3 +817,77 @@ def test_runtime_non_integer_user_turn_reserve_falls_back_and_warns(caplog):
         if "Invalid gateway.user_turn_reserve" in record.message
     ]
     assert len(warnings) == 1
+
+
+def test_startup_resume_concurrency_defaults_to_unbounded():
+    """Ace ruling 2026-09-23 09:40: boot-resume fan-out is unbounded by default.
+
+    #827 paced resumes 3-at-a-time onto a 10-thread turn executor; #936 removed
+    that executor cap, so a default throttle only delays interrupted sessions.
+    """
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert GatewayConfig().startup_resume_concurrency is None
+    assert GatewayConfig.from_dict({}).startup_resume_concurrency is None
+    assert DEFAULT_CONFIG["gateway"]["startup_resume_concurrency"] is None
+
+
+@pytest.mark.asyncio
+async def test_unbounded_startup_resume_pool_admits_every_resume_at_once():
+    """StartupResumePool(None) runs all submitted resumes concurrently."""
+    from gateway.turn_admission import StartupResumePool
+
+    pool = StartupResumePool(None)
+    release = asyncio.Event()
+    entered = []
+
+    async def body(i):
+        entered.append(i)
+        await release.wait()
+
+    handles = [pool.submit(body, i) for i in range(40)]
+    await asyncio.sleep(0)
+    try:
+        assert len(pool.running) == 40
+        assert not pool.pending
+        await asyncio.sleep(0)
+        assert sorted(entered) == list(range(40))
+    finally:
+        release.set()
+        await asyncio.gather(*handles)
+    assert not pool.running
+
+
+@pytest.mark.asyncio
+async def test_boot_resume_default_config_starts_every_session_at_once(monkeypatch):
+    """End to end through the scheduler with the shipped default config."""
+    runner, _ = make_restart_runner()
+    runner.config.startup_resume_concurrency = GatewayConfig().startup_resume_concurrency
+    runner._persist_active_agents = MagicMock()
+    now = datetime.now()
+    entries = [SessionEntry(
+        session_key=f"fan-key-{i}", session_id=f"fan-sid-{i}", created_at=now,
+        updated_at=now, origin=make_restart_source(str(i)),
+        platform=Platform.TELEGRAM, chat_type="dm", resume_pending=True,
+        resume_reason="restart_interrupted", last_resume_marked_at=now,
+    ) for i in range(8)]
+    runner.session_store._entries = {e.session_key: e for e in entries}
+    release = asyncio.Event()
+    entered = []
+
+    async def resume(adapter, event, key, reason=None):
+        entered.append(key)
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_run_startup_resume_event", resume)
+    assert runner._schedule_resume_pending_sessions() == 8
+    tasks = list(runner._background_tasks)
+    try:
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert runner._startup_resume_pool.concurrency is None
+        assert not runner._startup_resume_pool.pending
+        assert len(entered) == 8
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
