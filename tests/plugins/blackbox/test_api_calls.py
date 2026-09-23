@@ -10,9 +10,31 @@ from plugins.blackbox import store
 from plugins.blackbox.record import TurnRecord
 
 
-@pytest.fixture
-def db(tmp_path, monkeypatch):
+# Earliest shipped `turns` shape (store.py @ e54eb50327): predates depth,
+# cli_invocation_id, the C1 served_subs_json/attribution columns, the
+# turn_api_calls table, and every turns index. A live ledger opened by this
+# PR's code can be this old, so every AC below also runs migrated-from-here.
+_LEGACY_TURNS_COLS = (
+    "turn_id TEXT PRIMARY KEY, parent_turn_id TEXT, is_subagent INT,"
+    " ts_start REAL, ts_end REAL, profile TEXT, provider TEXT, model TEXT,"
+    " platform TEXT, chat_id TEXT, chat_name TEXT, api_calls INT, tools TEXT,"
+    " input_tokens INT, output_tokens INT, cache_read INT, cache_write INT,"
+    " reasoning INT, context_used INT, context_length INT, cost_usd REAL,"
+    " cost_status TEXT, interrupted INT, alerted INT DEFAULT 0,"
+    " user_text TEXT, final_text TEXT"
+)
+
+
+@pytest.fixture(params=["fresh", "legacy"])
+def db(request, tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if request.param == "legacy":
+        path = store._db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = sqlite3.connect(str(path))
+        legacy.execute(f"CREATE TABLE turns ({_LEGACY_TURNS_COLS})")
+        legacy.commit()
+        legacy.close()
     conn = store._connect()
     conn.close()
     return store._db_path()
