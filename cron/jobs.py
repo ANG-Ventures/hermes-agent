@@ -306,6 +306,7 @@ def _jobs_lock():
         # section read it. Reset on entry/exit so stale stamps from unlocked
         # loads or prior sections can never suppress a needed merge.
         _jobs_lock_state.load_stamp = None
+        _jobs_lock_state.load_baseline = None
         lock_fd = None
         try:
             try:
@@ -372,6 +373,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.load_baseline = None
 
 
 @contextlib.contextmanager
@@ -1750,6 +1752,7 @@ def load_jobs() -> List[Dict[str, Any]]:
     pre_read_stamp = _jobs_file_stamp(jobs_file)
     if not jobs_file.exists():
         _record_load_stamp(None)
+        _record_load_baseline([])
         return []
 
     try:
@@ -1808,6 +1811,7 @@ def load_jobs() -> List[Dict[str, Any]]:
             else:
                 logger.warning("Auto-repaired jobs.json (had invalid control characters)")
         _record_load_stamp(pre_read_stamp)
+        _record_load_baseline(jobs)
         return jobs
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
@@ -1816,6 +1820,7 @@ def load_jobs() -> List[Dict[str, Any]]:
             save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
         _record_load_stamp(pre_read_stamp)
+        _record_load_baseline(data)
         return data
 
     raise RuntimeError(
@@ -1931,27 +1936,115 @@ def _record_load_stamp(stamp: Optional[Tuple[int, int, int]]) -> None:
     _jobs_lock_state.load_stamp = stamp
 
 
+def _record_load_baseline(jobs: Optional[List[Dict[str, Any]]]) -> None:
+    """Snapshot what this critical section READ, keyed by job id.
+
+    The stamp above answers "did disk move?"; this answers the follow-up
+    the save path actually needs — "which fields did *we* change?". Without
+    it, a save is a whole-file read-modify-write from an in-memory copy:
+    every field of every job in the payload overwrites disk, so a stale
+    writer silently reverts a sibling's run-state update (``last_run_at``,
+    ``last_status``, ``state``) even though neither writer touched the same
+    field. That is the instance-3 shape: a one-shot ran, ``mark_job_run``
+    wrote ``last_run_at``, and a concurrent editor holding a pre-run
+    snapshot wrote it straight back to ``None``.
+
+    Stored as a deep copy because every caller mutates the list ``load_jobs``
+    handed back, in place. No-op outside a critical section (an unlocked
+    load has no save to reconcile against).
+    """
+    if not getattr(_jobs_lock_state, "depth", 0):
+        return
+    if jobs is None:
+        _jobs_lock_state.load_baseline = None
+        return
+    baseline: Dict[str, Dict[str, Any]] = {}
+    for job in jobs:
+        if isinstance(job, dict) and job.get("id"):
+            baseline[str(job["id"])] = copy.deepcopy(job)
+    _jobs_lock_state.load_baseline = baseline
+
+
+def _reconcile_job_fields(
+    payload_job: Dict[str, Any],
+    disk_job: Dict[str, Any],
+    baseline_job: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Three-way merge ONE job record: baseline -> (ours, disk).
+
+    Returns the record to persist. A field we did not change since the
+    baseline yields to disk (the sibling wrote it); a field we did change
+    wins. A field we deleted stays deleted; a field only disk added is
+    adopted. When both sides changed the same field there is no ordering
+    information available, so ours wins (last-writer-wins) — the case is
+    logged so a genuinely contended field is visible rather than silent.
+
+    Without a baseline we cannot tell "unchanged" from "deliberately reset",
+    so the payload is returned untouched (pre-existing behaviour).
+    """
+    if baseline_job is None:
+        return payload_job
+
+    merged = dict(payload_job)
+    conflicts: List[str] = []
+    for key in set(disk_job) | set(baseline_job):
+        in_payload = key in payload_job
+        base_val = baseline_job.get(key)
+        ours_changed = (
+            (key in baseline_job) != in_payload
+            or (in_payload and payload_job[key] != base_val)
+        )
+        if ours_changed:
+            if key in disk_job and disk_job[key] != base_val:
+                conflicts.append(key)
+            continue
+        # We left this field alone since the baseline — defer to disk.
+        if key in disk_job:
+            merged[key] = disk_job[key]
+        else:
+            merged.pop(key, None)
+
+    if conflicts:
+        logger.warning(
+            "Cron job %s: concurrent edits to the same field(s) %s — keeping "
+            "this writer's values (no ordering information available)",
+            payload_job.get("id"),
+            sorted(conflicts),
+        )
+    return merged
+
+
 def _merge_unexpected_disk_jobs(
     jobs: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Collection[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Return *jobs* plus any on-disk jobs missing from the save payload (#80624).
+    """Return *jobs* reconciled against on-disk state (#80624).
+
+    Two distinct losses are repaired here, both caused by a save being a
+    whole-file read-modify-write from a possibly-stale in-memory copy:
+
+    * **Vanished jobs** — an id present on disk but absent from the payload
+      is a concurrent create, and is merged back.
+    * **Reverted fields** — an id present in BOTH is reconciled field by
+      field against this section's load baseline, so a field this writer
+      never touched keeps the sibling's value instead of being overwritten
+      with our stale copy. This is the run-state loss (``last_run_at``,
+      ``last_status``, ``state`` reverting to their pre-run values).
 
     Under ``_jobs_lock()``'s degraded flock-timeout path (#60703), two
     processes can both believe they own the store. A writer that loaded an
-    older/smaller snapshot then calls ``save_jobs`` and would otherwise
-    clobber concurrent creates (the filed ``no_agent`` watchdog pattern:
-    CLI/tool create succeeds, then a gateway tick/remove rewrites
-    ``jobs.json`` empty or without the new id).
+    older snapshot then calls ``save_jobs`` and would otherwise clobber
+    concurrent work (the filed ``no_agent`` watchdog pattern: CLI/tool
+    create succeeds, then a gateway tick/remove rewrites ``jobs.json``
+    empty or without the new id).
 
-    Intentional deletes pass ``removed_ids``. Any other id present on disk
-    but absent from *jobs* is treated as a concurrent create and merged
-    back before the atomic write. The caller's list is never mutated — a
-    new list is returned when anything was recovered.
+    Intentional deletes pass ``removed_ids`` and are never resurrected. The
+    caller's list is never mutated — a new list is returned when anything
+    was recovered or reconciled.
 
     Fast path: when the enclosing critical section recorded a load stamp
-    and the file's ``(mtime_ns, size)`` still matches, nothing can have
+    and the file's ``(mtime_ns, size, ino)`` still matches, nothing can have
     changed underneath us, so the read+parse is skipped entirely — one
     ``stat()`` on the healthy no-race save.
     """
@@ -1963,35 +2056,64 @@ def _merge_unexpected_disk_jobs(
     if disk_jobs is None:
         return jobs
 
-    intended_remove = {str(i) for i in (removed_ids or ()) if i}
-    new_ids: Set[str] = set()
-    for job in jobs:
-        if isinstance(job, dict) and job.get("id"):
-            new_ids.add(str(job["id"]))
-
-    recovered: List[Dict[str, Any]] = []
+    baseline = getattr(_jobs_lock_state, "load_baseline", None)
+    disk_by_id: Dict[str, Dict[str, Any]] = {}
     for disk_job in disk_jobs:
-        if not isinstance(disk_job, dict):
+        if isinstance(disk_job, dict) and disk_job.get("id"):
+            disk_by_id[str(disk_job["id"])] = disk_job
+
+    intended_remove = {str(i) for i in (removed_ids or ()) if i}
+
+    # Pass 1: by-id field reconciliation for jobs present on both sides.
+    reconciled: List[Dict[str, Any]] = []
+    reconciled_ids: List[str] = []
+    new_ids: Set[str] = set()
+    changed = False
+    for job in jobs:
+        if not isinstance(job, dict) or not job.get("id"):
+            reconciled.append(job)
             continue
-        disk_id = disk_job.get("id")
-        if not disk_id:
+        jid = str(job["id"])
+        new_ids.add(jid)
+        disk_job = disk_by_id.get(jid)
+        if disk_job is None or baseline is None:
+            reconciled.append(job)
             continue
-        disk_id = str(disk_id)
+        merged = _reconcile_job_fields(job, disk_job, baseline.get(jid))
+        if merged != job:
+            changed = True
+            reconciled_ids.append(jid)
+        reconciled.append(merged)
+
+    if reconciled_ids:
+        logger.warning(
+            "Reconciled %d cron job record(s) against a concurrent writer's "
+            "on-disk state; fields this writer did not modify kept the "
+            "sibling's values instead of being reverted (#80624): %s",
+            len(reconciled_ids),
+            reconciled_ids,
+        )
+
+    # Pass 2: resurrect ids that exist on disk but not in the payload.
+    recovered: List[Dict[str, Any]] = []
+    for disk_id, disk_job in disk_by_id.items():
         if disk_id in new_ids or disk_id in intended_remove:
             continue
         recovered.append(disk_job)
         new_ids.add(disk_id)
 
-    if not recovered:
-        return jobs
-    logger.warning(
-        "Preserved %d cron job(s) present on disk but missing from the "
-        "in-memory save payload (concurrent create under degraded lock "
-        "or stale writer) (#80624): %s",
-        len(recovered),
-        [j.get("id") for j in recovered],
-    )
-    return jobs + recovered
+    if recovered:
+        logger.warning(
+            "Preserved %d cron job(s) present on disk but missing from the "
+            "in-memory save payload (concurrent create under degraded lock "
+            "or stale writer) (#80624): %s",
+            len(recovered),
+            [j.get("id") for j in recovered],
+        )
+        return reconciled + recovered
+    if changed:
+        return reconciled
+    return jobs
 
 
 def _save_jobs_unlocked(
@@ -2129,6 +2251,38 @@ def _save_jobs_unlocked(
         raise
 
 
+def _journal_created(job: Dict[str, Any]) -> None:
+    """Journal an intentional create. Never raises into the caller."""
+    try:
+        from cron.lifecycle_journal import record_created
+
+        record_created(str(job.get("id") or ""), name=job.get("name"))
+    except Exception:
+        logger.debug("cron lifecycle journal (create) unavailable", exc_info=True)
+
+
+def _journal_removed(removed_ids: Optional[Collection[str]],
+                     reason: Optional[str] = None) -> None:
+    """Journal intentional removals. Never raises into the caller.
+
+    Called from ``save_jobs`` rather than from each deletion site, because
+    ``removed_ids`` is already the single argument every intentional delete
+    must thread through (the shrink-merge guard refuses to drop an id that
+    was not declared). Journalling here therefore cannot drift from the
+    store: an unjournalled removal is one the store would have resurrected.
+    """
+    if not removed_ids:
+        return
+    try:
+        from cron.lifecycle_journal import record_removed
+
+        for jid in removed_ids:
+            if jid:
+                record_removed(str(jid), reason=reason)
+    except Exception:
+        logger.debug("cron lifecycle journal (remove) unavailable", exc_info=True)
+
+
 def save_jobs(
     jobs: List[Dict[str, Any]],
     *,
@@ -2149,6 +2303,14 @@ def save_jobs(
     _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
     with _jobs_lock():
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
+        # Journal INSIDE the lock, after the write lands. After, because a
+        # removal that raised never happened and must not leave an audit
+        # record claiming it did. Inside, because the journal's append order
+        # is what the vanished-job guard reads as causality: released first,
+        # a concurrent creator holding the same id could interleave its
+        # create AFTER our removal, and the guard would then report an
+        # intentionally-removed job as vanished.
+        _journal_removed(removed_ids)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -2633,6 +2795,11 @@ def create_job(
         jobs = load_jobs()
         jobs.append(job)
         save_jobs(jobs)
+        # Journal INSIDE the same lock the store write took — see the note in
+        # save_jobs. Journalled after release, a remover of this same id can
+        # append its removal FIRST, inverting the append order the guard reads
+        # as causality and turning an intentional removal into a false alarm.
+        _journal_created(job)
 
     return job
 
@@ -3759,6 +3926,82 @@ def _claim_job_for_fire_locked(
 # delivery error stay inspectable via `cronjob list`) instead of being deleted
 # at completion, then pruned by _sweep_completed_oneshots once they age out.
 COMPLETED_ONESHOT_RETENTION_DAYS = 7
+_STALE_FIRE_LOCK_AGE_SECONDS = 60.0
+_FIRE_LOCK_NAME_RE = re.compile(r"^\.fire-[0-9a-f]{32}\.lock$")
+
+
+def _reap_stale_fire_locks(
+    live_job_ids: Collection[str], *, now_epoch: Optional[float] = None
+) -> int:
+    """Remove old fire-fence pathnames that no current job can open again.
+
+    Fire-fence files are durable synchronization pathnames and normally outlive
+    each lock holder.  Only a file whose hashed job id is absent from the
+    current store is residue.  The age floor avoids racing a just-deleted job,
+    and a non-blocking exclusive ``flock`` preserves an orphan whose final run
+    still has the inode open.  Current-job files are never unlinked: deleting a
+    pathname while a waiter has opened the old inode could split future callers
+    across two lock files.  Platforms without ``fcntl`` fail closed.
+    """
+    if fcntl is None:
+        return 0
+
+    cron_dir = _current_cron_store().cron_dir
+    live_lock_names = {
+        f".fire-{uuid.uuid5(uuid.NAMESPACE_URL, f'{cron_dir.resolve()}::{job_id}').hex}.lock"
+        for job_id in live_job_ids
+        if job_id
+    }
+    now = time.time() if now_epoch is None else now_epoch
+    removed = 0
+    try:
+        candidates = list(cron_dir.glob(".fire-*.lock"))
+    except OSError:
+        return 0
+
+    for lock_path in candidates:
+        if (
+            not _FIRE_LOCK_NAME_RE.fullmatch(lock_path.name)
+            or lock_path.name in live_lock_names
+        ):
+            continue
+        lock_fd = None
+        acquired = False
+        try:
+            before = lock_path.stat()
+            if before.st_size != 0 or now - before.st_mtime <= _STALE_FIRE_LOCK_AGE_SECONDS:
+                continue
+            lock_fd = open(lock_path, "a+", encoding="utf-8")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (OSError, IOError):
+                continue
+
+            # The pathname may have been replaced between stat() and flock().
+            # Delete only the exact inode we inspected and locked.
+            held = os.fstat(lock_fd.fileno())
+            current = lock_path.stat()
+            if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+                continue
+            if current.st_size != 0 or now - current.st_mtime <= _STALE_FIRE_LOCK_AGE_SECONDS:
+                continue
+            lock_path.unlink()
+            removed += 1
+        except (OSError, IOError):
+            continue
+        finally:
+            if lock_fd is not None:
+                try:
+                    if acquired:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except (OSError, IOError):
+                    pass
+                lock_fd.close()
+
+    if removed:
+        logger.info("Pruned %d stale cron fire-fence lock file(s)", removed)
+    return removed
 
 
 def _completed_oneshot_retention_days() -> float:
@@ -3998,7 +4241,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # status / delivery error stay inspectable via `cronjob list`) instead of
     # being deleted on completion, but they must not accumulate in jobs.json
     # forever. Prune terminal one-shot records older than the retention
-    # window each scan.
+    # window each scan. The same GC pass reaps abandoned per-job fire-fence
+    # pathnames; a live holder makes the non-blocking lock probe fail closed.
+    _reap_stale_fire_locks(
+        {job_id for job in raw_jobs if (job_id := job.get("id"))}
+    )
     if _sweep_completed_oneshots(raw_jobs, now, removed_ids=intentionally_removed):
         needs_save = True
         jobs = [j for j in jobs if any(rj.get("id") == j.get("id") for rj in raw_jobs)]

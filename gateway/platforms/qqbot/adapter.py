@@ -333,7 +333,7 @@ class QQAdapter(BasePlatformAdapter):
             return False
 
         # Prevent duplicate connections with the same credentials
-        if not self._acquire_platform_lock("qqbot-appid", self._app_id, "QQBot app ID"):
+        if not await self._acquire_platform_lock_async("qqbot-appid", self._app_id, "QQBot app ID"):
             return False
 
         try:

@@ -761,6 +761,7 @@ class CLIAgentSetupMixin:
         """
         from cli import CLI_CONFIG, _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
         from tools.ansi_strip import sanitize_display_text as _sanitize_display_text
+        from agent.confab_notice import notice_from_display_row
         display_history = getattr(self, "_resume_display_history", self.conversation_history)
         if not display_history:
             return
@@ -802,7 +803,16 @@ class CLIAgentSetupMixin:
                 # Presentation-only tag on an assistant row that still has
                 # real content — surface the catch as an event line AND fall
                 # through so the reply itself is still recapped.
-                entries.append(("event", "confabulation caught — scaffold text removed"))
+                #
+                # Gated: display_kind is an open string column, so a reloaded
+                # user/system record (imported or malformed history) carrying
+                # it must NOT be presented as a confirmed catch. Only an
+                # assistant row whose display_metadata re-validates against
+                # the v1 schema earns the claim.
+                if notice_from_display_row(
+                    role, display_kind, msg.get("display_metadata")
+                ):
+                    entries.append(("event", "confabulation caught — scaffold text removed"))
 
             if role == "system":
                 continue

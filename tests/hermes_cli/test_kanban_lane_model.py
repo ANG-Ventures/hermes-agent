@@ -255,7 +255,7 @@ def test_cli_lane_model_firepower_requires_reason_beyond_reason_flag(kanban_home
     out = kc.run_slash(
         "lane-model set test-lane/gpt-6-astra-900k --ttl 2h --reason 'capacity'"
     )
-    assert "firepower-only" in out
+    assert "orchestrator-only" in out
     ok = kc.run_slash(
         "lane-model set test-lane/gpt-6-astra-900k --ttl 2h --reason 'capacity' "
         "--firepower 'approved burst'"

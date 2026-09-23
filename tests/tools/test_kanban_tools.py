@@ -422,7 +422,12 @@ def test_create_happy_path(worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     assert d["task_id"]
-    assert d["status"] == "todo"  # parent isn't done yet
+    # Fan-out brake (2026-09-22): a card created BY a dispatched worker parks
+    # in kanban.worker_created_status (default "triage") rather than following
+    # normal parent gating — a human promotes it. The pre-brake expectation
+    # here was "todo" (parent isn't done yet); that path is now only reachable
+    # for a non-worker creator.
+    assert d["status"] == "triage"
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -491,7 +496,16 @@ def test_create_parses_triage_string_false(worker_env):
     conn = kb.connect()
     try:
         task = kb.get_task(conn, d["task_id"])
-        assert task.status == "ready"
+        # Both triage=False and triage=True land in "triage" for a
+        # WORKER-created card now (the 2026-09-22 fan-out brake), so status
+        # alone no longer discriminates the bool parse. The discriminator is
+        # WHY it parked: triage="false" → the policy parked it
+        # (parked_by_policy event); triage="true" → the caller asked for
+        # triage and no policy event is written. See the sibling
+        # ..._string_true test for the other half.
+        assert task.status == "triage"
+        kinds = [e.kind for e in kb.list_events(conn, d["task_id"])]
+        assert "parked_by_policy" in kinds, kinds
     finally:
         conn.close()
 
@@ -510,6 +524,10 @@ def test_create_parses_triage_string_true(worker_env):
     try:
         task = kb.get_task(conn, d["task_id"])
         assert task.status == "triage"
+        # The caller ASKED for triage, so the fan-out brake did not fire —
+        # this is the discriminating half of the bool-parse pair above.
+        kinds = [e.kind for e in kb.list_events(conn, d["task_id"])]
+        assert "parked_by_policy" not in kinds, kinds
     finally:
         conn.close()
 
@@ -788,11 +806,14 @@ def test_worker_lifecycle_through_tools(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.metadata == {"child_task": child_out["task_id"]}
-        # Child is todo (parent just finished, but recompute_ready may
-        # have promoted it — complete_task runs recompute internally).
+        # Child parked in triage by the fan-out brake (2026-09-22): a card the
+        # WORKER created does not auto-promote to ready when the parent
+        # finishes — a human promotes it. Pre-brake this asserted "ready"
+        # (recompute_ready promoted it inside complete_task); the brake's whole
+        # point is that recompute never touches a triage card.
         child = kb.get_task(conn, child_out["task_id"])
-        assert child.status == "ready", (
-            f"child should be ready after parent done, got {child.status}"
+        assert child.status == "triage", (
+            f"worker-created child should park in triage, got {child.status}"
         )
         # Comment is visible
         assert len(kb.list_comments(conn, worker_env)) == 1
@@ -1391,3 +1412,46 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_complete_superseded_by_needs_no_summary(worker_env):
+    """The tool-level honest verb: pointer only, no work evidence, closes done."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env, "superseded_by": "t_0c5ac29a -> #889"})
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.outcome == "superseded"
+        assert run.metadata["superseded_by"] == "t_0c5ac29a -> #889"
+        assert kb.get_task(conn, worker_env).status == "done"
+    finally:
+        conn.close()
+
+
+def test_complete_superseded_by_empty_is_refused(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env, "superseded_by": "   "})
+    assert "superseded_by" in out
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_still_requires_evidence_without_superseded_by(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env})
+    assert "summary" in out and "superseded_by" in out
+
+
+def test_complete_schema_exposes_superseded_by():
+    from tools.kanban_tools import KANBAN_COMPLETE_SCHEMA
+    props = KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+    assert "superseded_by" in props
+    assert props["superseded_by"]["type"] == "string"

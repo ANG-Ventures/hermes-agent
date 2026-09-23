@@ -20,8 +20,10 @@ from gateway.lifecycle_ledger import (
     detect_unclean_exit,
     get_lifecycle_sentinel_path,
     mark_exited,
+    read_last_teardown_seconds,
     read_prior_exit_label,
     record_startup,
+    record_teardown_timing,
     sample_memory,
 )
 
@@ -73,6 +75,251 @@ def test_sample_memory_has_expected_keys_on_linux() -> None:
     assert sample.get("rss_kib", 0) > 0
     assert sample.get("mem_total_kib", 0) > 0
     assert "mem_available_kib" in sample
+
+
+# ---------------------------------------------------------------------------
+# Teardown timing
+# ---------------------------------------------------------------------------
+
+
+def test_teardown_timing_round_trips_and_reaches_exit_diag(tmp_path: Path) -> None:
+    assert read_last_teardown_seconds(tmp_path) is None
+
+    record_teardown_timing(
+        18.25,
+        total_shutdown_seconds=48.5,
+        drain_seconds=30.0,
+        budgeted=True,
+        home=tmp_path,
+    )
+
+    assert read_last_teardown_seconds(tmp_path) == 18.25
+    records = _exit_diag_records(tmp_path)
+    assert records[-1]["tag"] == "gateway.shutdown_teardown_timing"
+    assert records[-1]["teardown_seconds"] == 18.25
+    assert records[-1]["total_shutdown_seconds"] == 48.5
+
+
+def test_unbudgeted_teardown_is_diagnosed_but_never_becomes_the_reserve(
+    tmp_path: Path,
+) -> None:
+    """An unconstrained stop's teardown must not size the next drain.
+
+    ``hermes gateway stop`` / Ctrl+C / a foreground run have no supervisor
+    deadline, so their post-drain work can legitimately run far longer
+    than any launchd budget. Persisting that as the teardown reserve
+    drives the next SIGTERM's drain to zero and drops in-flight sessions
+    with no drain at all. The sample is still written for diagnostics.
+    """
+    record_teardown_timing(
+        95.0,
+        total_shutdown_seconds=120.0,
+        drain_seconds=25.0,
+        budgeted=False,
+        home=tmp_path,
+    )
+
+    assert read_last_teardown_seconds(tmp_path) is None
+    records = _exit_diag_records(tmp_path)
+    assert records[-1]["teardown_seconds"] == 95.0
+    assert records[-1]["budgeted"] is False
+
+
+def test_unbudgeted_stop_does_not_clobber_the_last_actionable_sample(
+    tmp_path: Path,
+) -> None:
+    """A manual stop between two SIGTERMs must not erase the reserve.
+
+    The reserve file is a single slot. Writing an unbudgeted sample into
+    it makes ``read_last_teardown_seconds`` return None — so a recorded
+    40s launchd teardown is lost and the next SIGTERM reserves the 15s
+    default instead, leaving post-drain persistence to run past
+    ExitTimeOut and be SIGKILLed. Unbudgeted samples belong in the
+    exit-diag log only.
+    """
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+
+    record_teardown_timing(
+        40.0,
+        total_shutdown_seconds=75.0,
+        drain_seconds=35.0,
+        budgeted=True,
+        home=tmp_path,
+    )
+    assert read_last_teardown_seconds(tmp_path) == 40.0
+
+    record_teardown_timing(
+        95.0,
+        total_shutdown_seconds=120.0,
+        drain_seconds=25.0,
+        budgeted=False,
+        home=tmp_path,
+    )
+
+    # The budgeted measurement survives the unbudgeted stop...
+    assert read_last_teardown_seconds(tmp_path) == 40.0
+    assert json.loads(get_teardown_timing_path(tmp_path).read_text())[
+        "teardown_seconds"
+    ] == 40.0
+    # ...and the unbudgeted sample is still diagnosed.
+    diag = _exit_diag_records(tmp_path)
+    assert [r["teardown_seconds"] for r in diag] == [40.0, 95.0]
+    assert diag[-1]["budgeted"] is False
+
+
+def test_oversized_budgeted_teardown_is_rejected_against_the_live_ceiling(
+    tmp_path: Path,
+) -> None:
+    """FleetReview P1 #3: a large *finite* sample must not zero the drain.
+
+    The inf/nan guard only covered values no measurement can produce. A
+    slow-but-real teardown (wedged adapter, slow SQLite checkpoint) writes
+    a large finite number; at clamp 60 a 55s reserve drives the drain to
+    0.0 — every in-flight session dropped with no drain — and if that stop
+    hard-exits before recording a new sample the file stays poisoned for
+    every later shutdown.
+    """
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+    from gateway.restart import (
+        resolve_launchd_capped_drain,
+        resolve_max_actionable_teardown_reserve_s,
+    )
+
+    path = get_teardown_timing_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"teardown_seconds": 55.0, "budgeted": True}))
+
+    ceiling = resolve_max_actionable_teardown_reserve_s(60.0)
+    assert ceiling == 50.0
+
+    # Unbounded read still sees the poisoned value...
+    assert read_last_teardown_seconds(tmp_path) == 55.0
+    # Bounded read (what the gateway uses at boot) rejects it.
+    assert read_last_teardown_seconds(tmp_path, max_seconds=ceiling) is None
+    assert (
+        resolve_launchd_capped_drain(
+            50.0,
+            60.0,
+            last_teardown_s=read_last_teardown_seconds(tmp_path, max_seconds=ceiling),
+        )
+        == 35.0
+    )
+    # ...and the resolver bounds it too, so even an unfiltered sample
+    # reaching the arithmetic (e.g. off a runner attribute) cannot zero
+    # the drain. Both layers, because the read is not the only path in.
+    assert resolve_launchd_capped_drain(50.0, 60.0, last_teardown_s=55.0) == 35.0
+
+
+def test_sample_exactly_at_the_ceiling_is_rejected(tmp_path: Path) -> None:
+    """The bound is inclusive: at the ceiling the drain is exactly zero.
+
+    ``value > max_seconds`` let a sample equal to the ceiling through, and
+    that is precisely the value that drives the drain to 0.0 — a real 50s
+    budgeted teardown under the 60s clamp would drop every in-flight
+    session with no drain at all.
+    """
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+    from gateway.restart import (
+        resolve_launchd_capped_drain,
+        resolve_max_actionable_teardown_reserve_s,
+    )
+
+    ceiling = resolve_max_actionable_teardown_reserve_s(60.0)
+    assert ceiling == 50.0
+    assert ceiling is not None
+
+    path = get_teardown_timing_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"teardown_seconds": ceiling, "budgeted": True}))
+
+    assert read_last_teardown_seconds(tmp_path, max_seconds=ceiling) is None
+    assert resolve_launchd_capped_drain(50.0, 60.0, last_teardown_s=ceiling) == 35.0
+    # Just below the ceiling is still honoured — the bound is not a blanket
+    # rejection of large samples.
+    path.write_text(
+        json.dumps({"teardown_seconds": ceiling - 1.0, "budgeted": True})
+    )
+    assert read_last_teardown_seconds(tmp_path, max_seconds=ceiling) == 49.0
+
+
+def test_poisoned_reserve_does_not_survive_the_next_successful_stop(
+    tmp_path: Path,
+) -> None:
+    """The poisoned value must be replaced by the next real measurement."""
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+    from gateway.restart import resolve_max_actionable_teardown_reserve_s
+
+    path = get_teardown_timing_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"teardown_seconds": 55.0, "budgeted": True}))
+
+    ceiling = resolve_max_actionable_teardown_reserve_s(60.0)
+    assert read_last_teardown_seconds(tmp_path, max_seconds=ceiling) is None
+
+    record_teardown_timing(
+        12.0,
+        total_shutdown_seconds=40.0,
+        drain_seconds=28.0,
+        budgeted=True,
+        home=tmp_path,
+    )
+
+    assert read_last_teardown_seconds(tmp_path, max_seconds=ceiling) == 12.0
+
+
+def test_no_launchd_budget_means_no_teardown_ceiling() -> None:
+    """Off launchd there is no SIGKILL to race, so no ceiling applies."""
+    from gateway.restart import resolve_max_actionable_teardown_reserve_s
+
+    assert resolve_max_actionable_teardown_reserve_s(None) is None
+    assert resolve_max_actionable_teardown_reserve_s(0.0) is None
+    assert resolve_max_actionable_teardown_reserve_s("nope") is None  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_non_finite_persisted_teardown_is_rejected(tmp_path: Path, bad: str) -> None:
+    """A corrupt file must not become an unbounded teardown reserve.
+
+    ``inf`` passes a bare ``>= 0.0`` check, and the reserve flows straight
+    into the next shutdown's drain budget — an unbounded reserve silently
+    drives that budget to zero. Exercised through the real file path, not
+    the parameter, because the file is what feeds the live value.
+    """
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+
+    path = get_teardown_timing_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"teardown_seconds": float(bad), "budgeted": True}))
+
+    assert read_last_teardown_seconds(tmp_path) is None
+
+
+def test_finite_persisted_teardown_still_survives_the_guard(tmp_path: Path) -> None:
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+
+    path = get_teardown_timing_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"teardown_seconds": 22.0, "budgeted": True}))
+
+    assert read_last_teardown_seconds(tmp_path) == 22.0
+    # Well under the clamp-60 ceiling, so bounding does not reject it.
+    assert read_last_teardown_seconds(tmp_path, max_seconds=50.0) == 22.0
+
+
+def test_legacy_record_without_budgeted_field_is_not_trusted(tmp_path: Path) -> None:
+    """Pre-existing files carry no provenance, so they cannot be trusted.
+
+    A record written before ``budgeted`` existed may have come from an
+    unconstrained stop. Treating it as budgeted would reintroduce exactly
+    the poisoning this guard closes, so it degrades to "no measurement".
+    """
+    from gateway.lifecycle_ledger import get_teardown_timing_path
+
+    path = get_teardown_timing_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"teardown_seconds": 22.0}))
+
+    assert read_last_teardown_seconds(tmp_path) is None
 
 
 # ---------------------------------------------------------------------------

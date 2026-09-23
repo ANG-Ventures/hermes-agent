@@ -41,14 +41,20 @@ def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int
     — it would just hang the request until the timeout. Failing fast surfaces
     the real auth error in the toast instead."""
     try:
+        command = ["git"]
+        if args and args[0] == "status":
+            command.append("--no-optional-locks")
+        command.extend(args)
+        env = noninteractive_git_env()
+        env["GIT_OPTIONAL_LOCKS"] = "0"
         proc = subprocess.run(
-            ["git", *args],
+            command,
             cwd=cwd,
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=timeout,
             stdin=subprocess.DEVNULL,
-            env=noninteractive_git_env(),
+            env=env,
         )
     except (OSError, subprocess.SubprocessError):
         return 1, "", "git invocation failed"

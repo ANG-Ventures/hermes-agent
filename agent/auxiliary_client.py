@@ -3667,6 +3667,30 @@ def _relay_auxiliary_metadata(
     }
 
 
+def _relay_auxiliary_route_snapshot() -> tuple[str, str, int]:
+    """Read ``(provider, model, attempts)`` for the in-flight auxiliary call.
+
+    ``attempts`` counts physical provider requests made so far
+    (:func:`_relay_auxiliary_metadata` increments it per request), floored at 1 so a
+    successful first try never reports 0.
+
+    The provider/model here is the route the call was DISPATCHED on:
+    :func:`_set_relay_auxiliary_route` is called once, during request preparation. A
+    recovery rung that moves the work to a different provider updates ``route_info``, not
+    this context — so a caller that needs the route which actually SERVED the call must
+    prefer ``route_info`` and use this only as the fallback. See
+    :func:`_log_compression_call_duration`.
+    """
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    if context is None:
+        return "", "", 1
+    return (
+        str(context.get("provider") or ""),
+        str(context.get("model") or ""),
+        max(1, int(context.get("attempt_count") or 1)),
+    )
+
+
 def _relay_sync_completion(
     client: Any,
     kwargs: dict[str, Any],
@@ -9923,6 +9947,12 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    # Attribution must not depend on the caller opting in: context engines call with no
+    # ``route_info``, and they are precisely the callers whose compactions went
+    # unattributable. Allocate one when absent so the recovery ladder always has somewhere
+    # to record which provider actually served, then pass the caller's dict through
+    # untouched when they did supply one.
+    route_info = {} if route_info is None else route_info
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -9933,6 +9963,7 @@ def call_llm(
             0, int((request_started_at - queue_started_at) * 1000)
         )
     prior_progress_hook = getattr(_aux_progress, "hook", None)
+    outcome = "failed"
 
     def _timed_response() -> None:
         if latency_info is not None and "time_to_first_progress_ms" not in latency_info:
@@ -9979,15 +10010,72 @@ def call_llm(
         if stream and semaphore is not None:
             stream_semaphore = semaphore
             semaphore = None
+            outcome = "streaming"
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
+        outcome = "ok"
         return response
     finally:
         if latency_info is not None:
             latency_info["summary_generation_ms"] = max(
                 0, int((time.monotonic() - request_started_at) * 1000)
             )
+        # Emit in ``finally`` so a stall or a raised failure — the cases actually worth
+        # measuring — is logged with the same shape as a success, instead of only the
+        # happy path being observable.
+        _log_compression_call_duration(
+            task,
+            request_started_at,
+            outcome=outcome,
+            explicit_timeout=timeout,
+            route_info=route_info,
+        )
         if semaphore is not None:
             semaphore.release()
+
+
+def _log_compression_call_duration(
+    task: Optional[str],
+    request_started_at: float,
+    *,
+    outcome: str,
+    explicit_timeout: Optional[float],
+    route_info: Optional[Dict[str, str]] = None,
+) -> None:
+    """Log one duration line for a compaction summariser call.
+
+    Best-effort by contract: telemetry must never convert a working compaction into a
+    failed one, so every step is inside the guard. The elapsed clock starts after the
+    concurrency semaphore is acquired, matching the provider-side deadline the budget is
+    compared against — queue wait is a separate figure (``latency_info["queue_wait_ms"]``)
+    and folding it in here would make a deadline kill look like an overrun.
+
+    ``route_info`` is preferred over the relay context for provider/model because the
+    recovery ladder rewrites it on every rung: naming the DISPATCHED provider when a
+    fallback actually did the work would point a future investigation at the wrong
+    backend, which is the exact failure this telemetry exists to prevent.
+    """
+    try:
+        from agent.compression_duration_log import (
+            format_duration_line,
+            should_log_duration,
+        )
+
+        if not should_log_duration(task):
+            return
+        dispatched_provider, dispatched_model, attempts = (
+            _relay_auxiliary_route_snapshot()
+        )
+        served = route_info if isinstance(route_info, dict) else {}
+        logger.info(format_duration_line(
+            provider=served.get("provider") or dispatched_provider,
+            model=served.get("model") or dispatched_model,
+            attempts=attempts,
+            seconds=max(0.0, time.monotonic() - request_started_at),
+            outcome=outcome,
+            budget_seconds=_effective_aux_timeout(str(task or ""), explicit_timeout),
+        ))
+    except Exception:
+        logger.debug("compression duration logging failed", exc_info=True)
 
 
 def _release_sync_semaphore_after_stream(
@@ -10916,11 +11004,14 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    route_info = {} if route_info is None else route_info  # see the sync path's note
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
+    request_started_at = time.monotonic()
+    outcome = "failed"
     try:
-        return await _async_call_llm_impl(
+        response = await _async_call_llm_impl(
             task=task,
             provider=provider,
             model=model,
@@ -10936,7 +11027,18 @@ async def async_call_llm(
             reasoning_config=reasoning_config,
             route_info=route_info,
         )
+        outcome = "ok"
+        return response
     finally:
+        # Same duration contract as the sync path: an engine that summarises on the async
+        # client must not be a blind spot just because it took the other entry point.
+        _log_compression_call_duration(
+            task,
+            request_started_at,
+            outcome=outcome,
+            explicit_timeout=timeout,
+            route_info=route_info,
+        )
         if semaphore is not None:
             semaphore.release()
 

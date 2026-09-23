@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -53,6 +54,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _LIFECYCLE_RELATIVE = ("state", "gateway.lifecycle.json")
+_TEARDOWN_TIMING_RELATIVE = ("state", "gateway.teardown.json")
 _EXIT_DIAG_RELATIVE = ("logs", "gateway-exit-diag.log")
 
 # Total wall-clock budget for the kill-attribution probe.  Boot must never
@@ -84,6 +86,109 @@ def get_lifecycle_sentinel_path(home: Optional[Path] = None) -> Path:
     """Return ``<HERMES_HOME>/state/gateway.lifecycle.json``."""
     base = home if home is not None else _process_hermes_home()
     return base.joinpath(*_LIFECYCLE_RELATIVE)
+
+
+def get_teardown_timing_path(home: Optional[Path] = None) -> Path:
+    """Return the last completed post-drain teardown timing path."""
+    base = home if home is not None else _process_hermes_home()
+    return base.joinpath(*_TEARDOWN_TIMING_RELATIVE)
+
+
+def read_last_teardown_seconds(
+    home: Optional[Path] = None,
+    *,
+    max_seconds: Optional[float] = None,
+) -> Optional[float]:
+    """Read the last completed post-drain teardown duration, if valid.
+
+    Two bounds keep a single anomalous sample from starving the next
+    shutdown's drain to zero — the reserve is an input to a time budget,
+    so it must never be unbounded:
+
+    * Only samples recorded by a *budgeted* (signal-driven, launchd-timed)
+      stop are representative of the next SIGTERM. An unconstrained stop —
+      ``hermes gateway stop``, Ctrl+C, a foreground run — has no supervisor
+      deadline, so its post-drain work can legitimately run far longer
+      than any launchd budget. Records written before this field existed
+      are treated as unbudgeted for the same reason.
+    * ``max_seconds`` rejects a sample too large to be *actionable* under
+      the live budget. A teardown that already meets or exceeds the whole
+      usable window cannot be reserved for; honouring it would zero the
+      drain and drop in-flight sessions while still not making the
+      teardown fit. The bound is inclusive — a sample exactly AT the
+      ceiling drives the drain to precisely zero, which is the
+      starvation this rejects, not a usable reserve.
+
+    ``inf``/``nan`` are rejected outright: no completed teardown can
+    produce them, so they only arrive from a corrupt or hand-edited file.
+    """
+    data = _read_json(get_teardown_timing_path(home)) or {}
+    raw = data.get("teardown_seconds")
+    if raw is None:
+        return None
+    if not bool(data.get("budgeted")):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    if value < 0.0:
+        return None
+    if max_seconds is not None:
+        try:
+            ceiling = float(max_seconds)
+        except (TypeError, ValueError):
+            return value
+        if math.isfinite(ceiling) and value >= ceiling:
+            return None
+    return value
+
+
+def record_teardown_timing(
+    teardown_seconds: float,
+    *,
+    total_shutdown_seconds: float,
+    drain_seconds: float,
+    budgeted: bool = False,
+    home: Optional[Path] = None,
+) -> None:
+    """Persist and diagnose one completed post-drain teardown measurement.
+
+    ``budgeted`` marks a stop that ran under a supervisor deadline, i.e.
+    the only kind whose duration predicts the next SIGTERM. An unbudgeted
+    sample is appended to the exit-diag log for diagnostics but must NOT
+    reach the single-slot reserve file: writing it there clobbers the last
+    actionable measurement (a manual ``hermes gateway stop`` between two
+    SIGTERMs would erase a recorded 40s teardown, so the next launchd stop
+    reserves the 15s default and can be SIGKILLed mid-persistence).
+    """
+    try:
+        teardown = max(float(teardown_seconds), 0.0)
+        total = max(float(total_shutdown_seconds), 0.0)
+        drain = max(float(drain_seconds), 0.0)
+    except (TypeError, ValueError):
+        return
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "tag": "gateway.shutdown_teardown_timing",
+        "pid": os.getpid(),
+        "teardown_seconds": teardown,
+        "total_shutdown_seconds": total,
+        "drain_seconds": drain,
+        "budgeted": bool(budgeted),
+    }
+    path = get_teardown_timing_path(home)
+    if budgeted:
+        try:
+            from utils import atomic_json_write
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(path, record, indent=None)
+        except Exception:
+            logger.debug("Failed to persist teardown timing", exc_info=True)
+    _append_exit_diag(record, home)
 
 
 def sample_memory() -> Dict[str, Any]:
@@ -562,27 +667,30 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
 async def record_startup_async(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Event-loop-safe :func:`record_startup`.
 
-    The attribution probe shells out to ``log show`` / ``journalctl``; running
-    it on the loop thread would stall platform heartbeats for up to
-    ``KILL_ATTRIBUTION_TIMEOUT_S`` at boot.  Offloaded via
-    ``asyncio.to_thread`` (the house pattern).  Never raises.
-    """
-    evidence: Optional[Dict[str, Any]] = None
-    try:
-        evidence = detect_unclean_exit(home)
-        if evidence is not None:
-            try:
-                attribution = await asyncio.to_thread(_probe_attribution, evidence)
-            except Exception:
-                logger.debug("Kill-attribution offload failed", exc_info=True)
-                attribution = {"killer": "unattributed", "reason": "offload_failed"}
-            _apply_attribution(evidence, attribution)
-            _emit_unclean_report(evidence, home)
-    except Exception:
-        logger.debug("Unclean-exit detection failed", exc_info=True)
+    EVERY step of the boot record is blocking, not just the probe:
 
-    _claim_sentinel(evidence, home)
-    return evidence
+    * ``detect_unclean_exit`` reads the sentinel and the heartbeat file, and
+      ``_pid_alive_with_start_time`` reaches psutil for the prior pid;
+    * the attribution probe shells out to ``log show`` / ``journalctl`` for up
+      to ``KILL_ATTRIBUTION_TIMEOUT_S``;
+    * ``_emit_unclean_report`` appends to ``gateway-exit-diag.log``;
+    * ``_claim_sentinel`` ends in ``atomic_json_write`` — ``mkstemp`` +
+      ``fsync`` + ``os.replace``, whose duration is unbounded under
+      filesystem pressure.
+
+    An earlier shape offloaded only the probe and left the other three on the
+    loop thread, so a stalled sentinel rename still starved every platform
+    heartbeat at boot (the 2026-09-20 incident class: a rename several
+    plain-``def`` frames below a coroutine).  The whole synchronous body is
+    therefore run in one worker thread via ``asyncio.to_thread`` (the house
+    pattern); :func:`record_startup` is that body verbatim, so the two paths
+    cannot drift.  Never raises.
+    """
+    try:
+        return await asyncio.to_thread(record_startup, home)
+    except Exception:
+        logger.debug("Lifecycle startup record offload failed", exc_info=True)
+        return None
 
 
 def mark_exited(

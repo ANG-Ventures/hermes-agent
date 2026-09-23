@@ -140,7 +140,7 @@ class CapturePipeline:
         """Start the drain+reaper worker if capture is active and there is un-drained work already in
         the durable queue. Safe to call any time; no-op if already started, inactive, or empty."""
         try:
-            if self._started or not self.active:
+            if not self.active:
                 return
             counts = self._queue.counts()
             if (counts.get("pending", 0) + counts.get("inflight", 0)) > 0:
@@ -155,12 +155,14 @@ class CapturePipeline:
 
     def start(self) -> None:
         with self._lock:
-            if self._started or not self._certified:
+            if not self._certified:
                 return
             self._worker.start()
+            first_start = not self._started
             self._started = True
-            logger.info("mem0 capture pipeline started (gate %s, model %s, queue depth %s)",
-                        self._gate_version, self._model, self._queue.counts())
+            if first_start:
+                logger.info("mem0 capture pipeline started (gate %s, model %s, queue depth %s)",
+                            self._gate_version, self._model, self._queue.counts())
 
     def stop(self) -> None:
         with self._lock:
@@ -182,13 +184,10 @@ class CapturePipeline:
             key = idem_key(session_id, turn_ordinal, user_content, assistant_content)
             enq = self._queue.enqueue(key, {"user": user_content, "assistant": assistant_content,
                                             "session_id": session_id})
-            # Start the worker whenever capture is active and it isn't running yet — NOT only on a
-            # brand-new insert (Greptile P1). After a restart with pending/expired rows already in
-            # SQLite, a duplicate enqueue returns False; gating start on `enq` would leave those
-            # durable rows (and the reaper) idle until some later unique turn. Reaching an active
-            # enqueue means there is work to drain, so ensure the drain+reaper loop is up.
-            if not self._started:
-                self.start()
+            # Start/restart the worker after every active enqueue. The worker
+            # retires itself when the durable queue becomes empty; start() is
+            # idempotent while it is still accepting work.
+            self.start()
             return enq
         except Exception as e:
             logger.warning("mem0 capture enqueue failed (turn not captured, not broken): %s", e)

@@ -147,7 +147,12 @@ class TestBusyHandlerProtectsBootResume:
         assert adapter._pending_messages.get(sk) is event
 
     @pytest.mark.asyncio
-    async def test_ack_names_the_restart_not_generic_interrupt(self) -> None:
+    async def test_ack_is_recovery_aware_not_generic_interrupt(self) -> None:
+        """The ack must be the recovery-specific one, not "Interrupting current
+        task". It deliberately does NOT say "restarted" any more: the boot notice
+        (fork_ext.unclean_restart_notice) is the single line per boot that
+        announces a restart and names its cause; this ack only says the message
+        is queued behind the interrupted work (2026-09-22 consolidation)."""
         runner = _make_runner()
         adapter = _make_adapter()
         event = _make_event(text="did you restart?")
@@ -163,8 +168,8 @@ class TestBusyHandlerProtectsBootResume:
 
         adapter._send_with_retry.assert_called_once()
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "restarted" in content.lower()
-        assert "resum" in content.lower()  # resuming/resume
+        assert "still finishing the interrupted work" in content.lower()
+        assert "restarted" not in content.lower()   # the boot notice owns that word
         assert "queued" in content.lower()
         assert "/stop" in content
         assert "Interrupting" not in content

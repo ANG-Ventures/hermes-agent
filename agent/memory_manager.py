@@ -870,26 +870,17 @@ class MemoryManager:
 
         ctx = contextvars.copy_context()
         fn = partial(ctx.run, fn)
-        executor = self._get_sync_executor()
-        if executor is None:
-            if self._shutting_down:
-                logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
-                return
-            # Creation failure outside shutdown: preserve the historical
-            # fail-safe behavior and run the operation inline.
-            try:
-                fn()
-            except Exception as e:  # pragma: no cover - fn guards internally
-                logger.debug("Inline memory background task failed: %s", e)
-            return
         try:
-            # Make submit+tracking atomic with the shutdown snapshot. The
-            # callback is attached after releasing the lock because an already
-            # completed future invokes callbacks synchronously.
+            # Make executor selection, submit, and tracking atomic with idle
+            # retirement and the shutdown snapshot. A completed manager must
+            # not retain one worker for the lifetime of every cached agent.
             with self._sync_executor_lock:
                 if self._shutting_down:
                     logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
                     return
+                executor = self._get_sync_executor_locked()
+                if executor is None:
+                    raise RuntimeError("memory sync executor unavailable")
                 future = executor.submit(fn)
                 self._background_futures[future] = kind
             future.add_done_callback(self._forget_background_future)
@@ -903,31 +894,39 @@ class MemoryManager:
                 logger.debug("Inline memory background task failed: %s", e)
 
     def _forget_background_future(self, future: Future) -> None:
+        idle_executor = None
         with self._sync_executor_lock:
             self._background_futures.pop(future, None)
+            if not self._background_futures and not self._shutting_down:
+                idle_executor = self._sync_executor
+                self._sync_executor = None
+        if idle_executor is not None:
+            # Called from the worker that just completed. wait=False queues the
+            # executor sentinel without attempting to join the current thread.
+            idle_executor.shutdown(wait=False, cancel_futures=False)
+
+    def _get_sync_executor_locked(self) -> Optional[ThreadPoolExecutor]:
+        """Return/create the executor while ``_sync_executor_lock`` is held."""
+        if self._shutting_down:
+            return None
+        if self._sync_executor is None:
+            try:
+                # Daemon workers (see tools.daemon_pool): a provider wedged
+                # on a network call must never block interpreter exit.
+                from tools.daemon_pool import DaemonThreadPoolExecutor
+                self._sync_executor = DaemonThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="mem-sync",
+                )
+            except Exception as e:  # pragma: no cover - resource exhaustion
+                logger.warning("Failed to create memory sync executor: %s", e)
+                return None
+        return self._sync_executor
 
     def _get_sync_executor(self) -> Optional[ThreadPoolExecutor]:
         """Lazily create the single-worker background executor."""
-        if self._shutting_down:
-            return None
-        if self._sync_executor is not None:
-            return self._sync_executor
         with self._sync_executor_lock:
-            if self._shutting_down:
-                return None
-            if self._sync_executor is None:
-                try:
-                    # Daemon workers (see tools.daemon_pool): a provider wedged
-                    # on a network call must never block interpreter exit.
-                    from tools.daemon_pool import DaemonThreadPoolExecutor
-                    self._sync_executor = DaemonThreadPoolExecutor(
-                        max_workers=1,
-                        thread_name_prefix="mem-sync",
-                    )
-                except Exception as e:  # pragma: no cover - resource exhaustion
-                    logger.warning("Failed to create memory sync executor: %s", e)
-                    return None
-            return self._sync_executor
+            return self._get_sync_executor_locked()
 
     def flush_pending(self, timeout: Optional[float] = None) -> bool:
         """Block until queued sync/prefetch work has drained.
@@ -938,14 +937,15 @@ class MemoryManager:
         exists), False on timeout. Used at real session boundaries and by
         tests that need to assert provider state deterministically.
         """
-        executor = self._sync_executor
-        if executor is None:
-            return True
-        try:
-            fut = executor.submit(lambda: None)
-        except RuntimeError:
-            # Executor already shut down — nothing pending.
-            return True
+        with self._sync_executor_lock:
+            executor = self._sync_executor
+            if executor is None:
+                return True
+            try:
+                fut = executor.submit(lambda: None)
+            except RuntimeError:
+                # Executor already shut down — nothing pending.
+                return True
         try:
             fut.result(timeout=timeout)
             return True

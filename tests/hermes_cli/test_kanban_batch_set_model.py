@@ -218,7 +218,7 @@ def test_set_model_batch_firepower_gate_is_atomic(kanban_home):
         f"set-model {first} {second} gpt-6-astra-900k --provider batch-provider"
     )
 
-    assert "firepower-only" in out
+    assert "orchestrator-only" in out
     with kb.connect() as conn:
         assert kb.get_task(conn, first).model_override is None
         assert kb.get_task(conn, second).model_override is None

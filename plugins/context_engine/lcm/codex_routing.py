@@ -26,7 +26,7 @@ _CODEX_OAUTH_CONTEXT_CAPS: dict[str, int] = {
     "gpt-5.5": 272_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
-    "gpt-5.6": 372_000,
+    "gpt-5.6": 272_000,
     "gpt-5": 272_000,
 }
 
@@ -37,6 +37,22 @@ def _bare_model_slug(model: str | None) -> str:
 
 def _is_openai_codex_route(provider: str | None) -> bool:
     return (provider or "").strip().lower() == "openai-codex"
+
+
+def _is_host_codex_context_variant(bare_model: str) -> bool:
+    """Return True when the host marks ``bare_model`` as a context-window variant.
+
+    Best-effort: LCM may run against a stub ``agent`` package (upstream CI),
+    in which case no variant is recognised and the conservative table applies.
+    """
+    try:
+        from agent.model_metadata import is_codex_context_variant
+    except Exception:  # pragma: no cover - host without the helper
+        return False
+    try:
+        return bool(is_codex_context_variant(bare_model))
+    except Exception:  # pragma: no cover - defensive
+        return False
 
 
 def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | None:
@@ -51,6 +67,13 @@ def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | N
         return None
     bare_model = _bare_model_slug(model)
     if not bare_model:
+        return None
+    if _is_host_codex_context_variant(bare_model):
+        # Explicit opt-in picker variants (``gpt-5.6-sol-900k``) are a
+        # host-side alias whose window the host has ALREADY resolved from its
+        # live-verified table (the alias is stripped before it hits the wire).
+        # Re-clamping them here to the advertised base-slug window would
+        # silently discard the user's opt-in, so trust the host value.
         return None
     for slug, cap in sorted(
         _CODEX_OAUTH_CONTEXT_CAPS.items(), key=lambda item: len(item[0]), reverse=True

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,7 @@ from typing import Any, Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_identity import safe_comment_provenance
+from hermes_constants import get_default_hermes_root
 
 
 # ---------------------------------------------------------------------------
@@ -476,10 +478,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "--provider <name> to the worker). Requires "
                                "--model.")
     p_create.add_argument(
+        "--allow-flagship",
         "--firepower",
         default=None,
+        dest="allow_flagship",
         metavar="REASON",
-        help="Required justification when --model selects a flagship/firepower-only model; appended to the card as an audit comment.",
+        help="Allow an orchestrator-only flagship model for this task. "
+             "Requires a non-empty reason, recorded as a task comment. "
+             "--firepower is an alias.",
     )
     p_create.add_argument(
         "--reasoning",
@@ -625,10 +631,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "running worker keeps its old model until it finishes.",
     )
     p_set_model.add_argument(
+        "--allow-flagship",
         "--firepower",
         default=None,
+        dest="allow_flagship",
         metavar="REASON",
-        help="Required justification when selecting a flagship/firepower-only model; appended to the card as an audit comment.",
+        help="Allow an orchestrator-only flagship model. Requires a non-empty "
+             "reason, recorded as a task comment. --firepower is an alias.",
     )
     _effort_group = p_set_model.add_mutually_exclusive_group()
     _effort_group.add_argument(
@@ -678,8 +687,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Restrict the override to one profile. Omit for board-wide.",
     )
     _lane_set.add_argument(
-        "--firepower", default=None, metavar="REASON",
-        help="Required justification when the model is flagship/firepower-only.",
+        "--firepower", "--allow-flagship", default=None, dest="firepower",
+        metavar="REASON",
+        help="Required justification when the model is flagship/firepower-only "
+             "(same flagship ban as create/set-model --allow-flagship).",
     )
     _lane_show = _lane_sub.add_parser(
         "show", help="Show active lane overrides and their remaining TTL",
@@ -812,14 +823,45 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
-    p_complete.add_argument("--survivor-ref", default=None, metavar="URL#SHA",
+    p_complete.add_argument("--superseded-by", default=None, metavar="CARD|PR|SHA",
+                            help="Evidence pointer for a card whose premise was already "
+                                 "satisfied elsewhere. Closes it done with outcome "
+                                 "'superseded'; no --result/--summary required, but the "
+                                 "pointer must be non-empty (an unnamed supersede is a "
+                                 "silent delete of the work).")
+    p_complete.add_argument("--survivor-ref", default=None, action="append", metavar="[REPO=]URL#SHA",
                             help="Name an external survivor when the implementation lives on a "
-                                 "remote, not in the workspace. Verified with git ls-remote; "
-                                 "an unverifiable claim refuses the completion.")
-    p_complete.add_argument("--survivor-pr", default=None, metavar="OWNER/REPO#N",
+                                 "remote, not in the workspace. Verified with git ls-remote "
+                                 "AND required to name this task: the SHA must resolve to a "
+                                 "single branch or tag tip whose ref name contains the task id. "
+                                 "An unverifiable claim, or one on an unrelated-looking ref, "
+                                 "refuses the completion (see --survivor-unbound). Repeatable: "
+                                 "qualify each claim as <workspace-relative-repo>=<claim> when "
+                                 "more than one recorded repository vanished.")
+    p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
-                                 "gh pr view (state OPEN or MERGED); an unverifiable claim "
-                                 "refuses the completion.")
+                                 "gh pr view (state OPEN or MERGED) AND required to name this "
+                                 "task; an unverifiable claim refuses the completion. Naming "
+                                 "the task in the PR's head BRANCH binds the claim. A match "
+                                 "only in the PR title or body is a mention, not a tie to this "
+                                 "card's work, so it is recorded as an unbound claim (see "
+                                 "--survivor-unbound) and never becomes standing authority to "
+                                 "delete the workspace later. Repeatable; same <repo>= qualifier "
+                                 "as --survivor-ref.")
+    p_complete.add_argument("--survivor-unbound", action="append", nargs="?", const=True,
+                            default=None, metavar="REPO",
+                            help="Operator override: accept a --survivor-ref/--survivor-pr that "
+                                 "is live but does NOT name this task (including one that names "
+                                 "it only in a PR title or body, which is a mention), for the "
+                                 "case where the work really did land on an unrelated-looking "
+                                 "branch. PER-CLAIM: pass it bare for a single-claim completion, "
+                                 "or repeat it with the <repo>= qualifier of each claim being "
+                                 "overridden when there is more than one -- overriding one claim "
+                                 "must not silently accept the others. The claim "
+                                 "is still remote-verified; the override and the OS user (resolved "
+                                 "from the real uid, not $USER) are recorded on the survivor and "
+                                 "in the task event log. An unbound claim authorises THIS "
+                                 "completion only: a later reclamation will not reuse it.")
 
     p_edit = sub.add_parser(
         "edit",
@@ -872,6 +914,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
         ),
+    )
+
+    p_budget = sub.add_parser(
+        "budget",
+        help="Report per-board 24h worker spend against kanban.budget.usd_per_24h",
+    )
+    p_budget.add_argument(
+        "--board", dest="budget_board", default=None,
+        help="Report a single board instead of every board.",
+    )
+    p_budget.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON",
     )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
@@ -929,7 +983,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_request_review.add_argument(
         "--reviewer", default=None,
-        help="Optional reviewer profile; reassigns the task before review dispatch.",
+        help=(
+            "Reviewer profile (or the explicit sentinel 'human' / "
+            "'human:<name>'); reassigns the task before review dispatch. "
+            "Defaults to config kanban.review_assignee. A reviewer that is "
+            "neither an installed profile nor 'human' is refused."
+        ),
+    )
+    p_request_review.add_argument(
+        "--allow-same-actor", action="store_true",
+        help=(
+            "Permit the implementer to review their own work (normally "
+            "refused). Recorded on the review_requested event."
+        ),
     )
     p_request_review.add_argument(
         "--metadata", default=None,
@@ -1434,6 +1500,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "budget":   _cmd_budget,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1489,7 +1556,13 @@ def kanban_command(args: argparse.Namespace) -> int:
         try:
             return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
+            # A survivor refusal carries its operator-only hint on the
+            # exception, not in the persisted message, so render it HERE --
+            # at the boundary whose environment belongs to the caller actually
+            # reading the text. See kanban_survivor.render_override_hint.
+            from hermes_cli.kanban_survivor import render_override_hint
+
+            print(f"kanban: {render_override_hint(exc)}", file=sys.stderr)
             return 1
 
 
@@ -1970,6 +2043,8 @@ def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_worker_policy as _kwp
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -1992,22 +2067,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    model_override = getattr(args, "model_override", None)
-    provider_override = getattr(args, "provider_override", None)
-    firepower_reason = getattr(args, "firepower", None)
-    from hermes_cli.model_policy import (
-        firepower_guard_error,
-        format_firepower_audit,
-        is_firepower_model,
-    )
-    guard_error = firepower_guard_error(model_override, firepower_reason)
-    if guard_error:
-        print(f"kanban: {guard_error}", file=sys.stderr)
-        return 2
-    with kb.connect_closing() as conn:
-        # The task and its mandatory firepower audit comment are one durable
-        # write: a comment failure must not leave an unaudited flagship card.
-        with kb.write_txn(conn):
+    try:
+        with kb.connect_closing() as conn:
             task_id = kb.create_task(
                 conn,
                 title=args.title,
@@ -2027,24 +2088,24 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 max_runtime_seconds=max_runtime,
                 skills=getattr(args, "skills", None) or None,
                 max_retries=max_retries,
-                model_override=model_override,
-                provider_override=provider_override,
+                model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                flagship_override_reason=getattr(args, "allow_flagship", None),
+                flagship_override_author=args.created_by or _profile_author(),
                 reasoning_effort=getattr(args, "reasoning_effort", None),
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 initial_status=getattr(args, "initial_status", "running"),
+                forced_status=_kwp.resolve_park_status(
+                    initial_status=getattr(args, "initial_status", "running"),
+                    triage=bool(getattr(args, "triage", False)),
+                ),
             )
-            if is_firepower_model(model_override):
-                kb.add_comment(
-                    conn,
-                    task_id,
-                    args.created_by or _profile_author(),
-                    format_firepower_audit(
-                        model_override, provider_override, firepower_reason
-                    ),
-                )
-        task = kb.get_task(conn, task_id)
-        auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
+            task = kb.get_task(conn, task_id)
+            auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2066,6 +2127,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_budget(args: argparse.Namespace) -> int:
+    """Read-only spend report. Never writes a pause marker or pages."""
+    from hermes_cli import kanban_budget as kbudget
+
+    rows = kbudget.board_budget_report(getattr(args, "budget_board", None))
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    print(kbudget.format_budget_report(rows))
+    if rows and rows[0].get("ceiling_usd") is None:
+        print(
+            "\nNo ceiling configured — set kanban.budget.usd_per_24h in "
+            "config.yaml to brake runaway fan-out."
+        )
     return 0
 
 
@@ -2643,7 +2721,8 @@ def _cli_model_override(args, *, allow_ttl=False):
             ("model", getattr(args, "model", None)),
             ("provider", getattr(args, "provider", None)),
             ("reasoning_effort", getattr(args, "reasoning_effort", None)),
-            ("firepower", getattr(args, "firepower", None)),
+            # set-model/create: dest=allow_flagship; lane-model: dest=firepower.
+            ("firepower", getattr(args, "allow_flagship", None) or getattr(args, "firepower", None)),
             ("ttl", getattr(args, "ttl", None)),
         ) if value is not None and (allow_ttl or key != "ttl")
     }
@@ -2708,12 +2787,16 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     model_given = model_given or bool(model) or bool(provider)
     effort = override.reasoning_effort if override else getattr(args, "reasoning_effort", None)
     clear_effort = bool(getattr(args, "clear_effort", False))
-    firepower_reason = override.firepower if override else getattr(args, "firepower", None)
+    # --allow-flagship (main) and --firepower (alias) share dest=allow_flagship.
+    firepower_reason = (
+        override.firepower if override and override.firepower
+        else getattr(args, "allow_flagship", None)
+    )
     from hermes_cli.model_policy import (
         canonical_model_pair,
         firepower_guard_error,
-        format_firepower_audit,
         is_firepower_model,
+        override_comment,
     )
     if model:
         model, provider = canonical_model_pair(model, provider)
@@ -2823,8 +2906,10 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.provider = provider
                     if firepower:
                         write.audit_comment_author = _profile_author()
-                        write.audit_comment_body = format_firepower_audit(
-                            effective_model, provider, firepower_reason,
+                        # Same comment main's create/set-model writes, so
+                        # the dispatcher's flagship gate authorizes it.
+                        write.audit_comment_body = override_comment(
+                            firepower_reason,
                         )
                 if effort is not None or clear_effort:
                     write.touch_effort = True
@@ -3567,18 +3652,29 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     summary = getattr(args, "summary", None)
+    superseded_by = getattr(args, "superseded_by", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
     survivor_ref = getattr(args, "survivor_ref", None)
     survivor_pr = getattr(args, "survivor_pr", None)
-    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr):
+    survivor_unbound = getattr(args, "survivor_unbound", None) or None
+    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
+                         or survivor_unbound or superseded_by):
         print(
-            "kanban: --summary / --metadata / --survivor-ref / --survivor-pr are per-task "
+            "kanban: --summary / --metadata / --superseded-by / --survivor-ref / "
+            "--survivor-pr / --survivor-unbound are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
+            file=sys.stderr,
+        )
+        return 2
+    if survivor_unbound and not (survivor_ref or survivor_pr):
+        print(
+            "kanban: --survivor-unbound only relaxes the task-id binding on an explicit "
+            "--survivor-ref/--survivor-pr claim; pass one, or drop the flag.",
             file=sys.stderr,
         )
         return 2
@@ -3598,7 +3694,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            # A superseded close has no work for the judge to grade; gating it
+            # would push the worker back into exiting silently.
+            rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
             )
@@ -3611,15 +3709,23 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-                survivor_ref=survivor_ref,
-                survivor_pr=survivor_pr,
-            ):
+            try:
+                done = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    survivor_ref=survivor_ref,
+                    survivor_pr=survivor_pr,
+                    survivor_unbound=survivor_unbound,
+                    superseded_by=superseded_by,
+                )
+            except kb.EmptySupersedeError as supersede_err:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
+                continue
+            if not done:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -3859,6 +3965,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             reviewer=reviewer,
             expected_run_id=_worker_run_id_for(tid),
             force=bool(getattr(args, "force", False)),
+            allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
             with_reason=True,
         )
         if not ok:
@@ -4128,8 +4235,19 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     from hermes_cli.model_policy import route_kind
 
     if getattr(args, "json", False):
+        # The human-readable tick prints the awaiting-HUMAN detector below;
+        # without this key a JSON consumer is exactly as blind as it was
+        # before the detector existed. Same dry-run rule as the text path:
+        # report, but only arm/send on a real tick.
+        review_awaiting = _collect_review_awaiting_human(
+            alert=not args.dry_run
+        )
         print(json.dumps({
+            "review_awaiting_human": review_awaiting,
             "reclaimed": res.reclaimed,
+            "skipped_locked": res.skipped_locked,
+            "budget_paused": getattr(res, "budget_paused", False),
+            "lock_holder": res.lock_holder,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
             "stale": res.stale,
@@ -4152,6 +4270,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "spawned_unwatched": spawned_unwatched,
             "skipped_unassigned": res.skipped_unassigned,
+            "flagship_refused": res.flagship_refused,
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "stranded_by_triage": [
                 {"task_id": child, "parent_id": parent}
@@ -4189,12 +4308,28 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "collision_check_failed": getattr(
                 res, "collision_check_failed", []
             ),
+            "gate_auto_resolved": getattr(res, "gate_auto_resolved", []),
+            "gate_closed_unmerged": getattr(res, "gate_closed_unmerged", []),
         }, indent=2))
         return 0
+    if res.skipped_locked:
+        print(kb.format_dispatch_lock_skip(res.lock_holder))
+    if getattr(res, "budget_paused", False):
+        # Loud: otherwise a budget-paused board prints "Spawned: 0" and is
+        # byte-identical to an idle board — the exact false negative the
+        # stranded-by-triage banner exists to prevent.
+        print(
+            "BUDGET PAUSED — this board's rolling-window worker spend has "
+            "reached kanban.budget.usd_per_24h; no new workers spawned. "
+            "Details: hermes kanban budget"
+        )
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
+    print(f"Flagship refused: {len(res.flagship_refused)}")
+    if res.flagship_refused:
+        print(f"  {', '.join(res.flagship_refused)}")
     print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")
@@ -4205,6 +4340,18 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    gate_resolved = getattr(res, "gate_auto_resolved", [])
+    if gate_resolved:
+        print(
+            f"Gate auto-resolved (referenced PR(s) merged): "
+            f"{', '.join(gate_resolved)}"
+        )
+    gate_closed = getattr(res, "gate_closed_unmerged", [])
+    if gate_closed:
+        print(
+            "WARNING — gate PR closed WITHOUT merging; card left blocked for "
+            f"a human: {', '.join(gate_closed)}"
+        )
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
@@ -4273,11 +4420,109 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             )
     if res.skipped_nonspawnable:
         print(
-            f"Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"Skipped (non-spawnable assignee — HUMAN review required): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    # --dry-run is documented (and mandated by the incident runbook) as the
+    # SAFE probe, so it must not arm alerts or send: arming writes a durable
+    # review_stale_alerted event, and the send fires a real Discord message.
+    # The detector still PRINTS — that is the whole value of the line — it
+    # just stops mutating the board it is only supposed to observe.
+    _print_review_awaiting_human(alert=not args.dry_run)
     _print_stranded_by_triage(res.stranded_by_triage)
     return 0
+
+
+def _notify_script_path():
+    """Locate ``notify.py`` (the out-of-agent Discord/Telegram alert helper).
+
+    Resolved under the *running* Hermes root, never a hardcoded ``~/.hermes``.
+    These assets are root-level (shared across profiles), so
+    ``get_default_hermes_root()`` is the right resolver: it maps a profile home
+    ``<root>/profiles/<name>`` back to ``<root>`` while leaving a redirected
+    home (a sandbox, a hermetic test home, CI) pointing at itself. Hardcoding
+    the path made a sandboxed board fire a REAL alert to the live channel about
+    cards that do not exist on the real board.
+    """
+    root = get_default_hermes_root()
+    candidates = [
+        str(root / "scripts" / "notify.py"),
+        str(root / "skills-shared/general/scheduler/scripts/notify.py"),
+        str(root / "skills/devops/scheduler/scripts/notify.py"),
+    ]
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def _send_review_stale_alert(entries) -> None:
+    """Fire one #alerts message for cards that just crossed the threshold."""
+    script = _notify_script_path()
+    if script is None:
+        return
+    lines = [
+        f"  • {e['task_id']} → {e['assignee'] or '(unassigned)'} "
+        f"({e['age_minutes']}m, {e['reason']})"
+        for e in entries[:10]
+    ]
+    body = (
+        "🕰️ Kanban review lane awaiting a HUMAN\n"
+        + "\n".join(lines)
+        + "\nNo autonomous reviewer will pick these up. Reassign with: "
+        "hermes kanban assign <id> argus"
+    )
+    try:
+        subprocess.run(
+            [sys.executable, str(script), "--send", body, "--channel", "discord"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception:
+        pass
+
+
+def _collect_review_awaiting_human(*, alert: bool = True) -> list:
+    """Return review cards nothing will ever spawn; arm+send only if ``alert``.
+
+    Single owner of this detector's side-effect policy. Both the text tick and
+    the ``--json`` tick go through here, so the two surfaces cannot drift into
+    reporting different things — or into one of them writing when the other
+    does not. ``alert=False`` makes the call strictly read-only: no
+    ``review_stale_alerted`` event, no Discord send.
+    """
+    try:
+        with kb.connect_closing() as conn:
+            entries = kb.review_awaiting_human(conn)
+            if entries and alert:
+                fresh = kb.arm_review_stale_alerts(conn, entries)
+                if fresh:
+                    _send_review_stale_alert(fresh)
+            return entries
+    except Exception:
+        return []
+
+
+def _print_review_awaiting_human(*, alert: bool = True) -> None:
+    """Report review cards nothing will ever spawn, and alert once each.
+
+    Before this, the dispatcher printed those cards as "terminal lane, OK"
+    and there was no other signal — 10 cards sat in review (one 2h+) with
+    nothing raised (incident 2026-09-21).
+    """
+    entries = _collect_review_awaiting_human(alert=alert)
+    try:
+        line = kb.format_review_awaiting_human(entries)
+    except Exception:
+        return
+    if line:
+        print(line)
 
 
 def _print_stranded_by_triage(stranded) -> None:
@@ -4407,14 +4652,20 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
             or res.spawned or res.auto_blocked or res.stale
+            or res.parent_satisfied_sticky
         )
         if did_work:
+            sticky_ids = sorted(res.parent_satisfied_sticky)
+            sticky_summary = (
+                f"parents_done_sticky={len(sticky_ids)}"
+                + (f" ({', '.join(sticky_ids)})" if sticky_ids else "")
+            )
             print(
                 f"[{_fmt_ts(int(time.time()))}] "
                 f"reclaimed={res.reclaimed} crashed={len(res.crashed)} "
                 f"timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
-                f"auto_blocked={len(res.auto_blocked)}",
+                f"auto_blocked={len(res.auto_blocked)} {sticky_summary}",
                 flush=True,
             )
 
@@ -4503,6 +4754,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         stats = kb.board_stats(conn)
+        stats["review_awaiting_human"] = kb.review_awaiting_human(conn)
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
@@ -4544,6 +4796,9 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    line = kb.format_review_awaiting_human(stats.get("review_awaiting_human") or [])
+    if line:
+        print(f"\n{line}")
     return 0
 
 

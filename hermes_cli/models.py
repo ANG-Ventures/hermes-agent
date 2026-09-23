@@ -7,6 +7,7 @@ Add, remove, or reorder entries here — both `hermes setup` and
 
 from __future__ import annotations
 
+import collections.abc
 import copy
 import json
 import http.client
@@ -90,6 +91,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # Anthropic
     ("anthropic/claude-fable-5-1",             ""),
     ("anthropic/claude-fable-5",               ""),
+    ("anthropic/claude-opus-5-5",              ""),
+    ("anthropic/claude-opus-5-5-fast",         "2x price, higher output speed"),
     ("anthropic/claude-opus-5",                ""),
     ("anthropic/claude-opus-5-fast",           "2x price, higher output speed"),
     ("anthropic/claude-opus-4.8",              ""),
@@ -99,6 +102,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # OpenAI
     ("openai/gpt-6-astra",                     ""),
     ("openai/gpt-6-astra-pro",                 ""),
+    ("openai/gpt-6-sol",                       ""),
+    ("openai/gpt-6-luna",                      ""),
     ("openai/gpt-5.6-sol",                     ""),
     ("openai/gpt-5.6-sol-pro",                 ""),
     ("openai/gpt-5.6-terra",                   ""),
@@ -112,6 +117,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("google/gemini-3.1-pro-preview",          ""),
     ("google/gemini-3.7-flash",                ""),
     # xAI
+    ("x-ai/grok-4.7",                          ""),
     ("x-ai/grok-4.6",                          ""),
     ("x-ai/grok-4.5",                          ""),
     # DeepSeek
@@ -207,6 +213,7 @@ def _codex_curated_models() -> list[str]:
 # (grok-4, grok-4-0709, grok-4-fast{,-reasoning,-non-reasoning},
 #  grok-4-1-fast{,-reasoning,-non-reasoning}, grok-code-fast-1 → grok-4.3).
 _XAI_STATIC_FALLBACK: list[str] = [
+    "grok-4.7",
     "grok-4.6",
     "grok-build-0.1",
     "grok-4.6",
@@ -219,13 +226,14 @@ _XAI_STATIC_FALLBACK: list[str] = [
 
 # Callable via xAI OAuth but omitted from models.dev and /v1/models listings.
 _XAI_CURATED_EXTRAS: list[str] = [
+    "grok-4.7",  # GA 2026-09-21 — kept until the models.dev disk cache refreshes
     "grok-4.6",  # GA 2026-08-12 — kept until the models.dev disk cache refreshes
     "grok-4.5",  # GA 2026-07 — kept until the models.dev disk cache refreshes
     "grok-composer-2.5-fast",
 ]
 
 
-_XAI_TOP_MODEL = "grok-4.6"
+_XAI_TOP_MODEL = "grok-4.7"
 
 
 def _xai_promote_top(ids: list[str]) -> list[str]:
@@ -279,6 +287,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # Anthropic
         "anthropic/claude-fable-5-1",
         "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5-5",
         "anthropic/claude-opus-5",
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-5",
@@ -286,6 +295,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # OpenAI
         "openai/gpt-6-astra",
         "openai/gpt-6-astra-pro",
+        "openai/gpt-6-sol",
+        "openai/gpt-6-luna",
         "openai/gpt-5.6-sol",
         "openai/gpt-5.6-sol-pro",
         "openai/gpt-5.6-terra",
@@ -299,6 +310,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "google/gemini-3.1-pro-preview",
         "google/gemini-3.7-flash",
         # xAI
+        "x-ai/grok-4.7",
         "x-ai/grok-4.6",
         "x-ai/grok-4.5",
         # DeepSeek
@@ -344,6 +356,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "openai-api": [
         "gpt-6-astra",
         "gpt-6-astra-pro",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-sol-pro",
         "gpt-5.6-terra",
@@ -473,6 +487,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "anthropic": [
         "claude-fable-5-1",
         "claude-fable-5",
+        "claude-opus-5-5",
         "claude-opus-5",
         "claude-sonnet-5",
         "claude-opus-4-8",
@@ -551,6 +566,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-5-nano",
         "claude-fable-5-1",
         "claude-fable-5",
+        "claude-opus-5-5",
         "claude-opus-5",
         "claude-sonnet-5",
         "claude-opus-4-8",
@@ -1371,23 +1387,238 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
 # that is not already in the list above.  Adding plugins/model-providers/<name>/
 # is sufficient to expose a new provider in the model picker, /model, and all
 # downstream consumers — no edits to this file needed.
-_canonical_slugs = {p.slug for p in CANONICAL_PROVIDERS}
-try:
-    from providers import list_providers as _list_providers_for_canonical
-    for _pp in _list_providers_for_canonical():
-        if _pp.name in _canonical_slugs:
-            continue
-        if _pp.auth_type in {"oauth_device_code", "oauth_external", "external_process", "aws_sdk", "copilot", "vertex"}:
-            continue  # non-api-key flows need bespoke picker UX; skip auto-inject
-        _label = _pp.display_name or _pp.name
-        _desc = _pp.description or f"{_label} (direct API)"
-        CANONICAL_PROVIDERS.append(ProviderEntry(_pp.name, _label, _desc))
-        _canonical_slugs.add(_pp.name)
-except Exception:
-    pass
+#
+# This runs on the FIRST READ of CANONICAL_PROVIDERS (or of the dicts derived
+# from it), never during this module's own import.  ``providers.list_providers()``
+# imports every model-provider plugin, and plugins routinely do
+# ``from hermes_cli.models import _PROVIDER_MODELS, CANONICAL_PROVIDERS`` at
+# their own import time.  Running discovery inside this module's import handed
+# those plugins a *partially initialised* ``hermes_cli.models``: under a
+# models-first import order they got ``ImportError: cannot import name
+# 'CANONICAL_PROVIDERS' from partially initialized module``, and under a
+# discovery-first order the plugin's providers were missing from
+# ``CANONICAL_PROVIDERS`` entirely.  Deferring to first read means the module is
+# always fully initialised before any plugin can import it.
+_canonical_extend_lock = threading.RLock()
+_canonical_extended = False
+_canonical_extend_active = False
+
+
+def _extend_canonical_from_plugins() -> None:
+    """Idempotent, lazy auto-extend of :data:`CANONICAL_PROVIDERS`.
+
+    Safe to call from anywhere at any time after import; the first call does
+    the work and every later call is a no-op.  Never call this at this
+    module's import time — see the comment above.
+    """
+    global _canonical_extended, _canonical_extend_active
+    with _canonical_extend_lock:
+        if _canonical_extended:
+            return
+        if _canonical_extend_active:
+            # Re-entrant read: a plugin being imported by our own
+            # ``list_providers()`` call is reading CANONICAL_PROVIDERS. Hand it
+            # the (as-yet unextended) list instead of recursing — and do NOT
+            # latch the done flag, because the outer call has not finished
+            # discovery yet and still owes us the append pass.
+            return
+        try:
+            from providers import discovery_in_progress as _discovery_in_progress
+            if _discovery_in_progress():
+                # Someone else (not us) is mid-discovery and a plugin it is
+                # importing is reading CANONICAL_PROVIDERS. The registry is
+                # half-populated; serve the current list but do not latch, so
+                # the first read AFTER discovery completes still extends.
+                return
+        except Exception:
+            pass
+        _canonical_extend_active = True
+        added: list[ProviderEntry] = []
+        try:
+            from providers import list_providers as _list_providers_for_canonical
+            known = {p.slug for p in list.__iter__(CANONICAL_PROVIDERS)}
+            for _pp in _list_providers_for_canonical():
+                if _pp.name in known:
+                    continue
+                if _pp.auth_type in {"oauth_device_code", "oauth_external", "external_process", "aws_sdk", "copilot", "vertex"}:
+                    continue  # non-api-key flows need bespoke picker UX; skip auto-inject
+                _label = _pp.display_name or _pp.name
+                _desc = _pp.description or f"{_label} (direct API)"
+                entry = ProviderEntry(_pp.name, _label, _desc)
+                list.append(CANONICAL_PROVIDERS, entry)
+                known.add(_pp.name)
+                added.append(entry)
+        except Exception:
+            pass
+        finally:
+            _canonical_extend_active = False
+            _canonical_extended = True
+        if not added:
+            return
+        # Keep the derived surfaces in step. They are defined below this
+        # function in the module body but always exist by the time any read
+        # can reach here (reads are what trigger this call).
+        labels = globals().get("_PROVIDER_LABELS")
+        if labels is not None:
+            for entry in added:
+                dict.setdefault(labels, entry.slug, entry.label)
+        known_names = globals().get("_KNOWN_PROVIDER_NAMES")
+        if known_names is not None:
+            for entry in added:
+                known_names.add(entry.slug)
+
+
+def _ensure_canonical_extended() -> None:
+    if not _canonical_extended:
+        _extend_canonical_from_plugins()
+
+
+class _LazyCanonicalProviders(list):
+    """``list`` whose first read triggers the plugin auto-extend.
+
+    Exists so every existing reader (``for p in CANONICAL_PROVIDERS``,
+    ``len(...)``, ``enumerate(...)``, ``[...][i]``) keeps working unchanged
+    while discovery moves out of import time.
+    """
+
+    __slots__ = ()
+
+    def __iter__(self):
+        _ensure_canonical_extended()
+        return list.__iter__(self)
+
+    def __len__(self):
+        _ensure_canonical_extended()
+        return list.__len__(self)
+
+    def __getitem__(self, item):
+        _ensure_canonical_extended()
+        return list.__getitem__(self, item)
+
+    def __contains__(self, item):
+        _ensure_canonical_extended()
+        return list.__contains__(self, item)
+
+    def __reversed__(self):
+        _ensure_canonical_extended()
+        return list.__reversed__(self)
+
+    def __repr__(self):
+        _ensure_canonical_extended()
+        return list.__repr__(self)
+
+    def index(self, *args):
+        _ensure_canonical_extended()
+        return list.index(self, *args)
+
+    def count(self, item):
+        _ensure_canonical_extended()
+        return list.count(self, item)
+
+    def copy(self):
+        _ensure_canonical_extended()
+        return list(list.__iter__(self))
+
+
+class _LazyProviderLabels(dict):
+    """``dict`` whose first read triggers the plugin auto-extend."""
+
+    __slots__ = ()
+
+    def __iter__(self):
+        _ensure_canonical_extended()
+        return dict.__iter__(self)
+
+    def __len__(self):
+        _ensure_canonical_extended()
+        return dict.__len__(self)
+
+    def __getitem__(self, key) -> str:
+        _ensure_canonical_extended()
+        return dict.__getitem__(self, key)
+
+    def __contains__(self, key):
+        _ensure_canonical_extended()
+        return dict.__contains__(self, key)
+
+    def __repr__(self):
+        _ensure_canonical_extended()
+        return dict.__repr__(self)
+
+    def get(self, key, default=None):  # type: ignore[override]
+        _ensure_canonical_extended()
+        return dict.get(self, key, default)
+
+    def keys(self):
+        _ensure_canonical_extended()
+        return dict.keys(self)
+
+    def values(self):
+        _ensure_canonical_extended()
+        return dict.values(self)
+
+    def items(self):
+        _ensure_canonical_extended()
+        return dict.items(self)
+
+    def copy(self):
+        _ensure_canonical_extended()
+        return dict(dict.items(self))
+
+
+class _LazyKnownProviderNames(collections.abc.Set):
+    """Set of known provider names whose first read triggers the auto-extend.
+
+    Deliberately a ``collections.abc.Set`` and NOT a ``set`` subclass.
+    CPython's ``set_update_internal`` takes a ``PyAnySet_Check`` fast path
+    that copies a real set's hash table directly, so ``set(x)`` /
+    ``frozenset(x)`` / ``s.update(x)`` / ``s | x`` NEVER call a subclass's
+    ``__iter__`` — the lazy trigger would be silently skipped and the copy
+    would be missing every plugin-registered provider. (Measured: with a
+    ``set`` subclass, ``PROBE in set(_KNOWN_PROVIDER_NAMES)`` was False while
+    ``PROBE in _KNOWN_PROVIDER_NAMES`` was True.) ``dict`` does not have this
+    problem — ``dict_merge`` checks that ``tp_iter`` is unchanged — which is
+    why ``_LazyProviderLabels`` can stay a ``dict`` subclass.
+    """
+
+    __slots__ = ("_names",)
+
+    def __init__(self, names) -> None:
+        self._names: set[str] = set(names)
+
+    def _get(self) -> set[str]:
+        _ensure_canonical_extended()
+        return self._names
+
+    # -- the three abstract methods; every other Set operation derives from
+    #    these, so each one goes through the lazy trigger.
+    def __contains__(self, item) -> bool:
+        return item in self._get()
+
+    def __iter__(self):
+        return iter(self._get())
+
+    def __len__(self) -> int:
+        return len(self._get())
+
+    def __repr__(self) -> str:
+        return repr(self._get())
+
+    def add(self, item: str) -> None:
+        """Used by the auto-extend to fold in a newly discovered provider."""
+        self._names.add(item)
+
+    def copy(self) -> set[str]:
+        return set(self._get())
+
+
+
+CANONICAL_PROVIDERS = _LazyCanonicalProviders(CANONICAL_PROVIDERS)
 
 # Derived dicts — used throughout the codebase
-_PROVIDER_LABELS = {p.slug: p.label for p in CANONICAL_PROVIDERS}
+_PROVIDER_LABELS = _LazyProviderLabels(
+    {p.slug: p.label for p in list.__iter__(CANONICAL_PROVIDERS)}
+)
 _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
 
 
@@ -2831,8 +3062,10 @@ def _fetch_novita_pricing(
 
 
 # All provider IDs and aliases that are valid for the provider:model syntax.
-_KNOWN_PROVIDER_NAMES: set[str] = (
-    set(_PROVIDER_LABELS.keys())
+# Lazy for the same reason as CANONICAL_PROVIDERS: it derives from
+# _PROVIDER_LABELS, which the plugin auto-extend tops up on first read.
+_KNOWN_PROVIDER_NAMES: collections.abc.Set[str] = _LazyKnownProviderNames(
+    set(dict.keys(_PROVIDER_LABELS))
     | set(_PROVIDER_ALIASES.keys())
     | {"openrouter", "custom"}
 )

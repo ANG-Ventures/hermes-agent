@@ -41,7 +41,7 @@ def test_review_tools_redact_handoff_and_route_changes(
         tools._handle_request_review({
             "summary": f"Ready; temporary token was {secret}",
             "metadata": {"token": secret, "tests_run": 7},
-            "reviewer": "reviewer",
+            "reviewer": "argus",
         })
     )
     assert requested["ok"] is True
@@ -50,7 +50,7 @@ def test_review_tools_redact_handoff_and_route_changes(
         task = kb.get_task(conn, review_worker)
         assert task is not None
         assert task.status == "review"
-        assert task.assignee == "reviewer"
+        assert task.assignee == "argus"
         handoff = kb.latest_run(conn, review_worker)
         assert handoff is not None
         assert secret not in (handoff.summary or "")
@@ -58,7 +58,7 @@ def test_review_tools_redact_handoff_and_route_changes(
         review = kb.claim_review_task(conn, review_worker, claimer="reviewer:1")
         assert review is not None
 
-    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_PROFILE", "argus")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
     change_secret = "sk-" + "B" * 32
     changed = json.loads(
@@ -133,14 +133,14 @@ def test_review_cli_round_trip_preserves_handoff(
 
     output = kc.run_slash(
         f"request-review {task_id} --summary 'ready for review' "
-        "--reviewer reviewer --metadata '{\"tests_run\": 3}'"
+        "--reviewer argus --metadata '{\"tests_run\": 3}'"
     )
     assert "Requested review" in output
 
     with kb.connect() as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert task.assignee == "reviewer"
+        assert task.assignee == "argus"
         handoff = kb.latest_run(conn, task_id)
         assert handoff is not None
         assert handoff.metadata == {"tests_run": 3}
@@ -401,7 +401,7 @@ def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
         child_id = kb.create_task(
             conn,
             title="Review",
-            assignee="reviewer",
+            assignee="argus",
             parents=[parent_id],
         )
         parent = kb.claim_task(conn, parent_id, claimer="builder:1")

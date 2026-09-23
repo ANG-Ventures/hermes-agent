@@ -1,6 +1,7 @@
 """Tests for hermes_cli.cron command handling."""
 
 import argparse
+import json
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -144,6 +145,49 @@ class TestGatewayNotRunningWarning:
         cron_command(Namespace(cron_command="list", all=True))
         out = capsys.readouterr().out
         assert "Gateway is not running" in out
+
+
+    def test_create_remove_and_status_use_lifecycle_guard(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        """Drive create/remove/status through the public ``hermes cron`` path."""
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        create_args = parser.parse_args([
+            "cron", "create", "every 1h", "Lifecycle probe",
+            "--name", "Lifecycle probe",
+        ])
+        assert cron_command(create_args) == 0
+        [job] = list_jobs(include_disabled=True)
+
+        remove_args = parser.parse_args(["cron", "remove", job["id"]])
+        assert cron_command(remove_args) == 0
+
+        journal_path = tmp_cron_dir / "cron" / "lifecycle.jsonl"
+        records = [json.loads(line) for line in journal_path.read_text().splitlines()]
+        assert [(record["event"], record["job_id"]) for record in records] == [
+            ("created", job["id"]),
+            ("removed", job["id"]),
+        ]
+
+        with journal_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "at": records[-1]["at"],
+                "event": "unknown-event",
+                "job_id": job["id"],
+            }) + "\n")
+
+        monkeypatch.setattr(
+            "hermes_cli.cron._active_cron_provider_name", lambda: "chronos"
+        )
+        capsys.readouterr()
+        status_args = parser.parse_args(["cron", "status"])
+        assert cron_command(status_args) == 0
+        output = capsys.readouterr().out
+        assert "vanished-job guard UNAVAILABLE" in output
+        assert "no losses detected" not in output
 
 
 class TestExternalCronProviderStatus:

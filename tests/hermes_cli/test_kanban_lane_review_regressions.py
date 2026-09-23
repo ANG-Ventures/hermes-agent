@@ -98,7 +98,7 @@ def test_card_alias_to_flagship_requires_firepower(kanban_home, route_arg):
         config.write('model:\n  aliases:\n    astra: batch-provider/gpt-6-astra-900k\n')
     card = _create('alias', 'worker')
     out = kc.run_slash(f'set-model {card} {route_arg}')
-    assert 'firepower-only' in out
+    assert 'orchestrator-only' in out
     with kb.connect() as conn:
         assert kb.get_task(conn, card).model_override is None
         assert kb.list_comments(conn, card) == []
@@ -107,7 +107,8 @@ def test_card_alias_to_flagship_requires_firepower(kanban_home, route_arg):
     assert 'gpt-6-astra-900k' in out
     with kb.connect() as conn:
         assert kb.get_task(conn, card).model_override == 'gpt-6-astra-900k'
-        assert 'batch-provider/gpt-6-astra-900k' in kb.list_comments(conn, card)[0].body
+        # Main's comment contract (what the dispatcher gate authorizes on).
+        assert kb.list_comments(conn, card)[0].body == 'flagship override: urgent task'
 
 
 @pytest.mark.parametrize('route_arg', [
@@ -119,7 +120,7 @@ def test_lane_alias_to_flagship_requires_firepower(kanban_home, route_arg):
     with (kanban_home / 'config.yaml').open('a') as config:
         config.write('model:\n  aliases:\n    astra: batch-provider/gpt-6-astra-900k\n')
     out = kc.run_slash(f'lane-model set {route_arg} --reason capacity')
-    assert 'firepower-only' in out
+    assert 'orchestrator-only' in out
     with kb.connect() as conn:
         assert kb.get_lane_model_override(conn) is None
     if '--model-json' in route_arg:
@@ -142,14 +143,15 @@ def test_provider_only_alias_in_profile_requires_firepower(kanban_home):
     (profile / 'config.yaml').write_text('model:\n  provider: batch-provider\n  default: astra\n')
     card = _create('provider-only alias', 'worker')
     out = kc.run_slash(f'set-model {card} --provider batch-provider')
-    assert 'firepower-only' in out
+    assert 'orchestrator-only' in out
     with kb.connect() as conn:
         assert kb.get_task(conn, card).model_override is None
     out = kc.run_slash(f'set-model {card} --provider batch-provider --firepower "urgent task"')
     assert 'gpt-6-astra-900k' in out
     with kb.connect() as conn:
         assert kb.get_task(conn, card).model_override == 'gpt-6-astra-900k'
-        assert 'batch-provider/gpt-6-astra-900k' in kb.list_comments(conn, card)[0].body
+        # Main's comment contract (what the dispatcher gate authorizes on).
+        assert kb.list_comments(conn, card)[0].body == 'flagship override: urgent task'
 
 
 def test_lane_reason_and_effort_round_trip(kanban_home):

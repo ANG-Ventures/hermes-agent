@@ -51,7 +51,9 @@ def test_create_refuses_flagship_without_firepower_reason(kanban_home):
         "create 'expensive task' --assignee worker "
         "--model gpt-6-astra-900k --provider openai-codex"
     )
-    assert "--firepower" in output
+    # create is main's #823 path: its message names --allow-flagship
+    # (--firepower is an argparse alias for the same dest).
+    assert "--allow-flagship" in output
     with kb.connect() as conn:
         count = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
     assert count == 0
@@ -71,7 +73,8 @@ def test_create_accepts_flagship_and_appends_audit_comment(kanban_home):
     assert task.model_override == "gpt-6-astra-900k"
     assert len(comments) == 1
     assert reason in comments[0].body
-    assert "openai-codex/gpt-6-astra-900k" in comments[0].body
+    # The dispatcher's flagship gate authorizes on exactly this prefix.
+    assert comments[0].body.startswith("flagship override:")
 
 
 def test_create_rolls_back_if_firepower_audit_comment_fails(
@@ -149,11 +152,52 @@ def test_set_model_rolls_back_if_firepower_audit_comment_fails(
                 "gpt-6-astra-900k",
                 provider="openai-codex",
                 audit_comment_author="operator",
-                audit_comment_body="firepower override: reason=hard recovery",
+                audit_comment_body="flagship override: reason=hard recovery",
             )
         task = kb.get_task(conn, task_id)
     assert task is not None
     assert task.model_override == "gpt-5.6-sol-900k"
+
+
+def test_db_layer_refuses_flagship_route_without_dispatch_authorizing_comment(
+    kanban_home,
+):
+    """A route the DB writes must never be one the dispatcher then refuses.
+
+    main's dispatcher gate (``flagship_refused``) only accepts a
+    ``flagship override:`` comment, so the batch/lane writer requires exactly
+    that prefix rather than any free-text audit body.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="t", assignee="worker")
+        with pytest.raises(ValueError, match="orchestrator-only"):
+            kb.apply_batch_route_writes(conn, [kb.BatchRouteWrite(
+                task_id=task_id, touch_model=True, model="gpt-6-astra-900k",
+                provider="openai-codex", audit_comment_author="op",
+                audit_comment_body="some other note",
+            )])
+        with pytest.raises(ValueError, match="orchestrator-only"):
+            kb.set_model_override(conn, task_id, "gpt-6-astra-900k")
+        assert kb.get_task(conn, task_id).model_override is None
+        assert kb.list_comments(conn, task_id) == []
+
+
+def test_batch_flagship_route_passes_main_dispatch_gate(kanban_home):
+    """set-model --where with --firepower yields a card main's gate admits."""
+    with kb.connect() as conn:
+        ids = [kb.create_task(conn, title=f"c{i}", assignee="worker") for i in range(2)]
+    out = kc.run_slash(
+        "set-model gpt-6-astra-900k --where assignee=worker "
+        "--firepower 'capacity incident'"
+    )
+    for task_id in ids:
+        assert f"{task_id}: route=gpt-6-astra-900k" in out, out
+    with kb.connect() as conn:
+        res = kb.dispatch_once(conn, dry_run=True)
+        for task_id in ids:
+            bodies = [c.body for c in kb.list_comments(conn, task_id)]
+            assert any(b.startswith("flagship override:") for b in bodies), bodies
+    assert not (set(res.flagship_refused) & set(ids)), res.flagship_refused
 
 
 def test_effective_worker_route_reads_profile_default(kanban_home):

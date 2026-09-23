@@ -921,6 +921,24 @@ class SessionEntry:
     resume_handoff: Optional[str] = None
     resume_request_id: Optional[str] = None
 
+    # Durable "the user ended this turn with /stop" marker.
+    #
+    # An interrupted turn ALWAYS auto-resumes after a gateway restart — except
+    # one the user killed, which must NEVER resume (ruling 2026-09-21). The
+    # boot gate previously judged only the persisted transcript tail, and a
+    # /stop'd turn cut mid-tool-call is indistinguishable from an amputated
+    # one, so it was re-prompted (2026-09-20 incident). These fields are the
+    # explicit evidence the tail cannot carry.
+    #
+    # ``user_stopped_message_id`` is the transcript rowid at stop time; the
+    # marker is superseded by the next non-empty USER row ABOVE that id rather
+    # than by a clock, so it survives skew and a missed clear. ``boot_id``
+    # is diagnostic only — a stop is honoured across boots, which is the
+    # whole point of persisting it.
+    user_stopped_at: Optional[datetime] = None
+    user_stopped_boot_id: Optional[str] = None
+    user_stopped_message_id: Optional[int] = None
+
     # Session-scoped /reasoning override persisted so it survives a gateway
     # restart (the harness event the user didn't cause) — the in-memory
     # GatewayRunner._session_reasoning_overrides dict is otherwise lost on
@@ -1005,6 +1023,11 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "user_stopped_at": (
+                self.user_stopped_at.isoformat() if self.user_stopped_at else None
+            ),
+            "user_stopped_boot_id": self.user_stopped_boot_id,
+            "user_stopped_message_id": self.user_stopped_message_id,
             "active_turn_token": self.active_turn_token,
             "active_turn_started_at": (
                 self.active_turn_started_at.isoformat()
@@ -1052,6 +1075,20 @@ class SessionEntry:
                 last_resume_marked_at = datetime.fromisoformat(_lrma)
             except (TypeError, ValueError):
                 last_resume_marked_at = None
+
+        user_stopped_at = None
+        _usa = data.get("user_stopped_at")
+        if _usa:
+            try:
+                user_stopped_at = datetime.fromisoformat(_usa)
+            except (TypeError, ValueError):
+                user_stopped_at = None
+
+        _usmid = data.get("user_stopped_message_id")
+        if isinstance(_usmid, bool) or not isinstance(_usmid, int) or _usmid < 0:
+            user_stopped_message_id = None
+        else:
+            user_stopped_message_id = _usmid
 
         active_turn_started_at = None
         _atsa = data.get("active_turn_started_at")
@@ -1128,6 +1165,13 @@ class SessionEntry:
             resume_handoff=data.get("resume_handoff"),
             resume_request_id=data.get("resume_request_id"),
             last_resume_marked_at=last_resume_marked_at,
+            user_stopped_at=user_stopped_at,
+            user_stopped_boot_id=(
+                data.get("user_stopped_boot_id")
+                if isinstance(data.get("user_stopped_boot_id"), str)
+                else None
+            ),
+            user_stopped_message_id=user_stopped_message_id,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
@@ -4130,7 +4174,11 @@ class SessionStore:
                     marker_is_stale = True
 
                 if not marker_is_stale and not entry.suspended:
-                    if entry.resume_pending:
+                    if entry.user_stopped_at is not None:
+                        # The user killed this turn on purpose; a crash marker
+                        # left behind by the same stop must not revive it.
+                        pass
+                    elif entry.resume_pending:
                         # A drain-timeout marker is more specific than the
                         # generic crash reason; preserve it and its freshness.
                         if entry.last_resume_marked_at is None:
@@ -4228,6 +4276,19 @@ class SessionStore:
         # Never override explicit suspension (/stop or breaker escalation).
         if entry is None or entry.suspended:
             return False
+        # Nor re-arm a turn the user ended with /stop. Every hedge mark flows
+        # through here — the pre-drain shutdown mark, the dropbox sweep, the
+        # crash-recovery promotion — so one guard at the write path covers the
+        # whole class instead of each caller remembering. The marker itself is
+        # retired by the next real user message (``clear_user_stopped``), so a
+        # stopped session that the user resumes by hand marks normally again.
+        if entry.user_stopped_at is not None:
+            logger.info(
+                "Refusing resume mark for /stop'd session %s (reason=%s)",
+                session_key,
+                reason,
+            )
+            return False
         entry.resume_pending = True
         entry.resume_reason = reason
         entry.resume_kind = resume_kind
@@ -4293,6 +4354,65 @@ class SessionStore:
         entry.resume_handoff = None
         entry.resume_request_id = None
         entry.last_resume_marked_at = None
+
+    def mark_user_stopped(
+        self,
+        session_key: str,
+        *,
+        boot_id: Optional[str] = None,
+        last_message_id: Optional[int] = None,
+    ) -> bool:
+        """Persist "the user ended this turn with /stop" and retire the hedge.
+
+        Durability is the whole point: the marker must be on disk before
+        ``/stop`` acknowledges, or a SIGKILL in that window leaves a stopped
+        turn looking exactly like an interrupted one and the next boot
+        re-prompts it. ``_save`` writes state.db (and the sessions.json
+        mirror) synchronously here, so the write happens before the caller
+        can reply.
+
+        ``resume_pending`` is cleared in the same critical section: a stop
+        consumes restart-recovery intent, and leaving the two markers to be
+        cleared by separate calls opens a window where a crash persists a
+        resume-pending session with no stop marker.
+
+        Returns True when a session existed and was marked.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            entry.user_stopped_at = _now()
+            entry.user_stopped_boot_id = boot_id
+            entry.user_stopped_message_id = (
+                last_message_id
+                if isinstance(last_message_id, int)
+                and not isinstance(last_message_id, bool)
+                and last_message_id >= 0
+                else None
+            )
+            self._clear_resume_pending_entry(entry)
+            self._save()
+        return True
+
+    def clear_user_stopped(self, session_key: str) -> bool:
+        """Retire the ``/stop`` marker once the user speaks again.
+
+        Called when a real inbound user message lands. The boot gate also
+        supersedes the marker by rowid, so this clear is an optimisation that
+        keeps the entry tidy, not the mechanism the correctness rests on.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.user_stopped_at is None:
+                return False
+            entry.user_stopped_at = None
+            entry.user_stopped_boot_id = None
+            entry.user_stopped_message_id = None
+            self._save()
+            return True
 
     def clear_stale_resume_pending(self, max_age_seconds: float) -> int:
         """Clear stale recovery markers without dropping session entries.
@@ -4410,6 +4530,12 @@ class SessionStore:
             self._ensure_loaded_locked()
             for entry in self._entries.values():
                 if entry.resume_pending:
+                    continue
+                if entry.user_stopped_at is not None:
+                    # A /stop'd turn is never auto-resumed (ruling 2026-09-21).
+                    # This wholesale post-crash re-mark is precisely the path
+                    # that made a stopped session indistinguishable from an
+                    # interrupted one on the next boot.
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
                     entry.resume_pending = True

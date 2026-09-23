@@ -70,7 +70,25 @@ SYSTEMD_TIMEOUT_STOP_SEC_FLOOR = 60.0
 # ``restart_drain_timeout: 180`` vs live 60 → SIGKILL at +60s on every
 # busy restart).
 LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S = 60
-LAUNCHD_STOP_CLEANUP_RESERVE_S = 10.0
+LAUNCHD_STOP_CLEANUP_RESERVE_S = 15.0
+LAUNCHD_HARD_EXIT_RESERVE_S = 10.0
+
+# Fallback reserve for a live ``ExitTimeOut`` too small to afford the fixed
+# ``LAUNCHD_HARD_EXIT_RESERVE_S``. Subtracting the fixed reserve from such a
+# budget yields a near-zero or zero-second watchdog, i.e. hard-exit the
+# instant shutdown starts — no drain, no persistence, strictly worse than
+# the SIGKILL it is avoiding. A short budget keeps the same shape (most of
+# it for work, a slice held back for launchd) at proportional scale.
+#
+# The reserve is ``min(fixed, budget * FRACTION)``, which makes the armed
+# window ``max(budget - fixed, budget * (1 - FRACTION))`` — continuous and
+# monotonically non-decreasing in the budget, so a larger ExitTimeOut can
+# never arm a smaller window. The two branches cross at
+# ``LAUNCHD_HARD_EXIT_RESERVE_S / FRACTION``; 1/3 puts that crossover at 30,
+# the smallest clamp launchd actually hands out, so every production clamp
+# (30, 60) keeps the full fixed reserve and only genuinely tiny budgets
+# scale.
+LAUNCHD_SHORT_BUDGET_RESERVE_FRACTION = 1.0 / 3.0
 
 _LAUNCHD_EXIT_TIMEOUT_RE = re.compile(r"^\s*exit timeout\s*=\s*(\d+)\s*$", re.MULTILINE)
 
@@ -141,17 +159,26 @@ def resolve_launchd_capped_drain(
     launchd_exit_timeout_s: float | None,
     *,
     cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
+    last_teardown_s: float | None = None,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
 ) -> float:
     """Clamp a SIGTERM-driven stop drain to what launchd will actually allow.
 
     ``launchd_exit_timeout_s`` is the live ``exit timeout`` for this job (see
     :func:`read_launchd_exit_timeout_s`); ``None`` means no launchd budget
-    applies and the configured drain is returned untouched. Otherwise the
-    drain may use at most ``exit_timeout - cleanup_reserve_s`` so the
-    post-drain teardown (interrupt agents, disconnect adapters, checkpoint
-    and close SQLite) still completes before launchd escalates to SIGKILL.
-    Never *extends* the drain — an operator who configured a short one
-    keeps it.
+    applies and the configured drain is returned untouched. Never *extends*
+    the drain — an operator who configured a short one keeps it.
+
+    The two reserves are ADDITIVE, not overlapping. The process does not run
+    until launchd's SIGKILL at ``exit_timeout``; the shutdown watchdog
+    hard-exits ``hard_exit_reserve_s`` earlier (see
+    :func:`resolve_launchd_shutdown_watchdog_delay`). Sizing the teardown
+    window against the SIGKILL wall therefore over-promises by exactly that
+    reserve — at clamp 60 a 45s drain left only 5s before os._exit for a
+    teardown allocated 15s, and a recorded 22s teardown got 12s. The drain
+    may use at most ``exit_timeout - hard_exit_reserve_s -
+    max(cleanup_reserve_s, last_teardown_s)`` so the teardown completes
+    before the hard exit that actually fires.
     """
 
     def _seconds(value: object) -> float:
@@ -169,8 +196,282 @@ def resolve_launchd_capped_drain(
         return drain
     if budget <= 0.0:
         return drain
-    cap = max(budget - _seconds(cleanup_reserve_s), 0.0)
+    hard_exit = resolve_launchd_shutdown_watchdog_delay(
+        budget,
+        budget,
+        signal_driven=True,
+        hard_exit_reserve_s=hard_exit_reserve_s,
+    )
+    # Bound the measured sample HERE, not only at the ledger read, so no
+    # caller can starve the drain by handing in an oversized reserve. The
+    # reader filters what it loads from disk, but `last_teardown_s` also
+    # arrives through `effective_stop_drain_timeout` from a runner
+    # attribute, and a sample at or above the actionable ceiling zeroes the
+    # drain — dropping every in-flight session with no drain at all while
+    # still not making the teardown fit. Falling back to the fixed cleanup
+    # reserve is the honest answer: the teardown cannot be reserved for.
+    ceiling = resolve_max_actionable_teardown_reserve_s(
+        budget, hard_exit_reserve_s=hard_exit_reserve_s
+    )
+    measured = _seconds(last_teardown_s)
+    if ceiling is not None and measured >= ceiling:
+        measured = 0.0
+    reserve = max(_seconds(cleanup_reserve_s), measured)
+    cap = max(hard_exit - reserve, 0.0)
     return min(drain, cap)
+
+
+def resolve_launchd_shutdown_watchdog_delay(
+    watchdog_delay_s: float,
+    launchd_exit_timeout_s: float | None,
+    *,
+    signal_driven: bool,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
+) -> float:
+    """Return the hard-exit deadline for a launchd-timed shutdown.
+
+    Signal-driven shutdown must stop itself before launchd's uncatchable
+    SIGKILL. The final reserve leaves launchd headroom even when persistence
+    or adapter teardown wedges. Other shutdown paths keep their normal
+    watchdog leash.
+
+    When the live budget is at or below the fixed reserve (a short but valid
+    ``ExitTimeOut`` such as 8s), subtracting it outright would return zero —
+    hard-exiting the instant shutdown starts, skipping all drain *and*
+    persistence rather than using the time that genuinely exists. Short
+    budgets therefore fall back to a proportional reserve, keeping a real
+    persistence window on the near side of SIGKILL.
+    """
+    try:
+        watchdog = max(float(watchdog_delay_s), 0.0)
+    except (TypeError, ValueError):
+        watchdog = 0.0
+    if not signal_driven or launchd_exit_timeout_s is None:
+        return watchdog
+    try:
+        launchd_budget = float(launchd_exit_timeout_s)
+        reserve = max(float(hard_exit_reserve_s), 0.0)
+    except (TypeError, ValueError):
+        return watchdog
+    if launchd_budget <= 0.0:
+        return watchdog
+    # The reserve must never consume more of the budget than the
+    # proportional fallback would, or a LARGER ExitTimeOut arms a SMALLER
+    # window. Gating on ``reserve >= launchd_budget`` left a cliff just
+    # above the reserve (budget 10 -> 7.5s armed, but 11 -> 1.0s, 12 ->
+    # 2.0s); FleetReview's proposed ``budget - reserve < budget * FRACTION``
+    # gate only MOVES that cliff (measured with FRACTION=0.25: budget 13.33
+    # -> 9.9975s armed, 13.34 -> 3.34s). A 1s watchdog calls os._exit one
+    # second into the stop — before the drain, before agents are
+    # interrupted, before the SQLite checkpoint — which is the silent-loss
+    # outcome this fallback exists to prevent, and strictly worse than
+    # letting launchd escalate at the full budget.
+    #
+    # Taking the SMALLER of the two reserves makes the armed window
+    # ``max(budget - fixed, budget * (1 - FRACTION))``: continuous, and
+    # monotonically non-decreasing in the budget (verified over 0.02..80.00
+    # in 0.01 steps). Every production clamp is above the crossover, so this
+    # is inert there — clamp 30 -> 20.0, clamp 60 -> 50.0, unchanged.
+    reserve = min(reserve, launchd_budget * LAUNCHD_SHORT_BUDGET_RESERVE_FRACTION)
+    return min(watchdog, max(launchd_budget - reserve, 0.0))
+
+
+def resolve_max_actionable_teardown_reserve_s(
+    launchd_exit_timeout_s: float | None,
+    *,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
+) -> float | None:
+    """Largest teardown sample worth reserving for under a live budget.
+
+    The teardown reserve is carved out of the drain, so it is bounded by
+    the span between the start of the stop and the hard exit:
+    ``exit_timeout - hard_exit_reserve_s``. A recorded sample at or above
+    that ceiling cannot be honoured — the drain is already zero there — so
+    treating it as the reserve buys nothing and costs every in-flight
+    session its drain.
+
+    This is the ONLY bound applied to the sample. The watchdog grace is
+    deliberately NOT a ceiling here: when the grace is the tighter of the
+    two, the right response is to widen the leash to the reserve (see
+    :func:`resolve_armed_shutdown_watchdog_delay`), not to discard the
+    measurement. Discarding it collapses the promise to the fixed 15s
+    cleanup reserve, which is strictly worse than the measurement it
+    replaces — at clamp 120 / configured 180 / measured 65 a grace-bounded
+    ceiling rejected the sample, giving drain 95 and a 15s window for a
+    teardown known to take 65s.
+
+    Returns ``None`` when no launchd budget applies, meaning "no ceiling":
+    an unsupervised stop is not racing a SIGKILL.
+    """
+    if launchd_exit_timeout_s is None:
+        return None
+    try:
+        budget = float(launchd_exit_timeout_s)
+    except (TypeError, ValueError):
+        return None
+    if not (budget > 0.0):
+        return None
+    return resolve_launchd_shutdown_watchdog_delay(
+        budget,
+        budget,
+        signal_driven=True,
+        hard_exit_reserve_s=hard_exit_reserve_s,
+    )
+
+
+def resolve_armed_shutdown_watchdog_delay(
+    drain_timeout: float,
+    launchd_exit_timeout_s: float | None,
+    *,
+    signal_driven: bool,
+    last_teardown_s: float | None = None,
+    cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
+    grace_s: float | None = None,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
+) -> float:
+    """Wall-clock deadline the shutdown watchdog is actually armed with.
+
+    The single source of truth for the two-step arming the stop path
+    performs: an inner leash of ``drain + leash`` (see
+    :func:`gateway.shutdown_watchdog.resolve_shutdown_watchdog_delay`),
+    then :func:`resolve_launchd_shutdown_watchdog_delay` to pull it back
+    inside launchd's budget.
+
+    Extracted so the reserve invariant can be measured against the
+    expression ``gateway.run`` really arms, rather than a copy of it
+    re-derived in a test. The grace is large (60s by default), so at the
+    production clamp (60, gui-domain-clamped) the inner leash loses the
+    ``min()`` and the armed deadline is
+    ``exit_timeout - hard_exit_reserve_s`` — exactly what
+    :func:`resolve_launchd_capped_drain` sizes the teardown window against.
+
+    The leash is ``max(grace, reserve)``, not the bare grace. On a clamp
+    high enough for the inner term to bind (system-domain launchd is not
+    gui-clamped to 60), a measured teardown ABOVE the grace would otherwise
+    be promised a window the watchdog cuts short: at clamp 300 /
+    configured 180 / measured 70 the grace-only leash armed at 240 for a
+    drain of 180 — a 60s window for a 70s reserve. Widening the leash to
+    the reserve honours the measurement instead of discarding it, and it
+    can never push the deadline past the hard exit because the outer
+    ``min()`` still binds.
+    """
+    from gateway.shutdown_watchdog import (
+        DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S,
+        resolve_shutdown_watchdog_delay,
+    )
+
+    def _seconds(value: object) -> float:
+        try:
+            return max(float(value), 0.0)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
+
+    grace = DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S if grace_s is None else grace_s
+    reserve = max(_seconds(cleanup_reserve_s), _seconds(last_teardown_s))
+    leash = max(_seconds(grace), reserve)
+    return resolve_launchd_shutdown_watchdog_delay(
+        resolve_shutdown_watchdog_delay(drain_timeout, grace_s=leash),
+        launchd_exit_timeout_s,
+        signal_driven=signal_driven,
+        hard_exit_reserve_s=hard_exit_reserve_s,
+    )
+
+
+def resolve_elapsed_adjusted_drain(
+    drain_timeout: float,
+    launchd_exit_timeout_s: float | None,
+    *,
+    signal_driven: bool,
+    elapsed_s: float,
+    cleanup_reserve_s: float = LAUNCHD_STOP_CLEANUP_RESERVE_S,
+    last_teardown_s: float | None = None,
+    hard_exit_reserve_s: float = LAUNCHD_HARD_EXIT_RESERVE_S,
+) -> float:
+    """Fit a launchd-timed drain inside the deadline the pre-drain phases left.
+
+    THE ONE DEADLINE FORMULA for this seam. Every budget on the launchd
+    stop path derives from it; do not re-derive a variant at a call site.
+
+    ``stop()`` runs against an ABSOLUTE wall measured from its own start:
+    launchd SIGKILLs at ``exit_timeout``, the watchdog hard-exits
+    ``hard_exit_reserve_s`` earlier, and the teardown needs
+    ``max(cleanup_reserve_s, last_teardown_s)`` before that. So the drain
+    must simply FINISH by::
+
+        deadline = exit_timeout - hard_exit_reserve_s - teardown_reserve
+
+    The drain does not start at zero — it starts at ``elapsed_s``, after
+    the pre-drain phases: secondary-profile reconnect cancellation (up to
+    the adapter disconnect timeout), the per-session shutdown
+    notifications (a sequential ``await adapter.send`` each, no per-send
+    timeout), the boot-resume cancellation and the pre-drain
+    ``resume_pending`` marking (SQLite writes plus notify sends). What
+    remains for it is therefore ``deadline - elapsed_s``, and the drain
+    is whichever of that and the configured budget is SMALLER::
+
+        drain = min(configured_drain, deadline - elapsed_s)
+
+    Worked examples at the production clamp (60), ``hard_exit_reserve_s``
+    10, teardown reserve 15 -> ``deadline`` 35:
+
+    * configured 45, elapsed 12 -> ``min(45, 35 - 12)`` = **23**. The
+      deadline binds; the elapsed genuinely costs the drain.
+    * configured 20, elapsed 12 -> ``min(20, 35 - 12)`` = **20**, NOT
+      ``20 - 12`` = 8. The operator's 20s still fits (12 + 20 = 32 <= 35),
+      so it stands in full.
+
+    That second row is the bug this replaced. Subtracting the elapsed
+    from the drain unconditionally treats the launchd budget as a mere
+    boolean gate and charges the elapsed twice whenever the configured
+    drain already fits in the remaining window — dropping in-flight
+    sessions early while the supervisor window sits idle (measured over
+    43,920 geometries: 41.5% over-subtracted, worst case 60s of drain
+    discarded at clamp 300). Taking the ``min`` keeps the teardown
+    reserve exactly as honest while never spending headroom that exists.
+
+    Only applies to launchd-timed signal stops: every other path has no
+    absolute supervisor deadline to preserve headroom against, so its
+    configured drain stands untouched. The cron branch does the
+    equivalent via ``resolve_cron_drain_budget(elapsed=...)``.
+    """
+
+    def _seconds(value: object) -> float:
+        try:
+            return max(float(value), 0.0)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
+
+    drain = _seconds(drain_timeout)
+    if not signal_driven or launchd_exit_timeout_s is None:
+        return drain
+    try:
+        budget = float(launchd_exit_timeout_s)
+    except (TypeError, ValueError):
+        return drain
+    if budget <= 0.0:
+        return drain
+    # Fail open on an unreadable elapsed: the whole point of the deadline is
+    # to spend a KNOWN pre-drain cost. With no usable reading there is
+    # nothing to charge, and silently fitting the drain to the bare deadline
+    # would shorten it on a measurement fault rather than a real cost.
+    try:
+        elapsed = max(float(elapsed_s), 0.0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return drain
+    hard_exit = resolve_launchd_shutdown_watchdog_delay(
+        budget, budget, signal_driven=True, hard_exit_reserve_s=hard_exit_reserve_s
+    )
+    # Same actionable-ceiling filter `resolve_launchd_capped_drain` applies,
+    # so an oversized recorded sample cannot zero the deadline here either.
+    ceiling = resolve_max_actionable_teardown_reserve_s(
+        budget, hard_exit_reserve_s=hard_exit_reserve_s
+    )
+    measured = _seconds(last_teardown_s)
+    if ceiling is not None and measured >= ceiling:
+        measured = 0.0
+    reserve = max(_seconds(cleanup_reserve_s), measured)
+    deadline = max(hard_exit - reserve, 0.0)
+    return max(min(drain, deadline - elapsed), 0.0)
 
 
 def effective_stop_drain_timeout(runner: object) -> float:
@@ -186,7 +487,11 @@ def effective_stop_drain_timeout(runner: object) -> float:
     drain = getattr(runner, "_restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
     if not getattr(runner, "_stop_requested_by_signal", False):
         return drain
-    return resolve_launchd_capped_drain(drain, getattr(runner, "_launchd_exit_timeout_s", None))
+    return resolve_launchd_capped_drain(
+        drain,
+        getattr(runner, "_launchd_exit_timeout_s", None),
+        last_teardown_s=getattr(runner, "_last_shutdown_teardown_s", None),
+    )
 
 
 def is_gateway_supervisor_process(

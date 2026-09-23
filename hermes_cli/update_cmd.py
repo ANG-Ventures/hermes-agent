@@ -36,6 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli.cli_hint import hint_value
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_python_path
 
@@ -1397,13 +1398,29 @@ def _print_parked_branch_skip_warning(
         )
     print()
     print("  To resolve, inspect the branch and switch back yourself:")
-    print(f"    git -C {cwd} status")
-    print(f"    git -C {cwd} checkout {target_branch} && hermes update")
+    print(f"    git -C {hint_value(cwd)} status")
+    print(f"    git -C {hint_value(cwd)} checkout {hint_value(target_branch)} "
+          f"&& hermes update")
     print(
         "  (commit or stash your work on the branch first if you want to "
         "keep it)"
     )
     print(bar)
+
+
+def _manual_rollback_remedy(project_root, pre_pull_sha: Optional[str]) -> str:
+    """The pasteable `cd … && git reset` line printed when rollback FAILS.
+
+    Extracted from `_cmd_update_impl` (a ~2800-line function) so the string an
+    operator is told to paste on the data-loss recovery path can be driven by a
+    real shell in a test. `project_root` is a filesystem path, so an install
+    under `/Users/x/My Projects/` would otherwise print a `cd` that splits.
+    """
+    if pre_pull_sha:
+        return (f"cd {hint_value(project_root)} "
+                f"&& git reset --hard {pre_pull_sha}")
+    return (f"cd {hint_value(project_root)} "
+            f"&& git reflog && git reset --hard <prev-sha>")
 
 
 def _print_parked_branch_kept_notice(
@@ -8197,13 +8214,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print("  Try ``hermes update`` again later once a fix lands.")
                     else:
                         print("  ✗ Rollback failed. Recover manually with:")
-                        print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
+                        print(f"    {_manual_rollback_remedy(_m().PROJECT_ROOT, pre_pull_sha)}")
                         if rollback_result.stderr.strip():
                             print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
                 else:
                     print()
                     print("  Could not capture pre-pull SHA — recover manually with:")
-                    print(f"    cd {_m().PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
+                    print(f"    {_manual_rollback_remedy(_m().PROJECT_ROOT, None)}")
                 sys.exit(1)
 
             update_succeeded = True

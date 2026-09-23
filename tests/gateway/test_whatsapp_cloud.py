@@ -1388,6 +1388,27 @@ class TestReplyContextResolution:
 
 
     @pytest.mark.asyncio
+    async def test_index_failure_does_not_drop_inbound_event(self, monkeypatch):
+        """Best-effort persistence failure must not suppress the primary event."""
+        from gateway import rich_sent_store
+
+        def fail_enqueue(*args, **kwargs):
+            raise OSError("index unavailable")
+
+        monkeypatch.setattr(rich_sent_store, "_enqueue_write", fail_enqueue)
+        adapter = _make_adapter()
+
+        event = await adapter._build_message_event_from_cloud(
+            {"from": "15551234567", "id": "wamid.KEPT", "type": "text",
+             "text": {"body": "keep delivering this"}},
+            {"15551234567": "Alice"}, {},
+        )
+
+        assert event is not None
+        assert event.text == "keep delivering this"
+        assert event.message_id == "wamid.KEPT"
+
+    @pytest.mark.asyncio
     async def test_non_reply_message_has_no_reply_context(self):
         adapter = _make_adapter()
         event = await adapter._build_message_event_from_cloud(

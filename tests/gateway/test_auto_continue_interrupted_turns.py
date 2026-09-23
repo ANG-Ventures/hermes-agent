@@ -137,6 +137,38 @@ def _rowid_credits(tmp_path: Path) -> list:
 
 
 @pytest.mark.asyncio
+async def test_restart_loop_guard_records_at_most_once_per_gateway_boot(
+    tmp_path, monkeypatch
+):
+    """Repeated resume scans in one process leave ONE entry in the ledger.
+
+    This used to assert the call pattern against a mocked-out guard, which
+    only pinned the per-GatewayRunner ``_restart_loop_guard_recorded_this_boot``
+    flag; with the guard mocked the on-disk ledger was never exercised, so the
+    assertion held no matter what the guard itself did. The dedupe now lives in
+    the guard (keyed on process boot identity, covering every caller), so assert
+    the real observable: the persisted ledger.
+    """
+    from gateway import restart_loop_guard
+
+    state_path = tmp_path / "restart_loop.json"
+    monkeypatch.setattr(restart_loop_guard, "_state_path", lambda: state_path)
+    restart_loop_guard.clear()
+
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner)
+    _mark_pending(runner, entry)
+
+    runner._schedule_resume_pending_sessions()
+    await asyncio.gather(*runner._background_tasks)
+    runner._schedule_resume_pending_sessions()
+    await asyncio.gather(*runner._background_tasks)
+
+    assert len(json.loads(state_path.read_text())["boots"]) == 1
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_t1_prompt_default_keeps_note_bytes_and_adds_taxonomy_log(
     tmp_path, monkeypatch, caplog
 ):
@@ -746,12 +778,28 @@ def test_attempt_store_prunes_ttl_and_corruption_fails_closed_once(tmp_path, cap
 
 
 def test_attempt_store_fsyncs_parent_directory_after_replace(tmp_path, monkeypatch):
-    calls: list[int] = []
-    monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd))
+    import stat
+
+    events = []
+    destinations = []
+    replace = os.replace
+
+    def record_fsync(fd):
+        events.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+
+    def record_replace(source, destination):
+        destinations.append(destination)
+        events.append("replace")
+        return replace(source, destination)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "replace", record_replace)
     store = AutoResumeAttemptStore(tmp_path / "state" / "auto_resume_attempts.json")
 
     assert store.consume("agent:main:telegram:dm:123", 2) is True
-    assert len(calls) == (2 if os.name == "posix" else 1)
+    assert set(destinations) == {store.path, store.session_path}
+    per_write = ["file", "replace", "directory"] if os.name == "posix" else ["file", "replace"]
+    assert events == per_write * len(destinations)
 
 
 def test_attempt_store_tolerates_unsupported_directory_fsync(

@@ -1063,6 +1063,82 @@ class TestForceReloadSymmetry:
         hold.set()
         assert blocker_returned.wait(10), "abandoned hook worker never drained"
 
+    def test_timed_out_callback_does_not_corrupt_next_callback(
+        self, monkeypatch
+    ):
+        """An abandoned worker must not write into the NEXT callback's slot.
+
+        ``_runner`` binds ``done``/``outcome``/``failure`` as default arguments
+        so each worker keeps its own references. A closure resolves free
+        variables at CALL time, so without the binding the abandoned worker
+        reaches the loop's CURRENT objects once the loop has advanced: it
+        releases the next callback's ``done.wait()`` early and overwrites that
+        callback's result with its own. Re-creating the objects per iteration
+        does NOT fix this; only the binding does.
+
+        DETERMINISTIC ORDERING — no wall-clock bound. ``slow`` is released only
+        after ``fast`` is confirmed running, so the late write always lands
+        during ``fast``'s execution: exactly the corrupting interleaving.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        slow_abandoned = threading.Event()
+        fast_running = threading.Event()
+        fast_may_finish = threading.Event()
+        slow_returned = threading.Event()
+
+        def slow(**_kwargs):
+            # Outlive the budget so invoke_hook abandons this worker, then
+            # wait until `fast` is mid-flight before returning, so the late
+            # write races `fast`'s slot rather than landing harmlessly.
+            assert slow_abandoned.wait(timeout=10.0)
+            assert fast_running.wait(timeout=10.0)
+            try:
+                return {"allow": False, "reason": "SLOW-LATE-BLOCK"}
+            finally:
+                slow_returned.set()
+
+        def fast(**_kwargs):
+            fast_running.set()
+            # Hold inside the budget-satisfying path until the abandoned
+            # worker has actually written back.
+            assert fast_may_finish.wait(timeout=10.0)
+            return {"allow": True, "reason": "FAST-ALLOW"}
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [slow, fast]
+
+        # Release `slow` as soon as `fast` starts; then let `fast` finish only
+        # after `slow`'s late return has completed.
+        def _release():
+            assert fast_running.wait(timeout=10.0)
+            slow_abandoned.set()
+            assert slow_returned.wait(timeout=10.0)
+            fast_may_finish.set()
+
+        # `slow` parks on slow_abandoned, so the 0.1s budget expires and its
+        # worker is abandoned before `fast` ever starts. _release then drives
+        # the interleaving from outside invoke_hook.
+        releaser = threading.Thread(target=_release, daemon=True)
+        releaser.start()
+
+        results = mgr.invoke_hook(
+            "pre_tool_call", tool_name="terminal", arguments={}
+        )
+        releaser.join(timeout=10.0)
+
+        reasons = [r.get("reason") for r in results if isinstance(r, dict)]
+        assert "FAST-ALLOW" in reasons, (
+            "the second callback's own decision was destroyed — an abandoned "
+            "worker released its done.wait() early and took its result slot"
+        )
+        assert "SLOW-LATE-BLOCK" not in reasons, (
+            "a timed-out callback's late write landed in a later callback's "
+            "slot — _runner is resolving done/outcome as free variables"
+        )
+
     def test_hook_callback_within_timeout_returns_value(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
@@ -1158,6 +1234,67 @@ class TestForceReloadSymmetry:
         hold.set()
         assert blocker_returned.wait(10), "abandoned hook worker never drained"
 
+    def test_concurrent_pre_tool_call_callback_is_not_treated_as_timed_out(
+        self, monkeypatch
+    ):
+        """Normal overlap across gateway sessions must not fail closed."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 2.0
+        )
+
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls = []
+
+        def overlapping_policy(*, session_id="", **_kwargs):
+            calls.append(session_id)
+            if session_id == "session-a":
+                first_started.set()
+                release_first.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [overlapping_policy]
+        first_results = []
+        first = threading.Thread(
+            target=lambda: first_results.extend(
+                mgr.invoke_hook("pre_tool_call", session_id="session-a")
+            )
+        )
+        first.start()
+        assert first_started.wait(timeout=10.0)
+
+        # This is a normal concurrent invocation, not a retry after timeout.
+        # It must execute the callback rather than synthesize a block.
+        assert mgr.invoke_hook("pre_tool_call", session_id="session-b") == []
+        assert calls == ["session-a", "session-b"]
+
+        release_first.set()
+        first.join(timeout=10.0)
+        assert not first.is_alive()
+        assert first_results == []
+
+    def test_advisory_pre_tool_call_timeout_fails_open(self, monkeypatch):
+        """An advisory callback timeout must not override its fail-open policy."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        hold = threading.Event()
+
+        def advisory_policy(**_kwargs):
+            hold.wait(timeout=10.0)
+            return None
+
+        setattr(advisory_policy, "_hermes_timeout_fail_closed", False)
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [advisory_policy]
+
+        # Both the original timeout and a follow-up during suppression fail open.
+        assert mgr.invoke_hook("pre_tool_call", session_id="session-a") == []
+        assert mgr.invoke_hook("pre_tool_call", session_id="session-a") == []
+        hold.set()
+
     def test_pre_tool_call_timeout_fail_closed(self, monkeypatch):
         """Timed-out pre_tool_call must return a block directive, not allow.
 
@@ -1167,10 +1304,7 @@ class TestForceReloadSymmetry:
         flip under load. The fail-closed message is the primary fact; the
         clock stood in for "we blocked without joining the hung policy".
         """
-        from hermes_cli.plugins import (
-            _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
-            resolve_pre_tool_block,
-        )
+        from hermes_cli.plugins import resolve_pre_tool_block
 
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
@@ -1195,26 +1329,299 @@ class TestForceReloadSymmetry:
 
         msg = resolve_pre_tool_block("web_search", {"query": "x"})
 
-        assert msg == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        # The timeout refusal names the callback and reports measured elapsed
+        # against the configured budget.
+        assert msg is not None
+        assert "hung_policy" in msg
+        assert "timed out" in msg
+        assert "budget 0.1s" in msg
         assert not policy_returned.is_set(), (
             "resolve_pre_tool_block returned only AFTER the hung policy "
             "finished — the timed-out worker was joined instead of abandoned"
         )
 
-        # Still-running / suppression window must also fail closed.
+        # The suppression window must also fail closed — but it is NOT a
+        # timeout of THIS call, and must not claim to be one.
         msg2 = resolve_pre_tool_block("web_search", {"query": "y"})
-        assert msg2 == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        assert msg2 is not None
+        assert "hung_policy" in msg2
+        assert "suppressed after an earlier timeout" in msg2
+        assert "timed out after" not in msg2, (
+            "the suppression refusal claims THIS callback timed out; an "
+            "earlier one did and the cooldown window is still open"
+        )
+        assert msg2 != msg, (
+            "timeout and suppression refusals are different events and must "
+            "not share one conflated message (#819)"
+        )
         assert not policy_returned.is_set(), (
             "the suppressed second call joined the still-running policy worker"
         )
         hold.set()
         assert policy_returned.wait(10), "abandoned policy worker never drained"
 
+    def test_refusals_do_not_disclose_a_shell_hook_command(self, monkeypatch):
+        """A hook command's secrets must not reach the MODEL-facing refusal.
+
+        The refusal messages interpolate the callback's ``__name__``, and a
+        shell hook's command is operator-supplied text that routinely embeds
+        credentials inline. Drives the real shell-hook callback through the
+        real dispatcher so the whole producer→consumer chain is covered, not
+        just the formatting helper.
+        """
+        from agent import shell_hooks
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        planted = "hunter2PRODSup3rSecret"
+        callback = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(
+                event="pre_tool_call",
+                command=f"/bin/sh -c 'export TOK={planted}; sleep 30'",
+                fail_closed=True,
+            )
+        )
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [callback]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        timeout_msg = resolve_pre_tool_block("web_search", {"query": "x"})
+        suppressed_msg = resolve_pre_tool_block("web_search", {"query": "y"})
+
+        # Both fail-closed paths block (policy preserved) ...
+        assert timeout_msg is not None
+        assert suppressed_msg is not None
+        # ... and neither discloses the command that produced them.
+        assert planted not in timeout_msg
+        assert planted not in suppressed_msg
+        # The hook is still identifiable in each refusal.
+        assert "shell_hook[pre_tool_call:" in timeout_msg
+        assert "shell_hook[pre_tool_call:" in suppressed_msg
+
+    def test_refusals_do_not_disclose_a_callback_without_a_name(self, monkeypatch):
+        """A callback with no ``__name__`` must not be named by ``repr()``.
+
+        The sibling test above covers callbacks that HAVE a ``__name__``.
+        This is the other half of the class: ``functools.partial`` (and any
+        callable object) has no ``__name__``, so the old
+        ``getattr(cb, "__name__", repr(cb))`` fell through to ``repr()`` —
+        which renders every bound argument, credentials included, into a
+        MODEL-facing refusal.
+        """
+        import functools
+
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        planted = "hunter2PRODSup3rSecret"
+        release = threading.Event()
+
+        def _policy(token, **kwargs):
+            release.wait(10)
+            return None
+
+        callback = functools.partial(_policy, planted)
+        # A partial has no __name__; repr() renders the bound token.
+        assert not hasattr(callback, "__name__")
+        assert planted in repr(callback)
+        setattr(callback, "_hermes_timeout_fail_closed", True)
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [callback]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        try:
+            timeout_msg = resolve_pre_tool_block("web_search", {"query": "x"})
+            suppressed_msg = resolve_pre_tool_block("web_search", {"query": "y"})
+
+            # Both fail-closed paths still block (policy preserved) ...
+            assert timeout_msg is not None
+            assert suppressed_msg is not None
+            # ... and neither renders the callback's bound arguments.
+            assert planted not in timeout_msg, (
+                "the timeout refusal named the callback by repr(), "
+                "disclosing its bound credential to the model"
+            )
+            assert planted not in suppressed_msg, (
+                "the suppression refusal named the callback by repr(), "
+                "disclosing its bound credential to the model"
+            )
+            # The callback is still identifiable by its wrapped function.
+            assert "_policy" in timeout_msg
+            assert "_policy" in suppressed_msg
+        finally:
+            release.set()
+
+    def test_unparseable_hook_command_is_not_disclosed(self, monkeypatch):
+        """An unparseable hook command must not reach the fail-closed refusal.
+
+        ``_spawn`` cannot split a command with an unbalanced quote — and that
+        is precisely the shape that still holds an inline credential. The
+        parse failure previously went into ``result["error"]``, which
+        ``_evaluate_result`` hands to ``_fail_closed_block`` as the
+        model-facing reason.
+        """
+        from agent import shell_hooks
+
+        planted = "hunter2PRODSup3rSecret"
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            # Unbalanced quote — shlex cannot split this.
+            command=f"/bin/sh -c 'export TOK={planted}; echo hi",
+            fail_closed=True,
+        )
+
+        r = shell_hooks._spawn(spec, "{}")
+        assert r["error"], "the unbalanced quote should have failed the parse"
+        assert planted not in r["error"], (
+            "the parse failure carried the raw command, which flows to the "
+            "model-facing fail-closed refusal"
+        )
+
+        decision = shell_hooks._evaluate_result(spec, r)
+        assert decision is not None and decision["action"] == "block", (
+            "a fail_closed hook that cannot be parsed must still block"
+        )
+        assert planted not in decision["message"], (
+            "the fail-closed refusal disclosed the hook command to the model"
+        )
+        # The hook is still identifiable by its secret-free digest name.
+        assert shell_hooks.hook_display_name(spec.command) in decision["message"]
+
+    def test_webhook_url_is_not_disclosed_in_refusals(self, monkeypatch):
+        """A webhook target's URL must not reach a model-facing refusal.
+
+        ``WebhookTarget.label`` falls back to ``self.url`` when the optional
+        ``name:`` is omitted, and ``_make_callback`` synthesized ``__name__``
+        from it. ``_callback_label`` trusts ``__name__``, so the raw URL — a
+        bearer credential for Slack/Discord/Teams — was interpolated into both
+        fail-closed refusals. Third sibling of the shell-hook/partial pair.
+        """
+        from agent import outbound_webhooks
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        planted = "T00000000/B11111111/PLANTEDwebhookCredential0"
+        url = f"https://hooks.slack.com/services/{planted}"
+        release = threading.Event()
+
+        # Operator omitted the optional `name:` — the documented fallback.
+        target = outbound_webhooks.WebhookTarget(url=url, events=["pre_tool_call"])
+        assert target.label == url, "label must still expose the URL for the log"
+
+        # POSITIVE CONTROL: prove the leak is REACHABLE before proving it is
+        # closed. The pre-fix identity was built from `target.label`, which is
+        # the raw URL here — so the disclosure channel genuinely exists and
+        # this test is not vacuous.
+        assert planted in f"outbound_webhook[pre_tool_call:{target.label}]", (
+            "positive control failed: the pre-fix identity should contain the URL"
+        )
+
+        callback = outbound_webhooks._make_callback("pre_tool_call", target)
+        assert planted not in callback.__name__, (
+            "the synthesized callback identity carried the raw webhook URL"
+        )
+
+        def _hang(**kwargs):
+            release.wait(10)
+            return None
+
+        _hang.__name__ = callback.__name__
+        _hang.__qualname__ = callback.__qualname__
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [_hang]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        try:
+            timeout_msg = resolve_pre_tool_block("web_search", {"query": "x"})
+            suppressed_msg = resolve_pre_tool_block("web_search", {"query": "y"})
+
+            # Both fail-closed paths still block (policy preserved) ...
+            assert timeout_msg is not None
+            assert suppressed_msg is not None
+            # ... and neither discloses the webhook credential.
+            assert planted not in timeout_msg, (
+                "the timeout refusal disclosed the webhook URL to the model"
+            )
+            assert planted not in suppressed_msg, (
+                "the suppression refusal disclosed the webhook URL to the model"
+            )
+            # The target is still identifiable by its stable digest.
+            assert target.display_label in timeout_msg
+            assert target.display_label in suppressed_msg
+        finally:
+            release.set()
+
+    def test_webhook_display_label_prefers_configured_name(self):
+        """A configured ``name:`` is an operator identifier and is used as-is."""
+        from agent import outbound_webhooks
+
+        url = "https://hooks.slack.com/services/T0/B0/PLANTEDwebhookCredential0"
+        named = outbound_webhooks.WebhookTarget(
+            url=url, events=["pre_tool_call"], name="ci-dashboard",
+        )
+        assert named.display_label == "ci-dashboard"
+        assert named.label == "ci-dashboard"
+
+        anon = outbound_webhooks.WebhookTarget(url=url, events=["pre_tool_call"])
+        # Digest, never the URL — and stable across calls/instances.
+        assert anon.display_label.startswith("webhook#")
+        assert "PLANTEDwebhookCredential0" not in anon.display_label
+        assert anon.display_label == outbound_webhooks.WebhookTarget(
+            url=url, events=["pre_tool_call"],
+        ).display_label
+        # Distinct URLs stay distinguishable.
+        other = outbound_webhooks.WebhookTarget(
+            url=url + "x", events=["pre_tool_call"],
+        )
+        assert other.display_label != anon.display_label
+
+    def test_anonymous_callback_label_is_stable_not_a_heap_address(self):
+        """The no-name fallback must be reproducible, not ``id()``.
+
+        ``id()`` is a CPython heap address: it differs between processes and is
+        recycled after GC, so a refusal naming a callback that way is neither
+        stable nor meaningful to whoever reads it.
+        """
+        from hermes_cli.plugins import _callback_label
+
+        class _Anon:
+            def __call__(self, **kwargs):
+                return None
+
+        a, b = _Anon(), _Anon()
+        label_a = _callback_label(a)
+
+        # Two distinct instances of the same type get the same label ...
+        assert label_a == _callback_label(b)
+        # ... and no heap address appears in it.
+        assert f"{id(a):x}" not in label_a
+        assert "@" not in label_a
+        assert label_a.startswith("<_Anon#") and label_a.endswith(">")
+
     def test_pre_tool_call_timeout_does_not_reach_tool_handler(self, monkeypatch):
         """E2E: timed-out pre_tool_call blocks handle_function_call before dispatch."""
         import json
-
-        from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
 
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
@@ -1253,7 +1660,8 @@ class TestForceReloadSymmetry:
             )
 
         assert dispatch_calls == []
-        assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in result
+        assert "hung_policy" in result
+        assert "timed out" in result
         hold.set()
 
 
