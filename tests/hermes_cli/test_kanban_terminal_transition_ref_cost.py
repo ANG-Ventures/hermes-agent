@@ -113,7 +113,7 @@ def test_complete_is_not_starved_by_ref_count(board, monkeypatch):
     # The regression the card is about: the transition must LAND, durably.
     assert len(spawns) < SPAWN_CEILING, (
         f"complete_task issued {len(spawns)} git spawns against {NHEADS} "
-        f"published heads — a per-ref scan is back"
+        f"published heads — a per-ref scan is back: {spawns}"
     )
     # And it must not have "fixed" the timeout by dropping the recovery index.
     row = board.execute(
