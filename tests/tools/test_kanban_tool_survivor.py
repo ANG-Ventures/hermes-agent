@@ -12,6 +12,7 @@ tool is never a softer path than the flag.
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import subprocess
 from pathlib import Path
@@ -272,8 +273,14 @@ def remote_multi(monkeypatch):
             calls.append(list(args))
             number = args[args.index("view") + 1]
             slug = args[args.index("--repo") + 1]
+            # #848 (landed after this fixture was written) requires a live PR to
+            # NAME the card it vouches for; corroborate through headRefName the
+            # same way the single-repo fixture above does.
+            tid = os.environ.get("HERMES_KANBAN_TASK", "")
             payload = {"state": "MERGED", "headRefOid": oid(slug, number),
-                       "mergeCommit": {"oid": oid(slug, number)}}
+                       "mergeCommit": {"oid": oid(slug, number)},
+                       "headRefName": f"operator/{tid}-landed-elsewhere",
+                       "title": "", "body": ""}
             return subprocess.CompletedProcess(args, 0, json.dumps(payload).encode(), b"")
         return real(args, **kwargs)
 
