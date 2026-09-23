@@ -172,6 +172,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ON turns(platform, chat_id, ts_end);
         CREATE INDEX IF NOT EXISTS idx_blackbox_turns_cost
             ON turns(cost_usd);
+        -- Rolling-window reads (hermes_cli/kanban_budget.py's per-tick spend
+        -- sum, daily-journal, /tokens) all filter on a ts_start/ts_end lower
+        -- bound. Without this they SCAN the whole table, and `turns` rows are
+        -- overflow-heavy (user_text/final_text previews): the 836 MB fleet
+        -- ledger stores ~5k rows across ~20k overflow pages, so a "5k-row
+        -- scan" is really an 80 MB read. Measured cold (macOS `purge` between
+        -- trials, 10 real fleet ledgers, 24h window): 6.13 s SCAN -> 1.40 s
+        -- SEARCH, identical 653 rows.
+        CREATE INDEX IF NOT EXISTS idx_blackbox_turns_ts_start
+            ON turns(ts_start);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts
             ON turn_api_calls(ts);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
