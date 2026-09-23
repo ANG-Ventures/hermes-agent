@@ -24,6 +24,43 @@ def test_read_only_python_heredoc_does_not_execute_diagnostic_log(tmp_path):
     assert not guard(f"python3 - <<'PY'\n{body}PY", cwd=str(tmp_path))
 
 
+def test_chained_sql_reads_and_open_loop_match_file_verdict(tmp_path):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = (
+        "import json,subprocess\n"
+        "rows=subprocess.run(['sudo','-n','sqlite3',"
+        f"'file:{tmp_path / 'reviews.sqlite3'}?mode=ro','select count(*) from reviews;'],"
+        "capture_output=True,text=True).stdout.split()\n"
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    try: d=json.loads(line)\n"
+        "    except: continue\n"
+        "    if d.get('type')!='intake': continue\n"
+        "    k=f\"{d['repo'].lower()}#{d['pr']}\"\n"
+        "    print(d)\n"
+    )
+    script = tmp_path / "diagnose.py"
+    script.write_text(body)
+    chain = (
+        f"DB={tmp_path / 'reviews.sqlite3'}; echo '== running now'; "
+        "echo configured | grep configured; "
+        'sudo -n sqlite3 "file:$DB?mode=ro" "select count(*) from reviews;"; '
+    )
+    assert not guard(chain, cwd=str(tmp_path))
+    assert not guard(f"python3 {script}", cwd=str(tmp_path))
+    assert not guard(chain + f"python3 - <<'PY'\n{body}PY", cwd=str(tmp_path))
+
+
+def test_open_loop_executing_lines_stays_blocked(tmp_path):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = (
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    __import__('os').system(line)\n"
+    )
+    assert guard("echo ok; " + f"python3 - <<'PY'\n{body}PY", cwd=str(tmp_path))
+
+
 @pytest.mark.parametrize("body", [
     "import subprocess\nsubprocess.run(['launchctl', 'bootout', 'system/ai.hermes.gateway'])\n",
     "import subprocess\nsubprocess.run(['kill', '$(pgrep -f hermes-gateway)'])\n",

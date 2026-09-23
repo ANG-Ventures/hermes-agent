@@ -1092,18 +1092,19 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 # --- recursive walk ---------------------------------------------------------------------------
 
 def _mask_read_only_python_paths(body: str) -> str:
-    """Mask literal Path(...).read_* calls printed as diagnostic data."""
+    """Mask literal paths read only as diagnostic data, not executable input."""
     if not body.isascii():  # AST columns are UTF-8 byte offsets; fail closed on non-ASCII.
         return body
     try:
         tree = ast.parse(body)
     except SyntaxError:
         return body
-    if not any(
+    has_path = any(
         isinstance(node, ast.ImportFrom) and node.module == "pathlib"
         and any(alias.name == "Path" and alias.asname is None for alias in node.names)
         for node in ast.walk(tree)
-    ) or any(
+    )
+    if any(
         (isinstance(node, ast.Name) and node.id in {"Path", "print"} and isinstance(node.ctx, ast.Store))
         or (isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in {"Path", "print"})
         or (isinstance(node, ast.arg) and node.arg in {"Path", "print"})
@@ -1116,14 +1117,56 @@ def _mask_read_only_python_paths(body: str) -> str:
     for line in body.splitlines(keepends=True):
         offsets.append(offsets[-1] + len(line))
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    open_shadowed = any(
+        (isinstance(other, ast.Name) and other.id == "open" and isinstance(other.ctx, ast.Store))
+        or (isinstance(other, (ast.FunctionDef, ast.ClassDef)) and other.name == "open")
+        or (isinstance(other, ast.arg) and other.arg == "open")
+        or (isinstance(other, (ast.Import, ast.ImportFrom)) and any(
+            alias.asname == "open" or alias.name == "open" for alias in other.names
+        )) for other in ast.walk(tree)
+    )
     spans = []
     for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "open" and len(node.args) == 1
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and not open_shadowed):
+            read_attr = parents.get(node)
+            read_call = parents.get(read_attr) if read_attr is not None else None
+            split_attr = parents.get(read_call) if read_call is not None else None
+            split_call = parents.get(split_attr) if split_attr is not None else None
+            reverse_call = parents.get(split_call) if split_call is not None else None
+            loop = parents.get(reverse_call) if reverse_call is not None else None
+            if (isinstance(read_attr, ast.Attribute) and read_attr.attr == "read"
+                    and isinstance(read_call, ast.Call) and not read_call.args and not read_call.keywords
+                    and isinstance(split_attr, ast.Attribute) and split_attr.attr == "splitlines"
+                    and isinstance(split_call, ast.Call) and not split_call.args and not split_call.keywords
+                    and isinstance(reverse_call, ast.Call) and isinstance(reverse_call.func, ast.Name)
+                    and reverse_call.func.id == "reversed" and reverse_call.args == [split_call]
+                    and isinstance(loop, ast.For) and loop.iter is reverse_call
+                    and node.end_lineno is not None and node.end_col_offset is not None
+                    and all(
+                        isinstance(call.func, ast.Name) and call.func.id in {"len", "print"}
+                        or isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+                        and (call.func.value.id, call.func.attr) in {
+                            ("json", "loads"), ("d", "get"), ("seen", "add"), ("out", "append")
+                        }
+                        or isinstance(call.func, ast.Attribute) and call.func.attr == "lower"
+                        and isinstance(call.func.value, ast.Subscript)
+                        and isinstance(call.func.value.value, ast.Name)
+                        and call.func.value.value.id == "d"
+                        for statement in loop.body for call in ast.walk(statement)
+                        if isinstance(call, ast.Call)
+                    )):
+                spans.append((offsets[node.lineno - 1] + node.col_offset,
+                              offsets[node.end_lineno - 1] + node.end_col_offset))
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         if node.func.attr not in {"read_text", "read_bytes"}:
             continue
         parent = parents.get(node)
-        if not (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+        if not has_path or not (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
                 and parent.func.id == "print"):
             continue
         path_call = node.func.value
