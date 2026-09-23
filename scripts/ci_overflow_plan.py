@@ -257,10 +257,10 @@ def main():
     parser.add_argument("--snapshot-json", type=Path, help="captured sampler snapshot for deterministic replay")
     args = parser.parse_args()
     req = parse_request(args.slices_json.read_bytes())
-    snapshot = Snapshot(**json.loads(args.snapshot_json.read_text())) if args.snapshot_json else sample_pool(PublicAPI(args.repo))
+    snapshot = Snapshot(**json.loads(args.snapshot_json.read_text(encoding="utf-8"))) if args.snapshot_json else sample_pool(PublicAPI(args.repo))
     result = plan(req.slices, req.e2e, snapshot, Policy(), 0)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(asdict(result), sort_keys=True, separators=(",", ":")) + "\n")
+    args.out.write_text(json.dumps(asdict(result), sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
