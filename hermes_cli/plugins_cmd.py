@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_cli.cli_hint import hint_value
 from hermes_cli.config import cfg_get
 from hermes_cli.secret_prompt import masked_secret_prompt
 from utils import atomic_write_text
@@ -1101,7 +1102,11 @@ def cmd_update(name: str) -> None:
         sys.exit(1)
     install_record = metadata.get(target.name, {})
     if install_record.get("pinned") is True:
-        recorded_source = escape(str(install_record.get("source", "<source>")))
+        # Shell-quote the raw value FIRST so the printed remedy survives a
+        # paste, then escape for rich markup so the rendering is faithful.
+        recorded_source = escape(
+            hint_value(str(install_record.get("source", "<source>")))
+        )
         console.print(
             f"[red]Error:[/red] Plugin '{name}' is pinned to "
             f"{install_record.get('revision')}. To move it, run "
@@ -2848,7 +2853,7 @@ def dashboard_update_user_plugin(name: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
     install_record = metadata.get(target.name, {})
     if install_record.get("pinned") is True:
-        recorded_source = install_record.get("source", "<source>")
+        recorded_source = hint_value(str(install_record.get("source", "<source>")))
         return {
             "ok": False,
             "error": (
