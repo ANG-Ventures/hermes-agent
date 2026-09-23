@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -915,6 +916,158 @@ class TestEvaluateResult:
             _spawn_result(error="boom"),
         )
         assert r is None
+
+
+# ── crash vs deny ─────────────────────────────────────────────────────────
+
+
+_OUTAGE_STDERR = (
+    "Traceback (most recent call last):\n"
+    '  File "/Users/x/.hermes/hooks/merge_attribution_policy.py", line 81, '
+    "in <module>\n"
+    "    from shell_line_fold import analysis_candidates\n"
+    "ModuleNotFoundError: No module named 'shell_line_fold'\n"
+)
+
+
+class TestCrashIsNotADeny:
+    """A hook that CRASHED must not be worded like a hook that DENIED.
+
+    2026-09-22: a fail_closed policy hook whose sibling module was absent from
+    the deployed tree blocked 517+ tool calls with only ``hook
+    merge_attribution_policy.py#<digest> failed closed: hook exited 1``. That
+    text names the MERGE policy, so operators went looking for a merge nobody
+    had attempted, and the available remedy the message implied was the
+    guard's kill-switch. Both outcomes still fail closed; what these gate is
+    that the operator-facing text tells them apart and points at the real fix.
+    """
+
+    def _spec(self, fail_closed=True):
+        return shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            command="/usr/bin/python3 /h/merge_attribution_policy.py",
+            fail_closed=fail_closed,
+        )
+
+    def test_crash_names_the_crash_and_the_missing_module(self):
+        r = shell_hooks._evaluate_result(
+            self._spec(), _spawn_result(returncode=1, stderr=_OUTAGE_STDERR),
+        )
+        assert r["action"] == "block", "a crashed fail_closed hook must block"
+        assert r["error_class"] == "hook_internal_error"
+        assert "CRASHED" in r["message"]
+        assert "ModuleNotFoundError" in r["message"]
+        assert "shell_line_fold" in r["message"], (
+            "the operator still cannot see WHICH module is missing"
+        )
+
+    def test_crash_message_does_not_read_as_a_policy_denial(self):
+        r = shell_hooks._evaluate_result(
+            self._spec(), _spawn_result(returncode=1, stderr=_OUTAGE_STDERR),
+        )
+        assert "not a policy denial" in r["message"]
+        # The pre-fix wording is what sent operators after the wrong thing.
+        assert "failed closed: hook exited" not in r["message"]
+
+    def test_crash_points_away_from_the_kill_switch(self):
+        r = shell_hooks._evaluate_result(
+            self._spec(), _spawn_result(returncode=1, stderr=_OUTAGE_STDERR),
+        )
+        assert "Do NOT disable the guard" in r["message"]
+        assert "partial deploy" in r["message"]
+
+    def test_crash_still_fails_closed(self):
+        """Classification only — enforcement is unchanged."""
+        r = shell_hooks._evaluate_result(
+            self._spec(), _spawn_result(returncode=1, stderr=_OUTAGE_STDERR),
+        )
+        assert r is not None and r["action"] == "block"
+
+    def test_a_real_deny_is_not_relabelled_as_a_crash(self):
+        """Exit 2 is the deny convention; it must keep its own message."""
+        r = shell_hooks._evaluate_result(
+            self._spec(),
+            _spawn_result(returncode=2, stderr="merge-attribution: BLOCKED"),
+        )
+        assert r == {"action": "block", "message": "merge-attribution: BLOCKED"}
+        assert "CRASHED" not in r["message"]
+
+    def test_stdout_block_directive_is_not_relabelled_as_a_crash(self):
+        """A hook that exits 0 with a block directive denied; it did not die."""
+        r = shell_hooks._evaluate_result(
+            self._spec(),
+            _spawn_result(
+                stdout='{"action": "block", "message": "merge-attribution: BLOCKED"}',
+            ),
+        )
+        assert r == {"action": "block", "message": "merge-attribution: BLOCKED"}
+
+    def test_nonzero_exit_without_a_traceback_still_reads_as_broken(self):
+        r = shell_hooks._evaluate_result(
+            self._spec(), _spawn_result(returncode=7, stderr="segfault-ish"),
+        )
+        assert "CRASHED" in r["message"]
+        assert "exited 7" in r["message"]
+
+    def test_crash_message_omits_the_raw_command(self):
+        """This text reaches the model; hook commands carry credentials."""
+        planted = "hunter2PRODSup3rSecret"
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            command=f"/bin/sh -c 'export TOK={planted}; exit 1'",
+            fail_closed=True,
+        )
+        r = shell_hooks._evaluate_result(
+            spec, _spawn_result(returncode=1, stderr=_OUTAGE_STDERR),
+        )
+        assert planted not in r["message"]
+
+    def test_crash_message_omits_free_text_from_the_child(self):
+        """Only the exception class and module name may cross over.
+
+        stderr is whatever the child printed — a traceback can echo argv or an
+        environment repr, so the block message must not relay it verbatim.
+        """
+        planted = "AWS_SECRET=hunter2PRODSup3rSecret"
+        stderr = (
+            "Traceback (most recent call last):\n"
+            f"  File \"/h/x.py\", line 1, in <module>  # env was {planted}\n"
+            "RuntimeError: refusing to start because " + planted + "\n"
+        )
+        r = shell_hooks._evaluate_result(
+            self._spec(), _spawn_result(returncode=1, stderr=stderr),
+        )
+        assert "RuntimeError" in r["message"]
+        assert planted not in r["message"]
+        assert "hunter2" not in r["message"]
+
+    def test_default_fail_open_hook_is_unaffected(self):
+        """A crash only blocks where fail_closed was already opted into."""
+        r = shell_hooks._evaluate_result(
+            self._spec(fail_closed=False),
+            _spawn_result(returncode=1, stderr=_OUTAGE_STDERR),
+        )
+        assert r is None
+
+    def test_end_to_end_missing_import_crash(self, tmp_path):
+        """The real outage path: a hook whose sibling module is absent."""
+        script = _write_script(
+            tmp_path, "merge_attribution_policy.py",
+            "#!/usr/bin/env python3\n"
+            "import shell_line_fold_definitely_absent\n",
+        )
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=f"{sys.executable} {script}",
+            fail_closed=True,
+        )
+        cb = shell_hooks._make_callback(spec)
+        result = cb(tool_name="terminal", args={"command": "true"})
+
+        assert result["action"] == "block"
+        assert result["error_class"] == "hook_internal_error"
+        assert "CRASHED" in result["message"]
+        assert "ModuleNotFoundError" in result["message"]
+        assert "shell_line_fold_definitely_absent" in result["message"]
 
 
 # ── exit-2 / fail_closed end-to-end ──────────────────────────────────────
