@@ -39,9 +39,11 @@ class SurvivorUnavailable(ValueError):
 
 log = logging.getLogger(__name__)
 
-def _git(repo, *args, env=None, check=True):
+def _git(repo, *args, env=None, check=True, input=None):
     result = subprocess.run(
-        ["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL,
+        ["git", "-C", str(repo), *args],
+        stdin=subprocess.DEVNULL if input is None else None,
+        input=input,
         capture_output=True, timeout=30, env=env,
     )
     if check and result.returncode:
@@ -338,22 +340,135 @@ def _published_refs(repo, workspace):
             yield {"remote": remote, "branch": ref.removeprefix("refs/heads/"), "sha": sha}
 
 
+def _present_commits(repo, shas):
+    """The subset of ``shas`` this repository actually holds, in ONE git call.
+
+    Both ref scans below ask git a reachability question per published ref.
+    That is fine for a handful of refs and ruinous for a real fork: the
+    workspace of card t_a49e8a28 had 5 remotes advertising 7,937 heads, and at
+    a measured 90.9 ms per `git` spawn the two scans projected to 721 s and
+    718 s -- each one alone past the 420 s tool-call ceiling, which is why the
+    `kanban_complete` TOOL timed out three times while the CLI (same DB, same
+    code) closed the card in 1.8 s. The cost tracks REMOTE REF COUNT, not
+    workspace size: a seeded 39,995-file workspace with one remote completes
+    in 1.52 s.
+
+    A sha advertised by a remote need not be in the local object store (the
+    measured workspace was missing 1 of 2,917). The per-ref loops pass
+    ``check=False`` and simply skip those, so the set-based forms must filter
+    them out first or `rev-list` aborts with "fatal: bad object" and takes the
+    whole scan with it. This filter is what makes bulk EXACTLY match per-ref,
+    not an approximation of it.
+    """
+    if not shas:
+        return []
+    probe = _git(
+        repo, "cat-file", "--batch-check=%(objectname) %(objecttype)", "--buffer",
+        check=False, input=b"".join(f"{sha}\n".encode() for sha in shas),
+    )
+    if probe.returncode:
+        return []
+    present = []
+    for line in probe.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == "commit":
+            present.append(parts[0])
+    return present
+
+
+def _rev_list(repo, head, shas, *args):
+    """``git rev-list <args> head ^sha ^sha …`` over a set of refs, in one call.
+
+    The negative revs go on stdin because 7,937 of them overflow ARG_MAX. Note
+    that ``--not --stdin`` does NOT negate stdin revs -- measured, it returned
+    52,090 (the whole positive union) where the explicit ``^`` form returned 6
+    -- so each line is written pre-negated.
+    """
+    payload = f"{head}\n".encode() + b"".join(f"^{sha}\n".encode() for sha in shas)
+    return _git(repo, "rev-list", *args, "--stdin", check=False, input=payload)
+
+
+def _first_containing(repo, head, candidates):
+    """The first ref in ``candidates`` that contains ``head``, in ~log2(N) calls.
+
+    Naming the ref is where the per-ref loop survived its first removal: the
+    containment QUESTION was already set-based, but the ANSWER still walked
+    `merge-base --is-ancestor` per ref, so a clean workspace parked behind a
+    branch tip (HEAD contained in the set but not itself a tip) paid the full
+    O(N) cost the card was filed about. Measured on the real board at 5 -> 41
+    refs: 24 -> 96 git spawns, slope 2.000/ref, projecting 1,424 s at the real
+    workspace's 7,937 refs -- half of it BEFORE the durable write.
+
+    `contained in candidates[:k]` is MONOTONE in k, so the first containing ref
+    is a binary search over prefixes using the same `_rev_list ... --count`
+    test, not a scan. Order is preserved, so the ref named is bit-for-bit the
+    one the per-ref loop named.
+    """
+    low, high = 0, len(candidates)  # invariant: not contained in [:low]
+    while low < high:
+        mid = (low + high) // 2
+        counted = _rev_list(repo, head, [c["sha"] for c in candidates[:mid + 1]], "--count")
+        if counted.returncode == 0 and counted.stdout.strip() == b"0":
+            high = mid
+        else:
+            low = mid + 1
+    return candidates[low] if low < len(candidates) else None
+
+
 def _remote_survivor(repo, head, published):
-    for ref in published:
-        if ref["sha"] == head or _git(repo, "merge-base", "--is-ancestor", head, ref["sha"], check=False).returncode == 0:
-            return dict(ref, head=head)
-    return None
+    # Reachability from a SET is the union of reachability from each member,
+    # so "HEAD is contained in some published ref" == "HEAD has no commit that
+    # is not in the set". One rev-list answers that for all refs at once
+    # (measured 0.04 s vs 721 s projected for the per-ref loop).
+    covered = [ref for ref in published if ref["sha"] == head]
+    if not covered:
+        present = set(_present_commits(repo, sorted({ref["sha"] for ref in published})))
+        if not present:
+            return None
+        # A sha the local store lacks can never contain HEAD; the per-ref loop
+        # skipped those via check=False, so dropping them here keeps the same
+        # answer AND keeps `rev-list ^<unknown>` from aborting the whole walk.
+        candidates = [ref for ref in published if ref["sha"] in present]
+        counted = _rev_list(repo, head, [ref["sha"] for ref in candidates], "--count")
+        if counted.returncode or counted.stdout.strip() != b"0":
+            return None
+        ref = _first_containing(repo, head, candidates)
+        return dict(ref, head=head) if ref else None
+    return dict(covered[0], head=head)
 
 
 def _base(repo, published):
+    # The nearest published ancestor of HEAD is a BOUNDARY commit of
+    # `rev-list HEAD ^<every ref>`: git stops there precisely because the
+    # commit is contained in the excluded set. That collapses one spawn per
+    # ref into one spawn total, then ranks the (handful of) boundary commits
+    # by distance exactly as the per-ref loop did. Verified against the
+    # per-ref result on the real workspace: same base, same distance.
+    present = _present_commits(repo, sorted({ref["sha"] for ref in published}))
+    if not present:
+        return None
+    walked = _rev_list(repo, "HEAD", present, "--boundary")
+    if walked.returncode:
+        return None
     candidates = []
-    for ref in published:
-        base = _git(repo, "merge-base", "HEAD", ref["sha"], check=False)
-        if base.returncode == 0:
-            sha = base.stdout.decode().strip()
-            distance = int(_git(repo, "rev-list", "--count", f"{sha}..HEAD").stdout)
-            candidates.append((distance, sha))
-    return min(candidates)[1] if candidates else None
+    for line in walked.stdout.decode("utf-8", "replace").split():
+        if not line.startswith("-"):
+            continue
+        sha = line[1:]
+        distance = int(_git(repo, "rev-list", "--count", f"{sha}..HEAD").stdout)
+        candidates.append((distance, sha))
+    if not candidates:
+        # An EMPTY walk is not "no base" -- it is the strongest possible base.
+        # git printed nothing because HEAD itself is contained in the excluded
+        # set, which is exactly the per-ref case `merge-base HEAD <ref>` == HEAD
+        # at distance 0 (the minimum, so it always won). Returning None here
+        # instead downgrades a pushed-but-dirty repo from a `patch` survivor to
+        # a whole-tree `bundle`.
+        head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
+        if head.returncode:
+            return None
+        return head.stdout.decode().strip() or None
+    return min(candidates)[1]
 
 
 def _snapshot(repo, base, prefix):
