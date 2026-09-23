@@ -2723,48 +2723,70 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     inherited_models[task.id] = inherited
             applied: list[tuple[str, bool]] = []
             cleared_routes: dict[str, str] = {}
+            reclaim_errors: dict[str, str] = {}
+            # Build the WHOLE batch first, then commit it in one transaction.
+            # Looping over individually-committing setters is what let a card
+            # that changed status after selection (archived/claimed by another
+            # connection) fail midway with earlier cards already pinned — a
+            # split route with no receipt. Prevalidation cannot close that
+            # window; a single write_txn can.
+            writes: list[kb.BatchRouteWrite] = []
             for task in tasks:
                 if touch_model and not model and not provider:
                     lane = kb.get_lane_model_override(conn, assignee=task.assignee)
                     cleared_routes[task.id] = lane.route if lane else "profile-default"
+                write = kb.BatchRouteWrite(task_id=task.id)
                 if touch_model:
                     effective_model = model or inherited_models.get(task.id)
                     firepower = is_firepower_model(effective_model)
-                    ok = kb.set_model_override(
-                        conn, task.id, effective_model, provider=provider,
-                        audit_comment_author=_profile_author() if firepower else None,
-                        audit_comment_body=(
-                            format_firepower_audit(effective_model, provider, firepower_reason)
-                            if firepower else None
-                        ),
-                    )
-                    if not ok:
-                        print(f"no such task: {task.id}", file=sys.stderr)
-                        return 1
+                    write.touch_model = True
+                    write.model = effective_model
+                    write.provider = provider
+                    if firepower:
+                        write.audit_comment_author = _profile_author()
+                        write.audit_comment_body = format_firepower_audit(
+                            effective_model, provider, firepower_reason,
+                        )
                 if effort is not None or clear_effort:
-                    ok = kb.set_reasoning_effort(
-                        conn, task.id, None if clear_effort else effort,
-                    )
-                    if not ok:
-                        print(f"no such task: {task.id}", file=sys.stderr)
-                        return 1
-                # A set-model on a RUNNING card is otherwise silent: the live
-                # worker keeps its old route and the change only lands if the
-                # card happens to be re-dispatched. --reclaim makes that
-                # explicit by releasing the claim so the next tick respawns
-                # on the new route.
-                #
-                # No status check here on purpose: reclaim_task is already the
-                # authority on what is reclaimable (it refuses anything not
-                # running/claimed, and preserves blocked/triage/scheduled
-                # rather than laundering them into ready). Re-testing status
-                # at this layer would be a second, drifting copy of that rule.
+                    write.touch_effort = True
+                    write.effort = None if clear_effort else effort
+                writes.append(write)
+
+            kb.apply_batch_route_writes(conn, writes)
+
+            # --reclaim runs only AFTER the route batch has committed, and
+            # deliberately NOT inside it: reclaim_task SIGTERMs a live worker,
+            # an irreversible side effect that a rollback could not undo. Its
+            # per-card outcome is reported individually below, so a reclaim
+            # that refuses one card is visible rather than silent.
+            #
+            # A set-model on a RUNNING card is otherwise silent: the live
+            # worker keeps its old route and the change only lands if the
+            # card happens to be re-dispatched. --reclaim makes that explicit
+            # by releasing the claim so the next tick respawns on the new
+            # route.
+            #
+            # No status check here on purpose: reclaim_task is already the
+            # authority on what is reclaimable (it refuses anything not
+            # running/claimed, and preserves blocked/triage/scheduled
+            # rather than laundering them into ready). Re-testing status
+            # at this layer would be a second, drifting copy of that rule.
+            for task in tasks:
                 redispatched = False
                 if reclaim:
-                    redispatched = kb.reclaim_task(
-                        conn, task.id,
-                        reason=f"set-model reclaim -> {provider or ''}/{model or ''}".strip("/"),
-                    )
+                    try:
+                        redispatched = kb.reclaim_task(
+                            conn, task.id,
+                            reason=f"set-model reclaim -> {provider or ''}/{model or ''}".strip("/"),
+                        )
+                    except (ValueError, RuntimeError) as exc:
+                        # The routes are already committed and reclaim's
+                        # SIGTERM is irreversible, so there is no rollback to
+                        # take here. Report the one card that failed and keep
+                        # printing the receipt below — an operator must still
+                        # learn which routes moved. Silence here would be the
+                        # split-batch defect wearing a different hat.
+                        reclaim_errors[task.id] = str(exc)
                 applied.append((task.id, redispatched))
     except (ValueError, RuntimeError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)
@@ -2807,7 +2829,15 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             print(f"{task_id}: effort=profile-default applies={applies}")
         elif effort is not None:
             print(f"{task_id}: effort={effort} applies={applies}")
-    return 0
+    # A reclaim that failed after its route committed is named explicitly —
+    # the receipt above already told the operator the route moved, so staying
+    # quiet here would leave them believing the worker was respawned.
+    for task_id, message in reclaim_errors.items():
+        print(
+            f"kanban: {task_id}: route applied but reclaim failed: {message}",
+            file=sys.stderr,
+        )
+    return 1 if reclaim_errors else 0
 
 
 def _lane_label(assignee: Optional[str]) -> str:
@@ -2972,9 +3002,10 @@ def _cmd_lane_model_clear(args: argparse.Namespace) -> int:
     clear_all = bool(getattr(args, "clear_all", False))
     with kb.connect_closing() as conn:
         if clear_all:
-            removed = kb.list_lane_model_overrides(conn, include_expired=True)
-            for row in removed:
-                kb.clear_lane_model_override(conn, assignee=row.assignee)
+            # One transaction for the whole sweep — see
+            # clear_all_lane_model_overrides. Listing and then deleting row by
+            # row is the same partial-commit class as the set-model batch.
+            removed = kb.clear_all_lane_model_overrides(conn)
         else:
             one = kb.clear_lane_model_override(conn, assignee=assignee)
             removed = [one] if one else []

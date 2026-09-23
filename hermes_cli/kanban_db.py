@@ -93,7 +93,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -4789,6 +4789,37 @@ def set_model_override(
     ``audit_comment_body`` must be supplied together; the comment is committed
     atomically with the override. Returns True on success.
     """
+    model, provider = _validate_model_override_args(
+        model, provider,
+        audit_comment_author=audit_comment_author,
+        audit_comment_body=audit_comment_body,
+    )
+    with write_txn(conn):
+        if not _set_model_override_locked(
+            conn, task_id, model, provider,
+            audit_comment_author=audit_comment_author,
+            audit_comment_body=audit_comment_body,
+        ):
+            return False
+    # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
+    notify_task_updated(conn, task_id, ("model_override", "provider_override"))
+    return True
+
+
+def _validate_model_override_args(
+    model: Optional[str],
+    provider: Optional[str],
+    *,
+    audit_comment_author: Optional[str] = None,
+    audit_comment_body: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Normalise + validate a route pair WITHOUT touching the database.
+
+    Split out of :func:`set_model_override` so a batch can validate every
+    card's arguments before it opens its single write transaction: argument
+    errors must never be discovered halfway through a batch, where some
+    cards have already been written.
+    """
     model = (model or "").strip() or None
     provider = (provider or "").strip() or None
     if bool(audit_comment_author) != bool(audit_comment_body):
@@ -4799,32 +4830,51 @@ def set_model_override(
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
-    model, provider = _resolve_stored_model_pair(model, provider)
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if not row:
-            return False
-        if row["status"] == "archived":
-            raise RuntimeError(f"cannot set model override on archived task {task_id}")
-        conn.execute(
-            "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
-            (model, provider, task_id),
+    return _resolve_stored_model_pair(model, provider)
+
+
+def _set_model_override_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    model: Optional[str],
+    provider: Optional[str],
+    *,
+    audit_comment_author: Optional[str] = None,
+    audit_comment_body: Optional[str] = None,
+) -> bool:
+    """Write one route override. MUST already be inside a ``write_txn``.
+
+    The status re-read happens here, inside the caller's transaction, so it
+    is the row state the write commits against — not a stale pre-check. A
+    batch therefore cannot half-commit when another connection archives a
+    selected card after selection: the ``RuntimeError`` raised here unwinds
+    the caller's transaction and every card in it.
+
+    ``model``/``provider`` must already have passed
+    :func:`_validate_model_override_args`.
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "archived":
+        raise RuntimeError(f"cannot set model override on archived task {task_id}")
+    conn.execute(
+        "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
+        (model, provider, task_id),
+    )
+    _append_event(
+        conn, task_id, "model_override_set",
+        {"model": model, "provider": provider},
+    )
+    if audit_comment_body:
+        add_comment(
+            conn,
+            task_id,
+            audit_comment_author or "",
+            audit_comment_body,
         )
-        _append_event(
-            conn, task_id, "model_override_set",
-            {"model": model, "provider": provider},
-        )
-        if audit_comment_body:
-            add_comment(
-                conn,
-                task_id,
-                audit_comment_author or "",
-                audit_comment_body,
-            )
-    # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
-    notify_task_updated(conn, task_id, ("model_override", "provider_override"))
     return True
 
 
@@ -4847,25 +4897,119 @@ def set_reasoning_effort(
     """
     effort = normalize_reasoning_effort(effort)
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if not row:
+        if not _set_reasoning_effort_locked(conn, task_id, effort):
             return False
-        if row["status"] == "archived":
-            raise RuntimeError(
-                f"cannot set reasoning effort on archived task {task_id}"
-            )
-        conn.execute(
-            "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
-            (effort, task_id),
-        )
-        _append_event(
-            conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
-        )
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("reasoning_effort",))
     return True
+
+
+def _set_reasoning_effort_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    effort: Optional[str],
+) -> bool:
+    """Write one effort override. MUST already be inside a ``write_txn``.
+
+    Sibling of :func:`_set_model_override_locked`; same reason. ``effort``
+    must already have passed :func:`normalize_reasoning_effort`.
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "archived":
+        raise RuntimeError(
+            f"cannot set reasoning effort on archived task {task_id}"
+        )
+    conn.execute(
+        "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
+        (effort, task_id),
+    )
+    _append_event(
+        conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
+    )
+    return True
+
+
+@dataclass
+class BatchRouteWrite:
+    """One card's requested route/effort change inside a batch."""
+
+    task_id: str
+    touch_model: bool = False
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    audit_comment_author: Optional[str] = None
+    audit_comment_body: Optional[str] = None
+    touch_effort: bool = False
+    effort: Optional[str] = None
+
+
+def apply_batch_route_writes(
+    conn: sqlite3.Connection,
+    writes: Sequence[BatchRouteWrite],
+) -> list[str]:
+    """Apply every route/effort write in ONE transaction, or none of them.
+
+    ``hermes kanban set-model`` selects N cards and then mutates them. Before
+    this primitive it called the individually-committing ``set_model_override``
+    / ``set_reasoning_effort`` in a loop, so a card that changed state AFTER
+    selection (another connection archives it; a worker claims it) failed
+    midway and left the cards ahead of it committed — a silently split route
+    across a batch the operator believed was one action, with no receipt
+    naming which cards moved.
+
+    Static prevalidation cannot close that: the interval between "we checked"
+    and "we wrote" is exactly where the race lives. The fix is to do the
+    checking and the writing inside one ``BEGIN IMMEDIATE`` — the per-card
+    status re-read in ``_set_model_override_locked`` then runs against the
+    same locked snapshot the UPDATE commits against, and any refusal unwinds
+    the whole batch.
+
+    Returns the ids written, in order. Raises ``RuntimeError`` (archived card)
+    or ``ValueError`` (bad arguments) having written NOTHING. Arguments are
+    validated for every card up front so an argument error also cannot reach
+    the transaction half-applied.
+    """
+    prepared: list[tuple[BatchRouteWrite, Optional[str], Optional[str], Optional[str]]] = []
+    for write in writes:
+        model, provider = (None, None)
+        if write.touch_model:
+            model, provider = _validate_model_override_args(
+                write.model, write.provider,
+                audit_comment_author=write.audit_comment_author,
+                audit_comment_body=write.audit_comment_body,
+            )
+        effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
+        prepared.append((write, model, provider, effort))
+
+    written: list[str] = []
+    fields: dict[str, tuple[str, ...]] = {}
+    with write_txn(conn):
+        for write, model, provider, effort in prepared:
+            changed: tuple[str, ...] = ()
+            if write.touch_model:
+                if not _set_model_override_locked(
+                    conn, write.task_id, model, provider,
+                    audit_comment_author=write.audit_comment_author,
+                    audit_comment_body=write.audit_comment_body,
+                ):
+                    raise RuntimeError(f"no such task: {write.task_id}")
+                changed += ("model_override", "provider_override")
+            if write.touch_effort:
+                if not _set_reasoning_effort_locked(conn, write.task_id, effort):
+                    raise RuntimeError(f"no such task: {write.task_id}")
+                changed += ("reasoning_effort",)
+            if changed:
+                written.append(write.task_id)
+                fields[write.task_id] = changed
+    # Observers fire only AFTER the whole batch commits, so a rolled-back
+    # batch never announces a mutation that did not happen.
+    for task_id in written:
+        notify_task_updated(conn, task_id, fields[task_id])
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -14339,6 +14483,29 @@ def clear_lane_model_override(
     with write_txn(conn):
         conn.execute("DELETE FROM lane_model_overrides WHERE assignee = ?", (key,))
     return removed
+
+
+def clear_all_lane_model_overrides(
+    conn: sqlite3.Connection,
+) -> list[LaneModelOverride]:
+    """Drop EVERY lane override in one transaction; return what was removed.
+
+    Same atomicity rule as :func:`apply_batch_route_writes`: ``lane-model
+    clear --all`` is one operator action over N rows, so looping over the
+    single-row clear (which commits each delete separately) could both leave
+    the board half-cleared and report rows that a concurrent writer had
+    already removed. Reading and deleting under one ``write_txn`` makes the
+    returned list the rows this call actually deleted.
+    """
+
+    with write_txn(conn):
+        rows = [
+            _lane_model_row(row)
+            for row in conn.execute("SELECT * FROM lane_model_overrides").fetchall()
+        ]
+        if rows:
+            conn.execute("DELETE FROM lane_model_overrides")
+    return rows
 
 
 def expire_lane_model_overrides(

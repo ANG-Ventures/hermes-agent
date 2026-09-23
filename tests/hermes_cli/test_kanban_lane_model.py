@@ -227,3 +227,43 @@ def test_cli_lane_model_firepower_requires_reason_beyond_reason_flag(kanban_home
         "--firepower 'approved burst'"
     )
     assert "route=test-lane/gpt-6-astra-900k" in ok
+
+
+def test_lane_clear_all_removes_every_lane_in_one_transaction(kanban_home):
+    """`clear --all` is one operator action: it reports exactly what it deleted.
+
+    Same partial-commit class as the set-model batch. Listing the rows and then
+    deleting them one individually-committed row at a time could leave the
+    board half-cleared and report rows a concurrent writer had already removed.
+    """
+    expires = 4_000_000_000
+    with kb.connect() as conn:
+        kb.set_lane_model_override(
+            conn, provider="test-lane", model="m-board", expires_at=expires,
+        )
+        kb.set_lane_model_override(
+            conn, provider="test-lane", model="m-worker",
+            assignee="worker", expires_at=expires,
+        )
+
+    out = kc.run_slash("lane-model clear --all")
+
+    assert "m-board" in out and "m-worker" in out
+    with kb.connect() as conn:
+        assert kb.list_lane_model_overrides(conn, include_expired=True) == []
+
+
+def test_lane_clear_all_reports_only_rows_it_actually_deleted(kanban_home):
+    """A concurrent delete must not be reported as this call's work."""
+    expires = 4_000_000_000
+    with kb.connect() as conn:
+        kb.set_lane_model_override(
+            conn, provider="test-lane", model="m-worker",
+            assignee="worker", expires_at=expires,
+        )
+        kb.clear_lane_model_override(conn, assignee="worker")
+
+    out = kc.run_slash("lane-model clear --all")
+
+    assert "m-worker" not in out
+    assert "no lane-model override set for any lane" in out
