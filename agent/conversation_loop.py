@@ -5193,19 +5193,6 @@ def run_conversation(
                         _turn_call = _turn_calls[-1]
                     except Exception:
                         pass  # telemetry must never break the conversation loop
-                    # Cumulative UNKNOWN provenance for the session_*_tokens
-                    # counters committed above. ABSORBING: those counters are
-                    # sums, so an unmeasured call contributes 0 and is
-                    # indistinguishable from a dead call once summed. One
-                    # unknown call therefore latches the SESSION term for the
-                    # rest of the window — a last-call-only guard cannot
-                    # recover it after a measured call follows an unmeasured
-                    # one. Lives here (not beside the += lines) so it stays
-                    # inside the same successful-usage commit block without
-                    # widening the append/commit adjacency invariant.
-                    for _flag_key, _flag_value in usage_flags.items():
-                        if _flag_value:
-                            setattr(agent, f"session_{_flag_key}", True)
                     # Rolling history for status-bar averages (last 10).
                     # An unmeasured output is not 0 tok/s. The two deques are
                     # appended together and consumers (cli.py status bar,
@@ -5368,8 +5355,18 @@ def run_conversation(
                                 # ones are last-write-wins, mirroring the
                                 # snapshot counters they discriminate.
                                 **usage_flags,
+                                # The last_turn_* discriminators move WITH the
+                                # snapshot they qualify: when the snapshot is
+                                # withheld (None -> COALESCE keeps the prior
+                                # real split), the flags are withheld too, or
+                                # they would stamp "unknown" over a measured
+                                # split that belongs to an earlier turn.
                                 **{
-                                    f"last_turn_{key}": value
+                                    f"last_turn_{key}": (
+                                        None
+                                        if bool(getattr(canonical_usage, "total_tokens_unknown", False))
+                                        else value
+                                    )
                                     for key, value in usage_flags.items()
                                 },
                             )

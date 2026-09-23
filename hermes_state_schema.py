@@ -891,6 +891,12 @@ class SessionSchemaMixin:
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    actual_cost_usd REAL NOT NULL DEFAULT 0,
+    cost_status TEXT,
+    cost_source TEXT,
+    first_seen REAL,
+    last_seen REAL,
     -- UNKNOWN != 0 (agent/usage_pricing.py USAGE_UNKNOWN_FIELDS). Absorbing
     -- per bucket; DEFAULT 0 so rebuilt/legacy rows read back "measured".
     input_tokens_unknown INTEGER NOT NULL DEFAULT 0,
@@ -898,12 +904,6 @@ class SessionSchemaMixin:
     cache_read_tokens_unknown INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens_unknown INTEGER NOT NULL DEFAULT 0,
     usage_unknown INTEGER NOT NULL DEFAULT 0,
-    estimated_cost_usd REAL NOT NULL DEFAULT 0,
-    actual_cost_usd REAL NOT NULL DEFAULT 0,
-    cost_status TEXT,
-    cost_source TEXT,
-    first_seen REAL,
-    last_seen REAL,
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 )"""
             )
@@ -1233,6 +1233,12 @@ class SessionSchemaMixin:
                                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                                   estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                                   actual_cost_usd REAL NOT NULL DEFAULT 0,
+                                   cost_status TEXT,
+                                   cost_source TEXT,
+                                   first_seen REAL,
+                                   last_seen REAL,
                                    -- UNKNOWN != 0 (agent/usage_pricing.py USAGE_UNKNOWN_FIELDS). Absorbing
                                    -- per bucket; DEFAULT 0 so rebuilt/legacy rows read back "measured".
                                    input_tokens_unknown INTEGER NOT NULL DEFAULT 0,
@@ -1240,12 +1246,6 @@ class SessionSchemaMixin:
                                    cache_read_tokens_unknown INTEGER NOT NULL DEFAULT 0,
                                    cache_write_tokens_unknown INTEGER NOT NULL DEFAULT 0,
                                    usage_unknown INTEGER NOT NULL DEFAULT 0,
-                                   estimated_cost_usd REAL NOT NULL DEFAULT 0,
-                                   actual_cost_usd REAL NOT NULL DEFAULT 0,
-                                   cost_status TEXT,
-                                   cost_source TEXT,
-                                   first_seen REAL,
-                                   last_seen REAL,
                                    PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
                                )"""
                         )
