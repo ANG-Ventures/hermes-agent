@@ -38,10 +38,13 @@ def test_every_workflow_parses():
 def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
     # Pin the declaration: injecting labels into a test would bypass this binding.
     job = yaml.safe_load((WORKFLOWS / "tests.yml").read_text())["jobs"]["e2e"]
-    assert job["runs-on"] == (
-        "${{ contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
+    # Non-merge_group events keep the legacy binding verbatim; merge_group uses
+    # the CI-overflow placement labels (tests/test_ci_overflow_workflow_contract.py).
+    assert job["runs-on"].startswith(
+        "${{ github.event_name != 'merge_group' && ("
+        "contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
         "&& fromJSON(format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"'))) "
-        "|| fromJSON('[\"ubuntu-latest\"]') }}"
+        "|| fromJSON('[\"ubuntu-latest\"]')) || "
     )
 
 
