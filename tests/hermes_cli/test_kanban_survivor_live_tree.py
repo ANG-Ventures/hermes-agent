@@ -480,6 +480,55 @@ def test_landed_accepts_byte_identical_rewritten_workspace_history(board, tmp_pa
     assert not ws.exists()
 
 
+def test_landed_rejects_replaced_workspace_commit_without_discarding_raw_work(board, tmp_path):
+    source = init(tmp_path / "replace-source")
+    base = commit(source, "code.py", "value = 1\n", "base")
+    tid = kb.create_task(board, title="replaced workspace history")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    git(tmp_path, "clone", "--no-local", str(source), str(ws))
+    git(ws, "config", "user.name", "Test")
+    git(ws, "config", "user.email", "test@example.invalid")
+    work = commit(ws, "code.py", "value = 2\n", "implementation")
+    live = tmp_path / "replace-live"
+    git(tmp_path, "clone", "--no-local", str(source), str(live))
+    git(ws, "replace", work, base)
+    git(ws, "reset", "--hard", "HEAD")
+    assert subprocess.run(
+        ["git", "-C", str(ws), "--no-replace-objects", "show", f"{work}:code.py"],
+        stdin=subprocess.DEVNULL, capture_output=True, check=True,
+    ).stdout == b"value = 2\n"
+    kb.set_workspace_path(board, tid, ws)
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        kb.complete_task(board, tid, metadata={
+            "changed_files": ["code.py"], "landed": [{"repo_path": str(live), "sha": base}],
+        })
+    assert ws.exists()
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_landed_allows_unrelated_edit_to_inherited_path(board, tmp_path):
+    source = init(tmp_path / "inherited-source")
+    commit(source, "config.txt", "version=1\n", "baseline config")
+    commit(source, "implementation.py", "result=0\n", "baseline implementation")
+    tid = kb.create_task(board, title="inherited path edited independently")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    live = tmp_path / "inherited-live"
+    for path in (ws, live):
+        git(tmp_path, "clone", "--no-local", str(source), str(path))
+        git(path, "config", "user.name", "Test")
+        git(path, "config", "user.email", "test@example.invalid")
+    work = commit(ws, "implementation.py", "result=1\n", "implementation")
+    landed = commit(live, "implementation.py", "result=1\n", "rewritten implementation")
+    assert work != landed
+    commit(live, "config.txt", "version=2\n", "unrelated configuration")
+    kb.set_workspace_path(board, tid, ws)
+    assert kb.complete_task(board, tid, metadata={
+        "changed_files": ["implementation.py"],
+        "landed": [{"repo_path": str(live), "sha": landed}],
+    })
+    assert not ws.exists()
+
+
 @pytest.mark.parametrize("rewritten", [False, True])
 def test_landed_rejects_work_reverted_from_canonical_head(board, tmp_path, rewritten):
     source = init(tmp_path / "reverted-source")
