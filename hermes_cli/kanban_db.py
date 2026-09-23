@@ -8026,30 +8026,92 @@ def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
         return False
 
 
+#: Per-GC-run cache of the machine-wide process-cwd snapshot. ``None`` means
+#: "no scope active: scan per call"; inside :func:`process_cwd_snapshot_scope`
+#: it holds a one-slot list, empty until the first probe fills it.
+_CWD_SNAPSHOT_SCOPE: ContextVar[Optional[list]] = ContextVar(
+    "kanban_cwd_snapshot_scope", default=None,
+)
+
+
+def _scan_process_cwds() -> Optional[frozenset]:
+    """Return every process cwd on the machine, resolved, or None on failure.
+
+    One ``lsof -d cwd -Fn`` lists only the cwd descriptor of each process, so
+    its cost scales with the process count, not with the size of any tree.
+    The previous per-candidate ``lsof +D <workspace>`` walked the whole
+    workspace and took 42-55 s on 62k-205k-entry workspaces, over its 30 s
+    timeout (card t_ee808d83). A machine-wide scan always contains at least
+    this process's own cwd, so a non-zero exit or an empty listing is a
+    failed scan, never "nothing found"; callers must fail closed on None.
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-d", "cwd", "-Fn"], capture_output=True,
+            text=True, timeout=30, stdin=subprocess.DEVNULL, check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = {line[1:] for line in result.stdout.splitlines()
+           if line.startswith("n") and len(line) > 1}
+    if not raw:
+        return None
+    cwds = set()
+    for name in raw:
+        try:
+            # lsof reports real paths on macOS (/private/var); resolve anyway
+            # so both sides of the prefix match are canonical.
+            cwds.add(Path(name).resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            return None
+    return frozenset(cwds)
+
+
+@contextlib.contextmanager
+def process_cwd_snapshot_scope():
+    """Reuse ONE process-cwd scan for every liveness probe in this block.
+
+    ``kanban gc`` wraps its removal loop in this so a run with N candidates
+    costs one ``lsof`` instead of N. A failed scan is cached too, so every
+    candidate in the run fails closed consistently. The snapshot is only as
+    fresh as the run: a process that enters a candidate after the scan is not
+    seen, which is the same window the per-path probe had between its lsof
+    and the rmtree.
+    """
+    token = _CWD_SNAPSHOT_SCOPE.set([])
+    try:
+        yield
+    finally:
+        _CWD_SNAPSHOT_SCOPE.reset(token)
+
+
+def _process_cwds() -> Optional[frozenset]:
+    slot = _CWD_SNAPSHOT_SCOPE.get()
+    if slot is None:
+        return _scan_process_cwds()
+    if not slot:
+        slot.append(_scan_process_cwds())
+    return slot[0]
+
+
 def _process_cwd_within(path: Path) -> bool:
     """Fail closed when a process has its cwd in *path* (including children).
 
     A live dir:home card normally does not own every managed scratch workspace,
     but its worker may have entered one. Check actual process cwd before
-    exempting that broad enclosing path from ownership.
+    exempting that broad enclosing path from ownership. A failed or timed-out
+    cwd scan answers True (preserve the path).
     """
-    try:
-        result = subprocess.run(
-            ["lsof", "-a", "-d", "cwd", "-Fn", "+D", str(path)], capture_output=True,
-            text=True, timeout=30, stdin=subprocess.DEVNULL, check=False,
-        )
-        # lsof returns 1 when no process has a matching cwd. Any other
-        # failure (including timeout or missing binary) preserves the path.
-        if result.returncode not in (0, 1):
-            return True
-        for line in result.stdout.splitlines():
-            if line.startswith("n"):
-                cwd = Path(line[1:]).resolve(strict=False)
-                if cwd == path or cwd.is_relative_to(path):
-                    return True
-        return False
-    except (OSError, subprocess.SubprocessError, ValueError):
+    cwds = _process_cwds()
+    if cwds is None:
         return True
+    try:
+        target = Path(path).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return True
+    return any(cwd == target or cwd.is_relative_to(target) for cwd in cwds)
 
 
 def _live_owners_of_path(

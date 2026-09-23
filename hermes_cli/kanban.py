@@ -4565,7 +4565,6 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     delete old worker logs."""
 
     scratch_root = kb.workspaces_root()
-    removed_ws = 0
     dry_run = bool(getattr(args, "dry_run", False))
     done_days = getattr(args, "done_retention_days", 3)
     # DONE cards are swept too once they have been finished for done_days:
@@ -4598,6 +4597,28 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         print(f"GC dry-run: {len(would)} workspace candidate(s); nothing removed "
               "(survivor/liveness gates are evaluated only on a real run)")
         return 0
+    # One machine-wide process-cwd scan serves every candidate's liveness
+    # probe in this run (card t_ee808d83); a per-path `lsof +D` walked each
+    # workspace and timed out on large ones, so nothing was ever reclaimed.
+    with kb.process_cwd_snapshot_scope():
+        removed_ws = _gc_remove_workspaces(rows, scratch_root)
+
+    event_days = getattr(args, "event_retention_days", 30)
+    log_days = getattr(args, "log_retention_days", 30)
+    with kb.connect_closing() as conn:
+        removed_events = kb.gc_events(
+            conn, older_than_seconds=event_days * 24 * 3600,
+        )
+    removed_logs = kb.gc_worker_logs(
+        older_than_seconds=log_days * 24 * 3600,
+    )
+    print(f"GC complete: {removed_ws} workspace(s), "
+          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    return 0
+
+
+def _gc_remove_workspaces(rows, scratch_root: Path) -> int:
+    removed_ws = 0
     for row in rows:
         if row["workspace_kind"] == "worktree":
             # Backstop for worktrees that escaped the completion/archive hook
@@ -4632,19 +4653,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
                 path, task_id=row["id"], reason="gc_archived", conn=conn,
             ):
                 removed_ws += 1
-
-    event_days = getattr(args, "event_retention_days", 30)
-    log_days = getattr(args, "log_retention_days", 30)
-    with kb.connect_closing() as conn:
-        removed_events = kb.gc_events(
-            conn, older_than_seconds=event_days * 24 * 3600,
-        )
-    removed_logs = kb.gc_worker_logs(
-        older_than_seconds=log_days * 24 * 3600,
-    )
-    print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
-    return 0
+    return removed_ws
 
 
 def _cmd_repair(args: argparse.Namespace) -> int:

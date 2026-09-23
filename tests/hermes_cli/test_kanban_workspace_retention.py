@@ -198,3 +198,125 @@ def test_gc_dry_run_deletes_nothing_and_lists_candidates(kanban_home, capsys):
     assert old_done.is_dir() and archived.is_dir() and old_log.exists()
     assert str(old_done) in out and str(archived) in out
     assert "2 workspace candidate(s)" in out
+
+
+# -- one cached process-cwd scan per gc run (card t_ee808d83) ---------------
+#
+# The per-path ``lsof +D <workspace>`` probe walked every candidate tree and
+# took 42-55 s on real 62k-205k-entry workspaces, over its 30 s timeout. The
+# replacement is ONE machine-wide ``lsof -d cwd`` per gc run, prefix-matched in
+# Python. These pin the three behaviours that matter: a failed scan retains,
+# an unrelated cwd reaps, and a nested cwd retains.
+
+
+def _fake_lsof(monkeypatch, behaviour):
+    """Route only ``lsof`` argv through *behaviour*; count the calls."""
+    real_run = subprocess.run
+    calls = []
+
+    def run(argv, *a, **kw):
+        if argv and argv[0] == "lsof":
+            calls.append(list(argv))
+            return behaviour(argv)
+        return real_run(argv, *a, **kw)
+
+    monkeypatch.setattr(kb.subprocess, "run", run)
+    return calls
+
+
+def _listing(*cwds):
+    out = "".join(f"p{100 + i}\nfcwd\nn{c}\n" for i, c in enumerate(cwds))
+    return lambda argv: subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+
+def _raise(exc):
+    def behaviour(argv):
+        raise exc
+    return behaviour
+
+
+@pytest.mark.parametrize("failure", ["timeout", "missing-binary", "nonzero-exit", "empty"])
+def test_cwd_scan_failure_retains_every_candidate(kanban_home, monkeypatch, failure):
+    behaviour = {
+        "timeout": _raise(subprocess.TimeoutExpired(["lsof"], 30)),
+        "missing-binary": _raise(FileNotFoundError("lsof")),
+        "nonzero-exit": lambda argv: subprocess.CompletedProcess(
+            argv, 1, stdout="p1\nfcwd\nn/\n", stderr="lsof: boom"),
+        "empty": lambda argv: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+    }[failure]
+    calls = _fake_lsof(monkeypatch, behaviour)
+    home_card = _home_rooted_dir_card(kanban_home, "running")
+    a = _scratch(_mktask("old done a"), "done", finished_days_ago=5)
+    b = _scratch(_mktask("old done b"), "done", finished_days_ago=5)
+
+    assert kb._process_cwd_within(a) is True
+    assert kb._live_owners_of_path(a) == [home_card]
+    assert _gc(done_retention_days=3) == 0
+
+    assert a.is_dir() and b.is_dir(), "a failed cwd scan must fail CLOSED"
+    assert calls, "the cwd scan was never attempted"
+    audit = kb.workspace_deletion_log_path().read_text(encoding="utf-8")
+    assert f"REFUSED\ttask={a.name}\t" in audit and "owner-has-live-run" in audit
+
+
+def test_live_home_card_without_cwd_in_candidate_reaps_it(kanban_home, monkeypatch):
+    _home_rooted_dir_card(kanban_home, "running")
+    old = _scratch(_mktask("old done"), "done", finished_days_ago=5)
+    # cwds that must NOT count: the workspaces root (an ancestor), a sibling
+    # whose name merely starts with the candidate's, and the home itself.
+    _fake_lsof(monkeypatch, _listing(
+        "/", str(kanban_home), str(kb.workspaces_root()),
+        str(old.parent / (old.name + "x")),
+    ))
+    assert kb._process_cwd_within(old) is False
+    assert _gc(done_retention_days=3) == 0
+    assert not old.exists()
+
+
+@pytest.mark.parametrize("via_symlink", [False, True])
+def test_nested_cwd_in_candidate_retains_it(kanban_home, monkeypatch, tmp_path, via_symlink):
+    home_card = _home_rooted_dir_card(kanban_home, "running")
+    old = _scratch(_mktask("old done"), "done", finished_days_ago=5)
+    free = _scratch(_mktask("free old done"), "done", finished_days_ago=5)
+    nested = old / "repo" / "src" / "pkg"
+    nested.mkdir(parents=True)
+    reported = nested
+    if via_symlink:
+        # lsof may report a path through a symlink (/var vs /private/var).
+        alias = tmp_path / "alias"
+        alias.symlink_to(old)
+        reported = alias / "repo" / "src" / "pkg"
+    _fake_lsof(monkeypatch, _listing("/", str(reported)))
+
+    assert kb._live_owners_of_path(old) == [home_card]
+    assert _gc(done_retention_days=3) == 0
+    assert old.is_dir() and not free.exists()
+
+
+def test_real_nested_cwd_process_retains_candidate(kanban_home):
+    """Same contract against the real ``lsof`` and a real process."""
+    _home_rooted_dir_card(kanban_home, "running")
+    old = _scratch(_mktask("old done"), "done", finished_days_ago=5)
+    free = _scratch(_mktask("free old done"), "done", finished_days_ago=5)
+    nested = old / "a" / "b"
+    nested.mkdir(parents=True)
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                               cwd=nested, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert sleeper.poll() is None
+        assert _gc(done_retention_days=3) == 0
+        assert old.is_dir() and not free.exists()
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=5)
+
+
+def test_gc_run_scans_process_cwds_once(kanban_home, monkeypatch):
+    _home_rooted_dir_card(kanban_home, "running")
+    ws = [_scratch(_mktask(f"old done {i}"), "done", finished_days_ago=5) for i in range(4)]
+    calls = _fake_lsof(monkeypatch, _listing("/"))
+    assert _gc(done_retention_days=3) == 0
+    assert not any(w.exists() for w in ws)
+    assert len(calls) == 1, calls
+    assert "+D" not in calls[0], "per-path tree walk is back"
