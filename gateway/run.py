@@ -8973,6 +8973,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
+        # t_e253d9d5: cancel_background_tasks() clears _pending_messages into
+        # a non-replayable flush file; let it spool follow-ups for boot
+        # replay first (see BasePlatformAdapter.cancel_background_tasks).
+        try:
+            adapter._shutdown_pending_sink = self._spool_one_adapter_pending
+        except Exception:
+            logger.debug("pending-sink install failed%s", suffix, exc_info=True)
         try:
             cancelled = await self._await_adapter_cleanup_with_timeout(
                 adapter.cancel_background_tasks(), timeout
@@ -15813,16 +15820,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         spooled = 0
         seen: set = set()
         for adapter in list((getattr(self, "adapters", None) or {}).values()):
-            slot = getattr(adapter, "_pending_messages", None)
-            if not isinstance(slot, dict):
-                continue
-            for key, event in list(slot.items()):
-                if event is None or id(event) in seen:
-                    continue
-                seen.add(id(event))
-                if await self._preserve_followup_across_restart(key, event, None):
-                    spooled += 1
-                    slot.pop(key, None)
+            spooled += await self._spool_one_adapter_pending(adapter, seen)
         overflow = getattr(self, "_queued_events", None)
         if isinstance(overflow, dict):
             for key, events in list(overflow.items()):
@@ -15832,6 +15830,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     seen.add(id(event))
                     if await self._preserve_followup_across_restart(key, event, None):
                         spooled += 1
+        return spooled
+
+    async def _spool_one_adapter_pending(self, adapter: Any, seen: Optional[set] = None) -> int:
+        """Spool one adapter's parked follow-ups (pending slot + debounce buffer).
+
+        Installed as the adapter's ``_shutdown_pending_sink`` by
+        ``_bounded_adapter_teardown`` so it runs inside
+        ``cancel_background_tasks()`` BEFORE that method drains the slot into
+        the non-replayable shutdown flush file.  An entry is removed only once
+        it is durably spooled; anything that fails to spool stays in the slot
+        and still reaches the #72680 flush file.
+        """
+        if seen is None:
+            seen = set()
+        spooled = 0
+        slot = getattr(adapter, "_pending_messages", None)
+        if isinstance(slot, dict):
+            for key, event in list(slot.items()):
+                if event is None or id(event) in seen:
+                    continue
+                seen.add(id(event))
+                if await self._preserve_followup_across_restart(key, event, None):
+                    spooled += 1
+                    if slot.get(key) is event:
+                        slot.pop(key, None)
+        store = getattr(adapter, "_text_debounce", None)
+        if isinstance(store, dict):
+            for key, state in list(store.items()):
+                event = getattr(state, "event", None)
+                if event is None or id(event) in seen:
+                    continue
+                seen.add(id(event))
+                if await self._preserve_followup_across_restart(key, event, None):
+                    spooled += 1
+                    if store.get(key) is state:
+                        store.pop(key, None)
+                        task = getattr(state, "task", None)
+                        if task is not None and not task.done():
+                            task.cancel()
         return spooled
 
     async def _load_restart_followups(self) -> int:
