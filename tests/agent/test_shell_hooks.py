@@ -1028,11 +1028,11 @@ class TestCrashIsNotADeny:
         stderr is whatever the child printed — a traceback can echo argv or an
         environment repr, so the block message must not relay it verbatim.
         """
-        planted = "AWS_SECRET=hunter2PRODSup3rSecret"
+        planted = "hunter2PRODSup3rSecret"
         stderr = (
             "Traceback (most recent call last):\n"
-            f"  File \"/h/x.py\", line 1, in <module>  # env was {planted}\n"
-            "RuntimeError: refusing to start because " + planted + "\n"
+            f"  File \"/h/x.py\", line 1, in <module>  # env was TOK={planted}\n"
+            "RuntimeError: refusing to start because TOK=" + planted + "\n"
         )
         r = shell_hooks._evaluate_result(
             self._spec(), _spawn_result(returncode=1, stderr=stderr),
