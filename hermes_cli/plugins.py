@@ -326,7 +326,8 @@ VALID_HOOKS: Set[str] = {
     #   exit_kind: "clean_exit" | "rate_limited" | "infra_unavailable"
     #              | "nonzero_exit" | "signaled" | "unknown",
     #   exit_code: int | None,
-    #   outcome: "crashed" | "rate_limited" | "infra_unavailable",
+    #   outcome: "crashed" | "rate_limited" | "infra_unavailable"
+    #            | "cohort_death",
     #   retry_status: str  (the phase the task was released back to).
     "on_kanban_worker_exited",
     # on_kanban_worker_stale_claim fires when release_stale_claims reclaims
