@@ -35,6 +35,16 @@ def test_every_workflow_parses():
         assert isinstance(workflow.get("jobs"), dict), path.name
 
 
+def test_ci_review_label_requests_full_rerun():
+    job = yaml.safe_load((WORKFLOWS / "label-rerun.yml").read_text())["jobs"]["rerun-review-labels"]
+    command = job["steps"][0]["run"]
+    # Failed-only rerun of this dynamic matrix has produced startup_failure / zero jobs.
+    assert command.startswith("set -euo pipefail\n")
+    assert 'gh run rerun "$RUN_ID" --repo "$REPO"\n' in command
+    assert "--failed" not in command
+    assert 'gh run rerun "$RUN_ID" --repo "$REPO" || true' not in command
+
+
 def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
     # Pin the declaration: injecting labels into a test would bypass this binding.
     job = yaml.safe_load((WORKFLOWS / "tests.yml").read_text())["jobs"]["e2e"]
