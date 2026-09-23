@@ -28226,7 +28226,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._warm_goals_session_db("loop wakeup")
 
                 now = time.time()
-                for sid, state in list_active_loops():
+                # OFF the event loop (Aegis, 2026-09-23). list_active_loops() reads state_meta
+                # through SessionDB._read_ctx, which past _READ_POOL_MAX falls back to the WRITER
+                # lock — so under 6+ live turns this sync call convoyed behind compaction-ingest
+                # transactions and blocked the loop for 10-50 s (16 of 19 PHASE=event_loop_blocked
+                # sites today). Every Discord interaction ack (3 s budget) and every platform
+                # read/write sat behind it: "/model: The application did not respond" and
+                # "Apollo is frozen again". tests/gateway/test_no_sync_db_on_loop.py pins the class.
+                for sid, state in await asyncio.to_thread(list_active_loops):
                     if state.awaiting_response or now < state.next_due_at:
                         continue
                     route = state.route or {}
