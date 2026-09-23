@@ -132,20 +132,20 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 # atexit-join would otherwise block interpreter finalization). Overridable via
 # HERMES_GATEWAY_EXECUTOR_DRAIN_TIMEOUT for ops tuning.
 _EXECUTOR_DRAIN_TIMEOUT_SECS_DEFAULT = 8.0
-# Size of the gateway-owned pool that runs agent TURN bodies (run_sync).
-# Overridable via HERMES_GATEWAY_EXECUTOR_MAX_WORKERS for ops tuning.
-#
-# INVARIANT (2026-09-23, Apollo): the turn pool must be at least as wide as
-# turn ADMISSION (gateway.max_concurrent_turns). Admission is what decides a
-# turn may run; a narrower pool silently re-queues admitted turns behind
-# whichever bodies are already occupying threads. A turn body holds its thread
-# for the whole turn (every tool call is blocking), so with 8 boot-resumes +
-# kanban wakes + user turns live at once, admitted turns sat in this queue for
-# 2151-2356 s (PHASE=executor_wait pool=turn inflight=10 queued=2..4) and Ace
-# read the sessions as "frozen". #807 moved housekeeping off this pool but
-# left it at 10 against an admission cap of 100. Threads here block on
-# LLM/HTTP and subprocess I/O, so a wide pool costs stacks, not CPU.
-_EXECUTOR_MAX_WORKERS_DEFAULT = 64
+# The gateway-owned pool that runs agent TURN bodies (run_sync) is UNBOUNDED
+# by default (Ace ruling 2026-09-23 08:47: "that limit is stupid ... completely
+# eliminate it"). History: 1011c07966 (upstream, 2026-06-04) replaced the loop
+# default executor (min(32, ncpu+4) = 36 on the Mac Studio) with an owned
+# ThreadPoolExecutor(max_workers=10); #807 (fork, 2026-09-21) moved
+# housekeeping off it and kept the 10. Neither had a measured reason for the
+# number. The effect was measured 2026-09-23: turn ADMISSION
+# (gateway.max_concurrent_turns=100) let turns start, and the 10-thread pool
+# silently re-queued them for 334-2356 s (PHASE=executor_wait pool=turn
+# inflight=10). A turn body blocks its thread on LLM/HTTP and subprocess I/O
+# for the whole turn, so a thread costs a stack, not CPU; admission is the
+# only concurrency control that should exist. HERMES_GATEWAY_EXECUTOR_MAX_WORKERS
+# remains as an explicit operator cap for a constrained host; unset = no cap.
+_EXECUTOR_MAX_WORKERS_DEFAULT = 0  # 0 = unbounded
 # Size of the separate pool that runs best-effort session HOUSEKEEPING
 # (finalize hooks, agent resource cleanup). Kept off the turn pool because
 # those callers ABANDON their worker on timeout — see
@@ -219,19 +219,22 @@ def _env_positive_int(name: str, default: int) -> int:
     return default
 
 
-def _executor_max_workers(admission_cap: Optional[int] = None) -> int:
-    """Return the size of the turn-body executor.
+def _executor_max_workers(admission_cap: Optional[int] = None) -> Optional[int]:
+    """Return the size of the turn-body executor, or ``None`` for unbounded.
 
-    Never narrower than turn admission: an admitted turn must find a thread.
-    ``admission_cap`` is ``gateway.max_concurrent_turns`` (None = unbounded,
-    which keeps the default). The env knob is an explicit operator override
-    and wins outright, but is still floored at the admission cap so a stale
-    knob cannot re-create the 2026-09-23 queue.
+    Default is unbounded: turn admission (``gateway.max_concurrent_turns``)
+    is the only concurrency control, and a pool narrower than admission
+    re-queues admitted turns invisibly. ``HERMES_GATEWAY_EXECUTOR_MAX_WORKERS``
+    is an explicit operator cap; when it is narrower than the admission cap it
+    is raised to the admission cap and a warning names both numbers, so a stale
+    knob cannot re-create the 2026-09-23 executor queue.
     """
-    floor = _EXECUTOR_MAX_WORKERS_DEFAULT
-    if type(admission_cap) is int and admission_cap > floor:
-        floor = admission_cap
-    size = _env_positive_int("HERMES_GATEWAY_EXECUTOR_MAX_WORKERS", floor)
+    raw = os.getenv("HERMES_GATEWAY_EXECUTOR_MAX_WORKERS", "").strip()
+    if not raw:
+        return None
+    size = _env_positive_int("HERMES_GATEWAY_EXECUTOR_MAX_WORKERS", 0)
+    if size <= 0:
+        return None
     if type(admission_cap) is int and admission_cap > size:
         logger.warning(
             "HERMES_GATEWAY_EXECUTOR_MAX_WORKERS=%d is narrower than "
@@ -251,9 +254,66 @@ def _housekeeping_executor_max_workers() -> int:
     )
 
 
+class _UnboundedThreadExecutor(concurrent.futures.Executor):
+    """One thread per submitted work item; no queue, no cap.
+
+    ``concurrent.futures.ThreadPoolExecutor(max_workers=None)`` is NOT
+    unbounded — it is ``min(32, ncpu + 4)`` (36 on the Mac Studio), which is
+    the same executor-queue failure at a different number. Turn bodies block
+    on LLM/HTTP and subprocess I/O, so the only cost of a thread is its stack.
+    Admission (``gateway.max_concurrent_turns``) is the concurrency control.
+    Exposes ``_threads``, ``_work_queue`` and ``_max_workers`` so the
+    ``PHASE=executor_wait`` reporter and the shutdown liveness scan keep
+    working unchanged (queue is always empty: nothing ever waits here).
+    """
+
+    def __init__(self, thread_name_prefix: str = ""):
+        self._prefix = thread_name_prefix
+        self._threads: set = set()
+        self._work_queue: "queue.Queue" = queue.Queue()
+        self._max_workers = None
+        self._shutdown = False
+        self._lock = threading.Lock()
+        self._n = 0
+
+    def submit(self, fn, /, *args, **kwargs):
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._n += 1
+            n = self._n
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _run():
+            try:
+                if not fut.set_running_or_notify_cancel():
+                    return
+                try:
+                    fut.set_result(fn(*args, **kwargs))
+                except BaseException as exc:  # noqa: BLE001 - mirror ThreadPoolExecutor
+                    fut.set_exception(exc)
+            finally:
+                with self._lock:
+                    self._threads.discard(threading.current_thread())
+
+        t = threading.Thread(target=_run, name=f"{self._prefix}_{n}", daemon=True)
+        with self._lock:
+            self._threads.add(t)
+        t.start()
+        return fut
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False):
+        with self._lock:
+            self._shutdown = True
+            threads = list(self._threads)
+        if wait:
+            for t in threads:
+                t.join()
+
+
 def _get_or_create_pool(
-    owner: Any, attr: str, prefix: str, max_workers: int
-) -> concurrent.futures.ThreadPoolExecutor:
+    owner: Any, attr: str, prefix: str, max_workers: Optional[int]
+) -> concurrent.futures.Executor:
     """Get-or-create one of the gateway-owned pools under the owner's shared lock.
 
     A module-level function, not a method: ``_get_executor`` is called unbound against
@@ -270,10 +330,13 @@ def _get_or_create_pool(
             raise RuntimeError("Gateway is shutting down; executor unavailable")
         executor = getattr(owner, attr, None)
         if executor is None or getattr(executor, "_shutdown", False):
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max_workers,
-                thread_name_prefix=prefix,
-            )
+            if max_workers is None:
+                executor = _UnboundedThreadExecutor(thread_name_prefix=prefix)
+            else:
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix=prefix,
+                )
             setattr(owner, attr, executor)
         return executor
 
