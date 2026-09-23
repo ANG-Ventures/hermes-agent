@@ -1846,3 +1846,72 @@ def test_gpt6_luna_cache_read_discount_and_tier():
     assert entry.cache_write_cost_per_million == Decimal("0.125")
     assert entry.tier_threshold_tokens == 272_000
     assert entry.cache_read_cost_per_million_above == Decimal("0.02")
+
+
+# ── Anthropic Claude Opus 5.5 (released 2026-09-22) ──────────────────────────
+# Behaviour contracts, not a snapshot of the table: each assertion is about a
+# COST RELATIONSHIP the announcement states ("20% less than Opus 5" on I/O,
+# "60% less than Opus 5" on cache reads) plus the invariant that every relay
+# spelling the fleet actually records in turns.db prices the same as the bare
+# vendor name. A rate refresh that keeps those relationships stays green; a
+# missing or $0-priced entry goes red.
+
+def test_opus_5_5_prices_below_opus_5_on_a_1m_input_turn():
+    """1M input on (anthropic, claude-opus-5-5) is non-zero and < opus-5."""
+    usage = CanonicalUsage(input_tokens=1_000_000)
+    new = estimate_usage_cost("claude-opus-5-5", usage, provider="anthropic")
+    old = estimate_usage_cost("claude-opus-5", usage, provider="anthropic")
+    assert new.amount_usd is not None and new.amount_usd > 0
+    assert old.amount_usd is not None and old.amount_usd > 0
+    assert new.amount_usd < old.amount_usd, (
+        f"opus-5-5 ({new.amount_usd}) must cost less than opus-5 "
+        f"({old.amount_usd}) — the announcement prices it 20% below."
+    )
+
+
+def test_opus_5_5_relay_spellings_price_identically_to_the_bare_vendor():
+    """Every notional relay lane that appears in turns.db must price.
+
+    claude-apr / claude-apx-N / claude-bpx-N are the provider strings the
+    fleet's turn ledger actually records for Opus traffic. They route to the
+    bare "anthropic" vendor via is_notional_anthropic_provider(), so a turn
+    recorded under any of them must produce the SAME non-zero estimate as the
+    bare name — never billing_mode="unknown" / $0.
+    """
+    usage = CanonicalUsage(input_tokens=1_000_000)
+    bare = estimate_usage_cost("claude-opus-5-5", usage, provider="anthropic")
+    assert bare.amount_usd is not None and bare.amount_usd > 0
+    for lane in ("claude-apr", "claude-apx-1", "claude-bpx-22", "claude-bpx-3"):
+        got = estimate_usage_cost("claude-opus-5-5", usage, provider=lane)
+        assert got.status != "unknown", lane
+        assert got.amount_usd == bare.amount_usd, lane
+        old = estimate_usage_cost("claude-opus-5", usage, provider=lane)
+        assert got.amount_usd < old.amount_usd, lane
+
+
+def test_opus_5_5_cache_read_is_cheaper_than_opus_5():
+    """Cache reads are the dominant agentic-coding cost; 0.05x input here."""
+    new = get_pricing_entry("claude-opus-5-5", provider="anthropic")
+    old = get_pricing_entry("claude-opus-5", provider="anthropic")
+    assert new is not None and old is not None
+    assert new.cache_read_cost_per_million > 0
+    assert new.cache_read_cost_per_million < old.cache_read_cost_per_million
+    assert new.cache_write_cost_per_million < old.cache_write_cost_per_million
+
+
+def test_opus_5_5_fast_mode_costs_double_the_standard_tier():
+    """Announcement: fast mode is $8/$40 against the standard $4/$20."""
+    std = get_pricing_entry("claude-opus-5-5", provider="anthropic")
+    fast = get_pricing_entry("claude-opus-5-5-fast", provider="anthropic")
+    assert std is not None and fast is not None
+    assert fast.input_cost_per_million == std.input_cost_per_million * 2
+    assert fast.output_cost_per_million == std.output_cost_per_million * 2
+
+
+def test_opus_5_5_dot_notation_resolves_to_the_same_entry():
+    """``claude-opus-5.5`` normalizes onto the hyphenated key."""
+    dotted = get_pricing_entry("claude-opus-5.5", provider="anthropic")
+    hyphen = get_pricing_entry("claude-opus-5-5", provider="anthropic")
+    assert dotted is not None and hyphen is not None
+    assert dotted.input_cost_per_million == hyphen.input_cost_per_million
+    assert dotted.output_cost_per_million == hyphen.output_cost_per_million

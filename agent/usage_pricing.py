@@ -579,6 +579,41 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-07",
     ),
+    # ── Anthropic Claude Opus 5.5 ────────────────────────────────────────
+    # Released 2026-09-22, the first Claude 5.5-family model. Priced BELOW
+    # Opus 5 on every axis (announcement: "Input and output tokens are $4 and
+    # $20 per million, 20% less than Opus 5. Cache reads ... are $0.20 per
+    # million tokens, 60% less than Opus 5"); cache write $5 keeps the table's
+    # 1.25x-input convention. All four numbers are one (list) tier — no promo.
+    # Fast mode is 2x ($8/$40), stated verbatim in the announcement, mirroring
+    # the opus-5-fast / opus-4-8-fast pattern. Subscription relays price
+    # NOTIONAL via is_notional_anthropic_provider(); this entry only prices
+    # the bare "anthropic" provider (direct key / Bedrock / Vertex).
+    # Source: https://www.anthropic.com/claude-opus-5-5
+    (
+        "anthropic",
+        "claude-opus-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("4.00"),
+        output_cost_per_million=Decimal("20.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("5.00"),
+        source="official_docs_snapshot",
+        source_url="https://www.anthropic.com/claude-opus-5-5",
+        pricing_version="anthropic-opus-5-5-2026-09",
+    ),
+    (
+        "anthropic",
+        "claude-opus-5-5-fast",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("8.00"),
+        output_cost_per_million=Decimal("40.00"),
+        cache_read_cost_per_million=Decimal("0.40"),
+        cache_write_cost_per_million=Decimal("10.00"),
+        source="official_docs_snapshot",
+        source_url="https://www.anthropic.com/claude-opus-5-5",
+        pricing_version="anthropic-opus-5-5-2026-09",
+    ),
     # ── Anthropic Claude 4.8 ─────────────────────────────────────────────
     # Same $5/$25 base pricing as 4.6/4.7.  Fast-mode variant is a separate
     # model ID with 2x premium (vs the 6x premium on older Opus generations).
