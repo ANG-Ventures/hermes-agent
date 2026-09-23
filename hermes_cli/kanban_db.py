@@ -8026,6 +8026,32 @@ def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
         return False
 
 
+def _process_cwd_within(path: Path) -> bool:
+    """Fail closed when a process has its cwd in *path* (including children).
+
+    A live dir:home card normally does not own every managed scratch workspace,
+    but its worker may have entered one. Check actual process cwd before
+    exempting that broad enclosing path from ownership.
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-Fn", "+D", str(path)], capture_output=True,
+            text=True, timeout=30, stdin=subprocess.DEVNULL, check=False,
+        )
+        # lsof returns 1 when no process has a matching cwd. Any other
+        # failure (including timeout or missing binary) preserves the path.
+        if result.returncode not in (0, 1):
+            return True
+        for line in result.stdout.splitlines():
+            if line.startswith("n"):
+                cwd = Path(line[1:]).resolve(strict=False)
+                if cwd == path or cwd.is_relative_to(path):
+                    return True
+        return False
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return True
+
+
 def _live_owners_of_path(
     path: Path,
     *,
@@ -8077,6 +8103,7 @@ def _live_owners_of_path(
 
     found: set = set()
     all_owners: set = set()
+    cwd_in_path: Optional[bool] = None
     with contextlib.ExitStack() as stack:
         conns = []
         if conn is not None:
@@ -8111,6 +8138,18 @@ def _live_owners_of_path(
                     ).expanduser().resolve(strict=False)
                 except Exception:
                     return ["<unresolvable-owner-path>"] if live_only else []
+                if (is_managed and stored != resolved
+                        and resolved.is_relative_to(stored)
+                        and not _is_managed_scratch_path(stored)):
+                    # A broad dir:home row owns a scratch workspace only when
+                    # it is live AND a process actually has its cwd there.
+                    # Unrelated home-rooted cards must not pin all workspaces.
+                    if not (live_only and _task_has_live_run(c, row["id"])):
+                        continue
+                    if cwd_in_path is None:
+                        cwd_in_path = _process_cwd_within(resolved)
+                    if not cwd_in_path:
+                        continue
                 if (stored == resolved or stored.is_relative_to(resolved)
                         or resolved.is_relative_to(stored)):
                     ids.add(row["id"])
@@ -8411,6 +8450,12 @@ def safe_remove_workspace_dir(
     if not resolved.is_dir():
         return False
 
+    if task_id and _has_active_children(conn, task_id):
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="active-children-need-handoff",
+        )
+        return False
     if _task_has_live_run(conn, task_id):
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,
@@ -8528,6 +8573,26 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+def _has_active_children(conn: Optional[sqlite3.Connection], task_id: str) -> bool:
+    """Fail closed if a linked child still needs its parent's handoff."""
+    if conn is None:
+        try:
+            with connect_closing() as own:
+                return _has_active_children(own, task_id)
+        except Exception:
+            return True
+    try:
+        return conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+            "LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return True
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -8556,14 +8621,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # Check if this task has children that still need the workspace.
         # If any child is not yet done/archived, defer cleanup so the
         # child can read handoff artifacts from the workspace (#33774).
-        _active_children = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks t ON t.id = l.child_id "
-            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
-            "LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if _active_children:
+        if _has_active_children(conn, task_id):
             _log.debug(
                 "Deferring %s workspace cleanup for task %s: "
                 "active children still need workspace at %s",
@@ -8638,6 +8696,12 @@ def _cleanup_worktree_workspace(
     try:
         wp = Path(path).expanduser()
         if not wp.is_dir():
+            return
+        if _has_active_children(conn, task_id):
+            _audit_workspace_deletion(
+                wp, task_id=task_id, reason=reason, allowed=False,
+                detail="active-children-need-handoff",
+            )
             return
         # Liveness FIRST: a card mid-run owns its checkout regardless of how
         # clean git thinks it is. Fail-closed on any DB error.
