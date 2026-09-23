@@ -291,3 +291,106 @@ def test_readonly_inspection_of_the_live_board_is_still_allowed(
     monkeypatch.setattr(hermes_test_context, "_in_test_context", lambda: True)
     with kb.connect_readonly(db_path=live) as conn:
         assert conn.execute("select count(*) from tasks").fetchone()[0] == 0
+
+
+# --- the SECOND read-write door: repair_db() (card t_880f5d17) --------------
+#
+# ``connect()`` is not the only rw open of a ``kanban_db_path()``-derived
+# board. ``repair_db()`` — reachable as ``hermes kanban repair`` — resolves
+# the same way and opens the file rw through ``_sqlite_connect()`` without
+# ever calling ``connect()``, so the gate above never ran for it. Measured on
+# the pre-fix tree from a pytest context against a synthetic live board:
+# PROCEEDED status=ok, leaving ``kanban.db.init.lock`` beside the board, and
+# on a corrupted board additionally a ``kanban.db.corrupt.<hash>.bak``.
+
+
+def test_repair_db_refuses_the_live_board_from_a_test_context(
+    live_root, monkeypatch, as_production_process
+):
+    """Same R1 refusal as connect(), through the repair door."""
+    live = _live_db(live_root)
+    monkeypatch.setenv("HERMES_HOME", str(live_root))  # production-shaped env
+    kb.connect(db_path=live).close()                   # seed as production
+    monkeypatch.setattr(hermes_test_context, "_in_test_context", lambda: True)
+
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.repair_db(db_path=live)
+
+
+def test_repair_db_refuses_the_pin_resolved_live_board(live_root, monkeypatch):
+    """The CLI shape: no ``db_path=``, resolved via ``kanban_db_path()``."""
+    monkeypatch.setenv("HERMES_HOME", str(live_root))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(_live_db(live_root)))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.repair_db()
+
+
+def test_repair_db_refusal_creates_no_files(live_root, monkeypatch):
+    """Refusal must precede EVERY filesystem effect.
+
+    The guard sits before the ``exists()`` probe and before
+    ``_cross_process_init_lock``, so a refused repair leaves no ``.init.lock``,
+    no quarantine ``.bak``, and does not create the board when it is absent.
+    """
+    live = _live_db(live_root)
+    monkeypatch.setenv("HERMES_HOME", str(live_root))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+
+    before = sorted(p.name for p in live_root.iterdir())
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.repair_db()
+    assert sorted(p.name for p in live_root.iterdir()) == before
+    assert not (live_root / "kanban.db.init.lock").exists()
+    assert not list(live_root.glob("*.bak"))
+    assert not live.exists()
+
+
+def test_repair_db_still_repairs_for_a_real_operator(
+    live_root, monkeypatch, as_production_process
+):
+    """The false-positive control: a genuine operator must still repair.
+
+    ``hermes kanban repair`` exists precisely to be run against the live board
+    when it is corrupt. A guard that refused the operator would take the only
+    recovery path away at the moment it is needed.
+    """
+    import sqlite3
+
+    live = _live_db(live_root)
+    monkeypatch.setenv("HERMES_HOME", str(live_root))
+    with kb.connect(db_path=live) as conn:
+        kb.create_task(conn, title="operator card")
+    conn.close()
+
+    # Index-only corruption, same technique as test_kanban_db_repair.py.
+    index_name = "idx_tasks_status"
+    raw = sqlite3.connect(live, isolation_level=None)
+    original_sql = raw.execute(
+        "SELECT sql FROM sqlite_master WHERE name = ?", (index_name,)
+    ).fetchone()[0]
+    raw.execute("PRAGMA writable_schema=ON")
+    raw.execute(
+        "UPDATE sqlite_master SET sql = ? WHERE name = ?",
+        (original_sql + " WHERE 0", index_name),
+    )
+    raw.execute("PRAGMA writable_schema=OFF")
+    raw.close()
+    raw = sqlite3.connect(live, isolation_level=None)
+    raw.execute(f'REINDEX "{index_name}"')
+    raw.execute("PRAGMA writable_schema=ON")
+    raw.execute(
+        "UPDATE sqlite_master SET sql = ? WHERE name = ?",
+        (original_sql, index_name),
+    )
+    raw.execute("PRAGMA writable_schema=OFF")
+    raw.close()
+    kb._INITIALIZED_PATHS.clear()
+
+    report = kb.repair_db(db_path=live)
+    assert report.status == "repaired"
+    assert index_name in report.reindexed
+    with kb.connect_readonly(db_path=live) as conn:
+        assert conn.execute("select count(*) from tasks").fetchone()[0] == 1
