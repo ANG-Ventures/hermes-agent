@@ -348,6 +348,43 @@ def test_landed_accepts_the_live_home_tree_without_any_mirror_claim(board, tmp_p
     assert not ws.exists()
 
 
+def test_landed_rejects_patch_id_whitespace_collision(board, tmp_path):
+    """Whitespace-normalized diffs can execute differently; never discard the original."""
+    from hermes_cli.kanban_survivor import _patch_id
+
+    source = init(tmp_path / "collision-source")
+    commit(source, "implementation.py", "if False:\n    safe = True\n", "base")
+    tid = kb.create_task(board, title="whitespace collision")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    git(tmp_path, "clone", "--no-local", str(source), str(ws))
+    git(ws, "config", "user.name", "Workspace")
+    git(ws, "config", "user.email", "workspace@example.invalid")
+    work_head = commit(ws, "implementation.py", "if False:\n    safe = True\nresult = 42\n", "work")
+    live = tmp_path / "collision-live"
+    git(tmp_path, "clone", "--no-local", str(source), str(live))
+    git(live, "config", "user.name", "Live")
+    git(live, "config", "user.email", "live@example.invalid")
+    live_head = commit(live, "implementation.py", "if False:\n    safe = True\n    result = 42\n", "landed")
+    assert _patch_id(ws, work_head) == _patch_id(live, live_head)
+    assert git(ws, "rev-parse", f"{work_head}^:implementation.py") == git(live, "rev-parse", f"{live_head}^:implementation.py")
+    assert _execution_value(ws) == 42
+    assert _execution_value(live) is None
+    kb.set_workspace_path(board, tid, ws)
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        kb.complete_task(board, tid, metadata={
+            "changed_files": ["implementation.py"],
+            "landed": [{"repo_path": str(live), "sha": live_head}],
+        })
+    assert ws.exists()
+    assert _execution_value(ws) == 42
+
+
+def _execution_value(repo):
+    scope = {}
+    exec((repo / "implementation.py").read_text(), scope)
+    return scope.get("result")
+
+
 def test_landed_rejects_a_valid_but_unrelated_commit(board, tmp_path):
     tid, ws, _, _, _ = home_clone(board, tmp_path)
     unrelated = init(tmp_path / "unrelated-live")
@@ -397,7 +434,7 @@ def test_landed_allows_ignored_workspace_files(board, tmp_path):
     assert not ws.exists()
 
 
-def test_landed_accepts_patch_equivalent_workspace_history(board, tmp_path):
+def test_landed_accepts_byte_identical_rewritten_workspace_history(board, tmp_path):
     source = init(tmp_path / "patch-source")
     commit(source, "code.py", "value = 1\n", "base")
     tid = kb.create_task(board, title="rewritten landed history")
@@ -421,7 +458,7 @@ def test_landed_accepts_patch_equivalent_workspace_history(board, tmp_path):
     })
     entry = kb.latest_run(board, tid).metadata["survivor"]["landed"][0]
     assert entry["workspace_repositories"] == [{
-        "repository": ".", "head": workspace_head, "matched_by": "patch-id",
+        "repository": ".", "head": workspace_head, "matched_by": "exact-diff",
     }]
     assert not ws.exists()
 

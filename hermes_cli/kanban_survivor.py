@@ -590,6 +590,14 @@ def _patch_id(repo, sha, env=None):
     return result.stdout.split()[0].decode()
 
 
+def _exact_commit_diff(repo, sha):
+    """Full blob-identified diff; unlike patch-id this retains whitespace and bytes."""
+    diff = _git(repo, "diff-tree", "-p", "--binary", "--no-commit-id",
+                "--full-index", "--no-ext-diff", "--no-textconv",
+                "--no-renames", "--root", sha, check=False)
+    return diff.stdout if not diff.returncode and diff.stdout else None
+
+
 def _landed_contains_history(workspace_repo, landed_repo, landed_sha):
     """Return how ``landed_sha`` contains every committed workspace change."""
     workspace_head = _git(
@@ -618,16 +626,16 @@ def _landed_contains_history(workspace_repo, landed_repo, landed_sha):
 
     needed = set()
     for commit in missing:
-        patch_id = _patch_id(workspace_repo, commit)
-        if patch_id is None:
+        diff = _exact_commit_diff(workspace_repo, commit)
+        if diff is None:
             return None
-        needed.add(patch_id)
+        needed.add(diff)
     for commit in landed_commits:
-        patch_id = _patch_id(landed_repo, commit)
-        if patch_id in needed:
-            needed.remove(patch_id)
+        diff = _exact_commit_diff(landed_repo, commit)
+        if diff in needed:
+            needed.remove(diff)
             if not needed:
-                return "patch-id"
+                return "exact-diff"
     return None
 
 
@@ -696,9 +704,8 @@ def _verify_landed(entries, workspace):
 
     Every repository in the workspace must be clean and its committed history
     must be represented by a named landed commit, either by exact ancestry or
-    commit-by-commit patch equivalence. Patch-id remains advisory for remote
-    mirrors; it can bind workspace commits only after a live canonical tree has
-    independently passed the durability and reachability checks above.
+    byte-exact commit diffs. Patch-id remains advisory for remote
+    mirrors; neither it nor a normalized diff can bind workspace commits.
 
     Every failure mode raises — an unverifiable claim must never be accepted,
     because accepting it authorises deleting the only remaining copy of the code.
