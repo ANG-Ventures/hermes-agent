@@ -39,12 +39,12 @@ class SurvivorUnavailable(ValueError):
 
 log = logging.getLogger(__name__)
 
-def _git(repo, *args, env=None, check=True, input=None):
+def _git(repo, *args, env=None, check=True, input=None, timeout=30):
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
         stdin=subprocess.DEVNULL if input is None else None,
         input=input,
-        capture_output=True, timeout=30, env=env,
+        capture_output=True, timeout=timeout, env=env,
     )
     if check and result.returncode:
         # Git stderr can contain credential-bearing remote URLs, so it is never
@@ -498,6 +498,80 @@ def _temporary_roots():
     return [Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp")]
 
 
+def _excluded_roots(workspace):
+    """Roots a repo must NOT live under to count as durable/canonical."""
+    return [workspace, kb.workspaces_root(), kb.kanban_home() / "kanban" / "workspaces",
+            kb.kanban_home() / "kanban" / "boards", *_temporary_roots()]
+
+
+def _independent_storage(repo, workspace):
+    """Require local ref authority to retain its Git storage after disposal.
+
+    Gitfiles and linked worktrees are fine when BOTH their private and common
+    directories are durable. Reject alternates and internal storage symlinks
+    conservatively: proving a checkout path alone says nothing about the objects
+    it borrows. Ordinary hardlinked clones remain independent on unlink.
+    """
+    if any(os.environ.get(key) for key in (
+        "GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    )):
+        return False
+    try:
+        excluded = [root.resolve() for root in _excluded_roots(workspace)]
+
+        def durable(path):
+            return not any(path.resolve(strict=True).is_relative_to(root) for root in excluded)
+
+        if not durable(repo):
+            return False
+        partial = _git(repo, "config", "--get", "extensions.partialClone", check=False)
+        if partial.returncode == 0 and partial.stdout.strip():
+            return False
+        promisors = _git(
+            repo, "config", "--bool", "--get-regexp", r"^remote\..*\.promisor$",
+            check=False,
+        )
+        if promisors.returncode == 0 and any(
+            line.rsplit(maxsplit=1)[-1] == b"true"
+            for line in promisors.stdout.splitlines() if line.strip()
+        ):
+            return False
+        directories = set()
+        for args in (("--git-dir",), ("--git-common-dir",), ("--git-path", "objects")):
+            result = _git(repo, "rev-parse", "--path-format=absolute", *args, check=False)
+            if result.returncode or not result.stdout.strip():
+                return False
+            path = Path(os.fsdecode(result.stdout).strip())
+            if not path.is_dir() or not durable(path):
+                return False
+            directories.add(path.resolve(strict=True))
+
+        def fail(exc):
+            raise exc
+
+        for directory in directories:
+            for root, dirs, files in os.walk(directory, followlinks=False, onerror=fail):
+                for name in dirs + files:
+                    path = Path(root) / name
+                    if path.is_symlink():
+                        return False
+                    if name.endswith(".promisor"):
+                        return False
+                    if name in {"alternates", "http-alternates"} and path.is_file() and path.stat().st_size:
+                        return False
+        complete = _git(
+            repo, "rev-list", "--objects", "--missing=print", "HEAD", check=False,
+        )
+        if complete.returncode or any(
+            line.startswith(b"?") for line in complete.stdout.splitlines()
+        ):
+            return False
+        return True
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+
+
 def _durable_remote(repo, remote, workspace):
     # Expand insteadOf aliases, then resolve symlinks before checking scope.
     url = _git(repo, "remote", "get-url", remote).stdout.decode().strip()
@@ -510,9 +584,7 @@ def _durable_remote(repo, remote, workspace):
         return False
     path = Path(unquote(parsed.path) if parsed.scheme else url).expanduser()
     path = (repo / path).resolve()
-    roots = [workspace, kb.workspaces_root(), kb.kanban_home() / "kanban" / "workspaces",
-             kb.kanban_home() / "kanban" / "boards", *_temporary_roots()]
-    return remote == "origin" and not any(path.is_relative_to(root.resolve()) for root in roots)
+    return remote == "origin" and _independent_storage(path, workspace)
 
 
 def _published_refs(repo, workspace):
@@ -627,6 +699,295 @@ def _remote_survivor(repo, head, published):
     return dict(covered[0], head=head)
 
 
+# A rewriting mirror (hermes-home's "isolated remote sync") republishes every
+# commit under a NEW sha, so `_remote_survivor` can never match a clone of it and
+# the capture falls through to a bundle of a 94 MB home tree, which always
+# exceeds KANBAN_ATTACHMENT_MAX_BYTES (2026-09-20, t_e69d693a).
+#
+# `git patch-id` survives the rewrite, but it is the identity of a commit's
+# DIFF, not of its content: two commits on different parents can produce
+# byte-identical diffs over different trees, and patch-id normalises whitespace
+# away. The live hermes-home mirror demonstrates this on the very pair the fix
+# was designed around — 9f25d7cce and e747d18db share a patch-id while their
+# trees differ by 58 files. So a patch-id hit is ADVISORY ANNOTATION ONLY and
+# never authority to delete a workspace (Apollo ruling, 2026-09-20).
+#
+# The durable target for a home-clone workspace is the LIVE CANONICAL TREE it
+# was cloned from — a local repository outside every kanban/temp root — which is
+# covered by the fleet-backup tier. The rewriting mirror is not a faithful copy
+# and must not be the bar.
+_CONTENT_SCAN_DEPTH = 25
+_CONTENT_SCAN_BUDGET = 100
+
+
+def _canonical_repos(repo, workspace):
+    """Local repositories this repo's remotes resolve to, outside every disposable root.
+
+    A `file:`/path remote pointing at a live checkout (``~/.hermes``) is the
+    canonical tree: it holds the real objects, it is what the workspace was
+    cloned from, and it is what the fleet-backup tier covers. Remotes inside a
+    kanban workspace, board, or temp root are disposable and never canonical.
+    """
+    for remote in _git(repo, "remote").stdout.decode().splitlines():
+        url = _git(repo, "remote", "get-url", remote, check=False)
+        if url.returncode:
+            continue
+        raw = url.stdout.decode().strip()
+        parsed = urlsplit(raw)
+        if parsed.scheme not in {"", "file"} or parsed.netloc not in {"", "localhost"}:
+            continue
+        if not parsed.scheme and ":" in raw and not raw.startswith(("/", ".")):
+            continue  # scp-style SSH: not a local path
+        path = Path(unquote(parsed.path) if parsed.scheme else raw).expanduser()
+        try:
+            path = (repo / path).resolve(strict=True)
+        except OSError:
+            continue
+        if not _independent_storage(path, workspace):
+            continue
+        yield {"remote": remote, "repository_path": str(path)}
+
+
+def _canonical_survivor(repo, head, workspace):
+    """Accept ``head`` when a LIVE canonical tree can reach it from its HEAD.
+
+    This is the deletion authority for a home-clone workspace: the commit is not
+    only present in a durable local repo, it is on that repo's current line of
+    work. Reachability (not sha equality) is the predicate, so the rewriting
+    mirror never enters into it.
+    """
+    for candidate in _canonical_repos(repo, workspace):
+        live = Path(candidate["repository_path"])
+        if _git(live, "merge-base", "--is-ancestor", head, "HEAD", check=False).returncode == 0:
+            return dict(candidate, sha=head, head=head, matched_by="canonical",
+                        branch=_git(live, "rev-parse", "--abbrev-ref", "HEAD",
+                                    check=False).stdout.decode().strip() or "HEAD")
+    return None
+
+
+def _patch_id(repo, sha, env=None):
+    """Content identity of one commit's diff. None when it cannot be computed."""
+    diff = _git(repo, "diff-tree", "-p", "--full-index", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--root", sha, env=env, check=False)
+    if diff.returncode or not diff.stdout:
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(repo), "patch-id", "--stable"],
+        input=diff.stdout, capture_output=True, timeout=30,
+    )
+    if result.returncode or not result.stdout.strip():
+        return None
+    return result.stdout.split()[0].decode()
+
+
+def _exact_commit_diff(repo, sha):
+    """Full blob-identified diff; unlike patch-id this retains whitespace and bytes."""
+    diff = _git(repo, "diff-tree", "-p", "--binary", "--no-commit-id",
+                "--full-index", "--no-ext-diff", "--no-textconv",
+                "--no-renames", "--root", sha, check=False)
+    return diff.stdout if not diff.returncode and diff.stdout else None
+
+
+def _landed_contains_history(workspace_repo, landed_repo, landed_sha):
+    """Return how ``landed_sha`` contains the workspace's final committed tree."""
+    workspace_head = _git(
+        workspace_repo, "rev-parse", "--verify", "HEAD^{commit}", check=False,
+    )
+    if workspace_head.returncode:
+        return None
+    workspace_head = workspace_head.stdout.decode().strip()
+    # Historical ancestry and identical commit diffs can both be undone by a
+    # later canonical commit. Only the current live tree can authorize deletion.
+    touched = _git(workspace_repo, "log", "--name-only", "-z", "--format=", workspace_head, check=False)
+    live_head = _git(landed_repo, "rev-parse", "--verify", "HEAD^{commit}", check=False)
+    if touched.returncode or live_head.returncode or not touched.stdout:
+        return None
+    work_tree = _git(workspace_repo, "ls-tree", "-rz", "--full-tree", workspace_head, check=False)
+    live_tree = _git(landed_repo, "ls-tree", "-rz", "--full-tree", live_head.stdout.decode().strip(), check=False)
+    if work_tree.returncode or live_tree.returncode:
+        return None
+    def entries(tree):
+        return dict(item.split(b"\t", 1)[::-1] for item in tree.stdout.split(b"\0") if item)
+    work_entries, live_entries = entries(work_tree), entries(live_tree)
+    if any(work_entries.get(path) != live_entries.get(path) for path in set(touched.stdout.split(b"\0")) - {b""}):
+        return None
+    if _git(
+        landed_repo, "merge-base", "--is-ancestor", workspace_head, landed_sha,
+        check=False,
+    ).returncode == 0:
+        return "ancestor"
+
+    workspace_history = _git(workspace_repo, "rev-list", "HEAD", check=False)
+    landed_history = _git(landed_repo, "rev-list", landed_sha, check=False)
+    if workspace_history.returncode or landed_history.returncode:
+        return None
+    landed_commits = set(landed_history.stdout.decode().split())
+    missing = [
+        commit for commit in workspace_history.stdout.decode().split()
+        if commit not in landed_commits
+    ]
+    if not missing:
+        return "ancestor"
+
+    needed = set()
+    for commit in missing:
+        diff = _exact_commit_diff(workspace_repo, commit)
+        if diff is None:
+            return None
+        needed.add(diff)
+    for commit in landed_commits:
+        diff = _exact_commit_diff(landed_repo, commit)
+        if diff in needed:
+            needed.remove(diff)
+            if not needed:
+                return "exact-diff"
+    return None
+
+
+def _content_advisory(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
+    """ADVISORY ONLY: a published commit with the same normalized patch-id.
+
+    Recorded in the sidecar as a recovery hint ("the mirror's <sha> looks like
+    this work"), NEVER as authority to delete a workspace: patch-id is diff
+    identity, not content identity, and the live hermes-home mirror produces
+    false positives on exactly the pair this feature was designed around.
+
+    Fetches each durable remote head shallowly into a throwaway bare repo that
+    borrows ``repo``'s objects, then walks it looking for a matching patch-id.
+    The deepest fetched commit is a shallow boundary — Git would diff it against
+    the empty tree and invent a bogus patch-id — so it is never scanned.
+    """
+    target = _patch_id(repo, head)
+    if target is None:
+        return None
+    objects = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects").stdout.decode().strip()
+    env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects)
+    with tempfile.TemporaryDirectory(prefix="kanban-content-") as tmp:
+        probe = Path(tmp) / "probe.git"
+        _git(repo, "init", "--bare", str(probe))
+        for ref in published:
+            if budget <= 0:
+                return None
+            url = _git(repo, "remote", "get-url", ref["remote"]).stdout.decode().strip()
+            fetch_env = dict(env, KANBAN_FETCH_URL=url)
+            try:
+                fetched = _git(
+                    probe, "--config-env=remote.candidate.url=KANBAN_FETCH_URL",
+                    "fetch", "--no-tags", "--depth", str(_CONTENT_SCAN_DEPTH + 1),
+                    "candidate", f"+refs/heads/{ref['branch']}:refs/heads/candidate",
+                    env=fetch_env, check=False, timeout=120,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            if fetched.returncode:
+                continue
+            walk = _git(probe, "rev-list", "--max-count", str(_CONTENT_SCAN_DEPTH),
+                        "refs/heads/candidate", env=env, check=False)
+            if walk.returncode:
+                continue
+            for sha in walk.stdout.decode().split():
+                if budget <= 0:
+                    return None
+                budget -= 1
+                if _patch_id(probe, sha, env=env) == target:
+                    return dict(ref, sha=sha, head=head, matched_by="patch-id",
+                                advisory=True, patch_id=target)
+            _git(probe, "update-ref", "-d", "refs/heads/candidate", env=env, check=False)
+    return None
+
+
+def _verify_landed(entries, workspace):
+    """Verify an explicit `landed` claim against a LIVE CANONICAL repository.
+
+    The escape hatch for work that was committed into a repo the workspace only
+    mirrors. The bar (Apollo ruling, 2026-09-20): the named repository must be a
+    real repository OUTSIDE every disposable root — a live tree covered by the
+    fleet-backup tier — and the sha must resolve there AND be reachable from that
+    tree's HEAD. Publication on a durable remote is NOT required, because the
+    hermes-home mirror rewrites trees and is not a faithful copy; requiring it
+    would make the claim unsatisfiable by construction.
+
+    Every repository in the workspace must be clean and its committed history
+    must be represented by a named landed commit, either by exact ancestry or
+    byte-exact commit diffs. Patch-id remains advisory for remote
+    mirrors; neither it nor a normalized diff can bind workspace commits.
+
+    Every failure mode raises — an unverifiable claim must never be accepted,
+    because accepting it authorises deleting the only remaining copy of the code.
+    """
+    verified = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SurvivorUnavailable("survivor_unavailable: landed entry is not an object")
+        repo_path, sha = entry.get("repo_path"), entry.get("sha")
+        if not repo_path or not sha:
+            raise SurvivorUnavailable("survivor_unavailable: landed entry needs repo_path and sha")
+        repo = Path(repo_path).expanduser()
+        if not repo.is_dir():
+            raise SurvivorUnavailable("survivor_unavailable: landed repository missing")
+        repo = repo.resolve(strict=True)
+        if _git(repo, "rev-parse", "--git-dir", check=False).returncode:
+            raise SurvivorUnavailable("survivor_unavailable: landed path is not a repository")
+        if not _independent_storage(repo, workspace):
+            # A workspace/board/temp tree is itself disposable: pointing `landed`
+            # at one would let the capture authorise deleting its own only copy.
+            raise SurvivorUnavailable("survivor_unavailable: landed repository is not a durable tree")
+        resolved = _git(repo, "rev-parse", "--verify", f"{sha}^{{commit}}", check=False)
+        if resolved.returncode:
+            raise SurvivorUnavailable("survivor_unavailable: landed commit not in repository")
+        sha = resolved.stdout.decode().strip()
+        if _git(repo, "merge-base", "--is-ancestor", sha, "HEAD", check=False).returncode:
+            raise SurvivorUnavailable("survivor_unavailable: landed commit not reachable from HEAD")
+        record = {"repository": str(repo), "sha": sha, "matched_by": "canonical",
+                  "branch": _git(repo, "rev-parse", "--abbrev-ref", "HEAD",
+                                 check=False).stdout.decode().strip() or "HEAD"}
+        published = list(_published_refs(repo, workspace))
+        ref = _remote_survivor(repo, sha, published)
+        if ref:
+            record["published"] = {"remote": ref["remote"], "branch": ref["branch"],
+                                   "sha": ref["sha"], "matched_by": "sha"}
+        else:
+            hint = _content_advisory(repo, sha, published)
+            if hint:
+                # Advisory: same diff on the mirror. Not why we accepted.
+                record["published"] = {"remote": hint["remote"], "branch": hint["branch"],
+                                       "sha": hint["sha"], "matched_by": "patch-id",
+                                       "advisory": True}
+        verified.append(record)
+
+    workspace_repos = _repos(workspace)
+    if not workspace_repos or _loose_files(workspace, workspace_repos):
+        raise SurvivorUnavailable("survivor_unavailable: landed workspace has uncaptured files")
+    used_entries = set()
+    for repo in workspace_repos:
+        status = _git(repo, "status", "--porcelain", "--untracked-files=all", check=False)
+        if status.returncode or status.stdout:
+            raise SurvivorUnavailable("survivor_unavailable: landed workspace is not clean")
+        workspace_head = _git(repo, "rev-parse", "--verify", "HEAD^{commit}", check=False)
+        if workspace_head.returncode:
+            raise SurvivorUnavailable("survivor_unavailable: workspace repository has no commit")
+        binding = None
+        for index, record in enumerate(verified):
+            matched_by = _landed_contains_history(repo, Path(record["repository"]), record["sha"])
+            if matched_by:
+                binding = (index, record, matched_by)
+                break
+        if binding is None:
+            raise SurvivorUnavailable(
+                "survivor_unavailable: landed commit does not contain workspace history"
+            )
+        index, record, matched_by = binding
+        used_entries.add(index)
+        record.setdefault("workspace_repositories", []).append({
+            "repository": str(repo.relative_to(workspace)),
+            "head": workspace_head.stdout.decode().strip(),
+            "matched_by": matched_by,
+        })
+    if used_entries != set(range(len(verified))):
+        raise SurvivorUnavailable("survivor_unavailable: landed claim is unrelated to workspace")
+    return verified
+
+
 def _base(repo, published):
     # The nearest published ancestor of HEAD is a BOUNDARY commit of
     # `rev-list HEAD ^<every ref>`: git stops there precisely because the
@@ -705,7 +1066,20 @@ def _capture(repo, key, workspace):
     head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
     dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
     if not dirty and head.returncode == 0:
-        ref = _remote_survivor(repo, head.stdout.decode().strip(), published)
+        sha = head.stdout.decode().strip()
+        # A rewriting mirror republishes the same content under a new sha, so
+        # sha equality can never hold for a home clone. The fallback is the
+        # LIVE CANONICAL TREE the workspace was cloned from — never a patch-id
+        # hit, which is diff identity only.
+        ref = (_remote_survivor(repo, sha, published)
+               or _canonical_survivor(repo, sha, workspace))
+        if ref and ref.get("matched_by") == "canonical":
+            hint = _content_advisory(repo, sha, published)
+            if hint:
+                ref = dict(ref, mirror_hint={
+                    "remote": hint["remote"], "branch": hint["branch"],
+                    "sha": hint["sha"], "matched_by": "patch-id", "advisory": True,
+                })
         if ref:
             return ref, None, None
     base = _base(repo, published)
@@ -1214,6 +1588,31 @@ def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cl
 
 _PATCH_KEYS = ("path", "sha256", "bytes", "sidecar")
 
+def _carries_recovery_artifact(survivor):
+    """Does this row's OWN sidecar stand beside recoverable bytes?
+
+    `sidecar` alone does not make a row a recovery pointer. Two kinds write an
+    `implementation.json` that is pure METADATA -- `landed` (which repo/sha a
+    live canonical tree holds the work at) and the canonical `ref` arm (which
+    LIVE tree holds a sha the published remote does not carry). Neither stores
+    a byte of the implementation: the durable copy is the named repository.
+
+    A genuine recovery row does store bytes, and always alongside a pointer to
+    them -- `path` for a concatenated `implementation.patch`, `bundles` for
+    git bundles. Discriminating on the ARTIFACT rather than on the `kind`
+    label covers both new metadata-only kinds at once and keeps covering any
+    later one, and it cannot be fooled by a row `_unshrunk` has already
+    relabelled.
+
+    Getting this wrong corrupts the durable recovery index rather than merely
+    mislabelling it: a metadata sidecar treated as a patch makes `_unshrunk`
+    relabel the row `kind: "patch"` with `notice: "NOT PUSHED"` and a
+    `patches` list of JSON manifests holding no patch bytes, after the
+    workspace has already been deleted (2026-09-23 review of #796).
+    """
+    entry = survivor or {}
+    return bool(entry.get("path") or entry.get("bundles"))
+
 
 def _patch_pointers(survivor):
     """Every stored patch a survivor row points at, top-level slot first.
@@ -1224,12 +1623,22 @@ def _patch_pointers(survivor):
     must retain a patch from an earlier capture as well keeps the extras in
     `patches`. Reading through one accessor keeps every consumer -- the
     non-shrink guard and the sidecar manifest scan -- seeing all of them.
+
+    The top-level slot is gated by :func:`_carries_recovery_artifact` so a
+    metadata-only `landed`/canonical-`ref` sidecar is not mistaken for stored
+    patch bytes. Entries already displaced into `patches` are NOT re-gated:
+    they were vetted when they were displaced, and a bundle row's pointer
+    legitimately carries only a `sidecar` once its `bundles` have been merged
+    into the fresh row.
     """
     pointers = []
-    for entry in ((survivor or {}), *((survivor or {}).get("patches") or ())):
+    row = survivor if isinstance(survivor, dict) else {}
+    for index, entry in enumerate((row, *(row.get("patches") or ()))):
         if not isinstance(entry, dict):
             continue
         pointer = {key: entry.get(key) for key in _PATCH_KEYS}
+        if index == 0 and not _carries_recovery_artifact(entry):
+            continue
         if pointer["path"] or pointer["sidecar"]:
             pointers.append(pointer)
     return pointers
@@ -1461,6 +1870,20 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 )
             return None
         workspace = workspace.resolve(strict=True)
+        landed = (metadata or {}).get("landed")
+        if cleanup and not landed and previous and previous.get("kind") == "landed":
+            # Revalidate the recorded live commits before removing the workspace.
+            landed = [{"repo_path": entry["repository"], "sha": entry["sha"]}
+                      for entry in previous["landed"]]
+        if landed:
+            if not isinstance(landed, list):
+                raise SurvivorUnavailable("survivor_unavailable: landed must be a list")
+            survivor = {"kind": "landed", "landed": _verify_landed(landed, workspace)}
+            survivor["sidecar"] = _store(
+                conn, task_id, "implementation.json",
+                json.dumps(survivor, sort_keys=True).encode(), "application/json",
+            )["path"]
+            return _record(conn, task_id, survivor, previous)
         # Git's registries answer "is there a nested repository here" in O(refs).
         # For the `dir`-workspace-rooted-at-a-home shape this is the whole fix:
         # that tree ALWAYS reaches the nested-repository refusal below, so the
@@ -1632,6 +2055,11 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             repositories.append({"repository": key, "base_sha": base})
         if repos and not bundles and len(refs) == len(repos) + len(carried):
             survivor = {"kind": "ref", "refs": refs}
+            if any(ref.get("matched_by") == "canonical" for ref in refs):
+                survivor["sidecar"] = _store(
+                    conn, task_id, "implementation.json",
+                    json.dumps(survivor, sort_keys=True).encode(), "application/json",
+                )["path"]
         elif patches or bundles:
             data = b"".join(patches)
             survivor = {"kind": "bundle" if bundles else "patch", "notice": "NOT PUSHED",
