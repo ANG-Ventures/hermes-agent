@@ -1345,6 +1345,32 @@ def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cl
 _PATCH_KEYS = ("path", "sha256", "bytes", "sidecar")
 
 
+def _carries_recovery_artifact(survivor):
+    """Does this row's OWN sidecar stand beside recoverable bytes?
+
+    `sidecar` alone does not make a row a recovery pointer. Two kinds write an
+    `implementation.json` that is pure METADATA -- `landed` (which repo/sha a
+    live canonical tree holds the work at) and the canonical `ref` arm (which
+    LIVE tree holds a sha the published remote does not carry). Neither stores
+    a byte of the implementation: the durable copy is the named repository.
+
+    A genuine recovery row does store bytes, and always alongside a pointer to
+    them -- `path` for a concatenated `implementation.patch`, `bundles` for
+    git bundles. Discriminating on the ARTIFACT rather than on the `kind`
+    label covers both new metadata-only kinds at once and keeps covering any
+    later one, and it cannot be fooled by a row `_unshrunk` has already
+    relabelled.
+
+    Getting this wrong corrupts the durable recovery index rather than merely
+    mislabelling it: a metadata sidecar treated as a patch makes `_unshrunk`
+    relabel the row `kind: "patch"` with `notice: "NOT PUSHED"` and a
+    `patches` list of JSON manifests holding no patch bytes, after the
+    workspace has already been deleted (2026-09-23 review of #796).
+    """
+    entry = survivor or {}
+    return bool(entry.get("path") or entry.get("bundles"))
+
+
 def _patch_pointers(survivor):
     """Every stored patch a survivor row points at, top-level slot first.
 
@@ -1354,12 +1380,22 @@ def _patch_pointers(survivor):
     must retain a patch from an earlier capture as well keeps the extras in
     `patches`. Reading through one accessor keeps every consumer -- the
     non-shrink guard and the sidecar manifest scan -- seeing all of them.
+
+    The top-level slot is gated by :func:`_carries_recovery_artifact` so a
+    metadata-only `landed`/canonical-`ref` sidecar is not mistaken for stored
+    patch bytes. Entries already displaced into `patches` are NOT re-gated:
+    they were vetted when they were displaced, and a bundle row's pointer
+    legitimately carries only a `sidecar` once its `bundles` have been merged
+    into the fresh row.
     """
     pointers = []
-    for entry in ((survivor or {}), *((survivor or {}).get("patches") or ())):
+    row = survivor if isinstance(survivor, dict) else {}
+    for index, entry in enumerate((row, *(row.get("patches") or ()))):
         if not isinstance(entry, dict):
             continue
         pointer = {key: entry.get(key) for key in _PATCH_KEYS}
+        if index == 0 and not _carries_recovery_artifact(entry):
+            continue
         if pointer["path"] or pointer["sidecar"]:
             pointers.append(pointer)
     return pointers

@@ -491,3 +491,128 @@ def test_diff_collision_over_attachment_limit_holds_workspace(board, tmp_path, m
         kb.complete_task(board, tid, metadata={"changed_files": ["unpublished.py"]})
     assert kb.get_task(board, tid).status != "done"
     assert (ws / "unpublished.py").read_text() == "secret_work = 1\n"
+
+
+def stored_survivor(conn, tid):
+    """The DURABLE recovery row -- what a later recovery actually reads."""
+    import hermes_cli.kanban_survivor as survivor_mod
+    return survivor_mod._state(conn, tid)[2]
+
+
+def assert_truthful_recovery_row(survivor):
+    """A row may only call itself a patch/bundle if it POINTS AT bytes.
+
+    The class this pins: a recovery row whose `kind`/`notice`/`patches` promise
+    an artifact that does not exist is worse than a mislabelled one -- the
+    workspace is already deleted by then, so the index is the only map back to
+    the implementation and it now points nowhere.
+    """
+    if survivor.get("kind") == "patch":
+        path = survivor.get("path")
+        assert path, f"kind=patch with no patch path: {survivor}"
+        assert Path(path).exists(), f"kind=patch pointing at missing bytes: {path}"
+    if survivor.get("kind") == "bundle":
+        bundles = survivor.get("bundles") or ()
+        assert bundles, f"kind=bundle with no bundles: {survivor}"
+        for bundle in bundles:
+            assert Path(bundle["path"]).exists(), bundle
+    # A displaced pointer is retained because it is the only copy of some
+    # work: it must name real bytes (a patch `path`, or a bundle row's
+    # manifest whose `bundles` were merged into the fresh row), never a bare
+    # metadata manifest.
+    for pointer in (survivor.get("patches") or ()):
+        path = pointer.get("path")
+        assert path, f"displaced recovery pointer with no patch path: {pointer}"
+        assert Path(path).exists(), f"displaced pointer to missing bytes: {path}"
+    if survivor.get("notice") == "NOT PUSHED":
+        assert survivor.get("path") or survivor.get("bundles"), (
+            f"NOT PUSHED promises unpushed bytes this row does not hold: {survivor}")
+
+
+def test_landed_cleanup_keeps_a_truthful_row_when_the_manifest_changes(board, tmp_path):
+    """A re-captured metadata sidecar is not a second PATCH to carry forward.
+
+    Completion and cleanup are separate calls, and cleanup re-verifies the
+    claim and re-stores `implementation.json`. Because the row carries that
+    manifest in the same `sidecar` slot a real patch uses, the non-shrink guard
+    read the completion's manifest as a stored patch being dropped, carried it
+    forward, and relabelled the durable row `kind: "patch"` / `NOT PUSHED` with
+    a `patches` list of JSON manifests holding no patch bytes -- after the
+    workspace had already been deleted.
+    """
+    from hermes_cli.kanban_survivor import preserve, remove_workspace_dir
+
+    tid, ws, live, head, _ = home_clone(board, tmp_path, live_remote=False)
+    first = preserve(board, tid, {"landed": [{"repo_path": str(live), "sha": head}]})
+    assert first["kind"] == "landed", first
+
+    # Anything that changes the re-stored manifest reaches this path; a branch
+    # rename is the cheapest (`_verify_landed` records the live branch).
+    git(live, "branch", "-m", "renamed")
+
+    assert remove_workspace_dir(board, tid, ws)
+    assert not ws.exists()
+
+    stored = stored_survivor(board, tid)
+    assert stored["kind"] == "landed", stored
+    assert "patches" not in stored, stored
+    assert stored.get("notice") != "NOT PUSHED", stored
+    assert stored["landed"][0]["sha"] == head, stored
+    assert_truthful_recovery_row(stored)
+
+
+def test_canonical_ref_cleanup_keeps_a_truthful_row_when_the_manifest_changes(board, tmp_path):
+    """Same class, the OTHER sidecar-bearing kind this PR added.
+
+    The canonical `ref` arm writes `implementation.json` for exactly the same
+    reason `landed` does -- to name the live tree holding a sha the published
+    remote lacks -- so it is exposed to the identical mislabelling.
+    """
+    from hermes_cli.kanban_survivor import preserve
+
+    tid, ws, live, head, _ = home_clone(board, tmp_path)
+    first = preserve(board, tid, {"changed_files": ["code.py"]})
+    assert first["kind"] == "ref" and first.get("sidecar"), first
+
+    # Advance the work so the re-capture's manifest genuinely differs (a
+    # stable manifest re-stores to the SAME path and never reaches the carry
+    # path -- that is the coverage boundary the previous round tested).
+    second_head = commit(ws, "code.py", "value = 3\n", "more implementation")
+    git(live, "fetch", str(ws), "main")
+    git(live, "reset", "--hard", "FETCH_HEAD")
+    second = preserve(board, tid, {"changed_files": ["code.py"]})
+    assert second["kind"] == "ref", second
+    assert second["sidecar"] != first["sidecar"], (first, second)
+    assert second["refs"][0]["sha"] == second_head, second
+    assert "patches" not in second, second
+    assert second.get("notice") != "NOT PUSHED", second
+    assert_truthful_recovery_row(stored_survivor(board, tid))
+
+
+def test_a_real_patch_is_still_carried_when_a_recapture_drops_it(board, tmp_path):
+    """Positive control: narrowing the sidecar rule must not inert non-shrink.
+
+    If this ever fails, the fix above has traded a mislabelled row for actual
+    data loss -- the case the non-shrink guard exists for.
+    """
+    import hermes_cli.kanban_survivor as survivor_mod
+
+    tid, ws, live, head, _ = home_clone(board, tmp_path, live_remote=False)
+    (ws / "unpublished.py").write_text("secret_work = 1\n")
+    git(ws, "add", "-A")
+    git(ws, "commit", "-m", "unpublished implementation")
+    captured = survivor_mod.preserve(board, tid, {"changed_files": ["unpublished.py"]})
+    assert captured["kind"] in ("patch", "bundle"), captured
+    assert_truthful_recovery_row(captured)
+
+    # The work then lands in the live tree, so a re-capture emits a bare ref
+    # and would otherwise drop the only copy of the pre-landing bytes.
+    git(live, "fetch", str(ws), "main")
+    git(live, "reset", "--hard", "FETCH_HEAD")
+    survivor_mod.preserve(board, tid, {"landed": [
+        {"repo_path": str(live), "sha": git(ws, "rev-parse", "HEAD")}]})
+
+    stored = stored_survivor(board, tid)
+    assert stored["kind"] in ("patch", "bundle"), stored
+    assert stored.get("notice") == "NOT PUSHED", stored
+    assert_truthful_recovery_row(stored)
