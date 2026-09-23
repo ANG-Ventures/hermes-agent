@@ -14856,17 +14856,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        wait_started = loop.time()
+        deadline = wait_started + timeout
         last_status_at = 0.0
+        # busy_policy=interrupt (safe-restart intent row) means "restart now".
+        # Re-read every second: the intent usually lands MID-wait (2026-09-23:
+        # wait began 03:59, deploy-lane interrupt intent 04:05, gateway then sat
+        # out the rest of the 1800 s cap until 04:29).
+        next_intent_check = 0.0
+        interrupt_capped = False
         while self._awaitable_work_count() > 0:
             now = loop.time()
+            if not interrupt_capped and now >= next_intent_check:
+                next_intent_check = now + 1.0
+                intent_cap = await self._interrupt_restart_intent_cap()
+                if intent_cap is not None:
+                    interrupt_capped = True
+                    deadline = min(deadline, now + intent_cap)
             if now >= deadline:
                 logger.warning(
                     "Restart after-turn wait timed out after %.0fs with %d "
                     "still active; proceeding to stop()/drain which may "
-                    "interrupt remaining work (#77184)",
-                    timeout,
+                    "interrupt remaining work (#77184)%s",
+                    now - wait_started,
                     self._active_work_count(),
+                    " [busy_policy=interrupt]" if interrupt_capped else "",
                 )
                 return False
             if (now - last_status_at) >= 30.0:
@@ -14898,14 +14912,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return True
 
+    async def _interrupt_restart_intent_cap(self) -> Optional[float]:
+        """After-turn cap (<=60 s) from a fresh busy_policy=interrupt intent, else None."""
+        try:
+            from gateway.fork_ext.unclean_restart_notice import (
+                interrupt_drain_cap,
+                read_interrupt_restart_intent,
+            )
+
+            row = await asyncio.to_thread(read_interrupt_restart_intent)
+            if row is None:
+                return None
+            cap = interrupt_drain_cap(row)
+        except Exception:
+            logger.debug("interrupt restart intent read failed", exc_info=True)
+            return None
+        logger.warning(
+            "PHASE=restart_interrupt_intent busy_policy=interrupt token=%s "
+            "initiator=%s origin=%s: capping after-turn wait to %.0fs "
+            "(restart_after_turn_timeout=%.0fs); still-running turns are "
+            "interrupted by the drain and marked resume_pending",
+            row.get("token") or "-",
+            row.get("initiator_profile") or "-",
+            row.get("origin_mode") or "-",
+            cap,
+            float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0),
+        )
+        return cap
+
+    @staticmethod
+    def _describe_restart_requester(depth: int = 2) -> str:
+        """``func@file:line`` of whoever called request_restart()."""
+        try:
+            frame = sys._getframe(depth)
+            return (
+                f"{frame.f_code.co_name}@"
+                f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+            )
+        except Exception:
+            return "unknown"
+
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+        requester = self._describe_restart_requester()
         if self._restart_task_started:
+            logger.info(
+                "Restart request from %s ignored: a restart is already in progress",
+                requester,
+            )
             return False
+        session_key = ""
         try:
             from gateway.session_context import get_session_env
             session_key = get_session_env("HERMES_SESSION_KEY", "")
             if session_key:
                 self._session_initiated_restart[session_key] = True
+        except Exception:
+            pass
+        self._restart_requester = requester
+        # 2026-09-23: "Restart requested with 16 active work unit(s)" had no
+        # requester on it; the forensics had to eliminate SIGTERM/FGR by
+        # absence. Name the caller on the line that starts the restart.
+        try:
+            logger.warning(
+                "PHASE=restart_requested requester=%s detached=%s via_service=%s "
+                "session=%s active_work=%d",
+                requester,
+                detached,
+                via_service,
+                session_key or "-",
+                self._active_work_count(),
+            )
         except Exception:
             pass
         self._restart_requested = True
@@ -14928,6 +15004,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._launch_detached_restart_command()
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart helper: %s", e)
+            # Written HERE (not at request time) so the row lands inside the
+            # boot notice's planned-restart window of the death it explains.
+            try:
+                from gateway.fork_ext.unclean_restart_notice import record_in_band_restart
+
+                await asyncio.to_thread(
+                    record_in_band_restart,
+                    requester,
+                    detail=f"detached={detached} via_service={via_service}",
+                )
+            except Exception:
+                logger.debug("in-band restart ledger row failed", exc_info=True)
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
 
@@ -15666,6 +15754,120 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             prepared += 1
         return prepared
 
+    async def _preserve_followup_across_restart(
+        self,
+        session_key: Optional[str],
+        pending_event: Any,
+        pending: Any,
+        source: Any = None,
+    ) -> bool:
+        """Spool a follow-up the draining gateway cannot run; next boot replays it."""
+        text = pending if isinstance(pending, str) and pending.strip() else ""
+        if not text:
+            text = str(getattr(pending_event, "text", "") or "")
+        src = getattr(pending_event, "source", None) or source
+        src_dict = None
+        try:
+            src_dict = src.to_dict() if src is not None else None
+        except Exception:
+            src_dict = None
+        path = None
+        if text.strip() and src_dict:
+            try:
+                from gateway.fork_ext.restart_followups import spool_followup
+
+                path = await asyncio.to_thread(
+                    spool_followup,
+                    session_key or "",
+                    text,
+                    src_dict,
+                    reason=self._status_action_label(),
+                )
+            except Exception:
+                logger.debug("restart follow-up spool failed", exc_info=True)
+        if path is not None:
+            logger.warning(
+                "PHASE=restart_followup_spooled session=%s action=%s chars=%d: "
+                "pending follow-up preserved; it replays on the next boot",
+                session_key or "?",
+                self._status_action_label(),
+                len(text),
+            )
+            return True
+        logger.error(
+            "PHASE=restart_followup_lost session=%s action=%s: could not spool "
+            "the pending follow-up; it is DROPPED",
+            session_key or "?",
+            self._status_action_label(),
+        )
+        return False
+
+    async def _spool_adapter_pending_for_restart(self) -> int:
+        """Spool follow-ups still parked in adapter queues when stop() tears down.
+
+        A message that arrives for a busy session during the drain is queued
+        on the adapter ("queued for the next turn after it comes back"); if
+        that session is interrupted rather than finishing, the queue dies with
+        the process. Sweep it into the restart spool first.
+        """
+        spooled = 0
+        seen: set = set()
+        for adapter in list((getattr(self, "adapters", None) or {}).values()):
+            slot = getattr(adapter, "_pending_messages", None)
+            if not isinstance(slot, dict):
+                continue
+            for key, event in list(slot.items()):
+                if event is None or id(event) in seen:
+                    continue
+                seen.add(id(event))
+                if await self._preserve_followup_across_restart(key, event, None):
+                    spooled += 1
+                    slot.pop(key, None)
+        overflow = getattr(self, "_queued_events", None)
+        if isinstance(overflow, dict):
+            for key, events in list(overflow.items()):
+                for event in list(events or []):
+                    if event is None or id(event) in seen:
+                        continue
+                    seen.add(id(event))
+                    if await self._preserve_followup_across_restart(key, event, None):
+                        spooled += 1
+        return spooled
+
+    async def _load_restart_followups(self) -> int:
+        """Queue follow-ups spooled by the previous life into startup restore."""
+        try:
+            from gateway.fork_ext.restart_followups import take_followups
+
+            records, stale = await asyncio.to_thread(take_followups)
+        except Exception:
+            logger.debug("restart follow-up spool load failed", exc_info=True)
+            return 0
+        queued = 0
+        for record in records:
+            try:
+                event = MessageEvent(
+                    text=record["text"],
+                    message_type=MessageType.TEXT,
+                    source=SessionSource.from_dict(record["source"]),
+                )
+                event._hermes_restart_followup_path = record["_spool_path"]
+                self._queue_startup_restore_event(event)
+                queued += 1
+            except Exception:
+                logger.warning(
+                    "PHASE=restart_followup_replay_failed session=%s",
+                    record.get("session_key"),
+                    exc_info=True,
+                )
+        if queued or stale:
+            logger.warning(
+                "PHASE=restart_followups_replayed queued=%d stale_skipped=%d",
+                queued,
+                stale,
+            )
+        return queued
+
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
@@ -15870,6 +16072,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 retry_delay = min(retry_delay * 2, 5.0)
                 continue
             queue.pop(0)
+            spool_path = getattr(event, "_hermes_restart_followup_path", None)
+            if spool_path:
+                from gateway.fork_ext.restart_followups import acknowledge_followup
+
+                await asyncio.to_thread(acknowledge_followup, spool_path)
             last_warning_at.pop(id(event), None)
             last_phase_warning_at.pop(id(event), None)
             logger.warning(
@@ -17674,8 +17881,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+        # Reset the queue BEFORE loading the spool: the loader claims (deletes)
+        # the spool files, so a reset after it would drop every follow-up.
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        # Follow-ups the previous life could not run (spooled while draining)
+        # enter the restore queue FIRST, ahead of anything newer.
+        try:
+            await self._load_restart_followups()
+        except Exception:
+            logger.debug("restart follow-up replay failed", exc_info=True)
         self._startup_restore_watchdog_task = asyncio.create_task(
             self._startup_restore_gate_watchdog()
         )
@@ -20725,6 +20940,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _task.cancel()
             self._background_tasks.clear()
 
+            try:
+                await self._spool_adapter_pending_for_restart()
+            except Exception:
+                logger.debug("adapter follow-up spool sweep failed", exc_info=True)
             self.adapters.clear()
             for _session_key in list(self._running_agents):
                 self._release_running_agent_state(_session_key)
@@ -37961,10 +38180,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
 
             if self._draining and (pending_event or pending):
-                logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
-                    session_key or "?",
-                    self._status_action_label(),
+                # Never silently drop it (2026-09-23: 4 follow-ups lost). The
+                # draining process may not start a new turn, so spool it for
+                # the next boot's startup-restore replay.
+                await self._preserve_followup_across_restart(
+                    session_key, pending_event, pending, source
                 )
                 pending_event = None
                 pending = None
