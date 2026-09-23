@@ -3,12 +3,27 @@ import base64
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import threading
 
 import pytest
 
-from scripts.ci_overflow_plan import JobPlacement, Plan
+from scripts.ci_overflow_plan import POOL, JobPlacement, Plan
 from scripts.ci_overflow_ledger import Ledger, Refusal, Reservation
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ci_overflow"
+CANONICAL = {"version": 1, "attempts": {}, "daily_totals": {}}
+
+
+def github_base64(raw: bytes) -> str:
+    """GitHub Contents API wire shape: base64 wrapped at 60 columns, newline-terminated."""
+    flat = base64.b64encode(raw).decode()
+    return "".join(flat[i:i + 60] + "\n" for i in range(0, len(flat), 60))
+
+
+def live_response():
+    """The captured live `GET contents/state.json?ref=ci-overflow-ledger` response."""
+    return json.loads((FIXTURES / "contents.json").read_text(encoding="utf-8"))
 
 
 def proposed(*names):
@@ -27,7 +42,7 @@ class Contents:
     def get(self, path, params):
         assert (path, params) == ("state.json", {"ref": "ci-overflow-ledger"})
         with self.lock:
-            return {"sha": self.sha, "encoding": "base64", "content": base64.b64encode(json.dumps(self.state).encode()).decode()}
+            return {"sha": self.sha, "encoding": "base64", "content": github_base64(json.dumps(self.state).encode())}
     def put(self, path, payload):
         assert path == "state.json" and payload["branch"] == "ci-overflow-ledger"
         with self.lock:
@@ -202,3 +217,78 @@ def test_oversized_essential_state_refuses_new_cloud():
     api.state["attempts"]["123:0:1"] = {"admitted_on": "2026-09-22", "jobs": [], "terminal_on": None,
                                        "pad": "z" * 520000}
     assert ledger(api).reserve(key(), proposed("a")).incident == "state-capacity"
+
+
+class Static:
+    def __init__(self, response):
+        self.response, self.writes = response, 0
+    def get(self, path, params):
+        assert (path, params) == ("state.json", {"ref": "ci-overflow-ledger"})
+        return self.response
+    def put(self, path, payload):
+        self.writes += 1
+        raise AssertionError("must not write")
+
+
+def test_captured_live_contents_response_decodes():
+    """F1: GitHub's newline-wrapped base64 decodes; the live (pre-canonical) schema is then refused."""
+    response = live_response()
+    assert "\n" in response["content"]  # the real wire shape is wrapped
+    api = Static(response)
+    with pytest.raises(ValueError, match="corrupt ledger"):  # decoded fine, rejected on schema
+        Ledger(api)._read()
+    r = ledger(api).reserve(key(), proposed("a"))
+    assert isinstance(r, Refusal) and r.incident == "ledger-unavailable" and api.writes == 0
+
+
+def test_live_envelope_with_canonical_state_admits():
+    response = dict(live_response(), content=github_base64(json.dumps(CANONICAL, indent=1).encode()))
+    assert response["content"].count("\n") >= 1
+    state, sha = Ledger(Static(response))._read()
+    assert state == CANONICAL and sha == response["sha"]
+
+
+def test_wrapped_base64_admission_round_trip():
+    api = Contents()
+    api.state["attempts"]["123:9:1"] = {"admitted_on": "2026-09-23", "terminal_on": None, "jobs": [
+        {"job_id": f"pad-{i}", "labels": POOL, "reason": "local-idle", "reserved_minutes": 0,
+         "released_unemitted": False} for i in range(5)], "plan": {}}
+    assert api.get("state.json", {"ref": "ci-overflow-ledger"})["content"].count("\n") > 3
+    assert ledger(api, limit=35).reserve(key(), proposed("a")).plan.jobs[0].reserved_minutes == 35
+
+
+class CreatesOnMissing:
+    """Real GitHub: GET on a missing path is 404, and PUT without `sha` CREATES the file."""
+    def __init__(self):
+        self.state = None
+        self.writes = 0
+    def get(self, path, params):
+        if self.state is None:
+            raise HTTPError(404)
+        return {"sha": "s1", "encoding": "base64", "content": github_base64(json.dumps(self.state).encode())}
+    def put(self, path, payload):
+        if self.state is None and payload.get("sha") is None:
+            self.state = json.loads(base64.b64decode(payload["content"]))
+            self.writes += 1
+            return {"content": {"sha": "s1"}}
+        raise HTTPError(409 if self.state is not None else 422)
+
+
+def test_missing_ledger_never_created():
+    """C13: a missing ledger refuses cloud and is never auto-created, on reserve or reconcile."""
+    api = CreatesOnMissing()
+    r = ledger(api).reserve(key(), proposed("a"))
+    assert isinstance(r, Refusal) and r.incident == "ledger-unavailable"
+    assert ledger(api).reconcile(key(), evidence(jobs=[])).incident == "ledger-unavailable"
+    assert api.writes == 0 and api.state is None
+
+
+def test_reserve_refuses_more_than_18_jobs():
+    """C29: controller ceiling is 17 slices + 1 e2e; a 19-job plan is refused even at 0 minutes."""
+    api = Contents()
+    at_limit = Plan([JobPlacement(f"j{i}", POOL, "local-queue", 0) for i in range(18)], [], {"mode": "overflow"})
+    assert isinstance(ledger(api).reserve(key(), at_limit), Reservation)
+    over = Plan([JobPlacement(f"j{i}", POOL, "local-queue", 0) for i in range(19)], [], {"mode": "overflow"})
+    r = ledger(api).reserve(key(2), over)
+    assert isinstance(r, Refusal) and r.incident == "invalid-plan"
+    assert api.writes == 1

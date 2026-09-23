@@ -17,6 +17,30 @@ CASES = [
      "if job is None:\n                    pass", "test_timeout_terminal_absent_job_restores_allowance_once", "tests/test_ci_overflow_ledger.py"),
     ("TTL-instead-of-terminal", "scripts/ci_overflow_ledger.py", "jobs.get(\"status\") != \"completed\"",
      "False", "test_no_phantom_release_without_exact_evidence", "tests/test_ci_overflow_ledger.py"),
+    # Argus t_9b423c85 F1/F3/F4: each spec-named guard owns a test that must go RED without it.
+    ("F1-validate-raw-base64", "scripts/ci_overflow_ledger.py", "base64.b64decode(\"\".join(content.split()), validate=True)",
+     "base64.b64decode(content, validate=True)", "test_captured_live_contents_response_decodes", "tests/test_ci_overflow_ledger.py"),
+    ("C16-no-exclude-this-attempt", "scripts/ci_overflow_plan.py", " or (run[\"id\"], run[\"run_attempt\"]) == exclude_attempt",
+     "", "test_sampler_excludes_this_run_attempt", "tests/test_ci_overflow_plan.py"),
+    ("C18-no-job-dedupe", "scripts/ci_overflow_plan.py", "if job[\"id\"] in seen:\n                    continue",
+     "if False:\n                    continue", "test_sampler_dedupes_jobs_by_id", "tests/test_ci_overflow_plan.py"),
+    ("C19-no-20s-bound", "scripts/ci_overflow_plan.py", "deadline = started + 20",
+     "deadline = started + 10**9", "test_sampler_collection_bound_20s_is_unknown", "tests/test_ci_overflow_plan.py"),
+    ("C20-no-60s-staleness", "scripts/ci_overflow_plan.py", "total_seconds() > 60",
+     "total_seconds() > 10**9", "test_sampler_snapshot_older_than_60s_is_unknown", "tests/test_ci_overflow_plan.py"),
+    ("C21-busy-counted-idle", "scripts/ci_overflow_plan.py", "sum(not r[\"busy\"] for r in matching)",
+     "len(matching)", "test_sampler_busy_runner_is_online_not_idle", "tests/test_ci_overflow_plan.py"),
+    ("C26-duplicate-field-last-wins", "scripts/ci_overflow_plan.py", "object_pairs_hook=_object_pairs,",
+     "object_pairs_hook=None,", "test_duplicate_json_field_rejected", "tests/test_ci_overflow_plan.py"),
+    ("C27-symlink-accepted", "scripts/ci_overflow_plan.py", " or (entries[0].external_attr >> 16) & 0o170000 == 0o120000",
+     "", "test_archive_symlink_entry_refused", "tests/test_ci_overflow_plan.py"),
+    ("C13-create-missing-ledger", "scripts/ci_overflow_ledger.py", "state, sha = self._read()\n            except (Exception):\n                return Refusal(\"ledger-unavailable\")",
+     "state, sha = self._read()\n            except (Exception):\n                state, sha = {\"version\": 1, \"attempts\": {}, \"daily_totals\": {}}, None",
+     "test_missing_ledger_never_created", "tests/test_ci_overflow_ledger.py"),
+    ("C5-arm-on-core", "scripts/ci_overflow_plan.py", "if not j[\"core\"] and any(",
+     "if any(", "test_arm_never_placed_on_core_when_core_goes_to_cloud", "tests/test_ci_overflow_plan.py"),
+    ("C29-no-18-job-ceiling", "scripts/ci_overflow_ledger.py", "                or len(plan.jobs) > 18\n",
+     "", "test_reserve_refuses_more_than_18_jobs", "tests/test_ci_overflow_ledger.py"),
 ]
 
 
@@ -30,6 +54,7 @@ def main():
                 dst = root / filename
                 dst.parent.mkdir(exist_ok=True)
                 shutil.copyfile(ROOT / filename, dst)
+            shutil.copytree(ROOT / "tests/fixtures/ci_overflow", root / "tests/fixtures/ci_overflow", dirs_exist_ok=True)
             target = root / src
             content = target.read_text(encoding="utf-8")
             assert content.count(before) == 1, (name, content.count(before))

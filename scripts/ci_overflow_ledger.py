@@ -57,7 +57,12 @@ class Ledger:
         response = self.api.get(PATH, params={"ref": BRANCH})
         if not isinstance(response, dict) or not isinstance(response.get("sha"), str) or response.get("encoding") != "base64":
             raise ValueError("invalid Contents response")
-        data = json.loads(base64.b64decode(response["content"], validate=True))
+        content = response.get("content")
+        if not isinstance(content, str):
+            raise ValueError("invalid Contents response")
+        # GitHub wraps Contents base64 at 60 columns with "\n"; drop only that whitespace,
+        # then decode strictly so any other non-alphabet byte still fails closed.
+        data = json.loads(base64.b64decode("".join(content.split()), validate=True))
         if (type(data) is not dict or data.get("version") != 1 or type(data.get("attempts")) is not dict
                 or type(data.get("daily_totals")) is not dict):
             raise ValueError("corrupt ledger")
