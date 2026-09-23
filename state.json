@@ -1,7 +1,1 @@
-{
- "schema": 1,
- "admissions": [],
- "incidents": [],
- "daily": {},
- "bootstrapped_at": "2026-09-23T15:11:17Z"
-}
+{"attempts":{},"daily_totals":{},"version":1}
