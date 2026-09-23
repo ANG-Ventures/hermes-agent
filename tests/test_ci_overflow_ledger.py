@@ -131,6 +131,52 @@ def test_missing_or_corrupt_refuses_cloud(name, state, incident):
     assert api.writes == 0
 
 
+def test_canonical_ledger_control_caps_admission():
+    api = Contents()
+    result = ledger(api, limit=35).reserve(key(), proposed("a", "b"))
+    assert isinstance(result, Reservation)
+    assert [j.reserved_minutes for j in result.plan.jobs] == [35, 0]
+    assert api.writes == 1
+
+
+@pytest.mark.parametrize("name,change", [
+    ("negative-daily-total", lambda s: s["daily_totals"].update({"2026-09-23": -35})),
+    ("fractional-daily-total", lambda s: s["daily_totals"].update({"2026-09-23": 0.5})),
+    ("future-daily-total", lambda s: s["daily_totals"].update({"2026-09-24": 35})),
+    ("negative-old-reservation", lambda s: s["attempts"]["123:9:1"]["jobs"][0].update(reserved_minutes=-35)),
+    ("missing-reservation-field", lambda s: s["attempts"]["123:9:1"]["jobs"][0].pop("reserved_minutes")),
+    ("future-dated-pending", lambda s: s["attempts"]["123:9:1"].update(admitted_on="2026-09-24")),
+    ("bad-terminal-date", lambda s: s["attempts"]["123:9:1"].update(terminal_on="nonsense")),
+    ("terminal-before-admission", lambda s: s["attempts"]["123:9:1"].update(terminal_on="2026-09-21")),
+    ("missing-existing-plan", lambda s: s["attempts"]["123:9:1"].pop("plan")),
+    ("malformed-existing-plan", lambda s: s["attempts"]["123:9:1"]["plan"].update(jobs="broken")),
+    ("plan-job-mismatch", lambda s: s["attempts"]["123:9:1"]["plan"]["jobs"][0].update(reserved_minutes=0)),
+    ("wrong-attempt-key", lambda s: s["attempts"].update({"bad-key": s["attempts"].pop("123:9:1")})),
+    ("released-without-receipt", lambda s: s["attempts"]["123:9:1"]["jobs"][0].update(released_unemitted=True)),
+])
+def test_semantically_corrupt_ledger_refuses_without_put(name, change):
+    api = Contents()
+    baseline = ledger(api, day="2026-09-22", limit=35).reserve(key(9), proposed("old"))
+    assert isinstance(baseline, Reservation)
+    api.writes = 0
+    change(api.state)
+    denied = ledger(api, limit=35).reserve(key(), proposed("a", "b"))
+    assert isinstance(denied, Refusal) and denied.incident == "ledger-unavailable", name
+    release = ledger(api).reconcile(key(9), evidence(run=9, jobs=[]))
+    assert release.incident == "ledger-unavailable", name
+    assert api.writes == 0, name
+
+
+def test_corrupt_existing_attempt_never_returns_stored_plan():
+    api = Contents()
+    assert isinstance(ledger(api).reserve(key(), proposed("a")), Reservation)
+    api.state["attempts"]["123:1:1"].pop("plan")
+    api.writes = 0
+    result = ledger(api).reserve(key(), proposed("a"))
+    assert isinstance(result, Refusal) and result.incident == "ledger-unavailable"
+    assert api.writes == 0
+
+
 def test_conflicts_recompute_allowance_and_retry_bounded():
     api = Contents()
     api.conflicts = 2
@@ -214,8 +260,8 @@ def test_underpriced_hosted_placement_cannot_be_committed():
 
 def test_oversized_essential_state_refuses_new_cloud():
     api = Contents()
-    api.state["attempts"]["123:0:1"] = {"admitted_on": "2026-09-22", "jobs": [], "terminal_on": None,
-                                       "pad": "z" * 520000}
+    ledger(api, day="2026-09-22").reserve(key(9), proposed("old"))
+    api.state["attempts"]["123:9:1"]["pad"] = "z" * 520000
     assert ledger(api).reserve(key(), proposed("a")).incident == "state-capacity"
 
 
@@ -250,9 +296,9 @@ def test_live_envelope_with_canonical_state_admits():
 
 def test_wrapped_base64_admission_round_trip():
     api = Contents()
-    api.state["attempts"]["123:9:1"] = {"admitted_on": "2026-09-23", "terminal_on": None, "jobs": [
-        {"job_id": f"pad-{i}", "labels": POOL, "reason": "local-idle", "reserved_minutes": 0,
-         "released_unemitted": False} for i in range(5)], "plan": {}}
+    local = Plan([JobPlacement(f"pad-{i}", POOL, "local-idle", 0) for i in range(5)],
+                 [], {"mode": "self-only"})
+    ledger(api).reserve(key(9), local)
     assert api.get("state.json", {"ref": "ci-overflow-ledger"})["content"].count("\n") > 3
     assert ledger(api, limit=35).reserve(key(), proposed("a")).plan.jobs[0].reserved_minutes == 35
 
