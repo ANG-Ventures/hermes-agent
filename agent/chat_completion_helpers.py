@@ -1194,18 +1194,22 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             pool_headers.update(_snapshot_pool_headers(http_response))
             agent._capture_anthropic_response_headers(http_response)
 
-        # Use the same adapter as AIAgent._anthropic_messages_create, but pass a
-        # call-scoped response callback. Swapping a callback on the shared agent
-        # races interrupt-abandoned workers and can transpose two calls' headers.
-        from agent.anthropic_adapter import create_anthropic_message
-
-        message = create_anthropic_message(
-            request_client,
-            api_kwargs,
-            log_prefix=getattr(agent, "log_prefix", ""),
-            prefer_stream=not bool(getattr(agent, "_disable_streaming", False)),
-            on_response=_capture_with_pool_headers,
-        )
+        # Keep the agent seam — interrupt/stale watchdog tests and the 413
+        # recovery path mock it, and a non-pooled provider has no attribution
+        # headers to snapshot. Only widen the call with the pool-header
+        # callback for pooled providers, where the wire stamp is the contract.
+        # The callback is call-scoped: swapping one onto the shared agent races
+        # interrupt-abandoned workers and can transpose two calls' headers.
+        if str(getattr(agent, "provider", "") or "").strip().lower() in _POOLED_PROVIDERS:
+            message = agent._anthropic_messages_create(
+                api_kwargs,
+                client=request_client,
+                on_response=_capture_with_pool_headers,
+            )
+        else:
+            message = agent._anthropic_messages_create(
+                api_kwargs, client=request_client
+            )
         return _stamp_pool_headers(message, pool_headers)
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.

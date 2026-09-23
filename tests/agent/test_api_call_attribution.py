@@ -200,6 +200,47 @@ def test_concurrent_parent_and_subagent_keep_turn_and_identity_paired(recorded):
     assert by_turn["turn-child"]["seq"] == 0
 
 
+def test_seq_counters_are_partitioned_by_turn_on_one_agent(recorded):
+    """seq is per-TURN, not per-agent or per-process.
+
+    The fixture above uses two distinct agent objects, so their counter dicts
+    are independent and a global-counter regression stays invisible there. A
+    single agent serving two turn ids concurrently is what actually gates the
+    partition: each turn must start its own sequence at 0.
+    """
+    agent = _agent("turn-a")
+    barrier = threading.Barrier(3)
+
+    def record(turn_id, response):
+        scoped = _agent(turn_id)
+        # Share the ONE allocator under test across both threads.
+        scoped._api_call_seq_lock = getattr(agent, "_api_call_seq_lock", None)
+        scoped.__dict__["_api_call_seq_by_turn"] = agent.__dict__.setdefault(
+            "_api_call_seq_by_turn", {}
+        )
+        barrier.wait()
+        cch._record_successful_api_call(scoped, response)
+        cch._record_successful_api_call(scoped, response)
+
+    threads = [
+        threading.Thread(target=record, args=("turn-a", _response("sub-vps-7", 1000, 50))),
+        threading.Thread(target=record, args=("turn-b", _response("sub-vps-2", 10, 7))),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    seqs = {}
+    for row in recorded:
+        seqs.setdefault(row["turn_id"], []).append(row["seq"])
+    # Each turn owns a private 0,1 sequence. A process-global counter would
+    # hand out 0,1,2,3 across the two turns instead.
+    assert sorted(seqs["turn-a"]) == [0, 1]
+    assert sorted(seqs["turn-b"]) == [0, 1]
+
+
 def test_pooled_provider_requires_transport_stamp(recorded, caplog):
     agent = _agent("turn-missing-stamp")
     cch._record_successful_api_call(agent, SimpleNamespace(usage=_usage(10, 7)))
@@ -253,11 +294,27 @@ def test_nonstream_transport_pairs_raw_headers_with_parsed_message(monkeypatch):
 
     class Agent:
         api_mode = "anthropic_messages"
+        provider = "claude-apr"
         log_prefix = ""
         _disable_streaming = False
+        _anthropic_client = object()
 
         def _capture_anthropic_response_headers(self, response):
             captured.append(response)
+
+        # Mirrors AIAgent._anthropic_messages_create: the transport must reach
+        # the adapter THROUGH this seam so the interrupt/stale watchdog and the
+        # 413 recovery path can keep mocking it.
+        def _anthropic_messages_create(self, api_kwargs, *, client=None, on_response=None):
+            from agent.anthropic_adapter import create_anthropic_message
+
+            return create_anthropic_message(
+                client or self._anthropic_client,
+                api_kwargs,
+                log_prefix=self.log_prefix,
+                prefer_stream=not self._disable_streaming,
+                on_response=on_response or self._capture_anthropic_response_headers,
+            )
 
     agent = Agent()
 

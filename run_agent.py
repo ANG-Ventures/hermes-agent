@@ -6999,7 +6999,9 @@ class AIAgent:
             return False
         return pool.has_available()
 
-    def _anthropic_messages_create(self, api_kwargs: dict, *, client: Any = None):
+    def _anthropic_messages_create(
+        self, api_kwargs: dict, *, client: Any = None, on_response: Any = None
+    ):
         # When a request-local client is supplied it was already credential-
         # refreshed in ``_create_request_anthropic_client``; only the shared
         # fallback path refreshes here.
@@ -7017,7 +7019,10 @@ class AIAgent:
             # Rate-limit + credits state live in response headers, which the
             # parsed Message drops. No-ops on providers that don't send the
             # matching header families (x-ratelimit-* / x-nous-credits-*).
-            on_response=self._capture_anthropic_response_headers,
+            # A caller-supplied callback is call-scoped (it wraps this one);
+            # swapping a callback on the shared agent would race
+            # interrupt-abandoned workers and transpose two calls' headers.
+            on_response=on_response or self._capture_anthropic_response_headers,
         )
 
     def _rebuild_anthropic_client(self) -> None:
