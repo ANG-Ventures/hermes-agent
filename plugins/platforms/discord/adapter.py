@@ -1656,7 +1656,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         try:
-            if not self._acquire_platform_lock('discord-bot-token', self.config.token, 'Discord bot token'):
+            if not await self._acquire_platform_lock_async('discord-bot-token', self.config.token, 'Discord bot token'):
                 return False
 
             # Snapshot this profile's gate env vars (issue #72348): connect()
@@ -7451,7 +7451,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Track thread participation so follow-ups don't require @mention
         if thread_id:
-            self._threads.mark(thread_id)
+            await self._threads.mark_async(thread_id)
 
         # If a message was provided, kick off a new Hermes session in the thread
         starter = (message or "").strip()
@@ -9702,7 +9702,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     is_thread = True
                     thread_id = str(thread.id)
                     auto_threaded_channel = thread
-                    self._threads.mark(thread_id)
+                    await self._threads.mark_async(thread_id)
                     # Pre-seed dedup: when _auto_create_thread creates a thread
                     # via message.create_thread(), Discord fires a second
                     # MESSAGE_CREATE event for the "thread starter message".
@@ -10061,7 +10061,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
         if thread_id:
-            self._threads.mark(thread_id)
+            await self._threads.mark_async(thread_id)
 
         # Only live plain text messages use split-message batching. Recovery
         # candidates are already complete historical messages; coalescing them

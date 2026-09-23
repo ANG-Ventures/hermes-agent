@@ -236,6 +236,88 @@ def test_initial_status_blocked_unblock_releases(kanban_home):
         assert kb.get_task(conn, t).status in ("ready", "todo")
 
 
+def test_initial_status_blocked_with_satisfied_parent_promotes_on_tick(kanban_home):
+    """A creation hold becomes dependency-backed once a blocks edge is added."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(
+            conn, title="dependency hold", assignee="worker",
+            initial_status="blocked",
+        )
+        kb.link_tasks(conn, parent, child, kind="blocks")
+        assert kb.get_task(conn, child).status == "blocked"
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(time.time()), parent),
+            )
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert kb.get_task(conn, child).status == "ready"
+        assert result.promoted == 1
+        assert result.parent_satisfied_sticky == []
+
+
+def test_explicit_block_with_satisfied_parent_stays_blocked_and_is_named(kanban_home):
+    """Parent completion never overrides an explicit worker/operator block."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="needs input", assignee="worker")
+        assert kb.block_task(
+            conn, child, reason="choose an API", kind="needs_input",
+        )
+        kb.link_tasks(conn, parent, child, kind="blocks")
+
+        assert kb.complete_task(conn, parent, result="done")
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert kb.get_task(conn, child).status == "blocked"
+        assert result.spawned == []
+        assert result.parent_satisfied_sticky == [child]
+
+
+def test_legacy_untagged_creation_hold_with_satisfied_parent_promotes(kanban_home):
+    """Pre-source-tag creation events retain dependency-release behavior."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="legacy hold", initial_status="blocked")
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'blocked'",
+            (json.dumps({"reason": "created with initial_status=blocked"}), child),
+        )
+        conn.commit()
+        kb.link_tasks(conn, parent, child, kind="blocks")
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(time.time()), parent),
+            )
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_explicit_block_cannot_spoof_legacy_creation_reason(kanban_home):
+    """A user-controlled reason never turns an explicit block into a creation hold."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="explicit hold", assignee="worker")
+        assert kb.block_task(
+            conn,
+            child,
+            reason="created with initial_status=blocked",
+            kind="needs_input",
+        )
+        kb.link_tasks(conn, parent, child, kind="blocks")
+
+        assert kb.complete_task(conn, parent, result="done")
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert kb.get_task(conn, child).status == "blocked"
+        assert result.parent_satisfied_sticky == [child]
+
+
 # ---------------------------------------------------------------------------
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------
@@ -682,6 +764,106 @@ def test_sandbox_flag_covers_every_declared_path_pin(tmp_path, monkeypatch):
     for name in kb._KANBAN_PATH_PIN_ENV_VARS:
         monkeypatch.setenv(name, str(tmp_path / "live"))
         assert kb._kanban_path_override(name) == "", name
+
+
+# --- SANDBOX neutralising an explicit pin (the mirror of the escape warning) --
+#
+# Measured 2026-09-22: HERMES_KANBAN_DB pinned + HERMES_HOME redirected logged
+# ONE warning; the same pin + HERMES_KANBAN_SANDBOX=1 logged ZERO while quietly
+# resolving to the LIVE board. Same user-visible failure, and the escape
+# warning's own remedy text recommends the flag that causes it. Cost card
+# t_adec8aba two fixture cards on the live board, claimed as real work.
+
+_NEUTRALISED_MARKER = "NEUTRALISED the explicit kanban path pin"
+
+
+@pytest.fixture
+def _sandbox_neutralised_env(tmp_path, monkeypatch):
+    """Sandbox flag ON with a throwaway board pinned — the incident shape."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(scratch))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(kb, "_CHECKED_SANDBOX_NEUTRALISED_PINS", set())
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_ATTACHMENTS_ROOT", raising=False)
+    fixture_db = tmp_path / "FIXTURE.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(fixture_db))
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    return scratch, fixture_db
+
+
+def test_sandbox_neutralising_a_pin_warns_once(_sandbox_neutralised_env, caplog):
+    """The neutralisation is loud, names the pin and where it landed, once.
+
+    Warn-ONCE is load-bearing, not cosmetic: this check hangs off
+    ``_kanban_path_override``, which ``kanban_db_path()`` calls on the
+    ``connect()`` hot path. A per-call warning would be a perf defect, and an
+    always-warns implementation passes a test that only counts >= 1.
+    """
+    scratch, fixture_db = _sandbox_neutralised_env
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        first = kb.kanban_db_path()
+        second = kb.kanban_db_path()
+    # RESOLUTION IS UNCHANGED: the sandbox flag still wins over the pin.
+    assert first == scratch / "kanban.db"
+    assert second == first
+    assert first != fixture_db
+
+    warnings = [r for r in caplog.records if _NEUTRALISED_MARKER in r.getMessage()]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    message = warnings[0].getMessage()
+    # Must name WHICH pin was neutralised AND where resolution actually landed,
+    # or the operator cannot act on it.
+    assert "HERMES_KANBAN_DB" in message
+    assert str(fixture_db) in message
+    assert str(scratch) in message
+
+
+def test_no_neutralisation_warning_when_sandbox_off(_sandbox_neutralised_env, monkeypatch, caplog):
+    """Pin without the flag: the pin wins, so nothing was neutralised."""
+    _scratch, fixture_db = _sandbox_neutralised_env
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        assert kb.kanban_db_path() == fixture_db
+    assert [r for r in caplog.records if _NEUTRALISED_MARKER in r.getMessage()] == []
+
+
+def test_no_neutralisation_warning_when_sandbox_on_without_pins(
+    _sandbox_neutralised_env, monkeypatch, caplog,
+):
+    """The flag alone is the intended hermetic setup — it must stay silent."""
+    scratch, _fixture_db = _sandbox_neutralised_env
+    for name in kb._KANBAN_PATH_PIN_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    with caplog.at_level("WARNING", logger=kb.__name__):
+        assert kb.kanban_db_path() == scratch / "kanban.db"
+    assert [r for r in caplog.records if _NEUTRALISED_MARKER in r.getMessage()] == []
+
+
+def test_neutralisation_warning_covers_every_declared_pin(
+    _sandbox_neutralised_env, monkeypatch, caplog,
+):
+    """Every var in the declared pin list must be reportable, not just the DB.
+
+    ``kanban_home()`` / ``workspaces_root()`` / ``attachments_root()`` are
+    silenced by the same flag through the same choke point; a warning that only
+    ever names HERMES_KANBAN_DB leaves the other three silent.
+    """
+    _scratch, _fixture_db = _sandbox_neutralised_env
+    for name in kb._KANBAN_PATH_PIN_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    for name in kb._KANBAN_PATH_PIN_ENV_VARS:
+        monkeypatch.setenv(name, "/tmp/pinned-elsewhere")
+        monkeypatch.setattr(kb, "_CHECKED_SANDBOX_NEUTRALISED_PINS", set())
+        caplog.clear()
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            assert kb._kanban_path_override(name) == "", name
+        emitted = [r.getMessage() for r in caplog.records if _NEUTRALISED_MARKER in r.getMessage()]
+        assert len(emitted) == 1, name
+        assert name in emitted[0]
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_sandboxed_worker_env_cannot_reach_live_board(tmp_path, monkeypatch):

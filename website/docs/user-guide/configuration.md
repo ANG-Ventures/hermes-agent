@@ -2227,6 +2227,29 @@ For separate natural mid-turn assistant updates without progressive token editin
 The master `streaming.enabled` switch is `false` by default — nothing streams until you flip it. Once enabled, streaming is decided **per platform**: Telegram ships with `display.platforms.telegram.streaming: true` (streams) and Discord with `display.platforms.discord.streaming: false` (does not). So after enabling streaming, Telegram streams out of the box and Discord stays on whole-message replies until you change its toggle. You can adjust these per-platform switches from the dashboard's **Channels** toggles or directly in `~/.hermes/config.yaml`.
 :::
 
+## Gateway Turn Concurrency
+
+Bound how many messaging-gateway agent turns execute at once without rejecting
+messages:
+
+```yaml
+gateway:
+  max_concurrent_turns: 8       # 0/null = unbounded
+  startup_resume_concurrency: 3 # boot-resume turns started at once
+```
+
+Turns above `max_concurrent_turns` wait for capacity. Internal turns use a
+smaller slice of the limit so they cannot consume every slot needed by live
+user messages. If a user turn waits longer than 15 seconds, Hermes sends one
+queued-message acknowledgment. `startup_resume_concurrency` separately limits
+the restart-recovery burst while preserving the configured startup-restore
+drain timeout.
+
+These settings are execution backpressure, not session admission. They do not
+change `max_concurrent_sessions`, and setting `max_concurrent_turns` to `0`
+restores unbounded turn execution. Top-level values are also accepted for
+backward compatibility and take precedence over the `gateway` block.
+
 ## Group Chat Session Isolation
 
 Limit how many chat sessions can actively be open across CLI, TUI/dashboard,

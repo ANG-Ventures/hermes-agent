@@ -67,6 +67,7 @@ except ModuleNotFoundError:
 # visible console when this process is windowless (pythonw gateway + every
 # kanban worker).  No-op on POSIX; never raises.
 from hermes_cli._subprocess_compat import suppress_platform_ver_console
+from hermes_cli.cli_hint import hint_value
 from hermes_cli.cli_output import line_input
 
 suppress_platform_ver_console()
@@ -1999,7 +2000,7 @@ def _print_tui_exit_summary(
     print("Resume this session with:")
     print(f"  hermes --tui --resume {target}")
     if title:
-        print(f'  hermes --tui -c "{title}"')
+        print(f'  hermes --tui -c {hint_value(title)}')
     print()
     print(f"Session:        {target}")
     if title:
@@ -9261,7 +9262,7 @@ def _recover_core_update_marker_locked() -> None:
             )
         else:
             print("  Recover manually with:")
-            print(f"    cd {PROJECT_ROOT}")
+            print(f"    cd {hint_value(PROJECT_ROOT)}")
             print(f"    {sys.executable} -m ensurepip --upgrade")
             print(f"    {sys.executable} -m pip install -e '.[all]'")
 
@@ -12182,7 +12183,7 @@ def cmd_dashboard(args):
         print("Web UI dependencies not installed (need fastapi + uvicorn).")
         print(
             f"Re-install the package into this interpreter so metadata updates apply:\n"
-            f"  cd {PROJECT_ROOT}\n"
+            f"  cd {hint_value(PROJECT_ROOT)}\n"
             f"  {sys.executable} -m pip install -e .\n"
             "If `pip` is missing in this venv, use:  uv pip install -e ."
         )

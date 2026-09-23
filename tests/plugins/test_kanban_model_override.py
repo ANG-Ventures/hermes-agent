@@ -162,6 +162,31 @@ def _create(client, **kwargs):
     return r.json()["task"]
 
 
+def test_dashboard_create_rejects_flagship_model(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "guarded",
+            "assignee": "worker",
+            "model_override": "gpt-6-astra",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "flagship model 'gpt-6-astra' is orchestrator-only" in response.json()["detail"]
+
+
+def test_dashboard_patch_rejects_flagship_model(client):
+    task = _create(client)
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"model_override": "claude-fable-5"},
+    )
+
+    assert response.status_code == 400
+    assert "flagship model 'claude-fable-5' is orchestrator-only" in response.json()["detail"]
+
+
 def test_patch_sets_model_override(client):
     task = _create(client)
     r = client.patch(

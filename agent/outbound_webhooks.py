@@ -137,7 +137,31 @@ class WebhookTarget:
 
     @property
     def label(self) -> str:
+        """Operator-facing identity. May be the raw URL — LOG CHANNEL ONLY.
+
+        Falls back to ``self.url`` when the optional ``name:`` is omitted, and
+        a webhook URL is a bearer credential (``hooks.slack.com/services/T…/
+        B…/<secret>``, ``?token=``). Never route this to a model-visible
+        string; use :attr:`display_label` there.
+        """
         return self.name or self.url
+
+    @property
+    def display_label(self) -> str:
+        """Return a stable, secret-free identity safe for model-facing text.
+
+        The configured ``name:`` is an operator-chosen identifier and is used
+        as-is. Without one we must NOT fall back to the URL, so the target is
+        named by a short stable digest of it instead — distinct targets stay
+        distinguishable without disclosing the credential.
+
+        Mirrors :func:`agent.shell_hooks.hook_display_name`, which does the
+        same job for the other producer of synthesized callback identities.
+        """
+        if self.name:
+            return self.name
+        digest = hashlib.sha256(self.url.encode("utf-8", "replace")).hexdigest()[:8]
+        return f"webhook#{digest}"
 
     def matches_tool(self, tool_name: Optional[str]) -> bool:
         if not self.matcher:
@@ -396,7 +420,12 @@ def _make_callback(event: str, target: WebhookTarget):
         _enqueue(_build_delivery(event, target, body, delivery_id))
         return None
 
-    _callback.__name__ = f"outbound_webhook[{event}:{target.label}]"
+    # The dispatcher reads __name__ into fail-closed refusal messages returned
+    # to the MODEL (hermes_cli/plugins.py _callback_label), so this must never
+    # carry `target.label`: that falls back to the raw URL when the optional
+    # `name:` is omitted, and a webhook URL is a bearer credential. The raw URL
+    # stays on the log channel only (register_from_config above).
+    _callback.__name__ = f"outbound_webhook[{event}:{target.display_label}]"
     _callback.__qualname__ = _callback.__name__
     return _callback
 

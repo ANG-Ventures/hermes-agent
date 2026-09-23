@@ -323,10 +323,10 @@ VALID_HOOKS: Set[str] = {
     # reclaim/accounting txn has committed. Exit visibility latency is
     # bounded by the dispatcher tick interval. Adds:
     #   worker_pid: int,
-    #   exit_kind: "clean_exit" | "rate_limited" | "nonzero_exit"
-    #              | "signaled" | "unknown",
+    #   exit_kind: "clean_exit" | "rate_limited" | "infra_unavailable"
+    #              | "nonzero_exit" | "signaled" | "unknown",
     #   exit_code: int | None,
-    #   outcome: "crashed" | "rate_limited",
+    #   outcome: "crashed" | "rate_limited" | "infra_unavailable",
     #   retry_status: str  (the phase the task was released back to).
     "on_kanban_worker_exited",
     # on_kanban_worker_stale_claim fires when release_stale_claims reclaims
@@ -445,8 +445,9 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "on_session_end",
 }
 
-# Policy hooks: timeout / still-running must fail closed (block the tool).
-# Skipping would let the tool run without a completed policy decision.
+# Policy hooks: a timeout, or a refusal inside the post-timeout suppression
+# window, must fail closed (block the tool). Skipping would let the tool run
+# without a completed policy decision.
 _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
 
 # Documented parent-thread serialization contract — never move the callback
@@ -457,9 +458,68 @@ _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # repeatedly invoked hung hook cannot accumulate abandoned daemon threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 
+# Distinct user-facing reasons for the two fail-closed refusal paths. Do NOT
+# collapse these back into one string: they describe different events, and
+# conflating them is what sent #819's investigation down a phantom
+# "callback is still running" concurrency hypothesis. The suppression refusal
+# is NOT a timeout of the call being refused — an EARLIER call timed out and
+# the cooldown window is still open.
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
-    "pre_tool_call plugin callback timed out or is still running"
+    "pre_tool_call plugin callback {callback} timed out after {elapsed:.3f}s "
+    "(budget {budget:g}s)"
 )
+_PRE_TOOL_CALL_SUPPRESSED_BLOCK_MESSAGE = (
+    "pre_tool_call plugin callback {callback} is suppressed after an earlier "
+    "timeout (retry in {remaining:.0f}s)"
+)
+
+
+def _callback_label(callback: Any) -> str:
+    """Return a stable, secret-free identifier for a plugin *callback*.
+
+    Callback labels reach the MODEL through the fail-closed refusal messages
+    above, so this must never fall back to ``repr()``: a callback that carries
+    credentials in its state — the canonical case is
+    ``functools.partial(fn, api_token)``, whose repr renders every bound
+    argument — would interpolate them straight into a model-visible string.
+    ``__name__``/``__qualname__`` are usually developer-chosen identifiers, but
+    they are NOT safe by construction: this codebase synthesizes them from
+    operator config (``agent.shell_hooks`` and ``agent.outbound_webhooks`` both
+    do), and a third-party plugin can set any value through
+    ``register_hook()``. Each PRODUCER of a synthesized identity is therefore
+    responsible for sanitizing it at the source — see
+    :func:`agent.shell_hooks.hook_display_name` and
+    :attr:`agent.outbound_webhooks.WebhookTarget.display_label`. This function
+    is the last line of defence, not the only one: it refuses ``repr()`` so an
+    unsanitized callback still cannot render its bound state.
+
+    Anything without a usable name is identified by TYPE plus a short digest of
+    that type — never ``id()``, whose value is a CPython heap address that
+    changes per process and is recycled after GC.
+    """
+    for attr in ("__qualname__", "__name__"):
+        label = getattr(callback, attr, None)
+        if isinstance(label, str) and label:
+            return label
+    # functools.partial and friends: the WRAPPED function's name is a safe
+    # developer identifier, while the partial's bound args are exactly what
+    # must not be rendered. Name the wrapped callable, never the arguments.
+    wrapped = getattr(callback, "func", None)
+    if wrapped is not None:
+        for attr in ("__qualname__", "__name__"):
+            label = getattr(wrapped, attr, None)
+            if isinstance(label, str) and label:
+                return f"{type(callback).__name__}({label})"
+    # Last resort: no usable name anywhere. Identify by TYPE plus a short
+    # digest of its fully-qualified type, NOT id() — a heap address differs
+    # between processes and is recycled after GC, so it is neither stable nor
+    # meaningful to whoever reads the refusal. The digest keeps two distinct
+    # anonymous callback types apart without disclosing any instance state.
+    cls = type(callback)
+    fqtn = f"{getattr(cls, '__module__', '?')}.{getattr(cls, '__qualname__', cls.__name__)}"
+    digest = hashlib.sha256(fqtn.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"<{cls.__name__}#{digest}>"
+
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 ENTRY_POINT_CAPABILITIES_GROUP = "hermes_agent.plugin_capabilities"
@@ -3792,11 +3852,29 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     )
 
 
-def _pre_tool_call_timeout_block() -> Dict[str, str]:
-    """Fail-closed directive when a policy callback times out or is still running."""
+def _pre_tool_call_timeout_block(
+    callback: str, elapsed: float, budget: float
+) -> Dict[str, str]:
+    """Fail-closed directive for a policy callback that exceeded its budget."""
     return {
         "action": "block",
-        "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+        "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE.format(
+            callback=callback, elapsed=elapsed, budget=budget
+        ),
+    }
+
+
+def _pre_tool_call_suppressed_block(callback: str, remaining: float) -> Dict[str, str]:
+    """Fail-closed directive for a refusal inside the post-timeout cooldown.
+
+    This is NOT a timeout of the call being refused: an EARLIER invocation of
+    *callback* timed out and its suppression window has not yet elapsed.
+    """
+    return {
+        "action": "block",
+        "message": _PRE_TOOL_CALL_SUPPRESSED_BLOCK_MESSAGE.format(
+            callback=callback, remaining=max(0.0, remaining)
+        ),
     }
 
 
@@ -3856,10 +3934,10 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
-        # In-flight / recently-timed-out hook callbacks. Keyed by
-        # (hook_name, id(cb)) so a stuck policy hook cannot spawn a new
-        # abandoned daemon thread on every subsequent fire.
-        self._hook_running_callbacks: Dict[tuple, object] = {}
+        # Recently timed-out hook callbacks. Keyed by (hook_name, id(cb));
+        # suppression starts only after an invocation actually exceeds its
+        # budget. Ordinary concurrent invocations are not timeouts and must
+        # not block one another in the multiplexed gateway.
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
@@ -4253,7 +4331,6 @@ class PluginManager:
             self._platform_handler_factories.clear()
             self._context_engine = None
             with self._hook_timeout_lock:
-                self._hook_running_callbacks.clear()
                 self._hook_timeout_suppressed_until.clear()
             self._discovered = False
         else:
@@ -5643,8 +5720,10 @@ class PluginManager:
         policy hook ``pre_tool_call`` are bounded by
         ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker
         is abandoned (not joined) so we do not reintroduce the #6622 hang.
-        Timed-out or still-running ``pre_tool_call`` callbacks fail closed
-        with a block directive; other bounded hooks fail open (skip).
+        Timed-out ``pre_tool_call`` callbacks fail closed by default; shell
+        hooks preserve their individual ``fail_closed`` setting. Other bounded
+        hooks fail open (skip). A timeout suppresses later invocations of that
+        callback briefly, but ordinary concurrent invocations remain independent.
 
         ``subagent_stop`` (and any hook in ``_HOOK_CALLER_THREAD_HOOKS``)
         always runs on the caller thread to preserve the documented parent-
@@ -5674,66 +5753,82 @@ class PluginManager:
         results: List[Any] = []
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
-        fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-
         for cb in callbacks:
-            callback_name = getattr(cb, "__name__", repr(cb))
+            callback_name = _callback_label(cb)
             callback_key = (hook_name, id(cb))
+            fail_closed = bool(
+                getattr(
+                    cb,
+                    "_hermes_timeout_fail_closed",
+                    hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS,
+                )
+            )
             try:
                 if use_timeout:
-                    token = object()
                     now = time.monotonic()
                     with self._hook_timeout_lock:
                         suppressed_until = self._hook_timeout_suppressed_until.get(
                             callback_key
                         )
-                        running = callback_key in self._hook_running_callbacks
-                        if (
-                            suppressed_until is not None and suppressed_until > now
-                        ) or running:
+                        if suppressed_until is not None and suppressed_until > now:
+                            remaining = suppressed_until - now
                             logger.warning(
-                                "Hook '%s' callback %s skipped after previous "
-                                "timeout or while still running",
+                                "Hook '%s' callback %s suppressed after callback "
+                                "timeout (%.1fs remaining)",
                                 hook_name,
                                 callback_name,
+                                remaining,
                             )
                             if fail_closed:
-                                results.append(_pre_tool_call_timeout_block())
+                                results.append(
+                                    _pre_tool_call_suppressed_block(
+                                        callback_name, remaining
+                                    )
+                                )
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
-                        self._hook_running_callbacks[callback_key] = token
 
                     context = contextvars.copy_context()
                     done = threading.Event()
                     outcome: Dict[str, Any] = {}
                     failure: Dict[str, Exception] = {}
 
+                    # Every object the worker touches is bound as a default
+                    # argument, so it is snapshotted into the thread's own frame
+                    # at definition time. A closure resolves a free variable at
+                    # CALL time: a worker abandoned on timeout keeps running,
+                    # and by the time it writes back the loop has advanced, so
+                    # a free `done`/`outcome`/`failure` would resolve to the
+                    # NEXT callback's objects — releasing that callback's wait
+                    # early and overwriting its result with the abandoned one's.
+                    # Re-creating the objects per iteration (above) does not
+                    # help; only the binding does.
                     def _runner(
                         _cb: Callable[..., Any] = cb,
-                        _key: tuple = callback_key,
-                        _token: object = token,
+                        _context: contextvars.Context = context,
+                        _done: threading.Event = done,
+                        _outcome: Dict[str, Any] = outcome,
+                        _failure: Dict[str, Exception] = failure,
                     ) -> None:
                         try:
                             # Route through _invoke_hook_callback so the
                             # additive-payload signature filtering (narrow
                             # legacy callbacks) applies on the worker too.
-                            outcome["value"] = context.run(
+                            _outcome["value"] = _context.run(
                                 self._invoke_hook_callback, _cb, kwargs
                             )
                         except Exception as exc:
-                            failure["exc"] = exc
+                            _failure["exc"] = exc
                         finally:
-                            with self._hook_timeout_lock:
-                                if self._hook_running_callbacks.get(_key) is _token:
-                                    self._hook_running_callbacks.pop(_key, None)
-                            done.set()
+                            _done.set()
 
                     thread = threading.Thread(
                         target=_runner,
                         name=f"hermes-hook-{callback_name}"[:40],
                         daemon=True,
                     )
+                    started_at = time.monotonic()
                     thread.start()
                     if not done.wait(timeout=timeout):
                         # Do not join — that would reintroduce the #6622 hang.
@@ -5742,14 +5837,21 @@ class PluginManager:
                                 time.monotonic()
                                 + self._hook_timeout_suppression_seconds
                             )
+                        elapsed = time.monotonic() - started_at
                         logger.warning(
-                            "Hook '%s' callback %s timed out after %gs — skipping",
+                            "Hook '%s' callback %s timed out after %.3fs "
+                            "(budget %gs) — skipping",
                             hook_name,
                             callback_name,
+                            elapsed,
                             timeout,
                         )
                         if fail_closed:
-                            results.append(_pre_tool_call_timeout_block())
+                            results.append(
+                                _pre_tool_call_timeout_block(
+                                    callback_name, elapsed, timeout
+                                )
+                            )
                         continue
                     if "exc" in failure:
                         raise failure["exc"]
@@ -5898,7 +6000,7 @@ class PluginManager:
                     logger.warning(
                         "Event '%s' subscriber %s raised: %s",
                         item.event,
-                        getattr(callback, "__name__", repr(callback)),
+                        _callback_label(callback),
                         exc,
                     )
         finally:
@@ -6084,7 +6186,7 @@ class PluginManager:
                 logger.warning(
                     "Middleware '%s' callback %s raised: %s",
                     kind,
-                    getattr(cb, "__name__", repr(cb)),
+                    _callback_label(cb),
                     exc,
                 )
         return results

@@ -1,3 +1,5 @@
+import { CONFAB_NOTICE_EVENT_TEXT, confabNoticeFromRow } from '@hermes/shared/confab-notice'
+
 import { LONG_MSG } from '../config/limits.js'
 import { buildToolTrailLine } from '../lib/text.js'
 import type { Msg, SessionInfo } from '../types.js'
@@ -84,6 +86,25 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       pending = []
 
       continue
+    }
+
+    // A confirmed out-of-band confabulation catch. The row still carries the
+    // real model reply, so emit the event marker AND fall through so the
+    // reply is rendered normally — without this, a reloaded session is
+    // indistinguishable from a clean one and the durable triage record is
+    // invisible to the operator.
+    //
+    // Gated on role + re-validated metadata: display_kind is an open string
+    // column, so a malformed or imported non-assistant row carrying it must
+    // not be presented as a confirmed catch.
+    //
+    // Unlike the branches above, this one must NOT clear `pending`: they each
+    // `continue` and replace the row, while this one falls through to the
+    // assistant push below, which reads `pending` for the reply's tool trail.
+    // Clearing it here would silently erase the tool evidence on exactly the
+    // turns an operator reloads history to audit.
+    if (display_kind === 'confab_notice' && confabNoticeFromRow(row as TranscriptRow)) {
+      out.push({ kind: 'event', role: 'system', text: CONFAB_NOTICE_EVENT_TEXT })
     }
 
     if (role === 'assistant') {

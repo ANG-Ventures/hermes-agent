@@ -1,4 +1,5 @@
 import { skillInvocationText } from '@hermes/shared'
+import { CONFAB_NOTICE_EVENT_TEXT, confabNoticeFromRow } from '@hermes/shared/confab-notice'
 
 import { extractImageRefs } from '@/lib/embedded-images'
 import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
@@ -112,6 +113,10 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
       : `${count} background agent${count === 1 ? '' : 's'} finished`
   }
 
+  // NOTE: `confab_notice` is deliberately absent here. Unlike the kinds above,
+  // that row still carries the real model reply, so its content must NOT be
+  // replaced by an event label — `toChatMessages` emits a separate system
+  // marker row ahead of it instead (see confabNoticeFromRow below).
   return content
 }
 
@@ -193,6 +198,25 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       message.display_content !== undefined
         ? message.display_content
         : message.content || message.text || message.context || message.name
+
+    // A confirmed out-of-band confabulation catch. The row still carries the
+    // real model reply, so push a separate system marker ahead of it rather
+    // than replacing its content — without this, a reloaded session renders
+    // the reply as an ordinary one and the durable triage record is invisible.
+    //
+    // Gated on role + re-validated metadata (confabNoticeFromRow): the
+    // `display_kind` string alone is open-ended, so a malformed or imported
+    // non-assistant row carrying it must not be shown as a confirmed catch.
+    if (confabNoticeFromRow(message)) {
+      flushPendingTools(index)
+      result.push({
+        id: `confab-notice-${message.timestamp || Date.now()}-${index}`,
+        role: 'system',
+        parts: [textPart(CONFAB_NOTICE_EVENT_TEXT, message.timestamp)],
+        timestamp: message.timestamp
+      })
+      activeAssistantIndex = null
+    }
 
     const rawDisplayContent = transcriptContent(
       message.display_kind,

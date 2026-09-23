@@ -2391,7 +2391,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # what we sent — replies to this message resolve via this index.
             try:
                 from gateway import rich_sent_store
-                rich_sent_store.record(str(chat_id), str(message_id), content)
+                await rich_sent_store.record_async(str(chat_id), str(message_id), content)
             except Exception:
                 pass
         return SendResult(
@@ -2474,7 +2474,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # replies to it would have no native echo to recover from.
         try:
             from gateway import rich_sent_store
-            rich_sent_store.record(str(chat_id), str(message_id), content)
+            await rich_sent_store.record_async(str(chat_id), str(message_id), content)
         except Exception:
             pass
         return SendResult(success=True, message_id=message_id)
@@ -4598,7 +4598,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         
         try:
-            if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
+            if not await self._acquire_platform_lock_async('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
             # Build the application
@@ -10693,7 +10693,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         from gateway.sticker_cache import (
             get_cached_description,
-            cache_sticker_description,
+            cache_sticker_description_async,
             build_sticker_injection,
             build_animated_sticker_injection,
             STICKER_VISION_PROMPT,
@@ -10732,7 +10732,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             if result.get("success"):
                 description = result.get("analysis", "a sticker")
-                cache_sticker_description(sticker.file_unique_id, description, emoji, set_name)
+                await cache_sticker_description_async(sticker.file_unique_id, description, emoji, set_name)
                 event.text = build_sticker_injection(description, emoji, set_name)
             else:
                 # Vision failed -- use emoji as fallback

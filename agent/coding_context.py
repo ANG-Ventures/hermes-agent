@@ -895,7 +895,7 @@ def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
     lines.append(f"- Root: {root}")
 
     if git_root is not None:
-        branch, counts = _parse_status(_git(root, "status", "--porcelain=2", "--branch"))
+        branch, counts = _parse_status(_git(root, "--no-optional-locks", "status", "--porcelain=2", "--branch"))
         head = branch.get("head", "")
         if head and head != "(detached)":
             line = f"- Branch: {head}"

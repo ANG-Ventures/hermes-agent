@@ -246,17 +246,54 @@ def _available_slug(preferred: str) -> str:
     ``default`` always reports as existing, so an archive exported from a
     default board naturally lands as ``default-2`` instead of colliding
     with the importer's own default board.
+
+    OBSERVES only -- it does not RESERVE. Two concurrent imports both see the
+    same slug free and both pick it. Use :func:`_reserve_slug`, which walks
+    these candidates and claims one atomically.
     """
-    if not kb.board_exists(preferred):
-        return preferred
+    for candidate in _slug_candidates(preferred):
+        if not kb.board_exists(candidate):
+            return candidate
+    raise AssertionError("unreachable: _slug_candidates is infinite")
+
+
+def _slug_candidates(preferred: str):
+    """Yield ``preferred`` then ``<stem>-2``, ``<stem>-3``, ... forever."""
+    yield preferred
     # Leave headroom for the suffix inside the 64-char slug limit.
     stem = preferred[:58].rstrip("-_") or "board"
     n = 2
     while True:
-        candidate = f"{stem}-{n}"
-        if not kb.board_exists(candidate):
-            return candidate
+        yield f"{stem}-{n}"
         n += 1
+
+
+def _reserve_slug(preferred: str) -> tuple[str, Path]:
+    """Atomically claim a free board slug. Returns ``(slug, board_root)``.
+
+    ``_available_slug`` only observes that a slug is free; between that
+    observation and the ``shutil.move`` that installs the DB, another importer
+    can claim the same one. Both then move onto the same ``kanban.db`` and the
+    later write REPLACES the first board -- silent, total loss of an imported
+    board (FleetReview on PR #785; reproduced with two real processes, one
+    card permanently gone).
+
+    The directory creation IS the reservation: ``mkdir(exist_ok=False)``
+    succeeds for exactly one racer, and the loser advances to the next
+    candidate. The returned root is therefore guaranteed to have been created
+    by THIS call and to be empty, which is the premise the gate-dominance
+    suppression at the ``shutil.move`` call sites rests on.
+    """
+    for candidate in _slug_candidates(preferred):
+        if kb.board_exists(candidate):
+            continue
+        board_root = kb.board_dir(candidate)
+        try:
+            board_root.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue  # lost the race for this slug; take the next one
+        return candidate, board_root
+    raise AssertionError("unreachable: _slug_candidates is infinite")
 
 
 def _read_manifest(root: Path) -> dict[str, Any]:
@@ -424,21 +461,25 @@ def import_board(
                 "cannot determine a board name from the archive — pass one "
                 "explicitly with --as <slug>"
             )
-        target = _available_slug(requested)
+        # The slug is RESERVED, not merely observed free: the mkdir inside
+        # _reserve_slug is the atomic claim, so a second importer racing this
+        # one takes the next candidate instead of moving onto this kanban.db
+        # (FleetReview on PR #785 -- measured board loss with two real
+        # processes). Everything below may therefore assume board_root was
+        # created by THIS call and is empty.
+        target, board_root = _reserve_slug(requested)
 
         staged_meta = _read_board_metadata(extracted / "board.json")
 
-        board_root = kb.board_dir(target)
-        board_root.mkdir(parents=True, exist_ok=True)
-        # noqa: gate-dominance -- target comes from _available_slug(), which
-        # returns a slug no board currently occupies, so board_root was just
-        # created empty and cannot enclose any card's workspaces/ (measured:
-        # card t_63fb42f9 round-6 class sweep). No liveness gate is owed.
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))  # noqa: gate-dominance -- fresh slug, see above
+        # noqa: gate-dominance -- target comes from _reserve_slug(), which
+        # CREATED board_root with exist_ok=False, so it was just created empty
+        # and cannot enclose any card's workspaces/ (measured: card t_63fb42f9
+        # round-6 class sweep). No liveness gate is owed.
+        shutil.move(str(staged_db), str(board_root / "kanban.db"))  # noqa: gate-dominance -- freshly reserved slug, see above
         for tree in ("attachments", "logs"):
             src = extracted / tree
             if src.is_dir():
-                shutil.move(str(src), str(board_root / tree))  # noqa: gate-dominance -- fresh slug, see above
+                shutil.move(str(src), str(board_root / tree))  # noqa: gate-dominance -- freshly reserved slug, see above
 
     # Rewritten rather than moved across: the archive's copy names a slug
     # and a workdir that belong to the exporting machine.

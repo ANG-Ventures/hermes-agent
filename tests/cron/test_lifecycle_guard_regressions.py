@@ -93,10 +93,13 @@ def test_append_does_not_resurrect_deleted_profile(tmp_path):
     assert not home.exists()
 
 
-def _append_in_process(home, ready, start, done):
+def _append_in_process(home, ready, start, appended, done):
     with jobs.use_cron_store(home):
         ready.set()
         if start.wait(15):
+            # Signal that we have REACHED the append, so the parent's pause
+            # window is bounded by an actual rendezvous rather than a sleep.
+            appended.set()
             journal.record_created("CONCURRENT")
             done.set()
 
@@ -110,15 +113,23 @@ def test_prune_preserves_concurrent_process_append(store, monkeypatch):
         f.write(json.dumps({"event": "created", "job_id": "old",
                             "at": "2020-01-01T00:00:00+00:00"}) + "\n")
     ctx = multiprocessing.get_context("spawn")
-    ready, start, done = ctx.Event(), ctx.Event(), ctx.Event()
-    writer = ctx.Process(target=_append_in_process, args=(store, ready, start, done))
+    ready, start, appended, done = (ctx.Event(), ctx.Event(),
+                                    ctx.Event(), ctx.Event())
+    writer = ctx.Process(target=_append_in_process,
+                         args=(store, ready, start, appended, done))
     replace = utils.atomic_replace
 
     def pause_before_replace(src, dst):
         start.set()
-        # Unlocked code completes the append here, then erases it. Locked
-        # code holds the writer until replace finishes; verify persisted data,
-        # not a negative timing assertion about whether the writer ran.
+        # Explicit barrier, not a sleep: block until the child has provably
+        # reached its append call. A bare sleep can expire before the child
+        # gets there, which makes this test pass even with NO interprocess
+        # locking — a false green on the very property it guards.
+        assert appended.wait(30), "child never reached record_created"
+        # The child is now inside record_created. Without the journal lock it
+        # completes the append here and prune() erases it; with the lock it
+        # blocks until this replace finishes. Either way the assertion below
+        # reads persisted data, not timing.
         done.wait(3)
         return replace(src, dst)
 

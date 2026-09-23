@@ -87,58 +87,43 @@ def _repo_root() -> Path:
 #
 # To fix one: move the call off-loop (or behind a loop-conditional dispatch,
 # annotated `# noqa: atomic-write-on-loop <reason>`), then DELETE its line here.
+#
+# KNOWN BLIND SPOT -- this inventory is a floor, not a census.  ``build_index``
+# keys on ``(file, function_name)``, so two same-named methods in one file
+# collapse onto ONE entry and the walk sees only whichever ``ast.walk`` visited
+# last.  Measured on ``gateway/platforms/weixin.py``: ``ContextTokenStore.set``
+# and ``TypingTicketCache.set`` collapse, and the index reports
+# ``calls={'time.time','time'}`` -- the typing cache's body.  That hid a
+# PER-INBOUND-MESSAGE ``atomic_json_write`` (``_process_message`` -> ``set`` ->
+# ``_persist``) from this gate entirely; it was fixed and pinned directly by
+# ``tests/gateway/test_weixin_state_write_off_loop.py`` rather than via this
+# baseline.  Do not read "absent from REACHABLE_BASELINE" as "off the loop".
 REACHABLE_BASELINE = frozenset({
-    "gateway/deferred_restart.py _run_armed -> os.replace",
-    "gateway/deferred_restart.py _run_as_leader -> os.replace",
-    "gateway/lifecycle_ledger.py record_startup_async -> atomic_json_write",
     "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
-    "gateway/platforms/base.py cancel_background_tasks -> atomic_json_write",
-    "gateway/platforms/signal.py connect -> atomic_json_write",
-    "gateway/platforms/weixin.py _poll_loop -> atomic_json_write",
-    "gateway/platforms/weixin.py connect -> atomic_json_write",
-    "gateway/platforms/weixin.py qr_login -> atomic_json_write",
-    "gateway/platforms/whatsapp_cloud.py _build_message_event_from_cloud -> os.replace",
-    "gateway/platforms/whatsapp_cloud.py send -> os.replace",
-    "gateway/platforms/yuanbao.py open -> atomic_json_write",
-    "gateway/run.py _await_active_work_before_restart -> atomic_json_write",
-    "gateway/run.py _cancel_pending_boot_resumes_for_shutdown -> os.replace",
-    "gateway/run.py _connect_one_startup -> atomic_json_write",
-    "gateway/run.py _drain_active_agents -> atomic_json_write",
-    "gateway/run.py _drain_control_watcher -> atomic_json_write",
-    "gateway/run.py _execute_mcp_reload -> atomic_json_write",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
-    "gateway/run.py _handle_adapter_fatal_error_impl -> atomic_json_write",
     "gateway/run.py _handle_message -> atomic_replace",
-    "gateway/run.py _handle_message_with_agent -> atomic_json_write",
-    "gateway/run.py _interrupt_and_clear_session -> os.replace",
-    "gateway/run.py _platform_reconnect_watcher -> atomic_json_write",
+    # Re-keyed, NOT introduced, by the transcript-spool fix: this coroutine's
+    # first reported sink used to be the spool's atomic_json_write via
+    # append_to_transcript>.._serialized>spool_dropped_transcript_message.
+    # With the spool off-loop, the DFS (which reports only the FIRST sink per
+    # coroutine) now surfaces the checkpoint rename that was always behind it:
+    # _is_telegram_boot_redelivered_duplicate>maybe_checkpoint>_write.
+    # Verified pre-existing on pristine fork/main by masking
+    # spool_dropped_transcript_message and re-running the walk.
+    "gateway/run.py _handle_message_with_agent_admitted -> os.replace",
+    # Unmasked by the status-write fix, NOT introduced by it: the DFS reports
+    # only the FIRST sink per coroutine, so the
+    # _schedule_resume_pending_sessions>..>_persist>_write chain was shadowed
+    # by write_runtime_status.  Verified present on pristine fork/main by
+    # masking the status sink and re-running the walk.
+    "gateway/run.py _platform_reconnect_watcher -> os.fsync",
     "gateway/run.py _prepare_auto_resume_decisions -> os.replace",
-    "gateway/run.py _process_handoff -> os.replace",
-    "gateway/run.py _reap_dead_running_agents_loop -> os.replace",
     "gateway/run.py _restore_resume_pending_sessions_at_startup -> os.fsync",
-    "gateway/run.py _run_agent_inner -> atomic_json_write",
-    "gateway/run.py _run_startup_resume_event -> os.replace",
-    "gateway/run.py _scale_to_zero_watcher -> atomic_json_write",
-    "gateway/run.py _start_one_profile_adapters -> atomic_json_write",
-    "gateway/run.py _start_secondary_profile_adapters -> atomic_json_write",
     "gateway/run.py _stop_impl -> atomic_json_write",
     "gateway/run.py _stop_impl_body -> atomic_json_write",
     "gateway/run.py start -> atomic_json_write",
     "gateway/run.py start_gateway -> atomic_json_write",
     "gateway/run.py stop -> atomic_json_write",
-    "gateway/run.py track_agent -> atomic_json_write",
-    "gateway/slash_commands.py _handle_platform_command -> atomic_json_write",
-    "gateway/slash_commands.py _handle_reset_command -> os.replace",
-    "gateway/slash_commands.py _handle_resume_command -> os.replace",
-    "gateway/slash_commands.py _try_discord_branch_thread -> os.replace",
-    "plugins/platforms/matrix/adapter.py _resolve_message_context -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py _handle_location_message -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py _handle_media_message -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py _handle_sticker -> os.fsync",
-    "plugins/platforms/telegram/adapter.py _handle_text_message -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py _try_edit_rich -> os.replace",
-    "plugins/platforms/telegram/adapter.py _try_send_rich -> os.replace",
-    "plugins/platforms/telegram/adapter.py connect -> atomic_json_write",
 })
 
 

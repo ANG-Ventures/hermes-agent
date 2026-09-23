@@ -70,3 +70,26 @@ def test_default_openai_endpoint_intersects_account_access(monkeypatch):
     assert result == list(curated[:2])
 
 
+
+
+# --- GPT-6 Sol / Luna are ordinary picker entries ---------------------------
+
+@pytest.mark.parametrize("slug", ["gpt-6-sol", "gpt-6-luna"])
+def test_gpt6_sol_luna_in_openai_api_curated_list(slug):
+    """Unlike Astra (deliberately absent from static catalogs), Sol and Luna
+    are ordinary named-reasoning models and must appear in the curated
+    direct-API list so the picker offers them offline."""
+    assert slug in M._PROVIDER_MODELS["openai-api"]
+
+
+@pytest.mark.parametrize("slug", ["openai/gpt-6-sol", "openai/gpt-6-luna"])
+def test_gpt6_sol_luna_in_aggregator_catalogs(slug):
+    assert slug in M._PROVIDER_MODELS["nous"]
+    assert slug in [model_id for model_id, _desc in M.OPENROUTER_MODELS]
+
+
+def test_gpt6_terra_is_not_listed_anywhere():
+    """GPT-6 Terra does not exist — no catalog may advertise it."""
+    for models in M._PROVIDER_MODELS.values():
+        assert not any("gpt-6-terra" in str(m) for m in models)
+    assert not any("gpt-6-terra" in mid for mid, _desc in M.OPENROUTER_MODELS)

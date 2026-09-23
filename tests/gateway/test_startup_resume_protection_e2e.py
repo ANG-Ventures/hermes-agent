@@ -50,6 +50,8 @@ from gateway.platforms.base import (  # noqa: E402
 )
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL  # noqa: E402
 
+_RECOVERY_ACK_MARK = "Still finishing the interrupted work"   # gateway/run.py queue-ack, recovery branch
+
 
 class RecordingAdapter(BasePlatformAdapter):
     """Real adapter machinery; only the wire transport is stubbed."""
@@ -186,10 +188,14 @@ async def test_marker_survives_for_the_lifetime_of_the_real_turn():
     await adapter.handle_message(poke)
 
     parent.interrupt.assert_not_called()
-    acks = [s for s in adapter.sent if "restarted" in s.lower() or "Interrupting" in s]
+    # The recovery-aware ack. It no longer says "restarted" — the boot notice
+    # (fork_ext.unclean_restart_notice) is the ONE line that announces a
+    # restart per boot; this ack says only what is new: the message is queued
+    # behind the interrupted work (2026-09-22, consolidation ruling).
+    acks = [s for s in adapter.sent if _RECOVERY_ACK_MARK in s or "Interrupting" in s]
     assert acks, f"no busy ack sent; sent={adapter.sent!r}"
-    assert any("restarted" in s.lower() for s in acks), (
-        f"old interrupt ack sent instead of restart-aware ack: {acks!r}"
+    assert any(_RECOVERY_ACK_MARK in s for s in acks), (
+        f"old interrupt ack sent instead of recovery-aware ack: {acks!r}"
     )
     assert not any("Interrupting" in s for s in acks)
 
@@ -371,7 +377,7 @@ async def test_marker_survives_session_task_lookup_miss():
     poke = _user_event("How's it going?")
     await adapter.handle_message(poke)
     parent.interrupt.assert_not_called()
-    assert any("restarted" in s.lower() for s in adapter.sent), adapter.sent
+    assert any(_RECOVERY_ACK_MARK in s for s in adapter.sent), adapter.sent
 
     turn_gate.set()
     await asyncio.sleep(0.1)
@@ -457,7 +463,7 @@ async def test_marker_survives_sentinel_phase_fast_dispatch():
     poke = _user_event("How's it going?")
     await adapter.handle_message(poke)
     parent.interrupt.assert_not_called()
-    assert any("restarted" in s.lower() for s in adapter.sent), adapter.sent
+    assert any(_RECOVERY_ACK_MARK in s for s in adapter.sent), adapter.sent
 
     turn_gate.set()
     await asyncio.sleep(0.1)

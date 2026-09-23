@@ -17,7 +17,9 @@ Covers three layers of the fix:
 """
 
 import asyncio
-from unittest.mock import MagicMock
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -259,6 +261,147 @@ class TestRunnerSessionGenerationGuard:
         assert released is False
         assert runner._running_agents[sk] == "fresh_agent"
         assert runner._running_agents_ts[sk] == 2.0
+
+    @pytest.mark.asyncio
+    async def test_stopped_generation_requeues_followup_without_recursing(
+        self, caplog
+    ):
+        runner = _make_runner()
+        sk = _session_key()
+        stopped_gen = runner._begin_session_run_generation(sk)
+        runner._invalidate_session_run_generation(sk, reason="stop")
+        runner._run_agent = AsyncMock()
+        adapter = _make_adapter()
+        runner._adapter_for_source = MagicMock(return_value=adapter)
+        queued_event = _make_event("queued after stop")
+        current = {"final_response": "stopped", "messages": []}
+
+        with caplog.at_level(logging.INFO, logger="gateway.run"):
+            result = await runner._run_queued_followup_if_current(
+                current_result=current,
+                message="queued after stop",
+                context_prompt="",
+                history=[],
+                source=queued_event.source,
+                session_id="session-1",
+                session_key=sk,
+                generation_session_key=sk,
+                run_generation=stopped_gen,
+                interrupt_depth=1,
+                event_message_id=None,
+                channel_prompt=None,
+                message_type=MessageType.TEXT.value,
+                queued_event=queued_event,
+                queued_adapter=adapter,
+            )
+
+        assert result is current
+        runner._run_agent.assert_not_awaited()
+        assert adapter.get_pending_message(sk) is queued_event
+        assert "Re-queued follow-up" in caplog.text
+        assert "no longer current (stopped)" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_stopped_generation_requeues_text_followup(self):
+        runner = _make_runner()
+        sk = _session_key()
+        stopped_gen = runner._begin_session_run_generation(sk)
+        runner._invalidate_session_run_generation(sk, reason="stop")
+        runner._run_agent = AsyncMock()
+        adapter = _make_adapter()
+
+        await runner._run_queued_followup_if_current(
+            current_result={"final_response": "stopped", "messages": []},
+            message="interrupt follow-up",
+            context_prompt="",
+            history=[],
+            source=_make_event().source,
+            session_id="session-1",
+            session_key=sk,
+            generation_session_key=sk,
+            run_generation=stopped_gen,
+            interrupt_depth=1,
+            event_message_id=None,
+            channel_prompt=None,
+            message_type=MessageType.TEXT.value,
+            queued_event=None,
+            queued_adapter=adapter,
+        )
+
+        requeued = adapter.get_pending_message(sk)
+        assert requeued is not None
+        assert requeued.text == "interrupt follow-up"
+        runner._run_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_followup_validates_parent_generation_when_source_key_changes(self):
+        runner = _make_runner()
+        parent_key = _session_key("12345")
+        next_key = _session_key("67890")
+        generation = runner._begin_session_run_generation(parent_key)
+        runner._run_agent = AsyncMock(
+            return_value={"final_response": "follow-up", "messages": []}
+        )
+        current = {"final_response": "first", "messages": []}
+
+        result = await runner._run_queued_followup_if_current(
+            current_result=current,
+            message="queued for another routed key",
+            context_prompt="",
+            history=[],
+            source=_make_event(chat_id="67890").source,
+            session_id="session-1",
+            session_key=next_key,
+            generation_session_key=parent_key,
+            run_generation=generation,
+            interrupt_depth=1,
+            event_message_id=None,
+            channel_prompt=None,
+            message_type=MessageType.TEXT.value,
+            queued_event=None,
+            queued_adapter=None,
+        )
+
+        assert result["final_response"] == "follow-up"
+        runner._run_agent.assert_awaited_once()
+
+    def test_soft_eviction_defers_agent_with_active_turn_lease(
+        self, caplog, monkeypatch
+    ):
+        runner = _make_runner()
+        agent = SimpleNamespace(
+            _active_session_turn_lease_holder="pid=123:turn=relay-turn-B:platform=discord",
+            release_clients=MagicMock(),
+            _session_messages=[{"role": "user", "content": "still running"}],
+            _db_flush_scan_prefix=[{"role": "user", "content": "still running"}],
+        )
+        deferred = {}
+
+        class _DeferredThread:
+            def __init__(self, *, target, daemon, name):
+                deferred.update(target=target, daemon=daemon, name=name)
+
+            def start(self):
+                deferred["started"] = True
+
+        monkeypatch.setattr("gateway.run.threading.Thread", _DeferredThread)
+
+        with caplog.at_level(logging.ERROR, logger="gateway.run"):
+            runner._release_evicted_agent_soft(agent)
+
+        agent.release_clients.assert_not_called()
+        assert agent._session_messages
+        assert agent._db_flush_scan_prefix
+        assert "turn=relay-turn-B" in caplog.text
+        assert deferred["started"] is True
+        assert deferred["daemon"] is True
+
+        agent._active_session_turn_lease_holder = None
+        deferred["target"]()
+
+        agent.release_clients.assert_called_once_with()
+        assert agent._session_messages == []
+        assert agent._db_flush_scan_prefix is None
 
 
 # ===========================================================================

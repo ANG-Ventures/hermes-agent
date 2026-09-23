@@ -1,7 +1,18 @@
 .DS_Store
-/venv/
-/venv.old/
-/venv.stale.runtime-*/
+# The venv family is SYMLINK-SAFE ON PURPOSE — do NOT re-add the trailing slash.
+# A trailing slash matches DIRECTORIES ONLY, and on a deploy host `venv` and
+# `venv.prev` are SYMLINKS into a `venv.rel-*` release dir (fleet/deploy.sh's
+# atomic flip), not directories. With `/venv/` those symlinks were untracked,
+# the deploy tree read dirty, and deploy.sh's clean-tree gate refused every
+# fleet deploy for ~48h (58 consecutive refusals, 2026-09-20 → 2026-09-22).
+# Slashless patterns match both a directory and a symlink, so they cover the
+# tree either way. This reasoning is specific to the venv family; the rest of
+# this file keeps its trailing slashes.
+/venv
+/venv.prev
+/venv.old
+/venv.rel-*
+/venv.stale.runtime-*
 /bin/
 /.hermes-runtime/
 /_pycache/

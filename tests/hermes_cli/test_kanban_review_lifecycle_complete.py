@@ -56,7 +56,7 @@ def _claimed_review(
         conn,
         task_id,
         summary="ready for independent review",
-        reviewer="reviewer",
+        reviewer="argus",
         expected_run_id=implementation.current_run_id,
     )
     review = kb.claim_review_task(
@@ -76,7 +76,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert kb.request_review(
         conn,
         task_id,
-        reviewer="reviewer",
+        reviewer="argus",
         summary="Implementation and focused tests are ready.",
         metadata={"commit": "abc123"},
         expected_run_id=implementation.current_run_id,
@@ -85,13 +85,13 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     awaiting_review = kb.get_task(conn, task_id)
     assert awaiting_review is not None
     assert awaiting_review.status == "review"
-    assert awaiting_review.assignee == "reviewer"
+    assert awaiting_review.assignee == "argus"
     assert awaiting_review.current_run_id is None
 
     first_events = kb.list_events(conn, task_id)
     requested = _event(first_events, "review_requested")
     assert requested.payload["implementer"] == "builder"
-    assert requested.payload["reviewer"] == "reviewer"
+    assert requested.payload["reviewer"] == "argus"
     assert requested.payload["summary"] == "Implementation and focused tests are ready."
     implementation_run = _run(kb.list_runs(conn, task_id), "review_requested")
     assert implementation_run.summary == "Implementation and focused tests are ready."
@@ -115,7 +115,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert changes.payload is not None
     assert changes.payload["reason"] == "Add a regression for the fallback branch."
     assert changes.payload["implementer"] == "builder"
-    assert changes.payload["reviewer"] == "reviewer"
+    assert changes.payload["reviewer"] == "argus"
     _run(kb.list_runs(conn, task_id), "changes_requested")
 
     implementation_2 = kb.claim_task(conn, task_id, claimer="builder:2")
@@ -129,13 +129,13 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     awaiting_rereview = kb.get_task(conn, task_id)
     assert awaiting_rereview is not None
     assert awaiting_rereview.status == "review"
-    assert awaiting_rereview.assignee == "reviewer"
+    assert awaiting_rereview.assignee == "argus"
     review_2 = kb.claim_review_task(conn, task_id, claimer="reviewer:2")
     assert review_2 is not None
-    assert review_2.assignee == "reviewer"
+    assert review_2.assignee == "argus"
     review_run = kb.latest_run(conn, task_id)
     assert review_run is not None
-    assert review_run.profile == "reviewer"
+    assert review_run.profile == "argus"
     assert kb.complete_task(
         conn,
         task_id,
@@ -193,14 +193,14 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
     assert kb.request_review(
         conn,
         task_id,
-        reviewer="reviewer",
+        reviewer="argus",
         summary="Corrected implementation.",
         expected_run_id=implementation.current_run_id,
     )
     restored = kb.get_task(conn, task_id)
     assert restored is not None
     assert restored.status == "review"
-    assert restored.assignee == "reviewer"
+    assert restored.assignee == "argus"
 
 
 def test_review_changes_reapply_parent_gate(conn):
@@ -220,7 +220,7 @@ def test_review_changes_reapply_parent_gate(conn):
     assert kb.request_review(
         conn,
         task_id,
-        reviewer="reviewer",
+        reviewer="argus",
         summary="Ready for review.",
         expected_run_id=implementation.current_run_id,
     )
@@ -282,7 +282,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
     assert kb.request_review(
         conn,
         task_id,
-        reviewer="reviewer",
+        reviewer="argus",
         summary="Ready.",
         expected_run_id=implementation.current_run_id,
     )
@@ -306,7 +306,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
     task = kb.get_task(conn, task_id)
     assert task is not None
     assert task.status == "running"
-    assert task.assignee == "reviewer"
+    assert task.assignee == "argus"
     assert task.current_run_id == review.current_run_id
 
 
@@ -431,7 +431,7 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
         conn,
         task_id,
         summary="ready",
-        reviewer="reviewer",
+        reviewer="argus",
         expected_run_id=implementation.current_run_id,
     )
     review = kb.claim_review_task(conn, task_id)
@@ -505,7 +505,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
         conn,
         task_id,
         summary="ready",
-        reviewer="reviewer",
+        reviewer="argus",
         expected_run_id=implementation.current_run_id,
     )
     review = kb.claim_review_task(conn, task_id)
@@ -541,7 +541,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
 
 
 def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
-    task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
+    task_id = kb.create_task(conn, title="Manual approval", assignee="argus")
     assert kb.request_review(conn, task_id, summary="implementation handoff")
     assert kb.complete_task(conn, task_id)
     completed_event = _event(kb.list_events(conn, task_id), "completed")
@@ -550,7 +550,7 @@ def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -
     assert run is not None
     assert run.id == completed_event.run_id
     assert run.outcome == "completed"
-    assert run.profile == "reviewer"
+    assert run.profile == "argus"
     assert run.summary == "Review approved without additional evidence."
     assert run.metadata == {
         "source_status": "review",
@@ -567,7 +567,7 @@ def test_legacy_review_child_deadlock_is_reported_immediately(conn):
     reviewer_id = kb.create_task(
         conn,
         title="Review export",
-        assignee="reviewer",
+        assignee="argus",
         parents=[implementation_id],
     )
     implementation = kb.claim_task(conn, implementation_id, claimer="builder:1")
@@ -663,7 +663,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
     assert kb.request_review(
-        conn, task_id, summary="v1", reviewer="reviewer",
+        conn, task_id, summary="v1", reviewer="argus",
         expected_run_id=implementation.current_run_id,
     )
     assert _failures(conn, task_id) == 1  # request_review preserved it

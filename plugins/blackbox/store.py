@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.redact import redact_sensitive_text
-from agent.usage_pricing import get_pricing_entry, resolve_billing_route
+from agent.usage_pricing import CanonicalUsage, get_pricing_entry, resolve_billing_route
 from hermes_constants import get_hermes_home
 from plugins.blackbox.record import TurnRecord, tools_summary
 
@@ -103,7 +103,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             alerted INT DEFAULT 0,
             user_text TEXT,
             final_text TEXT,
-            cli_invocation_id TEXT
+            cli_invocation_id TEXT,
+            served_subs_json TEXT,
+            attribution TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -141,10 +143,49 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(model, provider)
         );
 
+        -- Per-API-call attribution ledger (PRD-subs-ace §5.2, card C1). One row
+        -- per upstream completion call inside a turn; `turns` keeps the totals.
+        -- Column set here IS the contract insert_api_call binds against (I3:
+        -- guarded-additive — this is a NEW table, no existing consumer sees it).
+        -- No FK pragma is enabled on the live store, so retention is the
+        -- explicit parent-turn cascade in sweep(), not ON DELETE CASCADE.
+        CREATE TABLE IF NOT EXISTS turn_api_calls (
+            turn_id TEXT NOT NULL,
+            seq INT NOT NULL,
+            ts REAL,
+            provider TEXT,
+            sub_key TEXT,
+            model TEXT,
+            input_tokens INT,
+            output_tokens INT,
+            cache_read INT,
+            cache_write INT,
+            reasoning INT,
+            attribution TEXT,
+            http_status INT,
+            relay_synthetic INT NOT NULL DEFAULT 0,
+            route_id TEXT,
+            PRIMARY KEY(turn_id, seq)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_blackbox_turns_chat_end
             ON turns(platform, chat_id, ts_end);
         CREATE INDEX IF NOT EXISTS idx_blackbox_turns_cost
             ON turns(cost_usd);
+        -- Rolling-window reads (hermes_cli/kanban_budget.py's per-tick spend
+        -- sum, daily-journal, /tokens) all filter on a ts_start/ts_end lower
+        -- bound. Without this they SCAN the whole table, and `turns` rows are
+        -- overflow-heavy (user_text/final_text previews): the 836 MB fleet
+        -- ledger stores ~5k rows across ~20k overflow pages, so a "5k-row
+        -- scan" is really an 80 MB read. Measured cold (macOS `purge` between
+        -- trials, 10 real fleet ledgers, 24h window): 6.13 s SCAN -> 1.40 s
+        -- SEARCH, identical 653 rows.
+        CREATE INDEX IF NOT EXISTS idx_blackbox_turns_ts_start
+            ON turns(ts_start);
+        CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts
+            ON turn_api_calls(ts);
+        CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
+            ON turn_api_calls(sub_key);
         """
     )
     # Additive migration for DBs created before the last-call cache split
@@ -209,6 +250,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
+    # Per-sub attribution rollup columns (PRD-subs-ace §5.2, card C1). Both
+    # nullable TEXT; old rows stay NULL and nothing backfills them (I3).
+    # `served_subs_json` is the cheap per-turn display rollup
+    # ({"sub-vps-7": 3, ...}); `attribution` is the turn's dominant provenance.
+    # ALTER is NOT idempotent, hence the PRAGMA-guarded per-column pattern.
+    for _col in ("served_subs_json", "attribution"):
+        if _col not in _existing:
+            try:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} TEXT")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
     conn.commit()
 
 
@@ -267,31 +320,51 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return data
 
 
+# Columns insert_turn owns. The ORDER here IS the bind order of the value
+# tuple below — keep the two in lockstep. Columns NOT in this tuple
+# (served_subs_json, attribution) are owned by a later writer, so they are
+# deliberately excluded from the upsert's DO UPDATE: a re-finalize of the same
+# turn_id must refresh the record's own fields without erasing the rollup a
+# separate writer already populated. This is why the statement is an UPSERT and
+# not INSERT OR REPLACE — REPLACE deletes the whole row first, NULLing every
+# column absent from the insert list.
+_INSERT_TURN_COLUMNS = (
+    "turn_id", "parent_turn_id", "is_subagent", "depth", "ts_start", "ts_end",
+    "profile", "provider", "model", "platform", "chat_id", "chat_name",
+    "api_calls", "tools", "input_tokens", "output_tokens", "cache_read",
+    "cache_write", "reasoning", "context_used", "context_length",
+    "last_cache_read", "last_cache_write", "last_uncached",
+    "comp_sys_tokens", "comp_tool_schema_tokens", "comp_history_tokens",
+    "comp_history_message_count",
+    "comp_tool_result_tokens", "comp_tool_arg_tokens", "comp_tool_result_count",
+    "comp_skills_tokens", "comp_framing_tokens",
+    "comp_skills_count",
+    "comp_calls_json",
+    "cost_usd", "cost_status",
+    "cost_uncached_usd", "cost_cache_read_usd",
+    "cost_cache_write_usd", "cost_output_usd",
+    "interrupted", "alerted", "user_text",
+    "final_text", "cli_invocation_id",
+)
+
+_INSERT_TURN_SQL = (
+    "INSERT INTO turns (" + ", ".join(_INSERT_TURN_COLUMNS) + ") VALUES ("
+    + ", ".join("?" for _ in _INSERT_TURN_COLUMNS) + ") "
+    "ON CONFLICT(turn_id) DO UPDATE SET "
+    + ", ".join(
+        f"{col} = excluded.{col}"
+        for col in _INSERT_TURN_COLUMNS
+        if col != "turn_id"
+    )
+)
+
+
 def insert_turn(record: TurnRecord) -> None:
     """Persist one turn. Telemetry failures are logged but never raised."""
     try:
         with _connect() as conn:
             conn.execute(
-                """
-                INSERT OR REPLACE INTO turns (
-                    turn_id, parent_turn_id, is_subagent, depth, ts_start, ts_end,
-                    profile, provider, model, platform, chat_id, chat_name,
-                    api_calls, tools, input_tokens, output_tokens, cache_read,
-                    cache_write, reasoning, context_used, context_length,
-                    last_cache_read, last_cache_write, last_uncached,
-                    comp_sys_tokens, comp_tool_schema_tokens, comp_history_tokens,
-                    comp_history_message_count,
-                    comp_tool_result_tokens, comp_tool_arg_tokens, comp_tool_result_count,
-                    comp_skills_tokens, comp_framing_tokens,
-                    comp_skills_count,
-                    comp_calls_json,
-                    cost_usd, cost_status,
-                    cost_uncached_usd, cost_cache_read_usd,
-                    cost_cache_write_usd, cost_output_usd,
-                    interrupted, alerted, user_text,
-                    final_text, cli_invocation_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                _INSERT_TURN_SQL,
                 (
                     record.turn_id,
                     record.parent_turn_id,
@@ -367,6 +440,44 @@ def insert_turn(record: TurnRecord) -> None:
             )
     except Exception:
         logger.warning("blackbox telemetry insert failed", exc_info=True)
+
+
+def insert_api_call(
+    turn_id: str, seq: int, *, ts: float, provider: str, model: str,
+    usage: CanonicalUsage, sub_key: str | None, attribution: str,
+    http_status: int | None = None, relay_synthetic: bool = False,
+    route_id: str | None = None,
+) -> None:
+    """Append one call, including zero-usage failures, without changing turn totals.
+
+    The accumulator owns sequence allocation. Duplicate keys and invalid
+    provenance raise rather than silently replacing or dropping ledger rows.
+    Calls may arrive before their parent turn is finalized.
+    """
+    if attribution not in ("wire", "pinned", "inferred", "external"):
+        raise ValueError(f"Invalid API-call attribution: {attribution!r}")
+    # SQLite permits NULL in a non-INTEGER PRIMARY KEY column, so the composite
+    # key alone does not stop a NULL turn_id/seq row (and NULLs never collide,
+    # so duplicates accumulate unnoticed). Reject at the boundary too — the DDL
+    # NOT NULLs guard existing DBs, this guards the caller's intent.
+    if turn_id is None or seq is None:
+        raise ValueError(
+            f"turn_api_calls key parts must not be None (turn_id={turn_id!r}, seq={seq!r})"
+        )
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO turn_api_calls (
+                turn_id, seq, ts, provider, sub_key, model, input_tokens,
+                output_tokens, cache_read, cache_write, reasoning, attribution,
+                http_status, relay_synthetic, route_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (turn_id, seq, ts, provider, sub_key, model, usage.input_tokens,
+             usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
+             usage.reasoning_tokens, attribution, http_status,
+             _bool_int(relay_synthetic), route_id),
+        )
 
 
 def mark_alerted(turn_id: str) -> bool:
@@ -709,6 +820,15 @@ def subagent_rollup(platform: str, chat_id: str, limit: int = 200) -> dict[str, 
     }
 
 
+# Minimum age a PARENTLESS turn_api_calls row must reach before the sweeper may
+# delete it, independent of the retention window. Call rows are written as the
+# API calls happen; the parent turns row only appears at finalize, so a row with
+# no parent is indistinguishable from an in-flight turn. 24h is far longer than
+# any turn can plausibly run, so the ledger of a live turn is never harvested
+# even when retention is configured aggressively short.
+_ORPHAN_GRACE_S = 86400
+
+
 def sweep(retention_days: int, max_deletes: int = 10000) -> int:
     today = time.strftime("%Y-%m-%d", time.gmtime())
     cutoff = time.time() - (int(retention_days) * 86400)
@@ -741,6 +861,10 @@ def sweep(retention_days: int, max_deletes: int = 10000) -> int:
                 turn_ids,
             )
             conn.execute(
+                f"DELETE FROM turn_api_calls WHERE turn_id IN ({placeholders})",
+                turn_ids,
+            )
+            conn.execute(
                 f"DELETE FROM turns WHERE turn_id IN ({placeholders})",
                 turn_ids,
             )
@@ -748,6 +872,32 @@ def sweep(retention_days: int, max_deletes: int = 10000) -> int:
                 f"DELETE FROM last_turn WHERE turn_id IN ({placeholders})",
                 turn_ids,
             )
+        # Parentless call rows: a call is appended as it happens, but its parent
+        # turn only lands at finalize. A crash/interrupt between the two leaves
+        # an orphan that the parent-keyed cascade above can never reach, so it
+        # would outlive retention forever. Sweep those on their own ts, in the
+        # same transaction, bounded by the same max_deletes budget.
+        #
+        # The retention cutoff alone is NOT a safe predicate here: "no parent
+        # row yet" is the normal state of an in-flight turn, so a turn still
+        # running past retention — or any short retention setting — would have
+        # its call ledger deleted out from under it before finalize. Require the
+        # row to be past BOTH retention and an independent grace period, so a
+        # live turn is never harvested.
+        orphan_cutoff = time.time() - max(_ORPHAN_GRACE_S, int(retention_days) * 86400)
+        conn.execute(
+            """
+            DELETE FROM turn_api_calls
+            WHERE rowid IN (
+                SELECT rowid FROM turn_api_calls
+                WHERE ts < ?
+                  AND turn_id NOT IN (SELECT turn_id FROM turns)
+                ORDER BY ts
+                LIMIT ?
+            )
+            """,
+            (orphan_cutoff, max_deletes),
+        )
         deleted = len(turn_ids)
         # Atomic: deletes + sentinel commit together so a crash can't leave the
         # rows deleted without the sentinel (or vice-versa). The sentinel is

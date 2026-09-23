@@ -14,7 +14,6 @@ timeout, so the loop is never blocked and a stuck teardown degrades gracefully.
 import asyncio
 import logging
 import threading
-import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -89,58 +88,97 @@ def _make_runner_with_cached_agent(close_fn):
     return runner
 
 
+# Deadlock backstops, NOT assertions. Nothing below asserts on elapsed time or
+# on a per-second rate: the test's verdict is the ORDERING witness
+# ``dispatched_while_close_blocking``. These bounds only stop a regression from
+# hanging the suite forever, so they are set far above any plausible scheduling
+# latency on a loaded CI runner.
+_WORKER_BLOCK_BACKSTOP_S = 30.0
+_LOOP_DISPATCH_BACKSTOP_S = 20.0
+
+
 @pytest.mark.asyncio
 async def test_reset_does_not_block_event_loop_during_cleanup():
-    """#35994: a slow agent.close() must NOT block the event loop. A
-    concurrent loop task must keep ticking WHILE close() is still blocking
-    (proving cleanup was offloaded to a worker thread, not run inline on
-    the loop). With the pre-fix inline call, the loop is frozen for the
-    whole duration of close() and no ticks accumulate until it returns."""
+    """#35994: a slow agent.close() must NOT block the event loop.
+
+    Ordering witness (deterministic; no tick counting, no stopwatch): close()
+    schedules a callback onto the loop via ``call_soon_threadsafe`` and then
+    blocks. The callback records whether close() had ALREADY RETURNED by the
+    time the loop got around to dispatching it.
+
+      * offloaded to a worker thread (the fix) -> the loop is free, the
+        callback runs while close() is still blocking -> witness True.
+      * run inline on the loop (the pre-fix bug) -> the loop cannot dispatch
+        anything until close() returns, so the callback necessarily observes
+        ``close_returned`` already set -> witness False.
+
+    A loaded runner can delay the dispatch arbitrarily without changing that
+    ordering, which is what makes this immune to the CI-load flake the tick
+    count had.
+    """
+    loop = asyncio.get_running_loop()
+
     close_started = threading.Event()
+    close_returned = threading.Event()
+    loop_dispatched = asyncio.Event()
     release = threading.Event()
+    witness: dict[str, bool | None] = {"dispatched_while_close_blocking": None}
+
+    def _on_loop() -> None:
+        # Runs ON the event loop. `close_returned` is the ordering fact.
+        witness["dispatched_while_close_blocking"] = not close_returned.is_set()
+        loop_dispatched.set()
 
     def slow_close():
-        close_started.set()
-        # Block the WORKER thread (not the loop) until released.
-        release.wait(timeout=5)
+        try:
+            close_started.set()
+            loop.call_soon_threadsafe(_on_loop)
+            # Block until the test releases us. Bounded only so a regression
+            # cannot wedge the suite forever.
+            release.wait(timeout=_WORKER_BLOCK_BACKSTOP_S)
+        finally:
+            close_returned.set()
 
     runner = _make_runner_with_cached_agent(slow_close)
 
-    ticks = {"n": 0}
-    stop = threading.Event()
-
-    async def _heartbeat():
-        while not stop.is_set():
-            ticks["n"] += 1
-            await asyncio.sleep(0.005)
-
-    hb = asyncio.create_task(_heartbeat())
     reset_task = asyncio.create_task(
         runner._handle_reset_command(_make_event("/new"))
     )
 
-    # Wait until close() has actually started blocking in its worker thread.
-    for _ in range(200):
-        if close_started.is_set():
-            break
-        await asyncio.sleep(0.005)
-    assert close_started.is_set(), "close() never ran"
+    try:
+        await asyncio.wait_for(
+            loop_dispatched.wait(), timeout=_LOOP_DISPATCH_BACKSTOP_S
+        )
+    except asyncio.TimeoutError:
+        release.set()
+        await asyncio.gather(reset_task, return_exceptions=True)
+        pytest.fail(
+            "event loop was blocked during agent cleanup (#35994): a callback "
+            "scheduled from inside close() was never dispatched"
+        )
 
-    # Now sample ticks while close() is STILL blocking. If the loop were
-    # frozen (pre-fix inline call), this stays ~0.
-    ticks_at_block = ticks["n"]
-    await asyncio.sleep(0.1)
-    ticks_during_block = ticks["n"] - ticks_at_block
+    assert close_started.is_set(), "close() never ran"
 
     release.set()
     await reset_task
-    stop.set()
-    await hb
 
-    assert ticks_during_block >= 5, (
-        f"event loop was blocked during agent cleanup (#35994): only "
-        f"{ticks_during_block} ticks while close() was running"
+    # The ORDERING witness is the verdict for #35994; assert it FIRST so a
+    # regression reds on this line by name rather than on an adjacent
+    # invariant (an inline cleanup also skips the housekeeping pool below).
+    assert witness["dispatched_while_close_blocking"] is True, (
+        "event loop was blocked during agent cleanup (#35994): the loop only "
+        "dispatched the callback scheduled inside close() AFTER close() had "
+        "already returned, i.e. cleanup ran inline on the loop"
     )
+
+    # This path abandons the worker on timeout, so it must use the isolated
+    # housekeeping pool. Running it on the turn pool reproduces the 2026-09-20
+    # starvation: N wedged /new cleanups retire N turn slots indefinitely.
+    assert getattr(runner, "_executor", None) is None
+    housekeeping_pool = getattr(runner, "_housekeeping_executor", None)
+    assert housekeeping_pool is not None
+    assert len(housekeeping_pool._threads) == 1
+
     runner.session_store.reset_session.assert_called_once()
 
 

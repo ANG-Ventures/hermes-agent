@@ -137,6 +137,30 @@ def _rowid_credits(tmp_path: Path) -> list:
 
 
 @pytest.mark.asyncio
+async def test_restart_loop_guard_records_at_most_once_per_gateway_boot(
+    tmp_path, monkeypatch
+):
+    from gateway import restart_loop_guard
+
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner)
+    _mark_pending(runner, entry)
+    recorded = MagicMock(return_value=False)
+    inspected = MagicMock(return_value=False)
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", recorded)
+    monkeypatch.setattr(restart_loop_guard, "is_restart_loop_tripped", inspected)
+
+    runner._schedule_resume_pending_sessions()
+    await asyncio.gather(*runner._background_tasks)
+    runner._schedule_resume_pending_sessions()
+    await asyncio.gather(*runner._background_tasks)
+
+    recorded.assert_called_once()
+    inspected.assert_called_once()
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_t1_prompt_default_keeps_note_bytes_and_adds_taxonomy_log(
     tmp_path, monkeypatch, caplog
 ):
@@ -746,12 +770,28 @@ def test_attempt_store_prunes_ttl_and_corruption_fails_closed_once(tmp_path, cap
 
 
 def test_attempt_store_fsyncs_parent_directory_after_replace(tmp_path, monkeypatch):
-    calls: list[int] = []
-    monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd))
+    import stat
+
+    events = []
+    destinations = []
+    replace = os.replace
+
+    def record_fsync(fd):
+        events.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+
+    def record_replace(source, destination):
+        destinations.append(destination)
+        events.append("replace")
+        return replace(source, destination)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "replace", record_replace)
     store = AutoResumeAttemptStore(tmp_path / "state" / "auto_resume_attempts.json")
 
     assert store.consume("agent:main:telegram:dm:123", 2) is True
-    assert len(calls) == (2 if os.name == "posix" else 1)
+    assert set(destinations) == {store.path, store.session_path}
+    per_write = ["file", "replace", "directory"] if os.name == "posix" else ["file", "replace"]
+    assert events == per_write * len(destinations)
 
 
 def test_attempt_store_tolerates_unsupported_directory_fsync(
