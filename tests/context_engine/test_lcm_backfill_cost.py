@@ -91,3 +91,49 @@ def test_backfill_with_nothing_pending_issues_no_update(tmp_path):
     assert not any(s.lstrip().upper().startswith("UPDATE") for s in spy.sql), spy.sql
     assert not any("LIMIT ?" in s for s in spy.sql), "batch SELECT must not run when nothing is pending"
     assert spy.commits == 0
+
+
+def test_ingested_at_backfill_runs_once_then_is_gated_by_marker(tmp_path):
+    """Second store open must NOT re-run the ingested_at UPDATE."""
+    from plugins.context_engine.lcm.db_bootstrap import is_migration_step_complete
+    from plugins.context_engine.lcm.store import _INGESTED_AT_BACKFILL_STEP
+    st = _store(tmp_path)
+    conn = st._conn
+    assert conn is not None
+    assert is_migration_step_complete(conn, _INGESTED_AT_BACKFILL_STEP)
+    st.close() if hasattr(st, "close") else None
+    st2 = MessageStore(db_path=str(tmp_path / "lcm.db"))
+    conn2 = st2._conn
+    assert conn2 is not None
+    spy = _SpyConn(conn2)
+    st2._conn = spy  # type: ignore[assignment]
+    st2._ensure_time_contract_columns()
+    assert not any("UPDATE messages SET ingested_at" in s for s in spy.sql), spy.sql
+
+
+def test_init_path_has_no_unmarked_full_table_writes():
+    """SOURCE CONTRACT: every UPDATE/DELETE against `messages` reachable from
+    _init_db must be either row-bounded (WHERE store_id / session_id / LIMIT ?)
+    or wrapped in an is_migration_step_complete() gate. This is the lint that
+    stops the third ~21-minute boot stall; the first two were exactly this
+    shape (2026-09-22)."""
+    import inspect, re
+    from plugins.context_engine.lcm import store as S
+    src = inspect.getsource(S.MessageStore)
+    # methods called from _init_db, by name
+    init_src = inspect.getsource(S.MessageStore._init_db)
+    called = set(re.findall(r"self\.(_[a-z_]+)\(", init_src))
+    offenders = []
+    for name in sorted(called):
+        fn = getattr(S.MessageStore, name, None)
+        if fn is None:
+            continue
+        body = inspect.getsource(fn)
+        for m in re.finditer(r"(UPDATE|DELETE FROM)\s+messages\b[^;\"]*", body):
+            stmt = m.group(0)
+            bounded = re.search(r"WHERE\s+(store_id|session_id)\b|LIMIT \?", stmt)
+            # gated: an is_migration_step_complete check appears earlier in the same method
+            gated = "is_migration_step_complete(" in body[: m.start()]
+            if not (bounded or gated):
+                offenders.append(f"{name}: {stmt.strip()[:80]}")
+    assert not offenders, "unbounded, unmarked full-table write on the boot path:\n" + "\n".join(offenders)
