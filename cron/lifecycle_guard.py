@@ -1938,7 +1938,20 @@ def _contains_unsafe_gateway_action(
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
-    for payload in _iter_shell_command_payloads(command):
+    from tools.shell_heredoc import (
+        inert_python_heredoc_bodies,
+        strip_inert_heredoc_bodies,
+    )
+
+    # Python stdin is executable Python source, but not a sequence of shell
+    # commands. Scan its lifecycle-shaped calls like a .py file, then exclude
+    # its path strings from the shell's referenced-script walk.
+    for body in inert_python_heredoc_bodies(command):
+        if _direct_lifecycle_scan(body):
+            return True
+    shell_command = strip_inert_heredoc_bodies(command)
+
+    for payload in _iter_shell_command_payloads(shell_command):
         if _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
@@ -1948,7 +1961,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path in _iter_referenced_shell_scripts(shell_command, cwd=cwd):
         # Do not touch a FileProvider path even to discover whether the file
         # is hydrated. The lexical check covers direct cloud paths; the
         # resolved check below covers local launchers that are symlinks into
