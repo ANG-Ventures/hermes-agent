@@ -1995,6 +1995,7 @@ def cronjob(
     skills: Optional[List[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    allow_flagship_reason: Optional[str] = None,
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
@@ -2047,7 +2048,12 @@ def cronjob(
             # "auto" that can't resolve (no agent model published) degrades to
             # leaving the job unpinned — it never guesses a model.
             if not _no_agent:
+                requested_model = model
                 model, provider = _resolve_cron_llm_model(model, provider)
+                # An auto pin inherits the creating agent's elected primary;
+                # it is not a caller-chosen flagship route.
+                if model and requested_model in (None, "auto") and not str(allow_flagship_reason or "").strip():
+                    allow_flagship_reason = "auto-pin: inherited creating agent's own elected model"
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
             #     (and irrelevant to execution).
@@ -2152,6 +2158,7 @@ def cronjob(
                     skills=canonical_skills,
                     model=_normalize_optional_job_value(model),
                     provider=_normalize_optional_job_value(provider),
+                    allow_flagship_reason=allow_flagship_reason,
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                     script=_normalize_optional_job_value(script),
                     context_from=context_from,
@@ -2381,6 +2388,7 @@ def cronjob(
                 updates["skill"] = canonical_skills[0] if canonical_skills else None
             if model is not None:
                 updates["model"] = _normalize_optional_job_value(model)
+                updates["allow_flagship_reason"] = allow_flagship_reason
             if provider is not None:
                 updates["provider"] = _normalize_optional_job_value(provider)
             if reasoning_effort is not None:
@@ -2601,7 +2609,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "model": {
                 "type": "object",
-                "description": "Optional per-job model override, as an object {\"model\": \"<name>\", \"provider\": \"<provider>\"}. A flat model-name STRING (e.g. model=\"gpt-5.6-sol\" with a sibling provider=\"openai-codex\") is also accepted and coerced to this object. Use model='auto' to pin the job to the CREATING agent's own model (recommended for LLM crons — otherwise an unpinned job inherits the runtime primary, often Opus, at fire time). If provider is omitted (and model is not 'auto'), the current main provider is pinned at creation time so the job stays stable.",
+                "description": "Optional per-job model override, as an object {\"model\": \"<name>\", \"provider\": \"<provider>\"}. A flat model-name STRING (e.g. model=\"gpt-5.6-sol\" with a sibling provider=\"openai-codex\") is also accepted and coerced to this object. Use model='auto' to pin the job to the CREATING agent's own model (recommended for LLM crons — otherwise an unpinned job inherits the runtime primary, often Opus, at fire time). If provider is omitted (and model is not 'auto'), the current main provider is pinned at creation time so the job stays stable. Explicit flagship models require allow_flagship_reason.",
                 "properties": {
                     "provider": {
                         "type": "string",
@@ -2613,6 +2621,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                     }
                 },
                 "required": ["model"]
+            },
+            "allow_flagship_reason": {
+                "type": "string",
+                "description": "Nonblank justification for an explicit flagship model override (--allow-flagship); persisted with the job for audit."
             },
             "script": {
                 "type": "string",
@@ -2722,6 +2734,7 @@ def _cronjob_tool_handler(args: Dict[str, Any], **kw: Any) -> str:
         skills=args.get("skills"),
         model=resolved_model,
         provider=resolved_provider or _fallback_provider,
+        allow_flagship_reason=args.get("allow_flagship_reason"),
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),

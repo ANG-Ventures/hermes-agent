@@ -2553,6 +2553,7 @@ def create_job(
     skills: Optional[List[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    allow_flagship_reason: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
@@ -2658,6 +2659,11 @@ def create_job(
     normalized_provider = _normalize_job_optional_text(provider)
     normalized_model, normalized_provider = _resolve_stored_model_pair(
         normalized_model, normalized_provider
+    )
+    from hermes_cli.model_policy import validate_worker_model
+
+    flagship_reason = validate_worker_model(
+        normalized_model, allow_flagship_reason=allow_flagship_reason
     )
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
@@ -2790,6 +2796,8 @@ def create_job(
     # agent.reasoning_effort, the pre-existing behaviour).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    if flagship_reason:
+        job["allow_flagship_reason"] = flagship_reason
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2800,6 +2808,9 @@ def create_job(
         # append its removal FIRST, inverting the append order the guard reads
         # as causality and turning an intentional removal into a false alarm.
         _journal_created(job)
+
+    if flagship_reason:
+        logger.info("flagship override: cron create id=%s model=%s reason=%s", job_id, normalized_model, flagship_reason)
 
     return job
 
@@ -2955,6 +2966,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                     updates["model"] = _m
                     updates["provider"] = _p
+                    from hermes_cli.model_policy import validate_worker_model
+
+                    updates["allow_flagship_reason"] = validate_worker_model(
+                        _m, allow_flagship_reason=updates.get("allow_flagship_reason")
+                    )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
@@ -3076,6 +3092,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             jobs[i] = updated
             save_jobs(jobs)
+            if updates.get("allow_flagship_reason"):
+                logger.info("flagship override: cron update id=%s model=%s reason=%s", job_id, updated.get("model"), updates["allow_flagship_reason"])
             return _normalize_job_record(jobs[i])
     return None
 

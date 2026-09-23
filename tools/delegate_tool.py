@@ -4164,6 +4164,9 @@ def delegate_task(
     inherit_context: Optional[bool] = None,
     skills: Optional[List[str]] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    allow_flagship_reason: Optional[str] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
@@ -4207,6 +4210,22 @@ def delegate_task(
         return tool_error(
             f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
         )
+
+    model = str(model or "").strip() or None
+    provider = str(provider or "").strip() or None
+    if provider and not model:
+        return tool_error("delegate_task provider requires a model override.")
+    if model:
+        from hermes_cli.model_switch import resolve_model_pair_for_storage
+        from hermes_cli.model_policy import flagship_model_match, validate_worker_model
+
+        model, provider = resolve_model_pair_for_storage(model, provider)
+        try:
+            reason = validate_worker_model(model, allow_flagship_reason=allow_flagship_reason)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        if flagship_model_match(model):
+            logger.info("flagship override: delegate_task model=%s provider=%s reason=%s", model, provider, reason)
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -4264,6 +4283,14 @@ def delegate_task(
                 _execution.get("max_iterations") or DEFAULT_MAX_ITERATIONS
             ),
         })
+    if model:
+        cfg = dict(cfg)
+        cfg["model"] = model
+        if provider:
+            cfg["provider"] = provider
+            cfg["base_url"] = ""
+            cfg["api_key"] = ""
+            cfg["api_mode"] = ""
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -5710,6 +5737,9 @@ DELEGATE_TASK_SCHEMA = {
                     "can still browse/load ANY skill via skills_list/skill_view."
                 ),
             },
+            "model": {"type": "string", "description": "Optional per-call model override. Flagship models require allow_flagship_reason."},
+            "provider": {"type": "string", "description": "Provider for per-call model override; requires model."},
+            "allow_flagship_reason": {"type": "string", "description": "Nonblank audited justification for an explicit flagship model override (--allow-flagship)."},
         },
         "required": [],
     },
@@ -5781,6 +5811,9 @@ registry.register(
         inherit_context=args.get("inherit_context"),
         skills=args.get("skills"),
         output_schema=args.get("output_schema"),
+        model=args.get("model"),
+        provider=args.get("provider"),
+        allow_flagship_reason=args.get("allow_flagship_reason"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
