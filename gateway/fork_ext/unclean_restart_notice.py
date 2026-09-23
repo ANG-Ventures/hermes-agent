@@ -314,7 +314,12 @@ INTERRUPT_DRAIN_CAP_MAX_S = 60.0
 INTERRUPT_INTENT_MAX_AGE_S = 3600.0
 
 
-def _current_profile() -> str:
+def _current_profile(home: Optional[Path] = None) -> str:
+    # hermes --profile sets HERMES_HOME, not HERMES_PROFILE. The ledger is
+    # written into that profile's home; derive identity from the same root.
+    base = Path(home) if home is not None else _process_home()
+    if base.parent.name == "profiles":
+        return base.name
     return (os.environ.get("HERMES_PROFILE") or "").strip() or "default"
 
 
@@ -355,7 +360,7 @@ def read_interrupt_restart_intent(
     tail = _read_ledger_tail(home)
     if not tail:
         return None
-    profile = _current_profile()
+    profile = _current_profile(home)
     for line in reversed(tail.splitlines()):
         try:
             row = json.loads(line)
@@ -405,7 +410,7 @@ def record_in_band_restart(
             "epoch": round(time.time(), 3),
             "event": "in_band",
             "token": "",
-            "target_profile": _current_profile(),
+            "target_profile": _current_profile(home),
             "initiator_profile": f"self:{requester or 'unknown'}",
             "origin_mode": "in_band",
             "pid_before": os.getpid(),
@@ -453,7 +458,7 @@ def read_planned_restart(
     tail = _read_ledger_tail(home)
     if tail is None:
         return None
-    profile = _current_profile()
+    profile = _current_profile(home)
     best: Optional[Dict[str, Any]] = None
     for line in tail.splitlines():
         try:

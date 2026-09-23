@@ -12,9 +12,9 @@ silent until he re-sent by hand.
 
 This module is the durable carrier: one JSON file per follow-up under
 ``<home>/gateway/restart_followups/``, written by the draining process and
-consumed exactly once by the next boot, which feeds each record into the
-existing startup-restore inbound queue (the same path a message that arrives
-while the new gateway is still restoring takes). Best-effort on both ends: a
+loaded by the next boot and acknowledged only after adapter acceptance, which
+feeds each record into the existing startup-restore inbound queue. A failed
+boot or interrupted replay leaves unaccepted records on disk. Best-effort: a
 spool failure is logged LOUDLY by the caller, never raised into the turn.
 """
 
@@ -90,10 +90,11 @@ def spool_followup(
 def take_followups(
     home: Optional[Path] = None, *, now: Optional[float] = None
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Claim every spooled follow-up (oldest first) and delete its file.
+    """Load follow-ups (oldest first) without deleting unaccepted messages.
 
-    Returns ``(records, stale_count)``. Stale / malformed files are left on disk
-    (renamed ``*.stale`` / ``*.bad``) for forensics and are never replayed.
+    Returns ``(records, stale_count)``. Each record carries an internal
+    ``_spool_path`` for acknowledgement after adapter acceptance. Stale /
+    malformed files are left on disk (renamed ``*.stale`` / ``*.bad``).
     """
     records: List[Dict[str, Any]] = []
     stale = 0
@@ -119,8 +120,18 @@ def take_followups(
                 stale += 1
                 path.rename(path.with_suffix(".stale"))
                 continue
-            path.unlink()
+            record["_spool_path"] = str(path)
             records.append(record)
         except Exception:
             logger.debug("restart follow-up spool read failed for %s", path, exc_info=True)
     return records, stale
+
+
+def acknowledge_followup(path: str) -> bool:
+    """Remove a spooled record only after its adapter accepted the replay."""
+    try:
+        Path(path).unlink()
+        return True
+    except OSError:
+        logger.warning("restart follow-up acknowledgement failed for %s", path, exc_info=True)
+        return False

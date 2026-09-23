@@ -79,7 +79,7 @@ async def test_spooled_followups_reach_handle_message_through_real_start(tmp_pat
     try:
         await asyncio.wait_for(runner.start(), timeout=60)
         for _ in range(100):
-            if len(received) >= len(expected):
+            if len(received) >= len(expected) and not list(rf.spool_dir().glob("*.json")):
                 break
             await asyncio.sleep(0.1)
     finally:
@@ -89,3 +89,74 @@ async def test_spooled_followups_reach_handle_message_through_real_start(tmp_pat
             pass
 
     assert received == expected, f"delivered {received!r}, spool now {list(rf.spool_dir().glob('*'))!r}"
+    assert list(rf.spool_dir().glob("*.json")) == []
+
+
+@pytest.mark.asyncio
+async def test_failed_start_keeps_followups_for_next_boot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "logs").mkdir()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="101", chat_type="dm", user_id="u1")
+    assert rf.spool_followup("agent:main:telegram:dm:101", "retry me", source.to_dict())
+
+    def runner():
+        result = GatewayRunner(GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")},
+            sessions_dir=tmp_path / "sessions",
+        ))
+        async def _no_secondary():
+            return 0
+        result._start_secondary_profile_adapters = _no_secondary
+        return result
+
+    first = runner()
+    def unavailable(*args):
+        raise RuntimeError("adapter unavailable")
+    first._create_adapter = unavailable
+    with pytest.raises(RuntimeError, match="adapter unavailable"):
+        await first.start()
+    assert len(list(rf.spool_dir().glob("*.json"))) == 1
+    del first
+
+    received = []
+    second = runner()
+    second._create_adapter = lambda platform, cfg: _RecordingAdapter(platform, received)
+    try:
+        await asyncio.wait_for(second.start(), timeout=60)
+        for _ in range(100):
+            if received and not list(rf.spool_dir().glob("*.json")):
+                break
+            await asyncio.sleep(0.1)
+        assert received == [("101", "retry me")]
+        assert list(rf.spool_dir().glob("*.json")) == []
+    finally:
+        await asyncio.wait_for(second.stop(), timeout=30)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_replay_only_retries_unaccepted_followup(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "logs").mkdir()
+    for i in (1, 2):
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id=str(i), chat_type="dm", user_id="u1")
+        assert rf.spool_followup(f"agent:main:telegram:dm:{i}", f"item {i}", source.to_dict())
+
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    runner._startup_restore_queue = []
+    await runner._load_restart_followups()
+    accepted = []
+    entered = asyncio.Event()
+    class PartialAdapter:
+        async def handle_message(self, event):
+            if event.text == "item 2":
+                entered.set()
+                await asyncio.Future()
+            accepted.append(event.text)
+    runner._adapter_for_source = lambda source: PartialAdapter()
+    task = asyncio.create_task(runner._drain_startup_restore_queue())
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert accepted == ["item 1"]
+    assert [r["text"] for r in rf.take_followups()[0]] == ["item 2"]

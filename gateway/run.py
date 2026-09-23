@@ -15782,6 +15782,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_type=MessageType.TEXT,
                     source=SessionSource.from_dict(record["source"]),
                 )
+                event._hermes_restart_followup_path = record["_spool_path"]
                 self._queue_startup_restore_event(event)
                 queued += 1
             except Exception:
@@ -16002,6 +16003,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 retry_delay = min(retry_delay * 2, 5.0)
                 continue
             queue.pop(0)
+            spool_path = getattr(event, "_hermes_restart_followup_path", None)
+            if spool_path:
+                from gateway.fork_ext.restart_followups import acknowledge_followup
+
+                await asyncio.to_thread(acknowledge_followup, spool_path)
             last_warning_at.pop(id(event), None)
             last_phase_warning_at.pop(id(event), None)
             logger.warning(

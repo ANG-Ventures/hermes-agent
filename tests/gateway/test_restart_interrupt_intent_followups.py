@@ -22,6 +22,7 @@ from gateway.fork_ext.unclean_restart_notice import (
     interrupt_drain_cap,
     read_interrupt_restart_intent,
     read_planned_restart,
+    record_in_band_restart,
 )
 from gateway.platforms.base import MessageEvent, MessageType
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
@@ -160,9 +161,8 @@ async def test_four_draining_followups_are_spooled_and_replayed_on_boot(home):
     assert await new._load_restart_followups() == 4
     replayed = [(e.source.chat_id, e.text) for e in new._startup_restore_queue]
     assert replayed == [(str(i), f"follow-up {i}") for i in range(4)]
-    assert list(rf.spool_dir(home).glob("*.json")) == []
-    # consumed exactly once
-    assert await new._load_restart_followups() == 0
+    assert len(list(rf.spool_dir(home).glob("*.json"))) == 4
+    # Files remain durable until the startup-restore adapter accepts them.
 
 
 @pytest.mark.asyncio
@@ -230,3 +230,34 @@ async def test_in_band_restart_logs_requester_and_reads_planned(home, caplog):
     ended = datetime.now(timezone.utc).isoformat()
     planned = read_planned_restart(ended, home)
     assert planned is not None and planned["event"] == "in_band"
+
+
+@pytest.mark.asyncio
+async def test_named_launch_without_profile_env_honors_intent_and_planned_notice(tmp_path, monkeypatch):
+    named = tmp_path / "profiles" / "qa-profile"
+    (named / "logs").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(named))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    row = _write_intent(named, target_profile="qa-profile", drain_cap_s=0.2)
+    assert read_interrupt_restart_intent() == row
+    assert read_planned_restart(datetime.now(timezone.utc).isoformat()) == row
+
+    runner, _ = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._restart_after_turn_timeout = 1800
+    runner._running_agents["agent:main:telegram:dm:1"] = MagicMock()
+    assert runner.request_restart(detached=False, via_service=True)
+    await asyncio.wait_for(runner._restart_task, timeout=5)
+    runner.stop.assert_awaited_once()
+    in_band = [r for r in _ledger_rows(named) if r.get("event") == "in_band"]
+    assert len(in_band) == 1 and in_band[0]["target_profile"] == "qa-profile"
+
+
+def test_named_profile_does_not_accept_default_ledger_row(tmp_path, monkeypatch):
+    named = tmp_path / "profiles" / "qa-profile"
+    (named / "logs").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(named))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    _write_intent(named, target_profile="default")
+    assert read_interrupt_restart_intent() is None
+    assert read_planned_restart(datetime.now(timezone.utc).isoformat()) is None
