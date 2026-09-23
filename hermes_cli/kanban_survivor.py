@@ -48,21 +48,23 @@ def _git(repo, *args, env=None, check=True, input=None):
     )
     if check and result.returncode:
         # Git stderr can contain credential-bearing remote URLs, so it is never
-        # persisted: the raised message stays constant and the detail goes to
-        # the log, redacted by the same helper that guards an echoed claim.
+        # persisted. The subcommand and returncode are safe to include in the
+        # hold; the stderr goes to the log through the existing redaction path.
         #
         # Without this, every occurrence costs an attribution pass. A failure
         # that is purely environmental (t_169d6e46: a concurrent pytest session
         # deleting this repo's tmp_path, so git exits 128 "cannot change to
         # '<path>': No such file or directory") is indistinguishable from a real
-        # capture defect once it reaches the caller as a bare
+        # capture defect when the caller receives only the old bare
         # "survivor_unavailable: git inspection failed".
         log.warning(
             "kanban survivor: git %s failed rc=%s in %s: %s",
             args[0] if args else "?", result.returncode, _ext.redact(str(repo)),
             _ext.redact(result.stderr.decode("utf-8", "replace").strip()),
         )
-        raise SurvivorUnavailable("survivor_unavailable: git inspection failed")
+        raise SurvivorUnavailable(
+            f"survivor_unavailable: git {args[0] if args else '?'} failed (rc={result.returncode})"
+        )
     return result
 
 
