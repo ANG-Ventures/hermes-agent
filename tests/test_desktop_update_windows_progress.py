@@ -61,6 +61,9 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
     env["TMP"] = str(tmp_path)
     release_path = tmp_path / "release-self-test"
     env["HERMES_SELFTEST_RELEASE_FILE"] = str(release_path)
+    # If the release-file branch is ignored, the fallback timer must expire
+    # before we can sample even one progress tick.
+    env["HERMES_SELFTEST_HOLD_SECONDS"] = "0"
 
     with output_path.open("wb") as output:
         process = subprocess.Popen(
@@ -97,6 +100,7 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
             time.sleep(0.1)
 
         assert shim_url, output_path.read_text(encoding="utf-8", errors="replace")
+        assert process.poll() is None, "self-test exited before release file was written"
 
         # The URL prints BEFORE the orchestrator publishes its held stage —
         # sampling immediately races the publish and can catch the page's
