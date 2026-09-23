@@ -834,9 +834,9 @@ def _landed_contains_history(workspace_repo, landed_repo, landed_sha):
     # Compare net worker changes, not paths touched by inherited history.
     # A shared HEAD still needs its path guard against later live reverts.
     if shared and shared != workspace_head:
-        touched = _git(workspace_repo, "diff", "--name-only", "-z", shared, workspace_head, check=False)
+        touched = _git(workspace_repo, "diff", "--no-renames", "--name-only", "-z", shared, workspace_head, check=False)
     else:
-        touched = _git(workspace_repo, "log", "--name-only", "-z", "--format=", workspace_head, check=False)
+        touched = _git(workspace_repo, "log", "--no-renames", "--name-only", "-z", "--format=", workspace_head, check=False)
     live_head = _git(landed_repo, "rev-parse", "--verify", "HEAD^{commit}", check=False)
     if touched.returncode or live_head.returncode or not touched.stdout:
         return None

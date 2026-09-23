@@ -626,6 +626,44 @@ def test_landed_checks_deleted_paths_and_modes_at_live_head(board, tmp_path, res
     assert kb.get_task(board, tid).status != "done"
 
 
+@pytest.mark.parametrize("restore_source", [False, True])
+@pytest.mark.parametrize("shared_history", [False, True])
+def test_landed_rename_checks_both_source_and_destination(board, tmp_path, restore_source, shared_history):
+    source = init(tmp_path / "rename-source")
+    commit(source, "old.py", "value = 1\n", "base")
+    tid = kb.create_task(board, title="renamed implementation")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    live = tmp_path / "rename-live"
+    git(tmp_path, "clone", "--no-local", str(source), str(ws))
+    if shared_history:
+        git(tmp_path, "clone", "--no-local", str(source), str(live))
+    else:
+        init(live)
+        commit(live, "old.py", "value = 1\n", "independent base")
+    for repo in (ws, live):
+        git(repo, "config", "user.name", "Test")
+        git(repo, "config", "user.email", "test@example.invalid")
+    for repo, message in ((ws, "workspace rename"), (live, "independent rename")):
+        git(repo, "mv", "old.py", "new.py")
+        git(repo, "commit", "-m", message)
+    if restore_source:
+        commit(live, "old.py", "value = 1\n", "restore old path")
+    kb.set_workspace_path(board, tid, ws)
+    metadata = {
+        "changed_files": ["old.py", "new.py"],
+        "landed": [{"repo_path": str(live), "sha": git(live, "rev-parse", "HEAD")}],
+    }
+    if restore_source:
+        with pytest.raises(ValueError, match="survivor_unavailable"):
+            kb.complete_task(board, tid, metadata=metadata)
+        assert ws.exists()
+        assert kb.get_task(board, tid).status != "done"
+    else:
+        assert kb.complete_task(board, tid, metadata=metadata)
+        assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "landed"
+        assert not ws.exists()
+
+
 def test_landed_rejects_a_disposable_repository(board, tmp_path):
     """Pointing `landed` at the workspace itself must not authorise its deletion."""
     tid, ws, live, head, _ = home_clone(board, tmp_path)
