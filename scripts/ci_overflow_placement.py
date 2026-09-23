@@ -67,6 +67,10 @@ def validate_record(state, *, repository_id: int, run_id: int, run_attempt: int,
         raise PlanInvalid("plan record schema")
     if summary.get("validated") is not True:
         raise PlanInvalid("plan not validated")
+    if (type(row.get("jobs")) is not list or len(row["jobs"]) != len(plan["jobs"])
+            or any({k: entry.get(k) for k in ("job_id", "labels", "reason", "reserved_minutes")} != decision
+                   for entry, decision in zip(row["jobs"], plan["jobs"]))):
+        raise PlanInvalid("plan jobs disagree with committed admission")
     for field, want in (("repository_id", repository_id), ("run_id", run_id), ("run_attempt", run_attempt)):
         if type(summary.get(field)) is not int or summary[field] != want:
             raise PlanInvalid(f"{field} mismatch")

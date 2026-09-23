@@ -468,6 +468,14 @@ def test_valid_plan_relabels_without_touching_membership():
     assert got["e2e_runs_on"] == POOL
 
 
+def test_plan_jobs_must_match_committed_admission():
+    state = _state()
+    state["attempts"]["1234822999:42:2"]["jobs"] = copy.deepcopy(state["attempts"]["1234822999:42:2"]["jobs"])
+    state["attempts"]["1234822999:42:2"]["jobs"][0]["labels"] = POOL
+    with pytest.raises(PlanInvalid, match="disagree"):
+        _validate(state)
+
+
 def test_no_record_yet_is_none():
     assert _validate(_state(), run_attempt=3) is None
 
