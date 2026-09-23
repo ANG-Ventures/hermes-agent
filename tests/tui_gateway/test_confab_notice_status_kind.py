@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent.confab_notice import CONFAB_NOTICE_TEXT
+from agent.confab_notice import CONFAB_NOTICE_TEXT, confab_notice_status
 import tui_gateway.server as server
 
 
@@ -32,6 +32,12 @@ def emitted(monkeypatch):
 
 
 class TestConfabNoticeGetsItsOwnKind:
+    @pytest.mark.parametrize("kind", ["tool_call_unparseable", "tool_call_as_text"])
+    def test_live_tool_notice_is_retagged(self, emitted, kind):
+        text = confab_notice_status(kind)
+        server._status_update("sess-1", "lifecycle", text)
+        assert emitted[0][2] == {"kind": "confab_notice", "text": text}
+
     def test_lifecycle_confab_notice_is_retagged(self, emitted):
         server._status_update("sess-1", "lifecycle", CONFAB_NOTICE_TEXT)
 

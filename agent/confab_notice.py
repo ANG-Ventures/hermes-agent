@@ -29,8 +29,8 @@ forwards NO notice once a second valid notice appears in one stream.
 Two reader-side helpers complete the contract:
 
 * ``notice_from_display_row`` re-validates a persisted row before any surface
-  presents the confirmed-catch claim, and requires an ``assistant`` role —
-  ``display_kind`` alone is an open string any writer can set;
+  presents a confirmed catch; scaffold notices require an assistant row,
+  while metadata-only tool-call notices may use a system event row;
 * ``should_announce_notice`` scopes the announce-once ledger to the current
   turn, so a colliding or restarted provider ``request_id`` can never silently
   suppress a genuine later warning.
@@ -61,8 +61,29 @@ CONFAB_NOTICE_DISPLAY_KIND = "confab_notice"
 #: The only schema version this consumer understands.
 CONFAB_NOTICE_VERSION = 1
 
-#: The only catch kind defined by v1 of the contract.
+#: Original scaffold catch kind.
 CONFAB_NOTICE_KIND = "scaffold_confab_removed"
+
+# Fixed retry instructions; never interpolate provider-supplied labels.
+TOOL_CALL_NOTICE_TEXT = {
+    "tool_call_unparseable": (
+        "Tool call not executed: the tool-call JSON could not be parsed. "
+        "Re-issue the tool call with valid JSON matching the tool schema."
+    ),
+    "tool_call_as_text": (
+        "Tool call not executed: it was written as text rather than a native tool call. "
+        "Re-issue the call using the native tool-calling interface, not a text block."
+    ),
+}
+
+
+def confab_notice_status(kind: str) -> str:
+    """Fixed user-facing label, independent of the model retry instruction."""
+    return {
+        CONFAB_NOTICE_KIND: CONFAB_NOTICE_TEXT,
+        "tool_call_unparseable": "⚠️ Tool call not executed: tool-call JSON could not be parsed.",
+        "tool_call_as_text": "⚠️ Tool call not executed: text was sent instead of a native tool call.",
+    }.get(kind, "⚠️ Provider notice.")
 
 #: Allowed ``scope`` values.
 CONFAB_NOTICE_SCOPES = ("visible", "intermediate", "both")
@@ -99,7 +120,7 @@ def validate_confab_notice(raw: Any) -> Optional[Dict[str, Any]]:
         return None
 
     kind = raw.get("kind")
-    if kind != CONFAB_NOTICE_KIND:
+    if kind not in (CONFAB_NOTICE_KIND, *TOOL_CALL_NOTICE_TEXT):
         logger.debug("Ignoring %s: unknown kind %r", CONFAB_NOTICE_FIELD, kind)
         return None
 
@@ -119,6 +140,9 @@ def validate_confab_notice(raw: Any) -> Optional[Dict[str, Any]]:
     if scope not in CONFAB_NOTICE_SCOPES:
         logger.debug("Ignoring %s: invalid scope %r", CONFAB_NOTICE_FIELD, scope)
         return None
+    if kind in TOOL_CALL_NOTICE_TEXT and scope != "visible":
+        logger.debug("Ignoring %s: tool-call notice must be visible", CONFAB_NOTICE_FIELD)
+        return None
 
     # ``grammar`` is the detector's bounded label, or null when several catches
     # cannot be represented by one label. Absent is treated as null.
@@ -133,7 +157,7 @@ def validate_confab_notice(raw: Any) -> Optional[Dict[str, Any]]:
 
     return {
         "version": CONFAB_NOTICE_VERSION,
-        "kind": CONFAB_NOTICE_KIND,
+        "kind": kind,
         "request_id": request_id,
         "scope": scope,
         "grammar": grammar,
@@ -179,15 +203,15 @@ def notice_from_display_row(
 
     So a reader must clear two gates before presenting the claim:
 
-    1. the row is an ``assistant`` turn — only a model reply can carry a
-       catch; a user or system row tagged this way is malformed input, and
+    1. scaffold catches require an ``assistant`` turn; only validated
+       tool-call notices may use metadata-only ``system`` event rows, and
     2. ``display_metadata[CONFAB_NOTICE_KEY]`` re-validates against the same
        fail-closed v1 schema the wire payload had to pass.
 
     Returns the re-validated notice (so callers can key off ``kind`` /
     ``request_id``) or ``None`` when the row does not qualify.
     """
-    if role != "assistant":
+    if role not in ("assistant", "system"):
         return None
     if display_kind != CONFAB_NOTICE_DISPLAY_KIND:
         return None
@@ -203,7 +227,10 @@ def notice_from_display_row(
     if not isinstance(metadata, dict):
         return None
 
-    return validate_confab_notice(metadata.get(CONFAB_NOTICE_KEY))
+    notice = validate_confab_notice(metadata.get(CONFAB_NOTICE_KEY))
+    if role == "system" and (not notice or notice["kind"] not in TOOL_CALL_NOTICE_TEXT):
+        return None
+    return notice
 
 
 def should_announce_notice(agent: Any, notice: Any, turn_id: Any) -> bool:

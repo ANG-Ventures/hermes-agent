@@ -42,7 +42,7 @@ from agent.context_engine import (
     call_with_messages as _call_with_messages,
 )
 from agent.display import KawaiiSpinner
-from agent.confab_notice import CONFAB_NOTICE_TEXT, should_announce_notice
+from agent.confab_notice import TOOL_CALL_NOTICE_TEXT, confab_notice_status, should_announce_notice
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -2676,6 +2676,10 @@ def run_conversation(
 
         api_messages = []
         for idx, msg in enumerate(messages):
+            # Metadata-only provider events are durable UI rows, never system
+            # instructions in the provider request.
+            if msg.get("role") == "system" and msg.get("display_kind") == "confab_notice":
+                continue
 
             # Structural clone, NOT msg.copy(): every in-place transform
             # below (canonicalize/repair, surrogate + non-ASCII sanitizers,
@@ -8069,7 +8073,7 @@ def run_conversation(
             if _confab_notice and should_announce_notice(
                 agent, _confab_notice, turn_id
             ):
-                agent._emit_status(CONFAB_NOTICE_TEXT)
+                agent._emit_status(confab_notice_status(_confab_notice["kind"]))
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -8996,11 +9000,7 @@ def run_conversation(
                 continue
             
             else:
-                # No tool calls - this is the final response.
-                # (Dropped tool-call recovery — finish_reason=="tool_calls" with
-                # an empty tool_calls array — is handled at the finalization
-                # chokepoint below, after final_msg is built, so it catches
-                # every path that reaches turn finalization, not just this one.)
+                # Recover dropped calls before the empty-content fallback.
                 final_response = assistant_message.content or ""
                 
                 # Fix: unmute output when entering the no-tool-call branch
@@ -9009,6 +9009,47 @@ def run_conversation(
                 # prior housekeeping tool turn and should not silence the
                 # final response path.
                 agent._mute_post_response = False
+
+                _tool_notice_nudge = TOOL_CALL_NOTICE_TEXT.get(
+                    _confab_notice["kind"] if _confab_notice else None
+                )
+                if _tool_notice_nudge:
+                    # Durable metadata-only UI event, not a model instruction.
+                    _notice_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                    append_message(messages, {
+                        "role": "system", "content": "",
+                        "display_kind": _notice_msg["display_kind"],
+                        "display_metadata": _notice_msg["display_metadata"],
+                    })
+                if finish_reason == "tool_calls" or _tool_notice_nudge:
+                    if getattr(agent, "_dropped_toolcall_retries", 0) < 3:
+                        agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
+                        logger.warning(
+                            "Dropped tool call — re-prompting (retry %d/3, model=%s provider=%s)",
+                            agent._dropped_toolcall_retries, agent.model, agent.provider,
+                        )
+                        agent._emit_status(
+                            "↻ Model signaled a tool call but sent none — "
+                            f"re-prompting ({agent._dropped_toolcall_retries}/3)"
+                        )
+                        interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                        interim_msg["_dropped_toolcall_nudge"] = True
+                        append_message(messages, interim_msg)
+                        append_message(messages, {
+                            "role": "user",
+                            "content": _tool_notice_nudge or _DROPPED_TOOLCALL_NUDGE_CONTENT,
+                            "_dropped_toolcall_nudge": True,
+                        })
+                        agent._session_messages = messages
+                        final_response = None
+                        continue
+                    if _tool_notice_nudge:
+                        agent._emit_status("⚠️ Tool-call recovery exhausted after 3 retries.")
+                        _turn_exit_reason = "tool_call_recovery_exhausted"
+                        failed = True
+                        final_response = ""
+                        agent._dropped_toolcall_retries = 0
+                        break
                 
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
@@ -9489,54 +9530,6 @@ def run_conversation(
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
-                # ── Dropped tool-call recovery (copilot/Claude) ────────
-                # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
-                # on GitHub Copilot, ~2026-07) return finish_reason="tool_calls"
-                # while the parsed tool_calls array is empty — the model
-                # signalled it wanted to act but the payload shipped no call.
-                # Reaching finalization with that mismatch means the turn is
-                # about to end with the task unstarted (the narration, which may
-                # be in content or only in the reasoning field, gets treated as
-                # the final answer). Re-prompt (bounded to 3 CONSECUTIVE stalls;
-                # the budget resets after any successful tool round) to make the
-                # model emit the call instead of exiting. finish_reason="stop"
-                # text finishes never enter this guard.
-                if (
-                    finish_reason == "tool_calls"
-                    and not assistant_message.tool_calls
-                    and getattr(agent, "_dropped_toolcall_retries", 0) < 3
-                ):
-                    agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
-                    logger.warning(
-                        "finish_reason=tool_calls with empty tool_calls array "
-                        "(narration only) — re-prompting to emit the call "
-                        "(retry %d/3, model=%s provider=%s)",
-                        agent._dropped_toolcall_retries, agent.model, agent.provider,
-                    )
-                    agent._emit_status(
-                        "↻ Model signaled a tool call but sent none — "
-                        f"re-prompting ({agent._dropped_toolcall_retries}/3)"
-                    )
-                    # Both halves of the re-prompt pair are ephemeral recovery
-                    # scaffolding (mirrors the empty-response nudge pattern):
-                    # the interim narration-only assistant turn exists solely to
-                    # keep role alternation valid for the nudge, and the nudge
-                    # exists solely to drive the retry. Flag both so the
-                    # persistence layer never writes them to the durable
-                    # transcript and the finalization pop below can strip an
-                    # unanswered tail pair. A recovered (answered) pair stays
-                    # buried mid-list in live memory but is skipped by the
-                    # flush regardless of position.
-                    final_msg["_dropped_toolcall_nudge"] = True
-                    append_message(messages, final_msg)
-                    append_message(messages, {
-                        "role": "user",
-                        "content": _DROPPED_TOOLCALL_NUDGE_CONTENT,
-                        "_dropped_toolcall_nudge": True,
-                    })
-                    agent._session_messages = messages
-                    final_response = None
-                    continue
 
                 # Reached finalization without the dropped-tool-call mismatch —
                 # a genuine turn end. Clear the consecutive-stall budget so the
