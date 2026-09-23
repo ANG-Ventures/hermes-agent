@@ -9892,7 +9892,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        WHEN ? IS NULL THEN actual_cost_usd
                        ELSE ?
                    END,
-                   cost_status = COALESCE(?, cost_status),
+                   cost_status = CASE
+                       WHEN ? IS NULL THEN cost_status
+                       WHEN ? IN ('unknown', 'partial') THEN (
+                           CASE WHEN COALESCE(?, 0) > 0
+                                     OR CASE WHEN ? IS NULL
+                                             THEN COALESCE(actual_cost_usd, 0)
+                                             ELSE ? END > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
+                       ELSE ?
+                   END,
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
                    billing_provider = COALESCE(billing_provider, ?),
@@ -9918,7 +9928,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        WHEN ? IS NULL THEN actual_cost_usd
                        ELSE COALESCE(actual_cost_usd, 0) + ?
                    END,
-                   cost_status = COALESCE(?, cost_status),
+                   cost_status = CASE
+                       WHEN ? IS NULL THEN cost_status
+                       WHEN ? IN ('unknown', 'partial') THEN (
+                           CASE WHEN COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0) > 0
+                                     OR CASE WHEN ? IS NULL
+                                             THEN COALESCE(actual_cost_usd, 0)
+                                             ELSE COALESCE(actual_cost_usd, 0) + ? END > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
+                       ELSE ?
+                   END,
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
                    billing_provider = COALESCE(billing_provider, ?),
@@ -9943,6 +9963,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             last_turn_cache_read_tokens,
             last_turn_cache_write_tokens,
             last_turn_reasoning_tokens,
+            estimated_cost_usd,
+            actual_cost_usd,
+            actual_cost_usd,
+            # cost_status CASE: (is it NULL?), (is it incomplete?), the
+            # estimated dollars this write contributes, (is actual NULL?), the
+            # actual dollars this write contributes, and the value to store
+            # otherwise.
+            #
+            # Both incomplete labels are judged, and both are judged against the
+            # POST-update estimated AND actual (r6 round-4 finding 10). The old
+            # shape asked only `= 'unknown'` against incoming estimated + OLD
+            # actual, so: a NULL-keep write relabelled a row holding retained
+            # catalog spend as 'unknown' (stranding it — 'unknown' is outside
+            # the reprice allowlist); a first actual of $5 arriving with
+            # 'unknown' stayed 'unknown' because this statement's own actual was
+            # invisible to the test; and an incoming 'partial' fell to the ELSE
+            # arm and was stored verbatim even after a $0 replace left the row
+            # with no dollars to be partial about. Same rule the model-usage
+            # upsert below already applies.
+            cost_status,
+            cost_status,
             estimated_cost_usd,
             actual_cost_usd,
             actual_cost_usd,
@@ -10132,7 +10173,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
                    estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
                    actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
-                   cost_status = COALESCE(excluded.cost_status, cost_status),
+                   -- Same rule as the sessions row, but judged against THIS
+                   -- (model, provider, mode, task) row's own dollars. The
+                   -- incoming status is derived session-wide, so a wholly
+                   -- unpriced model must not inherit another model's spend and
+                   -- render "partial" on the Spend-by-model breakdown
+                   -- (r6 finding 1); conversely a row that does hold priced
+                   -- dollars must not be relabelled 'unknown' and stranded
+                   -- outside the reprice allowlist.
+                   cost_status = CASE
+                       WHEN excluded.cost_status IS NULL THEN cost_status
+                       WHEN excluded.cost_status IN ('unknown', 'partial') THEN (
+                           CASE WHEN estimated_cost_usd + excluded.estimated_cost_usd > 0
+                                     OR actual_cost_usd + excluded.actual_cost_usd > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
+                       ELSE excluded.cost_status
+                   END,
                    cost_source = COALESCE(excluded.cost_source, cost_source),
                    last_seen = excluded.last_seen""",
             (
@@ -10150,7 +10207,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 reasoning_tokens or 0,
                 float(estimated_cost_usd or 0.0),
                 float(actual_cost_usd or 0.0),
-                cost_status,
+                # A row's FIRST write cannot be "partial": there is no prior
+                # spend on this (model, provider, mode, task) to be partial
+                # about. The incoming status is session-scoped, so scope it to
+                # this row's own dollars (r6 finding 1).
+                (
+                    (
+                        "partial"
+                        if (float(estimated_cost_usd or 0.0) > 0
+                            or float(actual_cost_usd or 0.0) > 0)
+                        else "unknown"
+                    )
+                    if cost_status in ("unknown", "partial")
+                    else cost_status
+                ),
                 cost_source,
                 now,
                 now,

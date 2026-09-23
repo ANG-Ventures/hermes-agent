@@ -1,6 +1,6 @@
 """Physical-call attribution passed from the MoA loop to Blackbox."""
 
-from agent.usage_pricing import CanonicalUsage
+from agent.usage_pricing import USAGE_UNKNOWN_FIELDS, CanonicalUsage
 
 
 def test_build_moa_pricing_calls_appends_real_aggregator_after_advisors():
@@ -33,7 +33,7 @@ def test_build_moa_pricing_calls_appends_real_aggregator_after_advisors():
     )
 
     assert calls[0] == advisor_calls[0]
-    assert calls[1] == {
+    expected_measured = {
         "model": "anthropic/claude-opus-4.8",
         "provider": "openrouter",
         "base_url": "https://openrouter.ai/api/v1",
@@ -43,5 +43,35 @@ def test_build_moa_pricing_calls_appends_real_aggregator_after_advisors():
         "cache_write_tokens": 40,
         "reasoning_tokens": 10,
     }
+    # Attribution + counters are exactly as before. The serialized call also
+    # carries the UNKNOWN discriminators, which must be present and False for
+    # this fully-measured usage -- Blackbox prefers these nested calls, so
+    # dropping the flags here is what let an unknown input get priced as 0.
+    assert {k: calls[1][k] for k in expected_measured} == expected_measured
+    assert set(calls[1]) == set(expected_measured) | set(USAGE_UNKNOWN_FIELDS)
+    assert all(calls[1][flag] is False for flag in USAGE_UNKNOWN_FIELDS)
     # The helper must not mutate the facade-owned pending list.
     assert len(advisor_calls) == 1
+
+
+def test_build_moa_pricing_calls_preserves_unknown_discriminators():
+    """Unknown flags must survive the aggregator -> physical-call seam."""
+    from agent.conversation_loop import _build_moa_pricing_calls
+
+    usage = CanonicalUsage(
+        input_tokens=200,
+        output_tokens=0,
+        output_tokens_unknown=True,
+        cache_read_tokens_unknown=True,
+    )
+    call = _build_moa_pricing_calls(
+        [],
+        usage,
+        aggregator_model="claude-sonnet-4-5",
+        aggregator_provider="anthropic",
+        aggregator_base_url=None,
+    )[0]
+    assert call["output_tokens_unknown"] is True
+    assert call["cache_read_tokens_unknown"] is True
+    assert call["input_tokens_unknown"] is False
+    assert call["usage_unknown"] is False

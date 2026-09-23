@@ -851,6 +851,15 @@ class AIAgent:
         self.session_cache_write_tokens = 0
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
+        # ABSORBING per-bucket unknown latch over the cumulative counters above
+        # (set beside the increments in agent/conversation_loop.py). It must be
+        # cleared HERE with them: a new/branched/resumed session's totals start
+        # at zero and are fully measured until proven otherwise — carrying the
+        # old session's latch forward would render the fresh totals `unknown`.
+        from agent.usage_pricing import USAGE_UNKNOWN_FIELDS as _USAGE_UNKNOWN_FIELDS
+
+        for _usage_flag in _USAGE_UNKNOWN_FIELDS:
+            setattr(self, f"session_{_usage_flag}", False)
         # Snapshot of the most recent successful provider call, normalized into
         # Hermes' canonical usage shape. Session counters above are cumulative;
         # this per-call record lets status/usage surfaces show the last turn's

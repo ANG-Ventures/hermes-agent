@@ -34,7 +34,17 @@ _LOG = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Formatting helpers (verbatim from blackbox-inspect)
 # --------------------------------------------------------------------------- #
-def _humanize_tok(n) -> str:
+def _humanize_tok(n, *, unknown: bool = False) -> str:
+    """Token magnitude for the last-turn card; unknown spelling is shared.
+
+    The UNKNOWN rule is single-sourced in agent.usage_pricing.format_token_count
+    so this renderer, the alert card and usage.ace cannot drift on how an
+    unmeasured turn reads. The k/M magnitude formatting below is unchanged.
+    """
+    if unknown:
+        from agent.usage_pricing import format_token_count
+
+        return format_token_count(n, unknown=True)
     try:
         n = int(n or 0)
     except (TypeError, ValueError):
@@ -261,7 +271,14 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     # is just ~2 structural tokens/call). See Obsidian "Hermes Telemetry —
     # Token Terminology & Accounting".
     in_billed = cache_r + cache_w + in_tok
-    if in_billed > 0:
+    from agent.usage_pricing import (
+        last_call_prompt_unknown as _last_call_prompt_unknown,
+        prompt_tokens_unknown,
+    )
+    input_unknown = prompt_tokens_unknown(rec)
+    if input_unknown:
+        lines.append(f"• Tokens in: {_humanize_tok(0, unknown=True)} billed")
+    elif in_billed > 0:
         lines.append(
             f"• Tokens in: {_humanize_tok(in_billed)} billed "
             f"({_humanize_tok(cache_r)} cache-read + "
@@ -275,7 +292,12 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     # broken out (Ace 2026-06-14: /context reports finished/unfinished only, not
     # final/reasoning). When the per-call split is unknown (old/NULL/blackbox-off
     # blob) show the bare billed total — NEVER fall back to final/reasoning.
-    if out_tok > 0:
+    if bool(rec.get("output_tokens_unknown") or rec.get("usage_unknown")):
+        # UNKNOWN != 0: the provider never measured this turn's output, so the
+        # stored 0 is absence of data. Show it as unknown rather than omitting
+        # the row (omission reads as "nothing generated") or splitting a 0.
+        lines.append(f"• Tokens out: {_humanize_tok(0, unknown=True)}")
+    elif out_tok > 0:
         finished_output, unfinished_output = turn_output_split(
             _comp_calls_from_json(rec.get("comp_calls_json")),
             out_tok,
@@ -301,13 +323,24 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     lc_write = rec.get("last_cache_write_tokens", rec.get("last_cache_write"))
     lc_unc = rec.get("last_uncached_tokens", rec.get("last_uncached"))
     _have_split = lc_read is not None and lc_write is not None and lc_unc is not None
+    # The last-call rows below (and the Context-window line) describe the FINAL
+    # call only, so they gate on the final call's own discriminator, not on the
+    # turn-level `input_unknown` — which is an absorbing OR over every call
+    # (agent/turn_finalizer.py::_rollup_turn_usage) and would blank a fully
+    # measured final call just because call #2 of the turn returned no usage
+    # (r6 finding 9). `last_call_prompt_unknown` is NULL on rows written before
+    # that column existed; those fall back to the turn-level flag, i.e. exactly
+    # the behaviour they already had. That NULL fallback and the flag read both
+    # live in the shared callable so `card.py` — the other renderer over this
+    # same record — cannot answer differently (r6 round-4 finding 6).
+    last_call_unknown = _last_call_prompt_unknown(rec)
     # Change 3 (Ace 2026-06-14): the last-call cache split gets its OWN line
     # framed as the final call's billed input, ABOVE the occupancy line. The
     # split sums to context_used, so "Last call: {used} billed (split)" uses the
     # same headline as the window line — two framings of one number. The
     # Context-window line keeps ONLY the occupancy (suffix removed). When the
     # split is absent (old rows / blackbox-off) the Last-call line is omitted.
-    if _have_split and used > 0:
+    if _have_split and used > 0 and not last_call_unknown:
         lines.append(
             f"• Last call: {_humanize_tok(used)} billed "
             f"({_humanize_tok(int(lc_read or 0))} cache-read + "
@@ -320,11 +353,23 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     cache_r = int(rec.get("cache_read", 0) or 0)
     cache_w = int(rec.get("cache_write", 0) or 0)
     prompt_total = in_tok + cache_r + cache_w
-    if prompt_total > 0 and cache_r:
+    # This row IS turn-level — `cache_read` / `input_tokens` are the whole
+    # turn's summed billing — so the absorbing turn-level flag is the right
+    # gate here and stays (contrast the last-call rows above).
+    if prompt_total > 0 and cache_r and not input_unknown:
         cpct = cache_r / prompt_total * 100
         lines.append(f"• Cached: {_humanize_tok(cache_r)}/{_humanize_tok(prompt_total)} {_cache_health(cpct)} {cpct:.0f}%")
 
-    if length > 0:
+    if last_call_unknown:
+        # ``context_used`` is the final call's provider prompt count. When THAT
+        # call's count is unmeasured, a normalized zero or partial cache
+        # component is not a context-window measurement and must not produce a
+        # numeric %. Gated on the final call's own flag, not the turn-level OR.
+        suffix = f"/{_humanize_tok(length)}" if length > 0 else ""
+        lines.append(
+            f"• Context window (last call): {_humanize_tok(0, unknown=True)}{suffix}"
+        )
+    elif length > 0:
         # Clamp at 100%: last_prompt tokens can transiently overshoot the model
         # max during streaming or before compression fires — users must never
         # see >100% "of model max" (mirrors the clamp in agent/display.py,
