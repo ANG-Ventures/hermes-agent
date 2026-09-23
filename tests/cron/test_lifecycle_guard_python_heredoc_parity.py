@@ -97,3 +97,42 @@ def test_read_text_piped_to_os_system_is_executable(tmp_path):
     data.write_text("hermes gateway " + "re" + "start\n")
     body = f"from pathlib import Path\nimport os\nos.system(Path('{data}').read_text())\n"
     assert guard(f"python3 - <<'PY'\n{body}PY", cwd=str(tmp_path))
+
+
+def test_open_loop_parser_name_does_not_change_file_parity(tmp_path):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = (
+        "import json\n"
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    try: rec=json.loads(line)\n"
+        "    except: continue\n"
+        "    if rec.get('type')!='intake': continue\n"
+        "    print(rec['repo'].lower())\n"
+    )
+    script = tmp_path / "diagnose.py"
+    script.write_text(body)
+    assert not guard(f"python3 {script}", cwd=str(tmp_path))
+    assert not guard(f"python3 - <<'PY'\n{body}PY", cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("prefix,inside", [
+    ("json.loads = print\n", "    print(d)\n"),
+    ("setattr(json, 'loads', print)\n", "    print(d)\n"),
+    ("print = len\n", "    print(line)\n"),
+    ("len = print\n", "    len(line)\n"),
+    ("reversed = print\n", "    print(d)\n"),
+    ("open = print\n", "    print(d)\n"),
+    ("seen = type('Reader', (), {'add': print})()\n", "    seen.add(line)\n"),
+    ("out = type('Reader', (), {'append': print})()\n", "    out.append(line)\n"),
+    ("", "    d = type('Reader', (), {'get': print})()\n    d.get(line)\n"),
+])
+def test_open_loop_rebound_callable_does_not_hide_log(tmp_path, prefix, inside):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = (
+        "import json\n" + prefix
+        + f"for line in reversed(open('{log}').read().splitlines()):\n"
+        + "    d=json.loads(line)\n" + inside
+    )
+    assert guard(f"python3 - <<'PY'\n{body}PY", cwd=str(tmp_path))
