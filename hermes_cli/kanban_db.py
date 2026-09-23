@@ -1357,6 +1357,98 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
 
 _WORKER_LOG_TAIL_BYTES = 4096
 
+# The per-task worker log is opened APPEND across runs (see ``_default_spawn``),
+# so a byte window into it spans MULTIPLE runs. Anything that needs "what THIS
+# run said" must segment the file first: the dispatcher stamps a boundary line
+# immediately before each spawn, and the segment is everything after the LAST
+# one. Without this, a tail-based fingerprint is a size-dependent slice of all
+# runs concatenated — it silently compares run 1 against itself forever below
+# the window size, and cannot see a repeat at all just under it.
+_RUN_BOUNDARY_PREFIX = "[hermes-kanban-run-boundary "
+
+# How far back to look for the boundary. Real worker runs on this board measure
+# ~2-3 KB; 64 KiB covers an order of magnitude more. A run whose output exceeds
+# it has no findable boundary, and the segment reader returns None rather than
+# guessing — an unsegmentable run must never be fingerprinted.
+_WORKER_LOG_SEGMENT_BYTES = 65536
+
+# Lines whose content varies per run even when the run did the SAME thing.
+# They must not contribute to a run fingerprint or every run looks distinct.
+_RUN_VARYING_LINE_MARKERS = ("session_id:",)
+
+
+def _stamp_worker_log_run_boundary(log_path: Path) -> None:
+    """Append a unique run-boundary line to a worker log before spawning.
+
+    Best-effort: a log that cannot be written just yields an unsegmentable
+    run later (no fingerprint, full retry budget), never a failed spawn.
+
+    The nonce makes the boundary unforgeable from inside the worker — a worker
+    that echoed a predictable marker could otherwise truncate its own segment
+    down to a short constant and fake a reproduced no-op.
+    """
+    try:
+        import secrets
+        with open(log_path, "ab") as fh:
+            fh.write(
+                f"\n{_RUN_BOUNDARY_PREFIX}{secrets.token_hex(8)}]\n".encode("utf-8")
+            )
+    except OSError:
+        pass
+
+
+def _worker_log_run_segment(
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Return only the CURRENT run's slice of a worker's append-mode log.
+
+    ``None`` when the run cannot be isolated (no log, no boundary in the
+    window, empty segment). Callers must treat ``None`` as "no evidence",
+    never as "same as last time".
+    """
+    try:
+        path = worker_logs_dir(board=board) / f"{task_id}.log"
+        with path.open("rb") as log_f:
+            log_f.seek(0, os.SEEK_END)
+            size = log_f.tell()
+            log_f.seek(max(0, size - _WORKER_LOG_SEGMENT_BYTES))
+            raw = log_f.read(_WORKER_LOG_SEGMENT_BYTES)
+        text = raw.decode("utf-8", errors="replace")
+        idx = text.rfind(_RUN_BOUNDARY_PREFIX)
+        if idx < 0:
+            return None
+        newline = text.find("\n", idx)
+        if newline < 0:
+            return None
+        segment = text[newline + 1:].strip()
+        return segment or None
+    except OSError:
+        return None
+    except Exception:
+        _log.debug("failed to segment worker log for %s", task_id, exc_info=True)
+        return None
+
+
+def _run_output_fingerprint(segment: Optional[str]) -> str:
+    """Fingerprint ONE run's output; "" when there is nothing comparable.
+
+    Taken from the END of the run, not the start: the constant startup banner
+    is identical on every run, so a head-anchored fingerprint says "identical"
+    about two runs that did completely different work. The worker's last words
+    are the part that actually distinguishes a reproduced no-op from two
+    unrelated paperwork misses.
+    """
+    if not segment:
+        return ""
+    kept = [
+        line for line in segment.splitlines()
+        if not any(marker in line for marker in _RUN_VARYING_LINE_MARKERS)
+    ]
+    normalized = " ".join(" ".join(kept).split())
+    return normalized[-400:]
+
 
 def _worker_log_stderr_tail(
     task_id: str,
@@ -6418,6 +6510,11 @@ def goal_run_status(
         terminal_status = (
             {
                 "completed": "done",
+                # A superseded close IS a completion by this worker — it just
+                # had no work to do. Without an entry here the literal
+                # 'superseded' falls through and collides with this function's
+                # OWN use of that string below to mean "ownership lost".
+                "superseded": "done",
                 "review_requested": "review",
                 "changes_requested": "changes_requested",
                 "blocked": "blocked",
@@ -12216,12 +12313,24 @@ _PROTOCOL_VIOLATION_REPRODUCED_LIMIT = 2
 
 
 def _violation_output_fingerprint(metadata: dict) -> str:
-    """Normalized captured worker output of a violation run; "" when absent.
+    """Per-run fingerprint of a violation run's own output; "" when absent.
+
+    Reads ONLY ``run_output_fingerprint``, which ``detect_crashed_workers``
+    computes from the boundary-delimited segment for that one run. It
+    deliberately does NOT fall back to ``stderr_tail``: that field is a raw
+    byte window into the APPEND-mode per-task log, so it spans every run of the
+    task, and comparing two of them answers a different question than "did this
+    worker reproduce itself". Both ways it lies — below the window size the
+    window starts at byte 0 every run, so the same leading bytes compare EQUAL
+    across genuinely different work; just under it the window straddles a run
+    boundary differently each time, so a true repeat compares UNEQUAL.
 
     Absent output must never compare equal: two runs with nothing recorded say
-    nothing about each other, so the early trip stays off for them.
+    nothing about each other, so the early trip stays off for them. Runs
+    recorded before the segment existed have no ``run_output_fingerprint`` and
+    therefore never trip it either.
     """
-    raw = metadata.get("stderr_tail") or metadata.get("worker_output") or ""
+    raw = metadata.get("run_output_fingerprint") or ""
     return " ".join(str(raw).split())[:400]
 
 
@@ -12401,12 +12510,19 @@ def detect_crashed_workers(
                 }
                 # The worker's own last words are what distinguishes a
                 # REPRODUCED no-op ("nothing to implement, already on main")
-                # from three unrelated paperwork misses. Without capturing it
-                # here, _violation_output_fingerprint has nothing to compare
-                # and the early trip can never fire.
+                # from three unrelated paperwork misses. The per-task log is
+                # APPEND-mode across runs, so a raw tail of it is a slice of
+                # every run concatenated; fingerprint the boundary-delimited
+                # segment for THIS run instead. An unsegmentable run yields no
+                # fingerprint at all, which keeps the early trip off.
                 stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
                 if stderr_tail:
                     event_payload["stderr_tail"] = stderr_tail
+                run_fingerprint = _run_output_fingerprint(
+                    _worker_log_run_segment(row["id"], board=board)
+                )
+                if run_fingerprint:
+                    event_payload["run_output_fingerprint"] = run_fingerprint
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
@@ -15471,6 +15587,12 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+
+    # Segment the append-mode log so the reaper can fingerprint THIS run's
+    # output alone. Stamped AFTER rotation (a rotated log starts fresh, and
+    # its first run still needs a boundary) and BEFORE Popen, so everything
+    # the child writes lands after it.
+    _stamp_worker_log_run_boundary(log_path)
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
