@@ -1,0 +1,1 @@
+{"slices":[{"job_id":"core-smoke","core":true,"estimated_duration_s":10},{"job_id":"slice-0","core":false,"estimated_duration_s":30}],"e2e":{"job_id":"e2e","estimated_duration_s":10}}

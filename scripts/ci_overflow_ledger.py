@@ -1,0 +1,221 @@
+"""CAS-backed admission ledger for CI overflow; no credential handling here."""
+from __future__ import annotations
+
+import base64
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import time
+
+from scripts.ci_overflow_plan import ARM, POOL, X64, JobPlacement, Plan
+
+BRANCH = "ci-overflow-ledger"
+PATH = "state.json"
+SOFT_LIMIT = 400 * 1024
+HARD_LIMIT = 500 * 1024
+
+
+@dataclass(frozen=True)
+class Reservation:
+    plan: Plan
+    existing: bool = False
+
+
+@dataclass(frozen=True)
+class Refusal:
+    incident: str
+
+
+@dataclass(frozen=True)
+class ReleaseResult:
+    released_minutes: int
+    incident: str | None = None
+
+
+def _encode(state):
+    return json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _ident(key):
+    if len(key) != 3 or any(type(x) is not int or x <= 0 for x in key):
+        raise ValueError("invalid attempt key")
+    return ":".join(map(str, key))
+
+
+def _plan(raw):
+    return Plan([JobPlacement(**item) for item in raw["jobs"]], raw["incidents"], raw["summary"])
+
+
+class Ledger:
+    def __init__(self, api, *, daily_limit=0, clock=None):
+        self.api = api
+        self.daily_limit = daily_limit if type(daily_limit) is int and daily_limit >= 0 else 0
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _read(self):
+        response = self.api.get(PATH, params={"ref": BRANCH})
+        if not isinstance(response, dict) or not isinstance(response.get("sha"), str) or response.get("encoding") != "base64":
+            raise ValueError("invalid Contents response")
+        data = json.loads(base64.b64decode(response["content"], validate=True))
+        if (type(data) is not dict or data.get("version") != 1 or type(data.get("attempts")) is not dict
+                or type(data.get("daily_totals")) is not dict):
+            raise ValueError("corrupt ledger")
+        for row in data["attempts"].values():
+            if (type(row) is not dict or type(row.get("admitted_on")) is not str or
+                    type(row.get("jobs")) is not list or "terminal_on" not in row):
+                raise ValueError("corrupt admission")
+        return data, response["sha"]
+
+    def _write(self, state, sha):
+        return self.api.put(PATH, {"branch": BRANCH, "sha": sha,
+            "message": "ci overflow ledger admission/reconciliation", "content": base64.b64encode(_encode(state)).decode()})
+
+    def _today(self):
+        now = self.clock()
+        if now.tzinfo is None:
+            raise ValueError("ledger clock must be timezone aware")
+        return now.astimezone(timezone.utc).date().isoformat()
+
+    @staticmethod
+    def _consumed(state, day):
+        consumed = int(state["daily_totals"].get(day, 0))
+        for record in state["attempts"].values():
+            admitted = record["admitted_on"]
+            if admitted > day:
+                continue
+            terminal = record["terminal_on"]
+            if admitted != day and terminal is not None and terminal < day:
+                continue
+            consumed += sum(j["reserved_minutes"] for j in record["jobs"] if not j.get("released_unemitted", False))
+        return consumed
+
+    @staticmethod
+    def _compact(state, day):
+        for key, row in list(state["attempts"].items()):
+            terminal = row["terminal_on"]
+            if terminal and (datetime.fromisoformat(day).date() - datetime.fromisoformat(terminal).date()).days >= 30:
+                amount = sum(j["reserved_minutes"] for j in row["jobs"] if not j.get("released_unemitted", False))
+                state["daily_totals"][row["admitted_on"]] = state["daily_totals"].get(row["admitted_on"], 0) + amount
+                del state["attempts"][key]
+
+    def reserve(self, key, plan: Plan) -> Reservation | Refusal:
+        ident = _ident(key)
+        if (len({j.job_id for j in plan.jobs}) != len(plan.jobs)
+                or len(plan.jobs) > 18
+                or sum(j.reserved_minutes for j in plan.jobs) > 615
+                or any(j.labels not in (POOL, X64, ARM) or
+                       (j.labels == POOL and j.reserved_minutes != 0) or
+                       (j.labels != POOL and j.reserved_minutes != (20 if j.job_id == "e2e" else 35))
+                       for j in plan.jobs)):
+            return Refusal("invalid-plan")
+        started = time.monotonic()
+        for _ in range(3):
+            if time.monotonic() - started >= 10:
+                break
+            try:
+                state, sha = self._read()
+            except (Exception):
+                return Refusal("ledger-unavailable")
+            if ident in state["attempts"]:
+                raw = state["attempts"][ident]["plan"]
+                return Reservation(_plan(raw), True)
+            today = self._today()
+            if len(_encode(state)) >= SOFT_LIMIT:
+                self._compact(state, today)
+            if len(_encode(state)) >= HARD_LIMIT:
+                return Refusal("state-capacity")
+            remaining = max(0, self.daily_limit - self._consumed(state, today))
+            jobs = []
+            for job in plan.jobs:
+                if job.reserved_minutes and remaining >= job.reserved_minutes:
+                    remaining -= job.reserved_minutes
+                    jobs.append(job)
+                elif job.reserved_minutes:
+                    reason = "budget-overrides-cloud-only" if plan.summary.get("mode") == "cloud-only" else "budget-queue"
+                    jobs.append(JobPlacement(job.job_id, POOL.copy(), reason, 0))
+                else:
+                    jobs.append(job)
+            summary = dict(plan.summary)
+            summary.update(remaining_allowance=remaining, reserved_minutes=sum(j.reserved_minutes for j in jobs),
+                           budget_overrides_cloud_only=any(j.reason == "budget-overrides-cloud-only" for j in jobs))
+            decided = Plan(jobs, plan.incidents, summary)
+            state["attempts"][ident] = {"admitted_on": today, "terminal_on": None,
+                "jobs": [{**asdict(j), "released_unemitted": False} for j in jobs], "plan": asdict(decided)}
+            if len(_encode(state)) >= HARD_LIMIT:
+                return Refusal("state-capacity")
+            try:
+                self._write(state, sha)
+                return Reservation(decided)
+            except Exception as exc:
+                # A lost response may be a successful write. Always re-read the key.
+                try:
+                    current, _ = self._read()
+                    if ident in current["attempts"]:
+                        return Reservation(_plan(current["attempts"][ident]["plan"]), True)
+                except Exception:
+                    return Refusal("ledger-unavailable")
+                if getattr(exc, "status", None) not in (409, 422):
+                    return Refusal("ledger-unavailable")
+        return Refusal("ledger-contention")
+
+    def reconcile(self, key, jobs) -> ReleaseResult:
+        ident = _ident(key)
+        if (not isinstance(jobs, dict) or any(jobs.get(field) != value for field, value in
+                zip(("repository_id", "run_id", "run_attempt"), key))):
+            return ReleaseResult(0)
+        started = time.monotonic()
+        for _ in range(3):
+            if time.monotonic() - started >= 10:
+                break
+            try:
+                state, sha = self._read()
+            except Exception:
+                return ReleaseResult(0, "ledger-unavailable")
+            row = state["attempts"].get(ident)
+            if row is None or jobs.get("status") != "completed" or jobs.get("complete") is not True:
+                return ReleaseResult(0)
+            observed = jobs.get("jobs")
+            if not isinstance(observed, list) or any(not isinstance(j, dict) or not isinstance(j.get("name"), str) for j in observed):
+                return ReleaseResult(0)
+            names = [j["name"] for j in observed]
+            if len(names) != len(set(names)) or any(j.get("status") not in {"queued", "in_progress", "completed", "cancelled"} for j in observed):
+                return ReleaseResult(0)
+            mapping = {j["name"]: j for j in observed}
+            to_release = []
+            for entry in row["jobs"]:
+                if not entry["reserved_minutes"] or entry.get("released_unemitted"):
+                    continue
+                job = mapping.get(entry["job_id"])
+                if job is None:
+                    to_release.append(entry)
+                elif job.get("labels") == POOL and job.get("runner_name"):
+                    to_release.append(entry)
+                # Hosted, canceled, or ambiguous runner identity: no refund.
+            day = self._today()
+            changed = bool(to_release) or row["terminal_on"] is None
+            if not changed:
+                return ReleaseResult(0)
+            row["terminal_on"] = day
+            receipt = hashlib.sha256(_encode(observed)).hexdigest()
+            amount = 0
+            for entry in to_release:
+                entry["released_unemitted"] = True
+                entry["release_receipt_sha256"] = receipt
+                amount += entry["reserved_minutes"]
+            try:
+                self._write(state, sha)
+                return ReleaseResult(amount)
+            except Exception as exc:
+                try:
+                    current, _ = self._read()
+                    check = current["attempts"].get(ident)
+                    if check and check["terminal_on"] and all(any(
+                            j["job_id"] == e["job_id"] and j.get("released_unemitted")
+                            for j in check["jobs"]) for e in to_release):
+                        return ReleaseResult(0)
+                except Exception:
+                    return ReleaseResult(0, "ledger-unavailable")
+                if getattr(exc, "status", None) not in (409, 422):
+                    return ReleaseResult(0, "ledger-unavailable")
+        return ReleaseResult(0, "ledger-contention")
