@@ -16,6 +16,8 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import time
 from contextvars import Context
 from pathlib import Path
@@ -297,6 +299,7 @@ _BENIGN_DECLINE_FIELDS = (
 # that additionally tripped the circuit breaker (broken venv / PATH / credential
 # loss → repeated spawn_failed). Either forces the tick to count.
 _FAULT_FIELDS = (
+    "workspace_refused",
     "spawn_failed",
     "auto_blocked",
 )
@@ -323,6 +326,96 @@ def _format_respawn_guarded_summary(guarded) -> str:
         for reason, task_ids in grouped.items()
     )
     return f"respawn_guarded={len(entries)} ({details})"
+
+
+def _format_workspace_refused_summary(refused) -> str:
+    """Format mount-admission refusals by stable reason for the tick log."""
+    entries = list(refused or [])
+    if not entries:
+        return "workspace_refused=0"
+    grouped: dict[str, list[str]] = {}
+    for task_id, detail in entries:
+        reason = str(detail).split(":", 1)[0]
+        grouped.setdefault(reason, []).append(str(task_id))
+    details = "; ".join(
+        f"{reason}: {', '.join(sorted(task_ids))}"
+        for reason, task_ids in sorted(grouped.items())
+    )
+    return f"workspace_refused={len(entries)} ({details})"
+
+
+class _WorkspaceRefusalOutageNotifier:
+    """Latch one successfully delivered page per board outage."""
+
+    def __init__(self) -> None:
+        self._delivered: set[str] = set()
+
+    def observe(self, board: str, refused, send: Callable[[str, str], bool]) -> bool:
+        entries = list(refused or [])
+        if not entries:
+            self._delivered.discard(board)
+            return False
+        if board in self._delivered:
+            return False
+        summary = _format_workspace_refused_summary(entries)
+        if not send(board, summary):
+            return False
+        self._delivered.add(board)
+        return True
+
+
+def _send_workspace_refusal_alert(board: str, summary: str) -> bool:
+    """Best-effort #alerts page through the fleet notify boundary."""
+    candidates = (
+        Path.home() / ".hermes" / "scripts" / "notify.py",
+        Path.home() / ".hermes" / "skills-shared" / "general" / "scheduler" / "scripts" / "notify.py",
+        Path.home() / ".hermes" / "skills" / "devops" / "scheduler" / "scripts" / "notify.py",
+    )
+    script = next((path for path in candidates if path.is_file()), None)
+    if script is None:
+        logger.error("kanban dispatcher: notify.py unavailable; workspace outage page not delivered")
+        return False
+    message = (
+        "🛑 **Kanban dispatcher** · Workspace admission refused\n"
+        f"Board: `{board}`\n{summary}\n"
+        "The dispatcher refused before spawn; inspect the configured workspace mount. "
+        "No durable-disk fallback was created."
+    )
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, str(script), "--send", message,
+                "--channel", "discord", "--profile", "default", "--sev", "error",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception:
+        logger.exception("kanban dispatcher: workspace outage page failed")
+        return False
+    if proc.returncode != 0:
+        logger.error(
+            "kanban dispatcher: workspace outage page not delivered (rc=%d)",
+            proc.returncode,
+        )
+        return False
+    return True
+
+
+def _observe_workspace_refusal_outages(notifier, results) -> int:
+    """Process one full dispatcher tick; skipped boards do not imply recovery."""
+    delivered = 0
+    for board, result in results or []:
+        if result is None:
+            continue
+        refused = getattr(result, "workspace_refused", None) or []
+        delivered += int(
+            notifier.observe(board, refused, _send_workspace_refusal_alert)
+        )
+    return delivered
 
 
 def _stall_streak_is_bad(ready_pending, any_spawned, results) -> bool:
@@ -1955,6 +2048,8 @@ class GatewayKanbanWatchersMixin:
         # decision can legitimately sit for hours; warn every 5 min per board
         # rather than every tick.
         last_stranded_warn_at: dict[str, int] = {}
+        last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
+        workspace_refusal_notifier = _WorkspaceRefusalOutageNotifier()
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -2281,6 +2376,14 @@ class GatewayKanbanWatchersMixin:
                     if _ad_enabled:
                         await service(_auto_decompose_tick, _ad_per_tick)
                     results = await service(_tick_once)
+                    # Notification is off-loop. A failed delivery leaves the
+                    # outage unlatched so the next tick retries; an empty
+                    # successful board result rearms after recovery.
+                    await service(
+                        _observe_workspace_refusal_outages,
+                        workspace_refusal_notifier,
+                        results,
+                    )
                     any_spawned = False
                     for slug, res in (results or []):
                         spawned = getattr(res, "spawned", None) if res is not None else None
@@ -2289,8 +2392,21 @@ class GatewayKanbanWatchersMixin:
                             getattr(res, "parent_satisfied_sticky", None)
                             if res is not None else None
                         )
+                        refused = getattr(res, "workspace_refused", None) if res is not None else None
                         if spawned:
                             any_spawned = True
+                        if refused:
+                            summary = _format_workspace_refused_summary(refused)
+                            now_s = int(time.time())
+                            previous_summary, previous_at = (
+                                last_workspace_refusal_warn.get(slug, ("", 0))
+                            )
+                            if summary != previous_summary or now_s - previous_at >= 300:
+                                logger.error(
+                                    "kanban dispatcher tick [%s]: %s",
+                                    slug, summary,
+                                )
+                                last_workspace_refusal_warn[slug] = (summary, now_s)
                         if res is not None and (spawned or guarded or parent_satisfied_sticky):
                             # Quiet by default — log only actionable tick activity,
                             # including guarded tasks and satisfied dependency graphs
