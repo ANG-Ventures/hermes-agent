@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sqlite3
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -133,6 +134,24 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        self._load_latched = False
+
+    def load_fence_active(self) -> bool:
+        """Pause new macOS worker spawns above 80% of core-count load; resume below 75%."""
+        if sys.platform != "darwin":
+            return False
+        try:
+            load1, _, _ = os.getloadavg()
+            cores = os.cpu_count()
+        except OSError:
+            return self._load_latched
+        if not cores:
+            return self._load_latched
+        if self._load_latched:
+            self._load_latched = load1 >= cores * 0.75
+        else:
+            self._load_latched = load1 > cores * 0.80
+        return self._load_latched
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -182,11 +201,19 @@ class _KanbanDispatcher:
         if not self._quarantine_lifted(slug, fingerprint):
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        load_held = self.load_fence_active()
+        if load_held:
+            # Zero is the existing no-spawn budget: dispatch_once still reclaims,
+            # promotes and reconciles on every board while workers drain.
+            kwargs["max_spawn"] = 0
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(conn, board=slug, **kwargs)
+            result = _kbd().dispatch_once(conn, board=slug, **kwargs)
+            if load_held and result is not None:
+                result.memory_pressure = "load"
+            return result
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
