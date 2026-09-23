@@ -4313,6 +4313,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    forced_status: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -4599,6 +4600,22 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif forced_status:
+                    # Fan-out brake: a policy layer (kanban_worker_policy) has
+                    # decided this creation must PARK rather than queue — e.g.
+                    # a dispatched worker creating a child card. Parent ids are
+                    # still validated so the link rows can't dangle, but no
+                    # parent-gated promotion applies: the card sits until a
+                    # human moves it.
+                    if forced_status not in VALID_STATUSES:
+                        raise ValueError(
+                            f"forced_status must be one of {sorted(VALID_STATUSES)}"
+                        )
+                    task_status = forced_status
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                 elif triage:
                     task_status = "triage"
                 else:
@@ -4719,6 +4736,18 @@ def create_task(
                         task_id,
                         flagship_override_author or created_by or "operator",
                         override_comment(flagship_override_reason),
+                    )
+                if forced_status and task_status == forced_status:
+                    # Audit the brake on the card itself so the park is
+                    # explicable without reading config: WHY this card is not
+                    # in ``ready``, and which knob restores the old behaviour.
+                    from hermes_cli import kanban_worker_policy as _kwp
+
+                    _append_event(
+                        conn,
+                        task_id,
+                        "parked_by_policy",
+                        _kwp.park_event_payload(task_status),
                     )
                 if task_status == "blocked":
                     # Tag the source so dependency resolution can distinguish
@@ -11330,6 +11359,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    budget_paused: bool = False
+    """True when this board spawned nothing because its rolling-window worker
+    spend has reached ``kanban.budget.usd_per_24h``. Reclaim / promotion /
+    bookkeeping still ran — only NEW spawns are withheld, and they resume
+    automatically once the window rolls the spend back under the ceiling."""
     parent_satisfied_sticky: list[str] = field(default_factory=list)
     """Explicitly blocked task ids that have one or more ``blocks`` parents
     and whose parents are all terminal. The graph is satisfied, but the
@@ -13850,6 +13884,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    budget_cache: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -13887,6 +13922,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             pr_gate_prefetch=pr_gate_prefetch,
+            budget_cache=budget_cache,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -13911,6 +13947,7 @@ def dispatch_once(
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
                 pr_gate_prefetch=pr_gate_prefetch,
+                budget_cache=budget_cache,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -13980,6 +14017,7 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     pr_gate_prefetch=None,
+    budget_cache: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -14083,6 +14121,36 @@ def _dispatch_once_locked(
     # Computed AFTER recompute_ready so anything promotable this tick has
     # already left ``todo`` and can't be mis-reported as stranded.
     result.stranded_by_triage = find_stranded_by_triage(conn)
+
+    # Fan-out brake: per-board rolling-window USD ceiling. Evaluated AFTER all
+    # reclaim/promotion bookkeeping so a paused board stays accurate on the
+    # dashboard, and BEFORE any spawn decision so the pause actually withholds
+    # workers. Fail-open by construction (see evaluate_board_budget): a cost
+    # measurement fault must never halt the host.
+    #
+    # Skipped entirely under ``dry_run``: the documented SAFE probe must not
+    # write a pause marker or fire a real page about a tick it only observes.
+    # (Same rule the review-stale detector follows.)
+    if not dry_run:
+        try:
+            from hermes_cli import kanban_budget as _kbudget
+
+            # Single-board addressing, NOT enumeration — do not wrap in
+            # enumerating_boards(); that would suppress exactly the pin-vs-board
+            # contradiction warning this lookup should surface.
+            if _kbudget.evaluate_board_budget(
+                board,
+                kanban_db_path(board=board),
+                board_dir(board),
+                cache=budget_cache,
+            ):
+                result.budget_paused = True
+                return result
+        except Exception as exc:
+            _log.warning(
+                "kanban dispatch: budget gate failed (%s: %s); continuing tick",
+                type(exc).__name__, exc,
+            )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full

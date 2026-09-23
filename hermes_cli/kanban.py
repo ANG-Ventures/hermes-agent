@@ -831,6 +831,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_budget = sub.add_parser(
+        "budget",
+        help="Report per-board 24h worker spend against kanban.budget.usd_per_24h",
+    )
+    p_budget.add_argument(
+        "--board", dest="budget_board", default=None,
+        help="Report a single board instead of every board.",
+    )
+    p_budget.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON",
+    )
+
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
@@ -1403,6 +1415,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "budget":   _cmd_budget,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1944,6 +1957,8 @@ def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_worker_policy as _kwp
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -1995,6 +2010,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 initial_status=getattr(args, "initial_status", "running"),
+                forced_status=_kwp.resolve_park_status(
+                    initial_status=getattr(args, "initial_status", "running"),
+                    triage=bool(getattr(args, "triage", False)),
+                ),
             )
             task = kb.get_task(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
@@ -2022,6 +2041,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_budget(args: argparse.Namespace) -> int:
+    """Read-only spend report. Never writes a pause marker or pages."""
+    from hermes_cli import kanban_budget as kbudget
+
+    rows = kbudget.board_budget_report(getattr(args, "budget_board", None))
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    print(kbudget.format_budget_report(rows))
+    if rows and rows[0].get("ceiling_usd") is None:
+        print(
+            "\nNo ceiling configured — set kanban.budget.usd_per_24h in "
+            "config.yaml to brake runaway fan-out."
+        )
     return 0
 
 
@@ -3415,6 +3451,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "review_awaiting_human": review_awaiting,
             "reclaimed": res.reclaimed,
             "skipped_locked": res.skipped_locked,
+            "budget_paused": getattr(res, "budget_paused", False),
             "lock_holder": res.lock_holder,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
@@ -3471,6 +3508,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         return 0
     if res.skipped_locked:
         print(kb.format_dispatch_lock_skip(res.lock_holder))
+    if getattr(res, "budget_paused", False):
+        # Loud: otherwise a budget-paused board prints "Spawned: 0" and is
+        # byte-identical to an idle board — the exact false negative the
+        # stranded-by-triage banner exists to prevent.
+        print(
+            "BUDGET PAUSED — this board's rolling-window worker spend has "
+            "reached kanban.budget.usd_per_24h; no new workers spawned. "
+            "Details: hermes kanban budget"
+        )
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:

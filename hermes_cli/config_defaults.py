@@ -3084,6 +3084,39 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
+        # ~200 human-carded items became ~730 worked cards / ~$13K in two
+        # days: dispatched workers created 310 child cards via kanban_create
+        # and every one auto-dispatched, whose workers created more. The
+        # split-on-new-defect rule is right; the UNBOUNDED auto-dispatch of
+        # worker-created cards was the defect.
+        #
+        # Status a card lands in when its creator is a DISPATCHED WORKER (the
+        # env marker HERMES_KANBAN_TASK, not the profile name). "triage" is
+        # the one status no automation ever clears, so a human must promote
+        # the card before a worker spends on it. Any VALID_STATUSES value is
+        # accepted; "ready" restores the pre-brake behaviour exactly. Cards
+        # created by a human/orchestrator are untouched, as are explicit
+        # initial_status=blocked holds.
+        "worker_created_status": "triage",
+        # Rolling-window USD ceiling on a board's worker spend. Concurrency
+        # caps above bound how many workers run AT ONCE; they say nothing
+        # about what a long fan-out costs in total. When the board's spend in
+        # the window reaches the ceiling, the dispatcher stops spawning for
+        # that board (reclaim/promotion bookkeeping still runs), writes
+        # <board dir>/.budget_paused.json, and pages ONCE per pause episode.
+        # Spawning resumes automatically as the window rolls spend back under
+        # the ceiling. Spend is measured read-only from the per-profile
+        # blackbox turn ledgers; see hermes_cli/kanban_budget.py.
+        "budget": {
+            # null = OFF (no ceiling). A float sets the ceiling in USD.
+            "usd_per_24h": None,
+            # Channel the pause page names. The page itself goes out through
+            # scripts/notify.py --sev warn.
+            "page_channel": "#alerts",
+            # Rolling window the spend is summed over.
+            "window_hours": 24,
+        },
     # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
     # Re-homed here from hermes_cli/config.py when upstream extracted
     # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
