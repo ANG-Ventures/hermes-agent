@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -160,3 +162,50 @@ def test_cron_store_cannot_erase_flagship_reason(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="--allow-flagship"):
         update_job(job["id"], {"allow_flagship_reason": None})
     assert get_job(job["id"])["allow_flagship_reason"] == "incident"
+
+
+@pytest.mark.parametrize("creator_model", ["claude-opus-5", "claude-fable-5", None])
+def test_interleaved_turn_cannot_auto_pin_other_agents_flagship(tmp_path, monkeypatch, caplog, creator_model):
+    """Tool-executor admission must bind the creator, not the last published turn."""
+    from agent import tool_executor as te
+    from tools import cronjob_tools as ct
+    from tools.thread_context import propagate_context_to_thread
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"cron": {"default_model": "auto"}})
+    monkeypatch.setattr("agent.relay_tools.execute", lambda name, args, dispatch, **kw: (dispatch(args), args))
+    monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", lambda name, args, **kw: SimpleNamespace(payload=args, trace=[]))
+    monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", lambda name, args, dispatch, **kw: dispatch(args))
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", lambda *a, **kw: (None, None))
+    monkeypatch.setattr(te, "_begin_tool_execution", lambda *a, **kw: None)
+    monkeypatch.setattr(te, "_emit_terminal_post_tool_call", lambda *a, **kw: None)
+    agent = SimpleNamespace(
+        model=creator_model, provider="claude-apr", session_id="creator-A",
+        _current_turn_id="turn-A", _current_api_request_id="",
+        _tool_guardrails=SimpleNamespace(before_call=lambda *a: SimpleNamespace(allows_execution=True)),
+        _touch_activity=lambda *a: None,
+    )
+    try:
+        ct.set_current_agent_model(agent.provider, agent.model)  # turn A publishes
+        ct.set_current_agent_model("claude-apr", "gpt-6-astra-900k")  # turn B interleaves
+        with caplog.at_level(logging.INFO), ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(propagate_context_to_thread(
+                lambda: te._run_agent_tool_execution_middleware(
+                    agent, function_name="cronjob",
+                    function_args={"action": "create", "schedule": "every 1h", "prompt": "Check status"},
+                    effective_task_id="A", tool_call_id="cron-A", execute=lambda args: ct.cronjob(**args),
+                )
+            )).result(timeout=15)
+        created = json.loads(result.result)
+        assert created["success"] is True
+        job = get_job(created["job_id"])
+        assert job is not None
+        assert job["model"] == creator_model
+        if creator_model == "claude-fable-5":
+            assert job["allow_flagship_reason"].startswith("auto-pin:")
+            assert any("flagship override: cron" in record.message for record in caplog.records)
+        else:
+            assert not job.get("allow_flagship_reason")
+            assert not any("flagship override: cron" in record.message for record in caplog.records)
+    finally:
+        ct.set_current_agent_model(None, None)
