@@ -1,4 +1,0 @@
-# Derived runner image: VM-parity capabilities for the hermes heavy suite
-# (node20+npm for desktop/spectrum tests, lsof for pidfile tests, pulse utils for audio detection)
-FROM myoung34/github-runner:ubuntu-noble
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -  && apt-get install -y --no-install-recommends nodejs lsof pulseaudio-utils ripgrep  && apt-get clean && rm -rf /var/lib/apt/lists/*  && node --version && npm --version
