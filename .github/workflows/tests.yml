@@ -126,6 +126,10 @@ jobs:
     if: github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # A dead placement (checkout/runner failure, 5-min kill) must not fail the
+    # required check: the fallback already ran every slice locally. Only a
+    # validated plan ever writes plan_valid=true, so this cannot admit one.
+    continue-on-error: true
     permissions:
       contents: read
     outputs:

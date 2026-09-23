@@ -183,6 +183,8 @@ PLACEMENT_OUTCOMES = {
     "failure": {"result": "failure", "outputs": {}},
     "timeout": {"result": "failure", "outputs": {}},
     "cancelled": {"result": "cancelled", "outputs": {}},
+    # job-level continue-on-error may surface a failed placement as success
+    "failure-continue-on-error": {"result": "success", "outputs": {}},
     # killed after writing plan_valid but job failed: must still fall back
     "failed-after-output": {"result": "failure", "outputs": {"plan_valid": "true", "matrix": json.dumps(PLACED),
                                                              "e2e_runs_on": json.dumps(X64)}},
@@ -286,6 +288,7 @@ def test_placement_job_shape_and_permissions_exact():
     assert job["runs-on"] == "ubuntu-latest"
     assert job["timeout-minutes"] == 5
     assert job["permissions"] == {"contents": "read"}
+    assert job["continue-on-error"] is True  # a dead placement must not fail required checks
     assert set(job["outputs"]) == {"matrix", "e2e_runs_on", "plan_valid"}
 
 
