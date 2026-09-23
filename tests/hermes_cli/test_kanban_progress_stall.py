@@ -42,9 +42,9 @@ def _reap_in_background(proc):
 
 def _wait_idle(pid, timeout=30.0):
     """Wait until the REAL probe reads idle on 6 consecutive samples."""
-    deadline, streak = time.time() + timeout, 0
-    while time.time() < deadline:
-        streak = 0 if kb._worker_has_active_child(pid) else streak + 1
+    deadline, streak = time.monotonic() + timeout, 0
+    while time.monotonic() < deadline:
+        streak = 0 if kb._worker_cpu_active(pid) else streak + 1
         if streak >= 6:
             return
         time.sleep(0.25)
@@ -138,7 +138,7 @@ def test_healthy_in_flight_wait_with_advancing_progress_is_never_reclaimed(board
     proc = _in_flight_worker(silent_server)
     try:
         # The real probe cannot tell this from a dead socket...
-        assert kb._worker_has_active_child(proc.pid) is False
+        assert kb._worker_cpu_active(proc.pid) is False
         # ...but the agent reports progress (turns completing) each window.
         tid = _running(board, now, proc.pid, progress_at=now - 120, started_ago=3000)
         for _ in range(30):  # 30 minute-ticks across a 50+ minute run
@@ -152,28 +152,68 @@ def test_healthy_in_flight_wait_with_advancing_progress_is_never_reclaimed(board
         proc.kill()
 
 
-def test_live_child_vetoes_stale_progress(board, monkeypatch):
-    """Healthy long tool call: idle parent, live child process."""
+def _stalled_worker_with_persistent_child(server):
+    """7914 shape + one persistent idle child (execute_code kernel / LSP server)."""
+    code = (
+        "import socket,subprocess,sys;"
+        "d=subprocess.DEVNULL;subprocess.Popen([sys.executable,'-c','import time;time.sleep(600)'],"
+        "stdin=d,stdout=d,stderr=d);"
+        "s=socket.create_connection(('127.0.0.1',int(sys.argv[1])));"
+        "s.sendall(b'POST /v1/messages HTTP/1.1\\r\\n\\r\\n');s.recv(1)"
+    )
+    port = server.getsockname()[1]
+    proc = _reap_in_background(subprocess.Popen([sys.executable, "-c", code, str(port)]))
+    server.settimeout(30)
+    conn, _ = server.accept()
+    conn.recv(64)
+    _in_flight_worker.conns.append(conn)
+    deadline, kids = time.monotonic() + 20, []
+    while time.monotonic() < deadline and not kids:
+        ps = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+        kids = [int(p) for p, pp in (l.split() for l in ps.splitlines()) if int(pp) == proc.pid]
+        time.sleep(0.1)
+    assert kids  # the persistent idle child really exists
+    _wait_idle(proc.pid)
+    return proc, kids
+
+
+def test_persistent_idle_child_does_not_hide_a_stall(board, monkeypatch, silent_server):
+    """Argus round 2: an any-child veto blinded the detector to every worker
+    holding a kernel/LSP child. Stale progress + idle child -> reclaimed at T+25."""
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
-    code = "import subprocess,sys,time;subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)']);time.sleep(120)"
-    parent = _reap_in_background(subprocess.Popen([sys.executable, "-c", code]))
+    proc, kids = _stalled_worker_with_persistent_child(silent_server)
     try:
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            ps = subprocess.run(["ps", "-A", "-o", "ppid="], capture_output=True, text=True).stdout
-            if str(parent.pid) in ps.split():
-                break
-            time.sleep(0.1)
-        time.sleep(2)  # let parent CPU decay: only the child must hold the veto
-        assert kb._worker_has_active_child(parent.pid) is True
-        tid = _running(board, now, parent.pid, progress_at=now - 1600)
+        tid = _running(board, now, proc.pid, progress_at=now - 900)
+        assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == []
+        assert _count(board, tid, "stalled") == 1  # stalled at T+15
+        now += 600
+        _heartbeat(board, tid, now - 1500)  # wrapper heartbeat fresh, progress frozen
+        assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == [tid]
+        assert kb.get_task(board, tid).status == "ready"  # reclaimed at T+25
+        proc.wait(timeout=10)
+    finally:
+        proc.kill()
+        for kid in kids:  # reparented once the worker dies; kill by pid
+            subprocess.run(["kill", "-9", str(kid)], stderr=subprocess.DEVNULL)
+
+
+def test_cpu_active_worker_vetoes_stale_progress(board, monkeypatch):
+    """A worker burning CPU (real process) is never flagged on one stale window."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    busy = _reap_in_background(subprocess.Popen([sys.executable, "-c", "while True: pass"]))
+    try:
+        deadline = time.monotonic() + 20  # time.time is frozen by the patch above
+        while time.monotonic() < deadline and not kb._worker_cpu_active(busy.pid):
+            time.sleep(0.2)
+        assert kb._worker_cpu_active(busy.pid) is True
+        tid = _running(board, now, busy.pid, progress_at=now - 1600)
         assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == []
         assert _count(board, tid, "stalled") == 0
         assert kb.get_task(board, tid).status == "running"
     finally:
-        subprocess.run(["pkill", "-P", str(parent.pid)])
-        parent.kill()
+        busy.kill()
 
 
 @pytest.mark.parametrize("failure", [
@@ -189,7 +229,7 @@ def test_process_probe_failure_never_authorizes_reclaim(board, monkeypatch, sile
         def broken(*_a, **_kw):
             raise failure
         monkeypatch.setattr(subprocess, "run", broken)
-        assert kb._worker_has_active_child(proc.pid) is True
+        assert kb._worker_cpu_active(proc.pid) is True
         tid = _running(board, now, proc.pid, progress_at=now - 1600)
         assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == []
         assert kb.get_task(board, tid).status == "running"

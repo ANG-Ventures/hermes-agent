@@ -12646,15 +12646,18 @@ def enforce_max_runtime(
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
-def _worker_has_active_child(pid: int) -> bool:
-    """Veto only: a subprocess or CPU-active worker is evidence against a stall.
+def _worker_cpu_active(pid: int) -> bool:
+    """Veto only: a worker burning CPU right now is evidence against a stall.
 
     This probe can never *authorize* a reclaim on its own -- a worker blocked
-    on an in-flight provider request reads 0% CPU with no children, exactly
-    like a dead socket. The stall decision comes from the agent's own
-    progress timestamp (:func:`_run_progress_at`); this sample can only
-    cancel it. Unknown process state (``ps`` missing/failing/unparseable)
-    returns True so it never authorizes a kill.
+    on an in-flight provider request reads 0% CPU, exactly like a dead
+    socket. The stall decision comes from the agent's own progress timestamp
+    (:func:`_run_progress_at`); this sample can only cancel it. Child
+    processes are deliberately NOT a veto: workers hold persistent idle
+    children (execute_code kernels, LSP servers) for their whole life, and a
+    healthy long tool call already advances ``progress_at`` through the tool
+    keepalive tickers. Unknown process state (``ps`` missing/failing/
+    unparseable) returns True so it never authorizes a kill.
     """
     import subprocess
     try:
@@ -12667,8 +12670,8 @@ def _worker_has_active_child(pid: int) -> bool:
             fields = line.split()
             if len(fields) != 3:
                 continue
-            child, parent, cpu = int(fields[0]), int(fields[1]), float(fields[2])
-            if (child == pid and cpu > 0) or parent == pid:
+            proc, cpu = int(fields[0]), float(fields[2])
+            if proc == pid and cpu > 0:
                 return True
     except (OSError, ValueError, subprocess.SubprocessError):
         return True  # Unknown process state must not authorize a kill.
@@ -12741,14 +12744,14 @@ def detect_progress_stalls(
         age = now - max(start, log_time, progress_at)
         if age < stall_seconds:
             continue
-        if _worker_has_active_child(pid):
+        if _worker_cpu_active(pid):
             continue
         evidence = {
             "progress_age_seconds": age, "heartbeat_age_seconds": now - int(hb),
             "agent_progress_age_seconds": now - progress_at,
             "log_age_seconds": now - log_time, "worker_pid": pid,
             "oldest_age_seconds": max(now - progress_at, now - log_time),
-            "signals": ["no_agent_progress", "no_log_growth", "no_active_child_or_cpu"],
+            "signals": ["no_agent_progress", "no_log_growth", "no_cpu"],
         }
         prior = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='stalled' LIMIT 1",
