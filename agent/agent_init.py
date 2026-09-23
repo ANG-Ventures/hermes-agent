@@ -3093,6 +3093,17 @@ def init_agent(
     agent.session_cache_read_tokens = 0
     agent.session_cache_write_tokens = 0
     agent.session_reasoning_tokens = 0
+    # ABSORBING per-bucket unknown latch for the five cumulative counters
+    # above. They are plain ints — an unmeasured call adds the canonical 0 and
+    # leaves no trace — so a session-total consumer has no other way to know
+    # the aggregate is missing a measurement. Set (never cleared) beside the
+    # increments in `agent/conversation_loop.py`; reset with the counters in
+    # `AIAgent.reset_session_state`. Per-bucket rather than one boolean
+    # because narrow readers gate on individual buckets.
+    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS as _USAGE_UNKNOWN_FIELDS
+
+    for _usage_flag in _USAGE_UNKNOWN_FIELDS:
+        setattr(agent, f"session_{_usage_flag}", False)
     # Per-call snapshot for the most recent successful provider response.
     # Cumulative session_* counters are still the source of truth for totals.
     agent.last_turn_usage = None

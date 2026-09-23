@@ -49,8 +49,9 @@ overrides still work:
   above so every kanban path resolves from ``HERMES_HOME``. Required to
   sandbox kanban: redirecting ``HERMES_HOME`` alone does NOT isolate a
   process from the live board, because the pins outrank it and the
-  dispatcher injects them into every worker env. See
-  :func:`kanban_db_path`.
+  dispatcher injects them into every worker env. Since 2026-09-21 that
+  combination does not silently write to the live board either — it
+  RAISES ``KanbanPinDivergenceError``. See :func:`kanban_db_path`.
 
 The dispatcher injects ``HERMES_KANBAN_TASK``, ``HERMES_KANBAN_DB``,
 ``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into worker
@@ -93,7 +94,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -130,6 +131,14 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+
+# Run outcomes that mean "this attempt ENDED the card successfully".
+# ``superseded`` is the honest close for a card whose premise was already
+# satisfied elsewhere (evidence = the ``superseded_by`` pointer, no artifact).
+# Every reader that asks "did this task succeed" must treat it like
+# ``completed``, or a superseded card reads as never-run and gets respawned.
+SUCCESS_RUN_OUTCOMES = ("completed", "superseded")
+_SUCCESS_RUN_OUTCOMES_SQL = "('completed', 'superseded')"
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -383,6 +392,8 @@ def _fire_dispatch_tick_hook(
         outcome = "ok"
         if result.skipped_locked:
             outcome = "skipped_locked"
+        elif result.workspace_refused:
+            outcome = "workspace_refused"
         elif not any((
             result.spawned,
             result.reclaimed,
@@ -655,58 +666,211 @@ def _kanban_path_override(name: str) -> str:
     """Return the raw ``name`` path-pin env value, or ``""`` when sandboxed.
 
     Single choke point for every ``HERMES_KANBAN_*`` path pin so the sandbox
-    flag can't be honoured by some resolvers and silently ignored by others.
+    flag can't be honoured by some resolvers and silently ignored by others —
+    and, for the same reason, the one place that can see a pin being
+    neutralised and say so (:func:`_warn_if_sandbox_neutralises_pins`).
     """
     if kanban_sandbox_enabled():
+        _warn_if_sandbox_neutralises_pins()
         return ""
     return os.environ.get(name, "").strip()
 
 
-# Pairs of (HERMES_HOME, override) already evaluated by
-# ``_warn_if_override_escapes_hermes_home``. Keyed on the RAW env strings so
+# Raw ``(HERMES_HOME, (name, value), ...)`` environments already reported by
+# ``_warn_if_sandbox_neutralises_pins``. Same warn-once + resolve-once role as
+# ``_CHECKED_OVERRIDE_ESCAPES``: the check hangs off ``_kanban_path_override``,
+# which every resolver — including ``kanban_db_path()`` on the ``connect()``
+# hot path — calls, so the root resolution must happen once per distinct
+# environment rather than per call.
+_CHECKED_SANDBOX_NEUTRALISED_PINS: set[tuple] = set()
+
+
+def _warn_if_sandbox_neutralises_pins() -> None:
+    """Log once when ``HERMES_KANBAN_SANDBOX`` overrides an EXPLICIT path pin.
+
+    The mirror image of :func:`_warn_if_override_escapes_hermes_home`, and the
+    same user-visible failure: a process that pinned a throwaway board writes
+    to the live one instead. Measured 2026-09-22 — the escape case logged one
+    warning, this one logged zero, and the escape warning's own remedy text
+    RECOMMENDS the flag that produces it. It cost card t_adec8aba two fixture
+    cards on the live board, claimed by the dispatcher as real work, with
+    nothing printed at any point.
+
+    Resolution is deliberately UNCHANGED — the sandbox flag still wins over
+    every pin, which is the whole point of the flag. Only the silence is fixed.
+    """
+    pinned = tuple(
+        (name, value)
+        for name in _KANBAN_PATH_PIN_ENV_VARS
+        if (value := os.environ.get(name, "").strip())
+    )
+    if not pinned:
+        return  # sandbox on, nothing pinned: nothing was neutralised.
+    key = (os.environ.get("HERMES_HOME", "").strip(), pinned)
+    if key in _CHECKED_SANDBOX_NEUTRALISED_PINS:
+        return
+    _CHECKED_SANDBOX_NEUTRALISED_PINS.add(key)
+    # Under the sandbox flag every pin is already "" here, so the kanban root
+    # IS the HERMES_HOME-derived root. Read it directly rather than calling
+    # ``kanban_home()``, which would re-enter this choke point.
+    try:
+        from hermes_constants import get_default_hermes_root
+        root = get_default_hermes_root()
+    except Exception:  # pragma: no cover - diagnostic only
+        root = "<unresolvable>"
+    _log.warning(
+        "HERMES_KANBAN_SANDBOX=1 NEUTRALISED the explicit kanban path pin(s) "
+        "%s — kanban paths resolve from HERMES_HOME instead, under %s, so "
+        "pinning a throwaway board did NOT isolate this process. Unset "
+        "HERMES_KANBAN_SANDBOX if you meant the pin to win, or point "
+        "HERMES_HOME at a throwaway root if you meant to be sandboxed.",
+        ", ".join(f"{name}={value}" for name, value in pinned),
+        root,
+    )
+
+
+# The ``HERMES_KANBAN_DB`` pin and ``HERMES_HOME`` as they were when this
+# module was first imported. Load-bearing for telling the INCIDENT shape apart
+# from a caller that legitimately pins a DB of its own.
+#
+# The incident is specifically: the pin arrives INHERITED (the dispatcher puts
+# it in every worker's env) and the process then redirects ``HERMES_HOME`` to
+# sandbox itself. The pin is unchanged from startup; ``HERMES_HOME`` is not.
+#
+# A test fixture or tool that sets ``HERMES_KANBAN_DB`` itself has *chosen* that
+# path — measured on tests/gateway/test_kanban_notifier.py and 8 sibling files,
+# which pin a per-test tmp DB while ``HERMES_HOME`` is a different tmp dir. That
+# is not a divergence to refuse; a blanket refusal broke 33 such tests.
+_PIN_AT_IMPORT = os.environ.get("HERMES_KANBAN_DB", "").strip()
+_HERMES_HOME_AT_IMPORT = os.environ.get("HERMES_HOME", "").strip()
+
+
+def _pin_divergence_is_a_hazard(target: Path) -> bool:
+    """True when a diverging pin is the INCIDENT shape, not a chosen path.
+
+    Both divergence guards gate on this one predicate, so they cannot drift on
+    which situations are dangerous.
+
+    Two shapes qualify, and between them they cover every recorded incident:
+
+    * **Inherited pin under a redirected HERMES_HOME** — the pin is byte-identical
+      to what this process started with (the dispatcher injects it into every
+      worker env) and ``HERMES_HOME`` has moved since. That is 2026-08-08 and
+      t_d2b884e7 exactly: a worker sandboxes itself by moving ``HERMES_HOME``
+      and the inherited pin silently keeps it on the live board.
+    * **The pin reaches this machine's native Hermes home** — catches the
+      variant with no in-process change to detect, e.g.
+      ``HERMES_HOME=$(mktemp -d) HERMES_KANBAN_DB=~/.hermes/kanban.db cmd``.
+      The pin points at production; refusing is right regardless of provenance.
+
+    Everything else is a caller that CHOSE its pin and is not being silently
+    un-sandboxed — every kanban test fixture does this (measured: a blanket
+    refusal broke 33 otherwise-passing tests across 9 files). Left alone.
+    """
+    # Shape 1: inherited pin, HERMES_HOME moved out from under it.
+    if _PIN_AT_IMPORT and os.environ.get(
+        "HERMES_KANBAN_DB", ""
+    ).strip() == _PIN_AT_IMPORT:
+        if os.environ.get("HERMES_HOME", "").strip() != _HERMES_HOME_AT_IMPORT:
+            return True
+    # Shape 2: the pin reaches the machine's real Hermes home.
+    try:
+        from hermes_constants import _get_platform_default_hermes_home
+        native = _get_platform_default_hermes_home().resolve(strict=False)
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return target.is_relative_to(native)
+
+
+class KanbanPinDivergenceError(RuntimeError):
+    """Raised when the ``HERMES_KANBAN_*`` pins contradict what a caller asked.
+
+    Two shapes, one defect class: the resolver has **already computed** that
+    the board the caller asked for and the board the pin points at are
+    different, and the old behaviour was to log a warning and hand back the
+    pinned (live) board anyway. That is fail-OPEN on a destructive path — a
+    warning on stdout is perfectly accurate and perfectly skippable, and on
+    2026-09-21 a probe that redirected ``HERMES_HOME`` to sandbox itself wrote
+    a junk card and 17 events onto 16 production cards with the warning right
+    there in its output.
+
+    ``HERMES_KANBAN_SANDBOX=1`` remains the documented escape hatch: it
+    neutralises every pin, so the divergence cannot arise and this never
+    raises.
+    """
+
+
+# Pairs of (HERMES_HOME, override) already proven SAFE by
+# ``_refuse_if_override_escapes_hermes_home``. Keyed on the RAW env strings so
 # the filesystem work (two ``Path.resolve()`` calls) happens once per distinct
 # environment rather than on every ``kanban_db_path()`` — which sits on the
-# ``connect()`` path and is called constantly. Doubles as the warn-once ledger.
+# ``connect()`` path and is called constantly.
+#
+# Only AGREEING pairs are memoised, and that is load-bearing: a warn-once
+# ledger would have made the second call to a diverging pin succeed silently,
+# so a caller that ignored (or never saw) the first refusal could simply try
+# again and reach the live board. A refusal must be permanent for as long as
+# the environment says it.
 _CHECKED_OVERRIDE_ESCAPES: set[tuple[str, str]] = set()
 
 
-def _warn_if_override_escapes_hermes_home(override: Path) -> None:
-    """Log once when ``HERMES_KANBAN_DB`` points outside the HERMES_HOME root.
+def _refuse_if_override_escapes_hermes_home(override: Path) -> None:
+    """Refuse when ``HERMES_KANBAN_DB`` points outside the HERMES_HOME root.
 
     This is the signal that was missing on 2026-08-08: a worker redirected
     ``HERMES_HOME`` to a tempdir, believed it was sandboxed, and wrote six real
     cards to the production board because the dispatcher's ``HERMES_KANBAN_DB``
-    outranks ``HERMES_HOME``. Resolution is unchanged — the override still wins
-    — but the escape is no longer silent.
+    outranks ``HERMES_HOME``. It was made loud in that incident's wake, and on
+    2026-09-21 the loudness proved insufficient: the warning fired, verbatim
+    and correct, and the probe wrote to the live board regardless.
+
+    Redirecting ``HERMES_HOME`` is an unambiguous statement of intent to
+    isolate. Having detected that the pin defeats it, we refuse rather than
+    hand a live-board path to a caller that asked to be sandboxed.
+
+    Scoped to the genuinely hazardous shapes — see
+    :func:`_pin_divergence_is_a_hazard`. A caller that pins a DB of its own
+    choosing (every kanban test fixture does) is not making an isolation claim
+    it is then betrayed on, and is left alone: measured, a blanket refusal here
+    broke 33 otherwise-passing tests across 9 files.
     """
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
     if not hermes_home:
         return
     key = (hermes_home, str(override))
     if key in _CHECKED_OVERRIDE_ESCAPES:
-        return
-    _CHECKED_OVERRIDE_ESCAPES.add(key)
+        return  # proven safe already.
     try:
         root = kanban_home().resolve(strict=False)
         target = override.resolve(strict=False)
     except OSError:
         return
     if target.is_relative_to(root):
+        _CHECKED_OVERRIDE_ESCAPES.add(key)
         return  # override lives inside the HERMES_HOME-derived root: normal.
-    _log.warning(
-        "HERMES_KANBAN_DB=%s resolves OUTSIDE the HERMES_HOME-derived kanban "
-        "root %s — the override wins, so redirecting HERMES_HOME did NOT "
-        "sandbox kanban. Set HERMES_KANBAN_SANDBOX=1 (or unset the "
-        "HERMES_KANBAN_* path pins) if you meant to isolate this process from "
-        "the live board.",
-        target, root,
+    if not _pin_divergence_is_a_hazard(target):
+        # The pin escapes the HERMES_HOME root, but it was chosen by this
+        # process and does not reach the machine's live board. Nobody is being
+        # silently un-sandboxed. Do NOT memoise: the hazard state is
+        # env-dependent and must be re-evaluated on every call.
+        return
+    raise KanbanPinDivergenceError(
+        f"HERMES_KANBAN_DB={target} resolves OUTSIDE the HERMES_HOME-derived "
+        f"kanban root {root} — the override wins, so redirecting HERMES_HOME "
+        f"did NOT sandbox kanban. Refusing to resolve a live-board path for a "
+        f"process that asked to be isolated. Set HERMES_KANBAN_SANDBOX=1 (or "
+        f"unset the HERMES_KANBAN_* path pins) if you meant to isolate this "
+        f"process from the live board; unset HERMES_HOME (or point it at the "
+        f"root that contains the pin) if you meant to use the pinned board."
     )
 
 
-# ``(board slug, raw HERMES_KANBAN_DB)`` pairs already evaluated by
-# ``_warn_if_pin_contradicts_board_arg``. Same warn-once + resolve-once role as
+# ``(board slug, raw HERMES_KANBAN_DB)`` pairs already proven to AGREE by
+# ``_refuse_if_pin_contradicts_board_arg``. Same resolve-once role as
 # ``_CHECKED_OVERRIDE_ESCAPES``: ``kanban_db_path()`` sits on the ``connect()``
-# path, so the two ``Path.resolve()`` calls must not run per call.
+# path, so the two ``Path.resolve()`` calls must not run per call. Only
+# agreeing pairs are memoised — a disagreeing pair must refuse every time, not
+# just the first, or a caller could retry its way onto the live board.
 _CHECKED_PIN_BOARD_CONTRADICTIONS: set[tuple[str, str]] = set()
 
 # Depth of the innermost ``enumerating_boards()`` scope on THIS thread. Thread-
@@ -725,20 +889,21 @@ def enumerating_boards():
     """Mark a dynamic extent as ENUMERATING boards rather than ADDRESSING one.
 
     The pin-contradiction guard exists for a caller that names ONE board and
-    silently gets another. A caller sweeping every board on disk is a different
-    shape: under a ``HERMES_KANBAN_DB`` pin every non-active slug trivially
-    disagrees with the pin, so an unscoped sweep emits one warning per board
-    (measured: 64 on a single dispatcher sweep across 65 live boards) and trains
-    operators to ignore the signal.
+    gets another. A caller sweeping every board on disk is a different shape:
+    under a ``HERMES_KANBAN_DB`` pin every non-active slug trivially disagrees
+    with the pin, so an unscoped sweep would refuse on the first board and take
+    down every legitimate enumerator in the process (measured before this
+    extent existed: 64 contradiction reports on a single dispatcher sweep
+    across 65 live boards).
 
     This is a DYNAMIC EXTENT, not a per-call flag, and that distinction is the
     whole fix. The first cut passed ``warn_on_pin_contradiction=False`` at each
     ``kanban_db_path()`` call site, which cannot work: enumerators also call
     ``connect(board=slug)`` / ``connect_closing(board=slug)``, which re-resolve
     the path internally with no flag to thread through. Measured on that design,
-    ``_board_task_counts`` still emitted 8 warnings over 8 boards *despite* its
-    call site being flagged. Wrapping the LOOP covers every nested resolution,
-    however deep, including ones added later.
+    ``_board_task_counts`` still reported 8 contradictions over 8 boards
+    *despite* its call site being flagged. Wrapping the LOOP covers every nested
+    resolution, however deep, including ones added later.
 
     Scoped to the current thread, and re-entrant.
     """
@@ -747,6 +912,68 @@ def enumerating_boards():
         yield
     finally:
         _ENUMERATION_DEPTH.value = max(0, _enumeration_depth() - 1)
+
+
+class EnumeratedBoardSlug(str):
+    """A board slug DISCOVERED by sweeping ``boards/``, not named by a caller.
+
+    The pin-contradiction guard exists to catch a caller that *names* one board
+    and silently gets another. An enumerator never names a board — it reports
+    what is on disk — so its slugs must not trip the guard.
+
+    :func:`enumerating_boards` expresses that as a DYNAMIC EXTENT, and an extent
+    is the wrong shape for this data. It is bound to one thread and to one
+    moment, but an enumerated slug is a VALUE that outlives both: the notifier
+    sweeps boards in ``_collect()``, stores ``{"board": slug}`` in a delivery
+    dict, returns it (extent exits), then addresses that slug from a worker
+    thread via ``asyncio.to_thread``. Both axes were measured on this branch:
+
+        collect-then-address, SAME thread   -> REFUSED   (extent exited in TIME)
+        extent held, asyncio.to_thread      -> REFUSED   (extent lost by THREAD)
+
+    Marking the VALUE fixes both, because the value is what travels. Note that
+    a ``ContextVar`` would NOT have been enough for the second axis:
+    ``gateway/kanban_watchers.py::_run_in_fresh_context`` runs the offloaded
+    call in an empty ``Context()`` precisely to drop inherited ContextVars.
+
+    Verified to survive every hop on the real path: a ``dict`` entry, an
+    ``asyncio.to_thread`` argument, a list/queue, sqlite parameter binding,
+    f-strings, equality and dict-key use against plain ``str``.
+
+    This is deliberately structural. The alternative — re-entering the extent
+    at each point of use — works (measured: ALLOWED) but has to be *remembered*
+    at all ten board-scoped offload sites in ``gateway/kanban_watchers.py``, and
+    silently re-arms the outage the moment an eleventh is added. Marking at the
+    enumerator is one choke point that no call site can forget.
+
+    A ``str`` subclass, so every existing consumer keeps working unchanged.
+    Provenance deliberately does NOT survive serialization: a slug that
+    round-trips through JSON comes back a plain ``str`` and re-arms the guard,
+    which is the fail-CLOSED direction.
+    """
+
+    __slots__ = ()
+
+
+def _is_enumerated(board: Optional[str]) -> bool:
+    """True when this slug came from an enumerator rather than a caller."""
+    return isinstance(board, EnumeratedBoardSlug)
+
+
+def enumerated_slug(board):
+    """Stamp ``board`` as enumerator-produced, preserving ``None``.
+
+    Idempotent, and never raises on an odd value — provenance marking must not
+    become its own failure mode on a path whose whole job is not to fail open.
+    """
+    if board is None:
+        return None
+    if isinstance(board, EnumeratedBoardSlug):
+        return board
+    try:
+        return EnumeratedBoardSlug(board)
+    except Exception:  # pragma: no cover - defensive
+        return board
 
 
 def enumerating_each(boards):
@@ -765,83 +992,71 @@ def enumerating_each(boards):
     The generator is suspended inside the context manager while the consumer
     runs the body, so ``continue``, ``break``, ``return`` and exceptions all
     unwind it correctly.
+
+    The yielded board also carries its ENUMERATED PROVENANCE on the slug value
+    itself (:class:`EnumeratedBoardSlug`), which is what covers the consumer
+    that stores the slug and addresses it later — after this extent has exited,
+    possibly from another thread. The extent alone could not: it is scoped to
+    one thread and one moment, and the notifier's slugs outlive both.
     """
     for board in boards:
         with enumerating_boards():
-            yield board
+            yield _mark_board_meta(board)
 
 
-# Hard ceiling on contradiction warnings, charged PER CALL SITE. The warn-once
-# ledger is keyed on (slug, pin), so a host with many boards can still emit one
-# line per board from un-enumerated addressing paths. Past a handful of distinct
-# boards that one site has given the operator its signal; the rest is noise, so
-# collapse to a single summary line. Zero risk of hiding the FIRST occurrence
-# from any site, which is the one that diagnoses the misreading.
-_PIN_CONTRADICTION_WARN_BUDGET = 5
+def _mark_board_meta(board: Any) -> Any:
+    """Stamp an enumerated board's ``slug`` (and any mapping copy) in place.
 
-# Slugs already reported by the guard, in emission order, keyed by the CALL SITE
-# that asked (``file:lineno`` of the first frame outside this module).
-#
-# Per-site rather than per-process, and that is load-bearing. A process-global
-# budget reintroduces this card's own defect one level up: any per-board loop
-# that forgets :func:`enumerating_boards` looks like N addressing calls, burns
-# the whole budget, and then the genuine single-board misreading the guard
-# exists to surface goes SILENT. Measured on the process-global design: 8
-# unscoped ``connect(board=slug)`` calls emitted 5 warnings, after which
-# ``kanban_db_path('account-health')`` returned the pin path with 0 warnings —
-# run-1022's exact probe, silent again. Charging the ceiling to the site that
-# made the noise bounds a forgetful enumerator without ever spending another
-# caller's first warning.
-_PIN_CONTRADICTION_WARNED: dict[str, list[str]] = {}
-
-
-def _pin_contradiction_call_site() -> str:
-    """``file:lineno`` of the first frame outside this module, or ``"?"``.
-
-    Only reached for a genuine, not-yet-reported ``(slug, pin)`` contradiction,
-    so the frame walk is bounded by distinct offending boards, not by call
-    volume — it is not on the ``connect()`` hot path.
+    Board entries are ``dict``s from :func:`read_board_metadata`; consumers do
+    ``board_meta.get("slug")`` and carry that value onward. Stamping here means
+    every one of them inherits the provenance without changing a line — which
+    also covers the degraded ``except: boards = [read_board_metadata(DEFAULT)]``
+    fallback that never went through :func:`list_boards` at all.
     """
     try:
-        frame = sys._getframe(1)
-    except Exception:  # pragma: no cover - no frame introspection available
-        return "?"
-    this_file = __file__
-    while frame is not None:
-        if frame.f_code.co_filename != this_file:
-            return f"{frame.f_code.co_filename}:{frame.f_lineno}"
-        frame = frame.f_back
-    return "?"
+        if isinstance(board, dict) and board.get("slug") is not None:
+            board["slug"] = enumerated_slug(board["slug"])
+            return board
+        if isinstance(board, str):
+            return enumerated_slug(board)
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return board
 
 
-def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> None:
-    """Log once when an EXPLICIT ``board`` arg disagrees with the pinned DB.
+def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> None:
+    """Refuse when an EXPLICIT ``board`` arg disagrees with the pinned DB.
 
     The ``HERMES_KANBAN_DB`` pin is checked before anything derived from the
     ``board`` argument, and the dispatcher injects it into every worker env. So
-    inside a worker, ``kanban_db_path("some-other-board")`` silently returns the
-    pinned path and the caller reads the wrong board with no signal at all.
+    inside a worker, ``kanban_db_path("some-other-board")`` silently returned
+    the pinned path and the caller read — or wrote — the wrong board.
 
     That is not hypothetical: it produced two wrong readings inside one task
     (t_a1e6e877) — a repro that wrote junk cards to the live default board, and
     a review probe whose ``kanban_db_path('ban-forensics')`` answer read exactly
     like the board-alias feature being broken when in fact it was the pin.
-    Both operators knew about the trap and hit it anyway.
-
-    Resolution is deliberately UNCHANGED — the pin still wins, because it is the
-    dispatcher→worker handoff's defense in depth (``_default_spawn`` sets
-    ``HERMES_KANBAN_DB`` precisely so a worker that re-resolves paths under a
-    rewritten ``HERMES_HOME`` still converges on the DB the dispatcher claimed
-    its task from). Only the silence is fixed.
+    Both operators knew about the trap and hit it anyway. Making it loud was
+    not enough either (t_d2b884e7, 2026-09-21), so the contradiction is now
+    refused: a caller that names a board and gets a different one is a wrong
+    answer, and a wrong answer that looks right is worse than an error.
 
     Silent by design in the shapes that are not contradictions: ``board`` is
     None (the pin is then the intended source of truth), the pin already
-    resolves to the requested board's DB (the normal worker case), and the call
+    resolves to the requested board's DB (the normal worker case), the call
     happens inside an :func:`enumerating_boards` extent (a sweep over every
-    board on disk is not a claim to be addressing any one of them).
+    board on disk is not a claim to be addressing any one of them), and the
+    divergence is not hazardous per :func:`_pin_divergence_is_a_hazard` (the
+    caller chose its own pin and is not being silently put on production).
     """
     if board is None:
         return
+    if _is_enumerated(board):
+        # Provenance travels with the VALUE, so this holds in any thread and at
+        # any later time — including the notifier's collect-in-the-loop,
+        # deliver-from-a-worker-thread shape, which the dynamic extent alone
+        # could not reach.
+        return  # sweeping every board, not addressing the one named.
     if _enumeration_depth() > 0:
         return  # sweeping every board, not addressing the one named.
     try:
@@ -852,39 +1067,28 @@ def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> 
         return
     key = (slug, str(override))
     if key in _CHECKED_PIN_BOARD_CONTRADICTIONS:
-        return
-    _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
+        return  # proven to agree with the pin already.
     try:
         requested = _board_db_path_ignoring_pin(slug).resolve(strict=False)
         pinned = override.resolve(strict=False)
     except (OSError, ValueError):
         return
     if requested == pinned:
+        _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
         return  # pin agrees with the argument: the normal worker case.
-    site = _pin_contradiction_call_site()
-    reported = _PIN_CONTRADICTION_WARNED.setdefault(site, [])
-    reported.append(slug)
-    emitted = len(reported)
-    if emitted > _PIN_CONTRADICTION_WARN_BUDGET:
-        if emitted == _PIN_CONTRADICTION_WARN_BUDGET + 1:
-            _log.warning(
-                "kanban_db_path: more than %d distinct boards have now been "
-                "requested from %s while HERMES_KANBAN_DB pins %s — suppressing "
-                "further per-board contradiction warnings from that call site. "
-                "Set HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path "
-                "pins) if you meant to address the boards you named; if that "
-                "site sweeps every board, wrap its loop in "
-                "kanban_db.enumerating_boards().",
-                _PIN_CONTRADICTION_WARN_BUDGET, site, override,
-            )
+    if not _pin_divergence_is_a_hazard(pinned):
+        # Shares one predicate with the escape guard so the two cannot drift on
+        # what counts as dangerous. Not memoised: the hazard state depends on
+        # live env, so it must be re-evaluated every call.
         return
-    _log.warning(
-        "kanban_db_path(board=%r) returned the HERMES_KANBAN_DB pin %s, NOT "
-        "that board's DB %s — the pin outranks the board argument, so this "
-        "caller is reading a different board than it asked for. Set "
-        "HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path pins) if "
-        "you meant to address the board you named.",
-        slug, pinned, requested,
+    raise KanbanPinDivergenceError(
+        f"kanban_db_path(board={slug!r}) would return the HERMES_KANBAN_DB pin "
+        f"{pinned}, NOT that board's DB {requested} — the pin outranks the "
+        f"board argument, so this caller would read (and write) a different "
+        f"board than it asked for. Refusing. Set HERMES_KANBAN_SANDBOX=1 (or "
+        f"unset the HERMES_KANBAN_* path pins) if you meant to address the "
+        f"board you named; if this call site sweeps every board, wrap its loop "
+        f"in kanban_db.enumerating_boards()."
     )
 
 
@@ -1176,26 +1380,29 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
             os.environ.pop(_k, None)
 
     When ``HERMES_HOME`` is set and the override resolves outside the
-    ``HERMES_HOME``-derived kanban root, a warning is logged once — the
-    override still wins, but the escape is no longer silent.
+    ``HERMES_HOME``-derived kanban root, this **raises**
+    :class:`KanbanPinDivergenceError`. Redirecting ``HERMES_HOME`` is an
+    unambiguous statement of intent to isolate; handing back a live-board path
+    anyway is fail-open on a destructive path, and a warning was demonstrably
+    skippable (2026-09-21: the warning fired and the probe wrote 17 events onto
+    16 production cards regardless).
 
     Likewise, when an EXPLICIT ``board`` argument is passed and the override
-    resolves to a *different* board's DB, a warning is logged once naming both
-    the board you asked for and the path you actually got. Resolution is
-    unchanged; the contradiction is simply no longer invisible to the caller.
+    resolves to a *different* board's DB, this raises rather than returning a
+    board the caller did not ask for.
 
     A caller that sweeps every board on disk is not addressing any one of them,
     and under a pin every non-active slug trivially disagrees — so wrap such a
-    loop in :func:`enumerating_boards`, which suppresses the warning for the
-    whole dynamic extent (including the nested ``connect()`` resolutions a
-    per-call flag could never reach). Do NOT wrap a single-board lookup: that is
-    exactly the case the guard exists to catch.
+    loop in :func:`enumerating_boards`, which suppresses the board-argument
+    check for the whole dynamic extent (including the nested ``connect()``
+    resolutions a per-call flag could never reach). Do NOT wrap a single-board
+    lookup: that is exactly the case the guard exists to catch.
     """
     override = _kanban_path_override("HERMES_KANBAN_DB")
     if override:
         path = Path(override).expanduser()
-        _warn_if_override_escapes_hermes_home(path)
-        _warn_if_pin_contradicts_board_arg(board, path)
+        _refuse_if_override_escapes_hermes_home(path)
+        _refuse_if_pin_contradicts_board_arg(board, path)
         return path
     slug = _normalize_board_slug(board)
     if slug is None:
@@ -1208,7 +1415,7 @@ def _board_db_path_ignoring_pin(slug: str) -> Path:
 
     The single definition of the board→DB layout, shared by
     :func:`kanban_db_path` and the contradiction guard
-    :func:`_warn_if_pin_contradicts_board_arg` — so the guard can never drift
+    :func:`_refuse_if_pin_contradicts_board_arg` — so the guard can never drift
     from the resolution it is describing.
     """
     if slug == DEFAULT_BOARD:
@@ -1220,20 +1427,35 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
     Anchored per-board so workspaces don't leak between projects.
-    ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly (highest
-    precedence) — the dispatcher injects this into worker env. Ignored
-    when ``HERMES_KANBAN_SANDBOX`` is set — see :func:`kanban_db_path`.
+    ``kanban.workspaces_root`` is the canonical placement policy. The
+    dispatcher injects its board-qualified result as
+    ``HERMES_KANBAN_WORKSPACES_ROOT`` into worker env; when both are visible,
+    disagreement fails closed. The environment override remains available for
+    tests and deployments without configured policy, and is ignored when
+    ``HERMES_KANBAN_SANDBOX`` is set — see :func:`kanban_db_path`.
 
     ``default`` keeps the legacy path ``<root>/kanban/workspaces/`` so
     that existing scratch workspaces from before the boards feature are
     preserved. Other boards use ``<root>/kanban/boards/<slug>/workspaces/``.
     """
+    from hermes_cli.kanban_workspace_policy import (
+        WorkspaceUnavailable, configured_root, validate_mount,
+    )
+
     override = _kanban_path_override("HERMES_KANBAN_WORKSPACES_ROOT")
-    if override:
-        return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
+    root, require_mount = configured_root()
+    if root is not None:
+        if require_mount:
+            validate_mount(root)
+        resolved = root / slug
+        if override and Path(override).expanduser() != resolved:
+            raise WorkspaceUnavailable("workspaces_root_invalid: board pin disagrees with config")
+        return resolved
+    if override:
+        return Path(override).expanduser()
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "workspaces"
     return board_dir(slug) / "workspaces"
@@ -1292,6 +1514,98 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
 
 
 _WORKER_LOG_TAIL_BYTES = 4096
+
+# The per-task worker log is opened APPEND across runs (see ``_default_spawn``),
+# so a byte window into it spans MULTIPLE runs. Anything that needs "what THIS
+# run said" must segment the file first: the dispatcher stamps a boundary line
+# immediately before each spawn, and the segment is everything after the LAST
+# one. Without this, a tail-based fingerprint is a size-dependent slice of all
+# runs concatenated — it silently compares run 1 against itself forever below
+# the window size, and cannot see a repeat at all just under it.
+_RUN_BOUNDARY_PREFIX = "[hermes-kanban-run-boundary "
+
+# How far back to look for the boundary. Real worker runs on this board measure
+# ~2-3 KB; 64 KiB covers an order of magnitude more. A run whose output exceeds
+# it has no findable boundary, and the segment reader returns None rather than
+# guessing — an unsegmentable run must never be fingerprinted.
+_WORKER_LOG_SEGMENT_BYTES = 65536
+
+# Lines whose content varies per run even when the run did the SAME thing.
+# They must not contribute to a run fingerprint or every run looks distinct.
+_RUN_VARYING_LINE_MARKERS = ("session_id:",)
+
+
+def _stamp_worker_log_run_boundary(log_path: Path) -> None:
+    """Append a unique run-boundary line to a worker log before spawning.
+
+    Best-effort: a log that cannot be written just yields an unsegmentable
+    run later (no fingerprint, full retry budget), never a failed spawn.
+
+    The nonce makes the boundary unforgeable from inside the worker — a worker
+    that echoed a predictable marker could otherwise truncate its own segment
+    down to a short constant and fake a reproduced no-op.
+    """
+    try:
+        import secrets
+        with open(log_path, "ab") as fh:
+            fh.write(
+                f"\n{_RUN_BOUNDARY_PREFIX}{secrets.token_hex(8)}]\n".encode("utf-8")
+            )
+    except OSError:
+        pass
+
+
+def _worker_log_run_segment(
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Return only the CURRENT run's slice of a worker's append-mode log.
+
+    ``None`` when the run cannot be isolated (no log, no boundary in the
+    window, empty segment). Callers must treat ``None`` as "no evidence",
+    never as "same as last time".
+    """
+    try:
+        path = worker_logs_dir(board=board) / f"{task_id}.log"
+        with path.open("rb") as log_f:
+            log_f.seek(0, os.SEEK_END)
+            size = log_f.tell()
+            log_f.seek(max(0, size - _WORKER_LOG_SEGMENT_BYTES))
+            raw = log_f.read(_WORKER_LOG_SEGMENT_BYTES)
+        text = raw.decode("utf-8", errors="replace")
+        idx = text.rfind(_RUN_BOUNDARY_PREFIX)
+        if idx < 0:
+            return None
+        newline = text.find("\n", idx)
+        if newline < 0:
+            return None
+        segment = text[newline + 1:].strip()
+        return segment or None
+    except OSError:
+        return None
+    except Exception:
+        _log.debug("failed to segment worker log for %s", task_id, exc_info=True)
+        return None
+
+
+def _run_output_fingerprint(segment: Optional[str]) -> str:
+    """Fingerprint ONE run's output; "" when there is nothing comparable.
+
+    Taken from the END of the run, not the start: the constant startup banner
+    is identical on every run, so a head-anchored fingerprint says "identical"
+    about two runs that did completely different work. The worker's last words
+    are the part that actually distinguishes a reproduced no-op from two
+    unrelated paperwork misses.
+    """
+    if not segment:
+        return ""
+    kept = [
+        line for line in segment.splitlines()
+        if not any(marker in line for marker in _RUN_VARYING_LINE_MARKERS)
+    ]
+    normalized = " ".join(" ".join(kept).split())
+    return normalized[-400:]
 
 
 def _worker_log_stderr_tail(
@@ -1357,6 +1671,29 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     synthesised entry so the dashboard always has something to render.
     Includes the canonical ``slug`` and ``db_path`` so the caller
     doesn't need to reconstruct them.
+
+    The ``db_path`` resolve is REPORTING where a board's DB would live, not a
+    claim to be addressing that board, so it runs inside
+    :func:`enumerating_boards`. Without that it trips the pin-contradiction
+    refusal and breaks the "never raises" contract above — which matters most
+    exactly where it is least expected: this function IS the discovery
+    fallback for every board sweep in the fleet::
+
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+
+    (``gateway/kanban_watchers.py`` x4, ``tui_gateway/server.py``,
+    ``plugins/kanban/dashboard/plugin_api.py``). That branch runs when
+    ``list_boards()`` itself failed — i.e. already degraded — and it is
+    evaluated BEFORE ``enumerating_each()`` can stamp anything, so neither the
+    extent nor the value-provenance mark reached it.
+
+    Note what is deliberately NOT done here: the returned ``slug`` is left
+    unstamped. Only an enumerator (:func:`list_boards`, :func:`enumerating_each`)
+    marks provenance, so a caller that NAMES a board still refuses when it goes
+    on to open it.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta: dict[str, Any] = {
@@ -1385,7 +1722,8 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    meta["db_path"] = str(kanban_db_path(slug))
+    with enumerating_boards():
+        meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
 
@@ -1572,7 +1910,12 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                     continue
                 entries.append(meta)
                 seen.add(normed)
-    return entries
+    # Stamp provenance at the SOURCE. Every entry here was discovered by
+    # scanning ``boards/``, never named by a caller, so no consumer of this
+    # list should ever trip the pin-contradiction guard — including the ones
+    # that skip ``enumerating_each`` and the ones that carry a slug out of this
+    # frame into another thread or a later tick.
+    return [_mark_board_meta(m) for m in entries]
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
@@ -1603,10 +1946,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
-
     # A board directory CONTAINS that board's workspaces/ -- retiring it
     # takes every card's scratch dir at once, the same blast radius as the
     # 2026-09-20 incident. BOTH branches do that: archive renames the tree
@@ -1619,7 +1958,12 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     #
     # Checked BEFORE the cache invalidation below: it opens the board DB
     # (which would re-populate _INITIALIZED_PATHS) and it can abort, so no
-    # state may be torn down ahead of it.
+    # state may be torn down ahead of it -- INCLUDING the active-board pin,
+    # which used to be cleared above this gate. A refused removal that had
+    # already unlinked <root>/kanban/current left get_current_board() falling
+    # through to DEFAULT_BOARD, so every later `kanban add` / `list` /
+    # `dispatch` silently addressed the default board with nothing saying the
+    # pin had moved (FleetReview on PR #785, measured).
     live = _board_has_live_cards(normed)
     if live:
         verb = "archive" if archive else "delete"
@@ -1634,6 +1978,12 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             f"{verb} its directory, which contains their workspaces. "
             "Wait for the cards to finish, or stop them first."
         )
+
+    # Remember the active pin while the board still exists. It is cleared only
+    # after the archive/delete succeeds; either operation has later failure
+    # boundaries (rename errors and survivor-held hard deletes) that must leave
+    # the operator pointed at the still-present board.
+    was_current_board = get_current_board() == normed
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -1685,6 +2035,8 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             detail=f"board={normed} action=archive dest={target}",
             board=normed,
         )
+        if was_current_board:
+            clear_current_board()
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         from hermes_cli.kanban_survivor import remove_workspace_dir
@@ -1725,17 +2077,36 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             d, task_id=None, reason="remove_board", outcome=AUDIT_DELETE,
             detail=f"board={normed}", board=normed,
         )
+        if was_current_board:
+            clear_current_board()
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 def _board_has_live_cards(slug: str) -> list:
     """Return the ids of cards on *slug* that are running or claim-locked.
 
+    Opens that board's CANONICAL DB path directly rather than going through
+    ``connect_closing(board=slug)``: ``kanban_db_path`` gives an ambient
+    ``HERMES_KANBAN_DB`` pin precedence even over an explicit board argument,
+    and the dispatcher pins that variable into every worker env. Under a pin,
+    the board argument was silently ignored, so removing board B inspected
+    board A's tasks, concluded B was idle, and archived it out from under a
+    live worker -- the primary data-loss guard answering for the wrong
+    database (FleetReview on PR #785, measured).
+
     Fail-closed: if the board's DB cannot be read, return a sentinel so the
     caller refuses rather than deleting a board whose state is unknown.
     """
     try:
-        with connect_closing(board=slug) as conn:
+        db_path = _board_db_path_ignoring_pin(_normalize_board_slug(slug) or slug)
+    except Exception:
+        return ["<unreadable-board-db>"]
+    if not db_path.is_file():
+        # No DB on disk means no rows to be live. A board directory that
+        # exists without one is empty as far as cards are concerned.
+        return []
+    try:
+        with connect_closing(db_path=db_path) as conn:
             rows = conn.execute(
                 "SELECT id, status, claim_expires FROM tasks "
                 "WHERE status = 'running' OR claim_expires IS NOT NULL"
@@ -2172,6 +2543,12 @@ CREATE TABLE IF NOT EXISTS task_comments (
     run_id      INTEGER,
     session_ref TEXT,
     created_at  INTEGER NOT NULL
+);
+
+-- Retained across config rollback so old volatile paths stay fenced.
+CREATE TABLE IF NOT EXISTS workspace_mount_roots (
+    root       TEXT PRIMARY KEY,
+    mount_path TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -2789,6 +3166,176 @@ def assert_is_board_db(db_path: Path, conn: sqlite3.Connection) -> None:
         )
 
 
+class LiveBoardWriteRefused(RuntimeError):
+    """Raised when a test/probe process tries to open the PRODUCTION board rw.
+
+    See :func:`_assert_live_board_write_allowed`.
+    """
+
+
+def _production_kanban_roots() -> list[Path]:
+    """The Hermes roots whose ``kanban.db`` is the LIVE board.
+
+    Delegates to :func:`hermes_state._production_state_roots` rather than
+    computing its own answer. That list is the fleet's single definition of
+    "this is production": the platform-default root resolved WITHOUT
+    ``Path.home()`` / ``hermes_constants`` (both of which tests monkeypatch),
+    plus ``_STATE_DB_GUARD_EXTRA_DENY_ROOTS``, into which ``tests/conftest.py``
+    injects the pre-sandbox production root so custom-``HERMES_HOME``
+    deployments are covered too.
+
+    Sharing it is the point. ``state.db`` and ``kanban.db`` are the same class
+    of live store reached the same way, and the 2026-07-24 state.db incident
+    and the 2026-08-08 / 2026-09-21 kanban incidents are the same bug. A second
+    root definition here would be free to drift from the one the rest of the
+    guard class uses, which is how the first member got fixed while this one
+    kept leaking.
+    """
+    from hermes_state import _production_state_roots
+    return list(_production_state_roots())
+
+
+def _in_test_context() -> bool:
+    """True when this process is a test run, by environment OR by ancestry.
+
+    Re-exported from the leaf module ``hermes_test_context`` — the same single
+    definition ``hermes_state``'s guard uses. Deliberately NOT a local
+    ``PYTEST_CURRENT_TEST`` check: that misses a child spawned with a rebuilt
+    environment, which loses ``PYTEST_*`` and ``HERMES_HOME`` together and is
+    precisely the state in which it writes to production (#82770).
+    """
+    from hermes_test_context import _in_test_context as _impl
+    return _impl()
+
+
+def _is_production_board_db(resolved: Path, root: Path) -> bool:
+    """True when *resolved* is a LIVE board DB of the production root *root*.
+
+    Mirrors :func:`hermes_state._is_production_state_db` and covers the two
+    on-disk board layouts :func:`_board_db_path_ignoring_pin` produces:
+
+    * ``<root>/kanban.db`` — the ``default`` board (back-compat path);
+    * ``<root>/kanban/boards/<slug>/kanban.db`` — every named board.
+
+    Deliberately narrow. Anything deeper or elsewhere under the root is NOT a
+    board — notably ``~/.hermes/hermes-agent/...`` worktrees and
+    ``~/.hermes/kanban/workspaces/<task>/...`` scratch dirs, where hermetic
+    tests and workers legitimately create throwaway DBs. A containment-only
+    check (``is_relative_to(root)``) would refuse all of those.
+    """
+    if resolved == root / "kanban.db":
+        return True
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    return (
+        len(parts) == 4
+        and parts[0] == "kanban"
+        and parts[1] == "boards"
+        and parts[3] == "kanban.db"
+    )
+
+
+def _assert_live_board_write_allowed(path: Path) -> None:
+    """Refuse a READ-WRITE open of the LIVE board by a test/probe process.
+
+    The structural half of the 2026-08-08 / 2026-09-21 incidents. Until now the
+    only thing standing between a fixture card and the live board was
+    ``tests/conftest.py``'s env scrub, which is PATH-SCOPED: it loads when
+    pytest collects a file under ``tests/``, so a probe script sitting anywhere
+    else keeps the dispatcher-injected ``HERMES_KANBAN_DB`` pin and writes to
+    production. On 2026-09-21 that put three fixture cards on the live board and
+    burned three real worker runs against them.
+
+    A doc line and an opt-in flag cannot fix that — they require the probe's
+    author to remember. This gate sits at the ``connect()`` choke point instead,
+    so it covers every entry path regardless of where the ``.py`` file lives.
+
+    This is deliberately the SAME guard ``state.db`` has carried since the
+    2026-07-24 WAL incident (:func:`hermes_state._ensure_test_isolation`): same
+    production-root list, same test-context predicate, same fail-before-open
+    placement. Two stores, one class, one definition.
+
+    Two independent refusals, each covering a leak shape the other misses:
+
+    * **R1 (test context).** The process is a test run — by env *or* by process
+      ancestry (:func:`hermes_test_context._in_test_context`) — and is opening a
+      live board. This is the 16:05 shape: a probe under pytest from outside
+      ``tests/``, inheriting the worker's pin, ``HERMES_HOME`` still the real
+      profile. R2 cannot see it; nothing was redirected.
+    * **R2 (redirected home).** ``HERMES_HOME`` declares a root that is NOT a
+      production root — the caller sandboxed its Hermes state — yet kanban
+      resolved to a live board anyway, because a ``HERMES_KANBAN_*`` pin
+      outranks ``HERMES_HOME``. This is the 16:30 shape: bare
+      ``python probe.py`` under a throwaway probe home with no pytest marker at
+      all, so R1 cannot see it. This is the exact contradiction
+      :func:`_warn_if_override_escapes_hermes_home` has only ever WARNED about.
+
+    Neither condition can hold for a production writer. The fleet runs with
+    ``HERMES_HOME`` unset, ``=~/.hermes``, or ``=~/.hermes/profiles/<name>``,
+    all of which resolve ``kanban_home()`` to the production root (R2 false),
+    and no fleet component is a test context (R1 false). The gate is inert in
+    production and costs one ``Path.resolve()``.
+
+    A deliberate operator pin to a board outside every production root — the
+    documented ``HERMES_KANBAN_DB`` use — is untouched.
+    """
+    try:
+        target = path.expanduser().resolve(strict=False)
+    except OSError:  # pragma: no cover - resolution failure is not a leak
+        return
+    live_root: Optional[Path] = None
+    for root in _production_kanban_roots():
+        if _is_production_board_db(target, root):
+            live_root = root
+            break
+    if live_root is None:
+        return  # not a live board — nothing this guard is about.
+
+    reason: Optional[str] = None
+    if _in_test_context():
+        reason = (
+            f"this process is a TEST context and {target} is the LIVE board "
+            f"(under real Hermes root {live_root})"
+        )
+    else:
+        declared = os.environ.get("HERMES_HOME", "").strip()
+        if declared:
+            try:
+                declared_root = kanban_home().expanduser().resolve(strict=False)
+            except OSError:  # pragma: no cover - diagnostic only
+                declared_root = live_root
+            if declared_root not in {
+                r for r in _production_kanban_roots()
+            }:
+                reason = (
+                    f"HERMES_HOME={declared} declares the kanban root "
+                    f"{declared_root}, but a HERMES_KANBAN_* path pin "
+                    f"outranked it and resolved to {target} — the LIVE board "
+                    f"under {live_root}"
+                )
+    if reason is None:
+        return
+    pins = ", ".join(
+        f"{k}={os.environ[k]}"
+        for k in (*_KANBAN_PATH_PIN_ENV_VARS, "HERMES_KANBAN_BOARD")
+        if os.environ.get(k, "").strip()
+    ) or "<none>"
+    raise LiveBoardWriteRefused(
+        f"kanban live-system guard: refusing to open the live board "
+        f"read-write — {reason}. Writes from here create REAL cards that the "
+        f"dispatcher claims and spawns real workers against (3 fixture cards + "
+        f"3 burned runs on 2026-09-21). Active path pins: {pins}. To run "
+        f"against a throwaway board: HERMES_KANBAN_SANDBOX=1 "
+        f"HERMES_HOME=$(mktemp -d) — the flag neutralises every "
+        f"HERMES_KANBAN_* pin so kanban resolves under your temp home. "
+        f"Read-only inspection of the live board is still allowed via "
+        f"connect_readonly()."
+    )
+
+
 def connect_readonly(
     db_path: Optional[Path] = None,
     *,
@@ -3201,6 +3748,15 @@ def repair_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    # Same structural live-board guard connect() carries, at the OTHER
+    # read-write door to a kanban_db_path()-derived board. repair_db() opens
+    # the file rw through _sqlite_connect() without ever calling connect(),
+    # so the connect()-side gate never runs here. Placed immediately after
+    # the path is resolved — before the exists() probe, before
+    # _cross_process_init_lock — so a refusal creates no lock file, no
+    # quarantine .bak, and no directories: refuse before any filesystem
+    # effect, exactly like connect().
+    _assert_live_board_write_allowed(path)
     try:
         resolved = path.resolve()
     except OSError:
@@ -3306,6 +3862,13 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    # Structural live-board guard. Placed BEFORE the mkdir so a refused open
+    # cannot create board directories, and before every cache fast-path so a
+    # second connect() in the same process cannot skip it. It covers an
+    # explicit ``db_path=`` too: a probe that hands connect() the live path
+    # directly is the same leak through a different door. ``init_db`` routes
+    # through here, so it is covered as well.
+    _assert_live_board_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -4229,6 +4792,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    forced_status: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -4515,6 +5079,22 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif forced_status:
+                    # Fan-out brake: a policy layer (kanban_worker_policy) has
+                    # decided this creation must PARK rather than queue — e.g.
+                    # a dispatched worker creating a child card. Parent ids are
+                    # still validated so the link rows can't dangle, but no
+                    # parent-gated promotion applies: the card sits until a
+                    # human moves it.
+                    if forced_status not in VALID_STATUSES:
+                        raise ValueError(
+                            f"forced_status must be one of {sorted(VALID_STATUSES)}"
+                        )
+                    task_status = forced_status
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                 elif triage:
                     task_status = "triage"
                 else:
@@ -4635,6 +5215,18 @@ def create_task(
                         task_id,
                         flagship_override_author or created_by or "operator",
                         override_comment(flagship_override_reason),
+                    )
+                if forced_status and task_status == forced_status:
+                    # Audit the brake on the card itself so the park is
+                    # explicable without reading config: WHY this card is not
+                    # in ``ready``, and which knob restores the old behaviour.
+                    from hermes_cli import kanban_worker_policy as _kwp
+
+                    _append_event(
+                        conn,
+                        task_id,
+                        "parked_by_policy",
+                        _kwp.park_event_payload(task_status),
                     )
                 if task_status == "blocked":
                     # Tag the source so dependency resolution can distinguish
@@ -5284,6 +5876,32 @@ def add_comment(
             },
             run_id=run_id,
         )
+        # The CONTENT hook (card t_357330bf). The ``commented`` event above
+        # carries author + length, not the text. On 2026-09-21 the comment
+        # THREADS were the only part of the wiped subs-ace board that could
+        # not be reconstructed from any other source -- cards came back,
+        # discussion did not. Journaling the body is the single thing that
+        # would have saved them, so it is recorded explicitly rather than
+        # inferred from the event.
+        try:
+            from hermes_cli import kanban_journal
+
+            kanban_journal.append(
+                _journal_board_slug(),
+                task_id,
+                "comment_body",
+                {
+                    "author": author.strip(),
+                    "body": body.strip(),
+                    "session_ref": session_ref,
+                    "created_at": now,
+                    "comment_id": int(cur.lastrowid or 0),
+                },
+                actor=author.strip(),
+                run_id=run_id,
+            )
+        except Exception:  # pragma: no cover - never fail the comment write
+            pass
         return int(cur.lastrowid or 0)
 
 
@@ -5602,6 +6220,19 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+def _journal_board_slug() -> Optional[str]:
+    """Best-effort board slug for a journal record.
+
+    Resolution must never raise inside a write txn, and must never be the
+    reason a mutation fails, so every error degrades to ``None`` (which the
+    journal records under the ``default`` board).
+    """
+    try:
+        return get_current_board()
+    except Exception:
+        return None
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5624,6 +6255,25 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    # Append-only mutation journal (card t_357330bf). This is the single choke
+    # point every lifecycle mutation already flows through, so journaling here
+    # covers every event kind -- including ones added later -- without touching
+    # the ~119 call sites. Outside the kanban home on purpose: the 2026-09-21
+    # deleter took the whole kanban directory, so a journal inside it would
+    # have died with the data it protects. Best-effort by contract: a journal
+    # failure must never fail the board write.
+    try:
+        from hermes_cli import kanban_journal
+
+        kanban_journal.append(
+            _journal_board_slug(),
+            task_id,
+            kind,
+            payload,
+            run_id=run_id,
+        )
+    except Exception:  # pragma: no cover - the journal is a net, never a gate
+        pass
 
 
 def _end_run(
@@ -6268,6 +6918,11 @@ def goal_run_status(
         terminal_status = (
             {
                 "completed": "done",
+                # A superseded close IS a completion by this worker — it just
+                # had no work to do. Without an entry here the literal
+                # 'superseded' falls through and collides with this function's
+                # OWN use of that string below to mean "ownership lost".
+                "superseded": "done",
                 "review_requested": "review",
                 "changes_requested": "changes_requested",
                 "blocked": "blocked",
@@ -6750,6 +7405,29 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+# Evidence pointer for a superseded close, capped so a worker cannot paste a
+# whole transcript into the durable field the board renders.
+_SUPERSEDED_POINTER_MAX = 500
+
+
+class EmptySupersedeError(ValueError):
+    """Raised by ``complete_task`` when ``superseded_by`` is blank.
+
+    The pointer is the ONLY evidence a superseded close carries, so an empty
+    one would record that the card's work vanished without recording what
+    replaced it. ``ValueError`` so existing tool-error handlers treat it as a
+    recoverable user error the worker can retry.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: {task_id} was completed as superseded with an empty "
+            f"superseded_by; name the card, PR or sha that satisfied the premise "
+            f"(an unnamed supersede is a silent delete of the work)"
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6760,10 +7438,26 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
-    survivor_ref: Optional[str] = None,
-    survivor_pr: Optional[str] = None,
+    survivor_ref: Optional[Union[str, Sequence[str]]] = None,
+    survivor_pr: Optional[Union[str, Sequence[str]]] = None,
+    survivor_unbound: Union[bool, str, Sequence[Union[bool, str]], None] = None,
+    superseded_by: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``superseded_by`` closes a card whose premise is ALREADY SATISFIED on
+    current main — the sibling card, PR or sha that did the work. The closing
+    run's outcome is ``superseded`` rather than ``completed``, and the pointer
+    IS the evidence, so no ``summary``/``result`` is required. An empty /
+    whitespace-only pointer is refused (:class:`EmptySupersedeError`) — a
+    superseded card with no pointer is a silent delete of work. Survivor
+    preservation is deliberately NOT skipped: ``preserve`` already returns
+    ``None`` when the run produced nothing, so a genuine no-op close needs no
+    survivor, while a worker that DID change files still cannot use this
+    disposition to escape the survivor gate. Without this verb a worker that
+    finds its card already done has no honest option: completion demands work
+    it did not do and blocking demands a blocker that does not exist, so it
+    exits rc=0 and the dispatcher books a protocol violation and retries.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -6800,6 +7494,20 @@ def complete_task(
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+
+    # A superseded close carries its evidence in the pointer, so it is the one
+    # thing that must not be blank. Gate it before any filesystem work, and
+    # emit the audit event the same way the card gates do.
+    if superseded_by is not None:
+        superseded_by = str(superseded_by).strip()[:_SUPERSEDED_POINTER_MAX]
+        if not superseded_by:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_empty_supersede",
+                    {"reason": "empty_superseded_pointer"},
+                )
+            raise EmptySupersedeError(task_id)
+    run_outcome = "superseded" if superseded_by else "completed"
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -6838,6 +7546,7 @@ def complete_task(
     survivor = preserve(
         conn, task_id, metadata,
         survivor_ref=survivor_ref, survivor_pr=survivor_pr,
+        survivor_unbound=survivor_unbound,
         evidence=[t for t in (summary, result) if t],
     )
     if survivor:
@@ -6854,6 +7563,11 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    if superseded_by:
+        metadata = dict(metadata or {}, superseded_by=superseded_by)
+        if not (summary or "").strip() and not (result or "").strip():
+            # The pointer is the evidence; give the board a readable line too.
+            summary = f"Premise already satisfied; superseded by {superseded_by}."
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -6916,7 +7630,7 @@ def complete_task(
                 )
         run_id = _end_run(
             conn, task_id,
-            outcome="completed", status="done",
+            outcome=run_outcome, status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
@@ -6937,7 +7651,7 @@ def complete_task(
                 }
             run_id = _synthesize_ended_run(
                 conn, task_id,
-                outcome="completed",
+                outcome=run_outcome,
                 summary=synth_summary,
                 metadata=synth_metadata,
             )
@@ -6956,6 +7670,10 @@ def complete_task(
         }
         if survivor:
             completed_payload["survivor"] = survivor
+        if superseded_by:
+            # Read by the gateway notifier to say "premise superseded by X"
+            # instead of the generic done ping.
+            completed_payload["superseded_by"] = superseded_by
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -7280,6 +7998,34 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
 _TASK_DIR_NAME_RE = re.compile(r"^t_[0-9a-f]{4,}$")
 
 
+def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
+    """True when *conn* is already open on *board*'s database file.
+
+    Asks the connection which file it is attached to (``PRAGMA
+    database_list``) rather than trusting what the caller believes: under an
+    ambient ``HERMES_KANBAN_DB`` pin a connection opened "for" one board can
+    be attached to another's file. Any uncertainty answers False, which costs
+    one redundant connection -- never a wrong reuse.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except Exception:
+        return False
+    actual = ""
+    for row in rows:
+        # (seq, name, file) -- `main` is the connection's primary database.
+        if (row[1] if not isinstance(row, sqlite3.Row) else row["name"]) == "main":
+            actual = (row[2] if not isinstance(row, sqlite3.Row) else row["file"]) or ""
+            break
+    if not actual:
+        return False
+    try:
+        want = _board_db_path_ignoring_pin(_normalize_board_slug(board) or board)
+        return Path(actual).resolve(strict=False) == want.resolve(strict=False)
+    except Exception:
+        return False
+
+
 def _live_owners_of_path(
     path: Path,
     *,
@@ -7338,7 +8084,13 @@ def _live_owners_of_path(
         try:
             if is_managed and board:
                 # The directory's own board, which may not be the caller's.
-                conns.append(stack.enter_context(connect_closing(board=board)))
+                # Reuse the caller's connection when it is ALREADY that board:
+                # opening a second connection to the same database is pure
+                # cost on the completion path, which calls this while holding
+                # the completing task's connection (FleetReview on PR #785 --
+                # measured one redundant connection per call).
+                if not (conn is not None and _conn_is_board(conn, board)):
+                    conns.append(stack.enter_context(connect_closing(board=board)))
             elif conn is None:
                 conns.append(stack.enter_context(connect_closing()))
         except Exception:
@@ -7641,6 +8393,24 @@ def safe_remove_workspace_dir(
         )
         return False
 
+    # Nothing to remove. Checked BEFORE the liveness and owner scans, which
+    # are the expensive gates: `_live_owners_of_path` opens a second
+    # connection and full-scans `tasks`, resolving every row's path. In gc's
+    # steady state most archived cards' workspaces were already removed at
+    # completion, so leaving this check last turned `kanban gc` into O(M)
+    # extra connections plus O(M*N) path resolutions for zero removals -- and
+    # appended one permanent `REFUSED` line per already-clean row to an
+    # append-only log that `gc_worker_logs` is deliberately forbidden to reap,
+    # burying the DELETE/ATTEMPT records the audit exists to surface
+    # (FleetReview on PR #785, measured: 1 owner scan + 1 audit line for a
+    # path that does not exist).
+    #
+    # No audit line either: the log records deletions and refusals TO DELETE.
+    # A path with nothing at it was never a deletion, and a per-row entry that
+    # can never be reaped is exactly the noise the finding named.
+    if not resolved.is_dir():
+        return False
+
     if _task_has_live_run(conn, task_id):
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,
@@ -7667,13 +8437,6 @@ def safe_remove_workspace_dir(
             "Refusing to remove workspace %s (caller task %s, reason %s): it "
             "is owned by live card(s) %s",
             resolved, task_id, reason, ",".join(owners),
-        )
-        return False
-
-    if not resolved.is_dir():
-        _audit_workspace_deletion(
-            resolved, task_id=task_id, reason=reason, allowed=False,
-            detail="not-a-directory",
         )
         return False
 
@@ -8161,7 +8924,7 @@ def edit_completed_task_result(
             """
             SELECT id FROM task_runs
              WHERE task_id = ?
-               AND outcome = 'completed'
+               AND outcome IN ('completed', 'superseded')
              ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
              LIMIT 1
             """,
@@ -9087,7 +9850,7 @@ def reopen_task(
         if upd.rowcount != 1:
             return False, f"task {task_id} changed state concurrently; retry"
         run_id = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
             "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -10489,6 +11252,146 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+@dataclass(frozen=True)
+class _WorkspaceAdmission:
+    root: Path
+    mount_path: Path
+
+
+def _validate_workspace_admission(
+    task: Task, *, board: Optional[str] = None, conn=None, dry_run=False,
+) -> Optional[_WorkspaceAdmission]:
+    from hermes_cli.kanban_workspace_policy import (
+        WorkspaceUnavailable, configured_root, validate_mount,
+        validate_persisted, validate_target,
+    )
+
+    root, require_mount = configured_root()
+    if conn is None:
+        with connect_closing(board=board) as owned:
+            return _validate_workspace_admission(task, board=board, conn=owned, dry_run=dry_run)
+    roots = {
+        Path(row["root"]): Path(row["mount_path"])
+        for row in conn.execute("SELECT root, mount_path FROM workspace_mount_roots")
+    }
+    if root is not None and require_mount:
+        expected_mount = roots.get(root)
+        mount_path = validate_mount(root, expected_mount=expected_mount)
+        if expected_mount is None:
+            roots[root] = mount_path
+            if not dry_run:
+                with write_txn(conn):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO workspace_mount_roots(root, mount_path) "
+                        "VALUES (?, ?)",
+                        (str(root), str(mount_path)),
+                    )
+
+    def resolved(candidate: Path) -> Path:
+        try:
+            return candidate.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise WorkspaceUnavailable(
+                f"workspaces_root_invalid: cannot resolve: {candidate}"
+            ) from exc
+
+    if task.workspace_path:
+        path = Path(task.workspace_path).expanduser()
+        for protected, mount_path in sorted(
+            roots.items(), key=lambda item: len(item[0].parts), reverse=True,
+        ):
+            path_resolved = resolved(path)
+            protected_resolved = resolved(protected)
+            if path.is_relative_to(protected) or path_resolved.is_relative_to(protected_resolved):
+                validate_mount(protected, expected_mount=mount_path)
+                if not path.is_relative_to(protected) or path_resolved != path.absolute():
+                    raise WorkspaceUnavailable("workspaces_root_invalid: workspace symlink escape")
+                validate_target(protected, path)
+                validate_persisted(path)
+                return _WorkspaceAdmission(protected, mount_path)
+    elif task.workspace_kind in (None, "scratch"):
+        target = workspaces_root(board=board) / task.id
+        if require_mount:
+            assert root is not None
+            validate_target(root, target)
+            return _WorkspaceAdmission(root, roots[root])
+    return None
+
+
+def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+
+    task = get_task(conn, task_id)
+    if task is None:
+        return True
+    try:
+        _validate_workspace_admission(task, board=board, conn=conn, dry_run=dry_run)
+    except WorkspaceUnavailable as exc:
+        reason = str(exc)
+        # Only a spawnable lane refusal is a dispatcher fault. Startup
+        # reconciliation also scans todo/running tasks so their lost path is
+        # durable and visible, but must not make unrelated ready work look stuck.
+        spawnable_lane = task.status in ("ready", "review")
+        if spawnable_lane and not any(
+            item[0] == task_id for item in result.workspace_refused
+        ):
+            result.workspace_refused.append((task_id, reason))
+        stranded = bool(task.workspace_path) and reason.startswith((
+            "stranded_by_mount_loss:", "workspaces_root_unmounted:",
+        ))
+        if stranded and task_id not in result.stranded_by_mount_loss:
+            result.stranded_by_mount_loss.append(task_id)
+        event_kind = "stranded_by_mount_loss" if stranded else "workspace_refused"
+        _log.warning("kanban dispatch: %s task=%s", reason, task_id)
+        if not dry_run:
+            with write_txn(conn):
+                previous = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? "
+                    "AND kind=? ORDER BY id DESC LIMIT 1",
+                    (task_id, event_kind),
+                ).fetchone()
+                payload = {"reason": reason}
+                if previous is None or json.loads(previous[0]) != payload:
+                    _append_event(conn, task_id, event_kind, payload)
+        return True
+    return False
+
+
+def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
+    """Undo a claim when the mount changes during the claim/resolve window."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return
+    if not any(item[0] == task_id for item in result.workspace_refused):
+        result.workspace_refused.append((task_id, reason))
+    stranded = bool(task.workspace_path) and reason.startswith((
+        "stranded_by_mount_loss:", "workspaces_root_unmounted:",
+    ))
+    if stranded and task_id not in result.stranded_by_mount_loss:
+        result.stranded_by_mount_loss.append(task_id)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        run_id = row["current_run_id"] if row else None
+        retry_status = _retry_status_for_run(conn, task_id, run_id)
+        conn.execute(
+            "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=? AND current_run_id=?",
+            (retry_status, task_id, run_id),
+        )
+        closed_run_id = _end_run(
+            conn, task_id, outcome="workspace_refused",
+            status="workspace_refused", error=reason[:500],
+            metadata={"retry_status": retry_status},
+        )
+        _append_event(
+            conn, task_id,
+            "stranded_by_mount_loss" if stranded else "workspace_refused",
+            {"reason": reason}, run_id=closed_run_id,
+        )
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -10515,6 +11418,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
     """
+    protected = _validate_workspace_admission(task, board=board)
     kind = task.workspace_kind or "scratch"
     if kind == "scratch":
         if task.workspace_path:
@@ -10529,7 +11433,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 )
         else:
             p = workspaces_root(board=board) / task.id
-        p.mkdir(parents=True, exist_ok=True)
+        if protected is not None and not task.workspace_path:
+            from hermes_cli.kanban_workspace_policy import create_scratch
+            create_scratch(
+                protected.root, p, expected_mount=protected.mount_path,
+            )
+        elif protected is None:
+            p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "dir":
         if not task.workspace_path:
@@ -11095,6 +12005,9 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    stranded_by_mount_loss: list[str] = field(default_factory=list)
+    workspace_refused: list[tuple[str, str]] = field(default_factory=list)
+    """Mount or persisted-workspace failures, refused BEFORE claiming a run."""
     spawn_failed: list[str] = field(default_factory=list)
     """Task ids whose spawn attempt failed THIS tick — recorded on every
     failure (workspace resolution or worker launch), whether or not it was
@@ -11141,6 +12054,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    budget_paused: bool = False
+    """True when this board spawned nothing because its rolling-window worker
+    spend has reached ``kanban.budget.usd_per_24h``. Reclaim / promotion /
+    bookkeeping still ran — only NEW spawns are withheld, and they resume
+    automatically once the window rolls the spend back under the ceiling."""
     parent_satisfied_sticky: list[str] = field(default_factory=list)
     """Explicitly blocked task ids that have one or more ``blocks`` parents
     and whose parents are all terminal. The graph is satisfied, but the
@@ -11211,6 +12129,10 @@ _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 _worker_processes: dict = {}
 _worker_processes_lock = threading.Lock()
+# Startup stranding is a boot/restart reconciliation pass, not a per-tick
+# mount-probe fan-out. Ready/review candidates are still checked every tick
+# immediately before claim.
+_workspace_startup_scanned: set[str] = set()
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -11334,6 +12256,21 @@ def _run_exit_class(conn, task_id, run_id) -> Optional[str]:
     if db_path and run_id is not None:
         return read_exit_class(exit_file(Path(db_path), task_id, run_id))
     return None
+
+
+def _run_model_turn_completed(conn, task_id, run_id) -> bool:
+    """Positive receipt evidence that this run produced a model response.
+
+    A clean process exit alone is insufficient: provider/bootstrap failures
+    have historically returned rc=0 before a worker ever received a turn.
+    Legacy or missing receipts therefore fail closed to ``False``.
+    """
+    from hermes_cli.kanban_worker_exit import exit_file, read_model_turn_completed
+
+    db_path = next(r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main")
+    if db_path and run_id is not None:
+        return read_model_turn_completed(exit_file(Path(db_path), task_id, run_id))
+    return False
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -11948,6 +12885,36 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 # can only mean "way past the bound" anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
+# Identical clean exits (same captured worker output) that end the retry budget
+# EARLY. Two is the smallest number that distinguishes "reproduced" from
+# "happened once": a worker that reaches the same dead end twice is not
+# converging, so a third spawn buys nothing but a worker slot and quota. The
+# common cause is a card whose premise was already satisfied before dispatch,
+# which now has an honest terminal verb (``complete_task(superseded_by=...)``).
+_PROTOCOL_VIOLATION_REPRODUCED_LIMIT = 2
+
+
+def _violation_output_fingerprint(metadata: dict) -> str:
+    """Per-run fingerprint of a violation run's own output; "" when absent.
+
+    Reads ONLY ``run_output_fingerprint``, which ``detect_crashed_workers``
+    computes from the boundary-delimited segment for that one run. It
+    deliberately does NOT fall back to ``stderr_tail``: that field is a raw
+    byte window into the APPEND-mode per-task log, so it spans every run of the
+    task, and comparing two of them answers a different question than "did this
+    worker reproduce itself". Both ways it lies — below the window size the
+    window starts at byte 0 every run, so the same leading bytes compare EQUAL
+    across genuinely different work; just under it the window straddles a run
+    boundary differently each time, so a true repeat compares UNEQUAL.
+
+    Absent output must never compare equal: two runs with nothing recorded say
+    nothing about each other, so the early trip stays off for them. Runs
+    recorded before the segment existed have no ``run_output_fingerprint`` and
+    therefore never trip it either.
+    """
+    raw = metadata.get("run_output_fingerprint") or ""
+    return " ".join(str(raw).split())[:400]
+
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
@@ -11971,7 +12938,23 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     error text is matched as a fallback for runs recorded before the marker
     existed.
     """
+    return _protocol_violation_history(conn, task_id)[0]
+
+
+def _protocol_violation_history(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[int, int]:
+    """``(streak, identical_repeats)`` over the trailing violation run.
+
+    ``identical_repeats`` counts how many of those violations were captured
+    with the SAME worker output as the newest one (see
+    ``_violation_output_fingerprint``). A worker that reproduces its own clean
+    exit verbatim is not converging, so ``_account_crashes`` trips on the
+    repeat instead of spending the whole budget re-running it.
+    """
     streak = 0
+    newest_output: Optional[str] = None
+    identical = 0
     rows = conn.execute(
         "SELECT outcome, error, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
@@ -11984,21 +12967,28 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
             continue
         if outcome == "crashed":
             is_violation = False
+            meta: dict = {}
             raw_meta = row["metadata"]
             if raw_meta:
                 try:
-                    is_violation = bool(
-                        json.loads(raw_meta).get("protocol_violation")
-                    )
+                    parsed = json.loads(raw_meta)
+                    meta = parsed if isinstance(parsed, dict) else {}
+                    is_violation = bool(meta.get("protocol_violation"))
                 except (ValueError, TypeError):
-                    is_violation = False
+                    meta, is_violation = {}, False
             if not is_violation:
                 is_violation = "protocol violation" in (row["error"] or "")
             if is_violation:
                 streak += 1
+                output = _violation_output_fingerprint(meta)
+                if streak == 1:
+                    newest_output = output
+                    identical = 1 if output else 0
+                elif output and output == newest_output and identical == streak - 1:
+                    identical += 1
                 continue
         break
-    return streak
+    return streak, identical
 
 
 def detect_crashed_workers(
@@ -12020,9 +13010,10 @@ def detect_crashed_workers(
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    ``kanban_complete`` / ``kanban_block``). It gets a bounded retry budget;
+    only two identical, boundary-delimited worker responses can stop it early.
+    Clean exits without positive receipt evidence of a model response (for
+    example a pre-model provider abort) can never take that shortcut.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -12085,10 +13076,10 @@ def detect_crashed_workers(
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "
                     "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
+                    "If the work is already done, verify and report it via "
+                    "kanban_complete (superseded_by=<card|PR|sha> if a sibling "
+                    "got there first); a run that ends without a terminal "
+                    "kanban call counts as failed."
                 )
                 event_kind = "protocol_violation"
                 event_payload = {
@@ -12100,6 +13091,30 @@ def detect_crashed_workers(
                     # the violation-only retry budget is derived later.
                     "protocol_violation": True,
                 }
+                # The worker's own last words are what distinguishes a
+                # REPRODUCED no-op ("nothing to implement, already on main")
+                # from three unrelated paperwork misses. Positive receipt
+                # evidence that a model response was produced is mandatory:
+                # bootstrap/provider failures have historically returned rc=0,
+                # and identical infrastructure text is not worker work. The
+                # per-task log is APPEND-mode across runs, so a raw tail of it
+                # is a slice of every run concatenated; fingerprint the
+                # boundary-delimited segment for THIS run instead. A legacy or
+                # missing receipt, or an unsegmentable run, yields no fingerprint
+                # and therefore keeps the early trip off.
+                stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
+                if stderr_tail:
+                    event_payload["stderr_tail"] = stderr_tail
+                model_turn_completed = _run_model_turn_completed(
+                    conn, row["id"], row["current_run_id"]
+                )
+                event_payload["model_turn_completed"] = model_turn_completed
+                if model_turn_completed:
+                    run_fingerprint = _run_output_fingerprint(
+                        _worker_log_run_segment(row["id"], board=board)
+                    )
+                    if run_fingerprint:
+                        event_payload["run_output_fingerprint"] = run_fingerprint
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
@@ -12290,7 +13305,7 @@ def detect_crashed_workers(
             stderr_tail,
         ) in crash_details:
             if protocol_violation:
-                streak = _protocol_violation_streak(conn, tid)
+                streak, identical = _protocol_violation_history(conn, tid)
                 trow = conn.execute(
                     "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
                 ).fetchone()
@@ -12304,7 +13319,14 @@ def detect_crashed_workers(
                     if task_override is not None
                     else _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 )
-                if streak < violation_limit:
+                # Two byte-identical clean exits are a REPRODUCED no-op,
+                # not a flake: the worker reached the same dead end twice, so
+                # a third spawn buys nothing. Stop early and surface it as
+                # needing input rather than burning the rest of the budget on
+                # the same run. (The usual cause — a premise already satisfied
+                # on main — now has an honest verb: superseded_by.)
+                reproduced = identical >= _PROTOCOL_VIOLATION_REPRODUCED_LIMIT
+                if streak < violation_limit and not reproduced:
                     # Below budget: the task is already back at ``ready``
                     # (respawn allowed) with ``last_failure_error`` stamped.
                     # Deliberately no ``_record_task_failure`` call — a
@@ -12312,6 +13334,27 @@ def detect_crashed_workers(
                     # failure budget, just as other failure kinds don't
                     # consume this one.
                     continue
+                violation_extra = {
+                    "pid": pid,
+                    "claimer": claimer,
+                    "protocol_violations": streak,
+                    "protocol_violation_limit": violation_limit,
+                }
+                if reproduced:
+                    violation_extra["identical_violations"] = identical
+                    violation_extra["stopped_early"] = "reproduced_clean_exit"
+                    # PREPENDED, not appended: ``_record_task_failure`` caps
+                    # the stored error at 500 chars and the canned violation
+                    # text plus the worker's own output already fills it, so a
+                    # trailing hint would be truncated away unread.
+                    error_text = (
+                        f"Stopped retrying after {identical} IDENTICAL clean "
+                        f"exits — the worker reproduced the same no-op, so "
+                        f"this needs input, not another attempt. If the card's "
+                        f"premise was already satisfied, close it with `hermes "
+                        f"kanban complete {tid} --superseded-by <card|PR|sha>`. "
+                        f"{error_text}"
+                    )
                 # Streak reached the bound: trip the breaker. ``force_trip``
                 # skips the threshold resolution inside
                 # ``_record_task_failure`` because the decision — including
@@ -12325,12 +13368,7 @@ def detect_crashed_workers(
                     force_trip=True,
                     release_claim=False,
                     end_run=False,
-                    event_payload_extra={
-                        "pid": pid,
-                        "claimer": claimer,
-                        "protocol_violations": streak,
-                        "protocol_violation_limit": violation_limit,
-                    },
+                    event_payload_extra=violation_extra,
                 )
                 if tripped:
                     auto_blocked.append(tid)
@@ -12948,7 +13986,7 @@ def check_respawn_guard(
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
         "SELECT ended_at FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
+        "WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " AND ended_at >= ? "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id, cutoff),
     ).fetchone()
@@ -13661,6 +14699,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    budget_cache: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -13698,6 +14737,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             pr_gate_prefetch=pr_gate_prefetch,
+            budget_cache=budget_cache,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -13722,6 +14762,7 @@ def dispatch_once(
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
                 pr_gate_prefetch=pr_gate_prefetch,
+                budget_cache=budget_cache,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -13791,6 +14832,7 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     pr_gate_prefetch=None,
+    budget_cache: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -13832,6 +14874,20 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    # First tick after process start: mark lost persisted paths before reapers
+    # can make them spawnable. Do not repeat O(active tasks) DB transactions and
+    # write probes every tick; candidates are rechecked just before claim below.
+    startup_key = str(kanban_db_path(board))
+    if dry_run or startup_key not in _workspace_startup_scanned:
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE workspace_path IS NOT NULL "
+            "AND status IN ('todo', 'ready', 'running', 'review')"
+        ).fetchall():
+            _workspace_admission_refused(
+                conn, row["id"], result, board=board, dry_run=dry_run,
+            )
+        if not dry_run:
+            _workspace_startup_scanned.add(startup_key)
     pr_cycle_key = _pr_state_cache_key(kanban_db_path(board))
     pr_nonterminal_cache, pr_cycle_skip = _pr_state_caches_for_board(pr_cycle_key)
     pr_state_resolver = _PrStateResolver(
@@ -13894,6 +14950,36 @@ def _dispatch_once_locked(
     # Computed AFTER recompute_ready so anything promotable this tick has
     # already left ``todo`` and can't be mis-reported as stranded.
     result.stranded_by_triage = find_stranded_by_triage(conn)
+
+    # Fan-out brake: per-board rolling-window USD ceiling. Evaluated AFTER all
+    # reclaim/promotion bookkeeping so a paused board stays accurate on the
+    # dashboard, and BEFORE any spawn decision so the pause actually withholds
+    # workers. Fail-open by construction (see evaluate_board_budget): a cost
+    # measurement fault must never halt the host.
+    #
+    # Skipped entirely under ``dry_run``: the documented SAFE probe must not
+    # write a pause marker or fire a real page about a tick it only observes.
+    # (Same rule the review-stale detector follows.)
+    if not dry_run:
+        try:
+            from hermes_cli import kanban_budget as _kbudget
+
+            # Single-board addressing, NOT enumeration — do not wrap in
+            # enumerating_boards(); that would suppress exactly the pin-vs-board
+            # contradiction warning this lookup should surface.
+            if _kbudget.evaluate_board_budget(
+                board,
+                kanban_db_path(board=board),
+                board_dir(board),
+                cache=budget_cache,
+            ):
+                result.budget_paused = True
+                return result
+        except Exception as exc:
+            _log.warning(
+                "kanban dispatch: budget gate failed (%s: %s); continuing tick",
+                type(exc).__name__, exc,
+            )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -14252,6 +15338,8 @@ def _dispatch_once_locked(
                     "dispatch continues",
                     row["id"],
                 )
+        if _workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -14267,12 +15355,29 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        from hermes_cli.kanban_workspace_policy import (
+            WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
+        )
         try:
+            protected = _validate_workspace_admission(
+                claimed, board=board, conn=conn,
+            )
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+            if protected is not None:
+                validate_mount(
+                    protected.root, expected_mount=protected.mount_path,
+                )
+                validate_target(protected.root, workspace)
+                validate_persisted(workspace)
+        except WorkspaceUnavailable as exc:
+            _release_claim_for_workspace_refusal(
+                conn, claimed.id, result, str(exc),
+            )
+            continue
         except Exception as exc:
             # A workspace anchor that can never resolve (bare repo, non-repo
             # path, missing default_workdir) is a capability wall: retrying it
@@ -14409,6 +15514,8 @@ def _dispatch_once_locked(
             continue
         if provider_deferred(row["id"], row["assignee"]):
             continue
+        if _workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
@@ -14420,12 +15527,29 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        from hermes_cli.kanban_workspace_policy import (
+            WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
+        )
         try:
+            protected = _validate_workspace_admission(
+                claimed, board=board, conn=conn,
+            )
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+            if protected is not None:
+                validate_mount(
+                    protected.root, expected_mount=protected.mount_path,
+                )
+                validate_target(protected.root, workspace)
+                validate_persisted(workspace)
+        except WorkspaceUnavailable as exc:
+            _release_claim_for_workspace_refusal(
+                conn, claimed.id, result, str(exc),
+            )
+            continue
         except Exception as exc:
             # A workspace anchor that can never resolve (bare repo, non-repo
             # path, missing default_workdir) is a capability wall: retrying it
@@ -15142,6 +16266,12 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
+    # Segment the append-mode log so the reaper can fingerprint THIS run's
+    # output alone. Stamped AFTER rotation (a rotated log starts fresh, and
+    # its first run still needs a boundary) and BEFORE Popen, so everything
+    # the child writes lands after it.
+    _stamp_worker_log_run_boundary(log_path)
+
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     # Background CPU priority for the worker gateway. Niceness is inherited
@@ -15406,7 +16536,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             pt = get_task(conn, pid)
             if not pt or pt.status != "done":
                 continue
-            runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
+            runs = [r for r in list_runs(conn, pid) if r.outcome in SUCCESS_RUN_OUTCOMES]
             runs.sort(key=lambda r: r.started_at, reverse=True)
             run = runs[0] if runs else None
 
@@ -15459,7 +16589,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
             "WHERE r.profile = ? AND r.task_id != ? "
-            "  AND r.outcome = 'completed' "
+            "  AND r.outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
             "ORDER BY r.ended_at DESC LIMIT 5",
             (task.assignee, task_id),
         ).fetchall()

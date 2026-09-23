@@ -851,6 +851,15 @@ class AIAgent:
         self.session_cache_write_tokens = 0
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
+        # ABSORBING per-bucket unknown latch over the cumulative counters above
+        # (set beside the increments in agent/conversation_loop.py). It must be
+        # cleared HERE with them: a new/branched/resumed session's totals start
+        # at zero and are fully measured until proven otherwise — carrying the
+        # old session's latch forward would render the fresh totals `unknown`.
+        from agent.usage_pricing import USAGE_UNKNOWN_FIELDS as _USAGE_UNKNOWN_FIELDS
+
+        for _usage_flag in _USAGE_UNKNOWN_FIELDS:
+            setattr(self, f"session_{_usage_flag}", False)
         # Snapshot of the most recent successful provider call, normalized into
         # Hermes' canonical usage shape. Session counters above are cumulative;
         # this per-call record lets status/usage surfaces show the last turn's
@@ -6999,7 +7008,9 @@ class AIAgent:
             return False
         return pool.has_available()
 
-    def _anthropic_messages_create(self, api_kwargs: dict, *, client: Any = None):
+    def _anthropic_messages_create(
+        self, api_kwargs: dict, *, client: Any = None, on_response: Any = None
+    ):
         # When a request-local client is supplied it was already credential-
         # refreshed in ``_create_request_anthropic_client``; only the shared
         # fallback path refreshes here.
@@ -7017,7 +7028,10 @@ class AIAgent:
             # Rate-limit + credits state live in response headers, which the
             # parsed Message drops. No-ops on providers that don't send the
             # matching header families (x-ratelimit-* / x-nous-credits-*).
-            on_response=self._capture_anthropic_response_headers,
+            # A caller-supplied callback is call-scoped (it wraps this one);
+            # swapping a callback on the shared agent would race
+            # interrupt-abandoned workers and transpose two calls' headers.
+            on_response=on_response or self._capture_anthropic_response_headers,
         )
 
     def _rebuild_anthropic_client(self) -> None:
@@ -9004,6 +9018,9 @@ class AIAgent:
             background=(not _is_subagent),
             inherit_context=function_args.get("inherit_context"),
             skills=function_args.get("skills"),
+            model=function_args.get("model"),
+            provider=function_args.get("provider"),
+            allow_flagship_reason=function_args.get("allow_flagship_reason"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),

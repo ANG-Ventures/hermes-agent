@@ -35,6 +35,7 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from datetime import datetime
 
 from gateway.fork_ext.unclean_restart_notice import (
     UNCLEAN_NOTICE_RESUME_REASONS,
@@ -44,6 +45,8 @@ from gateway.fork_ext.unclean_restart_notice import (
     format_restart_notice,
     get_restart_notice_ledger_path,
     read_last_event_loop_blocked_site,
+    read_planned_restart,
+    PLANNED_RESTART_WINDOW_S,
 )
 from gateway.run import GatewayRunner
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
@@ -431,3 +434,99 @@ def test_claim_sentinel_carries_a_graceful_exit_forward_as_clean(tmp_path):
     )
     assert sentinel["prior_exit_reason"] == "graceful_shutdown"
     assert classify_prior_life(sentinel, site=None).unclean is False
+
+
+# --------------------------------------------------------------------------
+# Planned-restart suppression (2026-09-22)
+# --------------------------------------------------------------------------
+
+def _ledger(tmp_path, rows):
+    p = tmp_path / "logs" / "gateway-restart-ledger.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return p
+
+
+_WATCHDOG_ENDED = "2026-09-22T03:47:22+00:00"  # prior_exited_at
+_WATCHDOG_EPOCH = datetime.fromisoformat(_WATCHDOG_ENDED).timestamp()
+
+
+def test_kickstart_row_within_window_marks_the_restart_planned(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    _ledger(tmp_path, [
+        {"event": "intent", "target_profile": "default", "epoch": _WATCHDOG_EPOCH - 100,
+         "initiator_profile": "aegis", "token": "abc"},
+        {"event": "kickstart", "target_profile": "default", "epoch": _WATCHDOG_EPOCH - 40,
+         "initiator_profile": "aegis", "token": "abc"},
+    ])
+    row = read_planned_restart(_WATCHDOG_ENDED, tmp_path)
+    assert row and row["event"] == "kickstart" and row["initiator_profile"] == "aegis"
+
+
+def test_kickstart_row_for_another_profile_does_not_count(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    _ledger(tmp_path, [
+        {"event": "kickstart", "target_profile": "aegis", "epoch": _WATCHDOG_EPOCH - 40},
+    ])
+    assert read_planned_restart(_WATCHDOG_ENDED, tmp_path) is None
+
+
+def test_kickstart_row_outside_window_does_not_count(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    _ledger(tmp_path, [
+        {"event": "kickstart", "target_profile": "default",
+         "epoch": _WATCHDOG_EPOCH - PLANNED_RESTART_WINDOW_S - 60},
+    ])
+    assert read_planned_restart(_WATCHDOG_ENDED, tmp_path) is None
+
+
+def test_missing_or_corrupt_ledger_fails_open(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    assert read_planned_restart(_WATCHDOG_ENDED, tmp_path) is None
+    p = tmp_path / "logs" / "gateway-restart-ledger.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json\n", encoding="utf-8")
+    assert read_planned_restart(_WATCHDOG_ENDED, tmp_path) is None
+    assert read_planned_restart(None, tmp_path) is None
+
+
+def test_planned_watchdog_exit_names_who_and_how():
+    """The 2026-09-21 20:48 shape: SIGTERM from our own safe-restart, drain timed
+    out, shutdown watchdog fired (exit 1). Unclean from the process's view but
+    REQUESTED. 2026-09-22 Ace: "can we get a notification in chat if it's related
+    to a safe restart or what caused this freeze?" — so ONE line naming the
+    initiator and the mechanism, not silence and not the crash phrasing."""
+    sentinel = dict(_WATCHDOG_SENTINEL, prior_exit_code=1,
+                    prior_exit_reason="shutdown_watchdog")
+    verdict = classify_prior_life(
+        sentinel, planned={"event": "kickstart", "initiator_profile": "aegis",
+                           "detail": "kickstart -k"}
+    )
+    assert verdict.unclean is True          # the FACT is preserved
+    assert verdict.planned is True
+    msg = format_restart_notice(verdict)
+    assert msg is not None
+    assert "by aegis" in msg and "kickstart -k" in msg and "planned" in msg, msg
+    assert "UNPLANNED" not in msg and "exit 1" not in msg and "watchdog" not in msg, msg
+    assert "\n" not in msg and len(msg) < 200, msg
+
+
+def test_planned_and_unplanned_notices_are_one_family():
+    """Same shape, different verdict word — a reader learns one format."""
+    sentinel = dict(_WATCHDOG_SENTINEL, prior_exit_code=1, prior_exit_reason="shutdown_watchdog")
+    planned = format_restart_notice(classify_prior_life(
+        sentinel, planned={"event": "kickstart", "initiator_profile": "deploy"}))
+    unplanned = format_restart_notice(classify_prior_life(sentinel, planned=None))
+    assert planned and unplanned
+    assert planned.startswith("\U0001f504 Restarted") and unplanned.startswith("\u26a0\ufe0f Restarted")
+    assert "planned" in planned and "UNPLANNED" in unplanned
+    assert unplanned.endswith("resuming where I left off.") and planned.endswith("resuming where I left off.")
+
+
+def test_unplanned_watchdog_exit_still_notifies():
+    sentinel = dict(_WATCHDOG_SENTINEL, prior_exit_code=1,
+                    prior_exit_reason="shutdown_watchdog")
+    verdict = classify_prior_life(sentinel, planned=None)
+    assert verdict.planned is False
+    text = format_restart_notice(verdict)
+    assert text and "shutdown watchdog" in text

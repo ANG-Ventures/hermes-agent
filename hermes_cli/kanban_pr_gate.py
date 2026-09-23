@@ -110,6 +110,12 @@ _REPO_MENTION_RE = re.compile(
 # kanban*.py`` truncates to ``hermes_cli/kanban`` (no suffix left to deny) and
 # ``hermes_cli/kanban_db`` never had one. Both are rejected on the owner.
 _OWNER_RE = re.compile(r"\A[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\Z")
+# An all-digit segment. ``10/10``, ``5/5`` and ``30/31`` are prose, and the
+# first of those is ALSO a real GitHub repository — so existence alone cannot
+# reject it. Measured over every card body on all 76 boards: 522 bodies reach
+# the ranking branch below, and this filter is what separates the one prose
+# token that resolves on GitHub from the 18 genuine repo mentions.
+_NUMERIC_SEGMENT_RE = re.compile(r"\A\d+\Z")
 _SOURCE_PATH_SUFFIXES = frozenset(
     {
         ".c",
@@ -199,10 +205,17 @@ class _PrefetchResult:
 # OPEN/CLOSED are reused for CACHE_TTL_SECONDS because GitHub permits reopen.
 _CACHE: dict[tuple[str, int], _CacheEntry] = {}
 
+# Process-lifetime cache for :func:`repo_exists`, keyed by lowercased slug.
+# Both outcomes are cached: a body's prose tokens are stable per card, so the
+# negative answers are what keep this to roughly one lookup per distinct token
+# for the life of the dispatcher.
+_REPO_EXISTS_CACHE: dict[str, bool] = {}
+
 
 def clear_cache() -> None:
     """Drop all cached PR states (tests; operator repair)."""
     _CACHE.clear()
+    _REPO_EXISTS_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +356,24 @@ def parse_pr_refs(
     ``default_repo`` resolves bare ``#N`` / ``pull/N`` forms. When it is None
     those forms are DROPPED rather than guessed — an unblock is a real state
     transition and must never rest on an inferred repository.
+
+    ``text``'s OWN qualified refs outrank ``default_repo``. The block reason is
+    closer evidence than the card body it was derived from: live card
+    ``t_9a74e029`` names ``ANG-Ventures/hermes-home#225`` in plain text, and
+    its sibling bare ``#225``/``#228`` were still resolved against
+    ``ANG-Ventures/hermes-agent`` — two real PRs in the wrong repository —
+    because the BODY carried a qualified hermes-agent ref. A reason that
+    contradicts its own sibling numbers is not a repo the gate may act on.
+
+    When the reason names MORE than one distinct repo the bare numbers are
+    genuinely ambiguous, so they are dropped entirely rather than attached to
+    either — the same fail-safe as disagreeing remotes. Measured over every
+    blocked card on all 76 boards: 19 reasons carry bare numbers, 1 also
+    carries a qualified ref (``t_9a74e029``, the defect), and 0 name two.
+
+    This is the parse CHOKE POINT — both the locked and unlocked gate paths
+    reach bare-``#N`` resolution through here — so the rule cannot be bypassed
+    by a caller that assembles its own ``default_repo``.
     """
     if not isinstance(text, str) or not text.strip():
         return []
@@ -365,6 +396,14 @@ def parse_pr_refs(
             return
         seen.add(key)
         found.append((position, PrRef(repo=repo, number=number)))
+
+    # The reason's own qualified refs override the caller's context for the
+    # bare forms below. One distinct repo is an answer; two is ambiguity and
+    # resolves to None, which drops the bare numbers.
+    own = _corroborated_repos(text)
+    if own:
+        distinct = {slug.lower(): slug for slug in own}
+        default_repo = next(iter(distinct.values())) if len(distinct) == 1 else None
 
     # Consume the specific forms first, blanking each match so a later, looser
     # pattern cannot re-read the same digits as a different reference. Order is
@@ -390,11 +429,11 @@ def parse_pr_refs(
     return refs
 
 
-def _remotes_for(workspace_path: str) -> set[str]:
-    """Return the distinct ``owner/repo`` slugs a checkout's remotes point at."""
+def _git(workspace_path: str, *args: str) -> Optional[str]:
+    """Run a read-only git command in ``workspace_path``; None on any failure."""
     try:
         proc = subprocess.run(
-            ["git", "-C", workspace_path, "remote", "-v"],
+            ["git", "-C", workspace_path, *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -402,11 +441,54 @@ def _remotes_for(workspace_path: str) -> set[str]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError, TimeoutError):
-        return set()
+        return None
     if proc.returncode != 0:
+        return None
+    return proc.stdout or ""
+
+
+def _is_repo_toplevel(workspace_path: str) -> bool:
+    """True only when ``workspace_path`` IS a checkout root, not inside one.
+
+    ``git -C <dir>`` WALKS UP to the first enclosing repository, so a directory
+    with no repo of its own silently answers for whatever contains it. Every
+    ``scratch``-kind kanban workspace lives under ``~/.hermes``, which is itself
+    a checkout — and its remotes all agree, so the walk-up produced a single
+    UNANIMOUS (and wrong) slug that the disagreeing-remotes fail-safe in
+    :func:`repo_context` cannot see. That is how card ``t_cb701eee`` was
+    unblocked two seconds after a verifier blocked it, on merge evidence from
+    ``ANG-Ventures/hermes-home`` (2026-09-21).
+
+    Toplevel identity, not ``.git`` presence, is the discriminator: a git
+    worktree's ``.git`` is a file, and its toplevel is itself, so a worktree
+    workspace still resolves normally.
+    """
+    out = _git(workspace_path, "rev-parse", "--show-toplevel")
+    if not out:
+        return False
+    toplevel = out.strip()
+    if not toplevel:
+        return False
+    try:
+        return Path(toplevel).resolve() == Path(workspace_path).resolve()
+    except OSError:
+        return False
+
+
+def _remotes_for(workspace_path: str) -> set[str]:
+    """Return the distinct ``owner/repo`` slugs a checkout's remotes point at.
+
+    Empty when ``workspace_path`` is not the checkout TOPLEVEL — see
+    :func:`_is_repo_toplevel`. ``repo_context`` then falls through to
+    body-based resolution, which yields the card's own repo or None.
+    """
+    if not _is_repo_toplevel(workspace_path):
+        return set()
+    stdout = _git(workspace_path, "remote", "-v")
+    if stdout is None:
         return set()
     slugs: set[str] = set()
-    for line in (proc.stdout or "").splitlines():
+    for line in stdout.splitlines():
         parts = line.split()
         if len(parts) < 2:
             continue
@@ -455,13 +537,36 @@ def _corroborated_repos(body: str) -> list[str]:
     return out
 
 
-def _body_repo_choice(body: str) -> Optional[str]:
+def _body_repo_choice(
+    body: str, *, exists_fn: Optional[Callable[[str], bool]] = None
+) -> Optional[str]:
     """The single repo a bare ``#N`` in ``body`` may be resolved against.
 
     ``src/utils`` is a *legal* repo slug, so a body naming both it and a real
     repo has two candidates and no way to rank them. Rather than take the
     first (a coin flip that queries the wrong repo), return None and let the
     re-evaluator take no action — the same fail-safe as disagreeing remotes.
+
+    The remaining hole this closes is the SINGLE-candidate case. A lone
+    slash-bearing prose token (``before/after.`` on live card ``t_edb301c0``)
+    is the only candidate in its body, so it was RANKED as the default repo —
+    the same confidently-wrong shape :func:`_is_repo_toplevel` closed on the
+    workspace leg. ``_body_repo_mentions`` cannot tell prose from a slug
+    lexically, because real repo names and English word pairs have the same
+    shape; measured over all 76 boards, 522 bodies reach this branch and the
+    best lexical cue kept only 10 of 22 real repos while still admitting 14
+    prose tokens (``P0/P1``, ``title/body``, ``origin/main``).
+
+    So the discriminator is EXISTENCE, not vocabulary: a token may be ranked
+    only when GitHub actually has a repository by that name. Measured on the
+    same population that is 18 of 18 genuine repo mentions kept and 412 of 412
+    prose tokens rejected. ``10/10`` is the one prose token that IS a real
+    repository, which is why the numeric-segment filter runs first and why
+    existence alone is not sufficient.
+
+    This only ever RANKS — :func:`_body_corroborates` still only MATCHES, so
+    the asymmetry #870 relies on is preserved: noise can decline a resolution,
+    never redirect one.
     """
     corroborated = _corroborated_repos(body)
     if len(corroborated) == 1:
@@ -469,7 +574,55 @@ def _body_repo_choice(body: str) -> Optional[str]:
     if corroborated:
         return None
     candidates = list(_body_repo_mentions(body))
-    return candidates[0] if len(candidates) == 1 else None
+    if len(candidates) != 1:
+        return None
+    slug = candidates[0]
+    owner, _, name = slug.partition("/")
+    if _NUMERIC_SEGMENT_RE.match(owner) or _NUMERIC_SEGMENT_RE.match(name):
+        return None
+    exists_fn = exists_fn or repo_exists
+    return slug if exists_fn(slug) else None
+
+
+def _body_corroborates(slug: str, body: Optional[str]) -> bool:
+    """True when the CARD's own text supports resolving bare ``#N`` in ``slug``.
+
+    A workspace's remotes describe a *directory*, not a card. Two live shapes
+    make that directory answer for a repository the card has nothing to do
+    with, and only one of them involves a walk-up:
+
+    * ``scratch``/nested — ``git -C`` inherits an ENCLOSING repo's remotes
+      (closed by :func:`_is_repo_toplevel`);
+    * ``dir``-at-toplevel — the workspace IS a checkout root, just not of the
+      card's repo. Four live cards point at ``~/.hermes`` itself, whose remotes
+      both read ``ANG-Ventures/hermes-home``. Geometry is perfect; the answer is
+      still wrong.
+
+    So the trust test is card IDENTITY, not geometry: the body must either name
+    the workspace's repo, or name no repo at all. A body that names repositories
+    and omits this one is evidence AGAINST it — which is exactly the 2026-09-21
+    ``t_cb701eee`` body, naming ``Kyzcreig/ace-media-homelab`` in prose with its
+    PR as a bare ``#160``.
+
+    Silence is allowed on purpose: a worktree card whose body names no repo
+    (``t_8e1f2cf3``) is the legitimate case bare-``#N`` resolution exists for.
+    The rule MATCHES mentions, it never RANKS them, so slash-bearing prose that
+    ``_body_repo_mentions`` cannot tell from a slug (``try/except``, ``30/31``)
+    can only DECLINE a resolution, never redirect one at a wrong repo. Measured
+    over all 48 gate-candidate blocked cards on all 65 board DBs, that cost is
+    zero: the rule dropped exactly the 4 ``dir``-at-``~/.hermes`` cards and all
+    11 genuine resolutions survived.
+    """
+    if not isinstance(body, str):
+        return True
+    corroborated = _corroborated_repos(body)
+    if corroborated:
+        # PR-attached refs are evidence, not a guess: they outrank bare mentions.
+        return any(named.lower() == slug.lower() for named in corroborated)
+    mentions = list(_body_repo_mentions(body))
+    if not mentions:
+        return True
+    return any(named.lower() == slug.lower() for named in mentions)
 
 
 def repo_context(
@@ -477,10 +630,24 @@ def repo_context(
 ) -> Optional[str]:
     """Best-effort repository for resolving a bare ``#N``.
 
-    Order: the card's workspace remote (only when EVERY remote agrees — the
-    hermes-agent checkout has ``origin`` = upstream and ``fork`` = ours, so a
-    bare ``#787`` there is genuinely ambiguous), then the first ``owner/repo``
-    mentioned in the card body. None means "do not resolve bare numbers".
+    Order: the card's workspace remote (only when the workspace IS the
+    checkout toplevel AND every remote agrees — the hermes-agent checkout has
+    ``origin`` = upstream and ``fork`` = ours, so a bare ``#787`` there is
+    genuinely ambiguous), then the first ``owner/repo`` mentioned in the card
+    body. None means "do not resolve bare numbers".
+
+    Two fail-safes, both of which have to hold before a workspace answer is
+    trusted:
+
+    * **no walk-up** — :func:`_is_repo_toplevel` refuses an answer inherited
+      from an ENCLOSING repository (every ``scratch`` workspace sits under
+      ``~/.hermes``, itself a checkout);
+    * **body corroboration** — :func:`_body_corroborates` requires the card's
+      own text to name the workspace's repo, or to name none at all. Geometry
+      alone is not enough: a ``dir``-kind workspace pointing AT ``~/.hermes``
+      is a perfectly valid toplevel and still answers for the wrong repo.
+      Ambiguity detection cannot catch a confidently-wrong answer, and an
+      unblock reverts a human/verifier decision.
     """
     if workspace_path:
         try:
@@ -490,7 +657,13 @@ def repo_context(
         if exists:
             slugs = _remotes_for(workspace_path)
             if len(slugs) == 1:
-                return next(iter(slugs))
+                chosen = next(iter(slugs))
+                if not _body_corroborates(chosen, body):
+                    # The body names repositories and the workspace's is not
+                    # among them. Two incompatible answers, no way to rank
+                    # them: take no action.
+                    return None
+                return chosen
             if len(slugs) > 1 and isinstance(body, str):
                 # Ambiguous remotes: let an explicit body mention pick one.
                 lowered = {s.lower(): s for s in slugs}
@@ -545,6 +718,47 @@ def query_pr(repo: str, number: int) -> Optional[dict]:
         "mergedAt": merged_at,
         "mergeCommitSha": payload.get("merge_commit_sha"),
     }
+
+
+def repo_exists(slug: str) -> bool:
+    """True only when ``gh api repos/<slug>`` names EXACTLY ``slug``.
+
+    Fail-SAFE in the restrictive direction: any failure (no ``gh``, no network,
+    timeout, 404, bad JSON) returns False, which declines a bare-``#N``
+    resolution rather than guessing one. That is the same trade
+    :func:`query_pr` makes in the other direction — None means "cannot tell"
+    and the caller takes no action.
+
+    The full-name comparison is load-bearing, not belt-and-braces. GitHub
+    REDIRECTS renamed and numeric paths: ``repos/14/14`` answers 200 with
+    ``paglia201/paglia201``. Accepting a bare 200 would have re-admitted the
+    prose token ``14/14`` as a repository.
+
+    Results are cached for the process because this runs once per gate
+    candidate per tick and a repo's existence is not tick-volatile.
+    """
+    if not isinstance(slug, str) or "/" not in slug:
+        return False
+    key = slug.lower()
+    cached = _REPO_EXISTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            ["gh", "api", f"repos/{slug}", "--jq", ".full_name"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=_QUERY_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return False
+    exists = proc.returncode == 0 and (proc.stdout or "").strip().lower() == key
+    while len(_REPO_EXISTS_CACHE) >= _CACHE_LIMIT:
+        _REPO_EXISTS_CACHE.pop(next(iter(_REPO_EXISTS_CACHE)))
+    _REPO_EXISTS_CACHE[key] = exists
+    return exists
 
 
 def _merge_sha(payload: dict) -> Optional[str]:

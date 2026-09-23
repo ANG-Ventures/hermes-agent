@@ -72,6 +72,43 @@ _PLATFORM_LOCK_OWNERS: "dict[tuple[str, str], dict[int, Any]]" = {}
 _PLATFORM_LOCK_OWNERS_LOCK = threading.Lock()
 _PLATFORM_LOCK_TOKEN_SEQ = itertools.count(1)
 
+# Per-pair critical section covering the RESOURCE operation together with its
+# ownership bookkeeping.
+#
+# ``_PLATFORM_LOCK_OWNERS_LOCK`` guards only the registry dict.  That is not
+# enough, because every decision this module makes is "look at the registry,
+# THEN act on the machine-global lock file" (or the reverse).  With the two in
+# separate critical sections, a concurrent acquire/release of the same pair
+# lands in between and the decision is executed against state that no longer
+# holds:
+#
+#   * acquire: ``acquire_scoped_lock`` reports ``had_prior_holder`` and the
+#     token is recorded afterwards.  A sibling acquire that interleaves there
+#     records with a stale ``had_prior_holder=False`` and PRUNES the live
+#     holder, so the next release deletes a lock a connected adapter is using.
+#   * release: ``_claim_platform_lock_release`` decides "nothing else holds
+#     it" and ``release_scoped_lock`` runs afterwards.  A retry connect that
+#     acquires in that window loses its credential lock.
+#
+# So the pair itself gets a lock, held across acquire+record and across
+# claim+release.  It is an ``RLock`` because the release helpers are reachable
+# from one another, and per-pair so two different credentials never serialize
+# against each other (the takeover path sleeps ~15s inside, and it runs on a
+# worker thread -- serializing two takeovers of the SAME credential is the
+# intent; blocking an unrelated one is not).
+_PLATFORM_LOCK_KEY_LOCKS: "dict[tuple[str, str], threading.RLock]" = {}
+_PLATFORM_LOCK_KEY_LOCKS_GUARD = threading.Lock()
+
+
+def _platform_lock_key_lock(scope: str, identity: str) -> "threading.RLock":
+    """Return the critical section for one ``(scope, identity)`` pair."""
+    key = (scope, identity)
+    with _PLATFORM_LOCK_KEY_LOCKS_GUARD:
+        lock = _PLATFORM_LOCK_KEY_LOCKS.get(key)
+        if lock is None:
+            lock = _PLATFORM_LOCK_KEY_LOCKS[key] = threading.RLock()
+        return lock
+
 
 def _live_platform_lock_holders(key: "tuple[str, str]") -> "dict[int, Any]":
     """Return the live acquisitions for ``key``, pruning collected adapters.
@@ -150,6 +187,26 @@ def _claim_platform_lock_release(scope: str, identity: str, token: "Optional[int
             if not holders:
                 _PLATFORM_LOCK_OWNERS.pop(key, None)
         return not holders
+
+
+def _retire_platform_lock_acquisition(
+    scope: str, identity: str, token: "Optional[int]"
+) -> None:
+    """Drop ``token``'s acquisition record WITHOUT releasing the lock file.
+
+    Used when one adapter re-acquires a pair it already holds (a reconnect):
+    the machine-global lock is unchanged (``acquire_scoped_lock``
+    self-reacquires for the calling PID), but the superseded token must not be
+    left behind as a phantom live holder.
+    """
+    if token is None:
+        return
+    with _PLATFORM_LOCK_OWNERS_LOCK:
+        key = (scope, identity)
+        holders = _live_platform_lock_holders(key)
+        holders.pop(token, None)
+        if not holders:
+            _PLATFORM_LOCK_OWNERS.pop(key, None)
 
 
 # Per-call sink through which the cancelled-acquire drain learns the token its
@@ -4051,18 +4108,26 @@ class BasePlatformAdapter(ABC):
             # token our worker minted is an exact test of which acquisition
             # holds the lock; claiming it also clears the record, so a later
             # teardown on this adapter cannot release it a second time.
+            #
+            # The claim and the release it authorises are ONE critical section
+            # per pair: split, a retry connect acquires between them and this
+            # release deletes that live connect's credential lock.  Nothing
+            # slow is held under it (the takeover sleep is outside), so this
+            # cannot stall the loop.
             our_token = token_sink[0] if token_sink else None
-            if acquired and _claim_platform_lock_release(scope, identity, our_token):
-                try:
-                    self._release_platform_lock_identity(scope, identity)
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.warning(
-                        "[%s] could not release %s taken by a cancelled "
-                        "acquire: %s",
-                        self.name,
-                        resource_desc,
-                        exc,
-                    )
+            if acquired:
+                with _platform_lock_key_lock(scope, identity):
+                    if _claim_platform_lock_release(scope, identity, our_token):
+                        try:
+                            self._release_platform_lock_identity(scope, identity)
+                        except Exception as exc:  # pragma: no cover - defensive
+                            logger.warning(
+                                "[%s] could not release %s taken by a cancelled "
+                                "acquire: %s",
+                                self.name,
+                                resource_desc,
+                                exc,
+                            )
             raise cancelled
 
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
@@ -4082,6 +4147,20 @@ class BasePlatformAdapter(ABC):
 
         BLOCKING.  On the takeover path this writes a marker and sleeps for up
         to ~15s.  Coroutines must call :meth:`_acquire_platform_lock_async`.
+
+        The acquire and the token record that makes the acquisition visible to
+        every releaser are ONE critical section per pair (see
+        ``_platform_lock_key_lock``).  Split, a sibling acquire of the same
+        pair interleaves between them, records with a stale
+        ``had_prior_holder=False`` and prunes the live holder -- after which a
+        release deletes the machine-global lock a connected adapter is using.
+
+        The ~15s takeover is deliberately OUTSIDE that section.  Only file
+        operations are held under it, so ``_release_platform_lock`` -- which
+        coroutines call on teardown and takes the same lock -- can never wait
+        on a takeover sleep.  Holding it across the takeover would put the
+        stall back on the loop through the release path, which is the exact
+        failure this PR exists to remove.
         """
         from gateway.status import (
             acquire_scoped_lock,
@@ -4091,14 +4170,15 @@ class BasePlatformAdapter(ABC):
 
         self._platform_lock_scope = scope
         self._platform_lock_identity = identity
-        acquired, existing = acquire_scoped_lock(
-            scope, identity, metadata={'platform': self.platform.value}
-        )
-        if acquired:
-            self._note_acquired_platform_lock(
-                scope, identity, had_prior_holder=existing is not None
+        with _platform_lock_key_lock(scope, identity):
+            acquired, existing = acquire_scoped_lock(
+                scope, identity, metadata={'platform': self.platform.value}
             )
-            return True
+            if acquired:
+                self._note_acquired_platform_lock(
+                    scope, identity, had_prior_holder=existing is not None
+                )
+                return True
 
         takeover_allowed = bool(
             getattr(self, "_platform_lock_takeover_allowed", False)
@@ -4121,15 +4201,18 @@ class BasePlatformAdapter(ABC):
                     resource_desc,
                     owner_pid,
                 )
-                acquired, existing = acquire_scoped_lock(
-                    scope,
-                    identity,
-                    metadata={"platform": self.platform.value},
-                )
-                if acquired:
-                    self._note_acquired_platform_lock(
-                        scope, identity, had_prior_holder=existing is not None
+                acquired = False
+                with _platform_lock_key_lock(scope, identity):
+                    acquired, existing = acquire_scoped_lock(
+                        scope,
+                        identity,
+                        metadata={"platform": self.platform.value},
                     )
+                    if acquired:
+                        self._note_acquired_platform_lock(
+                            scope, identity, had_prior_holder=existing is not None
+                        )
+                if acquired:
                     logger.info(
                         "[%s] Acquired %s after taking over PID %d",
                         self.name,
@@ -4161,11 +4244,29 @@ class BasePlatformAdapter(ABC):
     def _note_acquired_platform_lock(
         self, scope: str, identity: str, *, had_prior_holder: bool
     ) -> None:
-        """Mint and record the ownership token for a just-acquired lock."""
+        """Mint and record the ownership token for a just-acquired lock.
+
+        A RETRY connect reuses the SAME adapter object, so it would overwrite
+        ``_platform_lock_token`` and strand the previous token in the pair's
+        live-holder set forever.  Nothing ever drops a stranded token (the
+        weakref prune cannot help -- the adapter is the same live object), so
+        the pair looks permanently held by a live sibling and no later release
+        fires: "already in use" until the process restarts.  Retire this
+        adapter's previous acquisition of the SAME pair before recording the
+        new one; the lock file itself is unaffected, because
+        ``acquire_scoped_lock`` self-reacquired it for this PID.
+        """
+        previous = getattr(self, "_platform_lock_token", None)
+        if (
+            previous is not None
+            and getattr(self, "_platform_lock_recorded_pair", None) == (scope, identity)
+        ):
+            _retire_platform_lock_acquisition(scope, identity, previous)
         token = _note_platform_lock_acquired(
             scope, identity, self, had_prior_holder=had_prior_holder
         )
         self._platform_lock_token = token
+        self._platform_lock_recorded_pair = (scope, identity)
         sink = _PLATFORM_LOCK_TOKEN_SINK.get()
         if sink is not None:
             sink.append(token)
@@ -4181,21 +4282,28 @@ class BasePlatformAdapter(ABC):
         release the pair a SECOND time, deleting whatever retry connect has
         since legitimately claimed it.  Release only while our own token is
         still the live owner's.
+
+        SERIALIZED PER PAIR.  The ownership claim and the release it authorises
+        are ONE critical section: split, a retry connect acquires between them
+        and this release deletes that live connect's credential lock.
         """
         identity = getattr(self, '_platform_lock_identity', None)
         if not identity:
             return
         scope = self._platform_lock_scope
         token = getattr(self, '_platform_lock_token', None)
-        if not _claim_platform_lock_release(scope, identity, token):
-            # Not ours any more (already released by the cancel drain, or
-            # re-acquired by someone else).  Still drop our own bookkeeping.
-            self._platform_lock_identity = None
-            self._platform_lock_token = None
-            return
-        self._release_platform_lock_identity(scope, identity)
+        with _platform_lock_key_lock(scope, identity):
+            if not _claim_platform_lock_release(scope, identity, token):
+                # Not ours any more (already released by the cancel drain, or
+                # re-acquired by someone else).  Still drop our own bookkeeping.
+                self._platform_lock_identity = None
+                self._platform_lock_token = None
+                self._platform_lock_recorded_pair = None
+                return
+            self._release_platform_lock_identity(scope, identity)
         self._platform_lock_identity = None
         self._platform_lock_token = None
+        self._platform_lock_recorded_pair = None
 
     def _release_platform_lock_identity(self, scope: str, identity: str) -> None:
         """Release one EXPLICIT (scope, identity) scoped lock.
@@ -7997,12 +8105,19 @@ class BasePlatformAdapter(ABC):
         self._expected_cancelled_tasks.clear()
         self._session_tasks.clear()
         # Flush pending messages to disk before clearing (#72680).
+        # Off-loop: each payload ends in an unbounded os.replace, and this
+        # runs while the other adapters are still draining.
+        # drain=True takes the snapshot AND clears the slot together, before
+        # the await: a message arriving during the offload (base.py:7994
+        # re-queues one right here in this teardown loop) then lands in an
+        # empty slot and survives instead of being wiped by a later clear().
         try:
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+            from gateway.shutdown_flush import flush_pending_to_file_async
+            await flush_pending_to_file_async(
+                self._pending_messages, reason="adapter_shutdown", drain=True
+            )
         except Exception:
             pass
-        self._pending_messages.clear()
         self._active_sessions.clear()
         for state in list(self._text_debounce_store().values()):
             if state.task is not None and not state.task.done():

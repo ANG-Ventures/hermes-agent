@@ -23,6 +23,8 @@ import os
 import sys
 from pathlib import Path
 
+from hermes_cli.cli_hint import hint_arg
+
 
 def _m():
     """Lazy ``hermes_cli.main`` reference (call-time, keeps patches working)."""
@@ -181,11 +183,16 @@ def cmd_sessions(args, sessions_parser=None):
             print("")
             print("  Next step — offline recovery (never modifies the source):")
             source_hint = report.get("backup_path") or db_path
-            print(f"    hermes sessions recover --source {source_hint} \\")
+            # The path is interpolated into a command the user is told to paste,
+            # so it must survive the shell: a backup path holding a space split
+            # into two words and argparse rejected the remedy this block exists
+            # to hand them. `hint_arg` owns that escaping.
+            source_arg = hint_arg("--source", str(source_hint))
+            print(f"    hermes sessions recover {source_arg} \\")
             print("        --inspect-only")
             print("  If that reports the data is recoverable, rebuild it into")
             print("  a NEW database (the active one is left untouched):")
-            print(f"    hermes sessions recover --source {source_hint} \\")
+            print(f"    hermes sessions recover {source_arg} \\")
             print("        --output recovered-state.db")
         return
 

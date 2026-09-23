@@ -343,13 +343,70 @@ def test_schema_migration_adds_columns_to_preexisting_table(tmp_path, monkeypatc
         )
         """
     )
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, output_tokens, cost_usd) "
+        "VALUES ('legacy-unpriced-measured', 100, 0, NULL)"
+    )
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, output_tokens, cache_read, "
+        "cache_write, cost_usd, cost_status) "
+        "VALUES ('legacy-unpriced-empty', 0, 0, 0, 0, NULL, 'unknown')"
+    )
+    # TEST-REPIN (r6 finding 6): the genuinely-zero-token row. The old
+    # assertion required the latch to fire here too, on the premise that every
+    # unpriced all-zero row is ambiguous. It is not: a turn interrupted before
+    # any API call fired, a blackbox-off turn, or one whose first call failed
+    # really did consume zero tokens, and latching it was irreversible — it
+    # could never again heal to `priced_zero` through `reprice_unpriced` (which
+    # now short-circuits on any unknown flag) and rendered `unknown in +
+    # unknown out` on every card forever. `cost_status` is the discriminator
+    # the pre-UNKNOWN schema already carried, so the latch is now scoped to
+    # rows that code itself could not account ('unknown'). This row has no
+    # status at all.
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, output_tokens, cache_read, "
+        "cache_write, cost_usd) VALUES ('legacy-zero-token-measured', 0, 0, 0, 0, NULL)"
+    )
     legacy.commit()
     legacy.close()
 
     # Re-open through the store: _ensure_schema must ALTER in the new columns.
     with store._connect() as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
+        measured_unknown = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'legacy-unpriced-measured'"
+        ).fetchone()[0]
+        empty_unknown = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'legacy-unpriced-empty'"
+        ).fetchone()[0]
+        zero_token_unknown = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'legacy-zero-token-measured'"
+        ).fetchone()[0]
     assert {"last_cache_read", "last_cache_write", "last_uncached"} <= cols
+    assert empty_unknown == 1, (
+        "a pre-discriminator unpriced row with NO token counts that the old "
+        "code itself labelled cost_status='unknown' is genuinely ambiguous and "
+        "must not be repriced as though it had been measured"
+    )
+    assert zero_token_unknown == 0, (
+        "a zero-token row the old code never labelled unknown (interrupted "
+        "before any API call, blackbox-off, failed first call) really did "
+        "consume zero tokens; latching it is irreversible and strands it "
+        "outside reprice_unpriced forever (r6 finding 6)"
+    )
+    assert measured_unknown == 0, (
+        "a row is routinely unpriced because pricing REFUSED the route, not "
+        "because usage was absent; latching usage_unknown on it rewrites its "
+        "real provider-measured counts as unmeasured, irreversibly"
+    )
+    # `usage_unknown` is the shared DISPLAY discriminator, so prove the claim
+    # at the surface the user actually sees, not just at the column.
+    from plugins.blackbox.last_turn import render_last_turn_record
+
+    measured_row = store.get_turn("legacy-unpriced-measured")
+    rendered = "\n".join(render_last_turn_record(measured_row))
+    assert "Tokens in: 100" in rendered
+    assert "Tokens in: unknown" not in rendered
 
     # A new record round-trips through the migrated columns.
     store.insert_turn(make_record("post-migrate", last_cache_read_tokens=7,
@@ -358,10 +415,60 @@ def test_schema_migration_adds_columns_to_preexisting_table(tmp_path, monkeypatc
     assert row["last_cache_read_tokens"] == 7
     assert row["last_cache_write_tokens"] == 8
     assert row["last_uncached_tokens"] == 1
+    assert row["usage_unknown"] == 0, "new post-cutover rows use their real discriminator"
 
     # Idempotent: connecting again must not raise (columns already present).
     with store._connect() as conn:
         conn.execute("SELECT last_cache_read FROM turns").fetchall()
+
+
+def test_migration_survives_a_db_missing_some_token_count_columns(tmp_path, monkeypatch):
+    """The unknown-latch must not name a token column this DB does not have.
+
+    `turns` is created WITH the four count columns, but a table that already
+    exists never gains them: CREATE TABLE IF NOT EXISTS is a no-op and no ALTER
+    adds them. A sufficiently old DB therefore reaches the latch without e.g.
+    `cache_write`, and naming it unconditionally aborts the ENTIRE _ensure_schema
+    with "no such column" — taking every later migration down with it.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db_path = store._db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(str(db_path))
+    # Only input_tokens survives of the four count columns.
+    legacy.execute(
+        "CREATE TABLE turns ("
+        "turn_id TEXT PRIMARY KEY, platform TEXT, chat_id TEXT, ts_end REAL, "
+        "cost_usd REAL, context_used INT, last_uncached INT, input_tokens INT)"
+    )
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, cost_usd) "
+        "VALUES ('ancient-measured', 100, NULL)"
+    )
+    legacy.execute(
+        "INSERT INTO turns (turn_id, input_tokens, cost_usd) "
+        "VALUES ('ancient-empty', 0, NULL)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    with store._connect() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
+        measured = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'ancient-measured'"
+        ).fetchone()[0]
+        empty = conn.execute(
+            "SELECT usage_unknown FROM turns WHERE turn_id = 'ancient-empty'"
+        ).fetchone()[0]
+
+    # The later migrations still ran — they would have been skipped had the
+    # latch raised.
+    assert {"comp_sys_tokens", "comp_calls_json", "cost_output_usd"} <= cols
+    assert {"usage_unknown", "output_tokens_unknown"} <= cols
+    # The guard keeps its meaning over the columns that DO exist: a row with a
+    # real count is not latched, a genuinely empty one is.
+    assert measured == 0
+    assert empty == 1
 
 
 # ---------------------------------------------------------------------------
@@ -445,3 +552,87 @@ def test_migration_adds_perclass_columns_to_old_db(tmp_path, monkeypatch):
         assert col in cols2, f"{col} not migrated into the old-shape DB"
     # idempotent: a further open must not raise
     store._connect().close()
+
+
+# ---------------------------------------------------------------------------
+# Rolling-window reads must not SCAN the ledger (card t_93776e8f)
+# ---------------------------------------------------------------------------
+# The kanban budget brake sums cost_usd over a 24h ts_start window on EVERY
+# profile ledger, every dispatcher tick. Without an index on ts_start the
+# planner picks SCAN turns, and `turns` is overflow-page-heavy (user_text /
+# final_text previews), so a few-thousand-row table is tens of MB of read.
+# These gate the PLAN, not the mere presence of an index row: a named index
+# the planner never picks would be inert.
+
+BUDGET_QUERY = (
+    "SELECT cost_usd, user_text FROM turns "
+    "WHERE ts_start >= ? AND cost_usd IS NOT NULL AND user_text IS NOT NULL"
+)
+
+
+def _plan(conn, sql, params):
+    return " ".join(
+        str(r[-1]) for r in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+    )
+
+
+def test_budget_window_query_uses_the_ts_start_index(tmp_path, monkeypatch):
+    """The kanban-budget window read must SEARCH, never SCAN."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for i in range(200):
+        store.insert_turn(make_record(f"turn-window-{i}", ts_start=1000.0 + i))
+    conn = store._connect()
+    try:
+        conn.execute("ANALYZE")
+        plan = _plan(conn, BUDGET_QUERY, (1100,))
+    finally:
+        conn.close()
+    assert "idx_blackbox_turns_ts_start" in plan, plan
+    assert "SCAN turns" not in plan, plan
+
+
+def test_ts_start_index_is_migrated_into_a_preexisting_ledger(tmp_path, monkeypatch):
+    """A ledger created before the index exists gains it on the next connect.
+
+    The live fleet ledgers are all pre-existing, so the index is worthless
+    unless _ensure_schema adds it to an already-populated DB.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db_path = store._db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(str(db_path))
+    # Pre-index shape: the original column set, no ts_start index.
+    legacy.execute(
+        """
+        CREATE TABLE turns (
+            turn_id TEXT PRIMARY KEY, parent_turn_id TEXT, is_subagent INT,
+            ts_start REAL, ts_end REAL, profile TEXT, provider TEXT, model TEXT,
+            platform TEXT, chat_id TEXT, chat_name TEXT, api_calls INT, tools TEXT,
+            input_tokens INT, output_tokens INT, cache_read INT, cache_write INT,
+            reasoning INT, context_used INT, context_length INT, cost_usd REAL,
+            cost_status TEXT, interrupted INT, alerted INT DEFAULT 0,
+            user_text TEXT, final_text TEXT
+        )
+        """
+    )
+    legacy.executemany(
+        "INSERT INTO turns (turn_id, ts_start, cost_usd, user_text) "
+        "VALUES (?, ?, 1.0, 'work kanban task t_deadbeef')",
+        [(f"legacy-{i}", 1000.0 + i) for i in range(200)],
+    )
+    legacy.commit()
+    pre_plan = _plan(legacy, BUDGET_QUERY, (1100,))
+    legacy.close()
+    # RED control: without the index this same query scans.
+    assert "SCAN turns" in pre_plan, pre_plan
+
+    conn = store._connect()  # runs _ensure_schema
+    try:
+        names = {r[1] for r in conn.execute("PRAGMA index_list(turns)")}
+        conn.execute("ANALYZE")
+        post_plan = _plan(conn, BUDGET_QUERY, (1100,))
+    finally:
+        conn.close()
+    assert "idx_blackbox_turns_ts_start" in names, names
+    assert "idx_blackbox_turns_ts_start" in post_plan, post_plan
+    assert "SCAN turns" not in post_plan, post_plan

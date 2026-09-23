@@ -473,6 +473,54 @@ _PRE_TOOL_CALL_SUPPRESSED_BLOCK_MESSAGE = (
     "timeout (retry in {remaining:.0f}s)"
 )
 
+
+def _callback_label(callback: Any) -> str:
+    """Return a stable, secret-free identifier for a plugin *callback*.
+
+    Callback labels reach the MODEL through the fail-closed refusal messages
+    above, so this must never fall back to ``repr()``: a callback that carries
+    credentials in its state — the canonical case is
+    ``functools.partial(fn, api_token)``, whose repr renders every bound
+    argument — would interpolate them straight into a model-visible string.
+    ``__name__``/``__qualname__`` are usually developer-chosen identifiers, but
+    they are NOT safe by construction: this codebase synthesizes them from
+    operator config (``agent.shell_hooks`` and ``agent.outbound_webhooks`` both
+    do), and a third-party plugin can set any value through
+    ``register_hook()``. Each PRODUCER of a synthesized identity is therefore
+    responsible for sanitizing it at the source — see
+    :func:`agent.shell_hooks.hook_display_name` and
+    :attr:`agent.outbound_webhooks.WebhookTarget.display_label`. This function
+    is the last line of defence, not the only one: it refuses ``repr()`` so an
+    unsanitized callback still cannot render its bound state.
+
+    Anything without a usable name is identified by TYPE plus a short digest of
+    that type — never ``id()``, whose value is a CPython heap address that
+    changes per process and is recycled after GC.
+    """
+    for attr in ("__qualname__", "__name__"):
+        label = getattr(callback, attr, None)
+        if isinstance(label, str) and label:
+            return label
+    # functools.partial and friends: the WRAPPED function's name is a safe
+    # developer identifier, while the partial's bound args are exactly what
+    # must not be rendered. Name the wrapped callable, never the arguments.
+    wrapped = getattr(callback, "func", None)
+    if wrapped is not None:
+        for attr in ("__qualname__", "__name__"):
+            label = getattr(wrapped, attr, None)
+            if isinstance(label, str) and label:
+                return f"{type(callback).__name__}({label})"
+    # Last resort: no usable name anywhere. Identify by TYPE plus a short
+    # digest of its fully-qualified type, NOT id() — a heap address differs
+    # between processes and is recycled after GC, so it is neither stable nor
+    # meaningful to whoever reads the refusal. The digest keeps two distinct
+    # anonymous callback types apart without disclosing any instance state.
+    cls = type(callback)
+    fqtn = f"{getattr(cls, '__module__', '?')}.{getattr(cls, '__qualname__', cls.__name__)}"
+    digest = hashlib.sha256(fqtn.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"<{cls.__name__}#{digest}>"
+
+
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 ENTRY_POINT_CAPABILITIES_GROUP = "hermes_agent.plugin_capabilities"
 
@@ -5706,7 +5754,7 @@ class PluginManager:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         for cb in callbacks:
-            callback_name = getattr(cb, "__name__", repr(cb))
+            callback_name = _callback_label(cb)
             callback_key = (hook_name, id(cb))
             fail_closed = bool(
                 getattr(
@@ -5952,7 +6000,7 @@ class PluginManager:
                     logger.warning(
                         "Event '%s' subscriber %s raised: %s",
                         item.event,
-                        getattr(callback, "__name__", repr(callback)),
+                        _callback_label(callback),
                         exc,
                     )
         finally:
@@ -6138,7 +6186,7 @@ class PluginManager:
                 logger.warning(
                     "Middleware '%s' callback %s raised: %s",
                     kind,
-                    getattr(cb, "__name__", repr(cb)),
+                    _callback_label(cb),
                     exc,
                 )
         return results

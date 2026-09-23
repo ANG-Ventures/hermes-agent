@@ -541,15 +541,17 @@ def test_record_baseline_skips_unreadable_dirs_instead_of_failing_dispatch(board
     # negative control: a non-permission walk error still propagates
     class Boom(OSError):
         pass
-    def exploding_walk(*a, **k):
-        k["onerror"](Boom("disk on fire"))
-        return iter(())
+    def exploding_scandir(*a, **k):
+        raise Boom("disk on fire")
     conn.execute("DELETE FROM task_workspace_survivors WHERE task_id = ?", (tid,))
     conn.commit()
-    orig = survivor.os.walk
-    survivor.os.walk = exploding_walk
+    # The enumeration reads directories via os.scandir (t_6c46905a replaced the
+    # os.walk form to drop a per-child is_symlink stat and to bound the walk).
+    # The PROPERTY under test is unchanged: only PermissionError is swallowed.
+    orig = survivor.os.scandir
+    survivor.os.scandir = exploding_scandir
     try:
         with pytest.raises(Boom):
             survivor.record_baseline(conn, tid, ws)
     finally:
-        survivor.os.walk = orig
+        survivor.os.scandir = orig

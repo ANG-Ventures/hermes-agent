@@ -1070,6 +1070,41 @@ class ModelCapabilities:
 _OVERRIDE_WARNED_KEYS: set = set()
 
 
+# Freshly-launched models may be usable before models.dev has indexed them.
+# Keep their published capabilities available for an explicitly selected or
+# discovered model so capability routing (vision, tools, context) is correct
+# on launch day instead of falling through to the unknown-model defaults.
+# Keyed by (models.dev provider id, lowercased model id).
+_BUILTIN_MODEL_METADATA: Dict[Tuple[str, str], Dict[str, Any]] = {
+    # GPT-6 Sol / Luna, GA 2026-09-22. Numbers from the official model docs
+    # (developers.openai.com/api/docs/models/gpt-6-{sol,luna}): 1,050,000
+    # context, 128,000 max output, text+image in / text out, reasoning +
+    # function calling supported.
+    ("openai", "gpt-6-sol"): {
+        "limit": {"context": 1_050_000, "output": 128_000},
+        "modalities": {"input": ["text", "image"], "output": ["text"]},
+        "tool_call": True,
+        "reasoning": True,
+        "family": "gpt-6",
+    },
+    ("openai", "gpt-6-luna"): {
+        "limit": {"context": 1_050_000, "output": 128_000},
+        "modalities": {"input": ["text", "image"], "output": ["text"]},
+        "tool_call": True,
+        "reasoning": True,
+        "family": "gpt-6",
+    },
+}
+
+
+def _builtin_metadata_for(provider: str, model: str) -> Optional[Dict[str, Any]]:
+    """Built-in capability entry for a model models.dev doesn't know yet."""
+    provider_key = PROVIDER_TO_MODELS_DEV.get(
+        (provider or "").strip(), (provider or "").strip()
+    )
+    return _BUILTIN_MODEL_METADATA.get((provider_key, (model or "").strip().lower()))
+
+
 def _load_model_overrides() -> Dict[str, Any]:
     """Load the ``model_overrides`` config section.
 
@@ -1380,6 +1415,10 @@ def get_model_capabilities(
     """
     models = _get_provider_models(provider, allow_network=allow_network)
     entry = _find_model_entry(models, model) if models is not None else None
+    if entry is None:
+        # Catalog miss: fall back to the built-in snapshot for models
+        # models.dev hasn't indexed yet (launch-day slugs).
+        entry = _builtin_metadata_for(provider, model)
 
     # Select the override AFTER the catalog lookup: explicit overrides
     # always apply; _default entries only fill gaps for catalog misses.
@@ -1687,13 +1726,18 @@ def get_model_info(
 
     def _from_override_alone() -> Optional[ModelInfo]:
         override = _override_for(provider_id, model_id, catalog_hit=False)
+        builtin = _builtin_metadata_for(provider_id, model_id)
         if override is None:
-            return None
+            # No override, but a built-in snapshot may still describe a
+            # launch-day model the catalog hasn't indexed yet.
+            if builtin is None:
+                return None
+            return _parse_model_info(model_id, dict(builtin), mdev_id)
         # Seed the same safe defaults get_model_capabilities uses for
         # unknown models (200K context, tools on) so the two
         # unknown-model paths agree; the override patches its fields on
-        # top.
-        base = {
+        # top. A built-in snapshot, when present, is the better base.
+        base = dict(builtin) if builtin is not None else {
             "limit": {"context": 200000, "output": 8192},
             "tool_call": True,
         }

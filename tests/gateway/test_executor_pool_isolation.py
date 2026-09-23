@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from gateway import run as run_mod
 from gateway.run import GatewayRunner
 
 
@@ -95,8 +96,17 @@ def test_abandoned_housekeeping_cannot_delay_a_boot_resume():
         entered.release()
         assert wedge.wait(60), "wedge never released"
 
-    runner = _runner(wedged_cleanup)
-    turn_pool = runner._get_executor()
+    # Pin the incident against a FINITE turn pool (explicit operator cap) so the
+    # "abandoned housekeeping retires turn slots" shape is still reproducible;
+    # the default turn pool is unbounded (Ace ruling 2026-09-23), where this
+    # class cannot occur at all.
+    import os as _os
+    _os.environ["HERMES_GATEWAY_EXECUTOR_MAX_WORKERS"] = "10"
+    try:
+        runner = _runner(wedged_cleanup)
+        turn_pool = runner._get_executor()
+    finally:
+        _os.environ.pop("HERMES_GATEWAY_EXECUTOR_MAX_WORKERS", None)
     hk_pool = runner._get_housekeeping_executor()
     hk_workers = hk_pool._max_workers
     abandoned = turn_pool._max_workers + hk_workers
@@ -143,47 +153,38 @@ def test_abandoned_housekeeping_cannot_delay_a_boot_resume():
     assert latency < 5.0, f"boot resume waited {latency:.2f}s behind housekeeping"
 
 
-def test_turn_pool_saturation_still_queues_fairly():
-    """Turn-vs-turn contention is NOT what this change alters.
+def test_turn_pool_never_queues_an_admitted_turn():
+    """Inverse of the old `saturation_still_queues_fairly` pin.
 
-    A pool of N with N in-flight turns still queues the N+1th; the fix is
-    about housekeeping never consuming those slots, not about unbounded
-    turn concurrency. Pinned so a future "just raise max_workers" change
-    cannot silently claim to have fixed the incident.
+    That pin asserted a full N-thread pool queues the N+1th turn. Measured on
+    Apollo 2026-09-23 that queue held admitted turns for 334-2356 s
+    (PHASE=executor_wait pool=turn inflight=10) and read as "sessions never
+    resume". Ace ruling 08:47 PT: no pool cap. So: with 40 turn bodies parked,
+    a 41st must START immediately.
     """
     release = threading.Event()
     occupied = threading.Semaphore(0)
     runner = _runner()
-    max_workers = runner._get_executor()._max_workers
+    pool = runner._get_executor()
 
     def long_turn():
         occupied.release()
         assert release.wait(60)
 
-    async def exercise():
-        turns = [
-            asyncio.ensure_future(runner._run_in_executor_with_context(long_turn))
-            for _ in range(max_workers)
-        ]
-        for _ in range(max_workers):
-            assert await asyncio.to_thread(occupied.acquire, True, 30)
-
-        started = threading.Event()
-        queued = asyncio.ensure_future(
-            runner._run_in_executor_with_context(started.set)
-        )
-        await asyncio.sleep(0.5)
-        was_queued = not started.is_set()
-        release.set()
-        await asyncio.gather(queued, *turns)
-        return was_queued
-
     try:
-        assert asyncio.run(exercise()), "a full turn pool must queue the next turn"
+        parked = [pool.submit(long_turn) for _ in range(40)]
+        for _ in range(40):
+            assert occupied.acquire(True, 30)
+        started = threading.Event()
+        extra = pool.submit(started.set)
+        assert started.wait(5), "the 41st admitted turn queued behind a full pool"
+        extra.result(timeout=5)
+        assert pool._work_queue.qsize() == 0
     finally:
         release.set()
-        _shutdown(runner)
-
+        for f in parked:
+            f.result(timeout=30)
+        pool.shutdown(wait=True)
 
 def test_executor_wait_logs_pool_depth_when_a_submit_waits(caplog, monkeypatch):
     """PHASE=executor_wait must name the pool, the wait and the saturation.
@@ -317,7 +318,7 @@ def test_get_executor_works_on_a_bare_duck_typed_double():
     double = types.SimpleNamespace(_executor=None, _executor_closing=False)
     pool = GatewayRunner._get_executor(double)
     try:
-        assert isinstance(pool, concurrent.futures.ThreadPoolExecutor)
+        assert isinstance(pool, concurrent.futures.Executor)
         assert double._executor is pool
         # Same for the housekeeping pool, on a double that has never heard of it.
         hk_double = types.SimpleNamespace(_executor_closing=False)
@@ -349,8 +350,10 @@ def test_invalid_pool_size_falls_back_to_default(monkeypatch, bad):
     runner = _runner()
     try:
         pool = runner._get_executor()
-        assert isinstance(pool, concurrent.futures.ThreadPoolExecutor)
-        assert pool._max_workers == 10
+        assert isinstance(pool, concurrent.futures.Executor)
+        # default is UNBOUNDED (Ace ruling 2026-09-23): no ThreadPoolExecutor cap
+        assert pool._max_workers is None
+        assert isinstance(pool, run_mod._UnboundedThreadExecutor)
     finally:
         _shutdown(runner)
 

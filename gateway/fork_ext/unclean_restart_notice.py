@@ -39,7 +39,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -88,6 +88,9 @@ class PriorLifeVerdict:
     kill_sender_label: Optional[str] = None
     ended_at: Optional[str] = None
     site: Optional[str] = None
+    planned: bool = False          # a safe-restart we REQUESTED explains the death
+    planned_by: Optional[str] = None
+    planned_detail: Optional[str] = None   # ledger `detail` (e.g. 'kickstart -k', 'full-reload')
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -101,7 +104,10 @@ def _as_str(value: Any) -> Optional[str]:
 
 
 def classify_prior_life(
-    sentinel: Optional[Dict[str, Any]], *, site: Optional[str] = None
+    sentinel: Optional[Dict[str, Any]],
+    *,
+    site: Optional[str] = None,
+    planned: Optional[Dict[str, Any]] = None,
 ) -> PriorLifeVerdict:
     """Read the CURRENT life's sentinel for the PREVIOUS life's verdict.
 
@@ -144,6 +150,9 @@ def classify_prior_life(
             ended_at=_as_str(data.get("prior_exited_at"))
             or _as_str(data.get("prior_started_at")),
             site=site if isinstance(site, str) and site else None,
+            planned=bool(planned),
+            planned_by=_as_str((planned or {}).get("initiator_profile")) if planned else None,
+            planned_detail=_as_str((planned or {}).get("detail")) if planned else None,
         )
     except Exception:  # pragma: no cover - classification is fail-quiet
         logger.debug("Prior-life classification failed", exc_info=True)
@@ -196,12 +205,21 @@ def format_restart_notice(verdict: PriorLifeVerdict) -> Optional[str]:
     """
     if not verdict.unclean:
         return None
+    if verdict.planned:
+        # A death our own safe-restart caused. 2026-09-22 22:5x, Ace: "can we get a
+        # notification in chat if it's related to a safe restart or what caused this
+        # freeze?" — silence read as a mystery freeze. So: ONE short line that names
+        # the initiator and the mechanism, no "resuming" scare-phrasing, no exit code.
+        who = verdict.planned_by or "fleet"
+        how = (verdict.planned_detail or "safe-restart").strip()
+        when = _local_hhmm(verdict.ended_at)
+        head = "\U0001f504 Restarted%s by %s (%s)" % ((" at %s" % when) if when else "", who, how)
+        return head + " — planned; resuming where I left off."
     when = _local_hhmm(verdict.ended_at)
-    head = ("\u26a0\ufe0f I was restarted at %s" % when) if when else "\u26a0\ufe0f I was restarted"
+    head = ("\u26a0\ufe0f Restarted at %s" % when) if when else "\u26a0\ufe0f Restarted"
     cause = _cause_phrase(verdict)
-    if cause:
-        head += " (%s)" % cause
-    return head + " and am resuming your last request."
+    head += " — UNPLANNED (%s)" % cause if cause else " — UNPLANNED"
+    return head + "; resuming where I left off."
 
 
 # --------------------------------------------------------------------------
@@ -263,6 +281,83 @@ def claim_restart_notice(
         # two resumes in one boot do not both send even if the disk is wedged.
         logger.debug("Restart-notice ledger write failed", exc_info=True)
     return True
+
+
+# --------------------------------------------------------------------------
+# Planned-restart suppression: a REQUESTED bounce is not an unexplained death
+# --------------------------------------------------------------------------
+
+_RESTART_LEDGER_RELATIVE = ("logs", "gateway-restart-ledger.jsonl")
+_LEDGER_TAIL_BYTES = 64 * 1024
+# A kickstart row this close BEFORE the prior life's end is the cause of it.
+PLANNED_RESTART_WINDOW_S = 180.0
+
+
+def _restart_ledger_path(home: Optional[Path] = None) -> Path:
+    base = home if home is not None else _process_home()
+    return base.joinpath(*_RESTART_LEDGER_RELATIVE)
+
+
+def read_planned_restart(
+    ended_at: Optional[str], home: Optional[Path] = None
+) -> Optional[Dict[str, Any]]:
+    """The safe-restart ``kickstart``/``intent`` row that explains ``ended_at``.
+
+    2026-09-21/22: Apollo posted "I was restarted at 20:48 (exit 1: shutdown
+    watchdog fired) and am resuming" into FOUR Discord channels per bounce,
+    and Ace read it as a crash loop. Every one of those bounces was a
+    safe-restart the fleet had REQUESTED (deploy lane / --interrupt-busy /
+    his own /restart): with 5-12 live turns the 30 s drain always times out,
+    the 50 s shutdown watchdog fires, and ``mark_exited(1, "shutdown_watchdog")``
+    makes the prior life look unclean. The watcher's ledger is the only
+    machine-readable record that the SIGTERM was ours. Read it; if a
+    ``kickstart`` (or ``intent``) row for this profile landed within
+    PLANNED_RESTART_WINDOW_S before the death, the restart was planned.
+
+    Returns the ledger row (dict) or ``None``. Fail-OPEN on any read error:
+    a missing/corrupt ledger must not silence a genuine unexplained death.
+    """
+    if not ended_at:
+        return None
+    try:
+        ended = datetime.fromisoformat(ended_at)
+        if ended.tzinfo is None:
+            ended = ended.replace(tzinfo=timezone.utc)
+        ended_epoch = ended.timestamp()
+    except (ValueError, OverflowError):
+        return None
+    path = _restart_ledger_path(home)
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > _LEDGER_TAIL_BYTES:
+                fh.seek(size - _LEDGER_TAIL_BYTES)
+                fh.readline()  # drop the partial first line
+            tail = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip() or "default"
+    best: Optional[Dict[str, Any]] = None
+    for line in tail.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("event") not in ("kickstart", "intent"):
+            continue
+        if (row.get("target_profile") or "default") != profile:
+            continue
+        try:
+            epoch = float(row.get("epoch"))
+        except (TypeError, ValueError):
+            continue
+        delta = ended_epoch - epoch
+        if -PLANNED_RESTART_WINDOW_S <= delta <= PLANNED_RESTART_WINDOW_S:
+            if best is None or abs(delta) < abs(ended_epoch - float(best["epoch"])):
+                best = row
+    return best
 
 
 # --------------------------------------------------------------------------

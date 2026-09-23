@@ -87,34 +87,42 @@ def _repo_root() -> Path:
 #
 # To fix one: move the call off-loop (or behind a loop-conditional dispatch,
 # annotated `# noqa: atomic-write-on-loop <reason>`), then DELETE its line here.
+#
+# KNOWN BLIND SPOT -- this inventory is a floor, not a census.  ``build_index``
+# keys on ``(file, function_name)``, so two same-named methods in one file
+# collapse onto ONE entry and the walk sees only whichever ``ast.walk`` visited
+# last.  Measured on ``gateway/platforms/weixin.py``: ``ContextTokenStore.set``
+# and ``TypingTicketCache.set`` collapse, and the index reports
+# ``calls={'time.time','time'}`` -- the typing cache's body.  That hid a
+# PER-INBOUND-MESSAGE ``atomic_json_write`` (``_process_message`` -> ``set`` ->
+# ``_persist``) from this gate entirely; it was fixed and pinned directly by
+# ``tests/gateway/test_weixin_state_write_off_loop.py`` rather than via this
+# baseline.  Do not read "absent from REACHABLE_BASELINE" as "off the loop".
 REACHABLE_BASELINE = frozenset({
-    "gateway/lifecycle_ledger.py record_startup_async -> atomic_json_write",
-    "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
-    "gateway/platforms/base.py cancel_background_tasks -> atomic_json_write",
-    "gateway/platforms/weixin.py _poll_loop -> atomic_json_write",
-    "gateway/platforms/weixin.py qr_login -> atomic_json_write",
-    "gateway/run.py _execute_mcp_reload -> atomic_json_write",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
     "gateway/run.py _handle_message -> atomic_replace",
-    "gateway/run.py _handle_message_with_agent -> atomic_json_write",
-    "gateway/run.py _prepare_auto_resume_decisions -> os.replace",
+    # Re-keyed, NOT introduced, by the transcript-spool fix: this coroutine's
+    # first reported sink used to be the spool's atomic_json_write via
+    # append_to_transcript>.._serialized>spool_dropped_transcript_message.
+    # With the spool off-loop, the DFS (which reports only the FIRST sink per
+    # coroutine) now surfaces the checkpoint rename that was always behind it:
+    # _is_telegram_boot_redelivered_duplicate>maybe_checkpoint>_write.
+    # Verified pre-existing on pristine fork/main by masking
+    # spool_dropped_transcript_message and re-running the walk.
+    "gateway/run.py _handle_message_with_agent_admitted -> os.replace",
     # Unmasked by the status-write fix, NOT introduced by it: the DFS reports
     # only the FIRST sink per coroutine, so the
     # _schedule_resume_pending_sessions>..>_persist>_write chain was shadowed
     # by write_runtime_status.  Verified present on pristine fork/main by
     # masking the status sink and re-running the walk.
     "gateway/run.py _platform_reconnect_watcher -> os.fsync",
+    "gateway/run.py _prepare_auto_resume_decisions -> os.replace",
     "gateway/run.py _restore_resume_pending_sessions_at_startup -> os.fsync",
     "gateway/run.py _stop_impl -> atomic_json_write",
     "gateway/run.py _stop_impl_body -> atomic_json_write",
     "gateway/run.py start -> atomic_json_write",
     "gateway/run.py start_gateway -> atomic_json_write",
     "gateway/run.py stop -> atomic_json_write",
-    "plugins/platforms/matrix/adapter.py _resolve_message_context -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py _handle_location_message -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py _handle_media_message -> atomic_json_write",
-    "plugins/platforms/telegram/adapter.py _handle_sticker -> os.fsync",
-    "plugins/platforms/telegram/adapter.py _handle_text_message -> atomic_json_write",
 })
 
 

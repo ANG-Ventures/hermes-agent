@@ -123,6 +123,28 @@ async def test_real_interrupted_turn_still_resumes(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resume_rescans_record_one_gateway_boot(tmp_path, monkeypatch):
+    """Startup, wide, and reconnect scans in one process are one boot."""
+    from gateway import restart_loop_guard as rlg
+
+    state_path = tmp_path / "restart_loop.json"
+    monkeypatch.setattr(rlg, "_state_path", lambda: state_path)
+    rlg.clear()
+    runner, _adapter = _runner(tmp_path, monkeypatch)
+    entry = _entry(runner)
+    assert runner.session_store.mark_resume_pending(
+        entry.session_key, "restart_interrupted"
+    )
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    assert runner._schedule_resume_pending_sessions() == 0
+    assert runner._schedule_resume_pending_sessions(Platform.TELEGRAM) == 0
+
+    assert len(json.loads(state_path.read_text())["boots"]) == 1
+    await asyncio.gather(*runner._background_tasks)
+
+
+@pytest.mark.asyncio
 async def test_all_restart_paths_set_flag(tmp_path, monkeypatch):
     runner, _adapter = _runner(tmp_path, monkeypatch)
     entry = _entry(runner)

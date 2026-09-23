@@ -939,3 +939,236 @@ async def test_teardown_after_a_cancelled_acquire_does_not_release_twice(
         "now running without its credential lock."
     )
 
+
+# ---------------------------------------------------------------------------
+# Round-5 regressions: the ownership bookkeeping and the RESOURCE operation it
+# authorises must be ONE critical section per (scope, identity) pair.
+#
+# FleetReview record ``576840bc1b`` raised three P1s that are the same class
+# seen from three sides -- a decision taken against registry state observed in
+# a DIFFERENT critical section than the one that acts on the lock file:
+#
+#   base.py:118  stale-holder wipe race       (acquire vs acquire)
+#   base.py:145  unlock race / double unlock  (release vs acquire)
+#   base.py:4188 teardown uses the overwritten token (reconnect on one adapter)
+#
+# Every oracle below is the RESOURCE -- which ``(scope, identity)`` pairs are
+# held in the scoped-lock registry -- never which method was called.
+# ---------------------------------------------------------------------------
+
+
+def _held_registry(monkeypatch, held: "set[tuple[str, str]]"):
+    """Install a scoped-lock fake that mirrors the real acquire contract.
+
+    ``acquire_scoped_lock`` returns ``(acquired, pre_existing_record)``: the
+    second element is non-None exactly when somebody already held the pair, and
+    an acquire by the CALLING pid always succeeds (self-reacquire).  Both
+    properties are load-bearing for these tests.
+    """
+    guard = threading.Lock()
+
+    def _acquire(scope: str, identity: str, metadata=None):
+        with guard:
+            existing = {"pid": os.getpid()} if (scope, identity) in held else None
+            held.add((scope, identity))
+        return True, existing
+
+    def _release(scope: str, identity: str) -> None:
+        with guard:
+            held.discard((scope, identity))
+
+    monkeypatch.setattr(status, "acquire_scoped_lock", _acquire)
+    monkeypatch.setattr(status, "release_scoped_lock", _release)
+    return _acquire, _release
+
+
+def test_a_concurrent_acquire_cannot_wipe_a_live_holders_record(monkeypatch):
+    """Two concurrent acquires of one pair: neither may prune the other.
+
+    ``_note_platform_lock_acquired`` prunes every recorded acquisition when its
+    caller observed ``had_prior_holder=False``.  That observation comes from
+    ``acquire_scoped_lock`` and is only valid while nothing else acquires the
+    pair -- so if the acquire and the record are separate critical sections, a
+    sibling acquire completing in the window records with a STALE
+    ``had_prior_holder=False`` and wipes the live holder.
+
+    The consequence is asserted on the resource: with its record gone, the live
+    adapter is invisible to the ownership guard, so the other adapter's routine
+    teardown deletes the machine-global lock that live adapter is using.
+
+    Regression for FleetReview P1 ``gateway/platforms/base.py:118`` on record
+    ``576840bc1b``.
+    """
+    from gateway.platforms import base as base_mod
+
+    held: set[tuple[str, str]] = set()
+    guard = threading.Lock()
+    observed = threading.Event()
+    may_return = threading.Event()
+    parked = {"done": False}
+
+    def _acquire(scope: str, identity: str, metadata=None):
+        with guard:
+            existing = {"pid": os.getpid()} if (scope, identity) in held else None
+            held.add((scope, identity))
+        if not parked["done"]:
+            # The FIRST acquire has read the pre-state; park it before it
+            # returns so the second can complete an entire acquire+record in
+            # the window its observation is already stale for.
+            parked["done"] = True
+            observed.set()
+            may_return.wait(timeout=10)
+        return True, existing
+
+    monkeypatch.setattr(status, "acquire_scoped_lock", _acquire)
+    monkeypatch.setattr(
+        status, "release_scoped_lock", lambda s, i: held.discard((s, i))
+    )
+
+    parked_adapter = _adapter()
+    live = _adapter()
+
+    parked_thread = threading.Thread(
+        target=parked_adapter._acquire_platform_lock,
+        args=("telegram-bot-token", "tok", "d"),
+        daemon=True,
+    )
+    parked_thread.start()
+    assert observed.wait(timeout=5), "the first acquire never ran"
+
+    live_result: list[bool] = []
+    live_thread = threading.Thread(
+        target=lambda: live_result.append(
+            live._acquire_platform_lock("telegram-bot-token", "tok", "d")
+        ),
+        daemon=True,
+    )
+    live_thread.start()
+    # Give the second acquire a real chance to land inside the window.  Under
+    # the fix it simply waits on the pair lock, which is the whole point.
+    live_thread.join(timeout=1.0)
+
+    may_return.set()
+    parked_thread.join(timeout=10)
+    live_thread.join(timeout=10)
+    assert live_result == [True], "the live adapter never completed its acquire"
+
+    live_token = live._platform_lock_token
+    holders = base_mod._PLATFORM_LOCK_OWNERS.get(("telegram-bot-token", "tok"), {})
+    assert live_token in holders, (
+        "a concurrent acquire wiped a LIVE holder's ownership record; the "
+        "ownership guard can no longer see it, so any other release deletes "
+        "its machine-global lock"
+    )
+
+    # The consequence, on the resource: routine teardown of the other adapter.
+    parked_adapter._release_platform_lock()
+    assert held == {("telegram-bot-token", "tok")}, (
+        "a live, connected adapter lost its machine-global credential lock to "
+        "another adapter's routine teardown"
+    )
+
+
+def test_a_retry_connect_in_the_release_window_keeps_its_lock(monkeypatch):
+    """The ownership claim and the release it authorises are one section.
+
+    ``_claim_platform_lock_release`` answers "no other live acquisition
+    remains, you may release".  That answer is only valid until somebody
+    acquires, so if the claim and ``release_scoped_lock`` are separate critical
+    sections a retry connect landing in between -- the reconnect supervisor
+    does exactly this -- has taken the machine-global lock and then loses it.
+
+    Regression for FleetReview P1s ``gateway/platforms/base.py:145`` ("Unlock
+    race") and ``:4054`` ("Double unlock") on record ``576840bc1b``.
+    """
+    held: set[tuple[str, str]] = set()
+    _held_registry(monkeypatch, held)
+
+    leaving = _adapter()
+    assert leaving._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
+
+    in_window = threading.Event()
+    retry_done = threading.Event()
+    original = type(leaving)._release_platform_lock_identity
+
+    def _slow_release_identity(self, scope: str, identity: str) -> None:
+        # Widen the real (small) window between the ownership claim and the
+        # release, deterministically rather than by racing.
+        in_window.set()
+        retry_done.wait(timeout=10)
+        original(self, scope, identity)
+
+    monkeypatch.setattr(
+        type(leaving), "_release_platform_lock_identity", _slow_release_identity
+    )
+
+    teardown = threading.Thread(target=leaving._release_platform_lock, daemon=True)
+    teardown.start()
+    assert in_window.wait(timeout=5), "teardown never reached the release window"
+
+    retry = _adapter()
+    retry_result: list[bool] = []
+    retry_thread = threading.Thread(
+        target=lambda: retry_result.append(
+            retry._acquire_platform_lock("telegram-bot-token", "tok", "d")
+        ),
+        daemon=True,
+    )
+    retry_thread.start()
+    # Under the fix the retry blocks on the pair lock until the release
+    # completes; on the broken shape it acquires inside the window.
+    retry_thread.join(timeout=1.0)
+
+    retry_done.set()
+    teardown.join(timeout=10)
+    retry_thread.join(timeout=10)
+    assert retry_result == [True], "the retry connect never completed its acquire"
+
+    assert held == {("telegram-bot-token", "tok")}, (
+        "a live retry connect lost the machine-global credential lock it had "
+        "just acquired, because a concurrent teardown released the pair on a "
+        "stale ownership claim"
+    )
+
+
+def test_a_reconnect_on_one_adapter_does_not_strand_its_first_token(monkeypatch):
+    """A re-acquire on the SAME adapter must retire its previous token.
+
+    The reconnect supervisor drives the same adapter object through
+    ``connect()`` again, so ``_note_acquired_platform_lock`` overwrites
+    ``_platform_lock_token``.  The superseded token stays in the pair's
+    live-holder set forever -- nothing drops it, and the weakref prune cannot
+    help because the adapter is the same live object.  The pair then looks
+    permanently held by a live sibling, so no later release ever fires and
+    every later connect on the machine fails "already in use" until the
+    process restarts.
+
+    Regression for FleetReview P1 ``gateway/platforms/base.py:4188``
+    ("Teardown uses overwritten token") on record ``576840bc1b``.
+    """
+    from gateway.platforms import base as base_mod
+
+    held: set[tuple[str, str]] = set()
+    _held_registry(monkeypatch, held)
+
+    adapter = _adapter()
+    assert adapter._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
+    first_token = adapter._platform_lock_token
+
+    # The reconnect: same adapter, same credential.  acquire_scoped_lock
+    # self-reacquires for this pid, so it succeeds.
+    assert adapter._acquire_platform_lock("telegram-bot-token", "tok", "d") is True
+    assert adapter._platform_lock_token != first_token
+
+    assert base_mod._platform_lock_holder_count("telegram-bot-token", "tok") == 1, (
+        "a reconnect on one adapter left its superseded acquisition on record; "
+        "the pair now looks held by a phantom live sibling"
+    )
+
+    adapter._release_platform_lock()
+    assert held == set(), (
+        "the sole adapter holding this credential could not release its "
+        "machine-global lock on teardown, because its own stranded token made "
+        "the pair look held by somebody else -- every later connect fails "
+        "'already in use' until the process restarts"
+    )

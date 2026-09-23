@@ -85,6 +85,14 @@ hook must not silently allow the action.  On non-blocking events
 ``fail_closed`` is ignored with a warning. A successful fail-closed hook must
 emit a valid block, allow, or modify directive (or the legacy no-op ``{}``).
 
+A fail-closed hook that exits non-zero WITHOUT the exit-2 deny convention has
+MALFUNCTIONED rather than denied, and blocks with a distinct
+``hook <name>#<digest> CRASHED`` message carrying ``error_class:
+hook_internal_error`` — naming the exception class and, for an import failure,
+the missing module.  Both outcomes still fail closed; only the classification
+and the operator-facing text differ, so a broken hook is not mistaken for the
+policy it would have enforced.
+
 Per-event ``extra`` keys
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -543,10 +551,24 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
     Returns a diagnostic dict with the same keys for every outcome
     (``returncode``, ``stdout``, ``stderr``, ``timed_out``,
-    ``elapsed_seconds``, ``error``).  This is the single place the
-    subprocess is actually invoked — both the live callback path
+    ``elapsed_seconds``, ``error``, ``error_detail``).  This is the single
+    place the subprocess is actually invoked — both the live callback path
     (:func:`_make_callback`) and the CLI test helper (:func:`run_once`)
     go through it.
+
+    TWO error channels, because they have opposite requirements:
+
+    * ``error`` is REDACTED and model-facing. It reaches the model through
+      :func:`_evaluate_result` -> :func:`_fail_closed_block`, so it carries
+      the failure's exception CLASS only — never the raw command, argv, or
+      ``str(exc)``, any of which can hold an inline credential.
+    * ``error_detail`` is the OPERATOR channel: the full diagnostic text, for
+      the log and for ``hermes hooks test`` / ``hermes doctor``. Without it a
+      shlex ``No closing quotation`` and a spawn ``EACCES``/``ENOEXEC`` are
+      indistinguishable to whoever has to fix the hook. It is ``None`` when
+      there is nothing to add beyond ``error``.
+
+    ``error_detail`` must never be routed to a model-facing string.
     """
     result: Dict[str, Any] = {
         "returncode": None,
@@ -555,6 +577,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         "timed_out": False,
         "elapsed_seconds": 0.0,
         "error": None,
+        "error_detail": None,
     }
     try:
         # Windows-safe: plain shlex.split eats backslashes in paths (#78293).
@@ -562,7 +585,17 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 
         argv = split_command_line(os.path.expanduser(spec.command))
     except ValueError as exc:
-        result["error"] = f"command {spec.command!r} cannot be parsed: {exc}"
+        # `error` reaches the MODEL via _evaluate_result -> _fail_closed_block,
+        # so it must never carry the raw command or exception text derived from
+        # it: an unparseable command is exactly the shape that still holds an
+        # inline credential (`sh -c 'export TOK=…` with the quote left open).
+        # Name the hook by its digest and the failure by its exception CLASS.
+        # The raw command stays on the log channel only (_evaluate_result).
+        result["error"] = (
+            f"command cannot be parsed ({type(exc).__name__})"
+        )
+        # Operator channel only — `exc` stringifies the offending command text.
+        result["error_detail"] = f"command cannot be parsed: {exc}"
         return result
     if not argv:
         result["error"] = "empty command"
@@ -596,7 +629,13 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         result["error"] = "command not executable"
         return result
     except Exception as exc:  # pragma: no cover — defensive
-        result["error"] = str(exc)
+        # Same channel as the parse failure above: spawn exceptions routinely
+        # embed argv (OSError stringifies the program path), and argv[0] can be
+        # the credential itself. Exception CLASS only.
+        result["error"] = f"spawn failed ({type(exc).__name__})"
+        # Operator channel only — OSError stringifies argv/the program path,
+        # and this is what distinguishes EACCES from ENOEXEC from EMFILE.
+        result["error_detail"] = f"spawn failed: {exc}"
         return result
 
     try:
@@ -619,7 +658,11 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             proc.communicate(timeout=1)
         except Exception:
             pass
-        result["error"] = str(exc)
+        # Model-facing via _fail_closed_block — exception CLASS only, never
+        # text that may carry argv or payload content.
+        result["error"] = f"communication failed ({type(exc).__name__})"
+        # Operator channel only — may carry argv or payload content.
+        result["error_detail"] = f"communication failed: {exc}"
         return result
 
     result["returncode"] = proc.returncode
@@ -731,6 +774,79 @@ def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:
     }
 
 
+# A crashed hook's stderr is NOT a model-facing channel — it is whatever the
+# process happened to print, and a hook command routinely holds credentials
+# that a traceback can echo back (an `os.environ` repr, an argv dump). So the
+# diagnosis below extracts only two ALLOWLISTED shapes: the exception CLASS
+# name and, for an import failure, the missing MODULE name. Both are bare
+# dotted identifiers by construction of these patterns; no free text from the
+# child crosses into the block message.
+_TRACEBACK_HEADER = "Traceback (most recent call last):"
+_MISSING_MODULE = re.compile(r"No module named ['\"]([A-Za-z0-9_.]+)['\"]")
+_EXCEPTION_LINE = re.compile(
+    r"\A(?P<cls>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+    r"(?:Error|Exception|Interrupt|Exit))\s*(?::|\Z)"
+)
+
+
+def _crash_diagnosis(stderr: str) -> Optional[str]:
+    """Name a hook's CRASH from its stderr, or ``None`` if it is not one.
+
+    A hook that dies is indistinguishable at the transport from a hook that
+    denies: both arrive as a block. Measured 2026-09-22 — a hook whose sibling
+    module was absent from the deployed tree surfaced only as ``hook exited
+    1``, naming the POLICY it would have enforced, so operators went looking
+    for the policy violation instead of the missing file, and the pressure was
+    to switch a working gate off for an unrelated reason.
+    """
+    if _TRACEBACK_HEADER not in stderr:
+        return None
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    for line in reversed(lines):
+        match = _EXCEPTION_LINE.match(line)
+        if not match:
+            continue
+        exc_class = match.group("cls")
+        module = _MISSING_MODULE.search(line)
+        if module:
+            return (
+                f"{exc_class}: the hook could not import `{module.group(1)}`, "
+                "so it never evaluated this call"
+            )
+        return f"{exc_class} raised before the hook could evaluate this call"
+    return None
+
+
+def _malfunction_block(
+    spec: ShellHookSpec, returncode: int, stderr: str,
+) -> Dict[str, Any]:
+    """Block for a fail-closed hook that MALFUNCTIONED rather than denied.
+
+    In this protocol a denial is exit 2 or a ``block`` directive on stdout. Any
+    other non-zero exit from a ``fail_closed`` hook is therefore a broken hook,
+    not a policy decision — and the operator-facing text has to say so, because
+    the two used to be worded identically. It still FAILS CLOSED; only the
+    classification and the message change.
+    """
+    diagnosis = _crash_diagnosis(stderr)
+    detail = diagnosis or (
+        f"exited {returncode} without emitting a policy directive"
+    )
+    return {
+        "action": "block",
+        "message": (
+            f"hook {hook_display_name(spec.command)} CRASHED — this is a BROKEN "
+            f"ENFORCEMENT HOOK, not a policy denial. {detail}. Failing closed, "
+            "so nothing was permitted that the hook would have refused. Fix the "
+            "hook itself (a missing module named above is usually a partial "
+            "deploy: restore it on the path the hook runs from, then retry). Do "
+            "NOT disable the guard to clear this — the policy did not object to "
+            "this call, the hook never ran."
+        ),
+        "error_class": "hook_internal_error",
+    }
+
+
 def _evaluate_result(
     spec: ShellHookSpec, r: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
@@ -758,9 +874,12 @@ def _evaluate_result(
     fail_closed = spec.fail_closed and blocking_event
 
     if r["error"]:
+        # Log/operator channel gets the DETAILED reason when there is one; the
+        # model-facing block below keeps the redacted `error`. This log line
+        # already carries `spec.command`, so it is not a new disclosure.
         logger.warning(
             "shell hook failed (event=%s command=%s): %s",
-            spec.event, spec.command, r["error"],
+            spec.event, spec.command, r.get("error_detail") or r["error"],
         )
         if fail_closed:
             return _fail_closed_block(spec, r["error"])
@@ -807,7 +926,12 @@ def _evaluate_result(
         )
 
         if fail_closed:
-            return _fail_closed_block(spec, f"hook exited {r['returncode']}")
+            # A DENIAL is exit 2 (handled above) or a block directive on
+            # stdout. Any other non-zero exit is a MALFUNCTION, and saying
+            # "failed closed" for both is what sent an operator hunting a
+            # merge they never attempted while the real cause was an absent
+            # module. Same fail-closed outcome, self-describing message.
+            return _malfunction_block(spec, r["returncode"], stderr)
 
     stdout = (r["stdout"] or "").strip()
     parsed = _parse_response(spec.event, stdout)

@@ -57,6 +57,55 @@ _lock = Lock()
 _sessions: dict[str, dict[str, Any]] = {}
 
 
+def record_api_call(
+    *,
+    turn_id: str,
+    seq: int,
+    ts: float,
+    provider: str,
+    model: str,
+    usage: Any,
+    api_mode: str,
+    sub_key: str | None,
+    attribution: str,
+    http_status: int | None,
+    relay_synthetic: bool,
+    route_id: str | None,
+) -> None:
+    """Persist one completion attempt when Blackbox is enabled.
+
+    This is deliberately a thin, fail-loud plugin boundary. The transport
+    caller owns fail-open handling so sequence-allocation or schema errors are
+    visible in logs without changing inference behavior.
+    """
+    if _config() is None:
+        return
+    from agent.usage_pricing import CanonicalUsage, normalize_usage
+    from plugins.blackbox import store
+
+    canonical = (
+        usage
+        if isinstance(usage, CanonicalUsage)
+        else normalize_usage(usage, provider=provider, api_mode=api_mode)
+        if usage is not None
+        else CanonicalUsage(request_count=0)
+    )
+    store.insert_api_call(
+        turn_id,
+        seq,
+        ts=ts,
+        provider=provider,
+        model=model,
+        usage=canonical,
+        sub_key=sub_key,
+        attribution=attribution,
+        http_status=http_status,
+        relay_synthetic=relay_synthetic,
+        route_id=route_id,
+    )
+
+
+
 def _turn_id() -> str:
     return "turn_" + uuid.uuid4().hex
 
@@ -339,6 +388,11 @@ def _build_record(
         tools=list(state.get("tools") or []),
         input_tokens=_int_value(usage.get("input_tokens")),
         output_tokens=_int_value(usage.get("output_tokens")),
+        output_tokens_unknown=bool(usage.get("output_tokens_unknown")),
+        input_tokens_unknown=bool(usage.get("input_tokens_unknown")),
+        cache_read_tokens_unknown=bool(usage.get("cache_read_tokens_unknown")),
+        cache_write_tokens_unknown=bool(usage.get("cache_write_tokens_unknown")),
+        usage_unknown=bool(usage.get("usage_unknown")),
         cache_read_tokens=_int_value(usage.get("cache_read_tokens")),
         cache_write_tokens=_int_value(usage.get("cache_write_tokens")),
         reasoning_tokens=_int_value(usage.get("reasoning_tokens")),
@@ -347,6 +401,7 @@ def _build_record(
         last_cache_read_tokens=_int_or_none_value(usage.get("last_cache_read_tokens")),
         last_cache_write_tokens=_int_or_none_value(usage.get("last_cache_write_tokens")),
         last_uncached_tokens=_int_or_none_value(usage.get("last_uncached_tokens")),
+        last_call_prompt_unknown=bool(usage.get("last_call_prompt_unknown")),
         comp_sys_tokens=_comp_get(usage, "sys_tokens"),
         comp_tool_schema_tokens=_comp_get(usage, "tool_schema_tokens"),
         comp_history_tokens=_comp_get(usage, "history_tokens"),

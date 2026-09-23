@@ -1305,3 +1305,77 @@ class TestModelOverrides:
         assert info is not None
         assert "image" in info.input_modalities
         assert info.attachment is True
+
+
+class TestGpt6SolLunaBuiltinMetadata:
+    """GPT-6 Sol/Luna (GA 2026-09-22) are usable before models.dev indexes
+    them, so their published capabilities ship as a built-in snapshot.
+    Behaviour contract: an EMPTY catalog must still resolve real
+    capabilities, and a catalog entry must still win."""
+
+    @pytest.mark.parametrize("slug", ["gpt-6-sol", "gpt-6-luna"])
+    def test_capabilities_resolve_without_catalog(self, slug):
+        with patch("agent.models_dev.fetch_models_dev", return_value={}):
+            caps = get_model_capabilities("openai", slug)
+        assert caps is not None
+        assert caps.context_window == 1_050_000
+        assert caps.max_output_tokens == 128_000
+        assert caps.supports_tools is True
+        assert caps.supports_reasoning is True
+        assert caps.supports_vision is True
+        assert caps.model_family == "gpt-6"
+
+    @pytest.mark.parametrize("slug", ["gpt-6-sol", "gpt-6-luna"])
+    def test_model_info_resolves_without_catalog(self, slug):
+        with patch("agent.models_dev.fetch_models_dev", return_value={}):
+            info = get_model_info("openai", slug)
+        assert info is not None
+        assert info.context_window == 1_050_000
+        assert info.max_output == 128_000
+        assert info.reasoning is True
+        assert "image" in info.input_modalities
+
+    @pytest.mark.parametrize("slug", ["gpt-6-sol", "gpt-6-luna"])
+    def test_catalog_entry_wins_over_builtin(self, slug):
+        """The built-in is a gap-filler, not an override: once models.dev
+        publishes the model its numbers take over."""
+        registry = {
+            "openai": {
+                "id": "openai",
+                "models": {
+                    slug: {
+                        "id": slug,
+                        "tool_call": True,
+                        "limit": {"context": 400_000, "output": 64_000},
+                    },
+                },
+            },
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities("openai", slug)
+        assert caps is not None
+        assert caps.context_window == 400_000
+        assert caps.max_output_tokens == 64_000
+
+    @pytest.mark.parametrize("slug", ["gpt-6-sol", "gpt-6-luna"])
+    def test_explicit_override_still_patches_builtin(self, slug):
+        """A user override patches the built-in base rather than being
+        ignored or wiping the unspecified fields."""
+        overrides = {"openai": {slug: {"context_window": 272_000}}}
+        with patch(
+            "agent.models_dev._load_model_overrides", return_value=overrides
+        ), patch("agent.models_dev.fetch_models_dev", return_value={}):
+            caps = get_model_capabilities("openai", slug)
+        assert caps is not None
+        assert caps.context_window == 272_000
+        # untouched by the override, still from the built-in snapshot
+        assert caps.max_output_tokens == 128_000
+        assert caps.supports_reasoning is True
+
+    def test_builtin_does_not_invent_unrelated_models(self):
+        """The gap-filler must not resolve models it knows nothing about."""
+        with patch("agent.models_dev.fetch_models_dev", return_value={}), patch(
+            "agent.models_dev._load_model_overrides", return_value={}
+        ):
+            assert get_model_capabilities("openai", "gpt-6-terra") is None
+            assert get_model_info("openai", "gpt-6-terra") is None

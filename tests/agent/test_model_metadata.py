@@ -353,6 +353,7 @@ class TestDefaultContextLengths:
              mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
              mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
             one_m = (
+                "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-sonnet-5",
                 "claude-fable-5",
@@ -453,6 +454,8 @@ class TestDefaultContextLengths:
         from unittest.mock import patch as mock_patch
 
         frontier = [
+            "claude-opus-5-5",
+            "claude-opus-5-5-fast",
             "claude-opus-5",
             "claude-opus-5-fast",
             "claude-sonnet-5",
@@ -742,6 +745,79 @@ class TestCodexOAuthContextLength:
             )
         assert ctx == 272_000
 
+    @pytest.mark.parametrize(
+        "slug,expected",
+        [("gpt-6-sol", 872_000), ("gpt-6-luna", 872_000)],
+    )
+    def test_gpt6_sol_luna_variant_resolves_to_measured_872k(self, slug, expected):
+        """Both slugs advertise 272K on the codex-sub catalog but report
+        max_context_window=872,000 (measured 2026-09-22). Only the explicit
+        ``-900k`` opt-in variant resolves to that cap."""
+        from agent.model_metadata import get_model_context_length
+
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {
+            "models": [{"slug": slug, "context_window": 272_000}]
+        }
+        import agent.model_metadata as mm
+        mm._codex_oauth_context_cache = {}
+        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length"):
+            ctx = get_model_context_length(
+                model=slug + "-900k",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="fake-token",
+                provider="openai-codex",
+            )
+        assert ctx == expected
+
+    @pytest.mark.parametrize("slug", ["gpt-6-sol", "gpt-6-luna"])
+    def test_gpt6_sol_luna_base_slug_keeps_advertised_272k(self, slug):
+        """Opt-in only: the base slug keeps the cheaper advertised limit."""
+        from agent.model_metadata import get_model_context_length
+
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {
+            "models": [{"slug": slug, "context_window": 272_000}]
+        }
+        import agent.model_metadata as mm
+        mm._codex_oauth_context_cache = {}
+        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length"):
+            ctx = get_model_context_length(
+                model=slug,
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="fake-token",
+                provider="openai-codex",
+            )
+        assert ctx == 272_000
+
+    @pytest.mark.parametrize("slug", ["gpt-6-sol", "gpt-6-luna"])
+    def test_gpt6_sol_luna_offline_fallback_also_bumped(self, slug):
+        """With the live probe down, the 272K fallback-table entry for an
+        opted-in variant is bumped the same way."""
+        from agent.model_metadata import get_model_context_length
+
+        fake_response = MagicMock()
+        fake_response.status_code = 401
+        fake_response.json.return_value = {}
+        import agent.model_metadata as mm
+        mm._codex_oauth_context_cache = {}
+        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length"):
+            ctx = get_model_context_length(
+                model=slug + "-900k",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="expired-token",
+                provider="openai-codex",
+            )
+        assert ctx == 872_000
+
     @pytest.mark.parametrize("slug", ["gpt-5.6-sol-900k", "gpt-daybreak-blue-latest-900k"])
     def test_fallback_table_resolution_also_bumped(self, slug):
         """When the live probe fails, the 272K fallback-table value for an
@@ -789,6 +865,10 @@ class TestCodexOAuthContextLength:
     # (model_id, is_valid_variant, expected_ctx, expected_wire_model)
     _900K_TABLE = [
         ("gpt-5.6-sol-900k",              True,  900_000, "gpt-5.6-sol"),
+        # GPT-6 Sol/Luna: catalog-measured max_context_window 872,000
+        # (2026-09-22), so their opt-in variant resolves to 872K, not 900K.
+        ("gpt-6-sol-900k",                True,  872_000, "gpt-6-sol"),
+        ("gpt-6-luna-900k",               True,  872_000, "gpt-6-luna"),
         ("gpt-5.6-terra-900k",            True,  900_000, "gpt-5.6-terra"),
         ("gpt-5.6-luna-900k",             True,  900_000, "gpt-5.6-luna"),
         ("gpt-5.4-900k",                  True,  900_000, "gpt-5.4"),
@@ -806,6 +886,26 @@ class TestCodexOAuthContextLength:
         # arbitrary future family descendants are not auto-eligible
         ("gpt-5.6-nova-900k",             False, 272_000, "gpt-5.6-nova-900k"),
     ]
+
+    def test_gpt6_is_not_a_family_prefix_for_900k_eligibility(self):
+        """Three gpt-6 slugs are listed by EXACT catalog measurement. An
+        unprobed gpt-6 descendant must not inherit eligibility from them
+        (kept out of _900K_TABLE because it has no 272K advertisement to
+        resolve against — it is absent from every fallback table too)."""
+        from agent.model_metadata import (
+            is_codex_900k_base,
+            is_codex_context_variant,
+            strip_codex_context_variant_suffix,
+        )
+
+        for eligible in ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna"):
+            assert is_codex_900k_base(eligible) is True
+
+        assert is_codex_900k_base("gpt-6-terra") is False
+        assert is_codex_context_variant("gpt-6-terra-900k") is False
+        # never stripped: it fails honestly at the API instead of silently
+        # running as a different model
+        assert strip_codex_context_variant_suffix("gpt-6-terra-900k") == "gpt-6-terra-900k"
 
     @pytest.mark.parametrize("model_id,valid,expected_ctx,wire", _900K_TABLE)
     def test_900k_eligibility_table(self, model_id, valid, expected_ctx, wire):
@@ -1912,6 +2012,43 @@ class TestGrok46StaleCacheGuard:
         mm.save_context_length("grok-4.6", base, 256_000)
         ctx = mm.get_model_context_length(
             "grok-4.6", base_url=base, api_key="", provider="xai"
+        )
+        assert ctx == 500_000
+
+
+class TestGrok47StaleCacheGuard:
+    """grok-4.7 (GA 2026-09-21) is 500K. Without its own catalog entry it falls
+    through the generic 'grok-4' catch-all to 256,000 — a HALF-SIZE window that
+    never errors, it just compacts ~2x too early forever. Same failure the 4.6
+    guard above exists for; this pins the new flagship on the day it ships.
+    Official card: 500,000 context (docs.x.ai/developers/models/grok-4.7).
+    """
+
+    def test_grok_4_7_catalog_entry_is_500k(self):
+        from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+        assert DEFAULT_CONTEXT_LENGTHS.get("grok-4.7") == 500_000
+
+    def test_stale_grok_4_7_detected_by_generic_guard(self):
+        from agent.model_metadata import _stale_pre_catalog_cache_entry
+        # 256,000 is the old grok-4 catch-all value — stale for grok-4.7 (500K).
+        assert _stale_pre_catalog_cache_entry("grok-4.7", 256_000)
+        assert _stale_pre_catalog_cache_entry("xai/grok-4.7", 256_000)
+        assert _stale_pre_catalog_cache_entry("x-ai/grok-4.7", 256_000)
+        # Correct/probed values are never dropped.
+        assert not _stale_pre_catalog_cache_entry("grok-4.7", 500_000)
+        # Sibling slugs with correct catalog values are untouched.
+        assert not _stale_pre_catalog_cache_entry("grok-4", 256_000)
+        assert not _stale_pre_catalog_cache_entry("grok-4.6", 500_000)
+
+    def test_stale_grok_4_7_dropped_and_reresolves_to_500k(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        import agent.model_metadata as mm
+        importlib.reload(mm)
+        base = "https://api.x.ai/v1"
+        mm.save_context_length("grok-4.7", base, 256_000)
+        ctx = mm.get_model_context_length(
+            "grok-4.7", base_url=base, api_key="", provider="xai"
         )
         assert ctx == 500_000
 

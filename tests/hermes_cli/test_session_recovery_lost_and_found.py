@@ -329,7 +329,7 @@ def _make_synthetic_lost_and_found(
     # The floor guards against accidentally reading an empty/old schema.
     current_width = len(sessions_columns)
     assert current_width >= 55
-    assert len(usage_columns) == 18
+    assert len(usage_columns) == 23  # 18 legacy + 5 *_unknown provenance columns
 
     max_fields = current_width
     conn = sqlite3.connect(str(path), isolation_level=None)
@@ -388,7 +388,7 @@ def _make_synthetic_lost_and_found(
                 [row.get(column) for column in messages_columns[:23]],
             )
 
-        # session_model_usage: 18 columns, orphaned session id on purpose.
+        # session_model_usage: current 23-column record, orphaned session id on purpose.
         usage = {
             "session_id": "20261212_121212_eee005",
             "model": "test/model",
@@ -407,7 +407,7 @@ def _make_synthetic_lost_and_found(
             "first_seen": 1_754_000_000.0,
             "last_seen": 1_754_000_500.0,
         }
-        insert(18, 200, [usage.get(column) for column in usage_columns])
+        insert(len(usage_columns), 200, [usage.get(column) for column in usage_columns])
 
         # Junk that must NOT be classified into canonical tables.
         insert(3, 300, ["random", "noise", 42])
@@ -451,6 +451,14 @@ def test_classify_lost_and_found_row_sentinels() -> None:
     assert (
         classify_lost_and_found_row(
             18, ("20260101_010101_aaa001", "gpt-x") + (None,) * 16
+        )
+        == "session_model_usage"
+    )
+    # A row written after the *_unknown columns were added carries 23 fields;
+    # dropping it would silently lose every post-migration usage row.
+    assert (
+        classify_lost_and_found_row(
+            23, ("20260101_010101_aaa001", "gpt-x") + (None,) * 21
         )
         == "session_model_usage"
     )

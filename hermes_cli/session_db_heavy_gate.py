@@ -61,10 +61,24 @@ def _coerce_positive_int(value: Any, default: int) -> int:
 
 
 def _configured_max_concurrency() -> int:
-    """Read dashboard.heavy_read_max_concurrency lazily from config.yaml."""
+    """Read dashboard.heavy_read_max_concurrency lazily from config.yaml.
+
+    Uses ``read_raw_config_readonly()``, not ``load_config()``: this runs on
+    the event loop on EVERY admission (via
+    ``session_db_heavy_read_semaphore``), and ``load_config()`` pays a full
+    expansion + ``copy.deepcopy`` per call — measured 429 us/call against the
+    live 22 KB config.yaml versus 4.6 us for the read-only variant (2000-call
+    loop, python 3.11.15).  Both share the same (mtime_ns, size) freshness key,
+    so an edited config.yaml is still picked up on the next call.
+
+    Trade-off, stated: the raw read skips ``${VAR}`` expansion, so an env-var
+    SPELLING of this knob would not resolve.  It is an int cap, no live config
+    spells it that way, and a non-int value already falls back to the default
+    via ``_coerce_positive_int``.
+    """
     default = _DEFAULT_MAX_CONCURRENCY
     try:
-        from hermes_cli.config import DEFAULT_CONFIG, load_config
+        from hermes_cli.config import DEFAULT_CONFIG, read_raw_config_readonly
 
         default_dashboard = DEFAULT_CONFIG.get("dashboard")
         if isinstance(default_dashboard, dict):
@@ -72,7 +86,9 @@ def _configured_max_concurrency() -> int:
                 default_dashboard.get("heavy_read_max_concurrency"),
                 _DEFAULT_MAX_CONCURRENCY,
             )
-        cfg = load_config() or {}
+        # Read-only: the returned dict is the shared cache entry, mutating it
+        # would corrupt config for every other caller in the process.
+        cfg = read_raw_config_readonly() or {}
         dashboard = cfg.get("dashboard") if isinstance(cfg, dict) else {}
         if not isinstance(dashboard, dict):
             dashboard = {}
@@ -149,20 +165,37 @@ async def session_db_heavy_read_slot(surface: str, operation: str):
             retry_after=_QUEUE_WAIT_TIMEOUT_S,
         ) from exc
 
-    queue_wait = loop.time() - start
-    was_queued = queued_at_entry or queue_wait >= _QUEUE_WAIT_LOG_THRESHOLD_S
-    _record_stats(
-        acquired=1,
-        queued=1 if was_queued else 0,
-        queue_wait=queue_wait if was_queued else 0.0,
-    )
-    if was_queued:
-        _LOG.info(
-            "session_db_heavy_read queue_wait=%.3fs surface=%s operation=%s outcome=acquired",
-            queue_wait,
-            surface,
-            operation,
+    try:
+        queue_wait = loop.time() - start
+        was_queued = queued_at_entry or queue_wait >= _QUEUE_WAIT_LOG_THRESHOLD_S
+        if was_queued:
+            _LOG.info(
+                "session_db_heavy_read queue_wait=%.3fs surface=%s operation=%s outcome=acquired",
+                queue_wait,
+                surface,
+                operation,
+            )
+        # LAST in the window, deliberately: an abort after this point could
+        # leave acquired_count/queued_count/queue_wait_seconds_total counting a
+        # slot the caller never received. Nothing follows it before the yield,
+        # so the counters now move only when the slot is actually granted —
+        # and an abort before it still releases via the handler below.
+        _record_stats(
+            acquired=1,
+            queued=1 if was_queued else 0,
+            queue_wait=queue_wait if was_queued else 0.0,
         )
+    except BaseException:
+        # A generator that raises BEFORE its first yield never runs __aexit__,
+        # so this is the ONLY release path for the permit acquired above. The
+        # statements in this window (logging, stats bookkeeping) do not raise
+        # today, but without this guard any future one that does — or a cancel
+        # delivered here — burns a permit permanently, and at zero every heavy
+        # read sheds SessionDBHeavyReadBusy until the process restarts. Same
+        # class as gateway/turn_admission.py::TurnAdmission.slot.
+        semaphore.release()
+        raise
+
     try:
         yield
     finally:

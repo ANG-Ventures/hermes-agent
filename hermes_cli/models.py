@@ -91,6 +91,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # Anthropic
     ("anthropic/claude-fable-5-1",             ""),
     ("anthropic/claude-fable-5",               ""),
+    ("anthropic/claude-opus-5-5",              ""),
+    ("anthropic/claude-opus-5-5-fast",         "2x price, higher output speed"),
     ("anthropic/claude-opus-5",                ""),
     ("anthropic/claude-opus-5-fast",           "2x price, higher output speed"),
     ("anthropic/claude-opus-4.8",              ""),
@@ -100,6 +102,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # OpenAI
     ("openai/gpt-6-astra",                     ""),
     ("openai/gpt-6-astra-pro",                 ""),
+    ("openai/gpt-6-sol",                       ""),
+    ("openai/gpt-6-luna",                      ""),
     ("openai/gpt-5.6-sol",                     ""),
     ("openai/gpt-5.6-sol-pro",                 ""),
     ("openai/gpt-5.6-terra",                   ""),
@@ -113,6 +117,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("google/gemini-3.1-pro-preview",          ""),
     ("google/gemini-3.7-flash",                ""),
     # xAI
+    ("x-ai/grok-4.7",                          ""),
     ("x-ai/grok-4.6",                          ""),
     ("x-ai/grok-4.5",                          ""),
     # DeepSeek
@@ -208,6 +213,7 @@ def _codex_curated_models() -> list[str]:
 # (grok-4, grok-4-0709, grok-4-fast{,-reasoning,-non-reasoning},
 #  grok-4-1-fast{,-reasoning,-non-reasoning}, grok-code-fast-1 → grok-4.3).
 _XAI_STATIC_FALLBACK: list[str] = [
+    "grok-4.7",
     "grok-4.6",
     "grok-build-0.1",
     "grok-4.6",
@@ -220,13 +226,14 @@ _XAI_STATIC_FALLBACK: list[str] = [
 
 # Callable via xAI OAuth but omitted from models.dev and /v1/models listings.
 _XAI_CURATED_EXTRAS: list[str] = [
+    "grok-4.7",  # GA 2026-09-21 — kept until the models.dev disk cache refreshes
     "grok-4.6",  # GA 2026-08-12 — kept until the models.dev disk cache refreshes
     "grok-4.5",  # GA 2026-07 — kept until the models.dev disk cache refreshes
     "grok-composer-2.5-fast",
 ]
 
 
-_XAI_TOP_MODEL = "grok-4.6"
+_XAI_TOP_MODEL = "grok-4.7"
 
 
 def _xai_promote_top(ids: list[str]) -> list[str]:
@@ -280,6 +287,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # Anthropic
         "anthropic/claude-fable-5-1",
         "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5-5",
         "anthropic/claude-opus-5",
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-5",
@@ -287,6 +295,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # OpenAI
         "openai/gpt-6-astra",
         "openai/gpt-6-astra-pro",
+        "openai/gpt-6-sol",
+        "openai/gpt-6-luna",
         "openai/gpt-5.6-sol",
         "openai/gpt-5.6-sol-pro",
         "openai/gpt-5.6-terra",
@@ -300,6 +310,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "google/gemini-3.1-pro-preview",
         "google/gemini-3.7-flash",
         # xAI
+        "x-ai/grok-4.7",
         "x-ai/grok-4.6",
         "x-ai/grok-4.5",
         # DeepSeek
@@ -345,6 +356,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "openai-api": [
         "gpt-6-astra",
         "gpt-6-astra-pro",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.6-sol",
         "gpt-5.6-sol-pro",
         "gpt-5.6-terra",
@@ -474,6 +487,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "anthropic": [
         "claude-fable-5-1",
         "claude-fable-5",
+        "claude-opus-5-5",
         "claude-opus-5",
         "claude-sonnet-5",
         "claude-opus-4-8",
@@ -552,6 +566,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-5-nano",
         "claude-fable-5-1",
         "claude-fable-5",
+        "claude-opus-5-5",
         "claude-opus-5",
         "claude-sonnet-5",
         "claude-opus-4-8",

@@ -16,6 +16,11 @@ DEFAULT_CODEX_MODELS: List[str] = [
     # Supersedes gpt-5.6-sol as the default heavy-reasoning slug; sol is kept
     # below because existing pins/crons still reference it.
     "gpt-6-astra",
+    # GPT-6 Sol / Luna (2026-09-22). Live on the Codex OAuth backend the day
+    # they shipped (catalog visibility=list for both). Sol is the mid-tier
+    # coding/agentic slug, Luna the cheap high-volume one.
+    "gpt-6-sol",
+    "gpt-6-luna",
     # GPT-5.6 series (Sol/Terra/Luna). The public API exposes "-pro"
     # variants, but the ChatGPT Codex OAuth backend rejects them with HTTP 400,
     # so the curated offline fallback must not surface those dead choices.
@@ -55,6 +60,8 @@ DEFAULT_CODEX_MODELS: List[str] = [
 
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
     ("gpt-6-astra", ("gpt-5.6-sol", "gpt-5.5", "gpt-5.4")),
+    ("gpt-6-sol", ("gpt-5.6-sol", "gpt-5.5", "gpt-5.4")),
+    ("gpt-6-luna", ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-sol", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-terra", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-luna", ("gpt-5.5", "gpt-5.4")),

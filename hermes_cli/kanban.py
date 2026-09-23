@@ -744,14 +744,45 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
-    p_complete.add_argument("--survivor-ref", default=None, metavar="URL#SHA",
+    p_complete.add_argument("--superseded-by", default=None, metavar="CARD|PR|SHA",
+                            help="Evidence pointer for a card whose premise was already "
+                                 "satisfied elsewhere. Closes it done with outcome "
+                                 "'superseded'; no --result/--summary required, but the "
+                                 "pointer must be non-empty (an unnamed supersede is a "
+                                 "silent delete of the work).")
+    p_complete.add_argument("--survivor-ref", default=None, action="append", metavar="[REPO=]URL#SHA",
                             help="Name an external survivor when the implementation lives on a "
-                                 "remote, not in the workspace. Verified with git ls-remote; "
-                                 "an unverifiable claim refuses the completion.")
-    p_complete.add_argument("--survivor-pr", default=None, metavar="OWNER/REPO#N",
+                                 "remote, not in the workspace. Verified with git ls-remote "
+                                 "AND required to name this task: the SHA must resolve to a "
+                                 "single branch or tag tip whose ref name contains the task id. "
+                                 "An unverifiable claim, or one on an unrelated-looking ref, "
+                                 "refuses the completion (see --survivor-unbound). Repeatable: "
+                                 "qualify each claim as <workspace-relative-repo>=<claim> when "
+                                 "more than one recorded repository vanished.")
+    p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
-                                 "gh pr view (state OPEN or MERGED); an unverifiable claim "
-                                 "refuses the completion.")
+                                 "gh pr view (state OPEN or MERGED) AND required to name this "
+                                 "task; an unverifiable claim refuses the completion. Naming "
+                                 "the task in the PR's head BRANCH binds the claim. A match "
+                                 "only in the PR title or body is a mention, not a tie to this "
+                                 "card's work, so it is recorded as an unbound claim (see "
+                                 "--survivor-unbound) and never becomes standing authority to "
+                                 "delete the workspace later. Repeatable; same <repo>= qualifier "
+                                 "as --survivor-ref.")
+    p_complete.add_argument("--survivor-unbound", action="append", nargs="?", const=True,
+                            default=None, metavar="REPO",
+                            help="Operator override: accept a --survivor-ref/--survivor-pr that "
+                                 "is live but does NOT name this task (including one that names "
+                                 "it only in a PR title or body, which is a mention), for the "
+                                 "case where the work really did land on an unrelated-looking "
+                                 "branch. PER-CLAIM: pass it bare for a single-claim completion, "
+                                 "or repeat it with the <repo>= qualifier of each claim being "
+                                 "overridden when there is more than one -- overriding one claim "
+                                 "must not silently accept the others. The claim "
+                                 "is still remote-verified; the override and the OS user (resolved "
+                                 "from the real uid, not $USER) are recorded on the survivor and "
+                                 "in the task event log. An unbound claim authorises THIS "
+                                 "completion only: a later reclamation will not reuse it.")
 
     p_edit = sub.add_parser(
         "edit",
@@ -804,6 +835,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
         ),
+    )
+
+    p_budget = sub.add_parser(
+        "budget",
+        help="Report per-board 24h worker spend against kanban.budget.usd_per_24h",
+    )
+    p_budget.add_argument(
+        "--board", dest="budget_board", default=None,
+        help="Report a single board instead of every board.",
+    )
+    p_budget.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON",
     )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
@@ -1378,6 +1421,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "budget":   _cmd_budget,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1432,7 +1476,13 @@ def kanban_command(args: argparse.Namespace) -> int:
         try:
             return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
+            # A survivor refusal carries its operator-only hint on the
+            # exception, not in the persisted message, so render it HERE --
+            # at the boundary whose environment belongs to the caller actually
+            # reading the text. See kanban_survivor.render_override_hint.
+            from hermes_cli.kanban_survivor import render_override_hint
+
+            print(f"kanban: {render_override_hint(exc)}", file=sys.stderr)
             return 1
 
 
@@ -1913,6 +1963,8 @@ def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_worker_policy as _kwp
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -1964,6 +2016,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 initial_status=getattr(args, "initial_status", "running"),
+                forced_status=_kwp.resolve_park_status(
+                    initial_status=getattr(args, "initial_status", "running"),
+                    triage=bool(getattr(args, "triage", False)),
+                ),
             )
             task = kb.get_task(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
@@ -1991,6 +2047,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_budget(args: argparse.Namespace) -> int:
+    """Read-only spend report. Never writes a pause marker or pages."""
+    from hermes_cli import kanban_budget as kbudget
+
+    rows = kbudget.board_budget_report(getattr(args, "budget_board", None))
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    print(kbudget.format_budget_report(rows))
+    if rows and rows[0].get("ceiling_usd") is None:
+        print(
+            "\nNo ceiling configured — set kanban.budget.usd_per_24h in "
+            "config.yaml to brake runaway fan-out."
+        )
     return 0
 
 
@@ -2803,18 +2876,29 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     summary = getattr(args, "summary", None)
+    superseded_by = getattr(args, "superseded_by", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
     survivor_ref = getattr(args, "survivor_ref", None)
     survivor_pr = getattr(args, "survivor_pr", None)
-    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr):
+    survivor_unbound = getattr(args, "survivor_unbound", None) or None
+    if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
+                         or survivor_unbound or superseded_by):
         print(
-            "kanban: --summary / --metadata / --survivor-ref / --survivor-pr are per-task "
+            "kanban: --summary / --metadata / --superseded-by / --survivor-ref / "
+            "--survivor-pr / --survivor-unbound are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
+            file=sys.stderr,
+        )
+        return 2
+    if survivor_unbound and not (survivor_ref or survivor_pr):
+        print(
+            "kanban: --survivor-unbound only relaxes the task-id binding on an explicit "
+            "--survivor-ref/--survivor-pr claim; pass one, or drop the flag.",
             file=sys.stderr,
         )
         return 2
@@ -2834,7 +2918,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            # A superseded close has no work for the judge to grade; gating it
+            # would push the worker back into exiting silently.
+            rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
             )
@@ -2847,15 +2933,23 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-                survivor_ref=survivor_ref,
-                survivor_pr=survivor_pr,
-            ):
+            try:
+                done = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    survivor_ref=survivor_ref,
+                    survivor_pr=survivor_pr,
+                    survivor_unbound=survivor_unbound,
+                    superseded_by=superseded_by,
+                )
+            except kb.EmptySupersedeError as supersede_err:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
+                continue
+            if not done:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -3374,6 +3468,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "review_awaiting_human": review_awaiting,
             "reclaimed": res.reclaimed,
             "skipped_locked": res.skipped_locked,
+            "budget_paused": getattr(res, "budget_paused", False),
             "lock_holder": res.lock_holder,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
@@ -3430,6 +3525,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         return 0
     if res.skipped_locked:
         print(kb.format_dispatch_lock_skip(res.lock_holder))
+    if getattr(res, "budget_paused", False):
+        # Loud: otherwise a budget-paused board prints "Spawned: 0" and is
+        # byte-identical to an idle board — the exact false negative the
+        # stranded-by-triage banner exists to prevent.
+        print(
+            "BUDGET PAUSED — this board's rolling-window worker spend has "
+            "reached kanban.budget.usd_per_24h; no new workers spawned. "
+            "Details: hermes kanban budget"
+        )
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
