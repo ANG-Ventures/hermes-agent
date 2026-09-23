@@ -833,7 +833,7 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
         if issues is not None:
             issues.append(
                 "Repair the CA bundle: run `hermes doctor --fix`, or "
-                f"`{sys.executable} -m pip install --force-reinstall certifi`"
+                f"`{hint_value(sys.executable)} -m pip install --force-reinstall certifi`"
             )
         return
 

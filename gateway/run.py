@@ -73,6 +73,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
+from hermes_cli.cli_hint import hint_value
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from gateway.fork_ext.restart_codec import (
@@ -4263,7 +4264,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
                     install_path = f"official/{'/'.join(parts)}"
                     return (
                         f"The **{command_name}** skill is available but not installed.\n"
-                        f"Install it with: `hermes skills install {install_path}`"
+                        f"Install it with: `hermes skills install {hint_value(install_path)}`"
                     )
     except Exception:
         pass
@@ -28356,7 +28357,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if "pynacl" in err_lower or "nacl" in err_lower or "davey" in err_lower:
                 return (
                     "Voice dependencies are missing (PyNaCl / davey). "
-                    f"Install with: `{sys.executable} -m pip install PyNaCl`"
+                    f"Install with: `{hint_value(sys.executable)} -m pip install PyNaCl`"
                 )
             return f"Failed to join voice channel: {e}"
 
