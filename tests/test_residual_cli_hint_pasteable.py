@@ -145,9 +145,18 @@ def test_self_repo_guard_keeps_the_readable_form_for_an_ordinary_path(
 #    EXECUTES it and asks the callee what it actually received.
 # --------------------------------------------------------------------------
 @requires_bash
+@pytest.mark.parametrize("arm", ["returncode", "exception"])
 def test_whatsapp_npm_install_hint_pastes_as_one_dir_and_one_binary(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, arm
 ):
+    """Both reachable arms print the same remedy, so both must be gated.
+
+    ``returncode`` is the ``install_result.returncode != 0`` branch;
+    ``exception`` is the ``except Exception`` arm around the same subprocess
+    (``TimeoutExpired``/``OSError`` -- ``npm`` never ran, or never finished).
+    They carry BYTE-IDENTICAL spans, which is exactly why one behavioural test
+    could not gate the other.
+    """
     import plugins.platforms.whatsapp.adapter as wa
     from gateway.platforms.base import PlatformConfig
 
@@ -206,7 +215,18 @@ def test_whatsapp_npm_install_hint_pastes_as_one_dir_and_one_binary(
     )
 
     with redirect_stdout(io.StringIO()):
-        connected = asyncio.run(adapter.connect())
+        if arm == "exception":
+            # The `except Exception` arm: npm never produced a returncode.
+            # Patched only across connect() so the oracle's own subprocess
+            # calls below run against the real implementation.
+            def _explode(*args, **kwargs):
+                raise OSError("npm could not be executed")
+
+            with monkeypatch.context() as patched:
+                patched.setattr(subprocess, "run", _explode)
+                connected = asyncio.run(adapter.connect())
+        else:
+            connected = asyncio.run(adapter.connect())
 
     assert connected is False
     assert "message" in captured, "the npm-install remedy site was never reached"
@@ -521,33 +541,46 @@ def test_pinned_plugin_hint_keeps_the_readable_form_for_an_ordinary_source(
 # class guard -- a new bare interpolation cannot land silently
 # --------------------------------------------------------------------------
 def test_no_residual_site_reintroduces_a_bare_interpolation():
-    """Pins the source shape of all eight fixed sites as one class."""
+    """Pins the source shape of all eight fixed sites as one class.
+
+    Each needle carries its EXPECTED COUNT, not just presence. Two of these
+    spans appear twice in their file (the whatsapp adapter's returncode and
+    exception arms; the plugins_cmd CLI and dashboard paths), and a
+    presence-only assertion cannot see one of a duplicated pair being
+    reverted -- the needle is still there. The count is what makes a
+    single-site regression visible to this guard.
+    """
     expectations = {
-        "tools/self_repo_guard.py": [
-            "git clone --shared {hint_value(str(root))}",
-            "{hint_value(f'{scratch}/<task>')}",
-        ],
-        "plugins/platforms/whatsapp/adapter.py": [
-            "cd {hint_value(str(bridge_dir))} && {hint_value(_npm_bin)} install",
-        ],
-        "staging/scripts/runtime-parity-check.py": [
-            "git -C {hint_value(TREE)} log --oneline",
-        ],
-        "hermes_cli/doctor.py": [
-            "{hint_value(sys.executable)} -m pip install --force-reinstall certifi",
-        ],
-        "gateway/run.py": [
-            "{hint_value(sys.executable)} -m pip install PyNaCl",
-            "hermes skills install {hint_value(install_path)}",
-        ],
-        "hermes_cli/plugins_cmd.py": [
-            "hermes plugins install {recorded_source} --force",
-        ],
+        "tools/self_repo_guard.py": {
+            "git clone --shared {hint_value(str(root))}": 1,
+            "{hint_value(f'{scratch}/<task>')}": 1,
+        },
+        "plugins/platforms/whatsapp/adapter.py": {
+            # :612 returncode arm and :626 exception arm, byte-identical.
+            "cd {hint_value(str(bridge_dir))} && {hint_value(_npm_bin)} install": 2,
+        },
+        "staging/scripts/runtime-parity-check.py": {
+            "git -C {hint_value(TREE)} log --oneline": 1,
+        },
+        "hermes_cli/doctor.py": {
+            "{hint_value(sys.executable)} -m pip install --force-reinstall certifi": 1,
+        },
+        "gateway/run.py": {
+            "{hint_value(sys.executable)} -m pip install PyNaCl": 1,
+            "hermes skills install {hint_value(install_path)}": 1,
+        },
+        "hermes_cli/plugins_cmd.py": {
+            # CLI (:1106) and dashboard (:2855) paths, byte-identical.
+            "hermes plugins install {recorded_source} --force": 2,
+        },
     }
     for rel, needles in expectations.items():
         source = (REPO_ROOT / rel).read_text(encoding="utf-8")
-        for needle in needles:
-            assert needle in source, f"{rel} lost its escaped form: {needle}"
+        for needle, expected in needles.items():
+            assert source.count(needle) == expected, (
+                f"{rel} has {source.count(needle)} of the escaped form, "
+                f"expected {expected}: {needle}"
+            )
 
     plugins = (REPO_ROOT / "hermes_cli" / "plugins_cmd.py").read_text(encoding="utf-8")
     assert plugins.count("recorded_source = hint_value(") == 1
