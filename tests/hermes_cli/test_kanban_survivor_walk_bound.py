@@ -33,6 +33,7 @@ Mutation checks (each run against this file):
   * drop the `_registered_nested` short-circuit -> `test_home_shaped_workspace_refuses_fast` red
   * add `.worktrees` to `_DERIVED_DIRS` -> `test_derived_prune_never_hides_a_repository` red
 """
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -246,6 +247,98 @@ def test_registered_nested_finds_a_worktree_without_walking(tmp_path, monkeypatc
     monkeypatch.setattr(survivor, "_subdirs", forbidden)
     registered = survivor._registered_nested(ws)
     assert (ws / "nested").resolve() in {p.resolve() for p in registered}
+
+
+# --- (d) a registry entry is proof only if the path is a REPO ON DISK -----
+#
+# Both registries record what git KNOWS ABOUT, not what is PRESENT, and both
+# lie in the same direction. Trusting either unfiltered made `preserve()`
+# refuse on a repository that is not there -- a fail-closed HOLD with no
+# operator remedy, because the raise precedes every survivor-consulting
+# branch. Measured live: 26/28 `~/.hermes/.worktrees/t_*` and 49/50
+# `ace-media-homelab/.worktrees/t_*` cards refused where they complete on main.
+
+
+def test_unmaterialised_gitlink_is_not_proof_of_a_nested_repo(tmp_path):
+    """`git worktree add` does NOT check submodules out; the dir stays EMPTY.
+
+    The gitlink is in the linked worktree's index regardless, so a
+    registry-only test calls an empty directory a nested repository.
+    """
+    sub = _init(tmp_path / "sub")
+    sup = _init(tmp_path / "sup")
+    git(sup, "-c", "protocol.file.allow=always", "submodule", "add", str(sub), "vendor/pool")
+    git(sup, "commit", "-m", "add submodule")
+    worktree = tmp_path / "wt"
+    git(sup, "worktree", "add", str(worktree), "-b", "side")
+
+    staged = git(worktree, "ls-files", "--stage").splitlines()
+    assert any(line.split(" ", 1)[0] == "160000" for line in staged), (
+        "fixture is vacuous: the gitlink must be in the worktree's index"
+    )
+    assert not (worktree / "vendor" / "pool" / ".git").exists(), (
+        "fixture is vacuous: the submodule must NOT be materialised"
+    )
+    assert survivor._registered_nested(worktree) == [], (
+        "an unmaterialised gitlink is not a nested repository on disk"
+    )
+
+
+def test_checked_out_submodule_is_still_proof(tmp_path):
+    """The other side of the discriminator: a REAL submodule must still refuse."""
+    sub = _init(tmp_path / "sub")
+    sup = _init(tmp_path / "sup")
+    git(sup, "-c", "protocol.file.allow=always", "submodule", "add", str(sub), "vendor/pool")
+    git(sup, "commit", "-m", "add submodule")
+
+    assert (sup / "vendor" / "pool" / ".git").exists(), "fixture: submodule is checked out"
+    assert (sup / "vendor" / "pool").resolve() in {
+        p.resolve() for p in survivor._registered_nested(sup)
+    }
+
+
+def test_stale_worktree_registration_is_not_proof_of_a_nested_repo(tmp_path):
+    """Same defect, second registry: a listed worktree whose dir is GONE.
+
+    `git worktree list` keeps reporting it until someone prunes -- exactly what
+    a failed `git worktree remove` (the retry path in `remove_workspace_dir`)
+    leaves behind.
+    """
+    ws = _init(tmp_path / "ws")
+    stale = ws / "gone"
+    git(ws, "worktree", "add", str(stale), "-b", "stale")
+    shutil.rmtree(stale)
+
+    assert "gone" in git(ws, "worktree", "list", "--porcelain"), (
+        "fixture is vacuous: git must still list the deleted worktree"
+    )
+    assert survivor._registered_nested(ws) == [], (
+        "a registration whose directory is gone is not a nested repository"
+    )
+
+
+def test_unmaterialised_gitlink_does_not_hold_the_card(board, tmp_path):
+    """End to end: the shape that regressed must COMPLETE, not be HELD.
+
+    B1 as argus reproduced it -- a worktree card of a superproject with an
+    unchecked-out submodule. `preserve` must record a survivor instead of
+    raising "nested repository requires separate recovery".
+    """
+    sub = _init(tmp_path / "sub")
+    sup = _init(tmp_path / "sup")
+    git(sup, "-c", "protocol.file.allow=always", "submodule", "add", str(sub), "vendor/pool")
+    git(sup, "commit", "-m", "add submodule")
+    ws = tmp_path / "wt"
+    git(sup, "worktree", "add", str(ws), "-b", "side")
+    (ws / "worker.py").write_text("work = True\n")
+    git(ws, "add", "worker.py")
+    git(ws, "commit", "-m", "worker output")
+
+    tid = kb.create_task(board, title="worktree card with an empty gitlink")
+    kb.set_workspace_path(board, tid, ws)
+    survivor.record_baseline(board, tid, ws)
+
+    survivor.preserve(board, tid, {"changed_files": ["worker.py"]}, workspace=ws)
 
 
 def test_home_shaped_workspace_refuses_fast(board, tmp_path, monkeypatch):

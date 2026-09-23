@@ -332,6 +332,37 @@ def _repos(workspace):
     return found
 
 
+def _is_repo_on_disk(path):
+    """A registry entry is proof only if the path is a repository ON DISK.
+
+    THE discriminator for both registry sources. Git's registries record what
+    git *knows about*, not what is *present*, and both of them lie in the same
+    direction:
+
+      * a `160000` gitlink stays in the index of a linked worktree even though
+        `git worktree add` does NOT check submodules out -- the path on disk is
+        an empty directory (measured: `~/.hermes/.worktrees/t_01322a3f` carries
+        18 gitlinks, 0 of them materialised);
+      * `git worktree list` keeps listing a worktree whose directory was
+        deleted but never pruned -- which is exactly what a failed
+        `git worktree remove` leaves behind.
+
+    Trusting either unfiltered made `preserve()` refuse on a repository that is
+    not there, and the raise precedes every survivor-consulting branch, so not
+    even `--survivor-unbound` could reach it: 26/28 `~/.hermes/.worktrees/t_*`
+    and 49/50 `ace-media-homelab/.worktrees/t_*` cards were fail-closed HELD
+    where they complete on main.
+
+    `.git` may be a directory (clone, checked-out submodule) or a file (linked
+    worktree, modern submodule), so `exists()` is the right test and costs one
+    stat per registry hit -- 0.07-0.12 s over the whole fleet home.
+    """
+    try:
+        return (path / ".git").exists()
+    except OSError:
+        return False
+
+
 def _registered_nested(workspace):
     """Nested repos Git ALREADY knows about, without walking the filesystem.
 
@@ -339,14 +370,21 @@ def _registered_nested(workspace):
     every linked worktree of the repo at ``workspace``, and a `160000` index
     entry is a gitlink (a submodule). Both are read from metadata, so the cost
     does not scale with the tree -- measured 1.2 s and 0.05 s on the fleet home,
-    against 227 s for the walk that finds the same thing.
+    against 227 s for the walk that finds the same thing. The registry path is
+    the arm that satisfies the card's <10 s acceptance bar; re-measured after
+    review at 2.34 s cold / 0.10--0.14 s warm. The bounded fallback remains
+    disk-contention sensitive (21.47--23.14 s in the same measurement), but it
+    terminates with a named refusal instead of hanging silently.
 
-    Used ONLY as a positive: a path Git lists really is a nested repository, so
-    finding one is proof. The converse does not hold and must not be inferred --
-    a repo a worker cloned by hand is in neither registry (measured: these two
-    registries account for 47 of the 813 repositories recorded for t_f5ebd9db),
-    which is why this supplements the walk's refusal rather than replacing the
-    walk.
+    Every hit is confirmed present via :func:`_is_repo_on_disk` before it is
+    returned; see there for why a bare registry entry is not proof.
+
+    Used ONLY as a positive: a path Git lists AND that is a repository on disk
+    really is a nested repository, so finding one is proof. The converse does
+    not hold and must not be inferred -- a repo a worker cloned by hand is in
+    neither registry (measured: these two registries account for 47 of the 813
+    repositories recorded for t_f5ebd9db), which is why this supplements the
+    walk's refusal rather than replacing the walk.
     """
     if not (workspace / ".git").exists():
         return []
@@ -360,13 +398,13 @@ def _registered_nested(workspace):
                 path = Path(line[len("worktree "):]).resolve()
             except OSError:
                 continue
-            if path != workspace and path.is_relative_to(workspace):
+            if path != workspace and path.is_relative_to(workspace) and _is_repo_on_disk(path):
                 nested.append(path)
     index = _git(workspace, "ls-files", "--stage", check=False)
     if index.returncode == 0:
         for line in index.stdout.decode("utf-8", "replace").splitlines():
             meta, _, path = line.partition("\t")
-            if meta.split(" ", 1)[0] == "160000" and path:
+            if meta.split(" ", 1)[0] == "160000" and path and _is_repo_on_disk(workspace / path):
                 nested.append(workspace / path)
     return nested
 
