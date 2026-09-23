@@ -31,9 +31,9 @@ def main():
                 dst.parent.mkdir(exist_ok=True)
                 shutil.copyfile(ROOT / filename, dst)
             target = root / src
-            content = target.read_text()
+            content = target.read_text(encoding="utf-8")
             assert content.count(before) == 1, (name, content.count(before))
-            target.write_text(content.replace(before, after))
+            target.write_text(content.replace(before, after), encoding="utf-8")
             result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-o", "addopts=", testfile,
                                      "-k", test], cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL)
             print(f"{name}: exit={result.returncode}")
