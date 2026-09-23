@@ -40,6 +40,7 @@ operations and stay allowed.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -1925,6 +1926,104 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
     return text, False
 
 
+def _mask_read_only_python_paths(body: str) -> str:
+    """Exclude literal paths read as diagnostic data, never executable input.
+
+    Unknown Python expressions retain the conservative referenced-script scan.
+    A path handed to os.system/subprocess remains visible to that scan.
+    """
+    if not body.isascii():  # AST columns are UTF-8 byte offsets; fail closed.
+        return body
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return body
+    has_path = any(
+        isinstance(node, ast.ImportFrom) and node.module == "pathlib"
+        and any(alias.name == "Path" and alias.asname is None for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    if any(
+        (isinstance(node, ast.Name) and node.id in {"Path", "print"} and isinstance(node.ctx, ast.Store))
+        or (isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in {"Path", "print"})
+        or (isinstance(node, ast.arg) and node.arg in {"Path", "print"})
+        or (isinstance(node, ast.ImportFrom) and node.module != "pathlib"
+            and any(alias.asname in {"Path", "print"} or alias.name in {"Path", "print"} for alias in node.names))
+        for node in ast.walk(tree)
+    ):
+        return body
+    lines = body.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    open_shadowed = any(
+        (isinstance(other, ast.Name) and other.id == "open" and isinstance(other.ctx, ast.Store))
+        or (isinstance(other, (ast.FunctionDef, ast.ClassDef)) and other.name == "open")
+        or (isinstance(other, ast.arg) and other.arg == "open")
+        or (isinstance(other, (ast.Import, ast.ImportFrom)) and any(
+            alias.asname == "open" or alias.name == "open" for alias in other.names
+        )) for other in ast.walk(tree)
+    )
+    spans = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "open" and len(node.args) == 1
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and not open_shadowed):
+            read_attr = parents.get(node)
+            read_call = parents.get(read_attr) if read_attr is not None else None
+            split_attr = parents.get(read_call) if read_call is not None else None
+            split_call = parents.get(split_attr) if split_attr is not None else None
+            reverse_call = parents.get(split_call) if split_call is not None else None
+            loop = parents.get(reverse_call) if reverse_call is not None else None
+            if (isinstance(read_attr, ast.Attribute) and read_attr.attr == "read"
+                    and isinstance(read_call, ast.Call) and not read_call.args and not read_call.keywords
+                    and isinstance(split_attr, ast.Attribute) and split_attr.attr == "splitlines"
+                    and isinstance(split_call, ast.Call) and not split_call.args and not split_call.keywords
+                    and isinstance(reverse_call, ast.Call) and isinstance(reverse_call.func, ast.Name)
+                    and reverse_call.func.id == "reversed" and reverse_call.args == [split_call]
+                    and isinstance(loop, ast.For) and loop.iter is reverse_call
+                    and node.end_lineno is not None and node.end_col_offset is not None
+                    and all(
+                        isinstance(call.func, ast.Name) and call.func.id in {"len", "print"}
+                        or isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+                        and (call.func.value.id, call.func.attr) in {
+                            ("json", "loads"), ("d", "get"), ("seen", "add"), ("out", "append")
+                        }
+                        or isinstance(call.func, ast.Attribute) and call.func.attr == "lower"
+                        and isinstance(call.func.value, ast.Subscript)
+                        and isinstance(call.func.value.value, ast.Name)
+                        and call.func.value.value.id == "d"
+                        for statement in loop.body for call in ast.walk(statement)
+                        if isinstance(call, ast.Call)
+                    )):
+                spans.append((offsets[node.lineno - 1] + node.col_offset,
+                              offsets[node.end_lineno - 1] + node.end_col_offset))
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in {"read_text", "read_bytes"}:
+            continue
+        parent = parents.get(node)
+        if not has_path or not (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+                and parent.func.id == "print"):
+            continue
+        path_call = node.func.value
+        if not (isinstance(path_call, ast.Call) and isinstance(path_call.func, ast.Name)
+                and path_call.func.id == "Path" and len(path_call.args) == 1
+                and isinstance(path_call.args[0], ast.Constant)
+                and isinstance(path_call.args[0].value, str)
+                and path_call.end_lineno is not None and path_call.end_col_offset is not None):
+            continue
+        start = offsets[path_call.lineno - 1] + path_call.col_offset
+        end = offsets[path_call.end_lineno - 1] + path_call.end_col_offset
+        spans.append((start, end))
+    for start, end in sorted(spans, reverse=True):
+        body = body[:start] + "read_only_path" + body[end:]
+    return body
+
+
 def _contains_unsafe_gateway_action(
     command: str,
     *,
@@ -1938,7 +2037,24 @@ def _contains_unsafe_gateway_action(
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
-    for payload in _iter_shell_command_payloads(command):
+    from tools.shell_heredoc import (
+        inert_python_heredoc_bodies,
+        strip_inert_heredoc_bodies,
+    )
+
+    # Python stdin is executable Python source, but not a sequence of shell
+    # commands. Scan its lifecycle-shaped calls like a .py file, then exclude
+    # its path strings from the shell's referenced-script walk.
+    python_bodies = inert_python_heredoc_bodies(command, semicolon_chain=True)
+    for body in python_bodies:
+        if _direct_lifecycle_scan(body):
+            return True
+    shell_command = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
+    referenced_command = shell_command + "\n" + "\n".join(
+        _mask_read_only_python_paths(body) for body in python_bodies
+    )
+
+    for payload in _iter_shell_command_payloads(shell_command):
         if _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
@@ -1948,7 +2064,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path in _iter_referenced_shell_scripts(referenced_command, cwd=cwd):
         # Do not touch a FileProvider path even to discover whether the file
         # is hydrated. The lexical check covers direct cloud paths; the
         # resolved check below covers local launchers that are symlinks into
