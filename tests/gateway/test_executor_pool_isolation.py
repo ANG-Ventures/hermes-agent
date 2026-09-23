@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from gateway import run as run_mod
 from gateway.run import GatewayRunner
 
 
@@ -350,7 +351,7 @@ def test_invalid_pool_size_falls_back_to_default(monkeypatch, bad):
     try:
         pool = runner._get_executor()
         assert isinstance(pool, concurrent.futures.ThreadPoolExecutor)
-        assert pool._max_workers == 10
+        assert pool._max_workers == run_mod._EXECUTOR_MAX_WORKERS_DEFAULT
     finally:
         _shutdown(runner)
 

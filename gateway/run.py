@@ -134,7 +134,18 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _EXECUTOR_DRAIN_TIMEOUT_SECS_DEFAULT = 8.0
 # Size of the gateway-owned pool that runs agent TURN bodies (run_sync).
 # Overridable via HERMES_GATEWAY_EXECUTOR_MAX_WORKERS for ops tuning.
-_EXECUTOR_MAX_WORKERS_DEFAULT = 10
+#
+# INVARIANT (2026-09-23, Apollo): the turn pool must be at least as wide as
+# turn ADMISSION (gateway.max_concurrent_turns). Admission is what decides a
+# turn may run; a narrower pool silently re-queues admitted turns behind
+# whichever bodies are already occupying threads. A turn body holds its thread
+# for the whole turn (every tool call is blocking), so with 8 boot-resumes +
+# kanban wakes + user turns live at once, admitted turns sat in this queue for
+# 2151-2356 s (PHASE=executor_wait pool=turn inflight=10 queued=2..4) and Ace
+# read the sessions as "frozen". #807 moved housekeeping off this pool but
+# left it at 10 against an admission cap of 100. Threads here block on
+# LLM/HTTP and subprocess I/O, so a wide pool costs stacks, not CPU.
+_EXECUTOR_MAX_WORKERS_DEFAULT = 64
 # Size of the separate pool that runs best-effort session HOUSEKEEPING
 # (finalize hooks, agent resource cleanup). Kept off the turn pool because
 # those callers ABANDON their worker on timeout — see
@@ -208,11 +219,28 @@ def _env_positive_int(name: str, default: int) -> int:
     return default
 
 
-def _executor_max_workers() -> int:
-    """Return the size of the turn-body executor."""
-    return _env_positive_int(
-        "HERMES_GATEWAY_EXECUTOR_MAX_WORKERS", _EXECUTOR_MAX_WORKERS_DEFAULT
-    )
+def _executor_max_workers(admission_cap: Optional[int] = None) -> int:
+    """Return the size of the turn-body executor.
+
+    Never narrower than turn admission: an admitted turn must find a thread.
+    ``admission_cap`` is ``gateway.max_concurrent_turns`` (None = unbounded,
+    which keeps the default). The env knob is an explicit operator override
+    and wins outright, but is still floored at the admission cap so a stale
+    knob cannot re-create the 2026-09-23 queue.
+    """
+    floor = _EXECUTOR_MAX_WORKERS_DEFAULT
+    if type(admission_cap) is int and admission_cap > floor:
+        floor = admission_cap
+    size = _env_positive_int("HERMES_GATEWAY_EXECUTOR_MAX_WORKERS", floor)
+    if type(admission_cap) is int and admission_cap > size:
+        logger.warning(
+            "HERMES_GATEWAY_EXECUTOR_MAX_WORKERS=%d is narrower than "
+            "gateway.max_concurrent_turns=%d; using %d so admitted turns "
+            "cannot queue behind the pool",
+            size, admission_cap, admission_cap,
+        )
+        size = admission_cap
+    return size
 
 
 def _housekeeping_executor_max_workers() -> int:
@@ -31378,9 +31406,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return await loop.run_in_executor(executor, _timed, *args)
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
-        """Return the gateway-owned executor for blocking agent work."""
+        """Return the gateway-owned executor for blocking agent work.
+
+        Sized against turn admission (see _executor_max_workers): the pool is
+        created lazily on the first turn, which is always AFTER that turn was
+        admitted, so the admission cap is known here.
+        """
+        _cap = None
+        try:
+            _cap = getattr(self._get_turn_admission(), "cap", None)
+        except Exception:
+            _cap = None
         return _get_or_create_pool(
-            self, "_executor", "hermes-gateway", _executor_max_workers()
+            self, "_executor", "hermes-gateway", _executor_max_workers(_cap)
         )
 
     def _get_housekeeping_executor(self) -> concurrent.futures.ThreadPoolExecutor:
