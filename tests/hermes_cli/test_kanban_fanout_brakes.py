@@ -301,6 +301,98 @@ def test_board_spend_cache_is_computed_once_per_tick(kanban_home, monkeypatch):
     assert len(calls) == 1
 
 
+def test_ledgers_are_read_once_per_tick_across_DIFFERENT_boards(
+    kanban_home, monkeypatch,
+):
+    """The cache must survive a board boundary, not just a repeated path.
+
+    The sibling test above calls the SAME board db twice, so it passes even
+    when the cache is keyed on the board path. Every board on a host has a
+    DISTINCT db path, and the expensive work — opening every profile's turn
+    ledger — is identical for all of them. Keyed on the board, an N-board host
+    re-reads every ledger N times per tick (measured 2026-09-22: 76 boards,
+    10 ledgers, 660 opens where the documented intent is 10).
+
+    So: two boards, two ledgers, one tick cache — each ledger opened ONCE.
+    """
+    from hermes_cli import kanban_budget
+
+    now = int(time.time())
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    with kb.connect_closing(board="alpha") as conn:
+        a_id = kb.create_task(conn, title="a", assignee="argus")
+    with kb.connect_closing(board="beta") as conn:
+        b_id = kb.create_task(conn, title="b", assignee="argus")
+
+    _write_ledger(
+        kanban_home, "daedalus-opus", [(now - 60, 2.0, f"work kanban task {a_id}")],
+    )
+    _write_ledger(
+        kanban_home, "argus", [(now - 60, 5.0, f"work kanban task {b_id}")],
+    )
+
+    a_path = kb.kanban_db_path(board="alpha")
+    b_path = kb.kanban_db_path(board="beta")
+    assert a_path != b_path, "boards must have distinct db paths for this test"
+
+    opened: list[str] = []
+    real = kanban_budget._ledger_card_costs
+
+    def counting(ledger, since_ts):
+        opened.append(str(ledger))
+        return real(ledger, since_ts)
+
+    monkeypatch.setattr(kanban_budget, "_ledger_card_costs", counting)
+
+    cache: dict = {}
+    a_spend = kanban_budget.board_spend_usd(
+        a_path, window_hours=24, home=kanban_home, cache=cache,
+    )
+    b_spend = kanban_budget.board_spend_usd(
+        b_path, window_hours=24, home=kanban_home, cache=cache,
+    )
+
+    # Values unchanged: this is a pure caching change, each board still sees
+    # only its own cards' cost.
+    assert a_spend == pytest.approx(2.0)
+    assert b_spend == pytest.approx(5.0)
+    # 2 ledgers, 2 boards, 2 opens — not 4. This is the assertion that fails
+    # when the ledger sum is keyed on the board db path.
+    assert len(opened) == 2, opened
+    assert len(set(opened)) == 2
+
+    # And the cached arm agrees with the uncached one, board for board.
+    assert a_spend == pytest.approx(
+        kanban_budget.board_spend_usd(a_path, window_hours=24, home=kanban_home)
+    )
+    assert b_spend == pytest.approx(
+        kanban_budget.board_spend_usd(b_path, window_hours=24, home=kanban_home)
+    )
+
+    # A second tick with a clock that ADVANCES between boards must still open
+    # each ledger once: the window start is pinned for the life of the cache.
+    # Unpinned, each board derives its own since_ts and misses the cache — the
+    # same 76x re-read, just via the timestamp instead of the path.
+    ticks = [now]
+
+    def advancing_clock():
+        ticks[0] += 1
+        return ticks[0]
+
+    monkeypatch.setattr(kanban_budget.time, "time", advancing_clock)
+    opened.clear()
+    cache2: dict = {}
+    assert kanban_budget.board_spend_usd(
+        a_path, window_hours=24, home=kanban_home, cache=cache2,
+    ) == pytest.approx(2.0)
+    assert kanban_budget.board_spend_usd(
+        b_path, window_hours=24, home=kanban_home, cache=cache2,
+    ) == pytest.approx(5.0)
+    assert len(opened) == 2, opened
+
+
 def test_dispatch_skips_spawn_over_ceiling_and_pages_once(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
@@ -337,6 +429,63 @@ def test_dispatch_skips_spawn_over_ceiling_and_pages_once(
     # Exactly ONE page for the whole pause episode, not one per tick.
     assert len(sent) == 1, sent
     assert any("expensive" not in a for a in sent[0])
+
+
+def test_dispatch_tick_reads_ledgers_once_across_boards(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """AC4: the dispatcher's per-tick budget_cache now actually dedupes.
+
+    gateway/kanban_watchers.py builds ONE budget_cache per tick and threads it
+    through dispatch_once for every board. That caller was always correct; the
+    cache key defeated it. Exercise the real dispatch path over two boards with
+    one tick cache and count ledger opens.
+    """
+    from hermes_cli import kanban_budget
+
+    now = int(time.time())
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    with kb.connect_closing(board="alpha") as conn:
+        a_id = kb.create_task(conn, title="a", assignee="argus")
+    with kb.connect_closing(board="beta") as conn:
+        b_id = kb.create_task(conn, title="b", assignee="argus")
+    _write_ledger(
+        kanban_home, "daedalus-opus", [(now - 60, 1.0, f"work kanban task {a_id}")],
+    )
+    _write_ledger(
+        kanban_home, "argus", [(now - 60, 1.0, f"work kanban task {b_id}")],
+    )
+    monkeypatch.setattr(
+        kanban_budget, "_load_config",
+        lambda: {"kanban": {"budget": {"usd_per_24h": 100.0}}},
+    )
+    monkeypatch.setattr(kanban_budget, "_run_notify", lambda argv: None)
+
+    opened: list[str] = []
+    real = kanban_budget._ledger_card_costs
+
+    def counting(ledger, since_ts):
+        opened.append(str(ledger))
+        return real(ledger, since_ts)
+
+    monkeypatch.setattr(kanban_budget, "_ledger_card_costs", counting)
+
+    spawns: list[str] = []
+    budget_cache: dict = {}
+    for slug in ("alpha", "beta"):
+        with kb.connect_closing(board=slug) as conn:
+            res = kb.dispatch_once(
+                conn,
+                board=slug,
+                spawn_fn=_fake_spawn_factory(spawns),
+                budget_cache=budget_cache,
+            )
+        assert res.budget_paused is False
+    assert sorted(spawns) == sorted([a_id, b_id])
+    # 2 ledgers x 2 boards, one tick cache => 2 opens, not 4.
+    assert len(opened) == 2, opened
 
 
 def test_dispatch_spawns_under_ceiling(

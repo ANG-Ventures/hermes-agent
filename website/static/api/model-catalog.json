@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-23T03:15:49Z",
+  "updated_at": "2026-09-23T08:40:12Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -19,6 +19,14 @@
         {
           "id": "anthropic/claude-fable-5",
           "description": ""
+        },
+        {
+          "id": "anthropic/claude-opus-5-5",
+          "description": ""
+        },
+        {
+          "id": "anthropic/claude-opus-5-5-fast",
+          "description": "2x price, higher output speed"
         },
         {
           "id": "anthropic/claude-opus-5",
@@ -242,6 +250,9 @@
         },
         {
           "id": "anthropic/claude-fable-5"
+        },
+        {
+          "id": "anthropic/claude-opus-5-5"
         },
         {
           "id": "anthropic/claude-opus-5"
