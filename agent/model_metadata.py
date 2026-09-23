@@ -578,6 +578,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     # moment it ships; the catch-all is for legacy Claude 3.x only.
     # (Substring match: this key also covers "claude-opus-5-fast", also 1M.)
     "claude-opus-5": 1000000,
+    # Claude Opus 5.5 (1M context, 128k max output) — released 2026-09-22.
+    # Listed explicitly rather than leaning on the "claude-opus-5" substring
+    # so the longest-key-first lookup resolves the exact id, and so the next
+    # id that breaks the prefix relationship still has a row here.
+    # (Substring match: this key also covers "claude-opus-5-5-fast", also 1M.)
+    "claude-opus-5-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4.8": 1000000,
     "claude-opus-4-7": 1000000,

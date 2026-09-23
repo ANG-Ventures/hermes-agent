@@ -206,28 +206,207 @@ def _explain_broken_object_store(repo, key, workspace, bases=()):
     )
 
 
+# Directories that cannot hold a survivor because their contents are DERIVED:
+# a package manager, an interpreter or a linter can regenerate every byte. They
+# are pruned so the walk never descends into them.
+#
+# The set is deliberately narrow, and the narrowness is the point. Pruning by
+# "this subtree is big" is what a reader reaching for a fix naturally proposes
+# (t_6c46905a proposed exactly `.worktrees`, `kanban`, `var`, `wt`, `plans`,
+# `skills-shared`, `sessions`, `runs`, `logs`, `backups`) and it is UNSOUND:
+# measured against every `bases` row on the live board, that list drops 691 of
+# the 832 recorded repository keys -- i.e. it prunes away the repositories the
+# walk exists to find, silently turning a HOLD into a delete for real unpushed
+# work. `kanban/workspaces/*` alone holds 422 recorded repos, and `.worktrees`
+# is where the dispatcher puts every worktree card.
+#
+# This set instead drops 0 of those 832 keys, so it can never lose a survivor,
+# and it is still worth ~10% of the entries on a real worktree workspace
+# (measured 2,128/21,877 on t_dbfa8eb2, 353/4,124 on t_19f4a9d3). Anything
+# added here must be re-measured the same way: coverage first, speed second.
+_DERIVED_DIRS = frozenset({
+    "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".venv", ".venvs", "venv",
+})
+
+# Hard ceiling on directories inspected by one enumeration. A gate that cannot
+# finish must SAY so rather than hang: unbounded, this walk visited 850,853
+# directories in 227 s on an idle disk for a `dir` workspace rooted at the
+# fleet home, and `kanban_complete` died at its 420 s tool ceiling having
+# written nothing at all -- no output, no error, no terminal state (t_6c46905a,
+# faulthandler caught it inside `is_symlink` under `os.walk`).
+#
+# 50,000 is ~6.7 s measured on that tree and leaves >2x headroom over the
+# largest real workspace on the board (21,877 directories).
+DEFAULT_WALK_BUDGET_ENTRIES = 50_000
+
+
+def _walk_budget():
+    """Entry ceiling for one enumeration; invalid env values fall back silently."""
+    raw = os.environ.get("HERMES_KANBAN_SURVIVOR_WALK_BUDGET", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+    return DEFAULT_WALK_BUDGET_ENTRIES
+
+
+def _over_budget(what, workspace, visited, budget):
+    """The refusal for a tree too large to enumerate, naming count and path.
+
+    Fail-closed and LEGIBLE: the count and the path are what tell an operator
+    which tree to point the workspace at instead, and neither is
+    credential-bearing, so both are safe to persist as ``held_reason``.
+    """
+    return SurvivorUnavailable(
+        f"survivor_unavailable: {what} exceeded the {budget} directory budget after "
+        f"{visited} entries under {workspace} -- the workspace is too large to "
+        "enumerate; point the card at the specific repository or worktree instead of "
+        "a whole home directory, or raise HERMES_KANBAN_SURVIVOR_WALK_BUDGET"
+    )
+
+
+def _subdirs(here):
+    """Immediate non-symlink subdirectory names, and whether ``.git`` is present.
+
+    ``os.scandir`` answers "is this a directory" and "is this a symlink" from
+    the dirent the readdir already returned, so the per-child ``is_symlink()``
+    stat the previous ``os.walk`` form issued -- 853,413 of them on the fleet
+    home -- is not paid at all.
+
+    An unreadable directory (EACCES/EPERM) cannot hold a repo the worker could
+    have written to, so skipping it loses no survivor. Raising took down every
+    dispatch tick for a `dir` workspace rooted at a real home (2026-09-20:
+    `var/skills-portal/caddy`, root-owned 0700, made the whole default board
+    unspawnable). Anything else is still fatal.
+    """
+    try:
+        with os.scandir(here) as it:
+            entries = list(it)
+    except PermissionError as exc:
+        log.warning("kanban survivor: skipping unreadable dir %s (%s)", here, exc.strerror)
+        return [], False
+    names = set()
+    children = []
+    for entry in entries:
+        names.add(entry.name)
+        if entry.name in (".git", *_DERIVED_DIRS):
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                children.append(Path(entry.path))
+        except OSError:
+            continue
+    return children, ".git" in names
+
+
+def _walk(workspace):
+    """Directories under ``workspace``, pruned and bounded; depth-first.
+
+    Yields ``(path, is_repo)``. Raises :class:`SurvivorUnavailable` rather than
+    running forever when the tree exceeds the entry budget.
+    """
+    budget = _walk_budget()
+    visited = 0
+    stack = [Path(workspace)]
+    while stack:
+        here = stack.pop()
+        visited += 1
+        if visited > budget:
+            raise _over_budget("repository enumeration", workspace, visited, budget)
+        children, is_repo = _subdirs(here)
+        yield here, is_repo
+        stack.extend(children)
+
+
 def _repos(workspace):
     """Find repos created inside scratch, including linked worktrees; no symlinks."""
-    found = []
-    def fail(exc):
-        # An unreadable directory (EACCES/EPERM) cannot hold a repo the worker
-        # could have written to, so skipping it loses no survivor. Raising here
-        # took down every dispatch tick for a `dir` workspace rooted at a real
-        # home (2026-09-20: `var/skills-portal/caddy`, root-owned 0700, made the
-        # whole default board unspawnable). Anything else is still fatal.
-        if isinstance(exc, PermissionError):
-            log.warning("kanban survivor: skipping unreadable dir %s (%s)", exc.filename, exc.strerror)
-            return
-        raise exc
-    for root, dirs, files in os.walk(workspace, followlinks=False, onerror=fail):
-        if ".git" in dirs or ".git" in files:
-            found.append(Path(root))
-        dirs[:] = sorted(d for d in dirs if d != ".git" and not (Path(root) / d).is_symlink())
+    found = [here for here, is_repo in _walk(workspace) if is_repo]
     if workspace not in found and any((p / ".git").exists() for p in (workspace, *workspace.parents)):
         tracked = _git(workspace, "ls-files", "--", ".")
         if tracked.returncode == 0 and tracked.stdout:
             found.insert(0, workspace)
     return found
+
+
+def _is_repo_on_disk(path):
+    """A registry entry is proof only if the path is a repository ON DISK.
+
+    THE discriminator for both registry sources. Git's registries record what
+    git *knows about*, not what is *present*, and both of them lie in the same
+    direction:
+
+      * a `160000` gitlink stays in the index of a linked worktree even though
+        `git worktree add` does NOT check submodules out -- the path on disk is
+        an empty directory (measured: `~/.hermes/.worktrees/t_01322a3f` carries
+        18 gitlinks, 0 of them materialised);
+      * `git worktree list` keeps listing a worktree whose directory was
+        deleted but never pruned -- which is exactly what a failed
+        `git worktree remove` leaves behind.
+
+    Trusting either unfiltered made `preserve()` refuse on a repository that is
+    not there, and the raise precedes every survivor-consulting branch, so not
+    even `--survivor-unbound` could reach it: 26/28 `~/.hermes/.worktrees/t_*`
+    and 49/50 `ace-media-homelab/.worktrees/t_*` cards were fail-closed HELD
+    where they complete on main.
+
+    `.git` may be a directory (clone, checked-out submodule) or a file (linked
+    worktree, modern submodule), so `exists()` is the right test and costs one
+    stat per registry hit -- 0.07-0.12 s over the whole fleet home.
+    """
+    try:
+        return (path / ".git").exists()
+    except OSError:
+        return False
+
+
+def _registered_nested(workspace):
+    """Nested repos Git ALREADY knows about, without walking the filesystem.
+
+    Git's own registries answer this in O(refs): `worktree list` enumerates
+    every linked worktree of the repo at ``workspace``, and a `160000` index
+    entry is a gitlink (a submodule). Both are read from metadata, so the cost
+    does not scale with the tree -- measured 1.2 s and 0.05 s on the fleet home,
+    against 227 s for the walk that finds the same thing. The registry path is
+    the arm that satisfies the card's <10 s acceptance bar; re-measured after
+    review at 2.34 s cold / 0.10--0.14 s warm. The bounded fallback remains
+    disk-contention sensitive (21.47--23.14 s in the same measurement), but it
+    terminates with a named refusal instead of hanging silently.
+
+    Every hit is confirmed present via :func:`_is_repo_on_disk` before it is
+    returned; see there for why a bare registry entry is not proof.
+
+    Used ONLY as a positive: a path Git lists AND that is a repository on disk
+    really is a nested repository, so finding one is proof. The converse does
+    not hold and must not be inferred -- a repo a worker cloned by hand is in
+    neither registry (measured: these two registries account for 47 of the 813
+    repositories recorded for t_f5ebd9db), which is why this supplements the
+    walk's refusal rather than replacing the walk.
+    """
+    if not (workspace / ".git").exists():
+        return []
+    nested = []
+    listing = _git(workspace, "worktree", "list", "--porcelain", check=False)
+    if listing.returncode == 0:
+        for line in listing.stdout.decode("utf-8", "replace").splitlines():
+            if not line.startswith("worktree "):
+                continue
+            try:
+                path = Path(line[len("worktree "):]).resolve()
+            except OSError:
+                continue
+            if path != workspace and path.is_relative_to(workspace) and _is_repo_on_disk(path):
+                nested.append(path)
+    index = _git(workspace, "ls-files", "--stage", check=False)
+    if index.returncode == 0:
+        for line in index.stdout.decode("utf-8", "replace").splitlines():
+            meta, _, path = line.partition("\t")
+            if meta.split(" ", 1)[0] == "160000" and path and _is_repo_on_disk(workspace / path):
+                nested.append(workspace / path)
+    return nested
 
 
 def _state(conn, task_id):
@@ -244,7 +423,18 @@ def record_baseline(conn, task_id, workspace):
         return
     bases, held, survivor = _state(conn, task_id)
     workspace = Path(workspace)
-    for repo in _repos(workspace):
+    try:
+        discovered = _repos(workspace)
+    except SurvivorUnavailable as exc:
+        # This runs at dispatch, before the worker exists. A refusal here would
+        # make the card UNSPAWNABLE -- the same failure mode the EACCES skip
+        # exists to avoid (2026-09-20, `var/skills-portal/caddy`). An empty
+        # `bases` is the honest record for a tree we could not enumerate, and it
+        # costs no survivor: `preserve` re-enumerates at completion under the
+        # same budget and fails closed there, where there is a run to hold.
+        log.warning("kanban survivor: baseline skipped for %s: %s", task_id, exc)
+        discovered = []
+    for repo in discovered:
         key = str(repo.relative_to(workspace))
         if key not in bases:
             head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
@@ -944,15 +1134,47 @@ def _loose_files(workspace, repos):
     A remote ref vouches only for the repositories it was resolved from; files
     beside them (notes, scripts, a tarball) are captured by nothing, so an
     inferred survivor must never trade them for a delete.
+
+    Bounded by the same budget as `_repos` for the same reason, and pruned by
+    the same derived-directory set -- a `node_modules` tree is not evidence a
+    survivor has to vouch for, and descending into one is what made this walk
+    unbounded.
     """
-    for root, dirs, files in os.walk(workspace, followlinks=False):
-        here = Path(root)
+    budget = _walk_budget()
+    visited = 0
+    stack = [Path(workspace)]
+    while stack:
+        here = stack.pop()
+        visited += 1
+        if visited > budget:
+            raise _over_budget("loose-file scan", workspace, visited, budget)
         if here in repos:
-            dirs[:] = []
             continue
-        if files or any((here / d).is_symlink() for d in dirs):
+        try:
+            with os.scandir(here) as it:
+                entries = list(it)
+        except PermissionError as exc:
+            log.warning("kanban survivor: skipping unreadable dir %s (%s)", here, exc.strerror)
+            continue
+        children = []
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                # Unreadable metadata cannot be classified as "no evidence".
+                return True
+            if entry.is_symlink():
+                # A symlink is an entry no repository's ref vouches for. The
+                # previous form reported it via `is_symlink` on the child; the
+                # scandir form has to test it before the directory branch, or a
+                # symlink to a directory would be silently skipped.
+                return True
+            if is_dir:
+                if entry.name not in _DERIVED_DIRS:
+                    children.append(Path(entry.path))
+                continue
             return True
-        dirs[:] = sorted(d for d in dirs if not (here / d).is_symlink())
+        stack.extend(children)
     return False
 
 
@@ -1239,6 +1461,22 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 )
             return None
         workspace = workspace.resolve(strict=True)
+        # Git's registries answer "is there a nested repository here" in O(refs).
+        # For the `dir`-workspace-rooted-at-a-home shape this is the whole fix:
+        # that tree ALWAYS reaches the nested-repository refusal below, so the
+        # walk spent 227 s (measured on ~/.hermes: 850,853 directories) deriving
+        # a verdict Git could state in 1.2 s. Asking first turns a silent hang
+        # into an immediate, legible refusal.
+        #
+        # Only a positive short-circuits: the absence of a registered nested
+        # repo proves nothing (a hand-made clone is in neither registry), so
+        # that case falls through to the bounded walk exactly as before.
+        registered = _registered_nested(workspace)
+        if registered:
+            raise SurvivorUnavailable(
+                "survivor_unavailable: nested repository requires separate recovery "
+                f"({str(registered[0].relative_to(workspace))})"
+            )
         repos = _repos(workspace)
         if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
             # A patch cannot add a gitlink and files below the same path.
