@@ -40,6 +40,7 @@ operations and stay allowed.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -1925,6 +1926,56 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
     return text, False
 
 
+def _mask_read_only_python_paths(body: str) -> str:
+    """Exclude only literal Path(...).read_* data reads from the shell walk.
+
+    Unknown Python expressions retain the conservative referenced-script scan.
+    A path handed to os.system/subprocess remains visible to that scan.
+    """
+    if not body.isascii():  # AST columns are UTF-8 byte offsets; fail closed.
+        return body
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return body
+    if not any(
+        isinstance(node, ast.ImportFrom) and node.module == "pathlib"
+        and any(alias.name == "Path" and alias.asname is None for alias in node.names)
+        for node in ast.walk(tree)
+    ) or any(
+        (isinstance(node, ast.Name) and node.id == "Path" and isinstance(node.ctx, ast.Store))
+        or (isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == "Path")
+        or (isinstance(node, ast.arg) and node.arg == "Path")
+        or (isinstance(node, ast.ImportFrom) and node.module != "pathlib"
+            and any(alias.asname == "Path" or alias.name == "Path" for alias in node.names))
+        for node in ast.walk(tree)
+    ):
+        return body
+    lines = body.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    spans = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in {"read_text", "read_bytes"}:
+            continue
+        path_call = node.func.value
+        if not (isinstance(path_call, ast.Call) and isinstance(path_call.func, ast.Name)
+                and path_call.func.id == "Path" and len(path_call.args) == 1
+                and isinstance(path_call.args[0], ast.Constant)
+                and isinstance(path_call.args[0].value, str)
+                and path_call.end_lineno is not None and path_call.end_col_offset is not None):
+            continue
+        start = offsets[path_call.lineno - 1] + path_call.col_offset
+        end = offsets[path_call.end_lineno - 1] + path_call.end_col_offset
+        spans.append((start, end))
+    for start, end in sorted(spans, reverse=True):
+        body = body[:start] + "read_only_path" + body[end:]
+    return body
+
+
 def _contains_unsafe_gateway_action(
     command: str,
     *,
@@ -1946,10 +1997,14 @@ def _contains_unsafe_gateway_action(
     # Python stdin is executable Python source, but not a sequence of shell
     # commands. Scan its lifecycle-shaped calls like a .py file, then exclude
     # its path strings from the shell's referenced-script walk.
-    for body in inert_python_heredoc_bodies(command):
+    python_bodies = inert_python_heredoc_bodies(command)
+    for body in python_bodies:
         if _direct_lifecycle_scan(body):
             return True
     shell_command = strip_inert_heredoc_bodies(command)
+    referenced_command = shell_command + "\n" + "\n".join(
+        _mask_read_only_python_paths(body) for body in python_bodies
+    )
 
     for payload in _iter_shell_command_payloads(shell_command):
         if _contains_unsafe_gateway_action(
@@ -1961,7 +2016,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(shell_command, cwd=cwd):
+    for script_path in _iter_referenced_shell_scripts(referenced_command, cwd=cwd):
         # Do not touch a FileProvider path even to discover whether the file
         # is hydrated. The lexical check covers direct cloud paths; the
         # resolved check below covers local launchers that are symlinks into

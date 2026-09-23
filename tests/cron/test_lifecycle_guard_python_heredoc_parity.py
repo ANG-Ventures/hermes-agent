@@ -54,3 +54,23 @@ def test_sibling_gateway_in_python_heredoc_uses_label_aware_rules(monkeypatch, t
     body = "import subprocess\nsubprocess.run(['launchctl', 'bootout', 'system/ai.hermes.gateway'])\n"
     heredoc, _ = _forms(tmp_path, body)
     assert not guard(heredoc, cwd=str(tmp_path))
+
+
+def test_python_heredoc_executing_referenced_script_stays_blocked(tmp_path):
+    script = tmp_path / "restart.sh"
+    script.write_text("hermes gateway " + "re" + "start\n")
+    body = f"import os\nos.system('{script}')\n"
+    heredoc, _ = _forms(tmp_path, body)
+    assert guard(heredoc, cwd=str(tmp_path))
+
+
+def test_shadowed_path_name_cannot_hide_executed_script(tmp_path):
+    script = tmp_path / "restart.sh"
+    script.write_text("hermes gateway " + "re" + "start\n")
+    body = (
+        "from pathlib import Path\n"
+        "Path = lambda value: __import__('os').system(value)\n"
+        f"Path('{script}').read_text()\n"
+    )
+    heredoc, _ = _forms(tmp_path, body)
+    assert guard(heredoc, cwd=str(tmp_path))
