@@ -353,6 +353,7 @@ class TestDefaultContextLengths:
              mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
              mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
             one_m = (
+                "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-sonnet-5",
                 "claude-fable-5",
@@ -453,6 +454,8 @@ class TestDefaultContextLengths:
         from unittest.mock import patch as mock_patch
 
         frontier = [
+            "claude-opus-5-5",
+            "claude-opus-5-5-fast",
             "claude-opus-5",
             "claude-opus-5-fast",
             "claude-sonnet-5",
