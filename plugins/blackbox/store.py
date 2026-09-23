@@ -178,6 +178,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- SEARCH, identical 653 rows.
         -- (turns indexes are created AFTER the additive column migration below,
         -- guarded on the indexed columns existing -- see _ensure_turn_indexes.)
+        -- DO NOT MERGE (t_6bab531f CI demo): #905's original ordering.
+        CREATE INDEX IF NOT EXISTS idx_blackbox_turns_ts_start
+            ON turns(ts_start);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_ts
             ON turn_api_calls(ts);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
