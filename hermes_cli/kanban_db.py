@@ -6669,13 +6669,25 @@ def reassign_task(
                 f"inspect task {task_id}"
             )
             return False
-    # assign_task handles its own txn + the still-running guard.
+    # assign_task handles its own txn + the still-running guard. After a
+    # committed reclaim, *any* assign failure must preserve that receipt;
+    # even its post-commit observer can raise after assignment landed.
     try:
         return assign_task(conn, task_id, profile)
-    except RuntimeError:
-        # Task is still running and reclaim_first was False; caller
-        # needs to decide whether to retry with reclaim.
-        return False
+    except BaseException as exc:  # noqa: BLE001 - post-reclaim receipt boundary
+        if receipt is not None and receipt.get("reclaimed"):
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                f"cannot reassign {task_id}: currently running (claimed)."
+            ):
+                # A new claim raced the assign; do not repeat assign_task's
+                # advice to reclaim it (that now belongs to another worker).
+                return False
+            receipt["assign_error"] = f"{exc.__class__.__name__}: {exc or 'no detail'}"
+            return False
+        if isinstance(exc, RuntimeError):
+            # Existing still-running refusal without a reclaim.
+            return False
+        raise
 
 
 def _verify_created_cards(

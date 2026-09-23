@@ -534,6 +534,81 @@ def test_reassign_reclaim_exception_is_named_not_swallowed(kanban_home, monkeypa
     assert _assignment(task_id)[2] == "worker"
 
 
+def test_reassign_reports_committed_reclaim_when_assign_hits_sqlite_lock(
+    kanban_home, monkeypatch,
+):
+    task_id = _create("locked assign", "worker-a")
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, task_id, claimer="probe")
+    original = kb.reclaim_task
+    holders = []
+
+    def lock_after_reclaim(conn, tid, **kwargs):
+        result = original(conn, tid, **kwargs)
+        assert result
+        conn.execute("PRAGMA busy_timeout=75")
+        other = kb.connect()
+        other.execute("BEGIN IMMEDIATE")
+        holders.append(other)
+        return result
+
+    monkeypatch.setattr(kb, "reclaim_task", lock_after_reclaim)
+    try:
+        out = kc.run_slash(f"reassign {task_id} worker-b --reclaim")
+    finally:
+        for holder in holders:
+            holder.rollback()
+            holder.close()
+    assert task_id in out and "WAS reclaimed" in out
+    assert "database is locked" in out
+    assert "not reassigned" not in out.lower()  # post-commit observer may have raised
+    assert _route(task_id)[0] == "ready"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.assignee == "worker-a"
+
+
+def test_reassign_reclaim_race_does_not_claim_card_is_no_longer_running(
+    kanban_home, monkeypatch,
+):
+    task_id = _create("new claim", "worker-a")
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, task_id, claimer="old")
+    original = kb.reclaim_task
+
+    def claim_after_reclaim(conn, tid, **kwargs):
+        result = original(conn, tid, **kwargs)
+        assert result
+        with kb.connect() as other:
+            assert kb.claim_task(other, tid, claimer="new")
+        return result
+
+    monkeypatch.setattr(kb, "reclaim_task", claim_after_reclaim)
+    out = kc.run_slash(f"reassign {task_id} worker-b --reclaim")
+    assert task_id in out and "WAS reclaimed" in out
+    assert "no longer running" not in out and "retry without" not in out
+    assert "reclaim the stale lock" not in out
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "running"
+
+
+def test_reassign_reports_uncertain_assignment_after_post_commit_observer_error(
+    kanban_home, monkeypatch,
+):
+    task_id = _claimed("observer")
+
+    def observer_failed(conn, tid, fields):
+        raise ValueError("observer failed")
+
+    monkeypatch.setattr(kb, "notify_task_updated", observer_failed)
+    out = kc.run_slash(f"reassign {task_id} worker-b --reclaim")
+    assert task_id in out and "WAS reclaimed" in out
+    assert "ValueError: observer failed" in out
+    assert "may have changed" in out
+    assert _assignment(task_id) == ("ready", None, "worker-b")
+
+
 def test_reassign_reclaim_success_control(kanban_home):
     """Control: the happy path still reassigns and reports the reclaim."""
     task_id = _claimed("victim")

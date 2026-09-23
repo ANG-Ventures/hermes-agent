@@ -2618,8 +2618,8 @@ def _run_batch_reclaims(
             continue
         if not redispatched and was_claimed:
             errors[task.id] = (
-                "card was claimed at selection but is no longer reclaimable "
-                "(status changed after selection)"
+                "prior claim was not reclaimed (card changed after selection; "
+                "it may be claimed again — inspect current status)"
             )
         applied.append((task.id, redispatched))
     return applied, errors
@@ -3176,10 +3176,16 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             )
             return 1
         if reclaimed:
+            detail = (
+                f"; assign failed ({receipt['assign_error']}); assignment outcome "
+                "may have changed — inspect the card"
+                if receipt.get("assign_error") else
+                "; assign refused (the card may have been claimed again) — "
+                "inspect the current status before retrying"
+            )
             print(
-                f"kanban: {args.task_id}: claim WAS reclaimed (the worker was "
-                "signalled) but the reassign was refused — the card is no "
-                "longer running; re-run the reassign without --reclaim",
+                f"kanban: {args.task_id}: claim WAS reclaimed (the prior "
+                f"worker was signalled){detail}",
                 file=sys.stderr,
             )
             return 1

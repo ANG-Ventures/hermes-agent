@@ -1438,13 +1438,19 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                                 entry.update(
                                     ok=False,
                                     error=(
-                                        "assign refused"
+                                        f"assign refused for {tid}"
                                         + (
                                             f"; reclaim failed: "
                                             f"{reassign_receipt['reclaim_error']}"
                                             if reassign_receipt.get("reclaim_error")
                                             else (
-                                                "; claim WAS reclaimed (worker signalled)"
+                                                "; claim WAS reclaimed (prior worker signalled)"
+                                                + (
+                                                    f"; assign failed ({reassign_receipt['assign_error']}); "
+                                                    "assignment outcome may have changed — inspect card"
+                                                    if reassign_receipt.get("assign_error") else
+                                                    "; card may have been claimed again — inspect status"
+                                                )
                                                 if reassign_receipt.get("reclaimed")
                                                 else ""
                                             )
@@ -1941,12 +1947,18 @@ def reassign_task_endpoint(
                     ),
                 )
             if receipt.get("reclaimed"):
+                detail = (
+                    f"; assign failed ({receipt['assign_error']}); assignment "
+                    "outcome may have changed — inspect the card"
+                    if receipt.get("assign_error") else
+                    "; assign refused (card may have been claimed again) — "
+                    "inspect current status before retrying"
+                )
                 raise HTTPException(
                     status_code=409,
                     detail=(
                         f"cannot reassign {task_id}: the claim WAS reclaimed "
-                        "(worker signalled) but the reassign was refused; the "
-                        "card is no longer running — retry without reclaim_first"
+                        f"(prior worker signalled){detail}"
                     ),
                 )
             raise HTTPException(
