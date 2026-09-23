@@ -1991,7 +1991,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -2042,6 +2042,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    budget_cache=budget_cache,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -2092,6 +2093,10 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             out: list[tuple[str, "Optional[object]"]] = []
+            # One budget cache per TICK, shared across boards: the per-profile
+            # turn ledgers are the same files for every board, so without this
+            # an N-board host re-reads every ledger N times per tick.
+            budget_cache: dict = {}
             # Enumeration extent spans the whole per-board tick body, not just
             # the fingerprint's path resolve: `_tick_once_for_board` also calls
             # `connect(board=slug)`, which re-resolves internally. Scoping only
@@ -2099,7 +2104,7 @@ class GatewayKanbanWatchersMixin:
             # warnings that then silenced later single-board misreadings.
             for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
+                out.append((slug, _tick_once_for_board(slug, budget_cache)))
             return out
 
         def _ready_nonempty() -> bool:
