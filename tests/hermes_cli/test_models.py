@@ -434,6 +434,42 @@ class TestClaudeSonnet5InCuratedLists:
         assert "claude-sonnet-5" in _PROVIDER_MODELS["anthropic"]
 
 
+class TestClaudeOpus55InCuratedLists:
+    """claude-opus-5-5 (2026-09-22) must be pickable in every curated list.
+
+    Behaviour contract, not a snapshot: the picker surfaces exactly these
+    lists, so an id missing here is an id a user cannot select. opus-5 must
+    survive alongside it (this is an ADD, not a replace), and 5.5 leads the
+    Opus group so the newest tier is what the picker offers first.
+    """
+
+    def test_anthropic_native_list_includes_opus_5_5_above_opus_5(self):
+        from hermes_cli.models import _PROVIDER_MODELS
+        lst = _PROVIDER_MODELS["anthropic"]
+        assert "claude-opus-5-5" in lst
+        assert "claude-opus-5" in lst
+        assert lst.index("claude-opus-5-5") < lst.index("claude-opus-5")
+
+    def test_nous_list_includes_opus_5_5_above_opus_5(self):
+        from hermes_cli.models import _PROVIDER_MODELS
+        lst = _PROVIDER_MODELS["nous"]
+        assert "anthropic/claude-opus-5-5" in lst
+        assert "anthropic/claude-opus-5" in lst
+        assert lst.index("anthropic/claude-opus-5-5") < lst.index(
+            "anthropic/claude-opus-5"
+        )
+
+    def test_openrouter_snapshot_includes_opus_5_5_and_its_fast_sku(self):
+        from hermes_cli.models import OPENROUTER_MODELS
+        ids = [mid for mid, _ in OPENROUTER_MODELS]
+        assert "anthropic/claude-opus-5-5" in ids
+        assert "anthropic/claude-opus-5-5-fast" in ids
+        assert "anthropic/claude-opus-5" in ids
+        assert ids.index("anthropic/claude-opus-5-5") < ids.index(
+            "anthropic/claude-opus-5"
+        )
+
+
 class TestFormatPricePerMtok:
     """_format_price_per_mtok: sub-cent prices must not collapse to 'free'/'$0.00'."""
 
