@@ -118,6 +118,64 @@ def test_landed_covers_all_recorded_repositories_with_independent_live_trees(boa
     assert not ws.exists()
 
 
+@pytest.mark.parametrize("unbound", [False, True], ids=["bound-reclaims", "unbound-holds"])
+def test_landed_missing_repo_explicit_rescue_requires_bound_ref_for_cleanup(
+    board, tmp_path, monkeypatch, unbound,
+):
+    """A vanished recorded repo needs its own authority at completion AND reclamation."""
+    import hermes_cli.kanban_survivor as survivor_mod
+
+    tid = kb.create_task(board, title="missing child with explicit rescue")
+    task = kb.get_task(board, tid)
+    assert task is not None
+    ws = kb.resolve_workspace(task)
+    child = init(ws / "a")
+    commit(child, "lost_impl.py", "unpublished child bytes\n", "implementation")
+    kb.set_workspace_path(board, tid, ws)
+    survivor_mod.record_baseline(board, tid, ws)
+    assert set(survivor_mod._state(board, tid)[0]) == {"a"}
+
+    shutil.rmtree(child / ".git")
+    init(ws)
+    commit(ws, ".gitignore", "a/\n", "ignore child")
+    sha = commit(ws, "replacement.txt", "replacement\n", "replacement")
+    live = tmp_path / "live-replacement"
+    git(tmp_path, "clone", "--no-local", str(ws), str(live))
+    assert not (live / "a" / "lost_impl.py").exists()
+    assert git(ws, "status", "--porcelain", "--untracked-files=all") == ""
+
+    real_run = subprocess.run
+
+    def remote_pr(args, **kwargs):
+        if args[0] == "gh":
+            payload = {"state": "OPEN", "headRefOid": "a1" * 20,
+                       "mergeCommit": None, "headRefName": f"operator/{tid}-landed",
+                       "title": "", "body": ""}
+            return subprocess.CompletedProcess(args, 0, json.dumps(payload).encode(), b"")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", remote_pr)
+    assert kb.complete_task(board, tid, metadata={
+        "changed_files": ["a/lost_impl.py", "replacement.txt"],
+        "landed": [{"repo_path": str(live), "sha": sha}],
+    }, survivor_pr="example/project#68", survivor_unbound=unbound)
+    run = kb.latest_run(board, tid)
+    assert run is not None and run.metadata is not None
+    receipt = run.metadata["survivor"]
+    assert receipt["kind"] == "landed"
+    assert len(receipt["refs"]) == 1
+    assert receipt["refs"][0]["repository"] == "a"
+    assert bool(receipt["refs"][0].get("unbound")) is unbound
+    if unbound:
+        assert ws.exists()
+        assert (child / "lost_impl.py").read_text() == "unpublished child bytes\n"
+        held = survivor_mod._state(board, tid)[1]
+        assert held is not None and "recorded repository missing" in held
+    else:
+        assert not ws.exists()
+        assert survivor_mod._state(board, tid)[1] is None
+
+
 @pytest.fixture
 def board(tmp_path, monkeypatch):
     import hermes_cli.kanban_survivor as survivor
