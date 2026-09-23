@@ -490,18 +490,37 @@ def test_missing_or_corrupt_ledger_fails_open(tmp_path, monkeypatch):
     assert read_planned_restart(None, tmp_path) is None
 
 
-def test_planned_watchdog_exit_produces_no_notice():
-    """The 2026-09-21 20:48 shape: SIGTERM from our own safe-restart, 30 s drain
-    timed out on 5+ live turns, shutdown watchdog fired (exit 1). Genuinely
-    unclean from the process's view, but REQUESTED — nothing to explain."""
+def test_planned_watchdog_exit_names_who_and_how():
+    """The 2026-09-21 20:48 shape: SIGTERM from our own safe-restart, drain timed
+    out, shutdown watchdog fired (exit 1). Unclean from the process's view but
+    REQUESTED. 2026-09-22 Ace: "can we get a notification in chat if it's related
+    to a safe restart or what caused this freeze?" — so ONE line naming the
+    initiator and the mechanism, not silence and not the crash phrasing."""
     sentinel = dict(_WATCHDOG_SENTINEL, prior_exit_code=1,
                     prior_exit_reason="shutdown_watchdog")
     verdict = classify_prior_life(
-        sentinel, planned={"event": "kickstart", "initiator_profile": "aegis"}
+        sentinel, planned={"event": "kickstart", "initiator_profile": "aegis",
+                           "detail": "kickstart -k"}
     )
     assert verdict.unclean is True          # the FACT is preserved
     assert verdict.planned is True
-    assert format_restart_notice(verdict) is None   # but no notice is owed
+    msg = format_restart_notice(verdict)
+    assert msg is not None
+    assert "by aegis" in msg and "kickstart -k" in msg and "planned" in msg, msg
+    assert "UNPLANNED" not in msg and "exit 1" not in msg and "watchdog" not in msg, msg
+    assert "\n" not in msg and len(msg) < 200, msg
+
+
+def test_planned_and_unplanned_notices_are_one_family():
+    """Same shape, different verdict word — a reader learns one format."""
+    sentinel = dict(_WATCHDOG_SENTINEL, prior_exit_code=1, prior_exit_reason="shutdown_watchdog")
+    planned = format_restart_notice(classify_prior_life(
+        sentinel, planned={"event": "kickstart", "initiator_profile": "deploy"}))
+    unplanned = format_restart_notice(classify_prior_life(sentinel, planned=None))
+    assert planned and unplanned
+    assert planned.startswith("\U0001f504 Restarted") and unplanned.startswith("\u26a0\ufe0f Restarted")
+    assert "planned" in planned and "UNPLANNED" in unplanned
+    assert unplanned.endswith("resuming where I left off.") and planned.endswith("resuming where I left off.")
 
 
 def test_unplanned_watchdog_exit_still_notifies():

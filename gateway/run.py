@@ -12721,10 +12721,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Tell the user the truth: a restart happened and recovery is
             # running. The generic "Interrupting current task" ack hid both
             # facts (2026-07-10).
+            # ONE restart message per boot, and it is the boot notice
+            # (fork_ext.unclean_restart_notice: names who restarted us and
+            # why, planned or not). This ack must not re-announce the restart
+            # — 2026-09-22 Ace saw "I was restarted", "Gateway restarted —
+            # resuming", and the watcher's line for the same bounce and
+            # asked to consolidate. Say only what is NEW here: queued.
             message = (
-                f"🔄 Gateway restarted — I'm resuming the work that was "
-                f"interrupted{status_detail}. Your message is queued and "
-                f"folds in right after (use /stop to cancel the recovery)."
+                f"⏳ Still finishing the interrupted work{status_detail} — "
+                f"your message is queued and folds in right after "
+                f"(use /stop to cancel the recovery)."
             )
         elif is_queue_mode and demoted_for_compression:
             message = (
@@ -14942,12 +14948,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             verdict = self._prior_life_verdict()
             message = format_restart_notice(verdict)
             if not message:
-                if verdict.unclean and verdict.planned:
-                    logger.info(
-                        "PHASE=unclean_restart_notice_suppressed key=%s reason=%s planned_by=%s",
-                        session_key, verdict.exit_reason or verdict.killer or "unclean",
-                        verdict.planned_by or "safe-restart",
-                    )
                 return
             # Idempotent per (boot, session): a re-scheduled resume or a crash
             # loop must not spam the channel. The claim does an atomic rename,
@@ -14982,9 +14982,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     str(source.chat_id), message, metadata=metadata
                 )
                 logger.warning(
-                    "PHASE=unclean_restart_notice key=%s reason=%s",
+                    "PHASE=restart_notice key=%s reason=%s planned=%s by=%s",
                     session_key,
                     verdict.exit_reason or verdict.killer or "unclean",
+                    verdict.planned, verdict.planned_by or "-",
                 )
         except Exception as exc:
             # Never let a transport failure eat the resumed turn.

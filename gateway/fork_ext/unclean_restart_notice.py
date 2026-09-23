@@ -90,6 +90,7 @@ class PriorLifeVerdict:
     site: Optional[str] = None
     planned: bool = False          # a safe-restart we REQUESTED explains the death
     planned_by: Optional[str] = None
+    planned_detail: Optional[str] = None   # ledger `detail` (e.g. 'kickstart -k', 'full-reload')
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -151,6 +152,7 @@ def classify_prior_life(
             site=site if isinstance(site, str) and site else None,
             planned=bool(planned),
             planned_by=_as_str((planned or {}).get("initiator_profile")) if planned else None,
+            planned_detail=_as_str((planned or {}).get("detail")) if planned else None,
         )
     except Exception:  # pragma: no cover - classification is fail-quiet
         logger.debug("Prior-life classification failed", exc_info=True)
@@ -204,17 +206,20 @@ def format_restart_notice(verdict: PriorLifeVerdict) -> Optional[str]:
     if not verdict.unclean:
         return None
     if verdict.planned:
-        # A death our own safe-restart caused (drain timed out on live
-        # turns -> shutdown watchdog) is a REQUESTED bounce. The resumed turn
-        # runs either way; the "I was restarted" line would only read as a
-        # crash loop (2026-09-21: 4 channels x 3 bounces = "restarted twice?").
-        return None
+        # A death our own safe-restart caused. 2026-09-22 22:5x, Ace: "can we get a
+        # notification in chat if it's related to a safe restart or what caused this
+        # freeze?" — silence read as a mystery freeze. So: ONE short line that names
+        # the initiator and the mechanism, no "resuming" scare-phrasing, no exit code.
+        who = verdict.planned_by or "fleet"
+        how = (verdict.planned_detail or "safe-restart").strip()
+        when = _local_hhmm(verdict.ended_at)
+        head = "\U0001f504 Restarted%s by %s (%s)" % ((" at %s" % when) if when else "", who, how)
+        return head + " — planned; resuming where I left off."
     when = _local_hhmm(verdict.ended_at)
-    head = ("\u26a0\ufe0f I was restarted at %s" % when) if when else "\u26a0\ufe0f I was restarted"
+    head = ("\u26a0\ufe0f Restarted at %s" % when) if when else "\u26a0\ufe0f Restarted"
     cause = _cause_phrase(verdict)
-    if cause:
-        head += " (%s)" % cause
-    return head + " and am resuming your last request."
+    head += " — UNPLANNED (%s)" % cause if cause else " — UNPLANNED"
+    return head + "; resuming where I left off."
 
 
 # --------------------------------------------------------------------------
