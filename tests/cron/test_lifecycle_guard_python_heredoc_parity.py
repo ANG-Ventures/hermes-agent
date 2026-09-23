@@ -34,6 +34,64 @@ def test_read_only_python_heredoc_does_not_execute_the_log_it_reads(tmp_path):
     assert not guard(heredoc, cwd=str(tmp_path))
 
 
+def test_chained_sql_reads_and_original_open_loop_match_file_verdict(tmp_path):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = (
+        "import json,subprocess\n"
+        "rows=subprocess.run(['sudo','-n','sqlite3',"
+        f"'file:{tmp_path / 'reviews.sqlite3'}?mode=ro','select count(*) from reviews;'],"
+        "capture_output=True,text=True).stdout.split()\n"
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    try: d=json.loads(line)\n"
+        "    except: continue\n"
+        "    if d.get('type')!='intake': continue\n"
+        "    print(d)\n"
+    )
+    heredoc, file_command = _forms(tmp_path, body)
+    chain = (
+        f"DB={tmp_path / 'reviews.sqlite3'}; echo '== running now'; "
+        "echo configured | grep configured; "
+        'sudo -n sqlite3 "file:$DB?mode=ro" "select count(*) from reviews;"; '
+    )
+    assert not guard(chain, cwd=str(tmp_path))
+    assert not guard(file_command, cwd=str(tmp_path))
+    assert not guard(chain + heredoc, cwd=str(tmp_path))
+    assert not guard(heredoc, cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("action", [
+    "subprocess.run(['launchctl', 'bootout', 'system/ai.hermes.gateway'])",
+    "subprocess.run(['kill', '$(pgrep -f hermes-gateway)'])",
+    "subprocess.run(['systemctl', 'stop', 'hermes-gateway'])",
+    "__import__('os').system('/tmp/restart.sh')",
+])
+def test_chained_python_heredoc_keeps_executable_actions_visible(tmp_path, action):
+    script = tmp_path / "restart.sh"
+    script.write_text("hermes gateway " + "restart\n")
+    body = f"import subprocess\n{action.replace('/tmp/restart.sh', str(script))}\n"
+    heredoc, _ = _forms(tmp_path, body)
+    assert guard("echo ok; " + heredoc, cwd=str(tmp_path))
+
+
+def test_read_log_as_executable_python_remains_blocked(tmp_path):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    heredoc, _ = _forms(tmp_path, f"exec(open('{log}').read())\n")
+    assert guard("echo ok; " + heredoc, cwd=str(tmp_path))
+
+
+def test_read_log_loop_executing_lines_remains_blocked(tmp_path):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = (
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    __import__('os').system(line)\n"
+    )
+    heredoc, _ = _forms(tmp_path, body)
+    assert guard("echo ok; " + heredoc, cwd=str(tmp_path))
+
+
 @pytest.mark.parametrize(
     "body",
     [

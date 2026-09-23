@@ -278,7 +278,9 @@ def _find_heredoc_close(
         cursor = after
 
 
-def _inert_heredoc_ranges(command: str) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+def _inert_heredoc_ranges(
+    command: str, *, python_semicolon_chain: bool = False
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """Return safely masked ranges and the subset fed to Python.
 
     See the module docstring for the qualification rules. On ANY ambiguity
@@ -335,9 +337,25 @@ def _inert_heredoc_ranges(command: str) -> tuple[list[tuple[int, int]], list[tup
         if unterminated:
             return [], []
 
-        if all(quoted for _delimiter, _strip_tabs, quoted in specs) and not has_list_operator:
+        if all(quoted for _delimiter, _strip_tabs, quoted in specs):
             masked_opener = _mask_simple_quotes(command[command_start:command_end])
-            consumer_match = _INERT_HEREDOC_CONSUMER_RE.search(masked_opener)
+            consumer_opener = masked_opener
+            if has_list_operator and python_semicolon_chain and len(specs) == 1:
+                # The last command alone owns this stdin; earlier semicolon
+                # commands remain visible to the lifecycle scanner. Pipes and
+                # background/conditional operators cannot be split this way.
+                if ";" in masked_opener:
+                    last_command = masked_opener.rsplit(";", 1)[-1]
+                    if not any(c in last_command for c in "|&"):
+                        consumer_opener = last_command
+            consumer_match = _INERT_HEREDOC_CONSUMER_RE.search(consumer_opener)
+            if has_list_operator and (
+                not python_semicolon_chain or consumer_opener == masked_opener
+                or not consumer_match or not re.search(
+                    r"(?i)python(?:3(?:\.\d+)*)?$", consumer_match.group(0)
+                )
+            ):
+                consumer_match = None
             if not _contains_nested_shell_scope(masked_opener) and consumer_match:
                 ranges.extend(body_ranges)
                 consumer = consumer_match.group(0)
@@ -348,15 +366,23 @@ def _inert_heredoc_ranges(command: str) -> tuple[list[tuple[int, int]], list[tup
     return ranges, python_ranges
 
 
-def inert_python_heredoc_bodies(command: str) -> tuple[str, ...]:
+def inert_python_heredoc_bodies(
+    command: str, *, semicolon_chain: bool = False
+) -> tuple[str, ...]:
     """Return safely bounded Python stdin source, not shell commands."""
-    _ranges, python_ranges = _inert_heredoc_ranges(command)
+    _ranges, python_ranges = _inert_heredoc_ranges(
+        command, python_semicolon_chain=semicolon_chain
+    )
     return tuple(command[start:end] for start, end in python_ranges)
 
 
-def strip_inert_heredoc_bodies(command: str) -> str:
+def strip_inert_heredoc_bodies(
+    command: str, *, python_semicolon_chain: bool = False
+) -> str:
     """Mask heredoc bodies that are provably inert data; keep the rest."""
-    ranges, _python_ranges = _inert_heredoc_ranges(command)
+    ranges, _python_ranges = _inert_heredoc_ranges(
+        command, python_semicolon_chain=python_semicolon_chain
+    )
     if not ranges:
         return command
     # Single-pass rebuild: ranges are sorted and non-overlapping, so join the
