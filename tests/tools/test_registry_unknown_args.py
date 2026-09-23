@@ -59,13 +59,15 @@ def test_delegate_task_is_registered_strict():
 
 
 def test_delegate_task_legacy_single_goal_shape_is_not_rejected():
-    """Legacy fields remain accepted while model policy fields are advertised."""
+    """The schema omits goal/context/role on purpose (legacy shape); strict mode must
+    still accept them — only a genuinely unknown key is rejected."""
     import tools.delegate_tool  # noqa: F401
     from tools.registry import registry
     entry = registry.get_entry("delegate_task")
     props = set(entry.schema["parameters"]["properties"]) | set(entry.extra_accepted_args)
-    for k in (
-        "goal", "context", "role", "tasks", "background", "skills",
-        "model", "provider", "firepower_reason",
-    ):
+    for k in ("goal", "context", "role", "tasks", "background", "skills"):
         assert k in props, k
+    assert {"model", "provider", "allow_flagship_reason"} <= props
+    assert "unknown_route_option" not in props
+    rejected = registry.dispatch("delegate_task", {"goal": "x", "unknown_route_option": True})
+    assert "unknown argument(s) ['unknown_route_option']" in str(rejected)

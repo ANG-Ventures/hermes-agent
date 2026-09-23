@@ -76,7 +76,17 @@ def compute_turn_cost(
             + _int_value(call.get("cache_write_tokens"))
         )
 
-    if all(_billed_tokens(call) == 0 for call in pricing_calls):
+    # UNKNOWN != 0: a call with any unmeasured token bucket has not been
+    # shown to be costless, so it can never take the priced_zero fast path (its
+    # zeroes are absence of data, not evidence of no spend).
+    def _usage_unknown(call: dict) -> bool:
+        from agent.usage_pricing import USAGE_UNKNOWN_FIELDS
+        return any(bool(call.get(key)) for key in USAGE_UNKNOWN_FIELDS)
+
+    if all(
+        _billed_tokens(call) == 0 and not _usage_unknown(call)
+        for call in pricing_calls
+    ):
         return 0.0, "priced_zero", {
             "uncached": 0.0,
             "cache_read": 0.0,
@@ -87,7 +97,12 @@ def compute_turn_cost(
     # A zero-token physical call is concretely $0 even if its route has no
     # pricing entry (for example a failed MoA advisor). It must not make an
     # otherwise fully-priced mixed-model turn look partial.
-    pricing_calls = [call for call in pricing_calls if _billed_tokens(call) > 0]
+    # An UNMEASURED-output call is exempt: its zero is missing data, not a
+    # measured nothing, so dropping it here would erase the unknown.
+    pricing_calls = [
+        call for call in pricing_calls
+        if _billed_tokens(call) > 0 or _usage_unknown(call)
+    ]
 
     known_total = Decimal("0")
     known_count = 0
@@ -107,6 +122,14 @@ def compute_turn_cost(
                 cache_read_tokens=_int_value(call.get("cache_read_tokens")),
                 cache_write_tokens=_int_value(call.get("cache_write_tokens")),
                 reasoning_tokens=_int_value(call.get("reasoning_tokens")),
+                # UNKNOWN != 0: carry the discriminator into pricing so a call
+                # whose output the provider never measured is refused, not
+                # silently priced as if it produced nothing.
+                output_tokens_unknown=bool(call.get("output_tokens_unknown")),
+                input_tokens_unknown=bool(call.get("input_tokens_unknown")),
+                cache_read_tokens_unknown=bool(call.get("cache_read_tokens_unknown")),
+                cache_write_tokens_unknown=bool(call.get("cache_write_tokens_unknown")),
+                usage_unknown=bool(call.get("usage_unknown")),
             )
             result = estimate_usage_cost(
                 call.get("model") or model,

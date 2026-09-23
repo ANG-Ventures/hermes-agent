@@ -221,6 +221,43 @@ _CORE_SMOKE_TESTS = (
 )
 
 
+# A plugin-scoped run also executes every test OUTSIDE tests/plugins/<name>/
+# that references the plugin by module path (``plugins.<name>``) or file path
+# (``plugins/<name>/``). #905 changed plugins/blackbox/store.py, the merge
+# group ran plugin:blackbox (158 tests, green), and main went red on
+# tests/test_request_composition.py — a cross-tree blackbox consumer the
+# scoped matrix never selected. A plugin with more consumers than this is
+# effectively core, so its scope fails open to the full matrix instead of
+# packing hundreds of files into one slice.
+_MAX_PLUGIN_DEPENDENT_TESTS = 60
+
+
+def _plugin_dependent_tests(plugin_name: str, repo_root: Path) -> List[Path]:
+    """Return test files outside ``tests/plugins/<name>/`` that reference the plugin.
+
+    Plain text match, deliberately over-inclusive: a mention in a comment or
+    string selects the file too, which costs one extra file and can never
+    under-test.
+    """
+    name = re.escape(plugin_name)
+    pattern = re.compile(
+        rf"(?<![\w.-])plugins[./]{name}(?![\w-])"
+        rf"|\bfrom\s+plugins\s+import\s+[^\n]*\b{name}\b"
+    )
+    own_root = (repo_root / "tests" / "plugins" / plugin_name).resolve()
+    out: List[Path] = []
+    for path in _discover_files([repo_root / root for root in _DEFAULT_ROOTS]):
+        if path.resolve().is_relative_to(own_root):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if pattern.search(text):
+            out.append(path)
+    return out
+
+
 def _split_pathspec(value: str) -> List[str]:
     """Split a separator-joined path list (``--paths``/``--files``/
     ``HERMES_TEST_PATHS``) into individual paths.
@@ -515,10 +552,12 @@ def _scoped_plugin_matrix(
     self_hosted_slots: int | None = None,
     self_hosted_labels: str = _HOSTED_RUNNER_LABELS,
 ) -> dict[str, list[dict[str, object]]] | None:
-    """Build one plugin slice plus one pinned core-smoke slice.
+    """Build one plugin slice, one pinned core-smoke slice, and — when any
+    test outside the plugin's own tree references it — one dependents slice.
 
-    Invalid scope names, missing plugin tests, or a missing pinned smoke file
-    return ``None`` so the caller can fail open to the full matrix.
+    Invalid scope names, missing plugin tests, a missing pinned smoke file, or
+    more than ``_MAX_PLUGIN_DEPENDENT_TESTS`` cross-tree consumers return
+    ``None`` so the caller can fail open to the full matrix.
     """
     if not scope.startswith("plugin:"):
         return None
@@ -535,8 +574,11 @@ def _scoped_plugin_matrix(
     smoke_files = [repo_root / path for path in _CORE_SMOKE_TESTS]
     if not plugin_files or any(not path.is_file() for path in smoke_files):
         return None
+    dependent_files = _plugin_dependent_tests(plugin_name, repo_root)
+    if len(dependent_files) > _MAX_PLUGIN_DEPENDENT_TESTS:
+        return None
 
-    return {
+    matrix: dict[str, list[dict[str, object]]] = {
         "slice": [
             {
                 "index": 1,
@@ -555,6 +597,18 @@ def _scoped_plugin_matrix(
             },
         ]
     }
+    if dependent_files:
+        matrix["slice"].append(
+            {
+                "index": 3,
+                "name": f"plugin {plugin_name} dependents",
+                "files": ":".join(
+                    _format_file(path, repo_root) for path in dependent_files
+                ),
+                "runs_on": _runs_on_for(3, self_hosted_slots, self_hosted_labels),
+            }
+        )
+    return matrix
 
 
 def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
@@ -1604,7 +1658,8 @@ def main() -> int:
         if scoped_matrix is not None:
             _route_arm_slices(scoped_matrix, args.arm_hosted_slices, repo_root)
             print(
-                f"Test scope: {args.test_scope} + core smoke (2 slices)",
+                f"Test scope: {args.test_scope} + core smoke"
+                f" ({len(scoped_matrix['slice'])} slices)",
                 file=sys.stderr,
             )
             print(json.dumps(scoped_matrix))

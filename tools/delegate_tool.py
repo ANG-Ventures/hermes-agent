@@ -4166,7 +4166,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
-    firepower_reason: Optional[str] = None,
+    allow_flagship_reason: Optional[str] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
@@ -4215,21 +4215,18 @@ def delegate_task(
     provider = str(provider or "").strip() or None
     if provider and not model:
         return tool_error("delegate_task provider requires a model override.")
-    from hermes_cli.model_policy import (
-        firepower_guard_error,
-        format_firepower_audit,
-        is_firepower_model,
-    )
-    guard_error = firepower_guard_error(
-        model, firepower_reason, reason_field="firepower_reason"
-    )
-    if guard_error:
-        return tool_error(guard_error)
-    if model and is_firepower_model(model):
-        logger.info(
-            "delegate_task %s",
-            format_firepower_audit(model, provider, firepower_reason or ""),
-        )
+    audit_reason = None
+    if model:
+        from hermes_cli.model_switch import resolve_model_pair_for_storage
+        from hermes_cli.model_policy import flagship_model_match, validate_worker_model
+
+        model, provider = resolve_model_pair_for_storage(model, provider)
+        try:
+            reason = validate_worker_model(model, allow_flagship_reason=allow_flagship_reason)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        if flagship_model_match(model):
+            audit_reason = reason
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -4292,8 +4289,6 @@ def delegate_task(
         cfg["model"] = model
         if provider:
             cfg["provider"] = provider
-            # A per-call provider must resolve its own endpoint/credentials;
-            # inherited direct-endpoint values belong to the configured lane.
             cfg["base_url"] = ""
             cfg["api_key"] = ""
             cfg["api_mode"] = ""
@@ -4538,6 +4533,11 @@ def delegate_task(
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
+
+    # Record an accepted override only after task validation and child construction.
+    # A rejected or unbuildable request must not leave a success-shaped audit.
+    if audit_reason:
+        logger.info("flagship override: delegate_task model=%s provider=%s reason=%s", model, provider, audit_reason)
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -5743,28 +5743,9 @@ DELEGATE_TASK_SCHEMA = {
                     "can still browse/load ANY skill via skills_list/skill_view."
                 ),
             },
-            "model": {
-                "type": "string",
-                "description": (
-                    "Optional per-call model override. Omit to inherit the "
-                    "configured delegation route. Flagship models require "
-                    "firepower_reason."
-                ),
-            },
-            "provider": {
-                "type": "string",
-                "description": (
-                    "Provider for the per-call model override. Requires model; "
-                    "omit when the model alias/config already resolves it."
-                ),
-            },
-            "firepower_reason": {
-                "type": "string",
-                "description": (
-                    "Required non-empty justification when model selects a "
-                    "flagship/firepower-only family; written to the audit log."
-                ),
-            },
+            "model": {"type": "string", "description": "Optional per-call model override. Flagship models require allow_flagship_reason."},
+            "provider": {"type": "string", "description": "Provider for per-call model override; requires model."},
+            "allow_flagship_reason": {"type": "string", "description": "Nonblank audited justification for an explicit flagship model override (--allow-flagship)."},
         },
         "required": [],
     },
@@ -5838,7 +5819,7 @@ registry.register(
         output_schema=args.get("output_schema"),
         model=args.get("model"),
         provider=args.get("provider"),
-        firepower_reason=args.get("firepower_reason"),
+        allow_flagship_reason=args.get("allow_flagship_reason"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),

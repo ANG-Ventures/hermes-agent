@@ -204,6 +204,138 @@ def _home_thread_from_source(source) -> Optional[str]:
     return str(thread_id)
 
 
+_RESIDENT_UNKNOWN_FLAGS = (
+    "input_tokens_unknown",
+    "output_tokens_unknown",
+    "cache_read_tokens_unknown",
+    "cache_write_tokens_unknown",
+    "usage_unknown",
+)
+
+
+def _resident_thin_snapshot(agent, as_int=None) -> dict:
+    """The resident ``/usage`` lane's thin snapshot, WITH its UNKNOWN flags.
+
+    The five ``session_*`` counters are plain ints: an unmeasured call adds the
+    canonical ``0`` and leaves no trace. Handing the renderer those five keys
+    alone made every UNKNOWN branch dead code on this lane, so a session whose
+    provider returned no usage payload rendered ``Total (billed in+out): 0`` —
+    an unmeasured value presented as a measurement, the exact defect class this
+    work removes (r6 finding 8).
+
+    The discriminators come from the ABSORBING SESSION-LEVEL latch
+    (``agent.session_*_unknown``, set beside the counter increments in
+    ``agent/conversation_loop.py``), NOT from ``agent.last_turn_usage``.
+    ``last_turn_usage`` is rewritten on every provider call, so it carries the
+    last CALL's provenance; stamping it onto a cumulative total was wrong in
+    both directions (r6 round-4 finding 7):
+
+    1. earlier call unmeasured, final call measured → no flag → an exact-looking
+       ``Total (billed in+out): 412,338`` that silently omits real spend, which
+       is finding 8 displaced by one call; and
+    2. final call unmeasured, 99 earlier calls measured → every row collapses to
+       ``unknown``, discarding hundreds of thousands of measured tokens.
+
+    A flag describing an aggregate has to be latched over that same aggregate.
+    """
+    if as_int is None:
+        def _coerce(v):
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+        as_int = _coerce
+
+    snap = {
+        "input_tokens": as_int(getattr(agent, "session_input_tokens", 0)),
+        "output_tokens": as_int(getattr(agent, "session_output_tokens", 0)),
+        "cache_read_tokens": as_int(getattr(agent, "session_cache_read_tokens", 0)),
+        "cache_write_tokens": as_int(getattr(agent, "session_cache_write_tokens", 0)),
+        "reasoning_tokens": as_int(getattr(agent, "session_reasoning_tokens", 0)),
+    }
+    for flag in _RESIDENT_UNKNOWN_FLAGS:
+        # `is True`, not truthiness. The latch is written as a real bool by
+        # `agent/agent_init.py` (False) and `agent/conversation_loop.py` (True),
+        # so any OTHER value means the attribute was never initialised on this
+        # object — and the dominant such object is a test double. A bare
+        # `getattr(..., False)` reads a `MagicMock`'s auto-created child
+        # attribute as TRUTHY, which collapsed every measured session counter to
+        # `unknown` on the resident lane (tests/gateway/test_usage_command.py).
+        # The five counters above are coerced through `as_int` for the same
+        # reason; this is the flags' half of that contract.
+        if getattr(agent, f"session_{flag}", False) is True:
+            snap[flag] = True
+    return snap
+
+
+def render_thin_last_turn_lines(thin_snap, fallback_label=None) -> list:
+    """Render the degraded /usage last-turn card from a thin usage snapshot.
+
+    Module-level and callable so tests drive the SHIPPED renderer directly
+    instead of AST-lifting it out of the mixin method below (a source-text
+    anchor that both breaks on benign refactors and can go green against a
+    fixture no producer emits).
+
+    ``thin_snap`` is whatever the two real producers hand over:
+    ``HermesState.get_last_turn_usage`` (persisted, agent evicted) or the
+    resident agent's session counters.
+
+    The RESIDENT producer carries the UNKNOWN discriminators, so an unmeasured
+    bucket renders ``unknown`` here rather than presenting the stored 0 as a
+    measurement. The PERSISTED producer does NOT: the sessions schema has no
+    ``last_turn_*_unknown`` columns (``hermes_state_common.py``), and
+    ``get_last_turn_usage`` returns exactly five integer keys. Adding them is a
+    schema change owned by PR #797. What this lane guarantees instead is that
+    the persisted snapshot is never an unmeasured zero in the first place:
+    ``conversation_loop._last_turn_snapshot_kwargs`` writes ``None`` for an
+    unknown call, so ``COALESCE`` retains the last REAL split rather than
+    stamping a measured-looking 0 over it. This renderer therefore only ever
+    sees measured values on the persisted lane, and the flag lookups below are
+    a no-op there by construction, not by guarantee.
+    """
+    from agent.usage_pricing import format_token_count, prompt_tokens_unknown
+
+    def _as_int(v):
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+    lt_in = _as_int(thin_snap.get("input_tokens"))
+    lt_out = _as_int(thin_snap.get("output_tokens"))
+    lt_cr = _as_int(thin_snap.get("cache_read_tokens"))
+    lt_cw = _as_int(thin_snap.get("cache_write_tokens"))
+    lt_rsn = _as_int(thin_snap.get("reasoning_tokens"))
+    in_billed = lt_in + lt_cr + lt_cw
+    out_billed = lt_out + lt_rsn  # fold reasoning into the output total
+    out_label = fallback_label or "persisted; agent not resident"
+    out_lines = [f"📊 **Last turn** ({out_label})"]
+
+    # Route only the UNKNOWN case through the shared rule; keep this card's
+    # own comma formatting for measured values via ``formatter``.
+    def _tok(value: int, *, unknown: bool) -> str:
+        return format_token_count(value, unknown=unknown, formatter=lambda v: f"{v:,}")
+
+    input_unknown = prompt_tokens_unknown(thin_snap)
+    output_unknown = bool(thin_snap.get("output_tokens_unknown") or thin_snap.get("usage_unknown"))
+    total_unknown = bool(
+        input_unknown or output_unknown or thin_snap.get("total_tokens_unknown")
+    )
+    if input_unknown:
+        out_lines.append(f"• Tokens in: {_tok(in_billed, unknown=True)}")
+    elif in_billed:
+        out_lines.append(
+            f"• Tokens in: {in_billed:,} billed "
+            f"({lt_cr:,} cache-read + {lt_cw:,} cache-write + {lt_in:,} uncached)"
+        )
+    if out_billed or output_unknown:
+        out_lines.append(f"• Tokens out: {_tok(out_billed, unknown=output_unknown)} billed")
+    out_lines.append(
+        f"• Total (billed in+out): "
+        f"{_tok(in_billed + out_billed, unknown=total_unknown)}"
+    )
+    return out_lines
+
+
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
@@ -8082,30 +8214,7 @@ class GatewaySlashCommandsMixin:
         if not thin_snap:
             return []
         logger.warning("usage last-turn card: degraded to thin get_last_turn_usage snapshot")
-
-        def _as_int(v):
-            try:
-                return int(v or 0)
-            except (TypeError, ValueError):
-                return 0
-        lt_in = _as_int(thin_snap.get("input_tokens"))
-        lt_out = _as_int(thin_snap.get("output_tokens"))
-        lt_cr = _as_int(thin_snap.get("cache_read_tokens"))
-        lt_cw = _as_int(thin_snap.get("cache_write_tokens"))
-        lt_rsn = _as_int(thin_snap.get("reasoning_tokens"))
-        in_billed = lt_in + lt_cr + lt_cw
-        out_billed = lt_out + lt_rsn  # fold reasoning into the output total
-        out_label = fallback_label or "persisted; agent not resident"
-        out_lines = [f"📊 **Last turn** ({out_label})"]
-        if in_billed:
-            out_lines.append(
-                f"• Tokens in: {in_billed:,} billed "
-                f"({lt_cr:,} cache-read + {lt_cw:,} cache-write + {lt_in:,} uncached)"
-            )
-        if out_billed:
-            out_lines.append(f"• Tokens out: {out_billed:,} billed")
-        out_lines.append(f"• Total (billed in+out): {in_billed + out_billed:,}")
-        return out_lines
+        return render_thin_last_turn_lines(thin_snap, fallback_label)
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
@@ -8257,13 +8366,7 @@ class GatewaySlashCommandsMixin:
                     return int(v or 0)
                 except (TypeError, ValueError):
                     return 0
-            agent_thin = {
-                "input_tokens": _as_int(getattr(agent, "session_input_tokens", 0)),
-                "output_tokens": _as_int(getattr(agent, "session_output_tokens", 0)),
-                "cache_read_tokens": _as_int(getattr(agent, "session_cache_read_tokens", 0)),
-                "cache_write_tokens": _as_int(getattr(agent, "session_cache_write_tokens", 0)),
-                "reasoning_tokens": _as_int(getattr(agent, "session_reasoning_tokens", 0)),
-            }
+            agent_thin = _resident_thin_snapshot(agent, _as_int)
             ctx = agent.context_compressor
             _comp_count = _as_int(getattr(ctx, "compression_count", 0))
 

@@ -24,19 +24,13 @@ logger = logging.getLogger(__name__)
 # making the job — instead of leaving it None to inherit the runtime primary
 # (often Opus) at fire time.
 #
-# 🔴 This is a MODULE-GLOBAL, deliberately NOT a ContextVar. A ContextVar set
-# inside ``build_turn_context`` (which runs in the conversation-loop asyncio
-# TASK) is invisible to ``handle_function_call`` when the tool executor runs the
-# call in a SEPARATE asyncio task — asyncio snapshots the context at task
-# creation, so a sibling/child task never sees a later ``.set()``. That async
-# task boundary made the ContextVar always read (None, None) at cron-create time
-# (live-repro 2026-07-18). ``handle_function_call`` is a module-level dispatcher
-# with no agent handle, so the value must live somewhere task-independent — the
-# same process-global pattern ``_last_resolved_tool_names`` uses in model_tools.
-# Set once per turn in ``agent/turn_context.py``; the gateway serializes tool
-# dispatch per turn, and a stale value only ever means model="auto" pins to the
-# most-recent turn's model (still a real agent model, never a wrong guess).
-_current_agent_model: Tuple[Optional[str], Optional[str]] = (None, None)
+# The turn publisher is task-local. The tool executor also binds the actual
+# executing agent at dispatch: a separate asyncio task cannot see a ContextVar
+# set after its context snapshot, and a process-global value can belong to a
+# different concurrent session.
+_current_agent_model: contextvars.ContextVar[Tuple[Optional[str], Optional[str]]] = contextvars.ContextVar(
+    "cron_creating_agent_model", default=(None, None)
+)
 
 
 def set_current_agent_model(provider: Optional[str], model: Optional[str]) -> None:
@@ -45,9 +39,8 @@ def set_current_agent_model(provider: Optional[str], model: Optional[str]) -> No
     Called per turn from ``agent/turn_context.py``. Best-effort and cheap; a bad
     value only means model="auto" falls back to leaving the cron unpinned.
     """
-    global _current_agent_model
     try:
-        _current_agent_model = (provider or None, model or None)
+        _current_agent_model.set((provider or None, model or None))
     except Exception:  # never let context bookkeeping break a turn
         pass
 
@@ -55,7 +48,7 @@ def set_current_agent_model(provider: Optional[str], model: Optional[str]) -> No
 def get_current_agent_model() -> Tuple[Optional[str], Optional[str]]:
     """Return the creating agent's (provider, model), or (None, None) if unset."""
     try:
-        return _current_agent_model
+        return _current_agent_model.get()
     except Exception:
         return (None, None)
 
@@ -1995,6 +1988,7 @@ def cronjob(
     skills: Optional[List[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    allow_flagship_reason: Optional[str] = None,
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
@@ -2047,7 +2041,22 @@ def cronjob(
             # "auto" that can't resolve (no agent model published) degrades to
             # leaving the job unpinned — it never guesses a model.
             if not _no_agent:
+                requested_model = model
+                # Only the "auto" sentinel authorizes inherited-model auto-pin.
+                # A literal configured default is a model choice, not inheritance.
+                auto_pin = isinstance(requested_model, str) and requested_model.strip().lower() == _AUTO_MODEL
+                if not requested_model:
+                    try:
+                        from hermes_cli.config import load_config
+                        configured = ((load_config() or {}).get("cron", {}) or {}).get("default_model")
+                        auto_pin = isinstance(configured, str) and configured.strip().lower() == _AUTO_MODEL
+                    except Exception:
+                        auto_pin = False
                 model, provider = _resolve_cron_llm_model(model, provider)
+                # An auto pin inherits the creating agent's elected primary;
+                # it is not a caller-chosen flagship route.
+                if model and auto_pin and not str(allow_flagship_reason or "").strip():
+                    allow_flagship_reason = "auto-pin: inherited creating agent's own elected model"
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
             #     (and irrelevant to execution).
@@ -2152,6 +2161,7 @@ def cronjob(
                     skills=canonical_skills,
                     model=_normalize_optional_job_value(model),
                     provider=_normalize_optional_job_value(provider),
+                    allow_flagship_reason=allow_flagship_reason,
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                     script=_normalize_optional_job_value(script),
                     context_from=context_from,
@@ -2381,6 +2391,7 @@ def cronjob(
                 updates["skill"] = canonical_skills[0] if canonical_skills else None
             if model is not None:
                 updates["model"] = _normalize_optional_job_value(model)
+                updates["allow_flagship_reason"] = allow_flagship_reason
             if provider is not None:
                 updates["provider"] = _normalize_optional_job_value(provider)
             if reasoning_effort is not None:
@@ -2601,7 +2612,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "model": {
                 "type": "object",
-                "description": "Optional per-job model override, as an object {\"model\": \"<name>\", \"provider\": \"<provider>\"}. A flat model-name STRING (e.g. model=\"gpt-5.6-sol\" with a sibling provider=\"openai-codex\") is also accepted and coerced to this object. Use model='auto' to pin the job to the CREATING agent's own model (recommended for LLM crons — otherwise an unpinned job inherits the runtime primary, often Opus, at fire time). If provider is omitted (and model is not 'auto'), the current main provider is pinned at creation time so the job stays stable.",
+                "description": "Optional per-job model override, as an object {\"model\": \"<name>\", \"provider\": \"<provider>\"}. A flat model-name STRING (e.g. model=\"gpt-5.6-sol\" with a sibling provider=\"openai-codex\") is also accepted and coerced to this object. Use model='auto' to pin the job to the CREATING agent's own model (recommended for LLM crons — otherwise an unpinned job inherits the runtime primary, often Opus, at fire time). If provider is omitted (and model is not 'auto'), the current main provider is pinned at creation time so the job stays stable. Explicit flagship models require allow_flagship_reason.",
                 "properties": {
                     "provider": {
                         "type": "string",
@@ -2613,6 +2624,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                     }
                 },
                 "required": ["model"]
+            },
+            "allow_flagship_reason": {
+                "type": "string",
+                "description": "Nonblank justification for an explicit flagship model override (--allow-flagship); persisted with the job for audit."
             },
             "script": {
                 "type": "string",
@@ -2722,6 +2737,7 @@ def _cronjob_tool_handler(args: Dict[str, Any], **kw: Any) -> str:
         skills=args.get("skills"),
         model=resolved_model,
         provider=resolved_provider or _fallback_provider,
+        allow_flagship_reason=args.get("allow_flagship_reason"),
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),

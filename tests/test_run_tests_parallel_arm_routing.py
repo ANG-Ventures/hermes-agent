@@ -51,7 +51,9 @@ def test_real_cli_scoped_plugin_preserves_core_smoke():
     proc = subprocess.run([sys.executable, str(SCRIPT), "--generate-slices", "4", "--test-scope", f"plugin:{plugin}", "--arm-hosted-slices", "3", "--self-hosted-labels", POOL], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
     assert proc.returncode == 0, proc.stderr
     slices = json.loads(proc.stdout)["slice"]
-    assert [(s["name"], s["runs_on"]) for s in slices] == [(f"plugin {plugin}", ARM), ("core smoke", POOL)]
+    assert [(s["name"], s["runs_on"]) for s in slices[:2]] == [(f"plugin {plugin}", ARM), ("core smoke", POOL)]
+    # Optional 3rd slice: the plugin's cross-tree consumers (never core smoke).
+    assert [s["name"] for s in slices[2:]] in ([], [f"plugin {plugin} dependents"])
 
 
 @pytest.mark.parametrize("weights,expected", [((0.1, 1, 9, 8), 2), ((0.1, 9, 8, 1), 4), ((0.1, 2, 2, 2), 2)])
