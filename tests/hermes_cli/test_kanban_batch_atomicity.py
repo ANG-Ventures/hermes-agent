@@ -147,10 +147,15 @@ def test_batch_rolls_back_effort_too_when_a_card_is_archived_mid_batch(
     assert _route(first) == ("ready", None, None, None)
 
 
-def test_selector_batch_rolls_back_when_a_card_is_archived_mid_batch(
+def test_selector_batch_skips_and_names_a_card_archived_mid_batch(
     kanban_home, monkeypatch,
 ):
-    """`--where` selects the same way; it must not commit partially either."""
+    """`--where` re-evaluates its predicate under the writer lock.
+
+    A selector describes a SET, so a card that left the set before the lock
+    is not written — and the receipt names it — while the cards still in the
+    set are. Explicit ids keep the all-or-nothing rule (tests above).
+    """
     first = _create("first")
     second = _create("second")
 
@@ -162,8 +167,9 @@ def test_selector_batch_rolls_back_when_a_card_is_archived_mid_batch(
         "--where status=ready assignee=worker"
     )
 
-    assert "archived" in out
-    assert _route(first) == ("ready", None, None, None)
+    assert f"{second}: skipped (status is now archived" in out
+    assert f"{first}: route=batch-provider/standard-model" in out
+    assert _route(first)[1:3] == ("batch-provider", "standard-model")
     assert _route(second)[1:] == (None, None, None)
 
 
@@ -319,8 +325,8 @@ def lock_after_route_commit(monkeypatch):
     holders: list = []
     original = kb.apply_batch_route_writes
 
-    def hold(conn, writes):
-        result = original(conn, writes)
+    def hold(conn, writes, **kwargs):
+        result = original(conn, writes, **kwargs)
         conn.execute("PRAGMA busy_timeout = 75")
         other = kb.connect()
         other.execute("BEGIN IMMEDIATE")
@@ -471,7 +477,7 @@ def test_pre_commit_failure_still_reports_plainly_and_writes_nothing(
     """
     first = _create("first")
 
-    def explode(conn, writes):
+    def explode(conn, writes, **kwargs):
         raise RuntimeError("write refused")
 
     monkeypatch.setattr(kb, "apply_batch_route_writes", explode)

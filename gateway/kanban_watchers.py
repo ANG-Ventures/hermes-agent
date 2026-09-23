@@ -321,16 +321,21 @@ def _format_spawn_routes(routes, sources=None) -> str:
     )
 
 
-def _format_lane_expiry(lane, route) -> str:
-    return f"lane-model expired -> profile default ({lane}: {route})"
+def _format_lane_expiry(lane, route, successor="profile default") -> str:
+    return f"lane-model expired -> {successor} ({lane}: {route})"
 
 
 def _log_dispatch_tick(logger, slug, res) -> None:
     """Log route choices and expiries, including ticks with no new workers."""
     if res is None:
         return
+    successors = getattr(res, "expired_lane_successors", None) or {}
     for lane, route in (getattr(res, "expired_lane_models", None) or []):
-        logger.info("kanban dispatcher [%s]: %s", slug, _format_lane_expiry(lane, route))
+        logger.info(
+            "kanban dispatcher [%s]: %s",
+            slug,
+            _format_lane_expiry(lane, route, successors.get(lane, "profile default")),
+        )
     spawned = getattr(res, "spawned", None)
     guarded = getattr(res, "respawn_guarded", None)
     parent_satisfied_sticky = getattr(res, "parent_satisfied_sticky", None)

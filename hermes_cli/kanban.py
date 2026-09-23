@@ -2858,6 +2858,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     applied: list[tuple[str, bool]] = []
     cleared_routes: dict[str, str] = {}
     reclaim_errors: dict[str, str] = {}
+    skipped: dict[str, str] = {}
     batch_error: Optional[str] = None
     committed = False
     try:
@@ -2892,12 +2893,32 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             # connection) fail midway with earlier cards already pinned — a
             # split route with no receipt. Prevalidation cannot close that
             # window; a single write_txn can.
+            # The selection is re-checked inside the write transaction (see
+            # apply_batch_route_writes): a card that stops matching between
+            # this SELECT and the writer lock — completed, archived, claimed
+            # out of a status=ready selector, reassigned — is not written.
+            if task_ids:
+                require_statuses = frozenset(_ACTIVE_STATUSES)
+                require_assignees = None
+            else:
+                wanted = {s.lower() for s in where.get("status", [])}
+                require_statuses = frozenset(
+                    s for s in _ACTIVE_STATUSES if not wanted or s in wanted
+                )
+                require_assignees = (
+                    frozenset(where["assignee"]) if where.get("assignee") else None
+                )
             writes: list[kb.BatchRouteWrite] = []
             for task in tasks:
                 if touch_model and not model and not provider:
                     lane = kb.get_lane_model_override(conn, assignee=task.assignee)
                     cleared_routes[task.id] = lane.route if lane else "profile-default"
-                write = kb.BatchRouteWrite(task_id=task.id)
+                write = kb.BatchRouteWrite(
+                    task_id=task.id,
+                    require_statuses=require_statuses,
+                    require_assignees=require_assignees,
+                    skip_if_unmatched=not task_ids,
+                )
                 if touch_model:
                     effective_model = model or inherited_models.get(task.id)
                     firepower = is_firepower_model(effective_model)
@@ -2916,12 +2937,13 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.effort = None if clear_effort else effort
                 writes.append(write)
 
-            kb.apply_batch_route_writes(conn, writes)
+            written = set(kb.apply_batch_route_writes(conn, writes, skipped=skipped))
             # PAST THIS LINE THE ROUTES ARE DURABLE. Nothing below may let an
             # exception escape without the operator learning which cards
             # moved — that is the whole honest-partial contract, and it is
             # why the reclaim loop catches by position rather than by type.
             committed = True
+            tasks = [task for task in tasks if task.id in written]
 
             # --reclaim runs only AFTER the route batch has committed, and
             # deliberately NOT inside it: reclaim_task SIGTERMs a live worker,
@@ -3009,6 +3031,10 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             print(f"{task_id}: effort=profile-default applies={applies}")
         elif effort is not None:
             print(f"{task_id}: effort={effort} applies={applies}")
+    # Selector-chosen cards that stopped matching before the writer lock were
+    # NOT written; name each one so the receipt covers every selected card.
+    for task_id, why in skipped.items():
+        print(f"{task_id}: skipped ({why}; no longer matches the selector) route unchanged")
     # A reclaim that failed after its route committed is named explicitly —
     # the receipt above already told the operator the route moved, so staying
     # quiet here would leave them believing the worker was respawned.
@@ -3026,6 +3052,10 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             f"cleanly: {batch_error}",
             file=sys.stderr,
         )
+    if skipped and not applied:
+        print("kanban: every selected card stopped matching; nothing written",
+              file=sys.stderr)
+        return 1
     return 1 if (reclaim_errors or batch_error) else 0
 
 
@@ -3143,7 +3173,8 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
         print(f"  {format_firepower_audit(model, provider, firepower_reason)}")
     print(
         "  cards with their own --model/--provider override are unaffected; "
-        "expiry returns this lane to its profile default"
+        "on expiry the lane falls back to the board-wide lane if one is "
+        "active, else its profile default"
     )
     return 0
 
@@ -3198,6 +3229,16 @@ def _cmd_lane_model_clear(args: argparse.Namespace) -> int:
         else:
             one = kb.clear_lane_model_override(conn, assignee=assignee)
             removed = [one] if one else []
+        # Name what routes each cleared lane NOW: clearing an assignee lane
+        # under a live board-wide lane does not return it to the profile
+        # default, and saying so would be the same false receipt class.
+        now = int(time.time())
+        successors = {
+            row.assignee: kb.lane_successor_label(
+                kb.get_lane_model_override(conn, assignee=row.assignee, now=now)
+            )
+            for row in removed
+        }
     if not removed:
         target = "any lane" if clear_all else _lane_label(assignee)
         print(f"no lane-model override set for {target}", file=sys.stderr)
@@ -3205,7 +3246,7 @@ def _cmd_lane_model_clear(args: argparse.Namespace) -> int:
     for row in removed:
         print(
             f"Cleared lane-model override for {_lane_label(row.assignee)} "
-            f"(was {row.route}); lane returns to its profile default"
+            f"(was {row.route}); lane now routes via {successors[row.assignee]}"
         )
     return 0
 
@@ -4265,7 +4306,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, ws) in res.spawned
             ],
             "expired_lane_models": [
-                {"lane": lane, "route": route}
+                {
+                    "lane": lane,
+                    "route": route,
+                    "successor": (getattr(res, "expired_lane_successors", None) or {})
+                    .get(lane, "profile default"),
+                }
                 for (lane, route) in getattr(res, "expired_lane_models", []) or []
             ],
             "spawned_unwatched": spawned_unwatched,
@@ -4365,8 +4411,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"  - {tid}  ->  {who}  @ {ws or '-'}  route={route}{source_part} "
             f"kind={route_kind(route)}{tag}"
         )
+    successors = getattr(res, "expired_lane_successors", None) or {}
     for lane, route in getattr(res, "expired_lane_models", []) or []:
-        print(f"lane-model expired ({lane}: {route}) -> profile default")
+        print(
+            f"lane-model expired ({lane}: {route}) -> "
+            f"{successors.get(lane, 'profile default')}"
+        )
     collision_warnings = getattr(res, "collision_warnings", [])
     if collision_warnings:
         print("WARNING — pre-dispatch file collision(s); dispatch continued:")
