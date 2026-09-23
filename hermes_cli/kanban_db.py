@@ -12464,8 +12464,13 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    progress_at: Optional[float] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+
+    ``progress_at`` is the agent's last real progress time (API call,
+    stream chunk, tool call). It rides on the event payload so the stall
+    detector can tell a live wrapper from a progressing model loop.
 
     Called by long-running workers as a liveness signal orthogonal to
     the PID check. A worker that forks a long-lived child (train loop,
@@ -12501,9 +12506,14 @@ def heartbeat_worker(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
                 (now, run_id),
             )
+        payload: dict[str, Any] = {}
+        if note:
+            payload["note"] = note
+        if progress_at is not None:
+            payload["progress_at"] = int(progress_at)
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            payload or None,
             run_id=run_id,
         )
     return True
@@ -12637,7 +12647,15 @@ _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
 def _worker_has_active_child(pid: int) -> bool:
-    """A subprocess or CPU-active worker is evidence against a stall."""
+    """Veto only: a subprocess or CPU-active worker is evidence against a stall.
+
+    This probe can never *authorize* a reclaim on its own -- a worker blocked
+    on an in-flight provider request reads 0% CPU with no children, exactly
+    like a dead socket. The stall decision comes from the agent's own
+    progress timestamp (:func:`_run_progress_at`); this sample can only
+    cancel it. Unknown process state (``ps`` missing/failing/unparseable)
+    returns True so it never authorizes a kill.
+    """
     import subprocess
     try:
         ps = subprocess.run(
@@ -12657,28 +12675,43 @@ def _worker_has_active_child(pid: int) -> bool:
     return False
 
 
-def _worker_request_dump_at(task_id: str, assignee: str, *, board: Optional[str] = None) -> Optional[int]:
-    """Timestamp of this run's most recent provider error dump, if identifiable."""
-    segment = _worker_log_run_segment(task_id, board=board)
-    match = re.search(r"\bsession_id:\s*([A-Za-z0-9_-]+)", segment or "")
-    if not match:
-        return None
-    from hermes_cli.profiles import resolve_profile_env
-    try:
-        sessions = Path(resolve_profile_env(assignee)) / "sessions"
-        return max(
-            (int(p.stat().st_mtime) for p in sessions.glob(f"request_dump_{match[1]}_*.json")),
-            default=None,
-        )
-    except OSError:
-        return None
+def _run_progress_at(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[int]:
+    """Latest agent-reported progress time for ``run_id``, or None if unknown.
+
+    The worker's heartbeat bridge (``heartbeat_current_worker_from_env``)
+    stamps ``progress_at`` -- the agent's last API-call start/finish, stream
+    chunk, tool start/finish or retry -- onto its heartbeat events. Pure
+    provider-wait tickers refresh the heartbeat but NOT ``progress_at``, so a
+    fresh heartbeat with an old ``progress_at`` is the run 7914 shape. A run
+    that never reported ``progress_at`` (older worker, non-agent worker) is
+    unknown and must never be reclaimed by the stall detector.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='heartbeat' AND payload LIKE '%progress_at%' "
+        "ORDER BY id DESC LIMIT 5",
+        (task_id, run_id),
+    ).fetchall()
+    for row in rows:
+        try:
+            value = json.loads(row["payload"] or "null").get("progress_at")
+            if value is not None:
+                return int(value)
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return None
 
 
 def detect_progress_stalls(
     conn: sqlite3.Connection, *, stall_seconds: int = 900,
     reclaim_seconds: int = 1500, board: Optional[str] = None,
 ) -> list[str]:
-    """Detect a silent model loop even while its wrapper sends heartbeats."""
+    """Detect a silent model loop even while its wrapper sends heartbeats.
+
+    A run is stalled only when the agent's own progress timestamp (plus
+    worker-log growth) has been stale for the whole window; a single
+    idle process sample is never sufficient, only a veto.
+    """
     now = int(time.time())
     reclaimed = []
     rows = conn.execute(
@@ -12697,23 +12730,25 @@ def detect_progress_stalls(
         lock = row["claim_lock"]
         if not lock or not str(lock).startswith(f"{_claimer_id().split(':', 1)[0]}:"):
             continue
+        rid = row["current_run_id"]
+        progress_at = _run_progress_at(conn, row["id"], rid)
+        if progress_at is None:
+            continue  # No agent progress signal: unknown, never reclaim.
         try:
             log_time = int(worker_log_path(row["id"], board=board).stat().st_mtime)
         except OSError:
             log_time = start
-        dump_time = _worker_request_dump_at(row["id"], row["assignee"], board=board)
-        age = now - max(start, log_time, dump_time or start)
+        age = now - max(start, log_time, progress_at)
         if age < stall_seconds:
             continue
         if _worker_has_active_child(pid):
             continue
-        rid = row["current_run_id"]
         evidence = {
             "progress_age_seconds": age, "heartbeat_age_seconds": now - int(hb),
+            "agent_progress_age_seconds": now - progress_at,
             "log_age_seconds": now - log_time, "worker_pid": pid,
-            "request_dump_age_seconds": now - dump_time if dump_time else None,
-            "oldest_age_seconds": max(now - start, now - log_time),
-            "signals": ["no_log_growth", "no_recent_provider_dump", "no_active_child_or_cpu"],
+            "oldest_age_seconds": max(now - progress_at, now - log_time),
+            "signals": ["no_agent_progress", "no_log_growth", "no_active_child_or_cpu"],
         }
         prior = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='stalled' LIMIT 1",

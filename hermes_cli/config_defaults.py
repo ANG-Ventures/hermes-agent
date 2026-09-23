@@ -3087,7 +3087,8 @@ DEFAULT_CONFIG = {
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
         # Wrapper heartbeats do not prove worker progress. Warn after 15 min
-        # without log/process activity and reclaim after 25 min (0 disables).
+        # without agent progress (heartbeat ``progress_at``: API call, stream
+        # chunk, tool call) and reclaim after 25 min (0 disables).
         "stall_minutes": 15,
         "stall_reclaim_minutes": 25,
         # For configured provider_health_probes, prefer a healthy fallback
