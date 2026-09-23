@@ -51,7 +51,8 @@ def _read_progress(url: str, deadline: float) -> dict[str, object]:
     )
 
 
-def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None:
+@pytest.mark.parametrize("trial", range(20))
+def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path, trial: int) -> None:
     powershell = shutil.which("powershell.exe")
     assert powershell, "Windows updater tests require Windows PowerShell."
 
