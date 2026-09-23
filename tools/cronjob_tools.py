@@ -2049,10 +2049,20 @@ def cronjob(
             # leaving the job unpinned — it never guesses a model.
             if not _no_agent:
                 requested_model = model
+                # Only the "auto" sentinel authorizes inherited-model auto-pin.
+                # A literal configured default is a model choice, not inheritance.
+                auto_pin = isinstance(requested_model, str) and requested_model.strip().lower() == _AUTO_MODEL
+                if not requested_model:
+                    try:
+                        from hermes_cli.config import load_config
+                        configured = ((load_config() or {}).get("cron", {}) or {}).get("default_model")
+                        auto_pin = isinstance(configured, str) and configured.strip().lower() == _AUTO_MODEL
+                    except Exception:
+                        auto_pin = False
                 model, provider = _resolve_cron_llm_model(model, provider)
                 # An auto pin inherits the creating agent's elected primary;
                 # it is not a caller-chosen flagship route.
-                if model and requested_model in (None, "auto") and not str(allow_flagship_reason or "").strip():
+                if model and auto_pin and not str(allow_flagship_reason or "").strip():
                     allow_flagship_reason = "auto-pin: inherited creating agent's own elected model"
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional

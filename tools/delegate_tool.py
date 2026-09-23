@@ -4215,6 +4215,7 @@ def delegate_task(
     provider = str(provider or "").strip() or None
     if provider and not model:
         return tool_error("delegate_task provider requires a model override.")
+    audit_reason = None
     if model:
         from hermes_cli.model_switch import resolve_model_pair_for_storage
         from hermes_cli.model_policy import flagship_model_match, validate_worker_model
@@ -4225,7 +4226,7 @@ def delegate_task(
         except ValueError as exc:
             return tool_error(str(exc))
         if flagship_model_match(model):
-            logger.info("flagship override: delegate_task model=%s provider=%s reason=%s", model, provider, reason)
+            audit_reason = reason
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -4532,6 +4533,11 @@ def delegate_task(
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
+
+    # Record an accepted override only after task validation and child construction.
+    # A rejected or unbuildable request must not leave a success-shaped audit.
+    if audit_reason:
+        logger.info("flagship override: delegate_task model=%s provider=%s reason=%s", model, provider, audit_reason)
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,

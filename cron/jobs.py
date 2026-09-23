@@ -2974,6 +2974,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if "allow_flagship_reason" in updates and "model" not in updates:
+                from hermes_cli.model_policy import validate_worker_model
+
+                validate_worker_model(
+                    updated.get("model"),
+                    allow_flagship_reason=updated.get("allow_flagship_reason"),
+                )
 
             if (
                 is_terminal_job(job)

@@ -42,14 +42,24 @@ def test_delegate_justified_route_is_audited_and_credential_isolation():
 
     with (patch("tools.delegate_tool._load_config", return_value={"model": "claude-opus-5", "provider": "claude-apr", "base_url": "old-endpoint", "api_key": "old-key", "api_mode": "anthropic"}),
           patch("tools.delegate_tool._resolve_delegation_credentials", side_effect=resolve),
+          patch("tools.delegate_tool._build_child_preserving_parent_tools", return_value=SimpleNamespace()),
+          patch("tools.delegate_tool._run_single_child", return_value={"task_index": 0, "status": "completed", "summary": "done", "api_calls": 1, "duration_seconds": 0}),
           patch("tools.delegate_tool.logger.info") as audit):
-        result = delegate_task(model="gpt-6-astra-900k", provider="openai-codex", allow_flagship_reason="hard concurrency diagnosis", parent_agent=_parent())
-    assert "No tasks provided" in result
+        result = delegate_task(goal="Diagnose concurrency failure", model="gpt-6-astra-900k", provider="openai-codex", allow_flagship_reason="hard concurrency diagnosis", parent_agent=_parent())
+    assert "done" in result
     assert captured["model"] == "gpt-6-astra-900k"
     assert captured["provider"] == "openai-codex"
     assert captured["base_url"] == captured["api_key"] == captured["api_mode"] == ""
     assert "flagship override:" in str(audit.call_args)
     assert "hard concurrency diagnosis" in str(audit.call_args)
+
+
+def test_delegate_invalid_request_has_no_success_override_audit():
+    with (patch("tools.delegate_tool._resolve_delegation_credentials", return_value={"model": "gpt-6-astra-900k", "provider": "openai-codex"}),
+          patch("tools.delegate_tool.logger.info") as audit):
+        result = delegate_task(model="gpt-6-astra-900k", provider="openai-codex", allow_flagship_reason="incident", parent_agent=_parent())
+    assert "No tasks provided" in result
+    assert not any("flagship override:" in str(call) for call in audit.call_args_list)
 
 
 def test_delegate_dispatch_and_registry_forward_route():
@@ -104,7 +114,49 @@ def test_cron_tool_update_refuses_flagship_without_reason(tmp_path, monkeypatch)
 
 def test_cron_auto_pin_inherits_creating_primary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("tools.cronjob_tools._resolve_cron_llm_model", return_value=("claude-fable-5", "claude-apr")):
+    from tools.cronjob_tools import set_current_agent_model
+    set_current_agent_model("claude-apr", "claude-fable-5")
+    try:
         result = json.loads(cronjob(action="create", schedule="every 1h", prompt="Check status", model="auto"))
+    finally:
+        set_current_agent_model(None, None)
     assert result["success"] is True
     assert get_job(result["job_id"])["allow_flagship_reason"].startswith("auto-pin:")
+
+
+def test_cron_literal_flagship_default_is_not_disguised_as_agent_auto_pin(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.cronjob_tools import set_current_agent_model
+    set_current_agent_model(None, None)
+    with patch("hermes_cli.config.load_config", return_value={"cron": {"default_model": "claude-fable-5", "default_provider": "claude-apr"}}):
+        refused = json.loads(cronjob(action="create", schedule="every 1h", prompt="Check status"))
+        assert refused["success"] is False
+        assert "--allow-flagship" in refused["error"]
+        accepted = json.loads(cronjob(action="create", schedule="every 1h", prompt="Check status", allow_flagship_reason="incident"))
+    assert accepted["success"] is True
+    job = get_job(accepted["job_id"])
+    assert job["model"] == "claude-fable-5"
+    assert job["allow_flagship_reason"] == "incident"
+
+
+def test_cron_config_auto_inherits_creating_primary(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.cronjob_tools import set_current_agent_model
+    set_current_agent_model("openai-codex", "gpt-6-astra-900k")
+    try:
+        with patch("hermes_cli.config.load_config", return_value={"cron": {"default_model": "auto"}}):
+            result = json.loads(cronjob(action="create", schedule="every 1h", prompt="Check status"))
+    finally:
+        set_current_agent_model(None, None)
+    assert result["success"] is True
+    job = get_job(result["job_id"])
+    assert job["model"] == "gpt-6-astra-900k"
+    assert job["allow_flagship_reason"].startswith("auto-pin:")
+
+
+def test_cron_store_cannot_erase_flagship_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    job = create_job(prompt="Check status", schedule="every 1h", model="gpt-6-astra-900k", allow_flagship_reason="incident")
+    with pytest.raises(ValueError, match="--allow-flagship"):
+        update_job(job["id"], {"allow_flagship_reason": None})
+    assert get_job(job["id"])["allow_flagship_reason"] == "incident"
