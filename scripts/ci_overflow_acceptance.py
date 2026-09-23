@@ -32,7 +32,7 @@ def check(name: str, status: Literal["PASS", "BLOCK", "UNVERIFIABLE"], evidence:
 
 
 def command(*args: str, cwd: Path = ROOT) -> str:
-    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=120, check=False)
+    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False)
     if proc.returncode:
         raise RuntimeError(f"{args[0]} {args[1] if len(args) > 1 else ''}: exit {proc.returncode}: {proc.stderr.strip()[:300]}")
     return proc.stdout
