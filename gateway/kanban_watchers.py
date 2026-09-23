@@ -944,10 +944,26 @@ class GatewayKanbanWatchersMixin:
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
                                 wake_handoff = r
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                            superseded_by = (
+                                ev.payload.get("superseded_by") if ev.payload else None
                             )
+                            if superseded_by:
+                                # A card whose premise was already satisfied is
+                                # NOT the same shape as one whose work this
+                                # worker did. Name the evidence, and do not let
+                                # it read as a crash — before this disposition
+                                # existed the same situation arrived as
+                                # "gave up (retries exhausted)".
+                                msg = (
+                                    f"↩️ {board_tag}{tag}Kanban {sub['task_id']} closed"
+                                    f" — premise superseded by "
+                                    f"{str(superseded_by)[:160]} — {title}{handoff}"
+                                )
+                            else:
+                                msg = (
+                                    f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
+                                    f" — {title}{handoff}"
+                                )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
@@ -957,10 +973,25 @@ class GatewayKanbanWatchersMixin:
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
+                            if (ev.payload or {}).get("stopped_early") == "reproduced_clean_exit":
+                                # NOT a crash: the worker exited cleanly with
+                                # nothing to do, twice identically. "gave up
+                                # after repeated spawn failures" sent operators
+                                # hunting a failure that never happened.
+                                repeats = int((ev.payload or {}).get("identical_violations") or 2)
+                                msg = (
+                                    f"🧭 {board_tag}{tag}Kanban {sub['task_id']} needs input: "
+                                    f"its worker finished with NOTHING TO DO {repeats}x "
+                                    f"identically (no crash) — retrying reproduces it. If the "
+                                    f"card's premise was already satisfied, close it with "
+                                    f"`hermes kanban complete {sub['task_id']} --superseded-by "
+                                    f"<card|PR|sha>`; otherwise re-scope it.{err}"
+                                )
+                            else:
+                                msg = (
+                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
+                                    f"after repeated spawn failures{err}"
+                                )
                         elif kind == "crashed":
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "

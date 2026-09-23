@@ -131,6 +131,14 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Run outcomes that mean "this attempt ENDED the card successfully".
+# ``superseded`` is the honest close for a card whose premise was already
+# satisfied elsewhere (evidence = the ``superseded_by`` pointer, no artifact).
+# Every reader that asks "did this task succeed" must treat it like
+# ``completed``, or a superseded card reads as never-run and gets respawned.
+SUCCESS_RUN_OUTCOMES = ("completed", "superseded")
+_SUCCESS_RUN_OUTCOMES_SQL = "('completed', 'superseded')"
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -6892,6 +6900,29 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+# Evidence pointer for a superseded close, capped so a worker cannot paste a
+# whole transcript into the durable field the board renders.
+_SUPERSEDED_POINTER_MAX = 500
+
+
+class EmptySupersedeError(ValueError):
+    """Raised by ``complete_task`` when ``superseded_by`` is blank.
+
+    The pointer is the ONLY evidence a superseded close carries, so an empty
+    one would record that the card's work vanished without recording what
+    replaced it. ``ValueError`` so existing tool-error handlers treat it as a
+    recoverable user error the worker can retry.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: {task_id} was completed as superseded with an empty "
+            f"superseded_by; name the card, PR or sha that satisfied the premise "
+            f"(an unnamed supersede is a silent delete of the work)"
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6905,8 +6936,23 @@ def complete_task(
     survivor_ref: Optional[Union[str, Sequence[str]]] = None,
     survivor_pr: Optional[Union[str, Sequence[str]]] = None,
     survivor_unbound: Union[bool, str, Sequence[Union[bool, str]], None] = None,
+    superseded_by: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``superseded_by`` closes a card whose premise is ALREADY SATISFIED on
+    current main — the sibling card, PR or sha that did the work. The closing
+    run's outcome is ``superseded`` rather than ``completed``, and the pointer
+    IS the evidence, so no ``summary``/``result`` is required. An empty /
+    whitespace-only pointer is refused (:class:`EmptySupersedeError`) — a
+    superseded card with no pointer is a silent delete of work. Survivor
+    preservation is deliberately NOT skipped: ``preserve`` already returns
+    ``None`` when the run produced nothing, so a genuine no-op close needs no
+    survivor, while a worker that DID change files still cannot use this
+    disposition to escape the survivor gate. Without this verb a worker that
+    finds its card already done has no honest option: completion demands work
+    it did not do and blocking demands a blocker that does not exist, so it
+    exits rc=0 and the dispatcher books a protocol violation and retries.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -6943,6 +6989,20 @@ def complete_task(
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+
+    # A superseded close carries its evidence in the pointer, so it is the one
+    # thing that must not be blank. Gate it before any filesystem work, and
+    # emit the audit event the same way the card gates do.
+    if superseded_by is not None:
+        superseded_by = str(superseded_by).strip()[:_SUPERSEDED_POINTER_MAX]
+        if not superseded_by:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_empty_supersede",
+                    {"reason": "empty_superseded_pointer"},
+                )
+            raise EmptySupersedeError(task_id)
+    run_outcome = "superseded" if superseded_by else "completed"
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -6998,6 +7058,11 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    if superseded_by:
+        metadata = dict(metadata or {}, superseded_by=superseded_by)
+        if not (summary or "").strip() and not (result or "").strip():
+            # The pointer is the evidence; give the board a readable line too.
+            summary = f"Premise already satisfied; superseded by {superseded_by}."
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -7060,7 +7125,7 @@ def complete_task(
                 )
         run_id = _end_run(
             conn, task_id,
-            outcome="completed", status="done",
+            outcome=run_outcome, status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
@@ -7081,7 +7146,7 @@ def complete_task(
                 }
             run_id = _synthesize_ended_run(
                 conn, task_id,
-                outcome="completed",
+                outcome=run_outcome,
                 summary=synth_summary,
                 metadata=synth_metadata,
             )
@@ -7100,6 +7165,10 @@ def complete_task(
         }
         if survivor:
             completed_payload["survivor"] = survivor
+        if superseded_by:
+            # Read by the gateway notifier to say "premise superseded by X"
+            # instead of the generic done ping.
+            completed_payload["superseded_by"] = superseded_by
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -8350,7 +8419,7 @@ def edit_completed_task_result(
             """
             SELECT id FROM task_runs
              WHERE task_id = ?
-               AND outcome = 'completed'
+               AND outcome IN ('completed', 'superseded')
              ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
              LIMIT 1
             """,
@@ -9276,7 +9345,7 @@ def reopen_task(
         if upd.rowcount != 1:
             return False, f"task {task_id} changed state concurrently; retry"
         run_id = conn.execute(
-            "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
             "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -12137,6 +12206,24 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 # can only mean "way past the bound" anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
+# Identical clean exits (same captured worker output) that end the retry budget
+# EARLY. Two is the smallest number that distinguishes "reproduced" from
+# "happened once": a worker that reaches the same dead end twice is not
+# converging, so a third spawn buys nothing but a worker slot and quota. The
+# common cause is a card whose premise was already satisfied before dispatch,
+# which now has an honest terminal verb (``complete_task(superseded_by=...)``).
+_PROTOCOL_VIOLATION_REPRODUCED_LIMIT = 2
+
+
+def _violation_output_fingerprint(metadata: dict) -> str:
+    """Normalized captured worker output of a violation run; "" when absent.
+
+    Absent output must never compare equal: two runs with nothing recorded say
+    nothing about each other, so the early trip stays off for them.
+    """
+    raw = metadata.get("stderr_tail") or metadata.get("worker_output") or ""
+    return " ".join(str(raw).split())[:400]
+
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
@@ -12160,7 +12247,23 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     error text is matched as a fallback for runs recorded before the marker
     existed.
     """
+    return _protocol_violation_history(conn, task_id)[0]
+
+
+def _protocol_violation_history(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[int, int]:
+    """``(streak, identical_repeats)`` over the trailing violation run.
+
+    ``identical_repeats`` counts how many of those violations were captured
+    with the SAME worker output as the newest one (see
+    ``_violation_output_fingerprint``). A worker that reproduces its own clean
+    exit verbatim is not converging, so ``_account_crashes`` trips on the
+    repeat instead of spending the whole budget re-running it.
+    """
     streak = 0
+    newest_output: Optional[str] = None
+    identical = 0
     rows = conn.execute(
         "SELECT outcome, error, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
@@ -12173,21 +12276,28 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
             continue
         if outcome == "crashed":
             is_violation = False
+            meta: dict = {}
             raw_meta = row["metadata"]
             if raw_meta:
                 try:
-                    is_violation = bool(
-                        json.loads(raw_meta).get("protocol_violation")
-                    )
+                    parsed = json.loads(raw_meta)
+                    meta = parsed if isinstance(parsed, dict) else {}
+                    is_violation = bool(meta.get("protocol_violation"))
                 except (ValueError, TypeError):
-                    is_violation = False
+                    meta, is_violation = {}, False
             if not is_violation:
                 is_violation = "protocol violation" in (row["error"] or "")
             if is_violation:
                 streak += 1
+                output = _violation_output_fingerprint(meta)
+                if streak == 1:
+                    newest_output = output
+                    identical = 1 if output else 0
+                elif output and output == newest_output and identical == streak - 1:
+                    identical += 1
                 continue
         break
-    return streak
+    return streak, identical
 
 
 def detect_crashed_workers(
@@ -12274,10 +12384,10 @@ def detect_crashed_workers(
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "
                     "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
+                    "If the work is already done, verify and report it via "
+                    "kanban_complete (superseded_by=<card|PR|sha> if a sibling "
+                    "got there first); a run that ends without a terminal "
+                    "kanban call counts as failed."
                 )
                 event_kind = "protocol_violation"
                 event_payload = {
@@ -12289,6 +12399,14 @@ def detect_crashed_workers(
                     # the violation-only retry budget is derived later.
                     "protocol_violation": True,
                 }
+                # The worker's own last words are what distinguishes a
+                # REPRODUCED no-op ("nothing to implement, already on main")
+                # from three unrelated paperwork misses. Without capturing it
+                # here, _violation_output_fingerprint has nothing to compare
+                # and the early trip can never fire.
+                stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
+                if stderr_tail:
+                    event_payload["stderr_tail"] = stderr_tail
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
@@ -12479,7 +12597,7 @@ def detect_crashed_workers(
             stderr_tail,
         ) in crash_details:
             if protocol_violation:
-                streak = _protocol_violation_streak(conn, tid)
+                streak, identical = _protocol_violation_history(conn, tid)
                 trow = conn.execute(
                     "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
                 ).fetchone()
@@ -12493,7 +12611,14 @@ def detect_crashed_workers(
                     if task_override is not None
                     else _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 )
-                if streak < violation_limit:
+                # Two byte-identical clean exits are a REPRODUCED no-op,
+                # not a flake: the worker reached the same dead end twice, so
+                # a third spawn buys nothing. Stop early and surface it as
+                # needing input rather than burning the rest of the budget on
+                # the same run. (The usual cause — a premise already satisfied
+                # on main — now has an honest verb: superseded_by.)
+                reproduced = identical >= _PROTOCOL_VIOLATION_REPRODUCED_LIMIT
+                if streak < violation_limit and not reproduced:
                     # Below budget: the task is already back at ``ready``
                     # (respawn allowed) with ``last_failure_error`` stamped.
                     # Deliberately no ``_record_task_failure`` call — a
@@ -12501,6 +12626,27 @@ def detect_crashed_workers(
                     # failure budget, just as other failure kinds don't
                     # consume this one.
                     continue
+                violation_extra = {
+                    "pid": pid,
+                    "claimer": claimer,
+                    "protocol_violations": streak,
+                    "protocol_violation_limit": violation_limit,
+                }
+                if reproduced:
+                    violation_extra["identical_violations"] = identical
+                    violation_extra["stopped_early"] = "reproduced_clean_exit"
+                    # PREPENDED, not appended: ``_record_task_failure`` caps
+                    # the stored error at 500 chars and the canned violation
+                    # text plus the worker's own output already fills it, so a
+                    # trailing hint would be truncated away unread.
+                    error_text = (
+                        f"Stopped retrying after {identical} IDENTICAL clean "
+                        f"exits — the worker reproduced the same no-op, so "
+                        f"this needs input, not another attempt. If the card's "
+                        f"premise was already satisfied, close it with `hermes "
+                        f"kanban complete {tid} --superseded-by <card|PR|sha>`. "
+                        f"{error_text}"
+                    )
                 # Streak reached the bound: trip the breaker. ``force_trip``
                 # skips the threshold resolution inside
                 # ``_record_task_failure`` because the decision — including
@@ -12514,12 +12660,7 @@ def detect_crashed_workers(
                     force_trip=True,
                     release_claim=False,
                     end_run=False,
-                    event_payload_extra={
-                        "pid": pid,
-                        "claimer": claimer,
-                        "protocol_violations": streak,
-                        "protocol_violation_limit": violation_limit,
-                    },
+                    event_payload_extra=violation_extra,
                 )
                 if tripped:
                     auto_blocked.append(tid)
@@ -13137,7 +13278,7 @@ def check_respawn_guard(
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
         "SELECT ended_at FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
+        "WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " AND ended_at >= ? "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id, cutoff),
     ).fetchone()
@@ -15595,7 +15736,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             pt = get_task(conn, pid)
             if not pt or pt.status != "done":
                 continue
-            runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
+            runs = [r for r in list_runs(conn, pid) if r.outcome in SUCCESS_RUN_OUTCOMES]
             runs.sort(key=lambda r: r.started_at, reverse=True)
             run = runs[0] if runs else None
 
@@ -15648,7 +15789,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
             "WHERE r.profile = ? AND r.task_id != ? "
-            "  AND r.outcome = 'completed' "
+            "  AND r.outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
             "ORDER BY r.ended_at DESC LIMIT 5",
             (task.assignee, task_id),
         ).fetchall()

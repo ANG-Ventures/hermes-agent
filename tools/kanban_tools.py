@@ -759,6 +759,13 @@ def _handle_complete(args: dict, **kw) -> str:
             metadata = json.loads(meta_json)
         except json.JSONDecodeError:
             pass
+    superseded_by = args.get("superseded_by")
+    if superseded_by is not None:
+        if not isinstance(superseded_by, str):
+            return tool_error(
+                f"superseded_by must be a string, got {type(superseded_by).__name__}"
+            )
+        superseded_by = redact_sensitive_text(superseded_by, force=True)
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -813,9 +820,10 @@ def _handle_complete(args: dict, **kw) -> str:
                 metadata["artifacts"] = merged
             else:
                 metadata["artifacts"] = artifacts
-    if not (summary or result):
+    if not (summary or result or superseded_by is not None):
         return tool_error(
-            "provide at least one of: summary (preferred), result"
+            "provide at least one of: summary (preferred), result — or "
+            "superseded_by if the card's premise was already satisfied elsewhere"
         )
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(
@@ -840,7 +848,11 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            # A superseded close asserts the card's premise no longer holds —
+            # there is no work for the judge to grade against the acceptance
+            # criteria, and gating it would put the worker straight back in the
+            # "no honest verb, exit silently" trap this disposition removes.
+            rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
             )
@@ -860,6 +872,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                     survivor_pr=survivor_pr, survivor_ref=survivor_ref,
+                    superseded_by=superseded_by,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -867,6 +880,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"{artifact_err}. Your task is still in-flight and its "
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
+                )
+            except kb.EmptySupersedeError as supersede_err:
+                # Gate runs before any write, so nothing was mutated; say so
+                # or the model reads a tool_error as terminal and blocks.
+                return tool_error(
+                    f"kanban_complete blocked: {supersede_err}. Your task is still "
+                    f"in-flight (no state change). Retry with a non-empty "
+                    f"superseded_by naming what satisfied the premise."
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -1956,7 +1977,11 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. If you "
+        "verify the card's premise NO LONGER HOLDS — the work already "
+        "landed on current main via a sibling card, PR or commit — do "
+        "not exit silently: complete with ``superseded_by`` pointing at "
+        "whatever satisfied it."
     ),
     "parameters": {
         "type": "object",
@@ -1964,6 +1989,21 @@ KANBAN_COMPLETE_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "superseded_by": {
+                "type": "string",
+                "description": (
+                    "Evidence pointer for a card whose premise was "
+                    "ALREADY SATISFIED before you got to it — the card "
+                    "id, PR url, or commit sha that did the work (e.g. "
+                    "\"t_0c5ac29a -> #889\"). Closes the task done with "
+                    "outcome ``superseded`` and requires no "
+                    "``summary``/``result``: the pointer IS the evidence, "
+                    "and there is no artifact to hand off. Only use it "
+                    "after you VERIFIED the premise against current main "
+                    "— and never with an empty value, which is refused. "
+                    "Leave it unset for ordinary work."
+                ),
             },
             "summary": {
                 "type": "string",

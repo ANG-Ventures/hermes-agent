@@ -1391,3 +1391,46 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_complete_superseded_by_needs_no_summary(worker_env):
+    """The tool-level honest verb: pointer only, no work evidence, closes done."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env, "superseded_by": "t_0c5ac29a -> #889"})
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.outcome == "superseded"
+        assert run.metadata["superseded_by"] == "t_0c5ac29a -> #889"
+        assert kb.get_task(conn, worker_env).status == "done"
+    finally:
+        conn.close()
+
+
+def test_complete_superseded_by_empty_is_refused(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env, "superseded_by": "   "})
+    assert "superseded_by" in out
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_still_requires_evidence_without_superseded_by(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env})
+    assert "summary" in out and "superseded_by" in out
+
+
+def test_complete_schema_exposes_superseded_by():
+    from tools.kanban_tools import KANBAN_COMPLETE_SCHEMA
+    props = KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+    assert "superseded_by" in props
+    assert props["superseded_by"]["type"] == "string"
