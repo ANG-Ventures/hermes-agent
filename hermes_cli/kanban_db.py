@@ -6462,6 +6462,73 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _prior_worker_still_alive(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    """Evidence that this card's PREVIOUS worker is STILL RUNNING, or ``None``.
+
+    Defence in depth behind :func:`reclaim_task`'s guard (scope item 3). If a
+    card reaches ``ready`` while its last worker is alive — because a reclaim
+    path missed the guard, because a row was hand-edited, or because an older
+    binary on another host re-queued it — this is the last line before two
+    workers share one workspace.
+
+    The test is EVIDENTIAL, not inferential: we only refuse when we can point
+    at a pid that is alive right now on this host. A missing pid is explicitly
+    NOT grounds to refuse here, because "no pid" is the steady state of every
+    card that was claimed and never spawned, and refusing those would wedge
+    them permanently (nothing would ever claim them again).
+
+    Returns the diagnostic payload for the refusal event, or ``None`` to allow.
+    """
+    row = conn.execute(
+        "SELECT id, status FROM task_runs WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "reclaimed":
+        return None
+
+    # _end_run clears task_runs.worker_pid when reclaiming. The durable
+    # spawned event is the only reliable record of the old process's pid.
+    # In the measured incident it arrived FIVE SECONDS after the reclaim:
+    # current_run_id was already NULL, so _set_worker_pid emitted it with
+    # run_id=NULL. Accept both the normal pre-reclaim event tied to the old
+    # run and this late-spawn shape, never an older run's event.
+    reclaimed = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'reclaimed' AND run_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id, row["id"]),
+    ).fetchone()
+    if reclaimed is None:
+        return None
+    try:
+        detail = json.loads(reclaimed["payload"] or "{}")
+        lock = detail.get("prev_lock") or ""
+    except (TypeError, ValueError):
+        return None
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if not str(lock).startswith(host_prefix):
+        return None
+    spawned = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'spawned' AND "
+        "((run_id = ? AND id < ?) OR (run_id IS NULL AND id > ?)) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, row["id"], reclaimed["id"], reclaimed["id"]),
+    ).fetchone()
+    if spawned is None:
+        return None
+    try:
+        pid = int(json.loads(spawned["payload"] or "{}")["pid"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    if _pid_alive(pid):
+        return {"prev_pid": pid, "prev_lock": lock,
+                "late_spawn": spawned["id"] > reclaimed["id"],
+                "needs_attention": True}
+    return None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6502,6 +6569,18 @@ def claim_task(
             _append_event(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
+            )
+            return None
+        # Last line of defence against two workers on one card (scope item 3).
+        # A ``ready`` card whose previous worker process is STILL ALIVE must
+        # not be claimed into a second concurrent run — that is exactly the
+        # t_09180e10 shape, where run 7394 was mid-flight when run 7414
+        # claimed the same card and both committed to the same file.
+        alive = _prior_worker_still_alive(conn, task_id)
+        if alive is not None:
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "prior_worker_still_alive", **alive},
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -6980,6 +7059,19 @@ def reclaim_task(
     when an operator wants to abort a running worker without waiting
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
+    If the worker was signalled but survived, or if this host holds the
+    claim but its worker pid cannot be resolved, reclamation FAILS CLOSED.
+    The card retains its owner and emits a ``reclaim_refused`` event marked
+    ``needs_attention``. A human must resolve the worker outside this path;
+    an operator request alone does not prove the worker is gone.
+
+    Measured incident ``t_09180e10`` (2026-09-22): the worker sweep saw
+    ``worker_pid IS NULL`` 197 s into a claim, called this function, and got
+    ``status='ready'`` back. The spawn was still in flight — the ``spawned``
+    event (pid 26401) landed **5 seconds after** the reclaim. The dispatcher
+    then claimed the re-queued card and started a second worker; both runs
+    committed to the same file 90 s apart.
+
     A reclaim releases a *claim*; it never promotes. Rows parked in
     ``blocked`` / ``triage`` / ``scheduled`` keep that status and only
     shed their stale claim residue — promoting them here would feed them
@@ -6987,7 +7079,8 @@ def reclaim_task(
     :func:`unblock_task` or :func:`promote_task` to actually re-queue one.
 
     Returns True if a reclaim happened, False if the task isn't in a
-    reclaimable state (not running, or doesn't exist).
+    reclaimable state (not running, or doesn't exist) or if the worker's
+    death cannot be proven.
     """
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
@@ -7002,6 +7095,14 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
+    # Never release a claim while our host-local worker is alive or its
+    # liveness is unknown. This also covers NULL pid in the TTL and stale
+    # paths that share the predicate. A request is not proof of death.
+    if _worker_survived_termination(termination):
+        _refuse_reclaim_unproven_death(
+            conn, task_id, prev_lock, termination, reason=reason,
+        )
+        return False
     # A reclaim RELEASES A CLAIM; it is not a promotion. Laundering a
     # ``blocked``/``triage``/``scheduled`` row into ``ready`` here hands it
     # straight to the dispatcher, which claims + spawns a worker on the next
@@ -12174,13 +12275,26 @@ def _terminate_reclaimed_worker(
         "terminated": False,
         "sigkill": False,
     }
-    if not pid or pid <= 0 or not claim_lock:
+    if not claim_lock:
         return info
 
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     if not str(claim_lock).startswith(host_prefix):
         return info
     info["host_local"] = True
+
+    if not pid or pid <= 0:
+        # OUR host holds this claim but no worker pid was ever stamped, so
+        # there is nothing to signal — and, critically, no evidence of death
+        # either. Flag that explicitly instead of returning a payload that
+        # looks identical to a clean "nothing to do".
+        #
+        # The pre-fix code returned here BEFORE setting host_local, so the
+        # event claimed the worker was some other host's problem. Measured on
+        # t_09180e10 (2026-09-22): `prev_pid: null, host_local: false` on a
+        # card whose lock was `mac-studio-m3u:71817` — our own host.
+        info["liveness_unprovable"] = True
+        return info
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
@@ -12221,19 +12335,69 @@ def _terminate_reclaimed_worker(
 
 
 def _worker_survived_termination(termination: dict) -> bool:
-    """True when we tried to kill our own host-local worker and it is still alive.
+    """True when a host-local worker has NOT been proven gone.
 
-    Reclaiming in this state would release the claim and let the dispatcher
-    spawn a second worker while the first is still running — the duplication
-    loop. Only host-local workers we actually signalled count: a non-local
-    claim lock or a no-op attempt (no ``os.kill`` available) must fall through
-    to the normal release path, since we cannot manage that worker anyway.
+    A signalled-but-still-alive worker is positive liveness evidence. A
+    missing pid is UNKNOWN liveness — not death evidence. Neither may release
+    the claim, because that would let the dispatcher spawn a second worker
+    beside the first. A proven-dead worker (including ProcessLookupError on
+    SIGTERM) and non-local claims use the normal release path.
     """
+    if not termination.get("host_local") or termination.get("terminated"):
+        return False
     return bool(
         termination.get("termination_attempted")
-        and termination.get("host_local")
-        and not termination.get("terminated")
+        or termination.get("liveness_unprovable")
     )
+
+
+def _refuse_reclaim_unproven_death(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    termination: dict,
+    *,
+    reason: Optional[str] = None,
+) -> None:
+    """Record a reclaim REFUSED because the worker was not proven dead.
+
+    Failing closed has to be visible or it is just a card that quietly stops
+    moving. The ``reclaim_refused`` event is what surfaces the card as
+    needs-attention: the claim, the run, and the status are left with their
+    existing owner. A human can inspect and terminate the worker out of band;
+    the next reclaim succeeds only after the worker pid is resolvable and
+    proven gone. A NULL-pid claim remains held, not silently retried.
+
+    ``claim_expires`` is extended the same way :func:`_defer_reclaim_for_live_worker`
+    does, so the TTL sweep cannot turn around and release on the next tick what
+    this call just refused to release.
+    """
+    now = int(time.time())
+    grace = now + RECLAIM_DEFER_GRACE_SECONDS
+    with write_txn(conn):
+        run_id = _current_run_id(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET claim_expires = ? "
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            (grace, task_id, claim_lock),
+        )
+        if cur.rowcount == 1 and run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                (grace, run_id),
+            )
+        payload = {
+            "reason": (
+                "liveness_unprovable"
+                if termination.get("liveness_unprovable")
+                else "worker_survived_termination"
+            ),
+            "requested_reason": reason,
+            "claim_lock": claim_lock,
+            "needs_attention": True,
+        }
+        payload.update(termination)
+        _append_event(conn, task_id, "reclaim_refused", payload, run_id=run_id)
 
 
 def _defer_reclaim_for_live_worker(
