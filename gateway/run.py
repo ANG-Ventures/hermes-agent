@@ -39050,7 +39050,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _stderr_handler = logging.StreamHandler(_safe_stderr())
         _stderr_handler.setLevel(_stderr_level)
         _stderr_handler.setFormatter(_gateway_stderr_formatter())
-        logging.getLogger().addHandler(_stderr_handler)
+        # Under launchd, stderr IS a file on the data volume
+        # (logs/gateway.error.log, 60 MB on 2026-09-23). Attached directly,
+        # this handler makes every WARNING+ emitted on the event loop a
+        # synchronous disk write: PHASE=event_loop_blocked seconds=10
+        # site=adapter.py:2396 _liveness_loop -> logging.emit -> stream.write,
+        # which is exactly the Discord heartbeat path, so a disk stall became
+        # an ack_stale reconnect. Route it through the same async QueueListener
+        # the rotating file handlers already use, so no loop thread ever waits
+        # on a log write.
+        from hermes_logging import _register_queued_handler as _queue_handler
+        _queue_handler(_stderr_handler)
         # Lower root logger level if needed so DEBUG records can reach the handler
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
