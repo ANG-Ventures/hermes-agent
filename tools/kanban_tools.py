@@ -831,13 +831,40 @@ def _handle_complete(args: dict, **kw) -> str:
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
     survivor_pr, survivor_ref = args.get("survivor_pr"), args.get("survivor_ref")
+    normalized: dict[str, object] = {}
     for value, name in ((survivor_pr, "survivor_pr"), (survivor_ref, "survivor_ref")):
-        if value is not None and not isinstance(value, str):
-            return tool_error(
-                f"{name} must be a string, got {type(value).__name__}"
-            )
-    survivor_pr = (survivor_pr or "").strip() or None
-    survivor_ref = (survivor_ref or "").strip() or None
+        # Repeatable and repository-qualified, matching --survivor-pr/--survivor-ref
+        # and kb.complete_task's Sequence. A multi-repository loss needs one
+        # claim PER vanished repository; a single string cannot express that,
+        # and the refusal that names the remedy would otherwise be unreachable
+        # from this surface.
+        if value is None:
+            normalized[name] = None
+            continue
+        if isinstance(value, str):
+            normalized[name] = value.strip() or None
+            continue
+        if isinstance(value, (list, tuple)):
+            claims = []
+            for index, item in enumerate(value):
+                if not isinstance(item, str):
+                    return tool_error(
+                        f"{name} must be a string or a list of strings; "
+                        f"element {index} is {type(item).__name__}"
+                    )
+                item = item.strip()
+                if item:
+                    claims.append(item)
+            # All-blank normalizes to None, never to [""] — an empty claim must
+            # not reach the verifier as a survivor the operator never made.
+            normalized[name] = claims or None
+            continue
+        return tool_error(
+            f"{name} must be a string or a list of strings, "
+            f"got {type(value).__name__}"
+        )
+    survivor_pr = normalized["survivor_pr"]
+    survivor_ref = normalized["survivor_ref"]
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -2073,7 +2100,8 @@ KANBAN_COMPLETE_SCHEMA = {
                 ),
             },
             "survivor_pr": {
-                "type": "string",
+                "type": ["string", "array"],
+                "items": {"type": "string"},
                 "description": (
                     "Only when completion already REFUSED with "
                     "``survivor_unavailable``: name the pull request that "
@@ -2083,12 +2111,20 @@ KANBAN_COMPLETE_SCHEMA = {
                     "OPEN or MERGED) and records it as the durable "
                     "survivor; an unverifiable claim still refuses. This "
                     "is the ``--survivor-pr`` escape hatch that error "
-                    "names. Never pass it speculatively — it authorises "
-                    "deleting a workspace whose work is not pushed."
+                    "names. Pass a LIST when more than one recorded "
+                    "repository vanished, qualifying every claim as "
+                    "``<workspace-relative-repo>=owner/repo#123`` — each "
+                    "vanished repository needs its own claim, an "
+                    "unqualified one stands only for a single lost "
+                    "repository, and a claim naming a repository still on "
+                    "disk is refused. Never pass it speculatively — it "
+                    "authorises deleting a workspace whose work is not "
+                    "pushed."
                 ),
             },
             "survivor_ref": {
-                "type": "string",
+                "type": ["string", "array"],
+                "items": {"type": "string"},
                 "description": (
                     "Alternative to ``survivor_pr`` when the work landed "
                     "on a branch or tag rather than a PR: "
@@ -2096,7 +2132,10 @@ KANBAN_COMPLETE_SCHEMA = {
                     "branch/tag tip on that remote or the completion "
                     "still refuses. Use a clean clone URL — a URL "
                     "carrying credentials is rejected, and is redacted "
-                    "before the rejection is echoed or logged."
+                    "before the rejection is echoed or logged. Repeatable "
+                    "as a list with the same "
+                    "``<workspace-relative-repo>=<claim>`` qualifier as "
+                    "``survivor_pr``."
                 ),
             },
             "board": _board_schema_prop(),
