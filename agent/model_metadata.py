@@ -576,6 +576,8 @@ DEFAULT_CONTEXT_LENGTHS = {
     # fell through to the `"claude": 200000` catch-all below and silently resolved
     # at a FIFTH of its real window. Keep each new frontier id in this block the
     # moment it ships; the catch-all is for legacy Claude 3.x only.
+    # Claude Opus 5.5 (1M context) — released 2026-09-22.
+    "claude-opus-5-5": 1000000,
     # (Substring match: this key also covers "claude-opus-5-fast", also 1M.)
     "claude-opus-5": 1000000,
     "claude-opus-4-8": 1000000,

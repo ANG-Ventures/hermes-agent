@@ -1846,3 +1846,29 @@ def test_gpt6_luna_cache_read_discount_and_tier():
     assert entry.cache_write_cost_per_million == Decimal("0.125")
     assert entry.tier_threshold_tokens == 272_000
     assert entry.cache_read_cost_per_million_above == Decimal("0.02")
+
+
+# ── Claude Opus 5.5 (2026-09-22) ───────────────────────────────────────────
+# Rollout gate: pricing must exist BEFORE any alias/slot points at the id, or
+# real turns bill $0 until the nightly reprice sweep notices (model-rollout §4).
+
+def test_opus_5_5_is_priced_at_official_rates_through_notional_relays():
+    """Official post: $4 in / $20 out / $0.20 cache read per M. Resolves for the
+    bare vendor id AND through the notional subscription relays (apr, bpx-N)."""
+    for provider in ("anthropic", "claude-apr", "custom:claude-apr", "custom:claude-bpx-12"):
+        route = resolve_billing_route("claude-opus-5-5", provider=provider)
+        assert route.provider == "anthropic", provider
+        assert route.billing_mode == "official_docs_snapshot", provider
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+    est = estimate_usage_cost("claude-opus-5-5", usage, provider="anthropic")
+    assert est.amount_usd == Decimal("24.00"), est
+
+
+def test_opus_5_5_prices_below_opus_5_on_the_same_usage():
+    """Invariant from the announcement (20% below Opus 5 on in/out), not a
+    snapshot: the successor must never price ABOVE its predecessor here."""
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=100_000)
+    new = estimate_usage_cost("claude-opus-5-5", usage, provider="anthropic")
+    old = estimate_usage_cost("claude-opus-5", usage, provider="anthropic")
+    assert new.status == old.status
+    assert new.amount_usd < old.amount_usd, (new.amount_usd, old.amount_usd)

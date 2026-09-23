@@ -453,6 +453,7 @@ class TestDefaultContextLengths:
         from unittest.mock import patch as mock_patch
 
         frontier = [
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-opus-5-fast",
             "claude-sonnet-5",

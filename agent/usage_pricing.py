@@ -567,6 +567,24 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-07",
     ),
+    # ── Anthropic Claude Opus 5.5 (2026-09-22) ──────────────────────────
+    # First Claude 5.5-family model. $4/$20 base (20% below Opus 5); cache
+    # read $0.20 (60% below Opus 5); cache write 1.25x input like every
+    # Opus generation. Same 1M context as Opus 5. Same NOTIONAL rule on the
+    # subscription relays; this entry prices the bare "anthropic" provider.
+    # Source: https://www.anthropic.com/news/claude-opus-5-5
+    (
+        "anthropic",
+        "claude-opus-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("4.00"),
+        output_cost_per_million=Decimal("20.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("5.00"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-09",
+    ),
     (
         "anthropic",
         "claude-opus-5-fast",
