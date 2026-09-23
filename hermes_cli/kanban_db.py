@@ -6470,15 +6470,19 @@ def _prior_worker_still_alive(
 
     A release outcome is not a death certificate: operator and worker calls
     can write identical outcomes, and a newer synthetic row can mask an older
-    owner. Inspect ended runs at both claim doors, before a second spawn.
-    A claimed-but-never-spawned run has no PID to probe here; its active claim
-    remains protected by the reclaim/reconcile guards.
+    owner. Inspect EVERY prior run at both claim doors, before a second
+    spawn -- ended or still open. An open run on a claimable card is a leaked
+    ``current_run_id`` (claim_task's invariant recovery closes it below); its
+    owner is exactly as able to be alive as an ended run's, so the ended_at
+    filter must not hide it. A claimed-but-never-spawned run has no PID to
+    probe here; its active claim remains protected by the reclaim/reconcile
+    guards.
     """
     # An outcome cannot certify exit: operators can write the same outcomes as
     # worker tools, and a newer synthetic row can hide an older live owner.
     runs = conn.execute(
-        "SELECT id, outcome, ended_at FROM task_runs WHERE task_id = ? "
-        "AND ended_at IS NOT NULL ORDER BY id DESC", (task_id,),
+        "SELECT id, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC", (task_id,),
     ).fetchall()
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     for row in runs:
@@ -6489,7 +6493,7 @@ def _prior_worker_still_alive(
 
 
 def _spawned_owner_alive(conn, task_id, row, host_prefix):
-    """Probe one ended run's spawned owner using its durable event evidence."""
+    """Probe one prior run's spawned owner(s) using durable event evidence."""
 
     # _end_run clears task_runs.worker_pid, so the durable claimed/spawned
     # events are the record. Both claim doors emit ``claimed`` with the lock
@@ -6526,25 +6530,32 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
         "SELECT MIN(id) FROM task_events WHERE task_id = ? "
         "AND kind = 'claimed' AND id > ?", (task_id, boundary_id),
     ).fetchone()[0]
-    spawned = conn.execute(
+    # Probe EVERY spawn in the interval, not just the newest: a run stamped
+    # twice leaves an older PID that a later dead one must not vouch for.
+    # _set_worker_pid is the only worker_pid writer and always appends this
+    # event in the same txn, so an open run's row pid is covered here too.
+    spawns = conn.execute(
         "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
         "AND kind = 'spawned' AND id >= ? "
         "AND (run_id = ? OR (run_id IS NULL AND (? IS NULL OR id < ?))) "
-        "ORDER BY id DESC LIMIT 1",
+        "ORDER BY id DESC",
         (task_id, boundary_id, row["id"], next_claim, next_claim),
-    ).fetchone()
-    if spawned is None:
-        return None
-    try:
-        pid = int(json.loads(spawned["payload"] or "{}")["pid"])
-    except (TypeError, ValueError, KeyError):
-        return None
-    if _pid_alive(pid):
-        return {"prev_pid": pid, "prev_lock": lock,
-                "prev_run_id": row["id"],
-                "prev_outcome": row["outcome"],
-                "late_spawn": spawned["run_id"] is None,
-                "needs_attention": True}
+    ).fetchall()
+    candidates = []
+    for spawned in spawns:
+        try:
+            pid = int(json.loads(spawned["payload"] or "{}")["pid"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        candidates.append((pid, spawned["run_id"] is None))
+    for pid, late in candidates:
+        if _pid_alive(pid):
+            return {"prev_pid": pid, "prev_lock": lock,
+                    "prev_run_id": row["id"],
+                    "prev_outcome": row["outcome"],
+                    "prev_run_open": row["ended_at"] is None,
+                    "late_spawn": late,
+                    "needs_attention": True}
     return None
 
 
