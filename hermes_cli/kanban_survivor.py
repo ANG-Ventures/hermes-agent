@@ -599,13 +599,28 @@ def _exact_commit_diff(repo, sha):
 
 
 def _landed_contains_history(workspace_repo, landed_repo, landed_sha):
-    """Return how ``landed_sha`` contains every committed workspace change."""
+    """Return how ``landed_sha`` contains the workspace's final committed tree."""
     workspace_head = _git(
         workspace_repo, "rev-parse", "--verify", "HEAD^{commit}", check=False,
     )
     if workspace_head.returncode:
         return None
     workspace_head = workspace_head.stdout.decode().strip()
+    # Historical ancestry and identical commit diffs can both be undone by a
+    # later canonical commit. Only the current live tree can authorize deletion.
+    touched = _git(workspace_repo, "log", "--name-only", "-z", "--format=", workspace_head, check=False)
+    live_head = _git(landed_repo, "rev-parse", "--verify", "HEAD^{commit}", check=False)
+    if touched.returncode or live_head.returncode or not touched.stdout:
+        return None
+    work_tree = _git(workspace_repo, "ls-tree", "-rz", "--full-tree", workspace_head, check=False)
+    live_tree = _git(landed_repo, "ls-tree", "-rz", "--full-tree", live_head.stdout.decode().strip(), check=False)
+    if work_tree.returncode or live_tree.returncode:
+        return None
+    def entries(tree):
+        return dict(item.split(b"\t", 1)[::-1] for item in tree.stdout.split(b"\0") if item)
+    work_entries, live_entries = entries(work_tree), entries(live_tree)
+    if any(work_entries.get(path) != live_entries.get(path) for path in set(touched.stdout.split(b"\0")) - {b""}):
+        return None
     if _git(
         landed_repo, "merge-base", "--is-ancestor", workspace_head, landed_sha,
         check=False,

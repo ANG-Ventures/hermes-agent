@@ -463,6 +463,103 @@ def test_landed_accepts_byte_identical_rewritten_workspace_history(board, tmp_pa
     assert not ws.exists()
 
 
+@pytest.mark.parametrize("rewritten", [False, True])
+def test_landed_rejects_work_reverted_from_canonical_head(board, tmp_path, rewritten):
+    source = init(tmp_path / "reverted-source")
+    commit(source, "implementation.py", "result = 0\n", "base")
+    tid = kb.create_task(board, title="reverted landed work")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    git(tmp_path, "clone", "--no-local", str(source), str(ws))
+    live = tmp_path / "reverted-live"
+    git(tmp_path, "clone", "--no-local", str(source), str(live))
+    for repo in (ws, live):
+        git(repo, "config", "user.name", "Test")
+        git(repo, "config", "user.email", "test@example.invalid")
+    work = commit(ws, "implementation.py", "result = 1\n", "workspace implementation")
+    if rewritten:
+        landed = commit(live, "implementation.py", "result = 1\n", "landed then removed")
+        assert landed != work
+        from hermes_cli.kanban_survivor import _exact_commit_diff
+        assert _exact_commit_diff(ws, work) == _exact_commit_diff(live, landed)
+    else:
+        git(live, "fetch", str(ws), "main")
+        git(live, "reset", "--hard", "FETCH_HEAD")
+    reverted = commit(live, "implementation.py", "result = 0\n", "revert implementation")
+    assert _execution_value(ws) == 1
+    assert _execution_value(live) == 0
+    kb.set_workspace_path(board, tid, ws)
+
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        kb.complete_task(board, tid, metadata={
+            "changed_files": ["implementation.py"],
+            "landed": [{"repo_path": str(live), "sha": reverted}],
+        })
+    assert ws.exists()
+    assert _execution_value(ws) == 1
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_landed_allows_unrelated_canonical_addition(board, tmp_path):
+    source = init(tmp_path / "addition-source")
+    commit(source, "implementation.py", "result = 0\n", "base")
+    tid = kb.create_task(board, title="canonical independent addition")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    git(tmp_path, "clone", "--no-local", str(source), str(ws))
+    git(ws, "config", "user.name", "Test")
+    git(ws, "config", "user.email", "test@example.invalid")
+    work = commit(ws, "implementation.py", "result = 1\n", "implementation")
+    live = tmp_path / "addition-live"
+    git(tmp_path, "clone", "--no-local", str(source), str(live))
+    git(live, "config", "user.name", "Test")
+    git(live, "config", "user.email", "test@example.invalid")
+    git(live, "fetch", str(ws), "main")
+    git(live, "reset", "--hard", "FETCH_HEAD")
+    commit(live, "independent.py", "other = 2\n", "unrelated addition")
+    kb.set_workspace_path(board, tid, ws)
+    assert kb.complete_task(board, tid, metadata={
+        "changed_files": ["implementation.py"],
+        "landed": [{"repo_path": str(live), "sha": work}],
+    })
+    assert not ws.exists()
+    assert _execution_value(live) == 1
+
+
+@pytest.mark.parametrize("restored", [False, True])
+def test_landed_checks_deleted_paths_and_modes_at_live_head(board, tmp_path, restored):
+    source = init(tmp_path / "mode-source")
+    commit(source, "implementation.py", "result = 1\n", "base")
+    tid = kb.create_task(board, title="deleted path or mode reverted")
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    git(tmp_path, "clone", "--no-local", str(source), str(ws))
+    live = tmp_path / "mode-live"
+    git(tmp_path, "clone", "--no-local", str(source), str(live))
+    for repo in (ws, live):
+        git(repo, "config", "user.name", "Test")
+        git(repo, "config", "user.email", "test@example.invalid")
+    if restored:
+        git(ws, "update-index", "--chmod=+x", "implementation.py")
+        git(ws, "commit", "-m", "make executable")
+    else:
+        (ws / "implementation.py").unlink()
+        git(ws, "add", "-u")
+        git(ws, "commit", "-m", "remove implementation")
+    git(live, "fetch", str(ws), "main")
+    git(live, "reset", "--hard", "FETCH_HEAD")
+    if restored:
+        git(live, "update-index", "--chmod=-x", "implementation.py")
+        git(live, "commit", "-m", "remove executable mode")
+    else:
+        commit(live, "implementation.py", "result = 1\n", "restore deleted path")
+    kb.set_workspace_path(board, tid, ws)
+    with pytest.raises(ValueError, match="survivor_unavailable"):
+        kb.complete_task(board, tid, metadata={
+            "changed_files": ["implementation.py"],
+            "landed": [{"repo_path": str(live), "sha": git(live, "rev-parse", "HEAD")}],
+        })
+    assert ws.exists()
+    assert kb.get_task(board, tid).status != "done"
+
+
 def test_landed_rejects_a_disposable_repository(board, tmp_path):
     """Pointing `landed` at the workspace itself must not authorise its deletion."""
     tid, ws, live, head, _ = home_clone(board, tmp_path)
