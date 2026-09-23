@@ -1938,6 +1938,29 @@ def _mask_read_only_python_paths(body: str) -> str:
         tree = ast.parse(body)
     except SyntaxError:
         return body
+    # A spelling is not an identity: rebinding any callable trusted by the
+    # diagnostic-loop recognizer can turn log data into executable input.
+    trusted_names = {"open", "reversed", "json", "len", "print", "Path", "set", "list"}
+    if any(
+        (isinstance(n, ast.Name) and n.id in trusted_names
+         and not isinstance(n.ctx, ast.Load))
+        or (isinstance(n, (ast.FunctionDef, ast.ClassDef, ast.arg))
+            and (n.name if not isinstance(n, ast.arg) else n.arg) in trusted_names)
+        or (isinstance(n, (ast.Import, ast.ImportFrom)) and any(
+            (a.asname or (a.name.split(".")[0] if isinstance(n, ast.Import) else a.name))
+            in trusted_names and not (
+                (isinstance(n, ast.Import) and a.name == "json" and a.asname is None)
+                or (isinstance(n, ast.ImportFrom) and n.module == "pathlib"
+                    and a.name == "Path" and a.asname is None)
+            ) for a in n.names
+        ))
+        or (isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Load))
+        or (isinstance(n, ast.Subscript) and not isinstance(n.ctx, ast.Load))
+        or (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in {"setattr", "delattr", "exec", "eval", "globals", "locals", "vars", "__import__"})
+        for n in ast.walk(tree)
+    ):
+        return body
     has_path = any(
         isinstance(node, ast.ImportFrom) and node.module == "pathlib"
         and any(alias.name == "Path" and alias.asname is None for alias in node.names)
@@ -1957,6 +1980,11 @@ def _mask_read_only_python_paths(body: str) -> str:
     for line in lines:
         offsets.append(offsets[-1] + len(line))
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    def only_binding(name: str, predicate) -> bool:
+        writes = [n for n in ast.walk(tree) if isinstance(n, ast.Name)
+                  and n.id == name and isinstance(n.ctx, (ast.Store, ast.Del))]
+        return len(writes) == 1 and isinstance(writes[0].ctx, ast.Store) and predicate(parents.get(writes[0]))
+
     open_shadowed = any(
         (isinstance(other, ast.Name) and other.id == "open" and isinstance(other.ctx, ast.Store))
         or (isinstance(other, (ast.FunctionDef, ast.ClassDef)) and other.name == "open")
@@ -1978,6 +2006,38 @@ def _mask_read_only_python_paths(body: str) -> str:
             split_call = parents.get(split_attr) if split_attr is not None else None
             reverse_call = parents.get(split_call) if split_call is not None else None
             loop = parents.get(reverse_call) if reverse_call is not None else None
+            parsers = {
+                target.id
+                for statement in loop.body for assignment in ast.walk(statement)
+                if isinstance(loop, ast.For) and isinstance(assignment, ast.Assign)
+                and isinstance(assignment.value, ast.Call)
+                and isinstance(assignment.value.func, ast.Attribute)
+                and isinstance(assignment.value.func.value, ast.Name)
+                and (assignment.value.func.value.id, assignment.value.func.attr) == ("json", "loads")
+                for target in assignment.targets if isinstance(target, ast.Name)
+            } if isinstance(loop, ast.For) else set()
+            parser = next(iter(parsers)) if len(parsers) == 1 else None
+            parser_safe = parser is not None and isinstance(loop, ast.For) and isinstance(loop.target, ast.Name) and only_binding(
+                parser,
+                lambda a: isinstance(a, ast.Assign) and isinstance(a.value, ast.Call)
+                and isinstance(a.value.func, ast.Attribute)
+                and isinstance(a.value.func.value, ast.Name)
+                and (a.value.func.value.id, a.value.func.attr) == ("json", "loads")
+                and len(a.targets) == 1 and len(a.value.args) == 1 and isinstance(a.value.args[0], ast.Name)
+                and a.value.args[0].id == loop.target.id and not a.value.keywords
+            )
+            methods = {(c.func.value.id, c.func.attr) for stmt in loop.body
+                       for c in ast.walk(stmt) if isinstance(c, ast.Call)
+                       and isinstance(c.func, ast.Attribute)
+                       and isinstance(c.func.value, ast.Name)} if isinstance(loop, ast.For) else set()
+            containers_safe = all(
+                only_binding(name, lambda a: isinstance(a, ast.Assign) and (
+                    isinstance(a.value, ast.List) and not a.value.elts if name == "out" else
+                    isinstance(a.value, ast.Call) and isinstance(a.value.func, ast.Name)
+                    and a.value.func.id == "set" and not a.value.args and not a.value.keywords
+                )) for name, method in (("seen", "add"), ("out", "append"))
+                if (name, method) in methods
+            )
             if (isinstance(read_attr, ast.Attribute) and read_attr.attr == "read"
                     and isinstance(read_call, ast.Call) and not read_call.args and not read_call.keywords
                     and isinstance(split_attr, ast.Attribute) and split_attr.attr == "splitlines"
@@ -1986,16 +2046,18 @@ def _mask_read_only_python_paths(body: str) -> str:
                     and reverse_call.func.id == "reversed" and reverse_call.args == [split_call]
                     and isinstance(loop, ast.For) and loop.iter is reverse_call
                     and node.end_lineno is not None and node.end_col_offset is not None
+                    and parser_safe and containers_safe
                     and all(
                         isinstance(call.func, ast.Name) and call.func.id in {"len", "print"}
                         or isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
                         and (call.func.value.id, call.func.attr) in {
-                            ("json", "loads"), ("d", "get"), ("seen", "add"), ("out", "append")
+                            ("json", "loads"), (parser, "get"),
+                            ("seen", "add"), ("out", "append")
                         }
                         or isinstance(call.func, ast.Attribute) and call.func.attr == "lower"
                         and isinstance(call.func.value, ast.Subscript)
                         and isinstance(call.func.value.value, ast.Name)
-                        and call.func.value.value.id == "d"
+                        and call.func.value.value.id in parsers
                         for statement in loop.body for call in ast.walk(statement)
                         if isinstance(call, ast.Call)
                     )):
