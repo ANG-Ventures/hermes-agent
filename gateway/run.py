@@ -17799,14 +17799,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+        # Reset the queue BEFORE loading the spool: the loader claims (deletes)
+        # the spool files, so a reset after it would drop every follow-up.
+        self._startup_restore_queue = []
+        self._startup_restore_tasks = []
         # Follow-ups the previous life could not run (spooled while draining)
         # enter the restore queue FIRST, ahead of anything newer.
         try:
             await self._load_restart_followups()
         except Exception:
             logger.debug("restart follow-up replay failed", exc_info=True)
-        self._startup_restore_queue = []
-        self._startup_restore_tasks = []
         self._startup_restore_watchdog_task = asyncio.create_task(
             self._startup_restore_gate_watchdog()
         )
