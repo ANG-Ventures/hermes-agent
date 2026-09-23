@@ -10,7 +10,9 @@ was therefore structurally unreachable for that state.
 These tests pin the remedy AND the guard: an operator-named, remote-VERIFIED
 survivor satisfies the card; anything less still fails closed.
 """
+import argparse
 import json
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -1053,9 +1055,19 @@ def test_the_multi_repository_refusal_names_a_remedy_that_actually_works(
     message = str(excinfo.value)
     assert "gone1" in message and "gone2" in message
     assert "<repository>=<claim>" in message, message
-    assert "--survivor-pr gone1=" in message, (
-        "the hint must name the qualified form, not a flag shape that cannot satisfy this state"
-    )
+
+    # Assert the hint by ROUND-TRIP, not by its spelling. The exact spelling is
+    # `hint_arg`'s business (it quotes whatever the shell would re-lex, and the
+    # `owner/repo#N` template contains `#`), so pinning `--survivor-pr gone1=`
+    # here would be a shape assertion that fails on a correct escaping change.
+    # What must hold is that the printed token binds `gone1` as the repository.
+    printed = message.split("e.g. ", 1)[1].strip()
+    words = shlex.split(printed)
+    parser = argparse.ArgumentParser(prog="p", add_help=False)
+    parser.add_argument("--survivor-pr", action="append")
+    bound = parser.parse_args(words).survivor_pr
+    assert bound, f"the hint {printed!r} bound no value"
+    assert survivor._split_qualifier(bound[0])[0] == "gone1", printed
 
     # And that form actually completes the card.
     out = survivor.preserve(board, tid, workspace=ws,

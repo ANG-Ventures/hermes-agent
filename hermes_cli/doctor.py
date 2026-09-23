@@ -31,6 +31,7 @@ _DHH = display_hermes_home()  # user-facing display path (e.g. ~/.hermes or ~/.h
 _env_path = get_env_path()
 load_hermes_dotenv(hermes_home=_env_path.parent, project_env=PROJECT_ROOT / ".env")
 
+from hermes_cli.cli_hint import hint_value
 from hermes_cli.colors import Colors, color
 from hermes_cli.models import _HERMES_USER_AGENT
 from hermes_cli.vercel_auth import describe_vercel_auth
@@ -2676,9 +2677,9 @@ def run_doctor(args):
                     # manual fix command for these build-tool advisories.
                     fix_cmd = None
                 elif audit_extra == ["--workspaces=false"]:
-                    fix_cmd = f"cd {npm_dir} && npm audit fix --workspaces=false"
+                    fix_cmd = f"cd {hint_value(npm_dir)} && npm audit fix --workspaces=false"
                 else:
-                    fix_cmd = f"cd {npm_dir} && npm audit fix"
+                    fix_cmd = f"cd {hint_value(npm_dir)} && npm audit fix"
                 if total == 0:
                     check_ok(f"{label} deps", "(no known vulnerabilities)")
                 elif critical > 0 or high > 0:

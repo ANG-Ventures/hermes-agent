@@ -2,46 +2,67 @@
 
 An error message that tells the operator what to type is a remedy only if the
 printed string WORKS when pasted. Interpolating a user-controlled token (a
-repository key, a filesystem path) into a bare ``--flag <token>`` form breaks
-for two token shapes, and breaks in the SHELL and in ARGPARSE respectively:
+repository key, a filesystem path) bare into a printed command line breaks in
+two layers, and the SHELL layer runs first:
 
-* a token beginning with ``-`` -- argparse binds the next token as an option
-  rather than as the value and refuses with ``expected one argument``;
-* a token containing whitespace -- the shell splits it into two words before
-  argparse ever sees it, so the trailing half arrives as a stray positional.
+* the SHELL re-lexes the printed text, so a token containing whitespace splits
+  into two words, a token containing ``;&|()`` is read as a control operator or
+  a syntax error, ``{a,b}`` brace-expands, ``*?[]`` glob against the operator's
+  CWD, and ``$VAR`` / ``` `cmd` ``` / ``$(cmd)`` / ``~`` EXPAND OR EXECUTE --
+  the printed remedy runs something the tool never intended;
+* ARGPARSE then binds a token beginning with ``-`` as an option rather than as
+  the value and refuses with ``expected one argument``.
 
-Both print a remedy that does not parse, which leaves the very state the
-message exists to escape with no accepted input at all. ``hint_arg`` is the
-single place that knows the two escaping rules, so a hint site gets them by
-calling it instead of re-deriving them.
+Either way the state the message exists to escape ends up with no accepted
+input at all, and the glob case is worse than broken: it binds a DIFFERENT
+value, silently, only when a matching name happens to exist in the CWD.
+
+``hint_arg`` (flag + value) and ``hint_value`` (a bare positional token, e.g.
+the path in ``cd <path>``) are the single place that knows those rules, so a
+hint site gets them by calling one instead of re-deriving them.
 """
 from __future__ import annotations
 
 import shlex
 
-__all__ = ["hint_arg"]
+__all__ = ["hint_arg", "hint_value"]
+
+
+def _is_shell_literal(value: str) -> bool:
+    """True when a real shell passes `value` through as exactly itself.
+
+    Decided by ``shlex.quote``, which is the INVERSE of the question: it
+    returns the token unchanged exactly when no shell metacharacter needs
+    escaping. Deciding instead by ``shlex.split`` -- "does it tokenize to one
+    word" -- under-approximates a shell, because ``shlex.split`` models only
+    quoting and whitespace: it reports ``$HOME``, ``` `id` ``` and ``star*glob``
+    as single clean words that a real ``/bin/bash`` expands, executes or globs.
+    A metacharacter denylist is the same guess that produced the original bug.
+    """
+    return shlex.quote(value) == value
 
 
 def hint_arg(flag: str, value: str) -> str:
     """Render ``flag``/``value`` as a shell- and argparse-safe argument pair.
 
-    Returns the plain ``--flag value`` form when `value` needs no escaping --
-    that is the spelling an operator expects to read, and it is what the great
-    majority of tokens get. Otherwise returns the quoted ``'--flag=value'``
-    form: the attached ``=`` is the only spelling argparse accepts for a value
-    beginning with ``-``, and the quotes are what stop the shell splitting a
-    value containing whitespace.
-
-    The "needs no escaping" test is measured, not assumed: the token must
-    survive ``shlex.split`` as exactly one unchanged word. Deciding by a
-    denylist of metacharacters is the same guess that produced the bug.
+    Returns the plain ``--flag value`` form when `value` is a shell literal --
+    that is the spelling an operator expects to read, and it is what ordinary
+    repository keys and paths get. Otherwise returns the quoted
+    ``'--flag=value'`` form: the attached ``=`` is the only spelling argparse
+    accepts for a value beginning with ``-``, and the quoting is what stops the
+    shell splitting, expanding or executing the rest.
     """
     value = str(value)
-    if not value.startswith("-"):
-        try:
-            if shlex.split(value) == [value]:
-                return f"{flag} {value}"
-        except ValueError:
-            # Unbalanced quotes -- the shell would not accept it bare at all.
-            pass
+    if not value.startswith("-") and _is_shell_literal(value):
+        return f"{flag} {value}"
     return shlex.quote(f"{flag}={value}")
+
+
+def hint_value(value: str) -> str:
+    """Render a bare positional token (``cd <here>``, ``rm <this>``) safely.
+
+    Same shell rule as `hint_arg` without the argparse half: a positional is
+    not read as an option, so a leading ``-`` needs no ``=`` spelling, but the
+    shell still re-lexes the token and quoting is still what stops it.
+    """
+    return shlex.quote(str(value))
