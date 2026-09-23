@@ -1992,6 +1992,10 @@ def _mask_read_only_python_paths(body: str) -> str:
                         and (call.func.value.id, call.func.attr) in {
                             ("json", "loads"), ("d", "get"), ("seen", "add"), ("out", "append")
                         }
+                        or isinstance(call.func, ast.Attribute) and call.func.attr == "lower"
+                        and isinstance(call.func.value, ast.Subscript)
+                        and isinstance(call.func.value.value, ast.Name)
+                        and call.func.value.value.id == "d"
                         for statement in loop.body for call in ast.walk(statement)
                         if isinstance(call, ast.Call)
                     )):

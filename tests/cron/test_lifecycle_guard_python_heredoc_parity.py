@@ -46,6 +46,7 @@ def test_chained_sql_reads_and_original_open_loop_match_file_verdict(tmp_path):
         "    try: d=json.loads(line)\n"
         "    except: continue\n"
         "    if d.get('type')!='intake': continue\n"
+        "    k=f\"{d['repo'].lower()}#{d['pr']}\"\n"
         "    print(d)\n"
     )
     heredoc, file_command = _forms(tmp_path, body)
