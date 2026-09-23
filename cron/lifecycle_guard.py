@@ -9,6 +9,7 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -1090,6 +1091,51 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 
 # --- recursive walk ---------------------------------------------------------------------------
 
+def _mask_read_only_python_paths(body: str) -> str:
+    """Mask literal Path(...).read_* operands, not paths passed to executors."""
+    if not body.isascii():  # AST columns are UTF-8 byte offsets; fail closed on non-ASCII.
+        return body
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return body
+    if not any(
+        isinstance(node, ast.ImportFrom) and node.module == "pathlib"
+        and any(alias.name == "Path" and alias.asname is None for alias in node.names)
+        for node in ast.walk(tree)
+    ) or any(
+        (isinstance(node, ast.Name) and node.id == "Path" and isinstance(node.ctx, ast.Store))
+        or (isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == "Path")
+        or (isinstance(node, ast.arg) and node.arg == "Path")
+        or (isinstance(node, ast.ImportFrom) and node.module != "pathlib"
+            and any(alias.asname == "Path" or alias.name == "Path" for alias in node.names))
+        for node in ast.walk(tree)
+    ):
+        return body
+    offsets = [0]
+    for line in body.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    spans = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in {"read_text", "read_bytes"}:
+            continue
+        path_call = node.func.value
+        if not (isinstance(path_call, ast.Call) and isinstance(path_call.func, ast.Name)
+                and path_call.func.id == "Path" and len(path_call.args) == 1
+                and isinstance(path_call.args[0], ast.Constant)
+                and isinstance(path_call.args[0].value, str)
+                and path_call.end_lineno is not None and path_call.end_col_offset is not None):
+            continue
+        start = offsets[path_call.lineno - 1] + path_call.col_offset
+        end = offsets[path_call.end_lineno - 1] + path_call.end_col_offset
+        spans.append((start, end))
+    for start, end in sorted(spans, reverse=True):
+        body = body[:start] + "read_only_path" + body[end:]
+    return body
+
+
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
@@ -1114,9 +1160,21 @@ def _contains_unsafe_gateway_action(
     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
     # path or `sh -c` payload inside a provably-inert heredoc body is never shell-executed, and an
     # oversized data file mentioned there otherwise fails closed as a "script".
-    from tools.shell_heredoc import strip_inert_heredoc_bodies
+    from tools.shell_heredoc import (
+        _inert_heredoc_ranges,
+        inert_python_heredoc_bodies,
+        strip_inert_heredoc_bodies,
+    )
 
     walk_command = strip_inert_heredoc_bodies(command)
+    # Python stdin is executable Python source, not a shell script. Give it
+    # the same lifecycle scan as a .py file without walking its path strings.
+    python_bodies = inert_python_heredoc_bodies(command)
+    for body in python_bodies:
+        if not budget.charge_text(body):
+            return _budget_exhausted(budget, "text", depth)
+        if _direct_lifecycle_scan(body):
+            return True
 
     for payload in _iter_shell_command_payloads(walk_command):
         if recurse(payload, cwd, executed):
@@ -1128,7 +1186,13 @@ def _contains_unsafe_gateway_action(
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
     candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
     if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+        # Preserve the mentioned-path walk for unknown Python calls and other
+        # inert consumers, excluding only statically identified read-only data.
+        _ranges, python_ranges = _inert_heredoc_ranges(command)
+        mentioned_command = command
+        for (start, end), body in reversed(list(zip(python_ranges, python_bodies))):
+            mentioned_command = mentioned_command[:start] + _mask_read_only_python_paths(body) + mentioned_command[end:]
+        candidates += [(path, False) for path in _iter_referenced_shell_scripts(mentioned_command, cwd=cwd)]
 
     for script_path, candidate_executed in candidates:
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
