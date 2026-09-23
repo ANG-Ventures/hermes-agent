@@ -99,7 +99,6 @@ def _repo_root() -> Path:
 # ``tests/gateway/test_weixin_state_write_off_loop.py`` rather than via this
 # baseline.  Do not read "absent from REACHABLE_BASELINE" as "off the loop".
 REACHABLE_BASELINE = frozenset({
-    "gateway/platforms/api_server.py _handle_artifact_upload -> os.fsync",
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
     "gateway/run.py _handle_message -> atomic_replace",
     # Re-keyed, NOT introduced, by the transcript-spool fix: this coroutine's
