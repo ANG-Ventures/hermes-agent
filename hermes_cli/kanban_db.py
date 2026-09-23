@@ -6462,48 +6462,34 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
-# Run outcomes written by the worker's OWN terminal call. That process
-# released the card itself and is exiting, so a successor claim is not a
-# presumption about its liveness. Every other outcome is.
-_SELF_DECLARED_RUN_OUTCOMES = frozenset({
-    "completed", "superseded", "blocked", "review_requested",
-    "changes_requested",
-})
-
 
 def _prior_worker_still_alive(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[dict]:
-    """Evidence that this card's PREVIOUS worker is STILL RUNNING, or ``None``.
+    """Evidence that ANY previous spawned owner still lives on this host.
 
-    Defence in depth behind :func:`reclaim_task`'s guard (scope item 3). If a
-    card reaches ``ready`` while its last worker is alive — because a reclaim
-    path missed the guard, because a row was hand-edited, or because an older
-    binary on another host re-queued it — this is the last line before two
-    workers share one workspace.
-
-    The test is EVIDENTIAL, not inferential: we only refuse when we can point
-    at a pid that is alive right now on this host. A missing pid is explicitly
-    NOT grounds to refuse here, because "no pid" is the steady state of every
-    card that was claimed and never spawned, and refusing those would wedge
-    them permanently (nothing would ever claim them again).
-
-    Returns the diagnostic payload for the refusal event, or ``None`` to allow.
+    A release outcome is not a death certificate: operator and worker calls
+    can write identical outcomes, and a newer synthetic row can mask an older
+    owner. Inspect ended runs at both claim doors, before a second spawn.
+    A claimed-but-never-spawned run has no PID to probe here; its active claim
+    remains protected by the reclaim/reconcile guards.
     """
-    # The discriminator is HOW the previous run ended, not which event kind
-    # the releaser happened to write. Every release that the worker did not
-    # declare itself (reclaim, TTL, stale, timeout, crash, reconcile,
-    # dashboard move, parent reopen, give-up, ...) is a presumption about the
-    # old process, so it is checked. Only the worker's OWN terminal calls are
-    # exempt: that process consented to the release and exits right after.
-    row = conn.execute(
+    # An outcome cannot certify exit: operators can write the same outcomes as
+    # worker tools, and a newer synthetic row can hide an older live owner.
+    runs = conn.execute(
         "SELECT id, outcome, ended_at FROM task_runs WHERE task_id = ? "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if row is None or row["ended_at"] is None:
-        return None
-    if (row["outcome"] or "") in _SELF_DECLARED_RUN_OUTCOMES:
-        return None
+        "AND ended_at IS NOT NULL ORDER BY id DESC", (task_id,),
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    for row in runs:
+        alive = _spawned_owner_alive(conn, task_id, row, host_prefix)
+        if alive is not None:
+            return alive
+    return None
+
+
+def _spawned_owner_alive(conn, task_id, row, host_prefix):
+    """Probe one ended run's spawned owner using its durable event evidence."""
 
     # _end_run clears task_runs.worker_pid, so the durable claimed/spawned
     # events are the record. Both claim doors emit ``claimed`` with the lock
@@ -6531,16 +6517,21 @@ def _prior_worker_still_alive(
                 or detail.get("claim_lock") or detail.get("stale_lock") or "")
         if lock:
             break
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     if not str(lock).startswith(host_prefix):
         return None
     boundary_id = min(ev["id"] for ev in run_events)
+    # An unattributed legacy spawn belongs only to this claim interval;
+    # otherwise an older run could borrow a newer run's PID.
+    next_claim = conn.execute(
+        "SELECT MIN(id) FROM task_events WHERE task_id = ? "
+        "AND kind = 'claimed' AND id > ?", (task_id, boundary_id),
+    ).fetchone()[0]
     spawned = conn.execute(
         "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
         "AND kind = 'spawned' AND id >= ? "
-        "AND (run_id = ? OR run_id IS NULL) "
+        "AND (run_id = ? OR (run_id IS NULL AND (? IS NULL OR id < ?))) "
         "ORDER BY id DESC LIMIT 1",
-        (task_id, boundary_id, row["id"]),
+        (task_id, boundary_id, row["id"], next_claim, next_claim),
     ).fetchone()
     if spawned is None:
         return None

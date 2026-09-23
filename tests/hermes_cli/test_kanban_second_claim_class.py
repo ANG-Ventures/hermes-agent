@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import time
 
 import pytest
@@ -141,7 +142,7 @@ def test_dashboard_move_proceeds_when_worker_proven_dead(conn, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Claim guard is keyed on how the run ended, not on a 'reclaimed' event.
+# Claim guard uses spawned owner evidence, regardless of run outcome/event.
 # ---------------------------------------------------------------------------
 
 
@@ -164,15 +165,72 @@ def test_claim_guard_catches_live_owner_released_without_reclaimed_event(
     assert rej[-1]["prev_pid"] == 424242
 
 
-def test_claim_guard_ignores_workers_own_terminal_call(conn, monkeypatch):
-    """A worker that blocked itself is exiting by its own hand; unblocking
-    must not wait on it (self-declared outcomes are exempt)."""
-    tid, first = _live_claim(conn, "self-declared")
-    assert kb.block_task(conn, tid, reason="need input",
-                         expected_run_id=first.current_run_id)
+@pytest.mark.parametrize("release", ["block", "review", "complete", "changes"])
+def test_operator_terminal_outcome_does_not_certify_worker_exit(conn, monkeypatch, release):
+    tid, first = _live_claim(conn, "operator release")
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 424242)
+    if release == "block":
+        assert kb.block_task(conn, tid, reason="operator")
+        assert kb.unblock_task(conn, tid)
+    elif release == "review":
+        assert kb.request_review(conn, tid, summary="operator", reviewer="worker", force=True)
+    elif release == "complete":
+        assert kb.complete_task(conn, tid, summary="operator")
+        assert api._set_status_direct(conn, tid, "ready")
+        assert kb.claim_task(conn, tid) is None
+        assert _events(conn, tid, "claim_rejected")[-1]["reason"] == "prior_worker_still_alive"
+        return
+    else:
+        assert kb.request_review(conn, tid, summary="for review", reviewer="worker",
+                                 expected_run_id=first.current_run_id)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        kb._set_worker_pid(conn, tid, 525252)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 525252)
+        assert kb.request_changes(conn, tid, reason="operator")
+    spawned, _ = _dispatch(conn)
+    assert tid not in spawned
+    assert _events(conn, tid, "claim_rejected")[-1]["reason"] == "prior_worker_still_alive"
+
+
+def test_ended_synthetic_run_cannot_mask_older_live_owner(conn, monkeypatch):
+    tid, _ = _live_claim(conn, "synthetic mask")
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 424242)
+    _external_release(conn, tid)
+    assert kb.claim_task(conn, tid) is None
+    assert kb.block_task(conn, tid, reason="operator pause")
     assert kb.unblock_task(conn, tid)
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    spawned, _ = _dispatch(conn)
+    assert tid not in spawned
+    assert _events(conn, tid, "claim_rejected")[-1]["prev_pid"] == 424242
+
+
+def test_real_process_survives_operator_block_without_second_spawn(conn):
+    tid = kb.create_task(conn, title="real PID operator release", assignee="worker")
     assert kb.claim_task(conn, tid) is not None
+    proc = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        kb._set_worker_pid(conn, tid, proc.pid)
+        assert kb.block_task(conn, tid, reason="operator pause")
+        assert kb.unblock_task(conn, tid)
+        spawned, _ = _dispatch(conn)
+        assert proc.poll() is None
+        assert tid not in spawned
+        assert _events(conn, tid, "claim_rejected")[-1]["prev_pid"] == proc.pid
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_terminal_release_allows_proven_dead_worker(conn, monkeypatch):
+    tid, _ = _live_claim(conn, "dead self-release")
+    assert kb.block_task(conn, tid, reason="operator")
+    assert kb.unblock_task(conn, tid)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    spawned, _ = _dispatch(conn)
+    assert tid in spawned
 
 
 # ---------------------------------------------------------------------------
