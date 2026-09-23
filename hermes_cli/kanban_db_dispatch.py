@@ -922,6 +922,12 @@ def _error_fingerprint(error_text: str) -> str:
 # nor extend it. Per-task ``max_retries`` overrides it.
 _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 
+# Identical clean exits (same final worker output) that end the retry budget
+# early. Two is the smallest number that distinguishes "reproduced" from
+# "happened once": three identical clean exits were never going to become a
+# fourth different one, and each costs a worker slot + quota.
+_PROTOCOL_VIOLATION_REPRODUCED_LIMIT = 2
+
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
@@ -936,7 +942,24 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ``protocol_violation`` run-metadata marker, with the error text as fallback
     for runs recorded before the marker existed.
     """
+    return _protocol_violation_history(conn, task_id)[0]
+
+
+def _protocol_violation_history(conn: sqlite3.Connection, task_id: str) -> tuple[int, int]:
+    """``(streak, identical_repeats)`` over the trailing violation run.
+
+    ``identical_repeats`` is how many of those violations exited with the SAME
+    final worker output as the newest one. A worker that reproduces its own
+    clean exit verbatim is not converging: the usual cause is a card whose
+    premise was already satisfied before dispatch, which had no honest terminal
+    verb before ``kanban_complete(superseded_by=...)``. Retrying that costs a
+    worker slot and produces the identical run again, so
+    :func:`_account_crashes` trips on the repeat instead of spending the whole
+    budget.
+    """
     streak = 0
+    newest_output: Optional[str] = None
+    identical = 0
     rows = conn.execute(
         "SELECT outcome, error, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
@@ -947,14 +970,30 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
+        meta = _kb._json_dict(row["metadata"])
         if outcome == "crashed" and (
-            _kb._json_dict(row["metadata"]).get("protocol_violation")
+            meta.get("protocol_violation")
             or "protocol violation" in (row["error"] or "")
         ):
             streak += 1
+            output = _violation_output_fingerprint(meta)
+            if streak == 1:
+                newest_output = output
+                identical = 1 if output else 0
+            elif output and output == newest_output and identical == streak - 1:
+                identical += 1
             continue
         break
-    return streak
+    return streak, identical
+
+
+def _violation_output_fingerprint(metadata: dict) -> str:
+    """Normalized final worker output of a violation run; "" when unavailable.
+
+    Unavailable must never compare equal: two runs with no recorded output say
+    nothing about each other, so the early trip stays off.
+    """
+    return " ".join(str(metadata.get("worker_output") or "").split())[:400]
 
 
 _PROTOCOL_VIOLATION_ERROR = (
@@ -967,10 +1006,9 @@ _PROTOCOL_VIOLATION_ERROR = (
     # truncates away the worker's explanation, which is the part the board and the retry worker need.
     "worker exited cleanly (rc=0) without kanban_complete, kanban_block "
     "or kanban_request_review — protocol violation. "
-    "If the prior run already did the work, verify it and "
-    "report it via kanban_complete (or kanban_request_review); "
-    "a run without a terminal kanban call counts as failed no "
-    "matter what it did."
+    "If the work is already done, verify and report it via kanban_complete "
+    "(superseded_by=<card|PR|sha> if a sibling got there first); a run "
+    "without a terminal kanban call counts as failed."
 )
 
 
@@ -1221,7 +1259,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
         if dead.protocol_violation:
-            streak = _protocol_violation_streak(conn, tid)
+            streak, identical = _protocol_violation_history(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
             if trow is None:
                 continue  # task deleted mid-loop
@@ -1229,10 +1267,36 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
             violation_limit = (
                 int(task_override) if task_override is not None else _PROTOCOL_VIOLATION_FAILURE_LIMIT
             )
-            if streak < violation_limit:
+            # Two byte-identical clean exits are a REPRODUCED no-op, not a flake:
+            # the worker reached the same dead end twice, so a third spawn buys
+            # nothing. Stop early and surface it as needing input rather than
+            # burning the rest of the budget on the same run. (The common cause —
+            # a premise already satisfied on main — now has an honest verb:
+            # ``kanban_complete(superseded_by=...)``.)
+            reproduced = identical >= _PROTOCOL_VIOLATION_REPRODUCED_LIMIT
+            if streak < violation_limit and not reproduced:
                 # Below budget: already back at ``ready`` with the error stamped.
                 # No ``_record_task_failure`` — must not consume the unified budget.
                 continue
+            extra = {
+                "pid": pid,
+                "claimer": claimer,
+                "protocol_violations": streak,
+                "protocol_violation_limit": violation_limit,
+            }
+            if reproduced:
+                extra["identical_violations"] = identical
+                extra["stopped_early"] = "reproduced_clean_exit"
+                # Prepended, not appended: ``_record_task_failure`` caps the
+                # stored error at 500 chars and the canned violation text plus
+                # the worker's own output already fills it, so a trailing hint
+                # would be truncated away before an operator ever sees it.
+                error_text = (
+                    f"Stopped retrying after {identical} IDENTICAL clean exits — the worker "
+                    "reproduced the same no-op, so this needs input, not another attempt. If "
+                    "the card's premise was already satisfied, close it with `hermes kanban "
+                    f"complete {tid} --superseded-by <card|PR|sha>`. {error_text}"
+                )
             # ``force_trip``: the decision (incl. per-task ``max_retries``) was
             # already made against the violation streak above.
             tripped = _record_task_failure(
@@ -1243,12 +1307,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 force_trip=True,
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={
-                    "pid": pid,
-                    "claimer": claimer,
-                    "protocol_violations": streak,
-                    "protocol_violation_limit": violation_limit,
-                },
+                event_payload_extra=extra,
             )
         elif dead.terminal_provider:
             # A retry cannot heal a revoked credential or a missing model, so
@@ -1569,7 +1628,7 @@ def check_respawn_guard(
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
         "SELECT ended_at FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
+        "WHERE task_id = ? AND outcome IN " + _kb._SUCCESS_RUN_OUTCOMES_SQL + " AND ended_at >= ? "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id, cutoff),
     ).fetchone()

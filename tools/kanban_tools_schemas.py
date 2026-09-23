@@ -102,10 +102,25 @@ KANBAN_COMPLETE_SCHEMA = _schema(
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. If you verify "
+        "the card's premise NO LONGER HOLDS — the work already landed on "
+        "current main via a sibling card, PR or commit — do not exit "
+        "silently: complete with ``superseded_by`` pointing at whatever "
+        "satisfied it."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "superseded_by": _prop("string", (
+                "Evidence pointer for a card whose premise was ALREADY "
+                "SATISFIED before you got to it — the card id, PR url, or "
+                "commit sha that did the work (e.g. \"t_0c5ac29a -> "
+                "#889\"). Closes the task done with outcome "
+                "``superseded`` and requires no ``summary``/``result``: "
+                "the pointer IS the evidence, and there is no artifact to "
+                "hand off. Only use it after you VERIFIED the premise "
+                "against current main — and never with an empty value, "
+                "which is refused. Leave it unset for ordinary work."
+        )),
         "summary": _prop("string", (
                 "Human-readable handoff, 1-3 sentences. Appears in "
                 "Run History on the dashboard and in downstream "

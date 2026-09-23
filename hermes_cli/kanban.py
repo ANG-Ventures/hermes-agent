@@ -904,11 +904,12 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     if rc:
         return rc
     summary = getattr(args, "summary", None)
+    superseded_by = getattr(args, "superseded_by", None)
     raw_meta = getattr(args, "metadata", None)
     # Handoff fields are per-run; refuse to copy them across N runs.
-    if len(ids) > 1 and (summary or raw_meta):
-        return _err("kanban: --summary / --metadata are per-task and can't be used "
-                    "with multiple ids (would apply the same handoff to every task). "
+    if len(ids) > 1 and (summary or raw_meta or superseded_by):
+        return _err("kanban: --summary / --metadata / --superseded-by are per-task and can't "
+                    "be used with multiple ids (would apply the same handoff to every task). "
                     "Complete tasks one at a time, or drop the flags for the bulk close.", 2)
     metadata, rc = _parse_metadata_flag(raw_meta)
     if rc:
@@ -916,17 +917,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def op(tid):
-            gate_err = _goal_gate_error(
-                conn, tid, (summary or args.result or "").strip(), "completion",
-                "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
-                "Provide evidence matching the task's acceptance criteria.")
-            if gate_err:
-                fail_msg[tid] = gate_err
-                return False
+            if superseded_by is None:
+                gate_err = _goal_gate_error(
+                    conn, tid, (summary or args.result or "").strip(), "completion",
+                    "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
+                    "Provide evidence matching the task's acceptance criteria.")
+                if gate_err:
+                    fail_msg[tid] = gate_err
+                    return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
+                                        superseded_by=superseded_by,
                                         force=bool(getattr(args, "force", False)))
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
@@ -934,8 +937,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                  f"--force to close its run and complete anyway.")
                 return False
             except kb.EmptyCompletionError as empty_err:
-                fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
-                                 f"describing what was done (an empty completion is not evidence).")
+                fail_msg[tid] = (
+                    f"cannot complete {tid}: {empty_err}."
+                    if getattr(empty_err, "superseded", False) else
+                    f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
+                    f"describing what was done (an empty completion is not evidence).")
                 return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;

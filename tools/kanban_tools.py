@@ -664,9 +664,13 @@ def _handle_complete(args: dict, **kw) -> str:
     created_cards = _coerce_str_list(
         args.get("created_cards"), "created_cards", "task ids", strip=True)
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
+    superseded_by = _redact_opt(args.get("superseded_by"))
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
-    _check(summary or result, "provide at least one of: summary (preferred), result")
+    _check(
+        summary or result or superseded_by is not None,
+        "provide at least one of: summary (preferred), result — or superseded_by "
+        "if the card's premise was already satisfied elsewhere")
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
@@ -674,11 +678,18 @@ def _handle_complete(args: dict, **kw) -> str:
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        # A superseded close asserts the card's premise no longer holds — there is
+        # no work for the judge to grade against the acceptance criteria, and
+        # gating it would put the worker right back in the "no honest verb, exit
+        # silently" trap this disposition exists to remove. The pointer is the
+        # evidence and it is durable on the run + event.
+        if superseded_by is None:
+            _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=_worker_run_id(tid),
+                superseded_by=superseded_by)
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -709,10 +720,16 @@ def _handle_complete(args: dict, **kw) -> str:
         except kb.EmptyCompletionError as empty_err:
             # Same shape as the card gate: nothing was mutated, the audit event
             # already landed; the worker retries with evidence instead of stalling.
+            if getattr(empty_err, "superseded", False):
+                return tool_error(
+                    f"kanban_complete blocked: {empty_err}. Your task is still in-flight "
+                    f"(no state change). Retry with a non-empty superseded_by naming what "
+                    f"satisfied the premise.")
             return tool_error(
                 f"kanban_complete blocked: {empty_err}. Your task is still in-flight (no state "
                 f"change). Retry kanban_complete with a non-empty summary or result describing "
-                f"what was done.")
+                f"what was done — or, if the card's premise was already satisfied elsewhere, a "
+                f"non-empty superseded_by pointer naming what satisfied it.")
         task = kb.get_task(conn, tid)
         if not ok:
             # complete_task reports every refusal as bare False; a reopened or

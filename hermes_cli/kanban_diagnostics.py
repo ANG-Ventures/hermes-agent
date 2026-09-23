@@ -475,7 +475,7 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
+        elif outcome in {"completed", "superseded", "reclaimed"}:
             break
     if consecutive < threshold:
         return []

@@ -106,6 +106,14 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Run outcomes that mean "this attempt ENDED the card successfully". ``superseded``
+# is the honest close for a card whose premise was already satisfied elsewhere
+# (evidence = the ``superseded_by`` pointer, no artifact); every reader that asks
+# "did this task succeed" must treat it like ``completed``, or a superseded card
+# reads as never-run and gets respawned.
+SUCCESS_RUN_OUTCOMES = ("completed", "superseded")
+_SUCCESS_RUN_OUTCOMES_SQL = "('completed', 'superseded')"
+
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
@@ -1018,8 +1026,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     outcome             TEXT,
-    -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    -- outcome: completed | superseded | blocked | crashed | timed_out |
+    --          spawn_failed | gave_up | reclaimed | (null while still running)
+    --          superseded = premise already satisfied elsewhere; the run metadata
+    --          carries the ``superseded_by`` evidence pointer. Counts as a success.
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -2677,14 +2687,21 @@ class HallucinatedCardsError(ValueError):
 
 class EmptyCompletionError(ValueError):
     """``complete_task`` refused: no substantive ``result``, ``summary``, or
-    stored result. A ``ValueError`` so tool error handlers treat it as
-    recoverable. Review approvals are exempt (the human is the record)."""
+    stored result — or, for a superseded close, no evidence pointer. A
+    ``ValueError`` so tool error handlers treat it as recoverable. Review
+    approvals are exempt (the human is the record)."""
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, *, superseded: bool = False):
         self.task_id = task_id
-        super().__init__(
-            f"completion blocked: {task_id} has no result or summary evidence"
+        self.superseded = superseded
+        detail = (
+            "was completed as superseded with an empty superseded_by; name the card, "
+            "PR or sha that satisfied the premise (an unnamed supersede is a silent "
+            "delete of the work)"
+            if superseded else
+            "has no result or summary evidence"
         )
+        super().__init__(f"completion blocked: {task_id} {detail}")
 
 
 class ArtifactPreservationError(RuntimeError):
@@ -2725,8 +2742,17 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    superseded_by: Optional[str] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
+
+    ``superseded_by`` closes a card whose premise is ALREADY SATISFIED on current
+    main — the sibling card, PR or sha that did the work. The run's outcome is
+    ``superseded`` instead of ``completed`` and the pointer IS the evidence, so
+    no ``summary``/``result`` is required; an empty pointer is refused
+    (:class:`EmptyCompletionError`), because a superseded card with no pointer is
+    a silent delete of work. Everything else (parents, live-claim fence,
+    created-cards gate, artifacts, hooks) behaves exactly as a normal completion.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
     approval. A ``running`` task under a live claim is only completed with
@@ -2748,12 +2774,22 @@ def complete_task(
     if not _parents_satisfied(conn, task_id):
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+    superseded_by = _clean_superseded_pointer(conn, task_id, superseded_by)
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    if superseded_by is None:
+        # The pointer IS the evidence for a superseded close; the work-evidence
+        # gate only applies to a card claiming work was done.
+        _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    if superseded_by is not None:
+        metadata = dict(metadata or {})
+        metadata["superseded_by"] = superseded_by
+    run_outcome = "superseded" if superseded_by is not None else "completed"
     handoff_summary = summary if summary is not None else result
+    if superseded_by is not None and not _substantive_text(handoff_summary):
+        handoff_summary = f"Premise already satisfied; superseded by {superseded_by}."
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -2796,7 +2832,7 @@ def complete_task(
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
-            conn, task_id, outcome="completed", status="done", summary=handoff_summary,
+            conn, task_id, outcome=run_outcome, status="done", summary=handoff_summary,
             metadata=metadata,
         )
         # Never-claimed task: synthesize a run so the handoff fields survive.
@@ -2806,14 +2842,16 @@ def complete_task(
                 synth_summary = _REVIEW_APPROVED_NOTE
                 synth_metadata = {"source_status": "review", "approval": "manual"}
             run_id = _synthesize_ended_run(
-                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+                conn, task_id, outcome=run_outcome, summary=synth_summary, metadata=synth_metadata,
             )
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
         _append_event(
             conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
+            _completed_event_payload(
+                result, event_summary, verified_cards, metadata, superseded_by=superseded_by,
+            ),
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
@@ -2855,6 +2893,33 @@ def _gate_created_cards(
 
 def _substantive_text(value: Optional[str]) -> bool:
     return bool(value is not None and str(value).strip())
+
+
+# Evidence pointer for a superseded close, capped so a worker cannot paste a
+# transcript into the durable field the board renders.
+_SUPERSEDED_POINTER_MAX = 500
+
+
+def _clean_superseded_pointer(
+    conn: sqlite3.Connection, task_id: str, superseded_by: Optional[str],
+) -> Optional[str]:
+    """Normalize ``superseded_by``; ``None`` when not a superseded close.
+
+    An empty / whitespace-only pointer is refused the same way an empty
+    completion is: a superseded card with no pointer records that the work
+    vanished without recording what replaced it.
+    """
+    if superseded_by is None:
+        return None
+    pointer = str(superseded_by).strip()
+    if pointer:
+        return pointer[:_SUPERSEDED_POINTER_MAX]
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_blocked_empty_result",
+            {"superseded_by_preview": None, "reason": "empty_superseded_pointer"},
+        )
+    raise EmptyCompletionError(task_id, superseded=True)
 
 
 def _gate_empty_completion(
@@ -2920,6 +2985,7 @@ def _cleaned_artifact_paths(metadata: Any) -> list[str]:
 
 def _completed_event_payload(
     result: Optional[str], event_summary: Optional[str], verified_cards: list[str], metadata: Any,
+    *, superseded_by: Optional[str] = None,
 ) -> dict:
     """``completed`` event payload: first summary line (400 chars) so gateway
     notifiers / dashboard WS render without a second round-trip; verified
@@ -2934,6 +3000,10 @@ def _completed_event_payload(
         "result_len": len(result) if result else 0,
         "summary": _first_line(event_summary, 400) or None,
     }
+    if superseded_by:
+        # The notifier reads this to say "premise superseded by X" instead of
+        # the generic done ping.
+        payload["superseded_by"] = superseded_by
     if verified_cards:
         payload["verified_cards"] = verified_cards
     if isinstance(metadata, dict):
@@ -3174,7 +3244,7 @@ def edit_task(
             """
             SELECT id FROM task_runs
              WHERE task_id = ?
-               AND outcome = 'completed'
+               AND outcome IN ('completed', 'superseded')
              ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
              LIMIT 1
             """,
@@ -4119,7 +4189,7 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         pt = get_task(conn, pid)
         if not pt or pt.status != "done":
             continue
-        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
+        runs = [r for r in list_runs(conn, pid) if r.outcome in SUCCESS_RUN_OUTCOMES]
         runs.sort(key=lambda r: r.started_at, reverse=True)
         run = runs[0] if runs else None
         if not wrote_header:
@@ -4156,7 +4226,7 @@ def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, no
         "SELECT t.id, t.title, r.summary, r.ended_at "
         "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
         "WHERE r.profile = ? AND r.task_id != ? "
-        "  AND r.outcome = 'completed' "
+        "  AND r.outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
         "ORDER BY r.ended_at DESC LIMIT 5", (task.assignee, task.id),
     ).fetchall()
     if not role_rows:

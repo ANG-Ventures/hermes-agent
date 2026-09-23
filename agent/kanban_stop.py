@@ -91,7 +91,11 @@ def build_kanban_stop_nudge(
         "and needs no review, `kanban_request_review(summary=...)` if it is a code "
         "change that needs same-card review, OR `kanban_block(reason=...)` if you are "
         "blocked. Reviewers approve with `kanban_complete` or send the card back with "
-        "`kanban_request_changes(reason=...)`.\n\n"
+        "`kanban_request_changes(reason=...)`.\n"
+        "3. If you found the work ALREADY DONE on current main — nothing left to "
+        "implement and no blocker — that is still a terminal outcome, not a reason to "
+        "stop silently: call `kanban_complete(superseded_by=\"<card|PR|sha>\", "
+        "summary=\"how you verified it\")`.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

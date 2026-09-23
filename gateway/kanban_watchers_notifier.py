@@ -384,6 +384,17 @@ def _fmt_completed(ev, n) -> tuple:
     elif n.task and n.task.result:
         wake_handoff = _first_line(n.task.result, 160)
     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
+    superseded_by = _payload(ev, "superseded_by")
+    if superseded_by:
+        # A card whose premise was already satisfied is NOT the same shape as a
+        # card whose work this worker did; say which, and name the evidence. It
+        # is also not a crash — the pre-fix path reported this as
+        # "gave up (retries exhausted)".
+        return (
+            f"↩️ {n.head} closed — premise superseded by {str(superseded_by)[:160]} "
+            f"— {n.title}{handoff}",
+            wake_handoff, None,
+        )
     return f"✔ {n.head} done — {n.title}{handoff}", wake_handoff, None
 
 
@@ -436,6 +447,19 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
 def _fmt_gave_up(ev, n) -> tuple:
     # The dispatcher auto-blocked the task after ``failures`` consecutive non-success attempts
     # (spawn failure, crash, or timeout alike): it is now Blocked and waiting for a human.
+    if _payload(ev, "stopped_early") == "reproduced_clean_exit":
+        # NOT a crash: the worker exited cleanly with nothing to do, twice
+        # identically. Saying "it kept failing" sent operators hunting a crash
+        # that never happened.
+        repeats = _payload(ev, "identical_violations") or 2
+        return (
+            f"🧭 {n.head} needs input: its worker finished with NOTHING TO DO {int(repeats)}x "
+            f"identically (no crash) — retrying reproduces it. If the card's premise was already "
+            f"satisfied, close it with `hermes kanban complete {n.task_id} --superseded-by "
+            f"<card|PR|sha>`; otherwise re-scope it with `hermes kanban edit {n.task_id}`. "
+            f"Logs: `hermes kanban log {n.task_id}`.",
+            None, None,
+        )
     failures = _payload(ev, "failures")
     count = f"it failed {int(failures)} times in a row" if failures else "it kept failing"
     last = _clip(ev, "error", " (last: {})", 160)

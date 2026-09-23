@@ -300,6 +300,10 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
+        _arg("--superseded-by",
+             help="Evidence pointer (card id / PR url / sha) for a card whose premise was "
+                  "already satisfied elsewhere. Closes it done with outcome 'superseded'; "
+                  "no --result/--summary required, but the pointer must be non-empty."),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
                   "even without owning its run (closes the worker's run)."),
