@@ -211,6 +211,34 @@ _NO_XHIGH_CLAUDE_SUBSTRINGS = (
     "claude-sonnet-4-6", "claude-sonnet-4.6",
 )
 
+# Claude families shipping the "5.5-generation" request-shape contract: forced
+# tool choice is rejected AND thinking cannot be disabled. Anthropic shipped
+# both restrictions together, first on Fable/Mythos 5.1 (2026-09-02) and then
+# on Opus 5.5 (2026-09-22), for the same stated reason — thinking is always on,
+# and a forced tool call would skip it.
+#
+# Kept as ONE family set read by both verdicts below, rather than two per-id
+# lists: every release so far has taken the restrictions as a pair, and a
+# split invites adding an id to one list and forgetting the other.
+#
+#   claude-fable / claude-mythos  — 5 and 5.1 alike are thinking-mandatory;
+#                                   only 5.1 forbids forced tools (see the
+#                                   forced-tool set below).
+#   claude-opus-5-5               — Opus 5 is NOT affected; the trailing "-5"
+#                                   is load-bearing and must not be matched by
+#                                   a "claude-opus-5" prefix.
+#
+# Both the hyphen and dot spellings are listed, matching
+# ``_LEGACY_MANUAL_THINKING_CLAUDE_SUBSTRINGS`` and
+# ``_NO_XHIGH_CLAUDE_SUBSTRINGS``: ``build_anthropic_kwargs`` normalizes dots
+# before it reaches these verdicts, but the helpers are also called directly
+# (and by tests) with the OpenRouter/Portal ``claude-opus-5.5`` spelling.
+_OPUS_5_5_FAMILY_SUBSTRINGS = (
+    "claude-opus-5-5", "claude-opus-5.5",
+    "claude-fable-5-1", "claude-fable-5.1",
+    "claude-mythos-5-1", "claude-mythos-5.1",
+)
+
 # Adaptive Claude families that REJECT a thinking disable — thinking is
 # mandatory and ``thinking: {"type": "disabled"}`` answers HTTP 400. The Portal
 # catalog flags the same families with ``reasoning.mandatory``.
@@ -220,7 +248,39 @@ _NO_XHIGH_CLAUDE_SUBSTRINGS = (
 # add the family.
 _MANDATORY_THINKING_CLAUDE_SUBSTRINGS = (
     "claude-fable",
-)
+) + _OPUS_5_5_FAMILY_SUBSTRINGS
+
+# Claude families that REJECT a forced tool call: ``tool_choice`` of type
+# ``any`` or ``tool`` answers HTTP 400 with
+#     tool_choice: type "tool" and "any" are not supported for this model.
+# on the Messages API, the Batches API and the token-counting endpoint alike.
+#
+# The asymmetry runs the OPPOSITE way from the thinking disable above, so this
+# list is opt-IN: a missing entry 400s loudly and the error names the field,
+# while a spurious one silently removes forced tool use from a model that still
+# supports it — a capability regression no error would ever surface.  An
+# unrecognized future Claude therefore keeps forced tool choice.
+_NO_FORCED_TOOL_CHOICE_CLAUDE_SUBSTRINGS = _OPUS_5_5_FAMILY_SUBSTRINGS
+
+# Models already reported for the forced-tool_choice downgrade. Keyed by model
+# so a fleet serving several ids still explains each one exactly once, and
+# bounded by the id set (never by request volume) — the downgrade otherwise
+# fires on every turn of an agent loop that forces a tool.
+_forced_tool_choice_downgrade_logged: set = set()
+
+
+def _log_forced_tool_choice_downgrade(model: str) -> None:
+    """Report the ``any``/``tool`` → ``auto`` + ``strict`` substitution once."""
+    if model in _forced_tool_choice_downgrade_logged:
+        return
+    _forced_tool_choice_downgrade_logged.add(model)
+    logger.info(
+        "Anthropic %s rejects a forced tool_choice (HTTP 400) — sending "
+        "tool_choice=auto instead. The model may now answer in text where the "
+        "caller required a tool call; prompt for the tool explicitly if that "
+        "matters.",
+        model,
+    )
 
 
 def _is_claude_model(model: str | None) -> bool:
@@ -410,6 +470,30 @@ def _accepts_thinking_disable(model: str) -> bool:
         return False
     m = model.lower()
     return not any(v in m for v in _MANDATORY_THINKING_CLAUDE_SUBSTRINGS)
+
+
+def _accepts_forced_tool_choice(model: str) -> bool:
+    """Return False when *model* rejects ``tool_choice`` ``any``/``tool``.
+
+    Opus 5.5 and Fable/Mythos 5.1 answer a forced tool call with HTTP 400::
+
+        tool_choice: type "tool" and "any" are not supported for this model.
+
+    on the Messages API, the Message Batches API and token counting.  The
+    documented replacement is ``{"type": "auto"}`` plus strict tool use, which
+    is what ``build_anthropic_kwargs`` substitutes when this returns False.
+
+    Scoped to Claude, and opt-in within it.  Third-party Anthropic-Messages
+    endpoints (minimax, qwen3, GLM, Kimi) have their own tool contract, and
+    Claude's restriction is not evidence about them.  Unknown Claude releases
+    keep forced tool choice: the failure is asymmetric the other way from
+    ``_accepts_thinking_disable`` — a missing entry 400s loudly and names the
+    field, a spurious one silently strips a capability nothing would report.
+    """
+    if not _is_claude_model(model):
+        return True
+    m = model.lower()
+    return not any(v in m for v in _NO_FORCED_TOOL_CHOICE_CLAUDE_SUBSTRINGS)
 
 
 def _forbids_sampling_params(model: str) -> bool:
@@ -1044,11 +1128,29 @@ def build_anthropic_kwargs(
         # Map OpenAI tool_choice to Anthropic format
         if tool_choice == "auto" or tool_choice is None:
             kwargs["tool_choice"] = {"type": "auto"}
-        elif tool_choice == "required":
-            kwargs["tool_choice"] = {"type": "any"}
         elif tool_choice == "none":
             # Anthropic has no tool_choice "none" — omit tools entirely to prevent use
             kwargs.pop("tools", None)
+        elif not _accepts_forced_tool_choice(model):
+            # Opus 5.5 / Fable 5.1 / Mythos 5.1 answer both forced shapes with
+            # HTTP 400. Downgrade to ``auto`` rather than sending a request
+            # that cannot succeed.
+            #
+            # Anthropic's documented replacement is "auto + strict tool use",
+            # and we deliberately do NOT inject ``strict: True`` here. Strict
+            # mode constrains sampling to a restricted JSON Schema subset, and
+            # measured against this tree's own registry on 2026-09-23, 39 of 39
+            # live tool schemas violate it — every one omits the mandatory
+            # ``additionalProperties: false``, and several use ``minimum`` /
+            # ``maximum`` / ``minItems > 1``, all explicitly unsupported. So a
+            # blanket strict flag would swap this 400 for a strict-schema 400
+            # that fires on EVERY tool-bearing request instead of only forced
+            # ones — strictly worse. Making the schemas strict-clean is real
+            # work with its own blast radius; it is not this guard's job.
+            kwargs["tool_choice"] = {"type": "auto"}
+            _log_forced_tool_choice_downgrade(model)
+        elif tool_choice == "required":
+            kwargs["tool_choice"] = {"type": "any"}
         elif isinstance(tool_choice, str):
             # Specific tool name
             kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
