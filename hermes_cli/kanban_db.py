@@ -720,51 +720,83 @@ def _warn_if_sandbox_neutralises_pins() -> None:
     )
 
 
-# Pairs of (HERMES_HOME, override) already evaluated by
-# ``_warn_if_override_escapes_hermes_home``. Keyed on the RAW env strings so
+class KanbanPinDivergenceError(RuntimeError):
+    """Raised when the ``HERMES_KANBAN_*`` pins contradict what a caller asked.
+
+    Two shapes, one defect class: the resolver has **already computed** that
+    the board the caller asked for and the board the pin points at are
+    different, and the old behaviour was to log a warning and hand back the
+    pinned (live) board anyway. That is fail-OPEN on a destructive path — a
+    warning on stdout is perfectly accurate and perfectly skippable, and on
+    2026-09-21 a probe that redirected ``HERMES_HOME`` to sandbox itself wrote
+    a junk card and 17 events onto 16 production cards with the warning right
+    there in its output.
+
+    ``HERMES_KANBAN_SANDBOX=1`` remains the documented escape hatch: it
+    neutralises every pin, so the divergence cannot arise and this never
+    raises.
+    """
+
+
+# Pairs of (HERMES_HOME, override) already proven SAFE by
+# ``_refuse_if_override_escapes_hermes_home``. Keyed on the RAW env strings so
 # the filesystem work (two ``Path.resolve()`` calls) happens once per distinct
 # environment rather than on every ``kanban_db_path()`` — which sits on the
-# ``connect()`` path and is called constantly. Doubles as the warn-once ledger.
+# ``connect()`` path and is called constantly.
+#
+# Only AGREEING pairs are memoised, and that is load-bearing: a warn-once
+# ledger would have made the second call to a diverging pin succeed silently,
+# so a caller that ignored (or never saw) the first refusal could simply try
+# again and reach the live board. A refusal must be permanent for as long as
+# the environment says it.
 _CHECKED_OVERRIDE_ESCAPES: set[tuple[str, str]] = set()
 
 
-def _warn_if_override_escapes_hermes_home(override: Path) -> None:
-    """Log once when ``HERMES_KANBAN_DB`` points outside the HERMES_HOME root.
+def _refuse_if_override_escapes_hermes_home(override: Path) -> None:
+    """Refuse when ``HERMES_KANBAN_DB`` points outside the HERMES_HOME root.
 
     This is the signal that was missing on 2026-08-08: a worker redirected
     ``HERMES_HOME`` to a tempdir, believed it was sandboxed, and wrote six real
     cards to the production board because the dispatcher's ``HERMES_KANBAN_DB``
-    outranks ``HERMES_HOME``. Resolution is unchanged — the override still wins
-    — but the escape is no longer silent.
+    outranks ``HERMES_HOME``. It was made loud in that incident's wake, and on
+    2026-09-21 the loudness proved insufficient: the warning fired, verbatim
+    and correct, and the probe wrote to the live board regardless.
+
+    Redirecting ``HERMES_HOME`` is an unambiguous statement of intent to
+    isolate. Having detected that the pin defeats it, we refuse rather than
+    hand a live-board path to a caller that asked to be sandboxed.
     """
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
     if not hermes_home:
         return
     key = (hermes_home, str(override))
     if key in _CHECKED_OVERRIDE_ESCAPES:
-        return
-    _CHECKED_OVERRIDE_ESCAPES.add(key)
+        return  # proven to live inside the HERMES_HOME-derived root already.
     try:
         root = kanban_home().resolve(strict=False)
         target = override.resolve(strict=False)
     except OSError:
         return
     if target.is_relative_to(root):
+        _CHECKED_OVERRIDE_ESCAPES.add(key)
         return  # override lives inside the HERMES_HOME-derived root: normal.
-    _log.warning(
-        "HERMES_KANBAN_DB=%s resolves OUTSIDE the HERMES_HOME-derived kanban "
-        "root %s — the override wins, so redirecting HERMES_HOME did NOT "
-        "sandbox kanban. Set HERMES_KANBAN_SANDBOX=1 (or unset the "
-        "HERMES_KANBAN_* path pins) if you meant to isolate this process from "
-        "the live board.",
-        target, root,
+    raise KanbanPinDivergenceError(
+        f"HERMES_KANBAN_DB={target} resolves OUTSIDE the HERMES_HOME-derived "
+        f"kanban root {root} — the override wins, so redirecting HERMES_HOME "
+        f"did NOT sandbox kanban. Refusing to resolve a live-board path for a "
+        f"process that asked to be isolated. Set HERMES_KANBAN_SANDBOX=1 (or "
+        f"unset the HERMES_KANBAN_* path pins) if you meant to isolate this "
+        f"process from the live board; unset HERMES_HOME (or point it at the "
+        f"root that contains the pin) if you meant to use the pinned board."
     )
 
 
-# ``(board slug, raw HERMES_KANBAN_DB)`` pairs already evaluated by
-# ``_warn_if_pin_contradicts_board_arg``. Same warn-once + resolve-once role as
+# ``(board slug, raw HERMES_KANBAN_DB)`` pairs already proven to AGREE by
+# ``_refuse_if_pin_contradicts_board_arg``. Same resolve-once role as
 # ``_CHECKED_OVERRIDE_ESCAPES``: ``kanban_db_path()`` sits on the ``connect()``
-# path, so the two ``Path.resolve()`` calls must not run per call.
+# path, so the two ``Path.resolve()`` calls must not run per call. Only
+# agreeing pairs are memoised — a disagreeing pair must refuse every time, not
+# just the first, or a caller could retry its way onto the live board.
 _CHECKED_PIN_BOARD_CONTRADICTIONS: set[tuple[str, str]] = set()
 
 # Depth of the innermost ``enumerating_boards()`` scope on THIS thread. Thread-
@@ -783,20 +815,21 @@ def enumerating_boards():
     """Mark a dynamic extent as ENUMERATING boards rather than ADDRESSING one.
 
     The pin-contradiction guard exists for a caller that names ONE board and
-    silently gets another. A caller sweeping every board on disk is a different
-    shape: under a ``HERMES_KANBAN_DB`` pin every non-active slug trivially
-    disagrees with the pin, so an unscoped sweep emits one warning per board
-    (measured: 64 on a single dispatcher sweep across 65 live boards) and trains
-    operators to ignore the signal.
+    gets another. A caller sweeping every board on disk is a different shape:
+    under a ``HERMES_KANBAN_DB`` pin every non-active slug trivially disagrees
+    with the pin, so an unscoped sweep would refuse on the first board and take
+    down every legitimate enumerator in the process (measured before this
+    extent existed: 64 contradiction reports on a single dispatcher sweep
+    across 65 live boards).
 
     This is a DYNAMIC EXTENT, not a per-call flag, and that distinction is the
     whole fix. The first cut passed ``warn_on_pin_contradiction=False`` at each
     ``kanban_db_path()`` call site, which cannot work: enumerators also call
     ``connect(board=slug)`` / ``connect_closing(board=slug)``, which re-resolve
     the path internally with no flag to thread through. Measured on that design,
-    ``_board_task_counts`` still emitted 8 warnings over 8 boards *despite* its
-    call site being flagged. Wrapping the LOOP covers every nested resolution,
-    however deep, including ones added later.
+    ``_board_task_counts`` still reported 8 contradictions over 8 boards
+    *despite* its call site being flagged. Wrapping the LOOP covers every nested
+    resolution, however deep, including ones added later.
 
     Scoped to the current thread, and re-entrant.
     """
@@ -829,68 +862,22 @@ def enumerating_each(boards):
             yield board
 
 
-# Hard ceiling on contradiction warnings, charged PER CALL SITE. The warn-once
-# ledger is keyed on (slug, pin), so a host with many boards can still emit one
-# line per board from un-enumerated addressing paths. Past a handful of distinct
-# boards that one site has given the operator its signal; the rest is noise, so
-# collapse to a single summary line. Zero risk of hiding the FIRST occurrence
-# from any site, which is the one that diagnoses the misreading.
-_PIN_CONTRADICTION_WARN_BUDGET = 5
-
-# Slugs already reported by the guard, in emission order, keyed by the CALL SITE
-# that asked (``file:lineno`` of the first frame outside this module).
-#
-# Per-site rather than per-process, and that is load-bearing. A process-global
-# budget reintroduces this card's own defect one level up: any per-board loop
-# that forgets :func:`enumerating_boards` looks like N addressing calls, burns
-# the whole budget, and then the genuine single-board misreading the guard
-# exists to surface goes SILENT. Measured on the process-global design: 8
-# unscoped ``connect(board=slug)`` calls emitted 5 warnings, after which
-# ``kanban_db_path('account-health')`` returned the pin path with 0 warnings —
-# run-1022's exact probe, silent again. Charging the ceiling to the site that
-# made the noise bounds a forgetful enumerator without ever spending another
-# caller's first warning.
-_PIN_CONTRADICTION_WARNED: dict[str, list[str]] = {}
-
-
-def _pin_contradiction_call_site() -> str:
-    """``file:lineno`` of the first frame outside this module, or ``"?"``.
-
-    Only reached for a genuine, not-yet-reported ``(slug, pin)`` contradiction,
-    so the frame walk is bounded by distinct offending boards, not by call
-    volume — it is not on the ``connect()`` hot path.
-    """
-    try:
-        frame = sys._getframe(1)
-    except Exception:  # pragma: no cover - no frame introspection available
-        return "?"
-    this_file = __file__
-    while frame is not None:
-        if frame.f_code.co_filename != this_file:
-            return f"{frame.f_code.co_filename}:{frame.f_lineno}"
-        frame = frame.f_back
-    return "?"
-
-
-def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> None:
-    """Log once when an EXPLICIT ``board`` arg disagrees with the pinned DB.
+def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> None:
+    """Refuse when an EXPLICIT ``board`` arg disagrees with the pinned DB.
 
     The ``HERMES_KANBAN_DB`` pin is checked before anything derived from the
     ``board`` argument, and the dispatcher injects it into every worker env. So
-    inside a worker, ``kanban_db_path("some-other-board")`` silently returns the
-    pinned path and the caller reads the wrong board with no signal at all.
+    inside a worker, ``kanban_db_path("some-other-board")`` silently returned
+    the pinned path and the caller read — or wrote — the wrong board.
 
     That is not hypothetical: it produced two wrong readings inside one task
     (t_a1e6e877) — a repro that wrote junk cards to the live default board, and
     a review probe whose ``kanban_db_path('ban-forensics')`` answer read exactly
     like the board-alias feature being broken when in fact it was the pin.
-    Both operators knew about the trap and hit it anyway.
-
-    Resolution is deliberately UNCHANGED — the pin still wins, because it is the
-    dispatcher→worker handoff's defense in depth (``_default_spawn`` sets
-    ``HERMES_KANBAN_DB`` precisely so a worker that re-resolves paths under a
-    rewritten ``HERMES_HOME`` still converges on the DB the dispatcher claimed
-    its task from). Only the silence is fixed.
+    Both operators knew about the trap and hit it anyway. Making it loud was
+    not enough either (t_d2b884e7, 2026-09-21), so the contradiction is now
+    refused: a caller that names a board and gets a different one is a wrong
+    answer, and a wrong answer that looks right is worse than an error.
 
     Silent by design in the shapes that are not contradictions: ``board`` is
     None (the pin is then the intended source of truth), the pin already
@@ -910,39 +897,23 @@ def _warn_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -> 
         return
     key = (slug, str(override))
     if key in _CHECKED_PIN_BOARD_CONTRADICTIONS:
-        return
-    _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
+        return  # proven to agree with the pin already.
     try:
         requested = _board_db_path_ignoring_pin(slug).resolve(strict=False)
         pinned = override.resolve(strict=False)
     except (OSError, ValueError):
         return
     if requested == pinned:
+        _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
         return  # pin agrees with the argument: the normal worker case.
-    site = _pin_contradiction_call_site()
-    reported = _PIN_CONTRADICTION_WARNED.setdefault(site, [])
-    reported.append(slug)
-    emitted = len(reported)
-    if emitted > _PIN_CONTRADICTION_WARN_BUDGET:
-        if emitted == _PIN_CONTRADICTION_WARN_BUDGET + 1:
-            _log.warning(
-                "kanban_db_path: more than %d distinct boards have now been "
-                "requested from %s while HERMES_KANBAN_DB pins %s — suppressing "
-                "further per-board contradiction warnings from that call site. "
-                "Set HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path "
-                "pins) if you meant to address the boards you named; if that "
-                "site sweeps every board, wrap its loop in "
-                "kanban_db.enumerating_boards().",
-                _PIN_CONTRADICTION_WARN_BUDGET, site, override,
-            )
-        return
-    _log.warning(
-        "kanban_db_path(board=%r) returned the HERMES_KANBAN_DB pin %s, NOT "
-        "that board's DB %s — the pin outranks the board argument, so this "
-        "caller is reading a different board than it asked for. Set "
-        "HERMES_KANBAN_SANDBOX=1 (or unset the HERMES_KANBAN_* path pins) if "
-        "you meant to address the board you named.",
-        slug, pinned, requested,
+    raise KanbanPinDivergenceError(
+        f"kanban_db_path(board={slug!r}) would return the HERMES_KANBAN_DB pin "
+        f"{pinned}, NOT that board's DB {requested} — the pin outranks the "
+        f"board argument, so this caller would read (and write) a different "
+        f"board than it asked for. Refusing. Set HERMES_KANBAN_SANDBOX=1 (or "
+        f"unset the HERMES_KANBAN_* path pins) if you meant to address the "
+        f"board you named; if this call site sweeps every board, wrap its loop "
+        f"in kanban_db.enumerating_boards()."
     )
 
 
@@ -1234,26 +1205,29 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
             os.environ.pop(_k, None)
 
     When ``HERMES_HOME`` is set and the override resolves outside the
-    ``HERMES_HOME``-derived kanban root, a warning is logged once — the
-    override still wins, but the escape is no longer silent.
+    ``HERMES_HOME``-derived kanban root, this **raises**
+    :class:`KanbanPinDivergenceError`. Redirecting ``HERMES_HOME`` is an
+    unambiguous statement of intent to isolate; handing back a live-board path
+    anyway is fail-open on a destructive path, and a warning was demonstrably
+    skippable (2026-09-21: the warning fired and the probe wrote 17 events onto
+    16 production cards regardless).
 
     Likewise, when an EXPLICIT ``board`` argument is passed and the override
-    resolves to a *different* board's DB, a warning is logged once naming both
-    the board you asked for and the path you actually got. Resolution is
-    unchanged; the contradiction is simply no longer invisible to the caller.
+    resolves to a *different* board's DB, this raises rather than returning a
+    board the caller did not ask for.
 
     A caller that sweeps every board on disk is not addressing any one of them,
     and under a pin every non-active slug trivially disagrees — so wrap such a
-    loop in :func:`enumerating_boards`, which suppresses the warning for the
-    whole dynamic extent (including the nested ``connect()`` resolutions a
-    per-call flag could never reach). Do NOT wrap a single-board lookup: that is
-    exactly the case the guard exists to catch.
+    loop in :func:`enumerating_boards`, which suppresses the board-argument
+    check for the whole dynamic extent (including the nested ``connect()``
+    resolutions a per-call flag could never reach). Do NOT wrap a single-board
+    lookup: that is exactly the case the guard exists to catch.
     """
     override = _kanban_path_override("HERMES_KANBAN_DB")
     if override:
         path = Path(override).expanduser()
-        _warn_if_override_escapes_hermes_home(path)
-        _warn_if_pin_contradicts_board_arg(board, path)
+        _refuse_if_override_escapes_hermes_home(path)
+        _refuse_if_pin_contradicts_board_arg(board, path)
         return path
     slug = _normalize_board_slug(board)
     if slug is None:
@@ -1266,7 +1240,7 @@ def _board_db_path_ignoring_pin(slug: str) -> Path:
 
     The single definition of the board→DB layout, shared by
     :func:`kanban_db_path` and the contradiction guard
-    :func:`_warn_if_pin_contradicts_board_arg` — so the guard can never drift
+    :func:`_refuse_if_pin_contradicts_board_arg` — so the guard can never drift
     from the resolution it is describing.
     """
     if slug == DEFAULT_BOARD:
