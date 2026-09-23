@@ -692,3 +692,37 @@ def test_migration_idempotent(bb_store):
     with bb_store._connect() as conn:
         cols2 = {r[1] for r in conn.execute("PRAGMA table_info(turns)").fetchall()}
     assert cols1 == cols2
+
+
+def test_legacy_db_without_ts_start_still_opens_and_migrates(tmp_path):
+    """t_71ae3a75: #905 put idx_blackbox_turns_ts_start inside the schema
+    executescript, so a legacy ledger whose `turns` table predates `ts_start`
+    raised `no such column: ts_start` before any guarded ALTER ran. Indexes now
+    follow the column migration and are created only for columns that exist."""
+    import sqlite3
+    from plugins.blackbox import store as bb_store
+
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE turns (turn_id TEXT PRIMARY KEY, platform TEXT, chat_id TEXT,"
+        " ts_end REAL, cost_usd REAL)"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = sqlite3.connect(db)
+    bb_store._ensure_schema(conn)  # must not raise
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(turns)")}
+    idx = {r[1] for r in conn.execute("PRAGMA index_list(turns)")}
+    conn.close()
+    assert "comp_calls_json" in cols  # the additive migration ran
+    assert "idx_blackbox_turns_chat_end" in idx and "idx_blackbox_turns_cost" in idx
+    assert "idx_blackbox_turns_ts_start" not in idx  # column absent -> no index, no crash
+
+    fresh = tmp_path / "fresh.db"
+    conn = sqlite3.connect(fresh)
+    bb_store._ensure_schema(conn)
+    idx = {r[1] for r in conn.execute("PRAGMA index_list(turns)")}
+    conn.close()
+    assert "idx_blackbox_turns_ts_start" in idx  # full schema keeps #905's index
