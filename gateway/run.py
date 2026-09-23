@@ -19760,6 +19760,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # it, and a forensic dump that recomputed the t=0 value
                     # would report the superseded deadline for the very
                     # hard-exit it is documenting.
+                    #
+                    # 🔴 FRAME: this is ABSOLUTE, measured from the start of
+                    # stop(). The dump's own top-level `delay_s`
+                    # (shutdown_watchdog._write_watchdog_dump) is RELATIVE to
+                    # the arming call. They coincide at the t=0 arming and
+                    # deliberately diverge after a re-arm (e.g. delay_s=249.1
+                    # alongside watchdog_delay_s=250.9); `phase_elapsed_s`
+                    # below is what reconciles them.
                     "watchdog_delay_s": (
                         getattr(self, "_armed_shutdown_deadline_s", None)
                         if getattr(self, "_armed_shutdown_deadline_s", None)
@@ -19831,6 +19839,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 would answer with SIGKILL anyway). When the wall already
                 binds there is nothing to extend and this is a no-op.
 
+                🔴 ONE exception to extend-only: a CURRENT deadline that is
+                itself past the wall is SHORTENED to the wall. That state is
+                reachable — see the ``_cur_past_wall`` comment below — and
+                extend-only was keeping a decorative ``os._exit`` armed
+                ~190s past an uncatchable SIGKILL. Shortening to the wall is
+                not "sooner than promised": launchd had already promised
+                less.
+
                 🔴 LAUNCHD-ONLY, because that bound only EXISTS there.
                 ``resolve_launchd_shutdown_watchdog_delay`` short-circuits
                 when there is no live ``ExitTimeOut`` (systemd, Docker/s6,
@@ -19869,6 +19885,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 drain, persist and teardown while the outer ``finally`` set
                 every event and disarmed the original too, leaving nothing
                 to ``os._exit`` before launchd's SIGKILL.
+
+                🔴 A SILENT arming failure is the reachable one, and it is
+                checked by RETURN VALUE, not by ``except``.
+                ``arm_shutdown_watchdog`` documents "Never raises" and wraps
+                its own ``Thread.start``, so the failure that actually
+                occurs — ``RuntimeError: can't start new thread`` under
+                thread/FD exhaustion, i.e. the very condition that wedges a
+                shutdown — used to walk the SUCCESS path: commit, then
+                ``_prev.set()`` retiring the live t=0 backstop in favour of a
+                thread that was never started. The process was then left with
+                no hard-exit at all. It now returns ``None`` in that case and
+                this bails out before committing anything.
                 """
                 if os.environ.get("PYTEST_CURRENT_TEST"):
                     return
@@ -19883,7 +19911,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cur = getattr(self, "_armed_shutdown_deadline_s", None)
                 # Compare against the deadline already armed, measured from
                 # the same stop() start, so "later" is unambiguous.
-                if _cur is not None and _new <= float(_cur) + 0.5:
+                #
+                # EXTEND-ONLY, with ONE exception: a deadline already PAST
+                # launchd's SIGKILL wall. `stop(restart=True)` arms with
+                # signal_driven=False, so resolve_launchd_shutdown_watchdog_
+                # delay short-circuits and publishes the RAW inner leash
+                # (drain 180 + grace 60 = 240 at clamp 60). If a supervisor
+                # SIGTERM then lands mid-stop, the re-arm's fresh value (50)
+                # is EARLIER and extend-only discarded it — leaving the real
+                # os._exit thread armed at stop()+240 against an uncatchable
+                # SIGKILL at 60. The watchdog was decorative on that path: a
+                # wedged teardown got SIGKILLed with no dump, no ledger entry
+                # and no ordered PID-file/runtime-lock release. Shortening is
+                # safe here precisely because the current deadline is one
+                # launchd will never honour, and the replacement is clamped
+                # to the wall rather than to anything the caller chose — so
+                # this can never hard-exit a healthy shutdown sooner than the
+                # supervisor would have killed it anyway.
+                _wall = resolve_max_actionable_teardown_reserve_s(_budget)
+                if _wall is None:
+                    # An unreadable budget has no actionable launchd wall;
+                    # the re-arm's launchd-only safety premise is absent.
+                    return
+                _cur_past_wall = _cur is not None and float(_cur) > _wall + 1e-9
+                if _cur_past_wall:
+                    _new = min(_new, _wall)
+                elif _cur is not None and _new <= float(_cur) + 0.5:
                     return
                 # Absolute -> relative. Measured from the same stop() start
                 # the deadline is expressed in; if that start is unknown the
@@ -19913,7 +19966,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # state is committed and the old backstop is still in
                     # force until this returns, so a failure here leaves
                     # stop() exactly as it was.
-                    arm_shutdown_watchdog(
+                    _armed_ev = arm_shutdown_watchdog(
                         _remaining,
                         done_event=_fresh,
                         snapshot_fn=_shutdown_watchdog_snapshot,
@@ -19931,6 +19984,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "the watchdog already armed at stop()+%.1fs",
                         float(_cur) if _cur is not None else -1.0,
                         exc_info=True,
+                    )
+                    return
+                if _armed_ev is None:
+                    # SILENT failure — the reachable one. The thread never
+                    # started, so committing here would retire a live
+                    # backstop for one that does not exist and advance the
+                    # published deadline to an instant nothing enforces.
+                    # Leave the t=0 watchdog in force; the drain and cron
+                    # leash keep consuming the deadline it was armed with.
+                    logger.warning(
+                        "Shutdown watchdog re-arm did not arm (thread start "
+                        "failed); continuing under the watchdog already armed "
+                        "at stop()+%.1fs",
+                        float(_cur) if _cur is not None else -1.0,
                     )
                     return
                 # Replacement is live — now commit, then retire the old one,

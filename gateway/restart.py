@@ -389,6 +389,20 @@ def resolve_armed_shutdown_watchdog_delay(
     can never push the deadline past the hard exit because the outer
     ``min()`` still binds.
 
+    🔴 The reserve comes from :func:`resolve_stop_teardown_reserve_s`, which
+    ZEROES a sample at or above :func:`resolve_max_actionable_teardown_
+    reserve_s`. For the drain CAP that filter is the point (a sample that
+    big cannot be honoured at all); for the leash it narrows the armed
+    window rather than widening it — at clamp 300 with a 295s sample the
+    leash falls back to ``max(60, 15)`` and the armed deadline moves from
+    290 to 240. That is inert in production (``gateway/run.py`` filters the
+    ledger read with the same ceiling, so ``_last_shutdown_teardown_s`` is
+    ``None`` rather than an over-ceiling number) and its direction is safe
+    (earlier hard exit, shorter drain, never past the wall). It is one
+    reserve on purpose: a site that re-derives half of the ``max()`` or
+    half of the ceiling filter drifts from the deadline the process is
+    actually running under, which is the #838 defect class.
+
     ``elapsed_s`` is the pre-drain cost ALREADY spent when the deadline is
     (re-)computed. The inner leash sizes a RELATIVE drain budget that does
     not begin until the pre-drain phases finish, so at ``elapsed_s = 0``
@@ -602,7 +616,10 @@ def resolve_elapsed_adjusted_drain(
     Only applies to launchd-timed signal stops: every other path has no
     absolute supervisor deadline to preserve headroom against, so its
     configured drain stands untouched. The cron branch consumes the same
-    deadline via :func:`resolve_cron_drain_budget(watchdog_delay=...)`.
+    deadline via :func:`resolve_cron_drain_budget` (``deadline_s=...``).
+    Not ``watchdog_delay=`` — that is the OLD second derivation this
+    retires, and ``resolve_cron_drain_budget`` reaches it only in its
+    ``else`` branch.
     """
 
     def _seconds(value: object) -> float:
@@ -776,6 +793,32 @@ def resolve_cron_drain_budget(
     is not a loophole — ``drain_timeout`` is itself already fitted to the
     same deadline by :func:`resolve_elapsed_adjusted_drain`, so the
     ``max()`` cannot reach past it.
+
+    🔴 The floor CAN collapse to zero, on purpose. ``deadline_s`` already
+    has the full teardown reserve
+    (:func:`resolve_stop_teardown_reserve_s`) subtracted, so when a large
+    measured teardown plus the pre-drain elapsed consume the whole window
+    the ceiling goes negative and no cron wait is granted::
+
+        budget 60, last_teardown_s 45, configured 180, floor 30, elapsed 8
+        reserve   = max(15, 45)             = 45
+        capped    = min(180, 50 - 45)       =  5
+        armed     = min(5 + max(60, 45), 50)= 50
+        deadline  = 50 - 45                 =  5
+        ceiling   = 5 - 8                   = -3   -> cron 0
+
+    That is not a regression against the old ``watchdog_delay`` branch's
+    30 — it is the point. At elapsed 8 with ``os._exit`` at 50 and a
+    teardown known to need 45 there is no window for BOTH a cron wait and
+    the teardown, and the module's own rationale
+    (``CRON_DRAIN_CLEANUP_RESERVE_S``) settles which one wins: waiting
+    past the reserve "trades a job that is killed *and recorded* for one
+    that is SIGKILLed mid-write and stays wedged at ``last_status=running``
+    forever". Note the non-cron drain collapses to 0 at the same geometry,
+    so this is consistent rather than cron-specific: the deadline has
+    already passed, and any positive floor here would be arithmetic past
+    the wall. Pinned by
+    ``test_cron_floor_collapses_to_zero_when_the_teardown_eats_the_window``.
     """
 
     def _seconds(value: object, fallback: float = 0.0) -> float:

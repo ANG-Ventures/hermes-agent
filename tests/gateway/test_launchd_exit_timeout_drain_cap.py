@@ -543,15 +543,42 @@ def test_elapsed_adjusted_drain_never_runs_past_the_hard_exit_deadline():
     expression here was finding 3 of the #838 review: the assertion
     restated the implementation's own assumption and so held by
     construction while the real window was being starved.
+
+    TWO independent oracles, deliberately. Feeding ``armed`` to both
+    the arming call and the fit makes ``deadline == armed - reserve``, so
+    ``armed - elapsed - adjusted >= reserve`` holds by construction and
+    an implementation that ignored ``armed_deadline_s`` entirely still
+    passes it (verified at clamp 300 / teardown 70: elapsed 0/20/40/60
+    -> 180/180/180/160 either way). We also derive the ABSOLUTE wall from
+    the clamp alone, then assert that (1) the arming resolver never returns
+    a deadline PAST it, and (2) the drain ends before ``wall -
+    LAUNCHD_STOP_CLEANUP_RESERVE_S``. Both are necessary: the deadline
+    resolver defensively re-clamps a caller-supplied armed value, so the
+    second check alone passes even if the REAL watchdog is armed after
+    SIGKILL; the first check alone says nothing about the drain fit. The
+    mutation that removed the arming resolver's outer ``min()`` was GREEN
+    with only the second check, RED with both.
     """
     from gateway.restart import (
         resolve_armed_shutdown_watchdog_delay,
         resolve_elapsed_adjusted_drain,
+        resolve_launchd_shutdown_watchdog_delay,
         resolve_stop_teardown_reserve_s,
     )
 
     violations = []
     for clamp in (30.0, 45.0, 60.0, 90.0, 120.0, 300.0):
+        # Independent absolute oracle: the SIGKILL wall, derived from the
+        # clamp alone and NOT from the arming expression. The relative check
+        # below holds by construction once `armed` is fed to both sides (the
+        # passed value is already wall-clamped, so the deadline is exactly
+        # `armed - reserve`); this is the term that goes red if
+        # resolve_armed_shutdown_watchdog_delay ever loses its outer min()
+        # wall clamp, i.e. the regression that fits a drain past launchd's
+        # uncatchable SIGKILL.
+        wall = resolve_launchd_shutdown_watchdog_delay(
+            clamp, clamp, signal_driven=True
+        )
         for configured in (5.0, 20.0, 30.0, 45.0, 60.0, 120.0):
             for teardown in (None, 22.0, 70.0):
                 drain = resolve_launchd_capped_drain(
@@ -570,6 +597,18 @@ def test_elapsed_adjusted_drain_never_runs_past_the_hard_exit_deadline():
                         last_teardown_s=teardown,
                         elapsed_s=elapsed,
                     )
+                    # The wall clamp at the ARMING site must hold on its own.
+                    # resolve_stop_drain_deadline_s defensively re-clamps a
+                    # caller-supplied value, so checking only the fitted
+                    # drain lets a lost outer min() in the arming resolver
+                    # survive — the REAL watchdog would still fire after
+                    # launchd's uncatchable SIGKILL even if the drain fits.
+                    if armed > wall + 1e-9:
+                        violations.append(
+                            f"clamp={clamp} configured={configured} "
+                            f"teardown={teardown} elapsed={elapsed}: armed "
+                            f"watchdog {armed} past launchd wall {wall}"
+                        )
                     adjusted = resolve_elapsed_adjusted_drain(
                         drain,
                         clamp,
@@ -580,6 +619,15 @@ def test_elapsed_adjusted_drain_never_runs_past_the_hard_exit_deadline():
                     )
                     if adjusted <= 0.0:
                         continue
+                    if elapsed + adjusted > wall - LAUNCHD_STOP_CLEANUP_RESERVE_S + 1e-9:
+                        violations.append(
+                            f"clamp={clamp} configured={configured} "
+                            f"teardown={teardown} elapsed={elapsed} "
+                            f"drain={adjusted} ends at {elapsed + adjusted} "
+                            f"against the SIGKILL wall {wall} minus the "
+                            f"{LAUNCHD_STOP_CLEANUP_RESERVE_S}s fixed cleanup "
+                            f"reserve — past launchd's uncatchable SIGKILL"
+                        )
                     window = armed - (elapsed + adjusted)
                     if window < reserve - 1e-9:
                         violations.append(
@@ -1589,9 +1637,14 @@ def test_stop_threads_the_one_deadline_into_both_the_drain_and_the_cron_leash(
     adapter.disconnect = AsyncMock()
 
     # In-flight cron work, so the cron leash is actually exercised.
-    monkeypatch.setattr(
-        run_mod.GatewayRunner, "_active_cron_job_count", lambda _self: 1
-    )
+    # Patched on the INSTANCE: make_restart_runner pre-binds
+    # _active_cron_job_count onto the runner (restart_test_helpers.py), and
+    # that instance attribute shadows any class-level patch for every
+    # `self._active_cron_job_count()` lookup inside stop() — the class patch
+    # was inert and the real method returned 0, so the in-flight-cron branch
+    # was never taken. (_drain_active_agents is NOT pre-bound, so the
+    # class-level patch of that one below is correct and must stay.)
+    monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 1)
 
     drain_kwargs: list[dict] = []
     real_drain_resolver = run_mod.resolve_elapsed_adjusted_drain
@@ -1709,10 +1762,10 @@ def test_drain_consumes_the_REARMED_deadline_at_the_inner_leash_geometry(
 
     monkeypatch.setattr(runner, "_notify_active_sessions_of_shutdown", _slow_notify)
 
-    # In-flight cron work, so the cron leash is exercised too.
-    monkeypatch.setattr(
-        run_mod.GatewayRunner, "_active_cron_job_count", lambda _self: 1
-    )
+    # In-flight cron work, so the cron leash is exercised too. INSTANCE, not
+    # class: make_restart_runner pre-binds this method on the runner, so a
+    # class-level patch is shadowed and inert (see the sibling test above).
+    monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 1)
 
     drain_kwargs: list[dict] = []
     real_drain_resolver = run_mod.resolve_elapsed_adjusted_drain
@@ -2017,18 +2070,105 @@ def test_rearm_is_skipped_off_the_launchd_path_where_nothing_bounds_it(
 def test_rearm_failure_leaves_the_original_watchdog_armed_and_stop_running(
     monkeypatch, tmp_path
 ):
-    """F2: a failing re-arm must not abort stop() or disarm the backstop.
+    """F2: a SILENTLY failing re-arm must not disarm the backstop.
 
-    If ``arm_shutdown_watchdog`` raises, propagating unwinds
-    ``_stop_impl_body`` at the drain fit — before drain, persist and
-    teardown — and the outer ``finally`` then sets every registered event,
-    retiring the ORIGINAL watchdog too. Result: in-flight state unpersisted
-    AND nothing left to ``os._exit`` before launchd's SIGKILL.
+    The reachable failure is NOT an exception. ``arm_shutdown_watchdog``
+    documents "Never raises" and wraps its own ``Thread.start``, so when
+    ``RuntimeError: can't start new thread`` hits under thread/FD exhaustion
+    — the very condition that wedges a shutdown — it used to return the
+    ``done`` event anyway. The re-arm then took the SUCCESS path: it
+    published a later ``_armed_shutdown_deadline_s`` and called
+    ``_prev.set()``, retiring the live t=0 watchdog in favour of a thread
+    that was never started. The process was left with NO hard-exit backstop:
+    no dump, no ``mark_exited`` ledger entry, no ordered PID-file /
+    runtime-lock release before launchd's SIGKILL.
 
-    Drives the real ``stop()`` with the marker cleared and the SECOND arming
-    call raising, then asserts stop() ran to completion (the adapter was
-    disconnected, which happens in post-drain teardown) and the published
-    deadline was NOT advanced to a backstop that does not exist.
+    The double here matches the real contract — it RETURNS without arming
+    (``None``), it does not raise — so this covers the path production
+    actually takes. ``test_arm_shutdown_watchdog_returns_none_when_the_
+    thread_cannot_start`` pins the other half of the contract against the
+    real function.
+    """
+    import asyncio
+
+    from gateway import run as run_mod
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 180.0
+    runner._cron_drain_timeout = 0.01
+    runner._launchd_exit_timeout_s = 300.0
+    runner._stop_requested_by_signal = True
+    runner._last_shutdown_teardown_s = 70.0
+    adapter.disconnect = AsyncMock()
+
+    async def _slow_notify():
+        await asyncio.sleep(0.9)
+
+    monkeypatch.setattr(runner, "_notify_active_sessions_of_shutdown", _slow_notify)
+
+    calls: list[float] = []
+    first_event: list[threading.Event] = []
+    live_at_drain: list[bool] = []
+
+    def _capture(delay, *, done_event=None, snapshot_fn=None, exit_code=None):
+        calls.append(delay)
+        if len(calls) == 1:
+            ev = done_event if done_event is not None else threading.Event()
+            first_event.append(ev)
+            return ev
+        # The REACHABLE failure: thread start failed, so no backstop was
+        # armed — reported by returning None, exactly as the real function
+        # does. It does NOT raise.
+        return None
+
+    async def _spy_drain(_self, timeout, cron_timeout=None):
+        # Observe during shutdown, BEFORE stop()'s finally disarms every
+        # watchdog on successful completion. Checking after stop() returns
+        # would test the deliberate cleanup rather than the re-arm ordering.
+        live_at_drain.append(
+            bool(first_event)
+            and not first_event[0].is_set()
+            and runner._shutdown_watchdog_done is first_event[0]
+        )
+        return ({}, False)
+
+    monkeypatch.setattr(run_mod.GatewayRunner, "_drain_active_agents", _spy_drain)
+    monkeypatch.setattr(run_mod, "arm_shutdown_watchdog", _capture)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"):
+        asyncio.run(runner.stop())  # must NOT raise
+
+    assert len(calls) == 2, f"expected the arming plus a failing re-arm, got {calls}"
+    # stop() reached post-drain teardown rather than unwinding at the fit.
+    adapter.disconnect.assert_awaited()
+    # The published deadline still names the backstop that actually exists.
+    assert runner._armed_shutdown_deadline_s == pytest.approx(250.0), (
+        f"published deadline {runner._armed_shutdown_deadline_s} was advanced "
+        f"to a watchdog that failed to arm; the live backstop is still the "
+        f"t=0 one at 250"
+    )
+    # And the ORIGINAL watchdog was live DURING the drain. stop()'s finally
+    # deliberately sets it on successful completion, so a post-return
+    # is_set() check would observe cleanup, not the re-arm ordering.
+    assert live_at_drain == [True], (
+        "the live t=0 watchdog was disarmed in favour of a replacement that "
+        "was never armed — the shutdown had no hard-exit backstop at drain"
+    )
+
+
+def test_rearm_exception_is_also_contained(monkeypatch, tmp_path):
+    """The defensive ``except`` path: an unexpected raise must not abort stop.
+
+    ``arm_shutdown_watchdog`` is contracted never to raise, so this is
+    belt-and-braces rather than the reachable path (that is the sibling test
+    above) — but propagating would unwind ``_stop_impl_body`` at the drain
+    fit, before drain / persist / teardown, and the outer ``finally`` would
+    then set every registered event and disarm the original watchdog too.
     """
     import asyncio
 
@@ -2059,7 +2199,7 @@ def test_rearm_failure_leaves_the_original_watchdog_armed_and_stop_running(
             ev = done_event if done_event is not None else threading.Event()
             first_event.append(ev)
             return ev
-        raise RuntimeError("can't start new thread")  # the re-arm fails
+        raise RuntimeError("can't start new thread")
 
     monkeypatch.setattr(run_mod, "arm_shutdown_watchdog", _capture)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
@@ -2069,11 +2209,221 @@ def test_rearm_failure_leaves_the_original_watchdog_armed_and_stop_running(
         asyncio.run(runner.stop())  # must NOT raise
 
     assert len(calls) == 2, f"expected the arming plus a failing re-arm, got {calls}"
-    # stop() reached post-drain teardown rather than unwinding at the fit.
     adapter.disconnect.assert_awaited()
-    # The published deadline still names the backstop that actually exists.
-    assert runner._armed_shutdown_deadline_s == pytest.approx(250.0), (
-        f"published deadline {runner._armed_shutdown_deadline_s} was advanced "
-        f"to a watchdog that failed to arm; the live backstop is still the "
-        f"t=0 one at 250"
+    assert runner._armed_shutdown_deadline_s == pytest.approx(250.0)
+    assert runner._shutdown_watchdog_done is first_event[0]
+
+
+def test_arm_shutdown_watchdog_returns_none_when_the_thread_cannot_start():
+    """The contract the re-arm's None check depends on, on the REAL function.
+
+    Independent of ``gateway.run``: patches ``threading.Thread.start`` to
+    raise the exception thread exhaustion actually produces, then asserts
+    the real ``arm_shutdown_watchdog`` reports it by returning ``None``
+    rather than handing back an event with no thread behind it. Without this
+    the caller cannot distinguish "armed" from "silently did nothing", which
+    is what made it retire a live backstop for a nonexistent one.
+    """
+    real_start = threading.Thread.start
+
+    def _boom(self):
+        raise RuntimeError("can't start new thread")
+
+    threading.Thread.start = _boom  # type: ignore[method-assign]
+    try:
+        result = arm_shutdown_watchdog(5.0)
+    finally:
+        threading.Thread.start = real_start  # type: ignore[method-assign]
+
+    assert result is None, (
+        f"arm_shutdown_watchdog returned {result!r} after the thread start "
+        f"failed; a replace-style caller cannot tell that no backstop exists"
+    )
+    # Nothing was left running under the documented name.
+    assert not [
+        t for t in threading.enumerate() if "gateway-shutdown-watchdog" in t.name
+    ]
+
+
+def test_arm_shutdown_watchdog_returns_the_event_on_success_and_on_zero_delay():
+    """The other two branches of the same contract stay non-None.
+
+    A ``None`` return means "failed to arm" and nothing else. The deliberate
+    ``delay_s <= 0`` disable arms nothing but was not asked to, so it must
+    NOT be reported as a failure — otherwise the re-arm's None check would
+    treat an intentional opt-out as thread exhaustion.
+    """
+    ev = threading.Event()
+    armed = arm_shutdown_watchdog(0.0, done_event=ev)
+    assert armed is ev
+
+    live = threading.Event()
+    armed_live = arm_shutdown_watchdog(30.0, done_event=live)
+    try:
+        assert armed_live is live
+    finally:
+        live.set()
+
+
+def test_cron_floor_collapses_to_zero_when_the_teardown_eats_the_window(
+    monkeypatch, tmp_path
+):
+    """Pins the ACCEPTED zero-ceiling row, end to end through stop().
+
+    A large measured teardown plus the pre-drain elapsed can consume the
+    whole window, and THE ONE DEADLINE then grants no cron wait at all.
+    Every number is hand-computed from the clamp, independent of the
+    resolvers::
+
+        budget 60, last_teardown_s 45, configured 180, cron floor 30
+        hard_exit = 60 - 10                  = 50
+        reserve   = max(15, 45)              = 45     (45 < 50 ceiling, kept)
+        capped    = min(180, 50 - 45)        =  5
+        armed     = min(5 + max(60, 45), 50) = 50
+        deadline  = 50 - 45                  =  5
+
+    With any pre-drain elapsed above 5s the ceiling is negative and BOTH the
+    drain and the cron floor resolve to 0. That is the deliberate trade
+    (``CRON_DRAIN_CLEANUP_RESERVE_S``: a job killed *and recorded* beats one
+    SIGKILLed mid-write and wedged at ``last_status=running``), and the old
+    ``watchdog_delay`` branch's 30 here was the #838 defect — it waited past
+    the reserve. Locked so the collapse cannot be "fixed" back into an
+    overrun without an explicit decision.
+    """
+    import asyncio
+
+    from gateway import run as run_mod
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 180.0
+    runner._cron_drain_timeout = 30.0
+    runner._launchd_exit_timeout_s = 60.0
+    runner._stop_requested_by_signal = True
+    runner._last_shutdown_teardown_s = 45.0
+    adapter.disconnect = AsyncMock()
+
+    # A real pre-drain cost, past the 5s deadline computed above.
+    async def _slow_notify():
+        await asyncio.sleep(5.1)
+
+    monkeypatch.setattr(runner, "_notify_active_sessions_of_shutdown", _slow_notify)
+    monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 1)
+
+    drain_budgets: list[tuple[float, float]] = []
+
+    async def _spy_drain(_self, timeout, cron_timeout=None):
+        drain_budgets.append((timeout, cron_timeout))
+        return ({}, False)
+
+    monkeypatch.setattr(run_mod.GatewayRunner, "_drain_active_agents", _spy_drain)
+    monkeypatch.setattr(
+        run_mod,
+        "arm_shutdown_watchdog",
+        lambda delay, **kw: kw.get("done_event") or threading.Event(),
+    )
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"):
+        asyncio.run(runner.stop())
+
+    assert len(drain_budgets) == 1, drain_budgets
+    timeout, cron_timeout = drain_budgets[0]
+    assert timeout == pytest.approx(0.0), (
+        f"non-cron drain was {timeout}; the deadline (5) is already past at "
+        f"this elapsed, so any positive budget runs into the 45s teardown"
+    )
+    assert cron_timeout == pytest.approx(0.0), (
+        f"cron budget was {cron_timeout}; the old watchdog_delay derivation "
+        f"returned 30 here, which is the #838 overrun — waiting past the "
+        f"measured teardown reserve to the hard-exit instant"
+    )
+
+
+def test_rearm_shortens_a_deadline_already_past_the_launchd_wall(
+    monkeypatch, tmp_path
+):
+    """Extend-only must NOT preserve a deadline launchd will never honour.
+
+    Reachable geometry: an in-band ``stop(restart=True)`` arms with
+    ``signal_driven=False``, so ``resolve_launchd_shutdown_watchdog_delay``
+    short-circuits and the published deadline is the RAW inner leash. A
+    supervisor SIGTERM then lands mid-stop and flips
+    ``_stop_requested_by_signal``. Hand-computed at clamp 60::
+
+        published by the in-band arming: 180 + max(60, 15) = 240
+        launchd wall (hard_exit):        60 - 10           =  50
+        SIGKILL:                                              60
+
+    Extend-only discarded the fresh 50 because it is EARLIER, leaving the
+    real ``os._exit`` thread armed at stop()+240 against an uncatchable
+    SIGKILL at 60 — a decorative backstop. The wall-bound exception
+    shortens it to 50 instead, so the second value handed to
+    ``arm_shutdown_watchdog`` must be a RELATIVE delay landing on 50
+    absolute, i.e. ``50 - elapsed``.
+    """
+    import asyncio
+
+    from gateway import run as run_mod
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 180.0
+    runner._cron_drain_timeout = 0.01
+    runner._launchd_exit_timeout_s = 60.0
+    runner._last_shutdown_teardown_s = None
+    adapter.disconnect = AsyncMock()
+
+    # The in-band arming: not signal-driven, so the published deadline is the
+    # raw unclamped inner leash.
+    runner._stop_requested_by_signal = False
+
+    async def _slow_notify():
+        # The SIGTERM lands mid-stop, exactly as the signal handler does.
+        runner._stop_requested_by_signal = True
+        await asyncio.sleep(0.9)
+
+    monkeypatch.setattr(runner, "_notify_active_sessions_of_shutdown", _slow_notify)
+
+    calls: list[float] = []
+
+    def _capture(delay, *, done_event=None, snapshot_fn=None, exit_code=None):
+        calls.append(delay)
+        return done_event if done_event is not None else threading.Event()
+
+    monkeypatch.setattr(run_mod, "arm_shutdown_watchdog", _capture)
+
+    async def _fake_drain(_self, timeout, cron_timeout=None):
+        return ({}, False)
+
+    monkeypatch.setattr(run_mod.GatewayRunner, "_drain_active_agents", _fake_drain)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"):
+        asyncio.run(runner.stop())
+
+    assert calls[0] == pytest.approx(240.0), (
+        f"expected the raw in-band inner leash 240 at t=0, got {calls[0]}"
+    )
+    assert len(calls) == 2, (
+        f"the re-arm did not fire: {calls}. Extend-only discarded the "
+        f"wall-clamped 50 and left os._exit armed at stop()+240 against a "
+        f"SIGKILL at 60"
+    )
+    # ABSOLUTE 50 = the wall. The armed call is RELATIVE, so it must be
+    # 50 minus the ~0.9s already spent — never above 50, never above the
+    # SIGKILL at 60.
+    assert runner._armed_shutdown_deadline_s == pytest.approx(50.0), (
+        f"published deadline {runner._armed_shutdown_deadline_s} is not the "
+        f"launchd wall (50)"
+    )
+    assert 0.0 < calls[1] <= 50.0, (
+        f"re-arm handed arm_shutdown_watchdog {calls[1]}; the relative delay "
+        f"must land on the wall at stop()+50, not past it"
     )
