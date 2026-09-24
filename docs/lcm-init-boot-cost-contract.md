@@ -143,6 +143,24 @@ inter-statement wall time.
    lock only when there is something to delete, and runs at most once per
    `empty_lifecycle_gc_interval_hours` (default 6 h) per process.
 
+## An FTS repair is one transaction (freeze #3, third defect)
+
+`repair_external_content_fts` issues DROP TABLE / CREATE VIRTUAL TABLE / `'rebuild'` /
+DROP+CREATE TRIGGER. Python's legacy sqlite3 isolation opens **no implicit transaction for
+DDL**. Before t_d3963974's follow-up, each of those statements autocommitted on its own. For
+the whole O(rows) rebuild (13–28 min on the fleet store), other connections saw the index
+missing (`LCM ingest failed: no such table: main.messages_fts`, live 05:10) or empty
+(docsize=0 vs 2.79 M, captured on disk), and a dropped trigger let concurrent inserts skip
+the index. Any repair now runs under `BEGIN IMMEDIATE` with one COMMIT and rolls back on any
+error. A no-op load still takes no write lock. The explicit-repair path was atomic only by
+accident: #966's parity-marker write opened a transaction first. The engine-load
+structural path was not. Gate: `test_lcm_fts_atomic_rebuild.py` (observer connection sees
+no torn state; a failed rebuild leaves the old index), RED on dc228d5810.
+
+Residual (not fixed here): a genuine structural rebuild still runs inline on the load
+path and holds the write lock for its whole duration. It is atomic now, but it is not
+off-path.
+
 ## Adding a new column with a legacy backfill — the recipe
 
 ```python

@@ -3152,9 +3152,41 @@ def repair_external_content_fts(
     now: float | None = None,
     throttle: bool = False,
 ) -> dict[str, bool]:
+    needs_rebuild = _fts_needs_rebuild(conn, spec, now=now, throttle=throttle)
+    if not (needs_rebuild or _fts_missing_triggers(conn, spec) or _fts_stale_triggers(conn, spec)):
+        # No-op pass (every ordinary engine load): take no write lock.
+        return _repair_external_content_fts_body(conn, spec, now=now, needs_rebuild=False)
+    # Any repair is ONE write transaction. Python's legacy sqlite3 isolation
+    # opens no implicit transaction for DDL, so DROP TABLE / CREATE VIRTUAL TABLE /
+    # DROP TRIGGER each autocommitted on their own. For the whole O(rows) rebuild
+    # (~13-28 min on the 11.9 GB fleet store) every other connection saw the index
+    # MISSING (live 2026-09-24 05:10: "LCM ingest failed: no such table:
+    # main.messages_fts") or EMPTY (docsize=0 vs 2.79 M messages, captured on disk),
+    # and a dropped-then-recreated trigger let concurrent inserts skip the index =
+    # real drift. BEGIN IMMEDIATE takes the write lock up front; readers keep the
+    # old, complete index until the single COMMIT; any failure rolls back to it.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        return _repair_external_content_fts_body(
+            conn, spec, now=now, needs_rebuild=needs_rebuild
+        )
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _repair_external_content_fts_body(
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    now: float | None,
+    needs_rebuild: bool,
+) -> dict[str, bool]:
     rebuilt = False
     degraded = False
-    if _fts_needs_rebuild(conn, spec, now=now, throttle=throttle):
+    if needs_rebuild:
         db_path = conn.execute("PRAGMA database_list").fetchone()
         if db_path:
             db_file = db_path[2]
