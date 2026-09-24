@@ -392,3 +392,13 @@ def test_reserve_refuses_more_than_18_jobs():
     r = ledger(api).reserve(key(2), over)
     assert isinstance(r, Refusal) and r.incident == "invalid-plan"
     assert api.writes == 1
+
+
+def test_reserve_refuses_unapproved_label():
+    """C4: reserve() admits only the POOL/X64/ARM label sets; a correctly priced unapproved label is refused unwritten."""
+    api = Contents()
+    rogue = Plan([JobPlacement("a", ["windows-latest"], "cloud-overflow", 35)], [], {"mode": "overflow"})
+    r = ledger(api).reserve(key(), rogue)
+    assert isinstance(r, Refusal) and r.incident == "invalid-plan"
+    assert api.writes == 0
+    assert isinstance(ledger(api).reserve(key(2), proposed("a")), Reservation)
