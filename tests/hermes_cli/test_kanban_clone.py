@@ -211,8 +211,8 @@ def test_userinfo_is_not_persisted_in_the_shared_mirror(fleet, monkeypatch):
     assert "s3cret" not in (mirror / "config").read_text()
 
 
-def test_failed_mirror_build_leaves_no_mirror_and_resumes(fleet, monkeypatch):
-    """A half-built mirror is never visible; the next call finishes the build."""
+def test_failed_mirror_build_leaves_no_mirror_and_no_staging(fleet, monkeypatch):
+    """An in-process failure is discarded, never left for the next caller."""
     real = kc._git
     calls = {"n": 0}
 
@@ -225,11 +225,224 @@ def test_failed_mirror_build_leaves_no_mirror_and_resumes(fleet, monkeypatch):
     monkeypatch.setattr(kc, "_git", flaky)
     with pytest.raises(RuntimeError, match="network down"):
         kc.ensure_mirror("https://github.com/Kyzcreig/demo.git", "Kyzcreig", "demo")
-    mirror = fleet / "mirrors" / "Kyzcreig" / "demo.git"
+    owner_dir = fleet / "mirrors" / "Kyzcreig"
+    mirror = owner_dir / "demo.git"
     assert not mirror.exists()
+    assert not list(owner_dir.glob(".demo.git.build-*"))
     assert kc.ensure_mirror("https://github.com/Kyzcreig/demo.git", "Kyzcreig", "demo") == mirror
     assert (mirror / "objects").is_dir()
-    assert not (fleet / "mirrors" / "Kyzcreig" / ".demo.git.partial").exists()
+    assert not list(owner_dir.glob(".demo.git.*"))
+
+
+def _residue_files(repo_dir):
+    return sorted(p.name for p in Path(repo_dir).rglob("*")
+                  if p.name.startswith("tmp_") or p.name.endswith(".lock"))
+
+
+def _dead_build(owner_dir, name):
+    """What a SIGKILLed first build leaves: a staging repo with the never-prune
+    config, a half-written pack, and ref + config locks (QA r2 R1 b/c)."""
+    staging = owner_dir / name
+    _git("init", "-q", "--bare", str(staging))
+    _git("--git-dir", str(staging), "config", "core.repositoryformatversion", "1")
+    _git("--git-dir", str(staging), "config", "extensions.preciousObjects", "true")
+    (staging / "objects" / "pack" / "tmp_pack_KILLED").write_bytes(b"\0" * 300_000)
+    (staging / "objects" / "pack" / "tmp_idx_KILLED").write_bytes(b"\0" * 10)
+    (staging / "refs" / "heads" / "main.lock").write_text("0" * 40 + "\n")
+    (staging / "config.lock").write_text("")
+    return staging
+
+
+@pytest.mark.parametrize("name", [".demo.git.build-deadbeef", ".demo.git.partial"])
+def test_dead_build_residue_is_discarded_not_promoted(fleet, name):
+    owner_dir = fleet / "mirrors" / "Kyzcreig"
+    owner_dir.mkdir(parents=True)
+    dead = _dead_build(owner_dir, name)
+    assert kc.clone("https://github.com/Kyzcreig/demo.git", "a") == 0
+    mirror = owner_dir / "demo.git"
+    assert (fleet / "a" / ".git" / "objects" / "info" / "alternates").read_text().strip() == str(
+        mirror / "objects")
+    assert _residue_files(mirror) == [], "killed build residue promoted into the mirror"
+    assert not dead.exists()
+    assert not list(owner_dir.glob(".demo.git.*"))
+
+
+def test_discard_only_touches_this_repos_staging(fleet, tmp_path):
+    owner_dir = fleet / "mirrors" / "Kyzcreig"
+    owner_dir.mkdir(parents=True)
+    keep = [owner_dir / "demo.git.build-x", owner_dir / ".other.git.build-x", owner_dir / "demo.git"]
+    for k in keep:
+        k.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_text("x")
+    (owner_dir / ".demo.git.build-link").symlink_to(outside)
+    # A symlink to a sibling INSIDE the owner dir passes the realpath check;
+    # only the symlink guard keeps it from reaching the live mirror.
+    (owner_dir / "demo.git" / "sentinel").write_text("live")
+    (owner_dir / ".demo.git.build-inner").symlink_to(owner_dir / "demo.git")
+    kc._discard_dead_builds(owner_dir, "demo")
+    assert all(k.exists() for k in keep)
+    assert (outside / "sentinel").exists()
+    assert (owner_dir / "demo.git" / "sentinel").read_text() == "live"
+
+
+_HELPER = (
+    "import sys; sys.path.insert(0, sys.argv[1]);"
+    "from hermes_cli import kanban_clone as kc;"
+    "sys.exit(kc.clone(sys.argv[2], sys.argv[3], ['-q']))"
+)
+
+
+def _spawn(dest, url="https://github.com/Kyzcreig/demo.git"):
+    import sys
+
+    root = str(Path(kc.__file__).resolve().parents[1])
+    return subprocess.Popen(
+        [sys.executable, "-c", _HELPER, root, url, str(dest)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+
+
+def _terminal_tool_kill(proc):
+    """What tools/environments/local.py does on timeout: SIGTERM the group,
+    wait up to 1 s, then SIGKILL it."""
+    import os
+    import signal
+    import time
+
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and proc.poll() is None:
+        time.sleep(0.02)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.communicate()
+
+
+def _dir_bytes(path):
+    return sum(p.stat().st_size for p in Path(path).rglob("*") if p.is_file())
+
+
+@pytest.fixture
+def big_fleet(fleet):
+    """demo with ~24 MB of incompressible history and 1,500 branches, so a
+    first build takes long enough to be killed mid-pack and mid-ref-update."""
+    import os
+
+    work = fleet / "src" / "work" / "Kyzcreig" / "demo"
+    for i in range(3):
+        (work / f"blob{i}.bin").write_bytes(os.urandom(8_000_000))
+        _git("add", ".", cwd=work)
+        _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", f"big {i}", cwd=work)
+    head = _git("rev-parse", "HEAD", cwd=work)
+    refs = "".join(f"create refs/heads/b{i:04d} {head}\n" for i in range(1500))
+    subprocess.run(["git", "update-ref", "--stdin"], input=refs, text=True, check=True, cwd=work)
+    bare = fleet / "src" / "Kyzcreig" / "demo.git"
+    _git("push", "-q", "--force", str(bare), "refs/heads/*:refs/heads/*", cwd=work)
+    return fleet
+
+
+def test_killed_first_build_never_poisons_the_mirror(big_fleet):
+    """QA r2 R1: kill REAL helper subprocesses the way the terminal tool does,
+    at points spread across the whole build (pack transfer and ref update).
+    After every kill the next call must build the mirror, clone with
+    alternates, and promote nothing from the killed attempt."""
+    import shutil
+    import time
+
+    owner_dir = big_fleet / "mirrors" / "Kyzcreig"
+    mirror = owner_dir / "demo.git"
+
+    # Clean reference build: its size and duration.
+    t0 = time.monotonic()
+    proc = _spawn(big_fleet / "clean")
+    _, err = proc.communicate(timeout=300)
+    build_s = time.monotonic() - t0
+    assert proc.returncode == 0, err
+    clean_bytes = _dir_bytes(mirror)
+    shutil.move(str(mirror), str(big_fleet / "clean-mirror"))
+
+    fractions = (0.05, 0.15, 0.3, 0.45, 0.6, 0.75, 0.85, 0.95)
+    landed = 0
+    for n, frac in enumerate(fractions):
+        victim = _spawn(big_fleet / f"killed{n}")
+        time.sleep(build_s * frac)
+        _terminal_tool_kill(victim)
+        if mirror.exists():  # the kill landed after promotion: nothing to prove
+            shutil.move(str(mirror), str(big_fleet / f"late{n}"))
+            continue
+        landed += 1
+        nxt = _spawn(big_fleet / f"next{n}")
+        _, err = nxt.communicate(timeout=300)
+        assert nxt.returncode == 0, err
+        assert "mirror unavailable" not in err, (frac, err)
+        alt = big_fleet / f"next{n}" / ".git" / "objects" / "info" / "alternates"
+        assert alt.read_text().strip() == str(mirror / "objects"), frac
+        assert _residue_files(mirror) == [], frac
+        assert _dir_bytes(mirror) <= clean_bytes * 1.05, (frac, _dir_bytes(mirror), clean_bytes)
+        assert not list(owner_dir.glob(".demo.git.*")), frac
+        shutil.move(str(mirror), str(big_fleet / f"built{n}"))
+    # Non-vacuity: most kills must land before promotion, or this proves nothing.
+    assert landed >= len(fractions) // 2, (landed, build_s)
+
+
+def test_concurrent_first_clones_share_one_mirror(fleet):
+    """QA r2 K1/MX3: without the flock most concurrent first clones degrade."""
+    procs = [_spawn(fleet / f"c{i}") for i in range(6)]
+    outs = [p.communicate(timeout=120) for p in procs]
+    mirror = fleet / "mirrors" / "Kyzcreig" / "demo.git"
+    for i, (p, (_, err)) in enumerate(zip(procs, outs)):
+        assert p.returncode == 0, err
+        assert "mirror unavailable" not in err, err
+        alt = fleet / f"c{i}" / ".git" / "objects" / "info" / "alternates"
+        assert alt.read_text().strip() == str(mirror / "objects")
+    assert not list((fleet / "mirrors" / "Kyzcreig").glob(".demo.git.*"))
+
+
+@pytest.mark.parametrize("arm", ["index", "gitdir"])
+def test_inherited_git_env_cannot_redirect_the_clone(fleet, monkeypatch, arm):
+    """QA r2 K1/MX4: a caller inside another repo's git env must not have its
+    index or config touched, and the clone must still borrow from the mirror."""
+    victim = fleet / "victim"
+    victim.mkdir()
+    _git("init", "-q", "-b", "main", cwd=victim)
+    (victim / "f").write_text("v\n")
+    _git("add", "f", cwd=victim)
+    before = ((victim / ".git" / "index").read_bytes(), (victim / ".git" / "config").read_bytes())
+    monkeypatch.setenv("GIT_INDEX_FILE", str(victim / ".git" / "index"))
+    if arm == "gitdir":
+        monkeypatch.setenv("GIT_DIR", str(victim / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(victim))
+    assert kc.clone("https://github.com/Kyzcreig/demo.git", "a") == 0
+    assert ((victim / ".git" / "index").read_bytes(), (victim / ".git" / "config").read_bytes()) == before
+    assert (fleet / "a" / ".git" / "objects" / "info" / "alternates").exists()
+    assert (fleet / "a" / "big.txt").exists()
+
+
+def test_never_prune_config_is_in_place_before_the_fetch(fleet, monkeypatch):
+    """QA r2 K2: no object may land in a repo that could still prune it."""
+    real = kc._git
+    seen = {}
+
+    def spy(*args):
+        if "fetch" in args:
+            git_dir = args[args.index("--git-dir") + 1]
+            for key in ("extensions.preciousObjects", "gc.pruneExpire"):
+                seen[key] = subprocess.run(
+                    ["git", "--git-dir", git_dir, "config", "--get", key],
+                    capture_output=True, text=True).stdout.strip()
+        return real(*args)
+
+    monkeypatch.setattr(kc, "_git", spy)
+    kc.ensure_mirror("https://github.com/Kyzcreig/demo.git", "Kyzcreig", "demo")
+    assert seen == {"extensions.preciousObjects": "true", "gc.pruneExpire": "never"}
 
 
 @pytest.mark.parametrize("precious", [True, False])

@@ -216,35 +216,97 @@ def _set_head(mirror: Path, url: str) -> None:
         _git("--git-dir", str(mirror), "symbolic-ref", "HEAD", m.group(1))
 
 
+# Leftovers a killed git process can leave in a repo it was writing. A build
+# that shows any of them is never promoted into a mirror.
+_RESIDUE = re.compile(r"(^tmp_|\.lock$)")
+
+
+def _build_prefix(repo: str) -> str:
+    return f".{repo}.git.build-"
+
+
+def _discard_dead_builds(parent: Path, repo: str) -> None:
+    """Delete every staging repo of *repo* under *parent*.
+
+    Called ONLY while holding the mirror flock. A builder holds that flock for
+    its whole build, and the kernel drops it when the builder dies, so any
+    staging repo that exists while we hold it belongs to a dead build: a
+    SIGTERM/SIGKILL'd fetch leaves tmp_pack_*, ref and config locks behind,
+    and git never resumes them. Deleting them is the only correct recovery.
+
+    Reviewed exception to kanban's one-deletion-choke-point rule
+    (tests/hermes_cli/test_kanban_survivor.py): this never touches a
+    workspace, only ``<mirrors>/<owner>/.<repo>.git.build-*`` (and the r2
+    ``.<repo>.git.partial`` name) -- direct, non-symlink children of the
+    owner dir, checked after realpath.
+    """
+    import shutil
+
+    root = os.path.realpath(parent)
+    prefix = _build_prefix(repo)
+    legacy = f".{repo}.git.partial"
+    for child in parent.iterdir():
+        if not (child.name.startswith(prefix) or child.name == legacy):
+            continue
+        if child.is_symlink() or not child.is_dir():
+            continue
+        if os.path.dirname(os.path.realpath(child)) != root:
+            continue
+        shutil.rmtree(child)
+
+
+def _residue(repo_dir: Path) -> list:
+    return sorted(
+        str(p.relative_to(repo_dir))
+        for p in repo_dir.rglob("*")
+        if _RESIDUE.search(p.name)
+    )
+
+
 def ensure_mirror(url: str, owner: str, repo: str) -> Path:
     """Return the mirror for owner/repo, creating it (bare, never-prune) lazily.
 
-    Built at a fixed staging path beside the target and renamed into place, so
-    a half-built mirror is never visible to a concurrent ``--reference-if-able``.
-    The never-prune config is written into the staging repo BEFORE the first
-    fetch, so no object ever lives in a mirror that could prune it. A failed
-    build leaves the staging repo for the next caller to resume (init and
-    config are idempotent, fetch is incremental) rather than deleting it here:
-    kanban's one directory-deletion choke point is
-    ``kanban_survivor.remove_workspace_dir``.
+    Every build runs in a FRESH staging repo (``.<repo>.git.build-<random>``
+    beside the target) and is renamed into place only when complete and
+    clean, so a half-built mirror is never visible to ``--reference-if-able``.
+    The never-prune config is written into the staging repo BEFORE the fetch,
+    so no object ever lives in a repo that could prune it.
+
+    Interrupted builds are NOT resumed: the terminal tool SIGTERMs then
+    SIGKILLs a timed-out command, and a killed ``git fetch`` leaves tmp_pack_*
+    files and ref/config locks that git never reuses. Promoting such a repo
+    would bake the residue into a precious (unprunable) mirror, and a stale ref
+    lock would fail every later fetch. So the next builder, under the flock,
+    discards every dead staging repo and starts from an empty one; a build
+    that fails in-process is discarded the same way before the error surfaces.
     """
     mirror = mirror_path(owner, repo)
     mirror.parent.mkdir(parents=True, exist_ok=True)
     with _mirror_lock(mirror):
         if (mirror / "objects").is_dir():
             return mirror
-        staging = mirror.parent / f".{repo}.git.partial"
-        _must(_git("init", "--bare", "--quiet", str(staging)), f"init of {staging}")
-        configure_mirror(staging, strip_userinfo(url))
-        # Fetch from the URL as given (it may carry credentials) without
-        # persisting it: remote.origin.url above is the stripped form.
-        _must(
-            _git("--git-dir", str(staging), "fetch", "--quiet", "--tags", url,
-                 "+refs/heads/*:refs/heads/*"),
-            f"mirror fetch of {strip_userinfo(url)}",
-        )
-        _set_head(staging, url)
-        os.replace(staging, mirror)
+        _discard_dead_builds(mirror.parent, repo)
+        import tempfile
+
+        staging = Path(tempfile.mkdtemp(prefix=_build_prefix(repo), dir=mirror.parent))
+        try:
+            _must(_git("init", "--bare", "--quiet", str(staging)), f"init of {staging}")
+            configure_mirror(staging, strip_userinfo(url))
+            # Fetch from the URL as given (it may carry credentials) without
+            # persisting it: remote.origin.url above is the stripped form.
+            _must(
+                _git("--git-dir", str(staging), "fetch", "--quiet", "--tags", url,
+                     "+refs/heads/*:refs/heads/*"),
+                f"mirror fetch of {strip_userinfo(url)}",
+            )
+            _set_head(staging, url)
+            left = _residue(staging)
+            if left:
+                raise RuntimeError(f"mirror build left {left[:3]}; not promoting")
+            os.replace(staging, mirror)
+        except BaseException:
+            _discard_dead_builds(mirror.parent, repo)
+            raise
     return mirror
 
 
