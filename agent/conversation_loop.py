@@ -576,7 +576,7 @@ def _account_unaccepted_billed_call(
     usage = _canonical_usage_from_response(
         entry.get("response"), provider=provider, api_mode=entry.get("api_mode") or None
     )
-    usage_flags = {key: bool(getattr(usage, key)) for key in USAGE_UNKNOWN_FIELDS}
+    call_flags = {key: bool(getattr(usage, key)) for key in USAGE_UNKNOWN_FIELDS}
     prior_api_calls = int(getattr(agent, "session_api_calls", 0) or 0)
     _bump_counter(agent, "session_prompt_tokens", usage.prompt_tokens)
     _bump_counter(agent, "session_completion_tokens", usage.output_tokens)
@@ -587,12 +587,12 @@ def _account_unaccepted_billed_call(
     _bump_counter(agent, "session_cache_read_tokens", usage.cache_read_tokens)
     _bump_counter(agent, "session_cache_write_tokens", usage.cache_write_tokens)
     _bump_counter(agent, "session_reasoning_tokens", usage.reasoning_tokens)
-    for flag, is_set in usage_flags.items():
+    for flag, is_set in call_flags.items():
         if is_set:
             setattr(agent, f"session_{flag}", True)
     if turn_calls is not None and entry.get("turn_id", "") == (turn_id or ""):
         turn_calls.append({
-            **usage_flags,
+            **call_flags,
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cache_read_tokens": usage.cache_read_tokens,
@@ -652,7 +652,7 @@ def _account_unaccepted_billed_call(
                 if cost_result.status == "included" else None,
                 model=model,
                 api_call_count=1,
-                **usage_flags,
+                **call_flags,
             )
         except Exception as exc:
             logger.debug("Unaccepted billed-call persistence failed: %s", exc)
