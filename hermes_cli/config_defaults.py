@@ -3114,7 +3114,9 @@ DEFAULT_CONFIG = {
         # "milestone_only": only cards whose title/body carry "[milestone]"
         # or that are parents in task_links get a reviewer session; every
         # other card that asks for review is completed in place with a
-        # review_skipped event (CI is the gate for slice work).
+        # review_skipped event (CI is the gate for slice work) — even when
+        # the worker names a reviewer profile; only reviewer=human or
+        # --force bypasses it.
         "review_policy": "all",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,

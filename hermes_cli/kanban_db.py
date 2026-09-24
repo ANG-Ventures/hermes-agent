@@ -10935,7 +10935,8 @@ def configured_review_policy() -> str:
     are routed to ``kanban.review_assignee``; every other card that asks for
     review is COMPLETED instead, with a ``review_skipped`` event — CI is the
     gate for slice work, the reviewer profile is functional QA at milestones.
-    An explicit ``reviewer=`` on the request still wins.
+    Applies even when a reviewer PROFILE is named explicitly; only the
+    ``human`` sentinel or ``force=True`` bypasses it.
     """
     try:
         from hermes_cli.config import load_config
@@ -11269,8 +11270,15 @@ def request_review(
     # ── Review policy (kanban.review_policy=milestone_only) ────────────────
     # Slice cards do not get a reviewer session; CI is their gate. They are
     # COMPLETED here with a review_skipped event so the orchestrator's merge
-    # pass sees them as done-with-PR. An explicit reviewer= still routes.
-    if reviewer is None and configured_review_policy() == "milestone_only":
+    # pass sees them as done-with-PR. The policy applies even when the worker
+    # names a reviewer profile explicitly (workers were templated to pass
+    # reviewer="argus" on every card — that IS the mechanism being removed).
+    # Only the explicit ``human`` sentinel or force=True (operator) bypasses it.
+    if (
+        configured_review_policy() == "milestone_only"
+        and not force
+        and not is_human_reviewer(reviewer)
+    ):
         if not is_milestone_card(conn, task_id):
             skip_meta = dict(metadata or {})
             skip_meta["review_skipped"] = "non_milestone"

@@ -233,13 +233,25 @@ def test_milestone_only_routes_marker_and_parent_cards(kanban_home, monkeypatch)
             )
         assert kb.is_milestone_card(conn, parent) is True
         assert kb.is_milestone_card(conn, child) is False
-        # explicit reviewer= on a slice card still routes (operator intent wins);
-        # a fresh leaf, since ``child`` is parent-gated until ``parent`` closes.
+        # an explicit reviewer PROFILE on a slice card does NOT bypass the policy
+        # (workers were templated to pass reviewer="argus" on every card — that is
+        # the mechanism being removed); the card completes in place.
         leaf = kb.create_task(conn, title="slice with explicit reviewer", assignee="builder")
         claimed = kb.claim_task(conn, leaf)
         assert kb.request_review(conn, leaf, summary="s", reviewer="argus",
                                  expected_run_id=claimed.current_run_id) is True
-        assert kb.get_task(conn, leaf).status == "review"
+        assert kb.get_task(conn, leaf).status == "done"
+        # the explicit human sentinel still parks the card for a person
+        leaf2 = kb.create_task(conn, title="slice for a human", assignee="builder")
+        claimed = kb.claim_task(conn, leaf2)
+        assert kb.request_review(conn, leaf2, summary="s", reviewer="human",
+                                 expected_run_id=claimed.current_run_id) is True
+        assert kb.get_task(conn, leaf2).status == "review"
+        # force=True is the operator override
+        leaf3 = kb.create_task(conn, title="slice forced to review", assignee="builder")
+        assert kb.claim_task(conn, leaf3) is not None
+        assert kb.request_review(conn, leaf3, summary="s", reviewer="argus", force=True) is True
+        assert kb.get_task(conn, leaf3).status == "review"
 
 
 def test_default_policy_all_is_unchanged(kanban_home, monkeypatch):
