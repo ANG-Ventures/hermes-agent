@@ -567,3 +567,211 @@ def test_real_loader_not_enabled_by_default(home):
     mgr = PluginManager()
     mgr.discover_and_load()
     assert not [r for r in mgr.invoke_hook("pre_llm_call", session_id=SID, platform="cli") if r]
+
+
+# ── P2 board mtime filter (t_11f2cf60) ──────────────────────────────────────
+
+def _age(path: Path, seconds_ago: float) -> None:
+    import os
+
+    t = time.time() - seconds_ago
+    os.utime(path, (t, t))
+
+
+def test_P2_board_not_written_since_home_start_is_not_opened(mod, home):
+    d = _board(home)
+    old = _board(home, "old-board")
+    new = _board(home, "new-board")
+    _card(old, "t_old00001", session_id=SID)  # cannot exist in reality; proves no open
+    _card(new, "t_new00001", session_id=SID)
+    _age(d, 86_400)
+    _age(old, 86_400)
+    since = time.time() - 3_600
+    dbs, skipped = mod._board_dbs(since)
+    assert [s for s, _ in dbs] == ["default", "new-board"]  # root kept even if old
+    assert skipped == 1
+    cards, stats = mod.query_cards([SID], budget_s=10, since=since)
+    assert {c["id"] for c in cards} == {"t_new00001"}
+    assert stats["mtime_skipped"] == 1 and stats["boards"] == 2
+
+
+def test_P2_mtime_slack_keeps_board_written_just_before_start(mod, home):
+    _board(home)
+    b = _board(home, "edge")
+    _age(b, 3_600 + mod.MTIME_SLACK_S - 60)  # inside the slack window
+    dbs, skipped = mod._board_dbs(time.time() - 3_600)
+    assert "edge" in [s for s, _ in dbs] and skipped == 0
+
+
+def test_P2_nonempty_wal_keeps_old_board(mod, home):
+    _board(home)
+    b = _board(home, "wal-board")
+    _age(b, 86_400)
+    Path(str(b) + "-wal").write_bytes(b"x" * 64)
+    dbs, skipped = mod._board_dbs(time.time() - 3_600)
+    assert "wal-board" in [s for s, _ in dbs] and skipped == 0
+
+
+def test_P2_unknown_start_disables_filter(mod, home):
+    _board(home)
+    b = _board(home, "ancient")
+    _age(b, 10 * 86_400)
+    dbs, skipped = mod._board_dbs(None)
+    assert "ancient" in [s for s, _ in dbs] and skipped == 0
+
+
+def test_P2_hook_uses_home_start_from_lineage(mod, home):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    db.create_session(SID, "discord", session_key="agent:main:discord:group:1")
+    db.close()
+    d = _board(home)
+    old = _board(home, "old-board")
+    _card(d, "t_home0001", session_id=SID)
+    _card(old, "t_old00001", session_id=SID)
+    _age(old, 86_400)  # session started "now"; this board predates it
+    out = mod.on_pre_llm_call(session_id=SID, platform="discord")
+    assert "t_home0001" in out["context"] and "t_old00001" not in out["context"]
+
+
+def test_plugin_home_ids_is_the_shared_lineage(mod, home):
+    from hermes_state import SessionDB
+
+    key = "agent:main:discord:group:9"
+    parent = "20260924_110000_pppppp"
+    db = SessionDB()
+    db.create_session(parent, "discord", session_key=key)
+    db.create_session(SID, "discord", session_key=key, parent_session_id=parent)
+    db.close()
+    assert set(mod.home_ids(SID)) == {parent, SID}
+    d = _board(home)
+    _card(d, "t_prnt0001", session_id=parent, title="parent card")
+    out = mod.on_pre_llm_call(session_id=SID, platform="discord")
+    assert "parent card" in out["context"]
+
+
+# ── I5 stage-attributed timeout (t_11f2cf60) ────────────────────────────────
+
+def test_I5_budget_is_1500ms(mod):
+    assert mod.BUDGET_S == 1.5
+
+
+def test_I5_lineage_timeout_names_stage(mod, home, monkeypatch, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    monkeypatch.setattr(mod, "BUDGET_S", 0.2)
+    monkeypatch.setattr(mod, "home_ids", lambda s: time.sleep(1) or (s,))
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        t = time.monotonic()
+        assert mod.on_pre_llm_call(session_id=SID) is None
+        assert time.monotonic() - t < 0.2 + 0.5
+    line = next(r.getMessage() for r in caplog.records if "unavailable=timeout" in r.getMessage())
+    assert "stage=lineage" in line and "partial_cards=0" in line and "ms=" in line
+
+
+def test_I5_dedupe_timeout_names_stage(mod, home, monkeypatch, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    monkeypatch.setattr(mod, "BUDGET_S", 0.2)
+    monkeypatch.setattr(mod, "_persisted_recently_injected",
+                        lambda *a: time.sleep(1) or False)
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        assert mod.on_pre_llm_call(session_id=SID) is None
+    assert any("stage=dedupe" in r.getMessage() for r in caplog.records)
+
+
+def test_I5_boards_timeout_names_stage_and_partial(mod, home, monkeypatch, caplog):
+    d = _board(home)
+    _card(d, "t_home0001", session_id=SID)
+    _board(home, "slow-board")
+    real = mod._query_board
+    def slow(slug, *a):
+        if slug == "slow-board":
+            time.sleep(3)
+        return real(slug, *a)
+    monkeypatch.setattr(mod, "_query_board", slow)
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        out = mod.on_pre_llm_call(session_id=SID)
+    assert out["context"].startswith("[Your open cards: unavailable (timeout)")
+    line = next(r.getMessage() for r in caplog.records if "unavailable=timeout" in r.getMessage())
+    assert "stage=boards" in line and "partial_cards=1" in line
+
+
+def test_success_log_carries_stage_timings(mod, home, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        assert mod.on_pre_llm_call(session_id=SID)
+    line = next(r.getMessage() for r in caplog.records if "cards=1" in r.getMessage())
+    for f in ("ms=", "lineage_ms=", "dedupe_ms=", "boards_ms=", "mtime_skipped=",
+              "prewarmed=False"):
+        assert f in line, (f, line)
+
+
+# ── P1 gateway prewarm (t_11f2cf60) ─────────────────────────────────────────
+
+class _Store:
+    def __init__(self, sid):
+        self.sid = sid
+
+    def _generate_session_key(self, source):
+        return "k"
+
+    def peek_session_id(self, key):
+        return self.sid if key == "k" else None
+
+
+class _Ev:
+    class source:  # noqa: N801 - attribute bag
+        platform = "discord"
+
+
+def test_P1_prewarm_probe_is_consumed_by_first_turn(mod, home, monkeypatch, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    calls = []
+    real = mod.home_ids
+    monkeypatch.setattr(mod, "home_ids", lambda s: calls.append(s) or real(s))
+    assert mod.on_pre_gateway_dispatch(event=_Ev(), gateway=None,
+                                       session_store=_Store(SID)) is None
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        out = mod.on_pre_llm_call(session_id=SID, platform="discord")
+    assert out and "t_home0001" in out["context"]
+    assert calls == [SID]  # one probe, started by dispatch, reused by the turn
+    assert any("prewarmed=True" in r.getMessage() for r in caplog.records)
+    assert mod.on_pre_llm_call(session_id=SID, platform="discord") is None  # I1
+
+
+def test_P1_prewarm_never_affects_dispatch_and_fails_quiet(mod, home):
+    class Boom:
+        def _generate_session_key(self, source):
+            raise RuntimeError("x")
+    assert mod.on_pre_gateway_dispatch(event=_Ev(), session_store=Boom()) is None
+    assert mod.on_pre_gateway_dispatch(event=None, session_store=None) is None
+    assert mod._PROBES == {}
+
+
+def test_P1_no_prewarm_for_already_served_session(mod, home):
+    _card(_board(home), "t_home0001", session_id=SID)
+    assert mod.on_pre_llm_call(session_id=SID)
+    mod.on_pre_gateway_dispatch(event=_Ev(), session_store=_Store(SID))
+    assert SID not in mod._PROBES
+
+
+def test_P1_stale_prewarm_is_not_trusted(mod, home, monkeypatch):
+    _card(_board(home), "t_home0001", session_id=SID)
+    mod.on_pre_gateway_dispatch(event=_Ev(), session_store=_Store(SID))
+    probe = mod._PROBES[SID]
+    probe.done.wait(10)
+    probe.created -= mod.PROBE_FRESH_S + 1
+    assert mod._take_probe(SID) is not probe
+
+
+def test_P1_real_loader_registers_dispatch_hook(home):
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["kanban-home-cards"]}}), encoding="utf-8"
+    )
+    from hermes_cli.plugins import PluginManager
+
+    mgr = PluginManager()
+    mgr.discover_and_load()
+    res = mgr.invoke_hook("pre_gateway_dispatch", event=_Ev(), gateway=None,
+                          session_store=_Store(None))
+    assert all(r is None for r in res)  # never skips/rewrites a message

@@ -177,3 +177,78 @@ def test_cli_show_label_spans_lineage(lineage, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", C)
     assert "home:      this-session" in kc.run_slash(f"show {mine}")
     assert f"home:      other ({X1})" in kc.run_slash(f"show {theirs}")
+
+
+# --- per-process cache + earliest start (t_11f2cf60) ------------------------
+
+
+def _spy_connects(monkeypatch):
+    calls = []
+    real = kb.sqlite3.connect
+
+    def spy(*a, **kw):
+        calls.append(a[0] if a else kw.get("database"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(kb.sqlite3, "connect", spy)
+    return calls
+
+
+def test_cache_second_lookup_opens_no_connection(lineage, monkeypatch):
+    kb.clear_home_ids_cache()
+    calls = _spy_connects(monkeypatch)
+    assert kb.home_ids(C) == {A, B, C}
+    n = len(calls)
+    assert n >= 1
+    assert kb.home_ids(C) == {A, B, C}
+    assert len(calls) == n  # warm: served from the per-process cache
+
+
+def test_cache_expires_after_ttl(lineage, monkeypatch):
+    kb.clear_home_ids_cache()
+    calls = _spy_connects(monkeypatch)
+    kb.home_ids(C)
+    n = len(calls)
+    monkeypatch.setattr(kb, "HOME_IDS_CACHE_TTL_S", 0.0)
+    assert kb.home_ids(C) == {A, B, C}
+    assert len(calls) > n
+
+
+def test_fail_open_answer_is_not_cached(home):
+    kb.clear_home_ids_cache()
+    assert kb.home_ids(B) == {B}  # no state.db yet
+    db = SessionDB(db_path=_state_db())
+    try:
+        db.create_session(A, "discord", session_key=KEY)
+        assert kb.home_ids(B) == {B}  # db exists, B's row does not: still exact
+        db.create_session(B, "discord", session_key=KEY, parent_session_id=A)
+    finally:
+        db.close()
+    assert kb.home_ids(B) == {A, B}  # neither miss was cached
+
+
+def test_cache_is_bounded(lineage, monkeypatch):
+    kb.clear_home_ids_cache()
+    monkeypatch.setattr(kb, "HOME_IDS_CACHE_MAX", 2)
+    for sid in (A, B, C, LONE):
+        kb.home_ids(sid)
+    assert len(kb._HOME_CACHE) == 2
+    assert {k[0] for k in kb._HOME_CACHE} == {C, LONE}  # oldest evicted first
+
+
+def test_home_lineage_started_at_is_earliest_member(lineage):
+    kb.clear_home_ids_cache()
+    import sqlite3
+
+    conn = sqlite3.connect(_state_db())
+    for sid, ts in ((A, 1000.0), (B, 2000.0), (C, 3000.0), (X1, 10.0), (LONE, 5.0)):
+        conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (ts, sid))
+    conn.commit()
+    conn.close()
+    ids, started = kb.home_lineage(C)
+    assert ids == {A, B, C} and started == 1000.0  # X1/LONE are other homes
+    assert kb.home_lineage(B) == (frozenset({A, B, C}), 1000.0)
+
+
+def test_home_lineage_start_unknown_on_fail_open(home):
+    assert kb.home_lineage(A) == (frozenset({A}), None)
