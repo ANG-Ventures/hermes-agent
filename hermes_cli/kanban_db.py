@@ -8207,24 +8207,25 @@ def _bounded_cwd_probe():
     it on POSIX; threads/platforms without timers refuse reclamation.
     """
     deadline = time.monotonic() + _CWD_SCAN_BUDGET_SECONDS
-    if (not hasattr(signal, "setitimer") or
+    alarm_signal = getattr(signal, "SIGALRM", None)
+    if (alarm_signal is None or not hasattr(signal, "setitimer") or
             threading.current_thread() is not threading.main_thread()):
         raise TimeoutError("cwd probe cannot be bounded in this context")
     previous = signal.getitimer(signal.ITIMER_REAL)
     if previous[0] > 0:
         raise TimeoutError("cwd probe cannot replace an existing alarm")
-    old_handler = signal.getsignal(signal.SIGALRM)
+    old_handler = signal.getsignal(alarm_signal)
 
     def expired(_signum, _frame):
         raise TimeoutError("cwd probe budget exhausted")
 
-    signal.signal(signal.SIGALRM, expired)
+    signal.signal(alarm_signal, expired)
     try:
         signal.setitimer(signal.ITIMER_REAL, max(deadline - time.monotonic(), 0.000001))
         yield
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, old_handler)
+        signal.signal(alarm_signal, old_handler)
 
 
 def _path_identity(path: Path, memo: Optional[dict] = None) -> Optional[tuple[int, int]]:
