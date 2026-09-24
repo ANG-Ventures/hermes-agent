@@ -101,6 +101,7 @@ from agent.prompt_caching import (
 from agent.provider_projection import splice_provider_projection
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    capacity_retry_wait,
     is_zai_coding_overload_error,
     jittered_backoff,
     resolve_retry_after,
@@ -6607,6 +6608,52 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # ── Pool-capacity 503: wait for a seat before a host move ──
+                # A relay "no eligible sub" 503 (``pool_exhausted``) is a
+                # CAPACITY signal, not auth/transport. Leaving the provider
+                # here is a host move for a bridge-backed session — the next
+                # box has no CLI session and replays the whole history
+                # (2026-09-24: 168 replays on one sub in 10h). So: stay on
+                # the same provider for up to ``capacity_retry_attempts``
+                # tries / ``capacity_retry_max_wait_s`` seconds, honouring
+                # the relay's Retry-After, THEN walk the chain. Policy is
+                # the pure ``capacity_retry_wait``; this block only widens
+                # the retry ceiling and, when the budget is spent, hands the
+                # attempt to the existing "max retries → fallback" branch
+                # below so the failover announce/threading stays single-
+                # sourced. ``attempts: 0`` = pre-policy behaviour.
+                _is_pool_capacity = (
+                    classified.reason == FailoverReason.pool_exhausted
+                    and int(getattr(agent, "_capacity_retry_attempts", 0) or 0) > 0
+                )
+                _capacity_wait = None
+                if _is_pool_capacity:
+                    max_retries = max(max_retries, int(agent._capacity_retry_attempts))
+                    _cap_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                    _cap_ra_raw = None
+                    if _cap_headers and hasattr(_cap_headers, "get"):
+                        _cap_ra_raw = _cap_headers.get("retry-after") or _cap_headers.get("Retry-After")
+                    _capacity_wait = capacity_retry_wait(
+                        retry_count=retry_count,
+                        max_retries=max_retries,
+                        raw_retry_after=_cap_ra_raw,
+                        waited_s=_retry.capacity_waited_s,
+                        max_wait_s=float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),
+                    )
+                    if _capacity_wait is None:
+                        logger.warning(
+                            "capacity 503 on %s: budget exhausted after %.0fs / %d attempt(s) "
+                            "(limits attempts=%d max_wait=%.0fs, retry_after=%s) → fallback %s",
+                            getattr(agent, "provider", "?"),
+                            _retry.capacity_waited_s,
+                            retry_count,
+                            int(agent._capacity_retry_attempts),
+                            float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),
+                            _cap_ra_raw,
+                            agent._client_log_context(),
+                        )
+                        # Hand off to the retries-exhausted → fallback branch.
+                        retry_count = max_retries
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
@@ -7861,6 +7908,23 @@ def run_conversation(
                     )
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                if _is_pool_capacity and _capacity_wait is not None:
+                    # Pool-capacity policy wins over the generic jitter: the
+                    # wait was already bounded (attempts + wall-clock budget,
+                    # relay Retry-After honoured) by ``capacity_retry_wait``.
+                    wait_time = _capacity_wait
+                    _backoff_policy = "pool_capacity"
+                    _retry.capacity_waited_s += float(wait_time)
+                    logger.warning(
+                        "capacity 503 on %s: retry %d/%d in %.1fs (waited %.0fs of %.0fs budget) %s",
+                        getattr(agent, "provider", "?"),
+                        retry_count + 1,
+                        max_retries,
+                        wait_time,
+                        _retry.capacity_waited_s,
+                        float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),
+                        agent._client_log_context(),
+                    )
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
@@ -7884,6 +7948,14 @@ def run_conversation(
                         agent._emit_status(_rate_limit_status)
                     else:
                         agent._buffer_status(_rate_limit_status)
+                elif _backoff_policy == "pool_capacity":
+                    # Say what we are waiting FOR: a pooled seat on the same
+                    # provider, not a generic retry — so the trace reads
+                    # "capped → waited → served" rather than "flaky".
+                    agent._buffer_status(
+                        f"⏱️ Sub pool capped — waiting {wait_time:.1f}s for a seat before "
+                        f"switching providers (attempt {retry_count + 1}/{max_retries})..."
+                    )
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 logger.warning(
