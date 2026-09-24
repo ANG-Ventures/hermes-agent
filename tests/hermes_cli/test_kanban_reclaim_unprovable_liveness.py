@@ -60,6 +60,9 @@ def conn(kanban_home, monkeypatch):
     import hermes_cli.profiles as _profiles
 
     monkeypatch.setattr(_profiles, "profile_exists", lambda name: True)
+    # These cases use synthetic live worker PIDs; identity timing is tested
+    # with a real process in test_kanban_second_claim_class.py.
+    monkeypatch.setattr(kb, "_pid_started_in_claim", lambda *_args: True)
     with kb.connect() as c:
         yield c
 

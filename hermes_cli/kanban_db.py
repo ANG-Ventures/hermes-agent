@@ -7294,6 +7294,34 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 
+def _real_pid_started_in_claim(pid: int, claimed_at: float, spawned_at: float) -> bool:
+    """A live PID is its original owner only if it started in the claim window."""
+    started = None
+    try:
+        import psutil
+        started = psutil.Process(pid).create_time()
+    except Exception:  # optional psutil, or process vanished during the probe
+        pass
+    if started is None and os.name == "posix":
+        try:
+            from datetime import datetime
+            proc = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, timeout=1,
+                env={**os.environ, "LC_ALL": "C"}, check=False,
+            )
+            if proc.returncode == 0:
+                started = datetime.strptime(proc.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    # Seconds-resolution event stamps can straddle the OS process timestamp.
+    return started is not None and claimed_at - 2 <= started <= spawned_at + 2
+
+
+_pid_started_in_claim = _real_pid_started_in_claim
+
+
 def _prior_worker_still_alive(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[dict]:
@@ -7308,8 +7336,10 @@ def _prior_worker_still_alive(
     # An outcome cannot certify exit: operators can write the same outcomes as
     # worker tools, and a newer synthetic row can hide an older live owner.
     runs = conn.execute(
-        "SELECT id, outcome, ended_at FROM task_runs WHERE task_id = ? "
-        "AND ended_at IS NOT NULL ORDER BY id DESC", (task_id,),
+        "SELECT r.id, r.outcome, r.ended_at, t.max_runtime_seconds "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.task_id = ? AND r.ended_at IS NOT NULL ORDER BY r.id DESC",
+        (task_id,),
     ).fetchall()
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     for row in runs:
@@ -7329,8 +7359,14 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
     # run_id NULL -- measured on t_09180e10, 5 s after the reclaim.
     # Legacy / hand-built rows may lack the claimed event; fall back to any
     # event of that run that recorded the lock (reclaimed.prev_lock, ...).
+    # Explicitly bounded workers cannot still own a run this long after its
+    # release, even when the PID has since been recycled.
+    if (row["max_runtime_seconds"] is not None
+            and time.time() > row["ended_at"] + row["max_runtime_seconds"]
+            + RECLAIM_DEFER_GRACE_SECONDS):
+        return None
     run_events = conn.execute(
-        "SELECT id, kind, payload FROM task_events WHERE task_id = ? "
+        "SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? "
         "AND run_id = ? ORDER BY (kind = 'claimed') DESC, id ASC",
         (task_id, row["id"]),
     ).fetchall()
@@ -7358,7 +7394,7 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
         "AND kind = 'claimed' AND id > ?", (task_id, boundary_id),
     ).fetchone()[0]
     spawned = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "SELECT id, run_id, payload, created_at FROM task_events WHERE task_id = ? "
         "AND kind = 'spawned' AND id >= ? "
         "AND (run_id = ? OR (run_id IS NULL AND (? IS NULL OR id < ?))) "
         "ORDER BY id DESC LIMIT 1",
@@ -7370,7 +7406,8 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
         pid = int(json.loads(spawned["payload"] or "{}")["pid"])
     except (TypeError, ValueError, KeyError):
         return None
-    if _pid_alive(pid):
+    claimed_at = min(ev["created_at"] for ev in run_events)
+    if _pid_alive(pid) and _pid_started_in_claim(pid, claimed_at, spawned["created_at"]):
         return {"prev_pid": pid, "prev_lock": lock,
                 "prev_run_id": row["id"],
                 "prev_outcome": row["outcome"],
@@ -15978,9 +16015,12 @@ def respawn_guard_stuck_tasks(
     min_seconds: int = RESPAWN_GUARD_STUCK_SECONDS,
     now: Optional[int] = None,
 ) -> list[dict]:
-    """Return ready+assigned+unclaimed cards stuck behind ``active_pr``.
+    """Return unclaimed cards continuously refused by active_pr or prior worker.
 
-    A card qualifies when it has been guarded with ``active_pr`` since the
+    Active-PR guards page for ready cards after 30 minutes; claim rejection by
+    an allegedly live previous worker pages for ready or review cards after
+    15 minutes (the process may have exited or its PID may have been recycled).
+    For active_pr, a card qualifies when it has been guarded with ``active_pr`` since the
     last event that could have changed the guard's answer
     (``_RESPAWN_GUARD_STUCK_RESET_KINDS``, or a guard decline for another
     reason), the first such guard row is at least ``min_seconds`` old, and the
@@ -15999,10 +16039,38 @@ def respawn_guard_stuck_tasks(
     reset_marks = ", ".join("?" for _ in _RESPAWN_GUARD_STUCK_RESET_KINDS)
     out: list[dict] = []
     for row in conn.execute(
-        "SELECT id, assignee FROM tasks WHERE status = 'ready' "
+        "SELECT id, assignee, status FROM tasks WHERE status IN ('ready', 'review') "
         "AND assignee IS NOT NULL AND claim_lock IS NULL ORDER BY id"
     ).fetchall():
         task_id = row["id"]
+        last_reset = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events WHERE task_id=? "
+            "AND (kind IN ('claimed', 'spawned', 'requeued', 'unblocked', 'status') "
+            "OR (kind='claim_rejected' AND ("
+            "COALESCE(json_extract(payload, '$.reason'), '') != 'prior_worker_still_alive' "
+            "OR COALESCE(json_extract(payload, '$.source_status'), 'ready') != ?)))",
+            (task_id, row["status"]),
+        ).fetchone()["m"]
+        rejected = conn.execute(
+            "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, "
+            "COUNT(*) AS n, MAX(json_extract(payload, '$.prev_pid')) AS pid "
+            "FROM task_events WHERE task_id=? AND id>? AND kind='claim_rejected'",
+            (task_id, last_reset),
+        ).fetchone()
+        if (rejected["n"] and now - rejected["first_at"] > 15 * 60
+                and now - rejected["last_at"] <= _RESPAWN_GUARD_STUCK_FRESH_SECONDS):
+            out.append({
+                "task_id": task_id, "assignee": row["assignee"],
+                "reason": "prior_worker_still_alive",
+                "status": row["status"],
+                "guarded_since": rejected["first_at"],
+                "guarded_seconds": now - rejected["first_at"],
+                "guard_events": rejected["n"],
+                "prev_pid": rejected["pid"],
+                "clear_verb": render_operator_command(board, "show", task_id),
+            })
+        if row["status"] != "ready":
+            continue  # active_pr is a ready-only respawn guard
         last_other = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
             f"WHERE task_id = ? AND (kind IN ({reset_marks}) "
