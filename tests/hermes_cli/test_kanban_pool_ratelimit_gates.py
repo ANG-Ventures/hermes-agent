@@ -1036,3 +1036,34 @@ def test_G1_lane_routed_429s_charge_the_lane_pool(home, apr, bpr, monkeypatch):
         now = int(time.time())
         assert _close_running_rate_limited(conn, now) == 5
         assert set(kb.rate_limit_circuits(conn, now=now, trip=5)) == {"claude-apr"}
+
+
+# Argus r3 F2: a lane override on a capped pool that then falls back to a rung
+# writes dispatch_lane_route FIRST and dispatch_provider_fallback SECOND. The
+# later event names the pool that actually served the run; a first-event-wins
+# resolver would charge the lane pool. (Adopted from Argus r3 probe test_H1.)
+def test_circuit_lane_then_fallback_charges_the_serving_rung(home, apr, bpr, monkeypatch):
+    from hermes_cli import kanban_budget as kbud
+
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: None)
+    apr.eligible, bpr.eligible = 0, 9          # lane pool (apr) capped
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url), max_spawn=50,
+            max_in_progress_per_profile=50)
+    _fb_chain_profile(home, [{"provider": "claude-bpx-16", "model": "m16"}])
+    with kb.connect_closing() as conn:
+        kb.set_lane_model_override(conn, provider="claude-apr", model="lm", assignee="fb",
+                                   expires_at=int(time.time()) + 3600, reason="window")
+        tids = [kb.create_task(conn, title=f"h{i}", assignee="fb") for i in range(5)]
+        kb.dispatch_once(conn, spawn_fn=_spawner([]))
+        lane = [_events(conn, t, "dispatch_lane_route") for t in tids]
+        fb = [_events(conn, t, "dispatch_provider_fallback") for t in tids]
+        print("\nH1 lane events:", [e[-1]["provider"] if e else None for e in lane])
+        print("H1 fallback rungs:", [e[-1]["to_provider"] if e else None for e in fb])
+        assert all(lane) and all(fb), "precondition: both route events on every run"
+        assert {e[-1]["to_provider"] for e in fb} == {"claude-bpx-16"}
+        now = int(time.time())
+        assert _close_running_rate_limited(conn, now) == 5
+        circuits = kb.rate_limit_circuits(conn, now=now, trip=5)
+        print("H1 circuits:", circuits)
+        assert set(circuits) == {"sub-vps-16"}, (
+            f"5 closes SERVED by claude-bpx-16 charged to {sorted(circuits)}")
