@@ -504,6 +504,37 @@ def test_pool_budget_single_call_without_tick_cache_is_per_call(home, apr):
         assert len(seen) == 4
 
 
+def test_gateway_tick_threads_one_budget_cache_through_every_board():
+    """The cross-board budget above only holds if the REAL gateway tick passes
+    one shared cache per tick to every board's dispatch_once. Pin that wiring."""
+    import ast
+    import inspect
+    from gateway import kanban_watchers
+
+    tree = ast.parse(inspect.getsource(kanban_watchers))
+    funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    tick = funcs["_tick_once"]
+    loop_calls = [c for c in ast.walk(tick) if isinstance(c, ast.Call)
+                  and getattr(c.func, "id", None) == "_tick_once_for_board"]
+    assert loop_calls and all(
+        any(isinstance(a, ast.Name) and a.id == "budget_cache" for a in c.args)
+        for c in loop_calls)
+    # Created once per tick, outside the per-board loop.
+    loops = [n for n in ast.walk(tick) if isinstance(n, ast.For)]
+    assigned_in_loop = {t.id for lp in loops for n in ast.walk(lp)
+                        if isinstance(n, (ast.Assign, ast.AnnAssign))
+                        for t in ([n.target] if isinstance(n, ast.AnnAssign) else n.targets)
+                        if isinstance(t, ast.Name)}
+    assert "budget_cache" not in assigned_in_loop
+    per_board = funcs["_tick_once_for_board"]
+    dispatch = [c for c in ast.walk(per_board) if isinstance(c, ast.Call)
+                and getattr(c.func, "attr", None) == "dispatch_once"]
+    assert dispatch and all(
+        any(k.arg == "budget_cache" and isinstance(k.value, ast.Name)
+            and k.value.id == "budget_cache" for k in c.keywords)
+        for c in dispatch)
+
+
 def test_pool_budget_config_default_and_legacy_zero(home):
     assert ph.configured_pool_spawns_per_eligible() == 2
     _config(home, pool_spawns_per_eligible=0)
