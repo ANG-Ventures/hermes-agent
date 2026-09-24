@@ -157,9 +157,29 @@ accident: #966's parity-marker write opened a transaction first. The engine-load
 structural path was not. Gate: `test_lcm_fts_atomic_rebuild.py` (observer connection sees
 no torn state; a failed rebuild leaves the old index), RED on dc228d5810.
 
-Residual (not fixed here): a genuine structural rebuild still runs inline on the load
-path and holds the write lock for its whole duration. It is atomic now, but it is not
-off-path.
+## A structural rebuild never runs on the load thread (t_1e04c4bd)
+
+With genuine structural damage (missing shadow table, non-FTS5 table, missing indexed
+column), the load path (`throttle=True`) does only O(1) work. It drops the FTS triggers,
+because a broken index makes every trigger-firing ingest raise. It sets
+`fts_integrity_failed:<table>` and starts a daemon thread (`lcm-fts-rebuild-<table>`, own
+connection). That thread runs the same one-transaction rebuild and recreates the triggers
+before the single COMMIT, so rows ingested during the window get indexed. MATCH raises
+until then, and search falls back to LIKE.
+
+- Inline still applies when the content table has ≤ `INLINE_STRUCTURAL_REBUILD_MAX_ROWS`
+  (1000) rows (bounded `LIMIT` probe). This covers a fresh DB with no FTS table yet. It
+  also applies with `LCM_FTS_INTEGRITY_BACKGROUND=false`, and for an in-memory DB.
+- Explicit `/lcm doctor repair apply` (`throttle=False`) stays synchronous.
+- Not removed: the rebuild still holds the SQLite **write** lock for its whole duration
+  (atomicity requires it), so ingests contend on the write lock for that time. Turns and
+  engine loads no longer wait behind `_LOAD_LOCK`.
+- `_drop_fts_table` restores stub shadow tables when `DROP` fails. A missing
+  `<fts>_config` makes the FTS5 constructor, and so any DROP on a *fresh* connection, fail
+  with `vtable constructor failed`, so before this every restart hit an unrepairable index.
+
+Gate: `test_lcm_fts_deferred_structural_rebuild.py`. On #971's head all 3 tests are RED
+(`vtable constructor failed`). With the deferral disabled, the load-thread test is RED.
 
 ## Adding a new column with a legacy backfill — the recipe
 

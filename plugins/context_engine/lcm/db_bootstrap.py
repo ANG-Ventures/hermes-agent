@@ -3038,8 +3038,36 @@ def check_external_content_fts_integrity(
     return {"status": "pass", "detail": "ok"}
 
 
+# FTS5 shadow-table schemas (external content: no ``_content``). Used ONLY to let
+# a DROP succeed on an index whose shadow table is gone.
+_FTS5_SHADOW_STUBS = (
+    ("_data", "(id INTEGER PRIMARY KEY, block BLOB)"),
+    ("_idx", "(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"),
+    ("_docsize", "(id INTEGER PRIMARY KEY, sz BLOB)"),
+    ("_config", "(k PRIMARY KEY, v) WITHOUT ROWID"),
+)
+
+
 def _drop_fts_table(conn: sqlite3.Connection, table_name: str) -> None:
-    conn.execute(f"DROP TABLE IF EXISTS {quote_sql_identifier(table_name)}")
+    quoted = quote_sql_identifier(table_name)
+    try:
+        conn.execute(f"DROP TABLE IF EXISTS {quoted}")
+    except sqlite3.OperationalError:
+        # DROP of an FTS5 table runs its constructor, which fails when
+        # ``<name>_config`` is missing ("vtable constructor failed"). A
+        # connection that had built the vtable before the damage hides this; any
+        # fresh connection (every restart, the background rebuild) could never
+        # repair it. Restore stub shadow tables plus the version row, then retry.
+        # The caller's repair transaction still covers all of it.
+        for suffix, columns in _FTS5_SHADOW_STUBS:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {quote_sql_identifier(table_name + suffix)} {columns}"
+            )
+        conn.execute(
+            f"INSERT OR IGNORE INTO {quote_sql_identifier(table_name + '_config')}(k, v) "
+            "VALUES('version', 4)"
+        )
+        conn.execute(f"DROP TABLE IF EXISTS {quoted}")
     for shadow_name in get_fts_shadow_table_names(table_name):
         conn.execute(f"DROP TABLE IF EXISTS {quote_sql_identifier(shadow_name)}")
 
@@ -3152,6 +3180,13 @@ def repair_external_content_fts(
     now: float | None = None,
     throttle: bool = False,
 ) -> dict[str, bool]:
+    if throttle and _fts_needs_rebuild_structural(conn, spec):
+        # Engine-load path with GENUINE structural damage: never rebuild inline.
+        # The rebuild is O(rows) — 1696 s on an 11.4 GB fleet snapshot — and
+        # inline it held _LOAD_LOCK plus the SQLite write lock for all of it.
+        deferred = _defer_structural_rebuild(conn, spec, now=now)
+        if deferred is not None:
+            return deferred
     needs_rebuild = _fts_needs_rebuild(conn, spec, now=now, throttle=throttle)
     if not (needs_rebuild or _fts_missing_triggers(conn, spec) or _fts_stale_triggers(conn, spec)):
         # No-op pass (every ordinary engine load): take no write lock.
@@ -3250,6 +3285,171 @@ def _repair_external_content_fts_body(
         "rebuilt": rebuilt,
         "degraded": degraded,
         "triggers_recreated": triggers_were_missing or triggers_were_stale,
+    }
+
+
+# --- Deferred structural rebuild (card t_1e04c4bd, residual of freeze #3) ----
+#
+# A structurally damaged index (missing shadow table, non-FTS5 table, missing
+# indexed column) can neither be queried nor written: MATCH raises, so search
+# already falls back to LIKE, and the FTS triggers make EVERY ingest raise
+# ("vtable constructor failed", "no such table: main.messages_fts", measured).
+# The load path therefore does only the O(1) part synchronously: drop the
+# triggers so ingest keeps working, and set ``fts_integrity_failed`` so
+# `/lcm doctor` shows the state. The O(rows) rebuild runs on a daemon thread with
+# its own connection, as ONE BEGIN IMMEDIATE transaction (#971). It re-reads the
+# whole content table and recreates the triggers before its single COMMIT, so
+# rows ingested during the window are indexed and nothing drifts. A process that
+# dies mid-rebuild rolls back; the next engine load finds the damage and retries.
+# Kill-switch (LCM_FTS_INTEGRITY_BACKGROUND=false) or an in-memory DB keeps the
+# old inline rebuild.
+
+# The load-path mark takes the write lock briefly. Never sit behind another
+# writer (possibly another process's 28-min rebuild) for the full busy timeout.
+FTS_REBUILD_MARK_BUSY_TIMEOUT_MS = 1_000
+
+# At or below this many content rows the rebuild stays inline: a fresh DB (no FTS
+# table yet) or a small one must come up with a working index, not on LIKE.
+# The probe is a bounded ``LIMIT`` scan, so it stays O(1) however big the table.
+# The fleet rebuild ran about 0.6 ms/row (1696 s, ~2.8 M rows), so this bound
+# costs well under a second even on that disk.
+INLINE_STRUCTURAL_REBUILD_MAX_ROWS = 1_000
+
+
+def _content_rows_exceed(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, limit: int
+) -> bool:
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM (SELECT 1 FROM {quote_sql_identifier(spec.content_table)} "
+        "LIMIT ?)",
+        (limit + 1,),
+    ).fetchone()
+    return int(row[0] or 0) > limit
+
+
+def _rebuild_thread_key(db_path: str, spec: ExternalContentFtsSpec) -> tuple[str, str]:
+    # Shares the integrity-scan registry so join_background_integrity_scans()
+    # also waits for rebuilds; the suffix keeps a scan and a rebuild independent.
+    return (db_path, f"{spec.table_name}:rebuild")
+
+
+def _mark_structural_rebuild_pending(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float
+) -> None:
+    """Drop the FTS triggers and set the failure flag: O(1), best-effort."""
+    try:
+        previous_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    except sqlite3.DatabaseError:
+        previous_timeout = SQLITE_BUSY_TIMEOUT_MS
+    conn.execute(f"PRAGMA busy_timeout={FTS_REBUILD_MARK_BUSY_TIMEOUT_MS}")
+    opened_txn = not conn.in_transaction
+    try:
+        if opened_txn:
+            conn.execute("BEGIN IMMEDIATE")
+        _drop_fts_triggers(conn, spec.trigger_sqls)
+        _record_integrity_failed(
+            conn,
+            spec,
+            detail="structural repair needed; background rebuild dispatched at engine load",
+            now=now,
+        )
+        if opened_txn:
+            conn.commit()
+    except sqlite3.DatabaseError as exc:
+        if opened_txn and conn.in_transaction:
+            conn.rollback()
+        logger.warning(
+            "Could not mark FTS '%s' for background rebuild (%s); ingest may fail "
+            "until the rebuild commits",
+            spec.table_name,
+            exc,
+        )
+    finally:
+        conn.execute(f"PRAGMA busy_timeout={int(previous_timeout)}")
+
+
+def _run_background_fts_rebuild(
+    db_path: str, spec: ExternalContentFtsSpec, started_at: float
+) -> None:
+    """Daemon-thread body: the atomic structural rebuild on a private connection."""
+    key = _rebuild_thread_key(db_path, spec)
+    timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+    began = time.monotonic()
+    try:
+        rebuild_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+        try:
+            rebuild_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            rebuild_conn.execute("PRAGMA synchronous=FULL")
+            rebuild_conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-check under the write lock: another process may have
+                # repaired it first. Then this pass only restores triggers.
+                needs_rebuild = _fts_needs_rebuild_structural(rebuild_conn, spec)
+                result = _repair_external_content_fts_body(
+                    rebuild_conn, spec, now=started_at, needs_rebuild=needs_rebuild
+                )
+            except BaseException:
+                if rebuild_conn.in_transaction:
+                    rebuild_conn.rollback()
+                raise
+        finally:
+            rebuild_conn.close()
+        logger.info(
+            "Background FTS rebuild of '%s' committed in %.1fs: %s",
+            spec.table_name,
+            time.monotonic() - began,
+            result,
+        )
+    except Exception:
+        logger.exception(
+            "Background FTS rebuild of '%s' failed; index left as it was (search "
+            "stays on LIKE); the next engine load retries",
+            spec.table_name,
+        )
+    finally:
+        with _integrity_scan_lock:
+            if _integrity_scan_threads.get(key) is threading.current_thread():
+                _integrity_scan_threads.pop(key, None)
+
+
+def _defer_structural_rebuild(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None
+) -> dict[str, bool] | None:
+    """Hand a load-path structural rebuild to a daemon thread.
+
+    Returns ``None`` when it should not be deferred (kill-switch, in-memory DB,
+    small content table); the caller then rebuilds inline as before."""
+    if not _background_integrity_enabled():
+        return None
+    db_path = _database_path_for_connection(conn)
+    if not db_path or db_path == ":memory:":
+        return None
+    try:
+        if not _content_rows_exceed(conn, spec, INLINE_STRUCTURAL_REBUILD_MAX_ROWS):
+            return None
+    except sqlite3.DatabaseError:
+        return None
+    current = time.time() if now is None else now
+    key = _rebuild_thread_key(db_path, spec)
+    with _integrity_scan_lock:
+        existing = _integrity_scan_threads.get(key)
+        if existing is None or not existing.is_alive():
+            # Mark only when no rebuild is in flight here: an in-flight rebuild
+            # holds the write lock, and it recreates the triggers itself.
+            _mark_structural_rebuild_pending(conn, spec, now=current)
+            thread = threading.Thread(
+                target=_run_background_fts_rebuild,
+                args=(db_path, spec, current),
+                name=f"lcm-fts-rebuild-{spec.table_name}",
+                daemon=True,
+            )
+            _integrity_scan_threads[key] = thread
+            thread.start()
+    return {
+        "rebuilt": False,
+        "degraded": True,
+        "triggers_recreated": False,
+        "rebuild_deferred": True,
     }
 
 
