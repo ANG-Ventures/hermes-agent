@@ -571,10 +571,9 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 # Columns insert_turn owns. The ORDER here IS the bind order of the value
 # tuple below — keep the two in lockstep. Columns NOT in this tuple
-# (served_subs_json, attribution) are owned by a later writer, so they are
-# deliberately excluded from the upsert's DO UPDATE: a re-finalize of the same
-# turn_id must refresh the record's own fields without erasing the rollup a
-# separate writer already populated. This is why the statement is an UPSERT and
+# (served_subs_json, attribution) are not owned by TurnRecord, so they are
+# excluded from the upsert's DO UPDATE: a re-finalize must not erase the
+# call-ledger rollup or another writer's attribution. This is an UPSERT and
 # not INSERT OR REPLACE — REPLACE deletes the whole row first, NULLing every
 # column absent from the insert list.
 _INSERT_TURN_COLUMNS = (
@@ -613,6 +612,20 @@ _INSERT_TURN_SQL = (
     )
 )
 
+
+def _refresh_served_subs(conn: sqlite3.Connection, turn_id: str) -> None:
+    """Aggregate known per-call subscription keys for an already stored turn."""
+    rows = conn.execute(
+        """SELECT sub_key, COUNT(*) FROM turn_api_calls
+           WHERE turn_id = ? AND sub_key IS NOT NULL AND sub_key != ''
+           GROUP BY sub_key ORDER BY sub_key""",
+        (turn_id,),
+    ).fetchall()
+    if rows:
+        conn.execute(
+            "UPDATE turns SET served_subs_json = ? WHERE turn_id = ?",
+            (json.dumps({sub: count for sub, count in rows}), turn_id),
+        )
 
 def insert_turn(record: TurnRecord) -> None:
     """Persist one turn. Telemetry failures are logged but never raised."""
@@ -679,6 +692,7 @@ def insert_turn(record: TurnRecord) -> None:
                     _bool_int(record.usage_unknown),
                 ),
             )
+            _refresh_served_subs(conn, record.turn_id)
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
             for seq, call in enumerate(record.tool_calls or []):
                 conn.execute(
@@ -760,6 +774,8 @@ def insert_api_call(
              cache_write_1h, cache_ttl_requested, lane_family(provider)),
         )
         _refresh_cache_monitoring(conn, turn_id)
+        if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
+            _refresh_served_subs(conn, turn_id)
 
 
 def mark_alerted(turn_id: str) -> bool:
