@@ -12587,8 +12587,6 @@ def _lexical_root_anchor(path: Path, root: Path) -> Optional[Path]:
     its spelling folds to the same string. Both only widen the set of rows
     that get full mount validation, so the fold fails closed.
     """
-    if path.is_relative_to(root):
-        return root
     target = _spelling_fold(root)
     root_identity = _path_identity(root)
     for ancestor in (path, *path.parents):
