@@ -1,0 +1,19 @@
+name: CI overflow P2b harness (t_8e737f2c, throwaway branch only)
+
+# Synthetic merge_group-shaped proof for the P2b local fallback. Lives ONLY on
+# ci-overflow-harness/* branches; never merged. Scenario = last ref segment.
+on:
+  push:
+    branches: ["ci-overflow-harness/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Python tests
+    uses: ./.github/workflows/zz-harness-tests.yml
+    with:
+      slice_count: 16
+      test_scope: ${{ contains(github.ref_name, '/full-') && 'full' || 'plugin:browser' }}
+      sim_event: ${{ endsWith(github.ref_name, '/pr') && 'pull_request' || 'merge_group' }}
