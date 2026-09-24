@@ -136,6 +136,65 @@ def test_dependency_intent_cannot_attach_to_second_promotion(board):
         assert kbd.check_respawn_guard(conn, child) == "active_pr"
 
 
+@pytest.mark.parametrize("inline_before", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_historical_pr_wait_resumes_with_trimmed_or_inline_comment(board, monkeypatch, inline_before, padded):
+    import time
+
+    now = int(time.time())
+    clock = {"now": now}
+    monkeypatch.setattr(kbd.time, "time", lambda: clock["now"])
+    with kbc.connect() as conn:
+        child = kb.create_task(conn, title="implement", assignee="worker")
+        claim = kb.claim_task(conn, child)
+        assert claim is not None
+        pr = "https://github.com/o/r/pull/9"
+        if inline_before:
+            with kb.write_txn(conn):
+                kb._insert_comment(conn, child, "worker", "x" * len(pr), now)
+        kb.add_comment(conn, child, "worker", f" {pr} " if padded else pr)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+                         "WHERE task_id=? AND kind='commented'", (child,))
+        parent = kb.create_task(conn, title="prerequisite", assignee="worker")
+        kb.link_tasks(conn, parent, child, expected_child_run_id=claim.current_run_id)
+        clock["now"] += 2
+        assert kb.block_task(conn, child, kind="dependency", reason="resume")
+        assert kb.complete_task(conn, parent, summary="prerequisite complete")
+        kb.recompute_ready(conn)
+        assert kbd.check_respawn_guard(conn, child) is None
+
+
+def test_legacy_intent_equal_second_resumes_without_comment_event_mapping(board, monkeypatch):
+    import time
+
+    now = int(time.time())
+    monkeypatch.setattr(kbd.time, "time", lambda: now)
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy tie", assignee="worker")
+        kb.add_comment(conn, task_id, "worker", " https://github.com/o/r/pull/9 ")
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue") == (True, None)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload=json_remove(payload, '$.after_comment_id') "
+                "WHERE task_id=? AND kind='requeued'", (task_id,),
+            )
+        assert kbd.check_respawn_guard(conn, task_id) is None
+
+
+def test_pr_guard_does_not_correlate_comment_rows_with_events():
+    import ast
+    import inspect
+
+    source = inspect.getsource(kbd.check_respawn_guard)
+    sql_literals = [node.value.lower() for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+    assert "after_comment_id" in source
+    assert not any("kind = 'commented'" in value for value in sql_literals)
+    assert not any("join task_comments" in value or "join task_events" in value
+                   for value in sql_literals)
+
+
 def test_new_pr_comment_after_wait_does_not_resume(board):
     with kbc.connect() as conn:
         child = kb.create_task(conn, title="implement", assignee="worker")

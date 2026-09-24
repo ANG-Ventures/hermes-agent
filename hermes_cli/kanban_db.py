@@ -1586,15 +1586,8 @@ def requeue_task(conn: sqlite3.Connection, task_id: str, *, actor: str, reason: 
             return False, "task not found"
         if row["status"] != "ready" or row["claim_lock"] is not None:
             return False, "requeue requires an unclaimed READY task"
-        from hermes_cli.kanban_db_dispatch import _RESPAWN_GUARD_PR_URL_RE, _RESPAWN_GUARD_PR_WINDOW
-
-        pr_comment_id = next((c["id"] for c in conn.execute(
-            "SELECT id, body FROM task_comments WHERE task_id = ? "
-            "AND created_at >= ? ORDER BY id DESC",
-            (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
-        ) if _RESPAWN_GUARD_PR_URL_RE.search(_lossy_text(c["body"]) or "")), None)
         _append_event(conn, task_id, "requeued", {
-            "actor": actor, "reason": reason.strip(), "pr_comment_id": pr_comment_id,
+            "actor": actor, "reason": reason.strip(),
         })
     return True, None
 
@@ -1797,7 +1790,7 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body), "comment_id": cur.lastrowid})
+        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
 
 
@@ -1963,6 +1956,13 @@ def _append_event(
     run_id: Optional[int] = None,
 ) -> None:
     """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
+    if kind in {"assigned", "changes_requested", "review_reopened", "requeued"} or (
+        kind == "dependency_wait" and (payload or {}).get("kind") == "dependency"
+    ):
+        payload = dict(payload or {})
+        payload["after_comment_id"] = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
+        ).fetchone()[0]
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
