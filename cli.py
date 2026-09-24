@@ -22240,6 +22240,24 @@ def main(
                     _sig_mod.alarm(5)
             except Exception:
                 pass
+            # Leave evidence BEFORE dying (card t_0c1ebbae): os._exit skips the
+            # atexit receipt, so an externally-ended worker used to vanish with
+            # no last words and a Popen rc of 0 the dispatcher read as a
+            # "protocol violation". One line into the run's log segment, and a
+            # signal receipt the dispatcher classifies as ``signaled``.
+            try:
+                sys.stderr.write(
+                    f"\n[kanban-worker] pid {os.getpid()} received signal {signum} "
+                    f"at {time.strftime('%Y-%m-%dT%H:%M:%S%z')} — terminated from "
+                    f"outside; exiting\n"
+                )
+            except Exception:
+                pass
+            try:
+                from hermes_cli.kanban_worker_exit import write_exit_status
+                write_exit_status(128 + int(signum), exit_class="signaled")
+            except Exception:
+                pass
             # os._exit(0) skips atexit AND SessionDB's token-drain hook, so
             # flush + finalize the session store here or the worker's turn
             # (and its usage deltas) never become durable (#88583 / #50881

@@ -405,6 +405,7 @@ def _fire_dispatch_tick_hook(
             result.auto_blocked,
             result.rate_limited,
             result.infra_unavailable,
+            result.cohort_deaths,
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
@@ -12411,6 +12412,11 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    cohort_deaths: list[str] = field(default_factory=list)
+    """Task ids whose workers ended EXTERNALLY together in one tick (a cohort
+    of >= ``_COHORT_DEATH_MIN`` dead pids, each with a heartbeat fresher than
+    ``_COHORT_DEATH_HEARTBEAT_WINDOW_SECONDS``). One outside actor ended them
+    all — released back without counting a failure (card t_0c1ebbae)."""
     infra_unavailable: list[str] = field(default_factory=list)
     """Task ids whose worker HARNESS could not be executed at all (exit
     126/127 — the ``hermes`` CLI path missing or unrunnable, e.g. during a
@@ -12599,12 +12605,18 @@ def reap_worker_zombies() -> "list[int]":
 
 def _classify_run_exit(conn, task_id, run_id, pid):
     """Use the connected board and exact run, never ambient env or PID alone."""
-    from hermes_cli.kanban_worker_exit import exit_file, read_exit_status
+    from hermes_cli.kanban_worker_exit import exit_file, read_exit_class, read_exit_status
 
     db_path = next(r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main")
     if db_path and run_id is not None:
-        code = read_exit_status(exit_file(Path(db_path), task_id, run_id))
+        receipt = exit_file(Path(db_path), task_id, run_id)
+        code = read_exit_status(receipt)
         if code is not None:
+            # A worker that caught SIGTERM/SIGHUP/SIGINT records 128+signum
+            # with exit_class "signaled" before its os._exit — it was ended
+            # from outside, which must never read as a clean exit.
+            if code > 128 and read_exit_class(receipt) == "signaled":
+                return "signaled", code - 128
             if code == 0:
                 return "clean_exit", code
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
@@ -13627,6 +13639,72 @@ def _protocol_violation_history(
     return streak, identical
 
 
+# Cohort-death guard (card t_0c1ebbae). On 2026-09-23 15:58 an outside reaper
+# SIGTERM'd 17 heartbeating workers at once; each was accounted as its own
+# crash / protocol violation, and the same-fingerprint "systemic" rule then
+# blocked several cards outright. A burst of externally-ended pids that were
+# all still heartbeating is one event about the HOST, never N task failures.
+_COHORT_DEATH_MIN = 3
+_COHORT_DEATH_HEARTBEAT_WINDOW_SECONDS = 120
+# Exit kinds that mean "ended from outside": no receipt + not our child
+# (``unknown``) or terminated by a signal (reaped status or signal receipt).
+_COHORT_DEATH_EXIT_KINDS = frozenset({"unknown", "signaled"})
+
+
+def _cohort_death_ids(dead: list, *, now: float) -> set:
+    """Task ids of dead workers that died as a cohort in this tick, else empty.
+
+    ``dead`` holds ``(row, pid, exit_kind, exit_code)``. A worker counts toward
+    the cohort only if it ended externally (``_COHORT_DEATH_EXIT_KINDS``) and
+    its last heartbeat is within the window — a worker that had already gone
+    silent is a stall, not part of a simultaneous kill.
+    """
+    fresh_after = now - _COHORT_DEATH_HEARTBEAT_WINDOW_SECONDS
+    members = set()
+    for row, _pid, kind, _code in dead:
+        if kind not in _COHORT_DEATH_EXIT_KINDS:
+            continue
+        hb = row["last_heartbeat_at"] if "last_heartbeat_at" in row.keys() else None
+        if hb is not None and hb >= fresh_after:
+            members.add(row["id"])
+    return members if len(members) >= _COHORT_DEATH_MIN else set()
+
+
+def _page_cohort_death(conn: sqlite3.Connection, task_ids: list) -> None:
+    """Page #alerts ONCE for a cohort death. Best-effort, never raises.
+
+    Once per cohort by construction: the members are released in the same
+    tick that detects them, so the next tick cannot see them dead again.
+    """
+    try:
+        import importlib
+        import subprocess
+
+        cli = importlib.import_module(f"{__package__}.kanban")
+        script = cli._notify_script_path()
+        if script is None:
+            return
+        db_path = next(r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main")
+        body = (
+            f"💀 Kanban cohort death: {len(task_ids)} workers ended externally in ONE "
+            f"dispatcher tick while still heartbeating ({os.path.basename(db_path or '')}).\n"
+            f"Tasks: {', '.join(task_ids[:20])}{' …' if len(task_ids) > 20 else ''}\n"
+            "Requeued WITHOUT counting a failure. Something outside the dispatcher killed "
+            "them (reaper / OOM / signal sweep) — find the sender: "
+            "`log show --predicate 'eventMessage CONTAINS \"sent by\"'` around the tick."
+        )
+        subprocess.run(
+            [sys.executable, str(script), "--send", body, "--channel", "discord"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception as exc:  # pragma: no cover - paging must never break a tick
+        _log.debug("cohort-death page failed: %s", exc)
+
+
 def detect_crashed_workers(
     conn: sqlite3.Connection,
     *,
@@ -13671,12 +13749,15 @@ def detect_crashed_workers(
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str, Optional[str]]] = []
     # (task_id, pid, claimer, protocol_violation, error_text, stderr_tail)
+    dead: list[tuple] = []  # (row, pid, exit_kind, exit_code) for every dead pid
+    cohort_dead: list[str] = []
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id, "
+            "       last_heartbeat_at "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -13699,8 +13780,37 @@ def detect_crashed_workers(
 
             pid = int(row["worker_pid"])
             kind, code = _classify_run_exit(conn, row["id"], row["current_run_id"], pid)
+            dead.append((row, pid, kind, code))
+        # N workers ending externally in the same tick while all were still
+        # heartbeating is ONE event (something outside killed them), not N
+        # independent task failures. Decided over the whole tick before any
+        # row is accounted, so the systemic-fingerprint rule below can never
+        # turn a cohort kill into N immediate ``gave_up`` blocks.
+        cohort_ids = _cohort_death_ids(dead, now=time.time())
+        for row, pid, kind, code in dead:
             rate_limited_exit = False
-            if kind == "clean_exit":
+            cohort_death = row["id"] in cohort_ids
+            if cohort_death:
+                protocol_violation = False
+                error_text = (
+                    f"pid {pid} ended externally together with "
+                    f"{len(cohort_ids) - 1} other worker(s) in one dispatcher "
+                    f"tick while still heartbeating — cohort death, not a task "
+                    f"failure; requeued without counting a failure"
+                )
+                event_kind = "cohort_death"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_kind": kind,
+                    "exit_code": code,
+                    "cohort_size": len(cohort_ids),
+                    "cohort": sorted(cohort_ids)[:50],
+                }
+                stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
+                if stderr_tail:
+                    event_payload["stderr_tail"] = stderr_tail
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -13846,7 +13956,9 @@ def detect_crashed_workers(
                 # An infra-unavailable requeue is the same shape but a
                 # different cause, so it gets its own outcome rather than
                 # being filed under a quota wall it never hit.
-                if kind == "infra_unavailable":
+                if cohort_death:
+                    _run_outcome = "cohort_death"
+                elif kind == "infra_unavailable":
                     _run_outcome = "infra_unavailable"
                 elif rate_limited_exit:
                     _run_outcome = "rate_limited"
@@ -13873,7 +13985,11 @@ def detect_crashed_workers(
                     "outcome": _run_outcome,
                     "retry_status": retry_status,
                 })
-                if rate_limited_exit:
+                if cohort_death:
+                    # Released like a quota wall (no failure counted) but with
+                    # no respawn deferral: the task was healthy, respawn it.
+                    cohort_dead.append(row["id"])
+                elif rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
                     # respawn until the window clears — WITHOUT touching
@@ -14036,6 +14152,14 @@ def detect_crashed_workers(
     # Same side-channel for harness-unavailable requeues (126/127): no
     # failure counted, not a crash, and NOT a quota wall.
     detect_crashed_workers._last_infra_unavailable = infra_unavailable  # type: ignore[attr-defined]
+    detect_crashed_workers._last_cohort_deaths = cohort_dead  # type: ignore[attr-defined]
+    if cohort_dead:
+        _log.error(
+            "kanban cohort death: %d workers ended externally in one tick "
+            "(no failure counted): %s",
+            len(cohort_dead), ", ".join(cohort_dead),
+        )
+        _page_cohort_death(conn, cohort_dead)
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -15645,6 +15769,9 @@ def _dispatch_once_locked(
     )
     if _crash_infra:
         result.infra_unavailable.extend(_crash_infra)
+    _crash_cohort = getattr(detect_crashed_workers, "_last_cohort_deaths", [])
+    if _crash_cohort:
+        result.cohort_deaths.extend(_crash_cohort)
     result.timed_out = enforce_max_runtime(conn)
     # PR-gate re-evaluation BEFORE recompute_ready so a card whose external
     # gate is already satisfied becomes spawnable in the SAME tick rather
