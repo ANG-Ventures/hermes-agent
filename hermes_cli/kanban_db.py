@@ -5049,6 +5049,52 @@ def home_guard_mode() -> str:
     return "warn" if str(value).strip().lower() == "warn" else "refuse"
 
 
+WORKER_FANOUT_MAX_DEPTH = 10
+
+
+def _worker_owns_card(
+    conn: sqlite3.Connection,
+    task_id: str,
+    worker_task_id: str,
+    session_ids: Iterable[str] = (),
+) -> bool:
+    """True when ``task_id`` belongs to the fan-out of the dispatched worker
+    run for ``worker_task_id``: it descends from that card through
+    ``task_links`` (any kind, depth <= :data:`WORKER_FANOUT_MAX_DEPTH`), or its
+    ``created`` event was written by this run's session (``actor_session_id``).
+    A card that only shares the worker card's human home is NOT owned."""
+    seen = {task_id}
+    frontier = [task_id]
+    for _ in range(WORKER_FANOUT_MAX_DEPTH):
+        if not frontier:
+            break
+        ph = ",".join("?" * len(frontier))
+        ups = [
+            r[0] for r in conn.execute(
+                f"SELECT parent_id FROM task_links WHERE child_id IN ({ph})",
+                frontier,
+            )
+            if r[0]
+        ]
+        if worker_task_id in ups:
+            return True
+        frontier = [u for u in ups if u not in seen]
+        seen.update(frontier)
+    sids = tuple(s for s in (session_ids or ()) if s)
+    if not sids:
+        return False
+    try:
+        ph = ",".join("?" * len(sids))
+        row = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'created' "
+            f"AND actor_session_id IN ({ph}) LIMIT 1",
+            (task_id, *sids),
+        ).fetchone()
+    except sqlite3.OperationalError:  # pre-provenance schema
+        return False
+    return row is not None
+
+
 def check_home_session(
     conn: sqlite3.Connection, task_id: str, action: str
 ) -> Optional[MutationActor]:
@@ -5089,6 +5135,15 @@ def check_home_session(
     if actor.profile and (row["assignee"] or "") == actor.profile:
         return None
     if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+        return None
+    # ...and the cards it fanned out: item 1 stamps a worker's children with
+    # the HUMAN home, so without this the guard refuses a worker on its own
+    # fan-out (link/assign/promote/archive...). Unrelated cards that merely
+    # share that home stay foreign.
+    worker_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if worker_tid and _worker_owns_card(
+        conn, task_id, worker_tid, actor.session_ids
+    ):
         return None
     for sid in actor.session_ids:
         if home in home_ids(sid) or home in _caller_session_lineage(sid):
