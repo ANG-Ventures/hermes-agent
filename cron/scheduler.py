@@ -3497,7 +3497,7 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict]):
         root = _host_down_fleet_root()
         if root is None:
             return content, targets
-        cfg = json.loads((root / _FLEET_HOSTS_REL).read_text())
+        cfg = json.loads((root / _FLEET_HOSTS_REL).read_text(encoding="utf-8"))
         armed = {}
         for host, h in (cfg.get("hosts") or {}).items():
             latch = (h or {}).get("latch")
@@ -3506,7 +3506,7 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict]):
             lp = root / latch
             if lp.is_file():
                 armed[host] = {
-                    "since": lp.read_text().strip() or "?",
+                    "since": lp.read_text(encoding="utf-8").strip() or "?",
                     "owner": h.get("owner") or f"{host}-deadman",
                     "latch_path": lp,
                 }
@@ -3533,7 +3533,7 @@ def _apply_host_down_gate(job: dict, content: str, targets: List[dict]):
         }
         for h in hosts:
             try:
-                with (armed[h]["latch_path"].parent / _HOST_DOWN_LEDGER).open("a") as f:
+                with (armed[h]["latch_path"].parent / _HOST_DOWN_LEDGER).open("a", encoding="utf-8") as f:
                     f.write(json.dumps(rec) + "\n")
             except Exception as e:
                 logger.warning("host-down ledger write failed: %r", e)

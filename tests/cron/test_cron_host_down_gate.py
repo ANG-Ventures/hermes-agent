@@ -43,7 +43,7 @@ HOSTS = {
 def fleet(tmp_path, monkeypatch):
     root = tmp_path / "fleet"
     (root / "scripts" / "lib").mkdir(parents=True)
-    (root / "scripts" / "lib" / "fleet-hosts.json").write_text(json.dumps(HOSTS))
+    (root / "scripts" / "lib" / "fleet-hosts.json").write_text(json.dumps(HOSTS), encoding="utf-8")
     home = root / "profiles" / "worker"  # profile-scoped home: table found by walking up
     home.mkdir(parents=True)
     monkeypatch.setattr(scheduler, "get_hermes_home", lambda: home)
@@ -53,7 +53,7 @@ def fleet(tmp_path, monkeypatch):
 def _arm(root, host="ace-ai", since="2026-09-23T21:01:00Z"):
     latch = root / HOSTS["hosts"][host]["latch"]
     latch.parent.mkdir(parents=True, exist_ok=True)
-    latch.write_text(since)
+    latch.write_text(since, encoding="utf-8")
     return latch
 
 
@@ -103,7 +103,7 @@ def test_a_latch_armed_qbt_failure_routes_to_logs_with_prefix_and_ledger(fleet):
     assert chat == LOGS
     assert "[host-down: ace-ai since 2026-09-23T21:01:00Z — deferred to ace-ai-host-deadman]" in msg
     assert "failed 5 runs in a row" in msg  # demoted, never dropped
-    rows = [json.loads(l) for l in (latch.parent / "suppressed.jsonl").read_text().splitlines()]
+    rows = [json.loads(l) for l in (latch.parent / "suppressed.jsonl").read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
     assert rows[0]["producer"] == "qbt-private-missingfiles-monitor"
     assert rows[0]["head"] and set(rows[0]) == {"ts", "producer", "head"}
@@ -162,7 +162,7 @@ def test_non_alerts_target_untouched(fleet):
 
 def test_fail_open_on_corrupt_table(fleet):
     _arm(fleet)
-    (fleet / "scripts" / "lib" / "fleet-hosts.json").write_text("{not json")
+    (fleet / "scripts" / "lib" / "fleet-hosts.json").write_text("{not json", encoding="utf-8")
     job = _qbt_job()
     chat, msg = _deliver(job, _failure_content(job, "cannot read torrents/info"))
     assert chat == ALERTS and "[host-down" not in msg
