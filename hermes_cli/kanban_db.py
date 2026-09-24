@@ -782,7 +782,7 @@ def _pin_divergence_is_a_hazard(target: Path) -> bool:
         return False
     # Spelling-blind: a pin naming the live home in another case/firmlink
     # spelling still reaches production (card t_ee808d83 class sweep).
-    return _same_tree(target, native)
+    return _same_tree(_existing_ancestor(target), native)
 
 
 class KanbanPinDivergenceError(RuntimeError):
@@ -852,7 +852,7 @@ def _refuse_if_override_escapes_hermes_home(override: Path) -> None:
     # spelling-blind, so a pin naming a file inside the root in another
     # case/firmlink spelling must be recognised here or it would be refused
     # as an escape (card t_ee808d83, Argus round 2 N1).
-    if _same_tree(target, root):
+    if _same_tree(_existing_ancestor(target), root):
         _CHECKED_OVERRIDE_ESCAPES.add(key)
         return  # override lives inside the HERMES_HOME-derived root: normal.
     if not _pin_divergence_is_a_hazard(target):
@@ -1083,7 +1083,7 @@ def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -
     # Spelling-blind equality: the same DB file spelled in another case or
     # via the Data-volume firmlink is agreement, not a contradiction (card
     # t_ee808d83, Argus round 2 N1).
-    if _same_path(requested, pinned):
+    if _pin_file_agrees(requested, pinned):
         _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
         return  # pin agrees with the argument: the normal worker case.
     if not _pin_divergence_is_a_hazard(pinned):
@@ -8194,73 +8194,80 @@ _CWD_SNAPSHOT_SCOPE: ContextVar[Optional[list]] = ContextVar(
 )
 
 
-#: macOS's Data-volume firmlink is not a symlink and survives realpath().
-_FIRMLINK_DATA_PREFIX = "/System/Volumes/Data"
+def _path_identity(path: Path, memo: Optional[dict] = None) -> Optional[tuple[int, int]]:
+    """Filesystem identity of an EXISTING path, without opening a descriptor.
 
-
-def _path_identity(path: Path, memo: Optional[dict] = None) -> Path:
-    """One descriptor-free identity for DB, environment, and lsof paths.
-
-    Fold case and Unicode only on case-insensitive volumes. A case-sensitive
-    volume can contain distinct directories differing only in case; treating
-    them as one would allow GC to delete an unmanaged directory. Never open a
-    descriptor here: closing a kanban.db fd cancels SQLite's POSIX locks.
+    The kernel resolves case, Unicode and firmlink aliases. Missing paths have
+    no identity; never borrow a parent mount's identity for a missing child.
+    In particular, opening and closing a DB file would cancel SQLite locks.
     """
-    import unicodedata
-
     key = str(path)
     if memo is not None and key in memo:
         return memo[key]
-    name = os.path.realpath(os.path.expanduser(key))
-    if sys.platform == "darwin":
-        prefix = _FIRMLINK_DATA_PREFIX
-        if name == prefix or name.startswith(prefix + "/"):
-            stripped = name[len(prefix):] or "/"
-            # Only strip an actual firmlink, not an unrelated mount.
-            current = Path(name)
-            while not current.exists() and current.parent != current:
-                current = current.parent
-            counterpart = Path(str(current)[len(prefix):] or "/")
-            if current.exists() and counterpart.exists() and current.samefile(counterpart):
-                name = stripped
-        # Python's macOS os.pathconf_names does not expose PC_CASE_SENSITIVE.
-        # Probe an existing component with opposite case using stat (not open).
-        current = Path(name)
-        while not current.exists() and current.parent != current:
-            current = current.parent
-        insensitive = False
-        probe = current
-        while probe.parent != probe:
-            spelling = probe.name
-            idx = next((i for i, c in enumerate(spelling) if c.isascii() and c.isalpha()), None)
-            if idx is not None:
-                alt = spelling[:idx] + spelling[idx].swapcase() + spelling[idx + 1:]
-                try:
-                    a, b = probe.stat(), (probe.parent / alt).stat()
-                    insensitive = (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
-                except FileNotFoundError:
-                    pass
-                else:
-                    break
-            probe = probe.parent
-        if insensitive:
-            name = unicodedata.normalize("NFC", name).casefold()
-    result = Path(name)
+    try:
+        stat = os.stat(os.path.realpath(os.path.expanduser(key)))
+        result = (stat.st_dev, stat.st_ino)
+    except (OSError, ValueError):
+        result = None
     if memo is not None:
         memo[key] = result
     return result
 
 
+def _existing_ancestor(path: Path) -> Path:
+    """For a missing path, find the nearest ancestor with a filesystem ID."""
+    current = path
+    while _path_identity(current) is None and current.parent != current:
+        current = current.parent
+    return current
+
+
 def _same_tree(child: Path, parent: Path, memo: Optional[dict] = None) -> bool:
-    """True when child names parent or a descendant under the same identity."""
-    c = _path_identity(child, memo)
-    p = _path_identity(parent, memo)
-    return c == p or c.is_relative_to(p)
+    """Walk the existing child's ancestors; compare filesystem identities."""
+    target = _path_identity(parent, memo)
+    if target is None or _path_identity(child, memo) is None:
+        return False
+    current = Path(os.path.realpath(os.path.expanduser(str(child))))
+    while True:
+        if _path_identity(current, memo) == target:
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
 
 
 def _same_path(a: Path, b: Path, memo: Optional[dict] = None) -> bool:
-    """True when both paths name the same file under the same identity."""
-    return _path_identity(a, memo) == _path_identity(b, memo)
+    """True only for two existing filesystem objects with identical identity."""
+    first, second = _path_identity(a, memo), _path_identity(b, memo)
+    return first is not None and first == second
+
+
+def _pin_file_agrees(a: Path, b: Path) -> bool:
+    """Allow an uncreated DB pin only at the same parent and filename.
+
+    This is a pin agreement check, never scratch admission or ownership: an
+    uncreated DB file has no filesystem identity until the first connection.
+    """
+    if _same_path(a, b):
+        return True
+    if _path_identity(a) is not None or _path_identity(b) is not None:
+        return False
+    return a.name == b.name and _same_path(a.parent, b.parent)
+
+
+def _unknown_owner_may_claim(candidate: Path, stored: Path) -> bool:
+    """A missing stored path may only add a refusal, never admit deletion."""
+    import unicodedata
+
+    def fold(path: Path) -> str:
+        name = unicodedata.normalize("NFC", str(path)).casefold()
+        prefix = "/system/volumes/data"
+        if name.startswith(prefix + "/"):
+            name = name[len(prefix):]
+        return name.rstrip("/")
+
+    a, b = fold(candidate), fold(stored)
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
 def _scan_process_cwds() -> Optional[frozenset]:
@@ -8333,23 +8340,18 @@ def _process_cwd_within(path: Path) -> bool:
     if cwds is None:
         return True
     try:
-        target = _path_identity(path)
-        # Fast lexical pre-filter avoids stat/realpath on unrelated process
-        # cwds (including unresponsive network mounts). Identity decides the
-        # match; the pre-filter never authorises a deletion by itself.
-        import unicodedata
-
-        def maybe_within(cwd: Path) -> bool:
-            name = unicodedata.normalize("NFC", str(cwd)).casefold()
-            prefix = _FIRMLINK_DATA_PREFIX.casefold()
-            if name.startswith(prefix + "/"):
-                name = name[len(prefix):]
-            candidate = unicodedata.normalize("NFC", str(target)).casefold()
-            if not (name == candidate or name.startswith(candidate.rstrip("/") + "/")):
-                return False
-            return _same_tree(cwd, path)
-
-        return any(maybe_within(cwd) for cwd in cwds)
+        if _path_identity(path) is None:
+            return True
+        for cwd in cwds:
+            # A real lsof cwd exists. An unreadable one is unknown, not
+            # evidence that no process occupies the candidate.
+            if _path_identity(cwd) is None:
+                if _unknown_owner_may_claim(path, cwd):
+                    return True
+                continue
+            if _same_tree(cwd, path):
+                return True
+        return False
     except (OSError, RuntimeError, ValueError):
         return True
 
@@ -8395,18 +8397,11 @@ def _live_owners_of_path(
     except Exception:
         return ["<unresolvable-owner>"] if live_only else []
 
-    candidates: set = set()
     managed_root: Optional[Path] = None
     if is_managed:
-        # A nested checkout belongs to the enclosing card too; testing only
-        # resolved.name would miss <root>/<live-card>/repo.
         for parent in (resolved, *resolved.parents):
-            if _is_managed_scratch_path(parent):
-                owner_id = _path_identity(parent).name
-                if _TASK_DIR_NAME_RE.fullmatch(owner_id):
-                    candidates.add(owner_id)
-            else:
-                managed_root = parent  # the workspaces root itself
+            if not _is_managed_scratch_path(parent):
+                managed_root = parent
                 break
     # Stored rows and the candidate come from different sources and may spell
     # the same directory differently (case, NFC/NFD, firmlink); compare them
@@ -8440,8 +8435,14 @@ def _live_owners_of_path(
                 rows = c.execute(sql).fetchall()
             except Exception:
                 return ["<unreadable-task-table>"] if live_only else []
-            ids = candidates.intersection(row["id"] for row in rows)
+            ids = set()
             for row in rows:
+                # Convention ownership is a filesystem question, not a
+                # comparison of the candidate's spelling with a task id.
+                if (is_managed and managed_root is not None
+                        and _TASK_DIR_NAME_RE.fullmatch(row["id"])
+                        and _same_tree(resolved, managed_root / row["id"], spelling_memo)):
+                    ids.add(row["id"])
                 if not row["workspace_path"]:
                     continue
                 try:
@@ -8450,6 +8451,13 @@ def _live_owners_of_path(
                     ).expanduser().resolve(strict=False)
                 except Exception:
                     return ["<unresolvable-owner-path>"] if live_only else []
+                if _path_identity(stored, spelling_memo) is None:
+                    if (live_only and _task_has_live_run(c, row["id"])
+                            and _unknown_owner_may_claim(resolved, stored)):
+                        # A row may name the candidate despite an unstatable
+                        # path. Unknown identity can only prevent removal.
+                        return ["<unknown-owner-path>"]
+                    continue
                 stored_in = _same_tree(stored, resolved, spelling_memo)
                 path_in = _same_tree(resolved, stored, spelling_memo)
                 if not (stored_in or path_in):
@@ -8590,7 +8598,12 @@ def _durable_audit_log_path(target: Path, board: Optional[str]) -> Path:
         except OSError:
             continue
         try:
-            if _same_tree(resolved, target):
+            # The audit FILE may not exist yet; its existing parent still
+            # determines whether writing it would be inside the target.
+            current = _existing_ancestor(resolved)
+            if (_same_tree(current, target)
+                    or (_path_identity(target) is None
+                        and _unknown_owner_may_claim(resolved, target))):
                 continue  # would be destroyed by the deletion it records
         except (ValueError, OSError):
             pass
@@ -8735,6 +8748,8 @@ def safe_remove_workspace_dir(
         )
         return False
 
+    if not resolved.is_dir():
+        return False
     if not _is_managed_scratch_path(resolved):
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,

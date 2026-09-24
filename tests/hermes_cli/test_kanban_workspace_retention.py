@@ -264,9 +264,10 @@ def test_live_home_card_without_cwd_in_candidate_reaps_it(kanban_home, monkeypat
     old = _scratch(_mktask("old done"), "done", finished_days_ago=5)
     # cwds that must NOT count: the workspaces root (an ancestor), a sibling
     # whose name merely starts with the candidate's, and the home itself.
+    sibling = old.parent / (old.name + "x")
+    sibling.mkdir()
     _fake_lsof(monkeypatch, _listing(
-        "/", str(kanban_home), str(kb.workspaces_root()),
-        str(old.parent / (old.name + "x")),
+        "/", str(kanban_home), str(kb.workspaces_root()), str(sibling),
     ))
     assert kb._process_cwd_within(old) is False
     assert _gc(done_retention_days=3) == 0
@@ -280,7 +281,7 @@ def test_nested_cwd_in_candidate_retains_it(kanban_home, monkeypatch):
     nested = old / "repo" / "src" / "pkg"
     nested.mkdir(parents=True)
     # Real lsof prints the kernel's spelling of a cwd; mirror that.
-    reported = kb._path_identity(nested)
+    reported = nested
     _fake_lsof(monkeypatch, _listing("/", str(reported)))
 
     assert kb._live_owners_of_path(old) == [home_card]
@@ -491,6 +492,99 @@ def test_gc_convention_owner_in_other_spelling_retains_live_work(kanban_home, ax
     assert "owner-has-live-run" in kb.workspace_deletion_log_path().read_text(encoding="utf-8")
 
 
+@pytest.fixture(scope="module")
+def case_sensitive_volume():
+    """Real case-sensitive APFS: the ordinary macOS temp volume is insensitive."""
+    import shutil
+    import os
+    import tempfile
+
+    if sys.platform != "darwin" or not shutil.which("hdiutil"):
+        pytest.skip("requires macOS hdiutil")
+    with tempfile.TemporaryDirectory(prefix="kanban-cs-", dir="/tmp") as temp:
+        image = Path(temp) / "case-sensitive.dmg"
+        mount = Path(f"/Volumes/KANBAN-CS-{os.getpid()}")
+        subprocess.run(["hdiutil", "create", "-size", "64m", "-fs", "Case-sensitive APFS",
+                        "-volname", "KANBAN-CS", str(image)], check=True,
+                       stdin=subprocess.DEVNULL, capture_output=True)
+        subprocess.run(["hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount),
+                        str(image)], check=True, stdin=subprocess.DEVNULL, capture_output=True)
+        try:
+            yield mount
+        finally:
+            subprocess.run(["hdiutil", "detach", str(mount)], check=True,
+                           stdin=subprocess.DEVNULL, capture_output=True)
+
+
+def test_gc_never_deletes_distinct_case_sensitive_directory(case_sensitive_volume, monkeypatch):
+    home = case_sensitive_volume / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    root = case_sensitive_volume / "ws"
+    root.mkdir()
+    other = case_sensitive_volume / "WS"
+    other.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(root))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.init_db()
+    tid = _mktask("unmanaged case-sensitive directory")
+    candidate = other / tid
+    candidate.mkdir()
+    # Both sides exist: a spelling-fold mutant must not borrow the managed
+    # counterpart's identity for this distinct unmanaged directory.
+    (root / tid).mkdir()
+    work = candidate / "precious.txt"
+    work.write_text("retain", encoding="utf-8")
+    _set(tid, status="done", workspace_kind="scratch", workspace_path=str(candidate),
+         completed_at=int(time.time() - 10 * 86400))
+    assert _gc(done_retention_days=3) == 0
+    assert work.read_text(encoding="utf-8") == "retain"
+    assert not kb._is_managed_scratch_path(candidate)
+
+
+def test_gc_reaps_managed_directory_on_case_sensitive_mount(case_sensitive_volume, monkeypatch):
+    home = case_sensitive_volume / "control-home"
+    home.mkdir()
+    root = case_sensitive_volume / "control-ws"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(root))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb.init_db()
+    tid = _mktask("managed case-sensitive control")
+    candidate = root / tid
+    candidate.mkdir()
+    _set(tid, status="done", workspace_kind="scratch", workspace_path=str(candidate),
+         completed_at=int(time.time() - 10 * 86400))
+    assert _gc(done_retention_days=3) == 0
+    assert not candidate.exists()
+
+
+def test_case_sensitive_mount_boundary_does_not_inherit_parent_case_rule(
+        case_sensitive_volume):
+    root = case_sensitive_volume / "ws"
+    root.mkdir(exist_ok=True)
+    other = case_sensitive_volume / "WS"
+    other.mkdir(exist_ok=True)
+    assert not kb._same_tree(other, root)
+    assert kb._same_tree(root / "missing-child", root) is False
+    # The parent /Users volume is insensitive; it must not govern lookup
+    # inside a mounted case-sensitive volume.
+    assert kb._path_identity(other) != kb._path_identity(root)
+
+
+def test_missing_stored_owner_path_can_only_refuse_candidate(kanban_home):
+    old = _scratch(_mktask("old done"), "done", finished_days_ago=10)
+    free = _scratch(_mktask("unrelated done"), "done", finished_days_ago=10)
+    missing = old / "future-work"
+    live = _mktask("live path not yet created")
+    _set(live, status="running", workspace_kind="dir", workspace_path=str(missing),
+         claim_expires=int(time.time()) + 3600)
+    assert _gc(done_retention_days=3) == 0
+    assert old.exists(), "an unknown stored owner must not authorize deletion"
+    assert not free.exists(), "an unknown owner must not pin unrelated candidates"
+
+
 def test_case_sensitive_distinct_root_is_not_managed(kanban_home):
     root = kb.workspaces_root()
     root.mkdir(parents=True)
@@ -570,8 +664,8 @@ def test_equivalent_pin_is_accepted_and_gc_reaps(tmp_path, monkeypatch, axis):
     home.mkdir()
     pin = _variant(home, axis) / "kanban.db"
     _pin_env(monkeypatch, tmp_path, home=home, pin=pin)
-    assert kb._same_path(kb.kanban_db_path(), home / "kanban.db")
-    assert kb._same_path(kb.kanban_db_path("default"), home / "kanban.db")
+    assert kb._pin_file_agrees(kb.kanban_db_path(), home / "kanban.db")
+    assert kb._pin_file_agrees(kb.kanban_db_path("default"), home / "kanban.db")
     kb.init_db()
     a = _scratch(_mktask("old done a"), "done", finished_days_ago=10)
     b = _scratch(_mktask("old done b"), "done", finished_days_ago=10)
