@@ -269,3 +269,331 @@ def test_tool_unblock_guard_and_foreign_ok(kanban_home, monkeypatch):
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status != "blocked"
         assert any("home is dead [unblock]" in b for b in _comments(conn, tid))
+
+
+# --- round 2: sessionless callers, slash path, every status writer ---------
+
+
+def test_sessionless_actor_is_never_refused(kanban_home):
+    """No chat-session identity (cron opener, plain shell) is session-vs-
+    session undefined: allowed, exactly as without the guard."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        with kb.mutation_actor(session_ids=(), profile="apollo"):
+            assert kb.unblock_task(conn, tid)
+        assert _comments(conn, tid) == []
+
+
+def test_cli_sessionless_opener_shape_matches_base(kanban_home, capsys):
+    """The live cron-opener shape (comment, then unblock) on a stamped,
+    blocked card whose assignee is not the caller lands in ready."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, assignee="daedalus")
+    assert kc.kanban_command(kc.build_parser(_subparsers()).parse_args(
+        ["comment", tid, "opener: waking"])) == 0
+    rc = kc.kanban_command(kc.build_parser(_subparsers()).parse_args(
+        ["unblock", tid]))
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert "home-session guard skipped" in err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert "opener: waking" in _comments(conn, tid)
+
+
+def _subparsers():
+    import argparse
+
+    return argparse.ArgumentParser().add_subparsers(dest="_top")
+
+
+def _ready(conn, **kw):
+    return _card(conn, blocked=False, **kw)
+
+
+def _done(conn, **kw):
+    tid = _ready(conn, **kw)
+    assert kb.complete_task(conn, tid, result="x")
+    return tid
+
+
+def _review(conn, **kw):
+    tid = _ready(conn, **kw)
+    assert kb.request_review(conn, tid, summary="s", reviewer="argus", force=True)
+    return tid
+
+
+def _review_run(conn, **kw):
+    """A card in an ACTIVE review run: request_changes' only legal state."""
+    tid = _ready(conn, **kw)
+    worker = kb.claim_task(conn, tid)
+    assert worker is not None
+    assert kb.request_review(conn, tid, reviewer="argus",
+                             expected_run_id=worker.current_run_id)
+    assert kb.claim_review_task(conn, tid) is not None
+    return tid
+
+
+def _triage(conn, **kw):
+    return kb.create_task(conn, title="t", triage=True, session_id=HOME, **kw)
+
+
+def _link(conn, tid):
+    parent = kb.create_task(conn, title="p", assignee="x", session_id=OTHER)
+    kb.link_tasks(conn, parent, tid)
+
+
+# (setup, mutation) for every newly guarded status writer. Each mutation is
+# first proven to CHANGE the card with no actor bound, so a refusal is real.
+_ROUND2 = {
+    "schedule": (_ready, lambda c, t: kb.schedule_task(c, t, reason="later")),
+    "reopen": (_done, lambda c, t: kb.reopen_task(c, t, actor="apollo", reason="r")),
+    "request-review": (_ready, lambda c, t: kb.request_review(
+        c, t, summary="s", reviewer="argus", force=True)),
+    "reopen-review": (_review, lambda c, t: kb.reopen_review_task(c, t)),
+    "request-changes": (_review_run, lambda c, t: kb.request_changes(c, t, reason="fix")),
+    "link": (_ready, _link),
+    "specify": (_triage, lambda c, t: kb.specify_triage_task(c, t, body="spec")),
+    "decompose": (_triage, lambda c, t: kb.decompose_triage_task(
+        c, t, root_assignee="worker-a",
+        children=[{"title": "c1", "assignee": "worker-b"}])),
+}
+
+
+def _state(conn, tid):
+    t = kb.get_task(conn, tid)
+    return (t.status, t.assignee, t.session_id)
+
+
+@pytest.mark.parametrize("verb", sorted(_ROUND2))
+def test_round2_writers_change_state_unguarded(kanban_home, verb):
+    setup, mutate = _ROUND2[verb]
+    with kb.connect_closing() as conn:
+        tid = setup(conn)
+        before = _state(conn, tid)
+        mutate(conn, tid)
+        assert _state(conn, tid) != before, f"{verb} is not a status writer here"
+
+
+@pytest.mark.parametrize("verb", sorted(_ROUND2))
+def test_round2_writers_refuse_foreign_session(kanban_home, verb):
+    setup, mutate = _ROUND2[verb]
+    with kb.connect_closing() as conn:
+        tid = setup(conn)
+        before = _state(conn, tid)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo"):
+            with pytest.raises(kb.ForeignSessionMutationError) as exc:
+                mutate(conn, tid)
+        assert f"refused {verb} on {tid}" in str(exc.value)
+        assert _state(conn, tid) == before
+
+
+@pytest.mark.parametrize("verb", sorted(_ROUND2))
+def test_round2_writers_allow_home_and_override(kanban_home, verb):
+    setup, mutate = _ROUND2[verb]
+    with kb.connect_closing() as conn:
+        mine = setup(conn)
+        before = _state(conn, mine)
+        with kb.mutation_actor(session_ids=(HOME,), profile="apollo"):
+            mutate(conn, mine)
+        assert _state(conn, mine) != before
+        theirs = setup(conn)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="home is gone"):
+            mutate(conn, theirs)
+        assert any(b.endswith(f"home is gone [{verb}]") for b in _comments(conn, theirs))
+
+
+# --- gateway /kanban slash path ------------------------------------------
+
+
+def _slash_runner(session_id):
+    from gateway.run import GatewayRunner
+    from types import SimpleNamespace
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._session_key_for_source = lambda source: "agent:main:telegram:dm:c1"
+    runner.session_store = SimpleNamespace(
+        entry_for=lambda key: SimpleNamespace(session_id=session_id)
+    )
+    return runner
+
+
+def _slash_event(text):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(text=text, source=SimpleNamespace(), message_id="1",
+                           reply_to_message_id=None)
+
+
+@pytest.mark.asyncio
+async def test_gateway_slash_binds_invoking_session(kanban_home, monkeypatch):
+    """In-process /kanban: env is another session's (process-global), the
+    invoking session comes from the gateway explicitly."""
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_SESSION_ID", "poisoned-global-env")
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    home_runner = _slash_runner(HOME)
+    out = await GatewayRunner._handle_kanban_command(
+        home_runner, _slash_event("/kanban create 'mine' --assignee worker-a --json"))
+    tid = json.loads(out)["id"]
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).session_id == HOME
+
+    other_runner = _slash_runner(OTHER)
+    out = await GatewayRunner._handle_kanban_command(
+        other_runner, _slash_event(f"/kanban block {tid} 'nope'"))
+    assert f"refused block on {tid}" in out and HOME in out
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "blocked"
+
+    out = await GatewayRunner._handle_kanban_command(
+        home_runner, _slash_event(f"/kanban block {tid} 'mine to block'"))
+    assert "refused" not in out, out
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_run_slash_session_does_not_leak(kanban_home):
+    kc.run_slash("list", session_id=HOME)
+    assert kc._SLASH_SESSION_ID.get() is None
+
+
+# --- contract: ONE choke point -------------------------------------------
+
+import ast as _ast
+import re as _re
+
+# Writers of tasks.status/assignee/priority/session_id that are NOT guarded,
+# each with the reason it is execution lane (never bound from a chat).
+EXECUTION_LANE = {
+    "_migrate_add_optional_columns": "schema migration at connect time",
+    "recompute_ready": "global todo->ready promotion cascade",
+    "claim_task": "dispatcher/worker claim of a ready card",
+    "claim_review_task": "dispatcher claim of a review card",
+    "heartbeat_claim": "the claiming worker extending its own lease",
+    "heartbeat_worker": "the running worker's liveness write",
+    "release_stale_claims": "reaper",
+    "invalidate_descendants_for_parent_reopen": "cascade of a (guarded) reopen",
+    "_release_claim_for_workspace_refusal": "dispatcher spawn refusal",
+    "_refuse_reclaim_unproven_death": "reaper",
+    "_defer_reclaim_for_live_worker": "reaper",
+    "enforce_max_runtime": "reaper",
+    "detect_progress_stalls": "reaper",
+    "detect_stale_running": "reaper",
+    "reconcile_orphaned_running": "reaper",
+    "detect_crashed_workers": "reaper",
+    "_record_task_failure": "dispatcher failure accounting",
+    "_dispatch_once_locked": "the dispatcher",
+}
+
+_STATIC_WRITE = _re.compile(
+    r"UPDATE\s+tasks\s+SET[^;]*?\b(status|assignee|priority|session_id)\s*=",
+    _re.S | _re.I)
+_DYNAMIC_WRITE = _re.compile(r"[\"'](status|assignee|priority|session_id)\s*=\s*\?")
+
+
+def _module_src(mod):
+    return Path(mod.__file__).read_text(encoding="utf-8")
+
+
+def _writers():
+    src = _module_src(kb)
+    out = {}
+    for node in _ast.parse(src).body:
+        if not isinstance(node, _ast.FunctionDef):
+            continue
+        seg = _ast.get_source_segment(src, node) or ""
+        if _STATIC_WRITE.search(seg) or (
+            "UPDATE tasks" in seg and _DYNAMIC_WRITE.search(seg)
+        ):
+            out[node.name] = node
+    return out
+
+
+def _is_guarded(node):
+    return any(
+        isinstance(d, _ast.Call) and getattr(d.func, "id", "") == "_home_session_guarded"
+        for d in node.decorator_list
+    )
+
+
+def test_every_status_writer_goes_through_the_guard():
+    writers = _writers()
+    assert len(writers) > 10, "writer scan found nothing: the scanner is broken"
+    unrouted = sorted(
+        n for n, node in writers.items()
+        if not _is_guarded(node) and n not in EXECUTION_LANE
+    )
+    assert not unrouted, (
+        f"status/assignee/priority/session_id writers without "
+        f"@_home_session_guarded: {unrouted}. Guard them, or add them to "
+        f"EXECUTION_LANE with the reason no chat surface can reach them."
+    )
+    stale = sorted(set(EXECUTION_LANE) - set(writers))
+    assert not stale, f"EXECUTION_LANE lists non-writers: {stale}"
+    both = sorted(n for n in EXECUTION_LANE if _is_guarded(writers[n]))
+    assert not both, f"guarded AND listed as execution lane: {both}"
+
+
+def test_every_cli_verb_reaching_a_guarded_writer_binds_the_actor():
+    """An unbound actor makes the guard inert, so a verb that reaches a
+    guarded writer but is missing from _HOME_GUARDED_ACTIONS bypasses it."""
+    guarded = {n for n, node in _writers().items() if _is_guarded(node)}
+    guarded |= {
+        name for name, fn in vars(kb).items()
+        if callable(fn) and getattr(fn, "__home_session_action__", None)
+    }
+    src = _module_src(kc)
+    tree = _ast.parse(src)
+    funcs = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
+    table = _re.search(r"handlers = \{(.*?)\}", src, _re.S).group(1)
+    verbs = dict(_re.findall(r'"([\w-]+)":\s*(_cmd_\w+)', table))
+
+    def reach(fn, seen):
+        hits = set()
+        for node in _ast.walk(fn):
+            if not isinstance(node, _ast.Call):
+                continue
+            f = node.func
+            if isinstance(f, _ast.Attribute) and getattr(f.value, "id", "") == "kb":
+                hits.add(f.attr)
+            elif isinstance(f, _ast.Name) and f.id in funcs and f.id not in seen:
+                seen.add(f.id)
+                hits |= reach(funcs[f.id], seen)
+        return hits
+
+    missing = sorted(
+        verb for verb, cmd in verbs.items()
+        if reach(funcs[cmd], {cmd}) & guarded and verb not in kc._HOME_GUARDED_ACTIONS
+    )
+    assert not missing, f"CLI verbs reaching guarded writers unbound: {missing}"
+
+
+def test_every_tool_reaching_a_guarded_writer_binds_the_actor():
+    from tools import kanban_tools as kt
+
+    guarded = {
+        name for name, fn in vars(kb).items()
+        if callable(fn) and getattr(fn, "__home_session_action__", None)
+    }
+    src = _module_src(kt)
+    tree = _ast.parse(src)
+    handlers = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
+    wrapped = set(_re.findall(r"handler=_with_mutation_actor\((\w+)\)", src))
+    registered = set(_re.findall(r"handler=(?:_with_mutation_actor\()?(\w+)", src))
+    missing = []
+    for name in sorted(registered):
+        node = handlers.get(name)
+        if node is None:
+            continue
+        calls = {
+            c.func.attr for c in _ast.walk(node)
+            if isinstance(c, _ast.Call) and isinstance(c.func, _ast.Attribute)
+        }
+        if calls & guarded and name not in wrapped:
+            missing.append(name)
+    assert not missing, f"tool handlers reaching guarded writers unbound: {missing}"

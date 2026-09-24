@@ -80,6 +80,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -4913,6 +4914,10 @@ def check_home_session(
                 file=sys.stderr,
             )
         return None
+    # No chat-session identity (cron opener, wake script, a plain shell):
+    # that is the execution lane, not a chat acting on a foreign card.
+    if not actor.session_ids:
+        return None
     if home in actor.session_ids:
         return None
     # Execution lane: the assignee works its card wherever it was born, and a
@@ -4941,6 +4946,8 @@ def check_home_session(
 
 
 def _mutation_succeeded(result: Any) -> bool:
+    if result is None:  # ``-> None`` mutators (link_tasks) signal failure by raising
+        return True
     if isinstance(result, tuple):
         return bool(result and result[0])
     return bool(result)
@@ -4969,15 +4976,27 @@ def record_foreign_action(
     )
 
 
-def _home_session_guarded(action: str):
-    """Decorate a ``(conn, task_id, ...)`` mutator with the home-session guard."""
+def _home_session_guarded(action: str, task_param: str = "task_id"):
+    """Decorate a status/ownership mutator with the home-session guard.
+
+    ``task_param`` names the parameter holding the card being mutated (the
+    child for :func:`link_tasks`, whose status a link can demote). Every
+    writer of ``tasks.status/assignee/priority/session_id`` either carries
+    this decorator or is an execution-lane internal listed in
+    ``tests/.../test_kanban_home_session.py::EXECUTION_LANE`` -- an AST
+    contract test fails on any other.
+    """
 
     def deco(fn):
+        sig = inspect.signature(fn)
+        if task_param not in sig.parameters:
+            raise TypeError(f"{fn.__name__} has no parameter {task_param!r}")
+
         @functools.wraps(fn)
         def wrapper(conn, *args, **kwargs):
             if _MUTATION_ACTOR.get() is None or kwargs.get("dry_run"):
                 return fn(conn, *args, **kwargs)
-            task_id = args[0] if args else kwargs.get("task_id")
+            task_id = sig.bind_partial(conn, *args, **kwargs).arguments.get(task_param)
             override = check_home_session(conn, str(task_id), action)
             token = _MUTATION_ACTOR.set(None)
             try:
@@ -4989,6 +5008,7 @@ def _home_session_guarded(action: str):
             return result
 
         wrapper.__home_session_action__ = action
+        wrapper.__home_session_task_param__ = task_param
         return wrapper
 
     return deco
@@ -6034,6 +6054,7 @@ def apply_batch_route_writes(
 # Links
 # ---------------------------------------------------------------------------
 
+@_home_session_guarded("link", task_param="child_id")
 def link_tasks(
     conn: sqlite3.Connection,
     parent_id: str,
@@ -10412,6 +10433,7 @@ def arm_review_stale_alerts(conn: sqlite3.Connection, entries: list[dict]) -> li
     return fresh
 
 
+@_home_session_guarded("request-review")
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10590,6 +10612,7 @@ def request_review(
     return _ret(True)
 
 
+@_home_session_guarded("request-changes")
 def request_changes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10747,6 +10770,8 @@ def requeue_task(
     return True, None
 
 
+
+@_home_session_guarded("reopen")
 def reopen_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11057,6 +11082,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+@_home_session_guarded("reopen-review")
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``review`` -> ready (or todo) so the implementer re-runs.
 
@@ -11295,6 +11321,7 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+@_home_session_guarded("specify")
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11524,6 +11551,7 @@ def triage_resolve_task(
     return True, None
 
 
+@_home_session_guarded("decompose")
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12484,6 +12512,7 @@ def set_branch_name(
 
 
 # ---------------------------------------------------------------------------
+@_home_session_guarded("schedule")
 def schedule_task(
     conn: sqlite3.Connection,
     task_id: str,

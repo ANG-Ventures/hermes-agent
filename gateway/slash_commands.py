@@ -883,8 +883,22 @@ class GatewaySlashCommandsMixin:
 
         is_create = action == "create"
 
+        # The invoking chat session, passed EXPLICITLY: create stamps it as the
+        # card's home and the home-session guard compares against it. Never
+        # read from env here -- os.environ is shared by every session.
+        invoking_session_id = None
         try:
-            output = await asyncio.to_thread(run_slash, text)
+            _entry = self.session_store.entry_for(
+                self._session_key_for_source(event.source)
+            )
+            invoking_session_id = getattr(_entry, "session_id", None) or None
+        except Exception:
+            invoking_session_id = None
+
+        try:
+            output = await asyncio.to_thread(
+                run_slash, text, session_id=invoking_session_id
+            )
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 

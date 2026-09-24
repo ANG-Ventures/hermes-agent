@@ -2702,7 +2702,11 @@ _FOREIGN_OK_PROP = {
         "session sees. Omit otherwise -- prefer kanban_comment on foreign cards."
     ),
 }
-for _schema in (KANBAN_COMPLETE_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_UNBLOCK_SCHEMA):
+for _schema in (
+    KANBAN_COMPLETE_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_UNBLOCK_SCHEMA,
+    KANBAN_REQUEST_REVIEW_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
+    KANBAN_LINK_SCHEMA,
+):
     _schema["parameters"]["properties"]["foreign_ok"] = _FOREIGN_OK_PROP
 
 
@@ -2788,7 +2792,7 @@ registry.register(
     name="kanban_request_review",
     toolset="kanban",
     schema=KANBAN_REQUEST_REVIEW_SCHEMA,
-    handler=_handle_request_review,
+    handler=_with_mutation_actor(_handle_request_review),
     check_fn=_check_kanban_mode,
     emoji="👀",
 )
@@ -2797,7 +2801,7 @@ registry.register(
     name="kanban_request_changes",
     toolset="kanban",
     schema=KANBAN_REQUEST_CHANGES_SCHEMA,
-    handler=_handle_request_changes,
+    handler=_with_mutation_actor(_handle_request_changes),
     check_fn=_check_kanban_mode,
     emoji="↩",
 )
@@ -2869,7 +2873,7 @@ registry.register(
     name="kanban_link",
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
-    handler=_handle_link,
+    handler=_with_mutation_actor(_handle_link),
     check_fn=_check_kanban_mode,
     emoji="🔗",
 )

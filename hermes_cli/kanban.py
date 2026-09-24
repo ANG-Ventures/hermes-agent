@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import difflib
 import json
 import os
@@ -1615,9 +1616,18 @@ def kanban_command(args: argparse.Namespace) -> int:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
         actor_scope = contextlib.nullcontext()
-        if action in _HOME_GUARDED_ACTIONS:
+        caller_sid = _caller_session_id() if action in _HOME_GUARDED_ACTIONS else None
+        if action in _HOME_GUARDED_ACTIONS and not caller_sid:
+            # No chat-session identity (plain shell, cron opener, launchd):
+            # the guard is session-vs-session, so an unattributed caller is
+            # never refused -- behaviour is exactly as before the guard.
+            print(
+                "note: no session identity \u2014 home-session guard skipped",
+                file=sys.stderr,
+            )
+        elif action in _HOME_GUARDED_ACTIONS:
             actor_scope = kb.mutation_actor(
-                session_ids=(_caller_session_id(),),
+                session_ids=(caller_sid,),
                 profile=_profile_author(),
                 foreign_ok=getattr(args, "foreign_ok", None),
                 surface="cli",
@@ -1646,10 +1656,38 @@ def kanban_command(args: argparse.Namespace) -> int:
 _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "complete", "block", "unblock", "archive", "assign", "reassign",
     "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
+    "schedule", "reopen", "reopen-review", "request-review",
+    "request-changes", "link", "specify", "decompose",
 })
 
 
+# The invoking chat session when the CLI runs IN-PROCESS for a gateway
+# ``/kanban`` slash command. The gateway passes it explicitly to
+# :func:`run_slash`; env is never consulted there (it is process-global and
+# shared by every concurrent session).
+_SLASH_SESSION_ID: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "kanban_slash_session_id", default=None
+)
+
+
 def _caller_session_id() -> Optional[str]:
+    """THE caller-identity read for every CLI site: the ``create`` stamp
+    (:func:`_resolve_session_flag`), ``show``'s home label, ``list --home`` and
+    the guard's actor binding. Order: explicit slash-path session, then the
+    ContextVar-first resolver shared with ``tools/kanban_tools``, then env."""
+    explicit = (_SLASH_SESSION_ID.get() or "").strip()
+    if explicit:
+        return explicit
+    try:
+        from gateway.session_context import resolve_current_session_id
+
+        resolved = (resolve_current_session_id() or "").strip()
+        if resolved:
+            return resolved
+        if os.environ.get("_HERMES_GATEWAY") == "1":
+            return None  # in-process: env is another session's, never ours
+    except Exception:
+        pass
     return (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
 
 
@@ -5428,7 +5466,10 @@ def _cmd_specify(args: argparse.Namespace) -> int:
     ok_count = 0
     fail_count = 0
     for tid in ids:
-        outcome = spec.specify_task(tid, author=author)
+        try:
+            outcome = spec.specify_task(tid, author=author)
+        except kb.ForeignSessionMutationError as exc:
+            outcome = spec.SpecifyOutcome(tid, False, str(exc))
         if outcome.ok:
             ok_count += 1
         else:
@@ -5501,7 +5542,10 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
     ok_count = 0
     for tid in ids:
-        outcome = decomp.decompose_task(tid, author=author)
+        try:
+            outcome = decomp.decompose_task(tid, author=author)
+        except kb.ForeignSessionMutationError as exc:
+            outcome = decomp.DecomposeOutcome(tid, False, str(exc))
         if outcome.ok:
             ok_count += 1
         if want_json:
@@ -5761,13 +5805,25 @@ Read-only commands are safe while an agent is running.\
 """
 
 
-def run_slash(rest: str) -> str:
+def run_slash(rest: str, *, session_id: Optional[str] = None) -> str:
     """Execute a ``/kanban …`` string and return captured stdout/stderr.
 
     ``rest`` is everything after ``/kanban`` (may be empty).  Used from
     both the interactive CLI (``self._handle_kanban_command``) and the
     gateway (``_handle_kanban_command``) so formatting is identical.
+
+    ``session_id`` is the invoking chat session. The gateway passes it
+    explicitly so ``create`` stamps it and the home-session guard sees it;
+    ``None`` falls back to :func:`_caller_session_id`'s normal resolution.
     """
+    token = _SLASH_SESSION_ID.set((session_id or "").strip() or None)
+    try:
+        return _run_slash(rest)
+    finally:
+        _SLASH_SESSION_ID.reset(token)
+
+
+def _run_slash(rest: str) -> str:
     import io
     import contextlib
 
