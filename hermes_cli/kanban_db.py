@@ -848,7 +848,11 @@ def _refuse_if_override_escapes_hermes_home(override: Path) -> None:
         target = override.resolve(strict=False)
     except OSError:
         return
-    if target.is_relative_to(root):
+    # Spelling-blind on the AGREE side too: the hazard predicate below is
+    # spelling-blind, so a pin naming a file inside the root in another
+    # case/firmlink spelling must be recognised here or it would be refused
+    # as an escape (card t_ee808d83, Argus round 2 N1).
+    if _same_tree(target, root):
         _CHECKED_OVERRIDE_ESCAPES.add(key)
         return  # override lives inside the HERMES_HOME-derived root: normal.
     if not _pin_divergence_is_a_hazard(target):
@@ -1076,7 +1080,10 @@ def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -
         pinned = override.resolve(strict=False)
     except (OSError, ValueError):
         return
-    if requested == pinned:
+    # Spelling-blind equality: the same DB file spelled in another case or
+    # via the Data-volume firmlink is agreement, not a contradiction (card
+    # t_ee808d83, Argus round 2 N1).
+    if _same_path(requested, pinned):
         _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
         return  # pin agrees with the argument: the normal worker case.
     if not _pin_divergence_is_a_hazard(pinned):
@@ -8128,11 +8135,17 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                     roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
                 except OSError:
                     continue
+    memo: dict = {}
     for root, board in roots:
-        if p_abs == root:
-            continue
         try:
-            if p_abs.is_relative_to(root):
+            # Spelling-blind (card t_ee808d83 round 3): a DB row can store a
+            # scratch path in another case/firmlink spelling, and a literal
+            # miss refused its reclamation forever. Containment is decided by
+            # kernel names, and STRICT descendancy is kept the same way: the
+            # root itself, in any spelling, is never managed.
+            if _same_path(p_abs, root, memo):
+                continue
+            if _same_tree(p_abs, root, memo):
                 return True, board
         except ValueError:
             continue
@@ -8168,7 +8181,7 @@ def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
         return False
     try:
         want = _board_db_path_ignoring_pin(_normalize_board_slug(board) or board)
-        return Path(actual).resolve(strict=False) == want.resolve(strict=False)
+        return _same_path(Path(actual).resolve(strict=False), want.resolve(strict=False))
     except Exception:
         return False
 
@@ -8240,9 +8253,8 @@ def _same_tree(child: Path, parent: Path, memo: Optional[dict] = None) -> bool:
     board DB, the environment, a candidate). An exact match answers at once.
     Otherwise only pairs that agree once case / Unicode / firmlink spelling is
     folded are re-compared by their kernel names, so unrelated rows (NAS
-    mounts, other projects) are never opened. A path the kernel cannot name
-    keeps its literal spelling: a missing path cannot physically contain or
-    sit inside an existing one under another name.
+    mounts, other projects) are never opened. A path that does not exist is
+    named by its nearest existing ancestor plus the literal missing tail.
     """
     if child == parent or child.is_relative_to(parent):
         return True
@@ -8253,16 +8265,37 @@ def _same_tree(child: Path, parent: Path, memo: Optional[dict] = None) -> bool:
         key = str(p)
         if memo is not None and key in memo:
             return memo[key]
-        try:
-            got = _kernel_path(p) or p
-        except (OSError, ValueError):
-            got = p
+        # Name the nearest EXISTING ancestor through the kernel and re-attach
+        # the missing tail literally: a pin whose kanban.db is not created yet
+        # still sits in (or outside) its home by the home's kernel name.
+        got = p
+        tail: list[str] = []
+        cur = p
+        while True:
+            try:
+                named = _kernel_path(cur)
+            except (OSError, ValueError):
+                named = None
+                if cur.parent != cur:
+                    tail.append(cur.name)
+                    cur = cur.parent
+                    continue
+            if named is not None:
+                got = named.joinpath(*reversed(tail))
+            break
         if memo is not None:
             memo[key] = got
         return got
 
     c, q = canon(child), canon(parent)
     return c == q or c.is_relative_to(q)
+
+
+def _same_path(a: Path, b: Path, memo: Optional[dict] = None) -> bool:
+    """True when *a* and *b* name the same file, however either is spelled."""
+    if memo is None:
+        memo = {}
+    return _same_tree(a, b, memo) and _same_tree(b, a, memo)
 
 
 def _scan_process_cwds() -> Optional[frozenset]:

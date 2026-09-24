@@ -382,19 +382,36 @@ def test_cwd_probe_fails_closed_when_candidate_cannot_be_named(monkeypatch, tmp_
     assert kb._process_cwd_within(tmp_path) is True
 
 
+def _home_spellings(tmp_path: Path, axis: str) -> tuple[Path, Path]:
+    """(on-disk home, the same directory spelled on *axis*)."""
+    import unicodedata
+
+    base = tmp_path.resolve()
+    if axis == "nfc":
+        on_disk = base / unicodedata.normalize("NFD", "home_caf\u00e9")
+        on_disk.mkdir()
+        spelled = base / unicodedata.normalize("NFC", "home_caf\u00e9")
+    else:
+        on_disk = base / "home_dir"
+        on_disk.mkdir()
+        spelled = _variant(on_disk, axis)
+    if str(spelled) == str(on_disk) or not spelled.exists():
+        pytest.skip(f"filesystem does not alias the {axis} spelling here")
+    return on_disk, spelled
+
+
+@pytest.mark.parametrize("axis", ["case", "nfc", "firmlink"])
 @pytest.mark.parametrize("row_spelling", ["env", "disk"])
 def test_gc_retains_candidate_when_home_env_is_spelled_differently(
-        tmp_path, monkeypatch, row_spelling):
-    """Argus's E2E repro: HERMES_HOME in another case than the on-disk home.
+        tmp_path, monkeypatch, row_spelling, axis):
+    """Argus's E2E repro: HERMES_HOME spelled differently from the on-disk home.
 
     ``disk`` also stores the dir:home row in the OTHER spelling from the
     candidates, so the home-rooted exemption must still recognise it (the
-    free control is reaped) while the live cwd still retains."""
-    on_disk = tmp_path / "home_dir"
-    on_disk.mkdir()
-    spelled = tmp_path / "HOME_DIR"
-    if not spelled.exists():
-        pytest.skip("case-sensitive filesystem")
+    free control is reaped) while the live cwd still retains. Every spelling
+    axis the pre-filter folds (case, NFC/NFD, the Data firmlink) has an arm,
+    so dropping any one fold fails here (Argus round 2 mutants T3/T4)."""
+    on_disk, spelled = _home_spellings(tmp_path, axis)
     monkeypatch.setenv("HERMES_HOME", str(spelled))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
@@ -425,3 +442,112 @@ def test_owner_row_spelled_differently_still_owns(kanban_home):
     _set(live, status="running", workspace_kind="dir", workspace_path=str(alt),
          claim_expires=int(time.time()) + 3600)
     assert kb._live_owners_of_path(custom / "repo") == [live]
+
+
+def test_nested_live_dir_card_stored_in_other_case_retains_candidate(kanban_home):
+    """A LIVE card's dir workspace nested INSIDE an old DONE candidate, stored in
+    another case: gc must keep the candidate (Argus round 2 mutant C3)."""
+    cand = _mktask("old done")
+    ws = _scratch(cand, "done", finished_days_ago=10)
+    nested = ws / "repo"
+    nested.mkdir()
+    (nested / "live_work.txt").write_text("live card's work\n", encoding="utf-8")
+    stored = _variant(nested, "case")
+    stored = Path(str(stored.parent).replace(cand, cand.upper())) / stored.name
+    if not stored.is_dir():
+        pytest.skip("case-sensitive filesystem")
+    live = _mktask("live nested dir card")
+    _set(live, status="running", workspace_kind="dir", workspace_path=str(stored),
+         claim_expires=int(time.time()) + 3600)
+    assert _gc(done_retention_days=3) == 0
+    assert (nested / "live_work.txt").exists(), "gc deleted a live card's workspace"
+
+
+def test_scratch_row_stored_in_other_case_is_reaped(kanban_home):
+    """A DONE scratch row whose workspace_path is spelled in another case is
+    still managed storage: gc reclaims it instead of refusing it forever."""
+    tid = _mktask("old done, other-case row")
+    ws = _scratch(tid, "done", finished_days_ago=10)
+    alt = _variant(ws, "case")
+    _set(tid, workspace_path=str(alt))
+    assert _gc(done_retention_days=3) == 0
+    assert not ws.exists()
+
+
+@pytest.mark.parametrize("axis", ["case", "firmlink"])
+def test_workspaces_root_in_other_spelling_is_never_managed(kanban_home, axis):
+    """Strict descendancy survives spelling-blind matching: the root itself,
+    however spelled, is not a deletable scratch dir."""
+    root = kb.workspaces_root()
+    (root / "t_child").mkdir(parents=True)
+    alt_root = _variant(root.resolve(), axis)
+    assert kb._is_managed_scratch_path(alt_root) is False
+    assert kb._is_managed_scratch_path(alt_root / "t_child") is True
+    assert kb._is_managed_scratch_path(alt_root.parent / "logs") is False
+
+
+def test_artifact_spelled_in_other_case_is_still_copied(kanban_home):
+    """Completion artifacts declared under another-case spelling of the scratch
+    workspace are preserved before cleanup (Argus round 2 mutant C2)."""
+    tid = _mktask("artifact card")
+    ws = _scratch(tid, "running")
+    (ws / "report.txt").write_text("deliverable\n", encoding="utf-8")
+    alt = _variant(ws, "case") / "report.txt"
+    with kb.connect_closing() as conn:
+        kb._persist_scratch_completion_artifacts(conn, tid, {"artifacts": [str(alt)]})
+    copies = list(kb.task_attachments_dir(tid).glob("report*.txt"))
+    assert copies and copies[0].read_text(encoding="utf-8") == "deliverable\n"
+
+
+def test_audit_log_escapes_target_spelled_in_other_case(kanban_home):
+    """Removing the kanban home spelled in another case must not route the audit
+    line into the tree being removed (Argus round 2 mutant C6)."""
+    target = _variant(kanban_home.resolve(), "case")
+    log = kb._durable_audit_log_path(target.resolve(strict=False), None)
+    assert not kb._same_tree(log.resolve(strict=False), kanban_home.resolve()), log
+
+
+# --- Pin guards: an EQUIVALENT pin agrees; a native pin in a sandbox refuses ---
+# Argus round 2 N1: the hazard predicate became spelling-blind while both
+# agree-checks in front of it still compared strings, so the same kanban.db in
+# another spelling raised KanbanPinDivergenceError and gc reclaimed nothing.
+
+
+def _pin_env(monkeypatch, tmp_path, *, home: Path, pin: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.setattr(kb, "_PIN_AT_IMPORT", "")
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
+
+
+@pytest.mark.parametrize("axis", ["case", "firmlink"])
+def test_equivalent_pin_is_accepted_and_gc_reaps(tmp_path, monkeypatch, axis):
+    home = tmp_path.resolve() / ".hermes"
+    home.mkdir()
+    pin = _variant(home, axis) / "kanban.db"
+    _pin_env(monkeypatch, tmp_path, home=home, pin=pin)
+    assert kb._same_path(kb.kanban_db_path(), home / "kanban.db")
+    assert kb._same_path(kb.kanban_db_path("default"), home / "kanban.db")
+    kb.init_db()
+    a = _scratch(_mktask("old done a"), "done", finished_days_ago=10)
+    b = _scratch(_mktask("old done b"), "done", finished_days_ago=10)
+    assert _gc(done_retention_days=3) == 0
+    assert not a.exists() and not b.exists(), "equivalent pin blocked reclamation"
+
+
+def test_sandbox_with_native_pin_in_other_case_still_refuses(tmp_path, monkeypatch):
+    """Positive control (incident shape, Argus round 2 C1): a sandboxed home
+    whose pin reaches the machine's native home in another case must RAISE."""
+    native = tmp_path.resolve() / ".hermes"
+    native.mkdir()
+    sandbox = tmp_path.resolve() / "sandbox"
+    sandbox.mkdir()
+    pin = _variant(native, "case") / "kanban.db"
+    _pin_env(monkeypatch, tmp_path, home=sandbox, pin=pin)
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path()
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path("default")
