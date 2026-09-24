@@ -4160,23 +4160,29 @@ def compress_context(
                         # a notice cannot split parallel tool results (or
                         # drift after the turn that originally followed it).
                         landing = None
-                        for successor in messages[index + 1:]:
+                        for successor_index in range(index + 1, len(messages)):
+                            successor = messages[successor_index]
                             if is_metadata_only_tool_notice(successor):
                                 continue
-                            for pos, candidate in enumerate(compressed):
-                                if candidate is successor or (
-                                    isinstance(candidate, dict)
-                                    and isinstance(successor, dict)
-                                    and (
-                                        (successor.get("tool_calls") and candidate.get("tool_calls") == successor["tool_calls"])
-                                        or (successor.get("role") == "tool" and candidate.get("tool_call_id") == successor.get("tool_call_id"))
-                                        or (successor.get("role") == candidate.get("role")
-                                            and successor.get("content") == candidate.get("content")
-                                            and not successor.get("tool_calls"))
-                                    )
-                                ):
-                                    landing = pos
-                                    break
+                            def same_row(candidate):
+                                if not isinstance(candidate, dict) or not isinstance(successor, dict):
+                                    return candidate is successor
+                                if candidate.get("role") != successor.get("role"):
+                                    return False
+                                if successor.get("tool_calls"):
+                                    return candidate.get("tool_calls") == successor["tool_calls"]
+                                if successor.get("role") == "tool":
+                                    return candidate.get("tool_call_id") == successor.get("tool_call_id")
+                                return (not candidate.get("tool_calls")
+                                        and candidate.get("content") == successor.get("content"))
+
+                            # Compression keeps a suffix, but may copy its rows.
+                            # Distinguish equal-text turns by their occurrence
+                            # counted from the end, not by the first equal row.
+                            rank = sum(same_row(row) for row in messages[successor_index:])
+                            matches = [pos for pos, row in enumerate(compressed) if same_row(row)]
+                            if len(matches) >= rank:
+                                landing = matches[-rank]
                             if landing is not None:
                                 break
                         if landing is None:

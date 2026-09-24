@@ -308,7 +308,7 @@ class TestConfabNoticeEndToEnd:
         assert persisted and all(is_metadata_only_tool_notice(r) for r in persisted)
 
     @pytest.mark.parametrize("engine", ["builtin", "lcm"])
-    @pytest.mark.parametrize("event_position", [3, 38])
+    @pytest.mark.parametrize("event_position", [3, 38, 47])
     @pytest.mark.parametrize("fallback", [False, True])
     def test_compaction_event_does_not_split_parallel_tool_results(self, notice_env, stream, engine, event_position, fallback, tmp_path):
         make_agent, handler, db, sid, _ = notice_env
@@ -329,8 +329,11 @@ class TestConfabNoticeEndToEnd:
                 {"role": "assistant", "content": "", "tool_calls": calls},
                 *({"role": "tool", "tool_call_id": call["id"],
                    "content": f"result {call['id']} {big}"} for call in calls),
-                {"role": "assistant", "content": f"a{i} {big}"},
+                {"role": "assistant", "content": "Done."},
             ])
+        for i in range(4):
+            history.extend([{"role": "user", "content": f"short question {i}"},
+                            {"role": "assistant", "content": "Done."}])
 
         def run(arm):
             arm_sid = f"tool-group-{engine}-{arm}-{stream}"
@@ -408,10 +411,35 @@ class TestConfabNoticeEndToEnd:
         assert not (event_rows[event_idx - 1].get("role") == "tool"
                     and event_rows[event_idx + 1].get("role") == "tool")
         successor = history[event_position]
-        surviving_successors = [i for i, m in enumerate(event_rows) if m.get("tool_calls") == successor.get("tool_calls")
-                                and m.get("tool_calls")]
-        if surviving_successors:
-            assert event_idx < surviving_successors[0], "event moved after its original successor"
+        if successor.get("tool_calls"):
+            matches = [i for i, m in enumerate(event_rows)
+                       if m.get("tool_calls") == successor["tool_calls"]]
+            if matches:
+                assert event_idx < matches[0], "event moved after its original successor"
+        elif successor.get("content") == "Done.":
+            # All final answers have identical text. Match this successor's
+            # occurrence from the END, not the first content-equal twin.
+            rank = sum(m.get("role") == "assistant" and m.get("content") == "Done."
+                       for m in history[event_position:])
+            matches = [i for i, m in enumerate(event_rows)
+                       if m.get("role") == "assistant" and m.get("content") == "Done."]
+            if event_position == 47:
+                assert len(matches) >= rank + 2, "duplicate predecessors and successor must survive"
+            if len(matches) >= rank:
+                assert event_idx < matches[-rank], "event moved after its own text successor"
+            predecessor = history[event_position - 1]
+            positions = [i for i, m in enumerate(event_rows)
+                         if m.get("role") == predecessor["role"] and
+                         (m.get("tool_call_id") == predecessor.get("tool_call_id")
+                          if predecessor.get("role") == "tool"
+                          else m.get("content") == predecessor.get("content"))]
+            if event_position == 47:
+                assert positions, "original predecessor must survive compression"
+                assert event_idx == positions[-1] + 1, "event must follow its own user turn"
+                assert event_rows[event_idx + 1].get("content") == "Done."
+                assert event_rows[event_idx + 2].get("content") == "short question 3"
+            if positions:
+                assert positions[-1] < event_idx, "event moved before its original predecessor"
 
     def test_contentful_tagged_system_is_not_stripped_before_compression(self, notice_env, stream):
         make_agent, handler, db, sid, _ = notice_env
