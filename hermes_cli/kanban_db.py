@@ -86,6 +86,7 @@ import random
 import secrets
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -783,7 +784,7 @@ def _pin_divergence_is_a_hazard(target: Path) -> bool:
         return False
     # Spelling-blind: a pin naming the live home in another case/firmlink
     # spelling still reaches production (card t_ee808d83 class sweep).
-    return _same_tree(target, native)
+    return _pin_tree_agrees(target, native)
 
 
 class KanbanPinDivergenceError(RuntimeError):
@@ -849,7 +850,11 @@ def _refuse_if_override_escapes_hermes_home(override: Path) -> None:
         target = override.resolve(strict=False)
     except OSError:
         return
-    if target.is_relative_to(root):
+    # Spelling-blind on the AGREE side too: the hazard predicate below is
+    # spelling-blind, so a pin naming a file inside the root in another
+    # case/firmlink spelling must be recognised here or it would be refused
+    # as an escape (card t_ee808d83, Argus round 2 N1).
+    if _pin_tree_agrees(target, root):
         _CHECKED_OVERRIDE_ESCAPES.add(key)
         return  # override lives inside the HERMES_HOME-derived root: normal.
     if not _pin_divergence_is_a_hazard(target):
@@ -1077,7 +1082,10 @@ def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -
         pinned = override.resolve(strict=False)
     except (OSError, ValueError):
         return
-    if requested == pinned:
+    # Spelling-blind equality: the same DB file spelled in another case or
+    # via the Data-volume firmlink is agreement, not a contradiction (card
+    # t_ee808d83, Argus round 2 N1).
+    if _pin_file_agrees(requested, pinned):
         _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
         return  # pin agrees with the argument: the normal worker case.
     if not _pin_divergence_is_a_hazard(pinned):
@@ -8442,11 +8450,17 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                     roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
                 except OSError:
                     continue
+    memo: dict = {}
     for root, board in roots:
-        if p_abs == root:
-            continue
         try:
-            if p_abs.is_relative_to(root):
+            # Spelling-blind (card t_ee808d83 round 3): a DB row can store a
+            # scratch path in another case/firmlink spelling, and a literal
+            # miss refused its reclamation forever. Containment is decided by
+            # kernel names, and STRICT descendancy is kept the same way: the
+            # root itself, in any spelling, is never managed.
+            if _same_path(p_abs, root, memo):
+                continue
+            if _same_tree(p_abs, root, memo):
                 return True, board
         except ValueError:
             continue
@@ -8482,7 +8496,7 @@ def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
         return False
     try:
         want = _board_db_path_ignoring_pin(_normalize_board_slug(board) or board)
-        return Path(actual).resolve(strict=False) == want.resolve(strict=False)
+        return _same_path(Path(actual).resolve(strict=False), want.resolve(strict=False))
     except Exception:
         return False
 
@@ -8493,90 +8507,134 @@ def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
 _CWD_SNAPSHOT_SCOPE: ContextVar[Optional[list]] = ContextVar(
     "kanban_cwd_snapshot_scope", default=None,
 )
+_CWD_SCAN_BUDGET_SECONDS = 30
 
 
-#: macOS spells every path on the Data volume twice: ``/Users/...`` and the
-#: firmlinked ``/System/Volumes/Data/Users/...``. Only used to decide whether
-#: two spellings are worth asking the kernel about (:func:`_same_tree`).
-_FIRMLINK_DATA_PREFIX = "/System/Volumes/Data"
+@contextlib.contextmanager
+def _bounded_cwd_probe():
+    """Bound lsof, cwd identity snapshot, and a candidate stat; fail closed.
 
-
-def _kernel_path(p) -> Optional[Path]:
-    """Return the kernel's own spelling of existing path *p*.
-
-    ``Path.resolve()`` follows symlinks only. On case-insensitive APFS it keeps
-    the caller's case, NFC vs NFD, and ``/System/Volumes/Data`` firmlink
-    spellings, while ``lsof`` prints the kernel's canonical name -- so a
-    string compare of the two misses a live cwd (card t_ee808d83, Argus
-    round 1). The kernel answers from an open descriptor: ``F_GETPATH`` on
-    macOS, ``/proc/self/fd`` on Linux, which is the same name source lsof
-    uses. Returns ``None`` on platforms with neither; raises ``OSError`` when
-    the path cannot be opened or named, so callers choose their fail-closed
-    answer.
+    The deadline starts with a probe, never with the GC removal loop: a slow
+    rmtree must not spend the following candidate's probe budget. All lsof
+    cwd ancestors are resolved in the first probe and cached for this run.
+    A stat on a dead mount can block independently of lsof. SIGALRM interrupts
+    it on POSIX; threads/platforms without timers refuse reclamation.
     """
-    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
-        return None
-    fd = os.open(os.fspath(p), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    deadline = time.monotonic() + _CWD_SCAN_BUDGET_SECONDS
+    alarm_signal = getattr(signal, "SIGALRM", None)
+    if (alarm_signal is None or not hasattr(signal, "setitimer") or
+            threading.current_thread() is not threading.main_thread()):
+        raise TimeoutError("cwd probe cannot be bounded in this context")
+    previous = signal.getitimer(signal.ITIMER_REAL)
+    if previous[0] > 0:
+        raise TimeoutError("cwd probe cannot replace an existing alarm")
+    old_handler = signal.getsignal(alarm_signal)
+
+    def expired(_signum, _frame):
+        raise TimeoutError("cwd probe budget exhausted")
+
+    signal.signal(alarm_signal, expired)
     try:
-        if sys.platform == "darwin":
-            import fcntl
-
-            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
-            name = os.fsdecode(raw.split(b"\0", 1)[0])
-        else:
-            name = os.readlink(f"/proc/self/fd/{fd}")
-            if name.endswith(" (deleted)"):
-                raise FileNotFoundError(name)
+        signal.setitimer(signal.ITIMER_REAL, max(deadline - time.monotonic(), 0.000001))
+        yield
     finally:
-        os.close(fd)
-    if not name.startswith("/"):
-        raise OSError(f"kernel returned a non-absolute path for {p}: {name!r}")
-    return Path(name)
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(alarm_signal, old_handler)
 
 
-def _loose_spelling(p: Path) -> Path:
-    """Fold the spelling axes the kernel may canonicalise (case, Unicode
-    normalisation, the Data-volume firmlink). A cheap pre-filter only: it
-    decides when :func:`_same_tree` should pay for a kernel lookup."""
-    import unicodedata
+def _path_identity(path: Path, memo: Optional[dict] = None) -> Optional[tuple[int, int]]:
+    """Filesystem identity of an EXISTING path, without opening a descriptor.
 
-    s = unicodedata.normalize("NFC", str(p)).casefold()
-    prefix = _FIRMLINK_DATA_PREFIX.casefold()
-    if s == prefix or s.startswith(prefix + "/"):
-        s = s[len(prefix):] or "/"
-    return Path(s)
+    The kernel resolves case, Unicode and firmlink aliases. Missing paths have
+    no identity; never borrow a parent mount's identity for a missing child.
+    In particular, opening and closing a DB file would cancel SQLite locks.
+    """
+    key = str(path)
+    if memo is not None and key in memo:
+        return memo[key]
+    try:
+        stat = os.stat(os.path.realpath(os.path.expanduser(key)))
+        result = (stat.st_dev, stat.st_ino)
+    except (OSError, ValueError):
+        result = None
+    if memo is not None:
+        memo[key] = result
+    return result
+
+
+def _existing_ancestor(path: Path) -> Path:
+    """For a missing path, find the nearest ancestor with a filesystem ID."""
+    current = path
+    while _path_identity(current) is None and current.parent != current:
+        current = current.parent
+    return current
 
 
 def _same_tree(child: Path, parent: Path, memo: Optional[dict] = None) -> bool:
-    """True when *child* is *parent* or lies beneath it, however either is spelled.
-
-    Both arguments are ``resolve()``d paths from different sources (the
-    board DB, the environment, a candidate). An exact match answers at once.
-    Otherwise only pairs that agree once case / Unicode / firmlink spelling is
-    folded are re-compared by their kernel names, so unrelated rows (NAS
-    mounts, other projects) are never opened. A path the kernel cannot name
-    keeps its literal spelling: a missing path cannot physically contain or
-    sit inside an existing one under another name.
-    """
-    if child == parent or child.is_relative_to(parent):
-        return True
-    if not _loose_spelling(child).is_relative_to(_loose_spelling(parent)):
+    """Walk the existing child's ancestors; compare filesystem identities."""
+    target = _path_identity(parent, memo)
+    if target is None or _path_identity(child, memo) is None:
         return False
+    current = Path(os.path.realpath(os.path.expanduser(str(child))))
+    while True:
+        if _path_identity(current, memo) == target:
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
 
-    def canon(p: Path) -> Path:
-        key = str(p)
-        if memo is not None and key in memo:
-            return memo[key]
-        try:
-            got = _kernel_path(p) or p
-        except (OSError, ValueError):
-            got = p
-        if memo is not None:
-            memo[key] = got
-        return got
 
-    c, q = canon(child), canon(parent)
-    return c == q or c.is_relative_to(q)
+def _same_path(a: Path, b: Path, memo: Optional[dict] = None) -> bool:
+    """True only for two existing filesystem objects with identical identity."""
+    first, second = _path_identity(a, memo), _path_identity(b, memo)
+    return first is not None and first == second
+
+
+def _pin_missing_parts(path: Path) -> tuple[Optional[tuple[int, int]], tuple[str, ...]]:
+    """Pin-only identity: nearest existing ancestor ID and exact missing tail."""
+    ancestor = _existing_ancestor(path)
+    return _path_identity(ancestor), path.parts[len(ancestor.parts):]
+
+
+def _pin_tree_agrees(child: Path, parent: Path) -> bool:
+    """Pin-only containment: filesystem identity plus exact uncreated tail.
+
+    Never use this for scratch admission or ownership. Missing paths have no
+    identity there; only the pin resolver needs to agree before mkdir.
+    """
+    child_base, child_tail = _pin_missing_parts(child)
+    parent_base, parent_tail = _pin_missing_parts(parent)
+    if child_base is None or parent_base is None:
+        return False
+    if not parent_tail:
+        return _same_tree(_existing_ancestor(child), parent)
+    return child_base == parent_base and child_tail[:len(parent_tail)] == parent_tail
+
+
+def _pin_file_agrees(a: Path, b: Path) -> bool:
+    """Compare an uncreated DB pin by existing ancestor and exact missing tail.
+
+    This is a pin agreement check, never scratch admission or ownership: an
+    uncreated DB file has no filesystem identity until the first connection.
+    """
+    identity_a, tail_a = _pin_missing_parts(a)
+    identity_b, tail_b = _pin_missing_parts(b)
+    return identity_a is not None and identity_a == identity_b and tail_a == tail_b
+
+
+def _unknown_owner_may_claim(candidate: Path, stored: Path) -> bool:
+    """A missing stored path may only add a refusal, never admit deletion."""
+    import unicodedata
+
+    def fold(path: Path) -> str:
+        name = unicodedata.normalize("NFC", str(path)).casefold()
+        prefix = "/system/volumes/data"
+        if name.startswith(prefix + "/"):
+            name = name[len(prefix):]
+        return name.rstrip("/")
+
+    a, b = fold(candidate), fold(stored)
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
 def _scan_process_cwds() -> Optional[frozenset]:
@@ -8590,10 +8648,9 @@ def _scan_process_cwds() -> Optional[frozenset]:
     this process's own cwd, so a non-zero exit or an empty listing is a
     failed scan, never "nothing found"; callers must fail closed on None.
 
-    Names are kept exactly as lsof prints them -- the kernel's canonical
-    spelling -- and are not touched on disk: resolving ~200 cwds here would
-    sit outside the lsof timeout and could hang on a dead network mount.
-    :func:`_process_cwd_within` canonicalises the CANDIDATE instead.
+    Names are kept exactly as lsof prints them. The first candidate's probe
+    resolves every cwd ancestor under a single 30s deadline and caches the
+    result; later candidates get fresh bounded identity checks.
     """
     try:
         result = subprocess.run(
@@ -8629,13 +8686,37 @@ def process_cwd_snapshot_scope():
         _CWD_SNAPSHOT_SCOPE.reset(token)
 
 
-def _process_cwds() -> Optional[frozenset]:
+def _process_cwds() -> Optional[tuple[frozenset, tuple]]:
+    """Cache cwd ancestor identities as well as lsof output under one deadline."""
     slot = _CWD_SNAPSHOT_SCOPE.get()
-    if slot is None:
-        return _scan_process_cwds()
-    if not slot:
-        slot.append(_scan_process_cwds())
-    return slot[0]
+    if slot is not None and slot:
+        return slot[0]
+    try:
+        with _bounded_cwd_probe():
+            cwds = _scan_process_cwds()
+            snapshot = None
+            if cwds is not None:
+                known, unknown = set(), []
+                for cwd in cwds:
+                    if _path_identity(cwd) is None:
+                        unknown.append(cwd)
+                        continue
+                    current = Path(os.path.realpath(os.path.expanduser(str(cwd))))
+                    while True:
+                        identity = _path_identity(current)
+                        if identity is None:
+                            unknown.append(cwd)
+                            break
+                        known.add(identity)
+                        if current == current.parent:
+                            break
+                        current = current.parent
+                snapshot = (frozenset(known), tuple(unknown))
+    except (OSError, RuntimeError, ValueError):
+        snapshot = None
+    if slot is not None:
+        slot.append(snapshot)
+    return snapshot
 
 
 def _process_cwd_within(path: Path) -> bool:
@@ -8646,19 +8727,25 @@ def _process_cwd_within(path: Path) -> bool:
     exempting that broad enclosing path from ownership. A failed or timed-out
     cwd scan answers True (preserve the path).
     """
-    cwds = _process_cwds()
-    if cwds is None:
+    snapshot = _process_cwds()
+    if snapshot is None:
         return True
     try:
-        targets = {Path(path).resolve(strict=False)}
-        # lsof prints kernel spellings; match against the candidate's kernel
-        # spelling too (case / NFC-NFD / firmlink). Unnameable => fail closed.
-        canonical = _kernel_path(path)
+        # Candidate identity is separately bounded; it does not consume or
+        # consult the cached cwd scan's deadline after a slow deletion.
+        with _bounded_cwd_probe():
+            identity = _path_identity(path)
+            if identity is None:
+                return True
+            known, unknown = snapshot
+            if identity in known:
+                return True
+            for cwd in unknown:
+                if _unknown_owner_may_claim(path, cwd):
+                    return True
+            return False
     except (OSError, RuntimeError, ValueError):
         return True
-    if canonical is not None:
-        targets.add(canonical)
-    return any(cwd == t or cwd.is_relative_to(t) for cwd in cwds for t in targets)
 
 
 def _live_owners_of_path(
@@ -8702,17 +8789,11 @@ def _live_owners_of_path(
     except Exception:
         return ["<unresolvable-owner>"] if live_only else []
 
-    candidates: set = set()
     managed_root: Optional[Path] = None
     if is_managed:
-        # A nested checkout belongs to the enclosing card too; testing only
-        # resolved.name would miss <root>/<live-card>/repo.
         for parent in (resolved, *resolved.parents):
-            if _is_managed_scratch_path(parent):
-                if _TASK_DIR_NAME_RE.fullmatch(parent.name):
-                    candidates.add(parent.name)
-            else:
-                managed_root = parent  # the workspaces root itself
+            if not _is_managed_scratch_path(parent):
+                managed_root = parent
                 break
     # Stored rows and the candidate come from different sources and may spell
     # the same directory differently (case, NFC/NFD, firmlink); compare them
@@ -8746,8 +8827,14 @@ def _live_owners_of_path(
                 rows = c.execute(sql).fetchall()
             except Exception:
                 return ["<unreadable-task-table>"] if live_only else []
-            ids = candidates.intersection(row["id"] for row in rows)
+            ids = set()
             for row in rows:
+                # Convention ownership is a filesystem question, not a
+                # comparison of the candidate's spelling with a task id.
+                if (is_managed and managed_root is not None
+                        and _TASK_DIR_NAME_RE.fullmatch(row["id"])
+                        and _same_tree(resolved, managed_root / row["id"], spelling_memo)):
+                    ids.add(row["id"])
                 if not row["workspace_path"]:
                     continue
                 try:
@@ -8756,6 +8843,13 @@ def _live_owners_of_path(
                     ).expanduser().resolve(strict=False)
                 except Exception:
                     return ["<unresolvable-owner-path>"] if live_only else []
+                if _path_identity(stored, spelling_memo) is None:
+                    if (live_only and _task_has_live_run(c, row["id"])
+                            and _unknown_owner_may_claim(resolved, stored)):
+                        # A row may name the candidate despite an unstatable
+                        # path. Unknown identity can only prevent removal.
+                        return ["<unknown-owner-path>"]
+                    continue
                 stored_in = _same_tree(stored, resolved, spelling_memo)
                 path_in = _same_tree(resolved, stored, spelling_memo)
                 if not (stored_in or path_in):
@@ -8896,7 +8990,12 @@ def _durable_audit_log_path(target: Path, board: Optional[str]) -> Path:
         except OSError:
             continue
         try:
-            if _same_tree(resolved, target):
+            # The audit FILE may not exist yet; its existing parent still
+            # determines whether writing it would be inside the target.
+            current = _existing_ancestor(resolved)
+            if (_same_tree(current, target)
+                    or (_path_identity(target) is None
+                        and _unknown_owner_may_claim(resolved, target))):
                 continue  # would be destroyed by the deletion it records
         except (ValueError, OSError):
             pass
@@ -9041,6 +9140,8 @@ def safe_remove_workspace_dir(
         )
         return False
 
+    if not resolved.is_dir():
+        return False
     if not _is_managed_scratch_path(resolved):
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,
