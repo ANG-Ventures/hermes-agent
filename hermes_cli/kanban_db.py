@@ -6140,6 +6140,7 @@ def add_comment(
             {
                 "author": author,
                 "len": len(body),
+                "comment_id": cur.lastrowid,
                 # Non-secret fingerprint only, so the event log stays
                 # attributable even if a comment row is later pruned.
                 **({"session_ref": session_ref} if session_ref else {}),
@@ -15004,7 +15005,7 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
     consumes the intent; automatic crash reclaim cannot reuse it.
     """
     comments = conn.execute(
-        "SELECT id, body, created_at FROM task_comments "
+        "SELECT id, author, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY id DESC",
         (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
     ).fetchall()
@@ -15013,18 +15014,32 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
     )
     if pr_comment is None:
         return False
-    # add_comment writes one 'commented' event per comment in the same txn.
-    # The ordinal maps a comment to its event even for same-second writes.
-    offset = conn.execute(
-        "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
-        "AND created_at = ? AND id < ?",
-        (task_id, pr_comment["created_at"], pr_comment["id"]),
-    ).fetchone()[0]
+    # New writes carry the exact comment id. Historical events lack it; match
+    # their author/length within the timestamp rather than counting unrelated
+    # inline audit comments (which do not emit 'commented' events).
     event = conn.execute(
-        "SELECT id FROM task_events WHERE task_id = ? "
-        "AND kind = 'commented' AND created_at = ? ORDER BY id LIMIT 1 OFFSET ?",
-        (task_id, pr_comment["created_at"], offset),
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
+        "AND json_extract(payload, '$.comment_id') = ? LIMIT 1",
+        (task_id, pr_comment["id"]),
     ).fetchone()
+    if event is None:
+        offset = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
+            "AND created_at = ? AND author = ? AND length(body) = ? AND id < ? "
+            "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = task_comments.task_id "
+            "AND e.kind = 'commented' AND json_extract(e.payload, '$.comment_id') = task_comments.id)",
+            (task_id, pr_comment["created_at"], pr_comment["author"],
+             len(pr_comment["body"]), pr_comment["id"]),
+        ).fetchone()[0]
+        event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
+            "AND created_at = ? AND json_extract(payload, '$.author') = ? "
+            "AND json_extract(payload, '$.len') = ? "
+            "AND json_extract(payload, '$.comment_id') IS NULL "
+            "ORDER BY id LIMIT 1 OFFSET ?",
+            (task_id, pr_comment["created_at"], pr_comment["author"],
+             len(pr_comment["body"]), offset),
+        ).fetchone()
     if event is None:
         return False  # Imported comment without an event: fail closed.
     pr_event_id = int(event["id"])
@@ -15047,7 +15062,7 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
         "WHERE d.task_id = ? AND d.kind = 'dependency_wait' AND d.id > ? "
         "AND json_extract(d.payload, '$.kind') = 'dependency' "
         "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = d.task_id "
-        "AND s.kind = 'spawned' AND s.id > p.id) LIMIT 1",
+        "AND s.kind = 'spawned' AND s.id > d.id) LIMIT 1",
         (task_id, pr_event_id),
     ).fetchone() is not None
 

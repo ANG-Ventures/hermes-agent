@@ -3635,6 +3635,93 @@ def test_requeue_intent_consumed_after_dispatch_and_crash(kanban_home, all_assig
         assert task_id not in spawned
 
 
+def test_ready_requeue_after_inline_triage_comment_resumes_pr(kanban_home, all_assignees_spawnable, monkeypatch):
+    """An inline audit comment cannot shift the PR comment's causal event."""
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="triage PR", assignee="alice")
+        assert kb.claim_task(conn, task_id)
+        assert kb.block_task(conn, task_id, reason="ruling one", kind="needs_input")
+        assert kb.unblock_task(conn, task_id)
+        assert kb.claim_task(conn, task_id)
+        assert kb.block_task(conn, task_id, reason="ruling two", kind="needs_input")
+        assert kb.triage_resolve_task(conn, task_id, to="todo", reason="resume", actor="qa") == (True, None)
+        kb.add_comment(conn, task_id, "qa", "https://github.com/o/r/pull/9")
+        assert kb.requeue_task(conn, task_id, actor="qa", reason="continue PR 9") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 99999999))
+        assert task_id in spawned
+
+
+def test_dependency_intent_not_reused_after_second_automatic_promotion(kanban_home, all_assignees_spawnable, monkeypatch):
+    from plugins.kanban.dashboard import plugin_api
+
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="qa", reason="first parent rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume after parent", kind="dependency")
+        assert kb.complete_task(conn, parent)
+        first = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (first.append(task.id) or 99999999))
+        assert child in first
+        assert plugin_api._set_status_direct(conn, parent, "todo")
+        assert kb.recompute_ready(conn) >= 1
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.check_respawn_guard(conn, child) == "active_pr"
+        second = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (second.append(task.id) or 99999999))
+        assert child not in second
+
+
+def test_inline_same_author_and_length_cannot_impersonate_pr_event(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="audit", assignee="alice")
+        pr = "https://github.com/o/r/pull/9"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "alice", "x" * len(pr), now),
+        )
+        conn.commit()
+        kb.add_comment(conn, task_id, "alice", pr)
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="resume") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/8")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_legacy_pr_event_with_inline_comment_still_requeues(kanban_home, monkeypatch):
+    """Existing boards have commented events without a comment_id payload."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy PR", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "audit", "old inline note", now),
+        )
+        conn.commit()
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/9")
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+            "WHERE task_id=? AND kind='commented'", (task_id,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
 def test_pr_intent_has_one_event_id_ordering_seam():
     """PR override must not regress to second-resolution timestamp ordering."""
     import inspect
@@ -3643,7 +3730,7 @@ def test_pr_intent_has_one_event_id_ordering_seam():
     assert guard.count("_unused_operator_intent_after_pr(conn, task_id)") == 1
     assert "newest_pr_at" not in guard and "requeued_after" not in guard[guard.index("# 4. Recent GitHub PR comments."):]
     assert "i.id > ?" in intent and "s.id > i.id" in intent
-    assert "d.id > ?" in intent and "s.id > p.id" in intent
+    assert "d.id > ?" in intent and "s.id > d.id" in intent
     assert "i.created_at >" not in intent and "s.created_at >" not in intent
 
 
