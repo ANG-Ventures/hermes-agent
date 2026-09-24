@@ -12350,8 +12350,8 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 # Event kinds that mean "an OPERATOR deliberately asked for this task to run
-# again". Any of these at/after the newest PR comment overrides the
-# ``active_pr`` guard: the open PR is the fix-round target, not duplicate work.
+# again". An unused event strictly AFTER the newest PR comment overrides
+# ``active_pr`` for one spawn: the open PR is the fix-round target.
 # This is the TOTAL set of operator requeue verbs -- every CLI verb that moves a
 # task back toward ``ready`` by human intent must appear here, and
 # ``tests/hermes_cli/test_kanban_db.py::test_operator_requeue_verbs_all_override_active_pr``
@@ -15248,14 +15248,10 @@ def check_respawn_guard(
     # 4. Recent GitHub PR comments. Guard while ANY referenced PR is open,
     #    unparseable, unqueryable, or beyond this tick's query budget. The
     #    duplicate-PR risk is gone only when ALL referenced PRs are closed.
-    #    Exception: an explicit requeue at/after the newest PR comment means
-    #    the open PR is the fix-round target, not duplicate work. Honor it
-    #    before querying PR states (2026-09-07, clanker-voice-backlog
-    #    t_800b8189: both unblock and changes_requested stranded PR #315).
-    #    Unlike rule 3, this is not gated behind a completed run, so only
-    #    operator-intent events count (including manual reclaim). Automatic
-    #    reclaim after a worker dies with an open PR is the founding case;
-    #    automatic dependency promotion and generic status events also defer.
+    #    Exception: a fresh, unconsumed operator requeue AFTER the newest PR
+    #    comment means the open PR is the fix-round target, not duplicate
+    #    work. Worker dependency_wait followed by promotion grants the same
+    #    one-shot continuation. Both are consumed by the next spawn.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     pr_urls: list[str] = []
     for c in conn.execute(
