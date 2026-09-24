@@ -14,10 +14,10 @@ name: CI
 # Do not add ``secrets: inherit`` or GitHub App credentials here. Trusted
 # main-only automation uses protected environments in its own workflows.
 #
-# RUNNERS (fork, 2026-09-16). Jobs here say
-# ``runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}``,
-# so the repo variable ``CI_RUNNER_LABELS`` moves the whole matrix between
-# GitHub-hosted and the ACE-AI self-hosted pool in one edit. The pool runs
+# RUNNERS (fork, 2026-09-16). Heavy portable jobs use
+# ``vars.CI_RUNNER_LABELS`` for self-hosted/hosted evacuation; cheap required
+# gates (sast, secret_scan, review-label, supply-chain pattern scan, lint)
+# use literal ``ubuntu-latest`` so a pool outage cannot strand those checks. The pool runs
 # ephemeral containers with ``--security-opt no-new-privileges`` and no docker
 # socket, which is why a handful of jobs are pinned to ``ubuntu-latest``
 # instead and carry a comment naming the reason at their ``runs-on``:
@@ -51,8 +51,8 @@ name: CI
 #     aggregator queued 17+ minutes behind test slices after they finished;
 #     these GitHub API/artifact and local Python jobs need no LAN resources.
 #
-# ``CI_RUNNER_LABELS`` rollback is unchanged: point it at ubuntu-latest and
-# every job, matrix slices included, goes hosted.
+# ``CI_RUNNER_LABELS`` rollback still sends the heavy variable-routed jobs,
+# including the matrix slices, to ubuntu-latest. Literal hosted gates stay hosted.
 
 on:
   pull_request:

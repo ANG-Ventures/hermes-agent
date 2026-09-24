@@ -215,6 +215,53 @@ def configured_min_eligible() -> int:
         return 1
 
 
+def configured_pool_spawns_per_eligible() -> int:
+    """Per-tick spawns per eligible sub; zero restores unlimited admission."""
+    from hermes_cli.config import load_config
+    try:
+        value = load_config().get("kanban", {}).get("pool_spawns_per_eligible", 2)
+        if type(value) is int and value >= 0:
+            return value
+    except (TypeError, AttributeError):
+        pass
+    return 2
+
+
+def pool_budget_eligible(provider, probes: dict, cache: dict, pool_urls: dict,
+                         *, box_health: bool = True):
+    """Known capacity of the serving pool; None means unknown (fail open).
+
+    Pinned routes spend one subscription, not the relay's aggregate count.
+    Only a valid relay probe with a numeric eligible_count budgets pooled
+    routes. Explicit provider probes take precedence as in capped_provider.
+    """
+    route = pool_route(provider)
+    if route is None:
+        return None
+    if route[1] is not None:
+        relay_url = (pool_urls or {}).get(route[0])
+        relay = _fetch(relay_url, cache, provider) if _valid_url(relay_url) else None
+        if relay is not None:
+            return 1
+        if box_health:
+            box_url = box_health_url(route[1])
+            if box_url is not None and _fetch(box_url, cache, provider) is not None:
+                return 1
+        return None  # Neither health signal was reachable: fail open.
+    url = (probes or {}).get(provider)
+    if url is None:
+        url = (pool_urls or {}).get(route[0])
+    if not _valid_url(url):
+        return None
+    data = _fetch(url, cache, provider)
+    if data is None:
+        return None
+    eligible = data.get("eligible_count")
+    if type(eligible) not in (int, float) or not (0 <= eligible < float("inf")):
+        return None
+    return int(eligible)
+
+
 def effective_provider(task) -> str | None:
     _, provider = model_override(task)
     if provider:
@@ -334,6 +381,7 @@ def capped_provider(
 def available_profile_fallback(
     task, probes: dict, cache: dict, *, min_eligible: int = 1,
     pool_urls: dict | None = None, skip_pools=frozenset(), box_health: bool = True,
+    budget_available=None,
 ) -> tuple[str, str] | None:
     """Pick a healthy configured profile rung without changing the task row.
 
@@ -362,6 +410,8 @@ def available_profile_fallback(
         if provider == effective_provider(task):
             continue
         if skip_pools and pool_key(provider) in skip_pools:
+            continue
+        if budget_available is not None and not budget_available(provider):
             continue
         candidate = SimpleNamespace(
             model_override=model, provider_override=provider, assignee=task.assignee,

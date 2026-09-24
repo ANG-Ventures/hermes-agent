@@ -2793,7 +2793,9 @@ DEFAULT_CONFIG = {
     # command prompts the user for consent; subsequent runs reuse the
     # stored approval from ~/.hermes/shell-hooks-allowlist.json.
     # See `website/docs/user-guide/features/hooks.md` for schema + examples.
-    "hooks": {},
+    # missing_hook_policy: what a hook whose script (or a tracked sibling) is ABSENT does —
+    # restore_then_fail_closed | fail_closed | fail_open_and_page.
+    "hooks": {"missing_hook_policy": "restore_then_fail_closed"},
 
     # Auto-accept shell-hook registrations without a TTY prompt.  Also
     # toggleable per-invocation via --accept-hooks or HERMES_ACCEPT_HOOKS=1.
@@ -3051,6 +3053,11 @@ DEFAULT_CONFIG = {
         # interactive responsiveness, not a throughput cap: an otherwise idle
         # machine still gives workers the whole CPU. Set "normal" to opt out
         # and leave workers at the dispatcher's inherited priority.
+        # On macOS "background" also clamps the worker tree to utility QoS
+        # (exec-form `taskpolicy -c utility`: lower CPU class AND disk I/O
+        # tier than an Interactive gateway); "idle" uses darwin background
+        # (`taskpolicy -b`: E-cores only, heavy I/O throttle — the gateway
+        # always wins, but worker throughput drops sharply under load).
         # (2026-09-20: a worker's runaway busy-loops drove the host to load
         # 538/32 cores and starved the resident gateway's event loop into two
         # watchdog hard-exits and a 12-minute boot.)
@@ -3115,6 +3122,9 @@ DEFAULT_CONFIG = {
         # For configured provider_health_probes, prefer a healthy fallback
         # if fewer than this many pool seats can serve the selected model.
         "provider_health_min_eligible": 1,
+        # Per-tick pool admission budget: eligible relay subs * this value.
+        # Pinned apx/bpx lanes each spend one sub's budget. 0 = unlimited.
+        "pool_spawns_per_eligible": 2,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create

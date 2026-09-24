@@ -7294,32 +7294,6 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 
-def _real_pid_started_in_claim(pid: int, claimed_at: float, spawned_at: float) -> bool:
-    """A live PID is its original owner only if it started in the claim window."""
-    started = None
-    try:
-        import psutil
-        started = psutil.Process(pid).create_time()
-    except Exception:  # optional psutil, or process vanished during the probe
-        pass
-    if started is None and os.name == "posix":
-        try:
-            from datetime import datetime
-            proc = subprocess.run(
-                ["ps", "-o", "lstart=", "-p", str(pid)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, timeout=1,
-                env={**os.environ, "LC_ALL": "C"}, check=False,
-            )
-            if proc.returncode == 0:
-                started = datetime.strptime(proc.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass
-    # Seconds-resolution event stamps can straddle the OS process timestamp.
-    return started is not None and claimed_at - 2 <= started <= spawned_at + 2
-
-
-_pid_started_in_claim = _real_pid_started_in_claim
 
 
 def _prior_worker_still_alive(
@@ -7329,16 +7303,20 @@ def _prior_worker_still_alive(
 
     A release outcome is not a death certificate: operator and worker calls
     can write identical outcomes, and a newer synthetic row can mask an older
-    owner. Inspect ended runs at both claim doors, before a second spawn.
-    A claimed-but-never-spawned run has no PID to probe here; its active claim
-    remains protected by the reclaim/reconcile guards.
+    owner. Inspect EVERY prior run at both claim doors, before a second
+    spawn -- ended or still open. An open run on a claimable card is a leaked
+    ``current_run_id`` (claim_task's invariant recovery closes it below); its
+    owner is exactly as able to be alive as an ended run's, so the ended_at
+    filter must not hide it. A claimed-but-never-spawned run has no PID to
+    probe here; its active claim remains protected by the reclaim/reconcile
+    guards.
     """
     # An outcome cannot certify exit: operators can write the same outcomes as
     # worker tools, and a newer synthetic row can hide an older live owner.
     runs = conn.execute(
-        "SELECT r.id, r.outcome, r.ended_at, t.max_runtime_seconds "
+        "SELECT r.id, r.outcome, r.ended_at, r.started_at, t.max_runtime_seconds "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
-        "WHERE r.task_id = ? AND r.ended_at IS NOT NULL ORDER BY r.id DESC",
+        "WHERE r.task_id = ? ORDER BY r.id DESC",
         (task_id,),
     ).fetchall()
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7350,7 +7328,7 @@ def _prior_worker_still_alive(
 
 
 def _spawned_owner_alive(conn, task_id, row, host_prefix):
-    """Probe one ended run's spawned owner using its durable event evidence."""
+    """Probe one prior run's spawned owner(s) using durable event evidence."""
 
     # _end_run clears task_runs.worker_pid, so the durable claimed/spawned
     # events are the record. Both claim doors emit ``claimed`` with the lock
@@ -7361,17 +7339,25 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
     # event of that run that recorded the lock (reclaimed.prev_lock, ...).
     # Explicitly bounded workers cannot still own a run this long after its
     # release, even when the PID has since been recycled.
-    if (row["max_runtime_seconds"] is not None
+    if (row["max_runtime_seconds"] is not None and row["ended_at"] is not None
             and time.time() > row["ended_at"] + row["max_runtime_seconds"]
             + RECLAIM_DEFER_GRACE_SECONDS):
         return None
     run_events = conn.execute(
-        "SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? "
-        "AND run_id = ? ORDER BY (kind = 'claimed') DESC, id ASC",
+        "SELECT id, kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND run_id = ? "
+        "ORDER BY (kind = 'claimed') DESC, id ASC",
         (task_id, row["id"]),
     ).fetchall()
     if not run_events:
         return None
+    # Lower edge of the run's causal window: a worker cannot exist before its
+    # claim committed. Legacy rows without a ``claimed`` event fall back to
+    # the run's started_at (stamped in the same claim txn).
+    claimed_at = next(
+        (ev["created_at"] for ev in run_events if ev["kind"] == "claimed"),
+        row["started_at"],
+    )
     lock = ""
     for ev in run_events:
         try:
@@ -7393,27 +7379,113 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
         "SELECT MIN(id) FROM task_events WHERE task_id = ? "
         "AND kind = 'claimed' AND id > ?", (task_id, boundary_id),
     ).fetchone()[0]
-    spawned = conn.execute(
-        "SELECT id, run_id, payload, created_at FROM task_events WHERE task_id = ? "
-        "AND kind = 'spawned' AND id >= ? "
+    # Probe EVERY spawn in the interval, not just the newest: a run stamped
+    # twice leaves an older PID that a later dead one must not vouch for.
+    # _set_worker_pid is the only worker_pid writer and always appends this
+    # event in the same txn, so an open run's row pid is covered here too.
+    spawns = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'spawned' AND id >= ? "
         "AND (run_id = ? OR (run_id IS NULL AND (? IS NULL OR id < ?))) "
-        "ORDER BY id DESC LIMIT 1",
+        "ORDER BY id DESC",
         (task_id, boundary_id, row["id"], next_claim, next_claim),
-    ).fetchone()
-    if spawned is None:
-        return None
-    try:
-        pid = int(json.loads(spawned["payload"] or "{}")["pid"])
-    except (TypeError, ValueError, KeyError):
-        return None
-    claimed_at = min(ev["created_at"] for ev in run_events)
-    if _pid_alive(pid) and _pid_started_in_claim(pid, claimed_at, spawned["created_at"]):
+    ).fetchall()
+    candidates = []
+    for spawned in spawns:
+        try:
+            pid = int(json.loads(spawned["payload"] or "{}")["pid"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        candidates.append((pid, spawned["run_id"] is None,
+                           spawned["created_at"]))
+    for pid, late, spawned_at in candidates:
+        if not _pid_alive(pid):
+            continue
+        # Liveness is not identity: the PID may now belong to an unrelated
+        # process (recycled PID). The owner is the process at this PID only
+        # if it was created inside this run's causal window.
+        identity = _owner_identity(pid, claimed_at, spawned_at)
+        if identity == "recycled":
+            continue
         return {"prev_pid": pid, "prev_lock": lock,
                 "prev_run_id": row["id"],
                 "prev_outcome": row["outcome"],
-                "late_spawn": spawned["run_id"] is None,
+                "prev_run_open": row["ended_at"] is None,
+                "late_spawn": late,
+                "owner_identity": identity,
                 "needs_attention": True}
     return None
+
+
+# Causal-window tolerances for owner identity, in seconds. Event timestamps
+# are integer seconds (floored), so allow 1 s before the claim and 2 s after
+# the spawned event. The window is deliberately ONE-SIDED around the spawn:
+# ``_set_worker_pid`` writes the ``spawned`` event inside write_txn AFTER
+# Popen, so under DB lock contention the event can lag the worker's real
+# creation by up to the busy timeout (measured -7.5 s / -19.6 s on genuine
+# workers). A symmetric +/-N s window around ``spawned_at`` would call those
+# genuine workers dead and let a second worker onto the card.
+_OWNER_CREATE_LEAD_SECONDS = 1.0
+_OWNER_CREATE_LAG_SECONDS = 2.0
+
+
+def _pid_create_time(pid: int) -> Optional[float]:
+    """Wall-clock epoch creation time of ``pid``, or None if unreadable."""
+    try:
+        import psutil
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:  # optional psutil, or process vanished during the probe
+        pass
+    if os.name == "posix":
+        try:
+            from datetime import datetime
+            proc = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(int(pid))],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, timeout=1,
+                env={**os.environ, "LC_ALL": "C"}, check=False,
+            )
+            if proc.returncode == 0:
+                return datetime.strptime(
+                    proc.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def _real_pid_started_in_claim(pid, claimed_at, spawned_at) -> Optional[bool]:
+    """Whether a live ``pid`` was created inside the run's causal window.
+
+    ``True``: created inside ``[claimed_at - 1 s, spawned_at + 2 s]``.
+    ``False``: created outside it -- provably not the recorded worker.
+    ``None``: create time unreadable. A missing bound is simply not applied,
+    so missing evidence never proves a PID recycled.
+    """
+    created = _pid_create_time(pid)
+    if created is None:
+        return None
+    if claimed_at is not None and created < float(claimed_at) - _OWNER_CREATE_LEAD_SECONDS:
+        return False
+    if spawned_at is not None and created > float(spawned_at) + _OWNER_CREATE_LAG_SECONDS:
+        return False
+    return True
+
+
+# Seam: tests with synthetic PIDs substitute a constant verdict here.
+_pid_started_in_claim = _real_pid_started_in_claim
+
+
+def _owner_identity(pid, claimed_at, spawned_at) -> str:
+    """Classify a LIVE pid against the run that recorded it.
+
+    Returns ``"verified"``, ``"recycled"`` (provably not the recorded
+    worker), or ``"unverified"`` (create time unreadable -- fail CLOSED, the
+    caller treats it as the owner).
+    """
+    started = _pid_started_in_claim(pid, claimed_at, spawned_at)
+    if started is None:
+        return "unverified"
+    return "verified" if started else "recycled"
 
 
 @_home_session_guarded("claim")
@@ -17311,13 +17383,49 @@ def _dispatch_once_locked(
     from hermes_cli.kanban_provider_health import (
         available_profile_fallback, capped_provider, configured_min_eligible,
         configured_box_health, configured_pool_health_urls, configured_probes,
-        effective_provider, pool_key,
+        configured_pool_spawns_per_eligible, effective_provider, pool_budget_eligible,
+        pool_key,
     )
     health_probes = configured_probes()
     min_eligible = configured_min_eligible()
     pool_urls = configured_pool_health_urls()
     box_health = configured_box_health()
-    health_cache: dict = {}
+    pool_spawns_per_eligible = configured_pool_spawns_per_eligible()
+    # The relay pools are shared by every board, so the per-tick admission
+    # budget must be too. The gateway tick calls dispatch_once once per board
+    # with ONE ``budget_cache``; keep the admitted-per-pool counter (and the
+    # health probe results it is measured against) in that tick-scoped dict so
+    # board N+1 sees board N's spawns. Callers without cross-board state (CLI,
+    # standalone daemon) pass no cache and get a fresh per-call map.
+    if budget_cache is not None:
+        health_cache: dict = budget_cache.setdefault(("_provider_health_cache",), {})
+        admitted_this_tick: dict[str, int] = budget_cache.setdefault(
+            ("_pool_admitted_this_tick",), {},
+        )
+    else:
+        health_cache = {}
+        admitted_this_tick = {}
+    admitted_routes: dict[str, str | None] = {}
+
+    def pool_budget(provider):
+        pool = pool_key(provider)
+        if pool is None or pool_spawns_per_eligible == 0:
+            return None
+        eligible = pool_budget_eligible(provider, health_probes, health_cache, pool_urls,
+                                        box_health=box_health)
+        if eligible is None:
+            return None  # Unknown probe: fail open.
+        admitted = admitted_this_tick.get(pool, 0)
+        if admitted < eligible * pool_spawns_per_eligible:
+            return None
+        return {"reason": "pool_budget", "provider": provider,
+                "pool": pool, "eligible": eligible, "admitted": admitted}
+
+    def charge_pool(task_id):
+        pool = admitted_routes.pop(task_id, None)
+        if pool is not None:
+            admitted_this_tick[pool] = admitted_this_tick.get(pool, 0) + 1
+
     circuits: dict[str, int] = {}
     try:
         rl_trip = _resolve_rate_limit_trip()
@@ -17354,11 +17462,15 @@ def _dispatch_once_locked(
                 task, health_probes, health_cache, min_eligible=min_eligible,
                 pool_urls=pool_urls, box_health=box_health,
             )
+            if payload is None:
+                payload = pool_budget(route_provider)
         if payload is None:
+            admitted_routes[task_id] = circuit_pool
             return False, None
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
             pool_urls=pool_urls, skip_pools=frozenset(circuits), box_health=box_health,
+            budget_available=lambda provider: pool_budget(provider) is None,
         )
         if fallback is not None and fallback_flagship_banned(task_id, fallback[0]):
             # The flagship gate covers the post-fallback route too: a capped
@@ -17373,6 +17485,7 @@ def _dispatch_once_locked(
             )
             fallback = None
         if fallback is not None:
+            admitted_routes[task_id] = pool_key(fallback[1])
             return False, (fallback, payload)
         result.respawn_guarded.append((task_id, payload["reason"]))
         if not dry_run:
@@ -17683,6 +17796,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            charge_pool(row["id"])
             spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
@@ -17802,6 +17916,7 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = route_source
+            charge_pool(claimed.id)
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
@@ -17887,6 +18002,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            charge_pool(row["id"])
             spawned += 1
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
@@ -17992,6 +18108,7 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = review_route_source
+            charge_pool(claimed.id)
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
@@ -18079,7 +18196,44 @@ def worker_cpu_priority_config(
     mode = str(raw or "").strip().lower()
     if mode == "normal":
         return ("normal", 0)
+    if mode == "idle":
+        return ("idle", WORKER_BACKGROUND_NICE)
     return ("background", WORKER_BACKGROUND_NICE)
+
+
+# macOS: nice(2) only reorders threads INSIDE one scheduling class. Darwin's
+# real levers are the task QoS clamp and the darwin-BG flag, which also set
+# the disk I/O tier. Both are inherited across fork/exec. The QoS clamp can
+# only be applied at spawn time (posix_spawnattr_set_qos_clamp_np) — there is
+# no setpriority() form — so it rides as an exec-form ``taskpolicy`` prefix:
+# taskpolicy execs the worker in place (same pid, same argv once running).
+#
+# Measured on the M3 Ultra, 2026-09-24 (16 spinners x 5s, 61% host idle):
+#   unclamped            15.9 cores   iotier 0 (IMPORTANT)
+#   -c utility            3.8 cores   iotier 1 (STANDARD), P+E cores
+#   -b (darwin BG)        0.1 cores   iotier 2, E-cores only
+# "background" = utility clamp: batch work sits strictly below an
+# Interactive gateway without collapsing worker throughput. "idle" = darwin
+# BG for hosts where the gateway must win at any cost to worker speed.
+WORKER_DARWIN_TASKPOLICY = "/usr/sbin/taskpolicy"
+_WORKER_DARWIN_POLICY_ARGS = {
+    "background": ("-c", "utility"),
+    "idle": ("-b",),
+}
+
+
+def worker_darwin_qos_prefix(mode: str) -> "list[str]":
+    """Return the exec-form ``taskpolicy`` argv prefix for *mode*, or ``[]``.
+
+    Empty off macOS, for ``normal``, and when ``taskpolicy`` is missing — a
+    missing wrapper must degrade to nice-only, never refuse the spawn.
+    """
+    args = _WORKER_DARWIN_POLICY_ARGS.get(mode)
+    if not args or sys.platform != "darwin":
+        return []
+    if not os.access(WORKER_DARWIN_TASKPOLICY, os.X_OK):
+        return []
+    return [WORKER_DARWIN_TASKPOLICY, *args]
 
 
 def _build_worker_priority_preexec(nice_value: int):
@@ -18958,16 +19112,22 @@ def _default_spawn(
     # the seam the 2026-09-20 load-538 incident escaped through.
     cpu_priority_mode, cpu_nice = worker_cpu_priority_config()
     priority_preexec = _build_worker_priority_preexec(cpu_nice)
+    # macOS: nice alone leaves the worker in the gateway's own QoS class and
+    # I/O tier, so worker pytest/git storms still starve the resident gateway
+    # (t_14c130aa). Clamp QoS via exec-form taskpolicy; it keeps the pid.
+    darwin_prefix = worker_darwin_qos_prefix(cpu_priority_mode)
+    spawn_cmd = [*darwin_prefix, *cmd]
     _log.info(
-        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s",
+        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s darwin_policy=%s",
         task.id,
         profile_arg,
         cpu_priority_mode,
         cpu_nice,
+        " ".join(darwin_prefix[1:]) or "-",
     )
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
+            spawn_cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
