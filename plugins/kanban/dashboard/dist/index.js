@@ -277,6 +277,7 @@
   // can inspect any board without shifting the CLI's active board out
   // from under a terminal they left open.
   const LS_BOARD_KEY = "hermes.kanban.selectedBoard";
+  const viewerSession = new URLSearchParams(window.location.search).get("session") || "";
 
   function readSelectedBoard() {
     try {
@@ -625,6 +626,7 @@
 
     const [tenantFilter, setTenantFilter] = useState("");
     const [assigneeFilter, setAssigneeFilter] = useState("");
+    const [homeFilter, setHomeFilter] = useState(viewerSession ? "this" : "all");
     const [includeArchived, setIncludeArchived] = useState(false);
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
@@ -669,6 +671,7 @@
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
+      if (viewerSession) qs.set("session", viewerSession);
       const url = qs.toString() ? `${API}/board?${qs}` : `${API}/board`;
       return SDK.fetchJSON(withBoard(url, board))
         .then(function (data) {
@@ -801,6 +804,11 @@
       const filterTask = function (t) {
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
+        // Home membership is resolved server-side (kanban_db.home_ids lineage),
+        // so a rotated gateway session still sees its own cards.
+        if (homeFilter === "this" && !t.in_viewer_home) return false;
+        if (homeFilter === "unstamped" && t.session_id) return false;
+        if (homeFilter === "worker" && !t.worker_created) return false;
         if (q) {
           const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
@@ -812,7 +820,7 @@
           return Object.assign({}, col, { tasks: col.tasks.filter(filterTask) });
         }),
       });
-    }, [boardData, tenantFilter, assigneeFilter, search]);
+    }, [boardData, tenantFilter, assigneeFilter, homeFilter, search]);
 
     // --- actions ------------------------------------------------------------
     // Performs the actual move (optimistic UI + PATCH) once any required
@@ -1291,6 +1299,7 @@
           board: boardData,
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
+          homeFilter, setHomeFilter, viewerSession,
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
           search, setSearch,
@@ -2457,6 +2466,23 @@
           }),
         ),
       ),
+      h("div", { className: "flex flex-col gap-1" },
+        h(Label, { className: "text-xs text-muted-foreground" }, "Home session"),
+        h("div", { className: "hermes-kanban-home-facet", role: "group", "aria-label": "Home session filter" },
+          [["this", "This session"], ["unstamped", "Unstamped"],
+           ["worker", "Worker-created"], ["all", "All"]].map(function (item) {
+            return h("button", {
+              key: item[0], type: "button",
+              className: cn("hermes-kanban-home-chip", props.homeFilter === item[0] && "hermes-kanban-home-chip--active"),
+              "aria-pressed": props.homeFilter === item[0],
+              disabled: item[0] === "this" && !props.viewerSession,
+              title: item[0] === "worker" ? "Cards a dispatched Kanban worker created (worker-policy provenance on the create event)." :
+                item[0] === "this" && !props.viewerSession ? "Open a /kanban?session=<id> link to filter this session." : undefined,
+              onClick: function () { props.setHomeFilter(item[0]); },
+            }, item[1]);
+          }),
+        ),
+      ),
       h("label", { className: "flex items-center gap-2 text-xs",
                    title: "Include archived tasks in the board view. Archived tasks are hidden by default." },
         h(Checkbox, {
@@ -2489,10 +2515,11 @@
           props.setSearch("");
           props.setTenantFilter("");
           props.setAssigneeFilter("");
+          props.setHomeFilter("all");
           props.setIncludeArchived(false);
         },
         size: "sm",
-        title: "Clear all active filters (search, tenant, assignee, archived).",
+        title: "Clear all active filters (search, tenant, assignee, home session, archived).",
       }, tx(t, "clearFilters", "Clear filters")),
     );
   }
@@ -3136,6 +3163,10 @@
                               ? tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile.")
                               : "No profile assigned." },
                   tx(i18n, "unassigned", "unassigned")),
+            t.home_channel
+              ? h("span", { className: "hermes-kanban-home-channel",
+                            title: `Home channel: ${t.home_channel}` }, t.home_channel)
+              : null,
             t.comment_count > 0
               ? h("span", { className: "hermes-kanban-count",
                             title: `${t.comment_count} comment${t.comment_count === 1 ? "" : "s"} on this task` }, "💬 ", t.comment_count)

@@ -903,6 +903,12 @@ class GatewaySlashCommandsMixin:
             )
             invoking_session_id = None
 
+        if action == "dashboard":
+            from gateway.kanban_dashboard_link import dashboard_link
+
+            link = dashboard_link(invoking_session_id)
+            return link or "Dashboard link unavailable: configure dashboard.public_url."
+
         try:
             output = await asyncio.to_thread(
                 run_slash, text, session_id=invoking_session_id
