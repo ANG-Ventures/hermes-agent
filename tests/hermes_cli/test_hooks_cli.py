@@ -235,12 +235,7 @@ def test_print_run_result_shows_decision_for_error_and_timeout():
 
 
 def test_hooks_test_distinguishes_fail_closed_from_fail_open(tmp_path):
-    """`hermes hooks test` on a missing command shows the dispatcher's decision (#115968).
-
-    Drives the real CLI subcommand: a fail_closed hook whose command does not exist
-    must print the block decision, while the fail-open twin prints the "contributed
-    nothing" line — the two must not render identically.
-    """
+    """The diagnostic labels an unrecoverable hook as infrastructure, never pages."""
     cfg = {
         "hooks": {
             "pre_tool_call": [
@@ -251,7 +246,9 @@ def test_hooks_test_distinguishes_fail_closed_from_fail_open(tmp_path):
         },
         "hooks_auto_accept": True,
     }
-    with patch("hermes_cli.config.load_config", return_value=cfg):
+    with patch("hermes_cli.config.load_config", return_value=cfg), patch.object(
+        shell_hooks, "_page_missing_hook", side_effect=AssertionError("diagnostic paged")
+    ):
         out = _run(SimpleNamespace(
             hooks_action="test", event="pre_tool_call",
             for_tool="terminal", payload_file=None,
@@ -259,7 +256,6 @@ def test_hooks_test_distinguishes_fail_closed_from_fail_open(tmp_path):
 
     closed, open_ = out.split("/nonexistent/hook-open.sh", 1)
     assert "✗ error:" in closed and "✗ error:" in open_
-    assert '"action": "block"' in closed
-    assert "failed closed" in closed
-    assert '"action": "block"' not in open_
-    assert "contributed nothing" in open_
+    assert "infrastructure failure" in closed and "infrastructure failure" in open_
+    assert '"action": "block"' in closed and '"action": "block"' in open_
+    assert "not a policy verdict" in closed and "not a policy verdict" in open_

@@ -1692,7 +1692,7 @@ DEFAULT_CONFIG = {
     # ...) -> list of {matcher, command, timeout}. First run of a new command prompts for consent;
     # approvals persist in ~/.hermes/shell-hooks-allowlist.json. Schema + examples:
     # website/docs/user-guide/features/hooks.md.
-    "hooks": {},
+    "hooks": {"missing_hook_policy": "restore_then_fail_closed"},
     # Auto-accept shell-hook registrations without a TTY prompt (also --accept-hooks or
     # HERMES_ACCEPT_HOOKS=1). Gateway/cron/non-interactive runs need one of these to pick up
     # newly-added hooks.

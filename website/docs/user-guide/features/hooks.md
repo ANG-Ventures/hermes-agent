@@ -1682,6 +1682,7 @@ Shell hooks are registered by calling `agent.shell_hooks.register_from_config(cf
 
 ```yaml
 hooks:
+  missing_hook_policy: restore_then_fail_closed # Default; fail_open_and_page is explicit opt-in
   <event_name>:                  # Must be in VALID_HOOKS
     - matcher: "<regex>"         # Optional; used for pre/post_tool_call only
       command: "<shell command>" # Required; runs via shlex.split, shell=False
@@ -1761,7 +1762,7 @@ For events whose block directive is not honored (everything except `pre_tool_cal
 
 ### Fail-open vs fail-closed
 
-By default shell hooks **fail open**: a spawn error, timeout, or unparseable stdout logs a warning and the action proceeds. That is the right default for observability hooks — but wrong for security gates. A crashed secret-scanner must not silently allow the tool call it was supposed to vet.
+By default shell hooks **fail open** on ordinary spawn errors, timeouts, or unparseable stdout. That is the right default for observability hooks — but wrong for security gates. A crashed secret-scanner must not silently allow the tool call it was supposed to vet.
 
 Set `fail_closed: true` (or `failClosed: true`, the Cursor/Claude Code spelling) on a `pre_tool_call` entry to invert that:
 
@@ -1784,6 +1785,8 @@ With `fail_closed: true`, each of these now **blocks** the tool call with `hook 
 | Clean exit, valid no-op JSON (`{}`) | proceed | proceed |
 
 `fail_closed` only applies to blocking-capable events (`pre_tool_call` today); setting it on any other event logs a warning at config-parse time and is ignored. `hermes hooks test` reflects these semantics — the `parsed` line shows exactly the block shape the dispatcher would receive.
+
+A missing hook script or broken sibling import is an infrastructure failure, not a policy verdict. For a hook inside a git checkout, Hermes restores the hook's entire tracked directory from HEAD's object store (including files excluded by sparse checkout), clears their skip-worktree bits, and retries the hook once. Every restoration attempt is ERROR-logged and paged through the fleet notify front door, deduplicated per profile and hook for ten minutes. If recovery fails, `pre_tool_call` blocks with an infrastructure-labelled message by default (`hooks.missing_hook_policy: restore_then_fail_closed`); `fail_open_and_page` is an explicit security downgrade. `hermes hooks test` reports the result without paging. A hook's genuine block directive or exit-2 policy verdict still blocks. The restore applies to git-tracked hook directories; separately installed hooks require their own recovery mechanism.
 
 ### Worked examples
 

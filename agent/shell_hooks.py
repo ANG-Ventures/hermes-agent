@@ -7,12 +7,14 @@ Exit code 2 blocks a ``pre_tool_call`` even without JSON (Claude-Code / Cursor).
 from __future__ import annotations
 
 import difflib
+import io
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from contextlib import ExitStack, contextmanager, suppress
@@ -55,6 +57,132 @@ _registered_lock = threading.Lock()
 # Non-POSIX fallback for allowlist read-modify-write. Must be separate from _registered_lock, which
 # register_from_config already holds when it triggers _record_approval (Lock is non-reentrant).
 _allowlist_write_lock = threading.Lock()
+_missing_page_lock = threading.Lock()
+_missing_pages: Dict[Tuple[str, str], float] = {}
+_MISSING_PAGE_INTERVAL = 600
+
+
+def _page_missing_hook(path: str, outcome: str = "restore failed") -> bool:
+    """Fleet alert front door is optional outside fleet installations."""
+    home = get_hermes_home().expanduser().resolve()
+    root = home.parent.parent if home.parent.name == "profiles" else home
+    notify = root / "scripts" / "notify"
+    if not notify.is_file():
+        logger.error("missing hook %s: fleet notify front door %s unavailable", path, notify)
+        return False
+    try:
+        proc = subprocess.run(
+            [str(notify), "--severity", "high", "--source", "shell-hooks",
+             "--body", f"hook {path} missing — infrastructure failure; {outcome}"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+            env={**os.environ, "HERMES_NOTIFY_REAL": "1"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("missing hook %s: page delivery failed: %s", path, exc)
+        return False
+    if proc.returncode != 0:
+        logger.error("missing hook %s: page delivery failed (rc=%d): %s", path, proc.returncode, proc.stderr[:200])
+    return proc.returncode == 0
+
+
+def _page_restore(path: str, outcome: str) -> None:
+    """Cross-process dedup applies to successful restores as well as failures."""
+    key = (_home_key(), path)
+    with _missing_page_lock:
+        now = time.time()
+        state_dir = get_hermes_home() / "state"
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            with (state_dir / "missing-hook-pages.lock").open("a+") as lock:
+                if fcntl is not None:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                state_file = state_dir / "missing-hook-pages.json"
+                try:
+                    stamps = json.loads(state_file.read_text(encoding="utf-8"))
+                    if not isinstance(stamps, dict):
+                        stamps = {}
+                except (OSError, ValueError):
+                    stamps = {}
+                if now - stamps.get(path, 0) >= _MISSING_PAGE_INTERVAL and _page_missing_hook(path, outcome):
+                    stamps[path] = now
+                    atomic_json_write(state_file, stamps, mode=0o600)
+                    _missing_pages[key] = now
+        except OSError as exc:
+            logger.error("missing hook %s: page dedup state unavailable: %s", path, exc)
+            if now - _missing_pages.get(key, 0) >= _MISSING_PAGE_INTERVAL and _page_missing_hook(path, outcome):
+                _missing_pages[key] = now
+
+
+def _missing_hook(spec: ShellHookSpec, path: str, detail: str, *, page: bool = True, outcome: str = "restore failed") -> Optional[Dict[str, Any]]:
+    logger.error("shell hook infrastructure failure %s (%s); %s", path, detail,
+                 "failing open by config" if spec.missing_hook_policy == "fail_open_and_page" else "failing closed")
+    owner = _owning_checkout(Path(path))
+    if page:
+        _page_restore(path, outcome)
+    return (None if spec.missing_hook_policy == "fail_open_and_page" else {
+        "action": "block", "message": f"hook infrastructure failure: hook missing and unrecoverable: {path}, "
+        f"owning checkout {owner or '<none>'}; this is not a policy verdict",
+    })
+
+
+def _owning_checkout(path: Path) -> Optional[Path]:
+    """Find the checkout owning the hook path, independent of the active profile."""
+    path = path.resolve()
+    ancestor = path.parent
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    try:
+        probe = subprocess.run(["git", "-C", str(ancestor), "rev-parse", "--show-toplevel"],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3)
+        if probe.returncode != 0:
+            return None
+        root = Path(probe.stdout.strip()).resolve()
+        return root if path.is_relative_to(root) else None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("could not locate shell hook checkout for %s: %s", path, exc)
+        return None
+
+
+def _restore_missing_hook(path: Path) -> Tuple[bool, str]:
+    """Restore the tracked directory closure from HEAD's object store, independent of sparse checkout."""
+    path = path.resolve()
+    root = _owning_checkout(path)
+    if root is None:
+        return False, "restore failed: no owning checkout"
+    rel = path.relative_to(root).parent
+    if rel == Path("."):
+        return False, "restore failed: hook directory is checkout root"
+    try:
+        archive = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", f"HEAD:{rel.as_posix()}"],
+                                 stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
+        if archive.returncode or len(archive.stdout) > 8_000_000:
+            return False, f"restore failed: HEAD directory unavailable or too large ({rel})"
+        members = []
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as bundle:
+            for member in bundle:
+                name = Path(member.name)
+                if not member.isfile() or name.is_absolute() or ".." in name.parts:
+                    continue
+                dest = root / rel / name
+                if dest.is_symlink() or any(p.is_symlink() for p in dest.parents if p != root):
+                    return False, f"restore failed: symlink in {rel}"
+                content = bundle.extractfile(member)
+                if content is None:
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(content.read())
+                dest.chmod(member.mode & 0o777)
+                members.append((rel / name).as_posix())
+        if path.is_file() and members:
+            indexed = subprocess.run(["git", "-C", str(root), "update-index", "--no-skip-worktree", "--", *members],
+                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
+            if indexed.returncode:
+                return False, f"restore failed: index update rc={indexed.returncode} for {rel}"
+            logger.error("restored shell hook directory %s (%d tracked files) from HEAD object store", root / rel, len(members))
+            return True, f"restored directory {root / rel}: {len(members)} tracked files from HEAD object store"
+    except (OSError, subprocess.TimeoutExpired, tarfile.TarError) as exc:
+        logger.error("could not restore shell hook %s from HEAD: %s", path, exc)
+    return False, f"restore failed for directory {root / rel}"
 
 
 def _home_key() -> str:
@@ -133,6 +261,7 @@ class ShellHookSpec(_ToolMatcherMixin):
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     fail_closed: bool = False
+    missing_hook_policy: str = "restore_then_fail_closed"
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
 
@@ -204,6 +333,8 @@ def reset_for_tests() -> None:
     """Test-only: clear the idempotence set."""
     with _registered_lock:
         _registered.clear()
+    with _missing_page_lock:
+        _missing_pages.clear()
 
 
 # --- Config parsing ---
@@ -213,9 +344,13 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
     from hermes_cli.plugins import SHELL_UNSUPPORTED_HOOKS, VALID_HOOKS
     if not isinstance(hooks_cfg, dict):
         return []
+    policy = hooks_cfg.get("missing_hook_policy", "restore_then_fail_closed")
+    if policy not in ("restore_then_fail_closed", "fail_open_and_page", "fail_closed"):
+        logger.warning("hooks.missing_hook_policy must be restore_then_fail_closed, fail_open_and_page or fail_closed; using default")
+        policy = "restore_then_fail_closed"
     specs: List[ShellHookSpec] = []
     for event_name, entries in hooks_cfg.items():
-        if event_name in ("output_spill", "outbound"):  # reserved non-event sub-sections under `hooks:`
+        if event_name in ("output_spill", "outbound", "missing_hook_policy"):
             continue
         if event_name in SHELL_UNSUPPORTED_HOOKS:  # _parse_response has no channel for these directives — refuse loudly
             logger.warning("hook event %r is Python-plugin-only: shell hooks cannot return its directive, "
@@ -233,7 +368,11 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
         if not isinstance(entries, list):
             logger.warning("hooks.%s must be a list of hook definitions; got %s", event_name, type(entries).__name__)
             continue
-        specs.extend(filter(None, (_parse_single_entry(event_name, i, raw) for i, raw in enumerate(entries))))
+        for i, raw in enumerate(entries):
+            spec = _parse_single_entry(event_name, i, raw)
+            if spec is not None:
+                spec.missing_hook_policy = policy
+                specs.append(spec)
     return specs
 
 
@@ -310,9 +449,9 @@ def _windows_script_argv(argv: list[str]) -> list[str]:
     return [_find_bash(), *argv]
 
 
-def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
+def _spawn(spec: ShellHookSpec, stdin_json: str, *, _retried: bool = False) -> Dict[str, Any]:
     """The single subprocess site: run ``spec.command`` with ``stdin_json`` on stdin. Same result keys for every outcome."""
-    result: Dict[str, Any] = {"returncode": None, "stdout": "", "stderr": "", "timed_out": False, "elapsed_seconds": 0.0, "error": None}
+    result: Dict[str, Any] = {"returncode": None, "stdout": "", "stderr": "", "timed_out": False, "elapsed_seconds": 0.0, "error": None, "infra_failure": None}
 
     def failed(error: str) -> Dict[str, Any]:
         result["error"] = error
@@ -324,6 +463,15 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         return failed(f"command {spec.command!r} cannot be parsed: {exc}")
     if not argv:
         return failed("empty command")
+    script = Path(os.path.expanduser(_command_script_path(spec.command)))
+    # An absent script cannot deliver a policy verdict. Restore only HEAD-tracked
+    # files in the checkout owning the script (which may differ from the profile home).
+    if script.suffix.lower() in _SCRIPT_EXTENSIONS and not script.is_file():
+        restored, outcome = _restore_missing_hook(script)
+        result["restore_outcome"] = outcome
+        if not restored:
+            result["infra_failure"] = str(script)
+            return failed("hook script missing")
     t0 = time.monotonic()
     # Own process group on POSIX so a timed-out hook's descendants are reaped with it (Windows: kill_process_tree
     # / taskkill /T). Hooks that finish in time keep detached helpers alive.
@@ -340,6 +488,8 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
                                 text=True, encoding='utf-8', errors='replace', shell=False,
                                 env=build_subprocess_env(scrub_secrets=is_multiplex_active()), **popen_kwargs)
     except Exception as exc:
+        if isinstance(exc, (FileNotFoundError, PermissionError)) or getattr(exc, "winerror", None) == 193:
+            result["infra_failure"] = argv[0]
         for cls, msg in _POPEN_ERRORS:
             if isinstance(exc, cls):
                 return failed(msg)
@@ -362,6 +512,22 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         result.update(timed_out=True, elapsed_seconds=round(time.monotonic() - t0, 3))
         return result
     result.update(returncode=proc.returncode, stdout=stdout or "", stderr=stderr or "", elapsed_seconds=round(time.monotonic() - t0, 3))
+    import_failure = (re.search(r"ModuleNotFoundError|ImportError|cannot import its shared dependency", stderr or "")
+                      or "[hook_internal_error]" in (stdout or "") and
+                      re.search(r"ModuleNotFoundError|ImportError|No module named|cannot import", stdout or ""))
+    if import_failure:
+        if not _retried and not result.get("restore_outcome") and script.is_file():
+            restored, outcome = _restore_missing_hook(script)
+            result["restore_outcome"] = outcome
+            if restored:
+                retry = _spawn(spec, stdin_json, _retried=True)
+                retry["restore_outcome"] = outcome
+                return retry
+        result["infra_failure"] = str(script)
+    if proc.returncode == BLOCK_EXIT_CODE and not (stdout or "").strip() and not script.is_file() and re.search(
+        r"can't open file|: No such file or directory\s*$", stderr or "", re.IGNORECASE
+    ):
+        result["infra_failure"] = str(script)
     return result
 
 
@@ -381,12 +547,22 @@ def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:
     return {"action": "block", "message": f"hook {spec.command} failed closed: {reason}"}
 
 
-def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any], *, page: bool = True) -> Optional[Dict[str, Any]]:
     """``_spawn`` result → hook contribution (live callback and ``run_once``). Spawn error/timeout fail
     open unless fail_closed; exit 2 on a blocking event blocks (message: stdout JSON, then stderr, then
     default); other non-zero exits warn then parse stdout; unparseable stdout on a fail_closed hook blocks."""
     blocking_event = spec.event in _BLOCKING_EVENTS
     fail_closed = spec.fail_closed and blocking_event
+    script_path = os.path.expanduser(_command_script_path(spec.command))
+    if (r.get("returncode") == BLOCK_EXIT_CODE and not (r.get("stdout") or "").strip()
+            and not Path(script_path).is_file()
+            and re.search(r"can't open file|: No such file or directory\s*$", r.get("stderr") or "", re.IGNORECASE)):
+        r["infra_failure"] = script_path
+    if r.get("infra_failure") and blocking_event:
+        return _missing_hook(spec, str(r["infra_failure"]), str(r["error"] or r["stderr"]), page=page,
+                             outcome=r.get("restore_outcome", "restore failed"))
+    if r.get("restore_outcome") and page:
+        _page_restore(script_path, r["restore_outcome"])
     if r["error"]:
         logger.warning("shell hook failed (event=%s command=%s): %s", spec.event, spec.command, r["error"])
     elif r["timed_out"]:
@@ -624,7 +800,7 @@ def script_is_executable(command: str) -> bool:
 def run_once(spec: ShellHookSpec, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """Fire one hook with a synthetic payload (``hermes hooks test`` / doctor) through the production path."""
     result = _spawn(spec, _serialize_payload(spec.event, kwargs))
-    result["parsed"] = _evaluate_result(spec, result)
+    result["parsed"] = _evaluate_result(spec, result, page=False)
     return result
 
 
