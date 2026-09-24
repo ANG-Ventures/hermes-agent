@@ -7181,6 +7181,34 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 
+def _real_pid_started_in_claim(pid: int, claimed_at: float, spawned_at: float) -> bool:
+    """A live PID is its original owner only if it started in the claim window."""
+    started = None
+    try:
+        import psutil
+        started = psutil.Process(pid).create_time()
+    except Exception:  # optional psutil, or process vanished during the probe
+        pass
+    if started is None and os.name == "posix":
+        try:
+            from datetime import datetime
+            proc = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, timeout=1,
+                env={**os.environ, "LC_ALL": "C"}, check=False,
+            )
+            if proc.returncode == 0:
+                started = datetime.strptime(proc.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    # Seconds-resolution event stamps can straddle the OS process timestamp.
+    return started is not None and claimed_at - 2 <= started <= spawned_at + 2
+
+
+_pid_started_in_claim = _real_pid_started_in_claim
+
+
 def _prior_worker_still_alive(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[dict]:
@@ -7195,8 +7223,10 @@ def _prior_worker_still_alive(
     # An outcome cannot certify exit: operators can write the same outcomes as
     # worker tools, and a newer synthetic row can hide an older live owner.
     runs = conn.execute(
-        "SELECT id, outcome, ended_at FROM task_runs WHERE task_id = ? "
-        "AND ended_at IS NOT NULL ORDER BY id DESC", (task_id,),
+        "SELECT r.id, r.outcome, r.ended_at, t.max_runtime_seconds "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.task_id = ? AND r.ended_at IS NOT NULL ORDER BY r.id DESC",
+        (task_id,),
     ).fetchall()
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     for row in runs:
@@ -7216,8 +7246,14 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
     # run_id NULL -- measured on t_09180e10, 5 s after the reclaim.
     # Legacy / hand-built rows may lack the claimed event; fall back to any
     # event of that run that recorded the lock (reclaimed.prev_lock, ...).
+    # Explicitly bounded workers cannot still own a run this long after its
+    # release, even when the PID has since been recycled.
+    if (row["max_runtime_seconds"] is not None
+            and time.time() > row["ended_at"] + row["max_runtime_seconds"]
+            + RECLAIM_DEFER_GRACE_SECONDS):
+        return None
     run_events = conn.execute(
-        "SELECT id, kind, payload FROM task_events WHERE task_id = ? "
+        "SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? "
         "AND run_id = ? ORDER BY (kind = 'claimed') DESC, id ASC",
         (task_id, row["id"]),
     ).fetchall()
@@ -7245,7 +7281,7 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
         "AND kind = 'claimed' AND id > ?", (task_id, boundary_id),
     ).fetchone()[0]
     spawned = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "SELECT id, run_id, payload, created_at FROM task_events WHERE task_id = ? "
         "AND kind = 'spawned' AND id >= ? "
         "AND (run_id = ? OR (run_id IS NULL AND (? IS NULL OR id < ?))) "
         "ORDER BY id DESC LIMIT 1",
@@ -7257,7 +7293,8 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
         pid = int(json.loads(spawned["payload"] or "{}")["pid"])
     except (TypeError, ValueError, KeyError):
         return None
-    if _pid_alive(pid):
+    claimed_at = min(ev["created_at"] for ev in run_events)
+    if _pid_alive(pid) and _pid_started_in_claim(pid, claimed_at, spawned["created_at"]):
         return {"prev_pid": pid, "prev_lock": lock,
                 "prev_run_id": row["id"],
                 "prev_outcome": row["outcome"],

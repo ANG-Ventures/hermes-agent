@@ -20,6 +20,7 @@ so the guard cannot pass by wedging everything.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -49,6 +50,8 @@ def conn(tmp_path, monkeypatch):
     # Otherwise dispatch skips non-profile assignees and every "no second
     # spawn" assertion passes vacuously.
     monkeypatch.setattr(_profiles, "profile_exists", lambda name: True)
+    # Synthetic PIDs in these tests stand for the original spawned process.
+    monkeypatch.setattr(kb, "_pid_started_in_claim", lambda *_args: True, raising=False)
     with kb.connect() as c:
         yield c
 
@@ -206,7 +209,59 @@ def test_ended_synthetic_run_cannot_mask_older_live_owner(conn, monkeypatch):
     assert _events(conn, tid, "claim_rejected")[-1]["prev_pid"] == 424242
 
 
-def test_real_process_survives_operator_block_without_second_spawn(conn):
+def test_reused_pid_does_not_block_claim(conn, monkeypatch):
+    tid, _ = _live_claim(conn, "reused PID")
+    _external_release(conn, tid)
+    # The PID is alive, but its process was started after the spawn event.
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb, "_pid_started_in_claim", lambda *_args: False, raising=False)
+    assert kb.claim_task(conn, tid) is not None
+
+
+def test_late_spawn_of_original_owner_still_blocks_claim(conn, monkeypatch):
+    tid, _ = _live_claim(conn, "late original spawn")
+    _external_release(conn, tid)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb, "_pid_started_in_claim", lambda *_args: True, raising=False)
+    assert kb.claim_task(conn, tid) is None
+    assert _events(conn, tid, "claim_rejected")[-1]["reason"] == "prior_worker_still_alive"
+
+
+def test_live_unrelated_pid_from_prior_claim_can_be_reclaimed(conn, monkeypatch):
+    tid, _ = _live_claim(conn, "live unrelated PID", pid=os.getpid())
+    _external_release(conn, tid)
+    # Simulate historical evidence for a PID whose current occupant started
+    # after this run. Keep both event stamps consistently old.
+    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? "
+                 "AND kind IN ('claimed', 'spawned')", (time.time() - 120, tid))
+    monkeypatch.setattr(kb, "_pid_started_in_claim", kb._real_pid_started_in_claim)
+    assert kb.claim_task(conn, tid) is not None
+
+
+def test_process_start_window_distinguishes_reused_pid(conn, monkeypatch):
+    proc = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        started = time.time()
+        assert kb._real_pid_started_in_claim(proc.pid, started - 5, started + 5)
+        assert not kb._real_pid_started_in_claim(proc.pid, started - 90, started - 60)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_expired_bounded_run_does_not_probe_live_pid(conn, monkeypatch):
+    tid, _ = _live_claim(conn, "bounded old run")
+    _external_release(conn, tid)
+    conn.execute("UPDATE tasks SET max_runtime_seconds=60 WHERE id=?", (tid,))
+    conn.execute("UPDATE task_runs SET ended_at=? WHERE task_id=?", (time.time() - 600, tid))
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    assert kb.claim_task(conn, tid) is not None
+
+
+def test_real_process_survives_operator_block_without_second_spawn(conn, monkeypatch):
+    monkeypatch.setattr(kb, "_pid_started_in_claim", kb._real_pid_started_in_claim)
+
     tid = kb.create_task(conn, title="real PID operator release", assignee="worker")
     assert kb.claim_task(conn, tid) is not None
     proc = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
