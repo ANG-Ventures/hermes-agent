@@ -1,6 +1,7 @@
 """A pid-less claim is safe to reclaim only when its local claimer is gone."""
 
 import os
+import psutil
 import time
 
 import pytest
@@ -34,11 +35,11 @@ def test_dead_local_claimer_releases_claim_and_records_reclaimed(board, monkeypa
     lock = f"{kb._host_prefix()}{dead_pid}"
     tid = _claim(board, lock, expired=expired)
 
-    def dead(pid, sig):
-        assert (pid, sig) == (dead_pid, 0)
-        raise ProcessLookupError(pid)
+    def dead(pid):
+        assert pid == dead_pid
+        raise psutil.NoSuchProcess(pid)
 
-    monkeypatch.setattr(kbd.os, "kill", dead)
+    monkeypatch.setattr(psutil, "Process", dead)
     if expired:
         assert kb.release_stale_claims(board) == 1
     else:
@@ -57,18 +58,18 @@ def test_live_local_claimer_keeps_pidless_claim(board, monkeypatch, expired):
     lock = f"{kb._host_prefix()}{os.getpid()}"
     tid = _claim(board, lock, expired=expired)
     seen = []
-    real_kill = os.kill
+    real_process = psutil.Process
 
-    def alive(pid, sig):
-        seen.append((pid, sig))
-        return real_kill(pid, sig)
+    def alive(pid):
+        seen.append(pid)
+        return real_process(pid)
 
-    monkeypatch.setattr(kbd.os, "kill", alive)
+    monkeypatch.setattr(psutil, "Process", alive)
     if expired:
         assert kb.release_stale_claims(board) == 0
     else:
         assert kb.reclaim_task(board, tid) is False
-    assert seen == [(os.getpid(), 0)]
+    assert seen == [os.getpid()]
     assert kb.get_task(board, tid).status == "running"
     assert kb.get_task(board, tid).claim_lock == lock
     assert not [e for e in kb.list_events(board, tid) if e.kind == "reclaimed"]
@@ -76,6 +77,6 @@ def test_live_local_claimer_keeps_pidless_claim(board, monkeypatch, expired):
 
 def test_foreign_pidless_claimer_is_not_probed(board, monkeypatch):
     tid = _claim(board, "foreign-host:999991")
-    monkeypatch.setattr(kbd.os, "kill", lambda *_: pytest.fail("foreign PID was probed"))
+    monkeypatch.setattr(psutil, "Process", lambda *_: pytest.fail("foreign PID was probed"))
     assert kb.reclaim_task(board, tid) is True  # preserve foreign-host release policy
     assert kb.get_task(board, tid).status == "ready"

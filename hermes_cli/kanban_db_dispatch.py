@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import psutil
 import re
 import signal
 import sqlite3
@@ -473,13 +474,15 @@ def _terminate_reclaimed_worker(
         claimer_pid = 0
         try:
             claimer_pid = int(str(claim_lock)[len(_kb._host_prefix()):])
-            if claimer_pid > 0 and hasattr(os, "kill"):
-                os.kill(claimer_pid, 0)
-        except ProcessLookupError:
+            if claimer_pid > 0:
+                # Equivalent to kill(pid, 0), without Windows' destructive
+                # CTRL_C_EVENT behavior for signal 0.
+                psutil.Process(claimer_pid)
+        except psutil.NoSuchProcess:
             info["liveness_unprovable"] = False
             info["terminated"] = True
             info["claimer_pid_dead"] = claimer_pid
-        except (ValueError, OSError):
+        except (ValueError, OSError, psutil.AccessDenied):
             pass
         return info
 

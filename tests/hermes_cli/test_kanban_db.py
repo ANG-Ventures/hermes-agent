@@ -11,6 +11,7 @@ import time
 import types
 from pathlib import Path
 
+import psutil
 import pytest
 
 import hermes_state_wal
@@ -254,10 +255,10 @@ def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home, mo
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="never spawned", assignee="a")
         host = kb._claimer_id().split(":", 1)[0]
-        def dead_claimer(pid, sig):
-            assert (pid, sig) == (999991, 0)
-            raise ProcessLookupError(pid)
-        monkeypatch.setattr(kbd.os, "kill", dead_claimer)
+        def dead_claimer(pid):
+            assert pid == 999991
+            raise psutil.NoSuchProcess(pid)
+        monkeypatch.setattr(psutil, "Process", dead_claimer)
         for expected in (1, 2):
             kb.claim_task(conn, t, claimer=f"{host}:999991")
             # No _set_worker_pid: the claimer never spawned a worker.
