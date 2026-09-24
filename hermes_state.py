@@ -9148,6 +9148,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
                 (system_prompt_hash, session_id),
             )
+            if system_prompt is None:
+                logger.warning(
+                    "Explicit system_prompt=NULL write for session %s via "
+                    "update_system_prompt", session_id, stack_info=True,
+                )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
@@ -9232,9 +9237,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
         (only filling in NULL), this unconditionally sets the model column
         so that the dashboard reflects the user's latest /model choice.
-        Also nulls ``system_prompt`` so stale ``Model:`` / ``Provider:``
-        footer metadata is rebuilt on the next turn. A successful /model
-        switch explicitly replaces any confirmed Browser runtime lock while
+        Retains the prior prompt until the next turn replaces it: the restore
+        path checks its runtime identity and rebuilds on a real change. A
+        successful /model switch replaces any confirmed Browser runtime lock while
         preserving unrelated lineage markers in ``model_config``.
 
         When *provider* is given, it is merged into ``model_config``
@@ -9267,12 +9272,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return
             conn.execute(
                 "UPDATE sessions SET "
-                "model = ?, model_config = ?, "
-                "system_prompt = NULL, system_prompt_hash = NULL "
+                "model = ?, model_config = ? "
                 "WHERE id = ?",
                 (model, merged, session_id),
             )
-            self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
     def _merge_model_config_json(
@@ -9379,8 +9382,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Persist a Browser / API client runtime lock without clobbering lineage markers.
 
         Merges ``browser_model_lock`` into the existing ``model_config`` JSON so
-        ``_branched_from`` / ``_delegate_from`` survive. Nulls ``system_prompt``
-        so cached ``Model:`` / ``Provider:`` footers cannot lie after a switch.
+        ``_branched_from`` / ``_delegate_from`` survive. The prior prompt is
+        retained until restore checks the runtime identity and replaces it.
         """
         lock = {
             "provider": provider or "",
@@ -9400,13 +9403,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """UPDATE sessions SET
                    model_config = ?,
-                   model = COALESCE(?, model),
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
+                   model = COALESCE(?, model)
                    WHERE id = ?""",
                 (merged, model, session_id),
             )
-            self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
     def set_session_yolo(self, session_id: str, enabled: bool) -> None:
@@ -9521,9 +9521,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (only filling in NULL), this unconditionally sets the billing fields so
         that the dashboard reflects the user's latest /model switch.
 
-        Also nulls ``system_prompt`` so the cached snapshot (which embeds a
-        stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
-        behavior of ``update_session_model`` (see #48173, #48248).
+        Retains the cached snapshot until restore compares its runtime identity;
+        a billing-only route update does not change the prompt bytes.
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
@@ -9533,13 +9532,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """UPDATE sessions SET
                    billing_provider = ?,
                    billing_base_url = ?,
-                   billing_mode = COALESCE(?, billing_mode),
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
+                   billing_mode = COALESCE(?, billing_mode)
                    WHERE id = ?""",
                 (provider, base_url, billing_mode, session_id),
             )
-            self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
     # ── Async token accounting ──
