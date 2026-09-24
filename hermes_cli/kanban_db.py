@@ -17199,9 +17199,21 @@ def _dispatch_once_locked(
     min_eligible = configured_min_eligible()
     pool_urls = configured_pool_health_urls()
     box_health = configured_box_health()
-    health_cache: dict = {}
     pool_spawns_per_eligible = configured_pool_spawns_per_eligible()
-    admitted_this_tick: dict[str, int] = {}
+    # The relay pools are shared by every board, so the per-tick admission
+    # budget must be too. The gateway tick calls dispatch_once once per board
+    # with ONE ``budget_cache``; keep the admitted-per-pool counter (and the
+    # health probe results it is measured against) in that tick-scoped dict so
+    # board N+1 sees board N's spawns. Callers without cross-board state (CLI,
+    # standalone daemon) pass no cache and get a fresh per-call map.
+    if budget_cache is not None:
+        health_cache: dict = budget_cache.setdefault(("_provider_health_cache",), {})
+        admitted_this_tick: dict[str, int] = budget_cache.setdefault(
+            ("_pool_admitted_this_tick",), {},
+        )
+    else:
+        health_cache = {}
+        admitted_this_tick = {}
     admitted_routes: dict[str, str | None] = {}
 
     def pool_budget(provider):

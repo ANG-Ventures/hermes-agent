@@ -446,6 +446,64 @@ def test_single_tick_pool_budget_across_ready_and_review(home, apr, reviews):
         assert apr.hits == 1
 
 
+def test_pool_budget_is_per_tick_across_boards_with_shared_tick_cache(home, apr):
+    """Argus r1 F1: the gateway tick calls dispatch_once once PER BOARD with one
+    shared ``budget_cache``. The relay pool is shared by every board, so the
+    admission budget must span the whole tick, not reset per board."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    boards = ["default", "b2", "b3"]
+    for b in boards[1:]:
+        kb.create_board(b)
+    ids: dict = {}
+    for b in boards:
+        with kb.connect_closing(board=b) as conn:
+            ids[b] = [kb.create_task(conn, title=f"{b}-{i}", assignee="argus")
+                      for i in range(10)]
+    tick_cache: dict = {}
+    seen: list = []
+    for b in boards:
+        with kb.connect_closing(board=b) as conn:
+            kb.dispatch_once(conn, board=b, spawn_fn=_spawner(seen), max_spawn=100,
+                             max_in_progress=100, budget_cache=tick_cache)
+    assert len(seen) == 2, seen
+    assert set(seen) <= set(ids["default"])
+    for b in boards[1:]:
+        with kb.connect_closing(board=b) as conn:
+            for tid in ids[b]:
+                assert _events(conn, tid, "deferred")[-1] == {
+                    "reason": "pool_budget", "provider": "claude-apr",
+                    "pool": "claude-apr", "eligible": 1, "admitted": 2,
+                }
+    # One probe per tick, not one per board.
+    assert apr.hits == 1
+
+    # A NEW tick (fresh cache) gets a fresh budget.
+    seen.clear()
+    with kb.connect_closing(board="b2") as conn:
+        kb.dispatch_once(conn, board="b2", spawn_fn=_spawner(seen), max_spawn=100,
+                         max_in_progress=100, budget_cache={})
+    assert len(seen) == 2
+
+
+def test_pool_budget_single_call_without_tick_cache_is_per_call(home, apr):
+    """CLI / standalone daemon pass no cache: each call is its own tick."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    with kb.connect_closing() as conn:
+        for i in range(6):
+            kb.create_task(conn, title=f"c-{i}", assignee="argus")
+        seen: list = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert len(seen) == 2
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert len(seen) == 4
+
+
 def test_pool_budget_config_default_and_legacy_zero(home):
     assert ph.configured_pool_spawns_per_eligible() == 2
     _config(home, pool_spawns_per_eligible=0)
