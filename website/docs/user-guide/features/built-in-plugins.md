@@ -57,6 +57,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 |---|---|---|
 | `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
 | `security-guidance` | hooks | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
+| `kanban-home-cards` | hooks | Once per session start, list this session's open home kanban cards on the first user turn (never the system prompt) |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
 | `teams_pipeline` | standalone | Microsoft Teams meeting pipeline — Graph-backed, transcript-first meeting summaries |
 | `spotify` | backend (7 tools) | Native Spotify playback, queue, search, playlists, albums, library |
@@ -138,6 +139,18 @@ The file is still written. The model reads the warning in the next turn's tool m
 **Disabling again:** `hermes plugins disable security-guidance`.
 
 **What it does not do (yet):** the upstream Anthropic plugin has two more layers — an LLM diff review on each agent turn that touched files, and an agentic commit-time review that traces data flow across files. Neither is ported. The agent can already run those reviews on demand via `delegate_task`.
+
+### kanban-home-cards
+
+On the first turn a process runs for a session (new session, restart-resume, `/new`), a `pre_llm_call` hook adds a compact block to the user message listing that session's OPEN home kanban cards (id, status, title, last activity, board, last comment) across all boards. The block rides the user-message `api_content` sidecar, so it is cached once and replayed byte-for-byte; the system prompt is untouched.
+
+- Capped: at most 8 cards, 180 chars per line, 900 chars total, then `(+N more: hermes kanban list --home)`. An empty home adds nothing.
+- Read-only (`mode=ro`), 750 ms total budget, fails open.
+- Skipped for kanban workers, `delegate_task` children and cron runs.
+- Restart dedupe: a restarted process does not re-inject while the block is still within the last 20 user rows of the session.
+- Titles and comments pass through the secret redactor and are framed as data, not instructions.
+
+**Enabling:** `hermes plugins enable kanban-home-cards`. **Disabling:** `hermes plugins disable kanban-home-cards`.
 
 ### observability/langfuse
 
