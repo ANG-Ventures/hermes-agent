@@ -36785,25 +36785,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=event_message_id,
             )
 
+            # ONE kwargs dict for both branches, carrying every parameter of
+            # this signature. The two hand-copied call lists this replaces
+            # silently dropped ``persist_user_display_kind`` (internal wakes
+            # persisted as plain user bubbles, #82888) and ``message_type``
+            # (voice replies, #60671). A parameter added above must be added
+            # here; test_run_agent_wrapper_forwards_every_parameter enforces it.
+            inner_kwargs = dict(
+                session_key=session_key,
+                run_generation=run_generation,
+                _interrupt_depth=_interrupt_depth,
+                event_message_id=event_message_id,
+                channel_prompt=channel_prompt,
+                moa_config=moa_config,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                message_type=message_type,
+            )
             if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
                 return await self._run_agent_inner(
                     message, context_prompt, history, source, session_id,
-                    session_key=session_key, run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                    channel_prompt=channel_prompt, moa_config=moa_config,
-                    persist_user_message=persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
+                    **inner_kwargs,
                 )
 
             profile_home = self._resolve_profile_home_for_source(source)
             with _profile_runtime_scope(profile_home):
                 return await self._run_agent_inner(
                     message, context_prompt, history, source, session_id,
-                    session_key=session_key, run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                    channel_prompt=channel_prompt, moa_config=moa_config,
-                    persist_user_message=persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
+                    **inner_kwargs,
                 )
         finally:
             try:
@@ -36879,6 +36889,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event_message_id=event_message_id,
             channel_prompt=channel_prompt,
             message_type=message_type,
+            # A kanban wake / async-delegation completion that arrived while
+            # this session was busy is drained here instead of through
+            # _handle_message_with_agent; keep its row typed (#82888).
+            persist_user_display_kind=(
+                "internal_notification"
+                if getattr(queued_event, "internal", False)
+                else None
+            ),
         )
         return _preserve_queued_followup_history_offset(
             current_result, followup_result
