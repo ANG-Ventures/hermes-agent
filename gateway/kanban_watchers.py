@@ -525,10 +525,20 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
     if not script.is_file():
         logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
         return False
+    if item.get("reason") == "prior_worker_still_alive":
+        detail = (
+            "READY card: prior_worker_still_alive claim rejected >15 min\n"
+            f"Prior PID: `{item.get('prev_pid')}` · Inspect: `{item['clear_verb']}`\n"
+            "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
+        )
+    else:
+        detail = (
+            "READY card stuck behind active_pr (>30 min)\n"
+            f"Operator recovery: `{item['clear_verb']}`"
+        )
     message = (
-        "🛑 **Kanban dispatcher** · READY card stuck behind active_pr (>30 min)\n"
-        f"Board: `{board}` · Card: `{item['task_id']}`\n"
-        f"Operator recovery: `{item['clear_verb']}`"
+        f"🛑 **Kanban dispatcher** · {detail}\n"
+        f"Board: `{board}` · Card: `{item['task_id']}`"
     )
     try:
         proc = subprocess.run(
@@ -2620,8 +2630,8 @@ class GatewayKanbanWatchersMixin:
                         observed_boards,
                     )
                     if guard_pages:
-                        logger.error("kanban dispatcher: %d active_pr card(s) STUCK >30 min; "
-                                     "#alerts paged with recovery verbs", guard_pages)
+                        logger.error("kanban dispatcher: %d guarded card(s) STUCK; "
+                                     "#alerts paged with diagnostics", guard_pages)
                     ready_pending = await service(_ready_nonempty)
                     if _stall_streak_is_bad(ready_pending, any_spawned, results,
                                             guard_stuck=bool(guard_stuck)):
@@ -2633,8 +2643,8 @@ class GatewayKanbanWatchersMixin:
                     if now - last_warn_at >= 300:
                         if guard_stuck:
                             logger.warning(
-                                "kanban dispatcher STUCK: active_pr held %d READY card(s) "
-                                ">30 min. Use the per-card requeue verb in #alerts.",
+                                "kanban dispatcher STUCK: %d READY card(s) continuously "
+                                "guarded. See per-card diagnostics in #alerts.",
                                 len(guard_stuck),
                             )
                         else:

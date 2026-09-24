@@ -15902,9 +15902,12 @@ def respawn_guard_stuck_tasks(
     min_seconds: int = RESPAWN_GUARD_STUCK_SECONDS,
     now: Optional[int] = None,
 ) -> list[dict]:
-    """Return ready+assigned+unclaimed cards stuck behind ``active_pr``.
+    """Return ready cards continuously refused by active_pr or prior worker.
 
-    A card qualifies when it has been guarded with ``active_pr`` since the
+    Active-PR guards page after 30 minutes; claim rejection by an allegedly
+    live previous worker pages after 15 minutes (the process may have exited
+    or its PID may have been recycled). Both use the same one-shot notifier.
+    For active_pr, a card qualifies when it has been guarded with ``active_pr`` since the
     last event that could have changed the guard's answer
     (``_RESPAWN_GUARD_STUCK_RESET_KINDS``, or a guard decline for another
     reason), the first such guard row is at least ``min_seconds`` old, and the
@@ -15927,6 +15930,30 @@ def respawn_guard_stuck_tasks(
         "AND assignee IS NOT NULL AND claim_lock IS NULL ORDER BY id"
     ).fetchall():
         task_id = row["id"]
+        last_reset = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events WHERE task_id=? "
+            "AND (kind IN ('claimed', 'spawned', 'requeued', 'unblocked', 'status') "
+            "OR (kind='claim_rejected' AND "
+            "COALESCE(json_extract(payload, '$.reason'), '') != 'prior_worker_still_alive'))",
+            (task_id,),
+        ).fetchone()["m"]
+        rejected = conn.execute(
+            "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, "
+            "COUNT(*) AS n, MAX(json_extract(payload, '$.prev_pid')) AS pid "
+            "FROM task_events WHERE task_id=? AND id>? AND kind='claim_rejected'",
+            (task_id, last_reset),
+        ).fetchone()
+        if (rejected["n"] and now - rejected["first_at"] > 15 * 60
+                and now - rejected["last_at"] <= _RESPAWN_GUARD_STUCK_FRESH_SECONDS):
+            out.append({
+                "task_id": task_id, "assignee": row["assignee"],
+                "reason": "prior_worker_still_alive",
+                "guarded_since": rejected["first_at"],
+                "guarded_seconds": now - rejected["first_at"],
+                "guard_events": rejected["n"],
+                "prev_pid": rejected["pid"],
+                "clear_verb": render_operator_command(board, "show", task_id),
+            })
         last_other = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
             f"WHERE task_id = ? AND (kind IN ({reset_marks}) "

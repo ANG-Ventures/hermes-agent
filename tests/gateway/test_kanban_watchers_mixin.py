@@ -274,6 +274,15 @@ def test_guard_stuck_sender_routes_to_alerts(tmp_path, monkeypatch):
     assert argv[argv.index("--sev") + 1] == "error"
     assert 'hermes kanban requeue t_test "<reason>"' in argv[argv.index("--send") + 1]
     assert kwargs["stdin"] is subprocess.DEVNULL
+    assert _send_guard_stuck_alert("default", {
+        "task_id": "t_pid", "reason": "prior_worker_still_alive",
+        "prev_pid": 97056, "clear_verb": "hermes kanban show t_pid",
+    })
+    pid_message = calls[-1][0][calls[-1][0].index("--send") + 1]
+    assert "prior_worker_still_alive" in pid_message
+    assert "97056" in pid_message
+    assert "hermes kanban show t_pid" in pid_message
+    assert "requeue alone cannot bypass" in pid_message
 
 
 def test_stall_respawn_guard_is_benign_not_bad():
