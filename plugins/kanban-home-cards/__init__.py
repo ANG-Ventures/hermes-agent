@@ -16,7 +16,17 @@ Invariants (spec plans/2026-09-24_session-start-home-cards.md §5):
 - I2 home-only: the only card query filters ``session_id IN home_ids(...)``.
 - I3 hard cap: <= ``MAX_CARDS`` lines, each <= ``MAX_LINE`` chars, block <=
   ``MAX_CHARS`` incl. header + overflow; truncation by whole lines only.
-- I5 fail-open: DB work bounded by ``BUDGET_S``; never raises.
+- I5 fail-open: the turn waits at most ``BUDGET_S``; never raises.  A
+  timeout names the stage that was still running (lineage / dedupe /
+  boards) so it is attributable.
+- P1 prewarm: in the gateway the whole probe (lineage, dedupe, boards) is
+  started by ``pre_gateway_dispatch`` -- before auth, agent construction and
+  prompt build -- so its cost overlaps work the turn does anyway;
+  ``pre_llm_call`` only waits for what is left.  Elsewhere (CLI) the probe
+  starts at ``pre_llm_call``.
+- P2 board filter: a board whose ``kanban.db`` was last written before the
+  home's earliest session started, with an empty WAL, cannot hold a card
+  this home created, so it is not opened.
 - I6 no block for kanban workers, delegate children, cron.
 - I7 titles/comments are redacted and framed as data.
 - I8 read-only: ``mode=ro`` URIs + busy timeout, never ``immutable=1``.
@@ -50,8 +60,16 @@ TITLE_MAX = 60
 COMMENT_MAX = 70
 
 # ── budget (I5) ─────────────────────────────────────────────────────────────
-BUDGET_S = 0.75
+BUDGET_S = 1.5
 PER_BOARD_BUSY_MS = 150
+# Upper bound on a background probe's own DB work (it no longer blocks the
+# turn, but must not run forever on a wedged board).
+PROBE_MAX_S = 30.0
+# A prewarmed probe older than this is not trusted for a first turn.
+PROBE_FRESH_S = 120.0
+MAX_PROBES = 64
+# mtime-filter slack for clock granularity / skew between writers.
+MTIME_SLACK_S = 300.0
 
 # ── restart dedupe (R3) ─────────────────────────────────────────────────────
 DEDUPE_USER_ROWS = 20
@@ -78,12 +96,26 @@ _SEEN_LOCK = threading.Lock()
 def home_ids(session_id: str) -> tuple[str, ...]:
     """Return the session ids whose cards count as this session's home.
 
-    Single seam for OQ-1.  Exact-id semantics until the shared lineage
-    helper from #951 lands; that follow-up PR replaces this body with a call
-    to the helper ``kanban list --home`` uses (id + parent_session_id chain,
-    same session_key, depth <= 10), so both surfaces share one semantics.
+    Single seam for OQ-1: :func:`hermes_cli.kanban_db.home_ids`, the same
+    lineage ``kanban list --home`` and the home guard use (id +
+    parent_session_id chain, same session_key, depth <= 10; per-process
+    cached).  Fails open to the exact id.
     """
-    return (session_id,) if session_id else ()
+    if not session_id:
+        return ()
+    from hermes_cli import kanban_db
+
+    return tuple(sorted(kanban_db.home_ids(session_id)))
+
+
+def home_started_at(session_id: str) -> Optional[float]:
+    """Earliest ``started_at`` in the home (cached after :func:`home_ids`);
+    ``None`` = unknown, which disables the board mtime filter."""
+    if not session_id:
+        return None
+    from hermes_cli import kanban_db
+
+    return kanban_db.home_lineage(session_id)[1]
 
 
 # ── pure renderer (I3, I7) ──────────────────────────────────────────────────
@@ -170,7 +202,25 @@ def render(cards: Sequence[Mapping[str, Any]]) -> Optional[str]:
 
 
 # ── read-only board scan (I2, I5, I8) ───────────────────────────────────────
-def _board_dbs() -> list[tuple[str, Path]]:
+def _written_before(path: Path, since: float) -> bool:
+    """P2: provably no write at/after ``since``?  The main file's mtime only
+    moves on commit/checkpoint, so a non-empty WAL (uncheckpointed frames)
+    means "unknown" and the board is kept."""
+    try:
+        wal = Path(str(path) + "-wal")
+        if wal.exists() and wal.stat().st_size > 0:
+            return False
+        return path.stat().st_mtime < since - MTIME_SLACK_S
+    except OSError:
+        return False
+
+
+def _board_dbs(since: Optional[float] = None) -> tuple[list[tuple[str, Path]], int]:
+    """Boards to scan, and how many the mtime filter skipped.
+
+    The root board is always scanned; every other board is skipped when it
+    was provably not written since ``since`` (the home's earliest start).
+    """
     from hermes_cli import kanban_db
 
     root = kanban_db.kanban_home()
@@ -181,7 +231,12 @@ def _board_dbs() -> list[tuple[str, Path]]:
             if child.name == "default":
                 continue
             out.append((child.name, child / "kanban.db"))
-    return [(slug, p) for slug, p in out if p.is_file() and p.stat().st_size > 0]
+    present = [(slug, p) for slug, p in out if p.is_file() and p.stat().st_size > 0]
+    if since is None:
+        return present, 0
+    keep = [(slug, p) for slug, p in present
+            if slug == "default" or not _written_before(p, since)]
+    return keep, len(present) - len(keep)
 
 
 _CARD_SQL = """
@@ -236,19 +291,28 @@ def _query_board(slug: str, path: Path, sql: str, params: list, deadline: float)
             conn.close()
 
 
-def query_cards(ids: Sequence[str], *, budget_s: float = BUDGET_S) -> tuple[list[dict], dict]:
+def query_cards(
+    ids: Sequence[str],
+    *,
+    budget_s: float = BUDGET_S,
+    since: Optional[float] = None,
+    progress: Optional[list] = None,
+) -> tuple[list[dict], dict]:
     """Read open cards homed at ``ids`` from every board, within ``budget_s``.
 
     Boards are read concurrently (per-board cost is dominated by opening the
     WAL database, not the indexed query).  Returns ``(cards, stats)``; a board
-    that is locked/corrupt is skipped (``stats['skipped']``).  Blowing the
-    total budget raises ``_BudgetExceeded`` — partial results are discarded
-    rather than presented as the full home.
+    that is locked/corrupt is skipped (``stats['skipped']``), a board the
+    mtime filter proves irrelevant is never opened (``stats['mtime_skipped']``).
+    Blowing the total budget raises ``_BudgetExceeded`` — partial results are
+    discarded rather than presented as the full home.  ``progress`` (if given)
+    receives each board's cards as that board answers, so a caller that stops
+    waiting can still tell how many were already known.
     """
     from concurrent.futures import ThreadPoolExecutor, wait
 
     deadline = time.monotonic() + budget_s
-    stats = {"boards": 0, "skipped": 0}
+    stats = {"boards": 0, "skipped": 0, "mtime_skipped": 0}
     cards: list[dict] = []
     if not ids:
         return cards, stats
@@ -256,15 +320,21 @@ def query_cards(ids: Sequence[str], *, budget_s: float = BUDGET_S) -> tuple[list
         ids=",".join("?" * len(ids)), statuses=",".join("?" * len(OPEN_STATUSES))
     )
     params = [*ids, *OPEN_STATUSES]
-    dbs = _board_dbs()
+    dbs, stats["mtime_skipped"] = _board_dbs(since)
     stats["boards"] = len(dbs)
     if not dbs:
         return cards, stats
+
+    def _one(slug: str, path: Path) -> list[dict]:
+        rows = _query_board(slug, path, sql, params, deadline)
+        if progress is not None:
+            progress.extend(rows)
+        return rows
+
     pool = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(dbs)),
                               thread_name_prefix="kanban-home-cards")
     try:
-        futures = [pool.submit(_query_board, slug, path, sql, params, deadline)
-                   for slug, path in dbs]
+        futures = [pool.submit(_one, slug, path) for slug, path in dbs]
         done, pending = wait(futures, timeout=max(0.0, deadline - time.monotonic()))
         timed_out = bool(pending)
         for fut in done:
@@ -402,6 +472,110 @@ def _unavailable(reason: str) -> str:
     return f"[Your open cards: unavailable ({reason}) — {LIST_HINT}]"[:MAX_UNAVAILABLE]
 
 
+# ── probe (I5, P1) ──────────────────────────────────────────────────────────
+def _ms(since: float) -> int:
+    return int((time.monotonic() - since) * 1000)
+
+
+class _Probe:
+    """One session's DB work (lineage -> dedupe -> boards) on a daemon thread.
+
+    ``stage`` always names the step in flight, so a caller that stops waiting
+    can attribute the timeout; ``partial`` collects cards as boards answer.
+    ``result`` is ``("dedupe",)``, ``("cards", cards, stats)``,
+    ``("timeout",)`` (own ``PROBE_MAX_S`` cap) or ``("error", msg)``.
+    """
+
+    def __init__(self, session_id: str, *, prewarmed: bool = False) -> None:
+        self.session_id = session_id
+        self.prewarmed = prewarmed
+        self.created = time.monotonic()
+        self.stage = "lineage"
+        self.stage_ms: dict[str, int] = {}
+        self.partial: list = []
+        self.result: tuple = ()
+        self.done = threading.Event()
+
+    def start(self) -> "_Probe":
+        threading.Thread(target=self._run, name="kanban-home-cards-probe",
+                         daemon=True).start()
+        return self
+
+    def _run(self) -> None:
+        try:
+            t = time.monotonic()
+            ids = home_ids(self.session_id)
+            since = home_started_at(self.session_id)
+            self.stage_ms["lineage"] = _ms(t)
+            self.stage, t = "dedupe", time.monotonic()
+            dup = _persisted_recently_injected(self.session_id, t + PROBE_MAX_S)
+            self.stage_ms["dedupe"] = _ms(t)
+            if dup:
+                self.result = ("dedupe",)
+                return
+            self.stage, t = "boards", time.monotonic()
+            cards, stats = query_cards(ids, budget_s=PROBE_MAX_S, since=since,
+                                       progress=self.partial)
+            self.stage_ms["boards"] = _ms(t)
+            self.result = ("cards", cards, stats)
+        except _BudgetExceeded:
+            self.result = ("timeout",)
+        except Exception as exc:
+            self.result = ("error", str(exc))
+        finally:
+            self.done.set()
+
+
+_PROBES: dict[str, _Probe] = {}
+
+
+def _prewarm(session_id: str) -> Optional[_Probe]:
+    """Start a probe for a session this process has not served yet."""
+    now = time.monotonic()
+    with _SEEN_LOCK:
+        if session_id in _SEEN or session_id in _PROBES:
+            return None
+        for sid in [s for s, p in _PROBES.items() if now - p.created > PROBE_FRESH_S]:
+            _PROBES.pop(sid, None)
+        while len(_PROBES) >= MAX_PROBES:
+            _PROBES.pop(next(iter(_PROBES)))
+        probe = _PROBES[session_id] = _Probe(session_id, prewarmed=True)
+    return probe.start()
+
+
+def _take_probe(session_id: str) -> _Probe:
+    with _SEEN_LOCK:
+        probe = _PROBES.pop(session_id, None)
+    if probe is not None and time.monotonic() - probe.created <= PROBE_FRESH_S:
+        return probe
+    return _Probe(session_id).start()
+
+
+def on_pre_gateway_dispatch(
+    event: Any = None, gateway: Any = None, session_store: Any = None, **_: Any
+) -> None:
+    """P1: start the probe as soon as the gateway sees an inbound message.
+
+    Resolves the session id from the gateway's in-process session store (no
+    DB).  Never influences dispatch: always returns ``None`` (= allow).
+    """
+    try:
+        source = getattr(event, "source", None)
+        if source is None or session_store is None:
+            return None
+        plat = getattr(source, "platform", "")
+        if _excluded(str(getattr(plat, "value", plat) or "")):
+            return None
+        key_fn = getattr(gateway, "_session_key_for_source", None)
+        key = key_fn(source) if callable(key_fn) else session_store._generate_session_key(source)
+        sid = session_store.peek_session_id(key)
+        if sid:
+            _prewarm(str(sid))
+    except Exception as exc:
+        logger.debug("kanban-home-cards: prewarm skipped: %s", exc)
+    return None
+
+
 def on_pre_llm_call(
     session_id: str = "",
     platform: str = "",
@@ -417,28 +591,43 @@ def on_pre_llm_call(
         if _recently_injected(conversation_history):  # R3 (replayed history)
             return None
         started = time.monotonic()
-        if _persisted_recently_injected(sid, started + BUDGET_S):  # R3 (state.db)
-            return None
-        remaining = BUDGET_S - (time.monotonic() - started)
-        if remaining <= 0:
-            logger.info("kanban-home-cards: session=%s unavailable=timeout (dedupe)", sid)
-            return None
-        try:
-            cards, stats = query_cards(home_ids(sid), budget_s=remaining)
-        except _BudgetExceeded as exc:
+        probe = _take_probe(sid)
+        if not probe.done.wait(BUDGET_S):  # I5 — the turn never waits longer
+            partial = len(probe.partial) if probe.stage == "boards" else 0
             logger.info(
-                "kanban-home-cards: session=%s unavailable=timeout partial_cards=%d",
-                sid, exc.partial_cards,
+                "kanban-home-cards: session=%s unavailable=timeout stage=%s "
+                "partial_cards=%d ms=%d prewarmed=%s",
+                sid, probe.stage, partial, _ms(started), probe.prewarmed,
             )
             # A home already known to be non-empty gets a pointer; an
             # unknown/empty one stays zero-token (D5) instead of paying a
             # line on every session start of a loaded host.
-            return {"context": _unavailable("timeout")} if exc.partial_cards else None
+            return {"context": _unavailable("timeout")} if partial else None
+        kind = probe.result[0] if probe.result else "error"
+        if kind == "dedupe":  # R3 (state.db)
+            return None
+        if kind == "timeout":
+            partial = len(probe.partial)
+            logger.info(
+                "kanban-home-cards: session=%s unavailable=timeout stage=boards "
+                "partial_cards=%d ms=%d prewarmed=%s",
+                sid, partial, _ms(started), probe.prewarmed,
+            )
+            return {"context": _unavailable("timeout")} if partial else None
+        if kind != "cards":
+            logger.warning("kanban-home-cards: failed open: %s",
+                           probe.result[1] if len(probe.result) > 1 else "no result")
+            return None
+        _, cards, stats = probe.result
         block = render(cards)
-        ms = int((time.monotonic() - started) * 1000)
         logger.info(
-            "kanban-home-cards: session=%s cards=%d chars=%d ms=%d boards=%d skipped=%d",
-            sid, len(cards), len(block or ""), ms, stats["boards"], stats["skipped"],
+            "kanban-home-cards: session=%s cards=%d chars=%d ms=%d boards=%d "
+            "skipped=%d mtime_skipped=%d prewarmed=%s lineage_ms=%d dedupe_ms=%d "
+            "boards_ms=%d",
+            sid, len(cards), len(block or ""), _ms(started), stats["boards"],
+            stats["skipped"], stats.get("mtime_skipped", 0), probe.prewarmed,
+            probe.stage_ms.get("lineage", -1), probe.stage_ms.get("dedupe", -1),
+            probe.stage_ms.get("boards", -1),
         )
         return {"context": block} if block else None
     except Exception as exc:  # I5 — never raise into the turn
@@ -448,3 +637,4 @@ def on_pre_llm_call(
 
 def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
+    ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
