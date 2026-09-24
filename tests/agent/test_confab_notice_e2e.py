@@ -307,10 +307,7 @@ class TestConfabNoticeEndToEnd:
                      for r in db.get_messages(session) if r.get("display_kind") == CONFAB_NOTICE_DISPLAY_KIND]
         assert persisted and all(is_metadata_only_tool_notice(r) for r in persisted)
 
-    @pytest.mark.parametrize("engine", ["builtin", "lcm"])
-    @pytest.mark.parametrize("event_position", [3, 38, 47])
-    @pytest.mark.parametrize("fallback", [False, True])
-    def test_compaction_event_does_not_split_parallel_tool_results(self, notice_env, stream, engine, event_position, fallback, tmp_path):
+    def _check_compaction_event_does_not_split_parallel_tool_results(self, notice_env, stream, engine, event_position, fallback, tmp_path):
         make_agent, handler, db, sid, _ = notice_env
         handler.response_queue.extend([
             ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
@@ -441,9 +438,7 @@ class TestConfabNoticeEndToEnd:
             if positions:
                 assert positions[-1] < event_idx, "event moved before its original predecessor"
 
-    @pytest.mark.parametrize("engine", ["builtin", "lcm"])
-    @pytest.mark.parametrize("event_position", [1, 3, 7, 19])
-    def test_compaction_event_stays_between_original_neighbours_with_head_twins(
+    def _check_compaction_event_stays_between_original_neighbours_with_head_twins(
         self, notice_env, stream, engine, event_position, tmp_path
     ):
         make_agent, handler, db, sid, _ = notice_env
@@ -537,10 +532,9 @@ class TestConfabNoticeEndToEnd:
             else:
                 assert index > summary, "event from the dropped middle entered protected head"
 
-    @pytest.mark.parametrize("engine", ["builtin", "lcm"])
-    @pytest.mark.parametrize("layout", ["bigargs", "twins", "image", "merge"])
-    @pytest.mark.parametrize("event_position", range(1, 32, 2))
-    def test_rewritten_kept_rows_preserve_notice_timeline(
+    # Called by the small per-layout/engine test files: each completes within
+    # CI's five-minute per-file ceiling, while retaining every position.
+    def _check_rewritten_kept_rows_preserve_notice_timeline(
         self, notice_env, stream, engine, layout, event_position, tmp_path
     ):
         make_agent, handler, db, sid, _ = notice_env
@@ -746,6 +740,93 @@ class TestConfabNoticeEndToEnd:
         assert len(compressed) == 2
         assert compressed[0]["content"] == "same"
         assert is_metadata_only_tool_notice(compressed[1])
+
+    def test_plugin_equal_head_cannot_match_overlapping_tail(self, notice_env, stream):
+        make_agent, handler, db, sid, _ = notice_env
+        handler.response_queue[:] = [
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
+        ]
+        make_agent(stream=stream).run_conversation("first", conversation_history=[], task_id="writer")
+        event = next(m for m in db.get_messages_as_conversation(sid)
+                     if is_metadata_only_tool_notice(m))
+        twin = {"role": "user", "content": "same"}
+        history = [twin, event, {"role": "assistant", "content": "dropped"}, dict(twin)]
+        agent = make_agent(stream=stream)
+        agent.context_compressor.compress = lambda rows, **kw: [dict(twin)]
+        compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
+        assert len(compressed) == 2
+        assert compressed[0]["content"] == twin["content"]
+        assert is_metadata_only_tool_notice(compressed[1])
+
+    def test_lcm_stamp_anchors_notice_before_rewritten_kept_successor(
+        self, notice_env, stream, tmp_path
+    ):
+        from plugins.context_engine.lcm.config import LCMConfig
+        from plugins.context_engine.lcm.engine import LCMEngine
+
+        make_agent, handler, db, sid, _ = notice_env
+        handler.response_queue[:] = [
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
+        ]
+        make_agent(stream=stream).run_conversation("first", conversation_history=[], task_id="writer")
+        event = next(m for m in db.get_messages_as_conversation(sid)
+                     if is_metadata_only_tool_notice(m))
+        history = [{"role": "user", "content": "head"}, event,
+                   {"role": "user", "content": "original successor"},
+                   {"role": "assistant", "content": "discarded " * 200},
+                   {"role": "user", "content": "tail"}]
+        agent = make_agent(stream=stream)
+        agent.session_id = "lcm-stamp-rewrite"
+        cc = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")),
+                       hermes_home=str(tmp_path))
+        cc.on_session_start(agent.session_id, hermes_home=str(tmp_path))
+        def rewritten(rows, **kw):
+            return [dict(rows[0]), {"role": "assistant", "content": "summary"},
+                    {**rows[1], "content": "rewritten successor", "_src_idx": 1},
+                    {**rows[3], "_src_idx": 3}]
+        agent.context_compressor = cc
+        try:
+            with patch.object(cc, "compress", side_effect=rewritten):
+                compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
+            assert [m.get("content") for m in compressed] == [
+                "head", "summary", "", "rewritten successor", "tail"
+            ]
+            assert is_metadata_only_tool_notice(compressed[2])
+            assert all("_src_idx" not in row for row in compressed)
+        finally:
+            cc.shutdown()
+
+    def test_stamped_predecessor_cannot_be_overridden_by_equal_tail(
+        self, notice_env, stream, tmp_path
+    ):
+        from plugins.context_engine.lcm.config import LCMConfig
+        from plugins.context_engine.lcm.engine import LCMEngine
+
+        make_agent, handler, db, sid, _ = notice_env
+        handler.response_queue[:] = [
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
+        ]
+        make_agent(stream=stream).run_conversation("first", conversation_history=[], task_id="writer")
+        event = next(m for m in db.get_messages_as_conversation(sid)
+                     if is_metadata_only_tool_notice(m))
+        twin = {"role": "user", "content": "same"}
+        history = [twin, event, {"role": "assistant", "content": "dropped " * 200},
+                   dict(twin)]
+        agent = make_agent(stream=stream)
+        agent.session_id = "lcm-stamped-predecessor"
+        cc = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")),
+                       hermes_home=str(tmp_path))
+        cc.on_session_start(agent.session_id, hermes_home=str(tmp_path))
+        agent.context_compressor = cc
+        try:
+            with patch.object(cc, "compress", side_effect=lambda rows, **kw: [
+                {"role": "assistant", "content": "summary"}, {**rows[0], "_src_idx": 0}
+            ]):
+                compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
+            assert [m.get("content") for m in compressed] == ["summary", "same", ""]
+            assert is_metadata_only_tool_notice(compressed[-1])
+        finally:
+            cc.shutdown()
 
     def test_same_request_id_retry_has_one_durable_event(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env

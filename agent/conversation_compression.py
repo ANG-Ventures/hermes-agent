@@ -5528,9 +5528,18 @@ def compress_context(
                                 len(_b_idx), len(_cur_idx), _sid, _src,
                             )
 
+                    # LCM's provenance stamp indexes the event-free engine
+                    # input. Use that same index space on BOTH sides of the
+                    # stats partition; presentation-only events count as
+                    # neither anchors nor folded conversation content.
+                    _stats_messages = engine_messages if tool_events else messages
+                    _stats_compressed = (
+                        [row for row in compressed if not is_metadata_only_tool_notice(row)]
+                        if tool_events else compressed
+                    )
                     _cand = build_inturn_stats(
-                        messages=messages,
-                        compressed=compressed,
+                        messages=_stats_messages,
+                        compressed=_stats_compressed,
                         estimator=_est,
                         engine_is_lcm=(_engine_name == "lcm"),
                         sanitize=getattr(_cc, "_sanitize_active_context_messages", None),
