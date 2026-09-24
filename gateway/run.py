@@ -25632,7 +25632,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # miss (thread rename, /sethome, redact_pii flip, ...) re-renders
         # once — the only legitimate cache busts.
         context_prompt = self._pinned_session_context_prompt(
-            context, _redact_pii, session_key
+            context, _redact_pii, session_key,
+            internal=bool(getattr(event, "internal", False)),
         )
 
         # Per-turn must-deliver notes.  These used to be appended to
@@ -35565,7 +35566,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return f"[Voice channel now: {vc_now}]"
 
     def _pinned_session_context_prompt(
-        self, context, redact_pii: bool, session_key: Optional[str]
+        self,
+        context,
+        redact_pii: bool,
+        session_key: Optional[str],
+        *,
+        internal: bool = False,
     ) -> str:
         """Return the session-context prompt, pinned per session.
 
@@ -35573,12 +35579,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         composed system prompt against renderer nondeterminism); key miss →
         re-render ``build_session_context_prompt`` and re-pin (a legitimate
         cache bust: rename, topic edit, /sethome, redact_pii flip, ...).
+
+        ``internal`` events (kanban wakes, delegation completions, watch
+        notifications) carry a source rebuilt from the persisted origin, which
+        lacks chat_name/user_name/message_id. Rendering from it produced
+        different bytes than the surrounding human turns, so every internal
+        turn re-keyed the pin and the next human turn re-keyed it back (A→B→A).
+        Each flip rewrote already-sent system bytes and collapsed the prompt
+        cache to the static prefix (t_064c65a9). An internal event is never a
+        real metadata change, so it reuses the existing pin verbatim and never
+        re-pins.
         """
-        _eph_key = self._ephemeral_change_key(context, redact_pii)
         _eph_pin = None
         if session_key:
             _pin_state = self._peek_session_state(session_key)
             _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
+        if internal:
+            if _eph_pin is not None:
+                return _eph_pin[1]
+            return build_session_context_prompt(context, redact_pii=redact_pii)
+        _eph_key = self._ephemeral_change_key(context, redact_pii)
         if _eph_pin is not None and _eph_pin[0] == _eph_key:
             return _eph_pin[1]
         text = build_session_context_prompt(context, redact_pii=redact_pii)

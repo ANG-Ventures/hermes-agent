@@ -208,6 +208,50 @@ class TestSessionContextPin:
         # immunizing against renderer nondeterminism.
         assert second is first
 
+    @staticmethod
+    def _internal_ctx():
+        # The source an internal event (kanban wake, delegation completion)
+        # carries: rebuilt from the persisted origin, so display names and the
+        # triggering message id are absent (measured live, t_064c65a9).
+        return _make_context(chat_name=None, user_name=None, message_id=None)
+
+    def test_internal_event_reuses_pin_across_human_internal_human(self):
+        """human → internal → human must emit byte-identical context bytes.
+
+        Before the fix the internal turn re-keyed the pin (A) and the next
+        human turn re-keyed it back (B): an A→B→A toggle of already-sent
+        system bytes that collapsed the prompt cache to the static prefix.
+        """
+        runner = _make_runner()
+        # The fixture is only meaningful if the degraded source really renders
+        # different bytes; otherwise this test proves nothing.
+        assert _render(self._internal_ctx()) != _render(_make_context())
+        human1 = runner._pinned_session_context_prompt(_make_context(), False, "sk")  # noqa: SLF001
+        internal = runner._pinned_session_context_prompt(  # noqa: SLF001
+            self._internal_ctx(), False, "sk", internal=True
+        )
+        human2 = runner._pinned_session_context_prompt(_make_context(), False, "sk")  # noqa: SLF001
+        assert internal is human1
+        assert human2 is human1
+
+    def test_internal_event_without_pin_does_not_pin_degraded_bytes(self):
+        runner = _make_runner()
+        runner._pinned_session_context_prompt(  # noqa: SLF001
+            self._internal_ctx(), False, "sk", internal=True
+        )
+        human = runner._pinned_session_context_prompt(_make_context(), False, "sk")  # noqa: SLF001
+        again = runner._pinned_session_context_prompt(_make_context(), False, "sk")  # noqa: SLF001
+        assert human == _render(_make_context())
+        assert again is human
+
+    def test_human_metadata_change_still_repins(self):
+        runner = _make_runner()
+        first = runner._pinned_session_context_prompt(_make_context(), False, "sk")  # noqa: SLF001
+        renamed = runner._pinned_session_context_prompt(  # noqa: SLF001
+            _make_context(chat_name="renamed"), False, "sk"
+        )
+        assert renamed != first
+
 
 # ---------------------------------------------------------------------------
 # 3. Two-turn byte test: composed system prompt sha256 + codex cache key
