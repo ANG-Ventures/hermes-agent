@@ -672,7 +672,9 @@ class GatewaySlashCommandsMixin:
         preserved_preferences = []
         unavailable_model_preference = False
         if preserve_route_preferences and new_entry:
-            route_lookup = self._persisted_session_route_identity(session_key)
+            route_lookup = await asyncio.to_thread(
+                self._persisted_session_route_identity, session_key
+            )
             invalid_model_preference = route_lookup.state == "unavailable"
             if (
                 route_lookup.identity
@@ -5223,7 +5225,9 @@ class GatewaySlashCommandsMixin:
 
         user_config = _load_gateway_config()
         session_key = self._session_key_for_source(event.source)
-        persisted_lookup = self._persisted_session_route_identity(session_key)
+        persisted_lookup = await asyncio.to_thread(
+            self._persisted_session_route_identity, session_key
+        )
         if persisted_lookup.state == "unavailable":
             return t("gateway.fast.preference_unavailable", route="<unreadable>")
         model, provider, api_mode = self._resolve_configured_session_route_identity(
