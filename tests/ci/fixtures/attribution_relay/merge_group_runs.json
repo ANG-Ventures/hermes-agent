@@ -1,0 +1,48 @@
+{
+ "capture": {
+  "captured_at": "2026-09-24T11:18:02Z",
+  "command": "gh api repos/ANG-Ventures/hermes-agent/actions/runs?event=merge_group&per_page=100 --jq [.workflow_runs[] | select(.name == \"CI\" and (.head_branch | test(\"/pr-(829|945|947|955)-\"))) | {id,name,event,head_branch,head_sha,status,conclusion,created_at}]"
+ },
+ "response": [
+  {
+   "conclusion": "success",
+   "created_at": "2026-09-24T09:35:56Z",
+   "event": "merge_group",
+   "head_branch": "gh-readonly-queue/main/pr-955-f2fffde3acca1bcf68533bf516c851d636cf743e",
+   "head_sha": "4956e38e1885f7d7b14e15e75120fbd9a161bbf1",
+   "id": 35982206893,
+   "name": "CI",
+   "status": "completed"
+  },
+  {
+   "conclusion": "success",
+   "created_at": "2026-09-24T09:20:10Z",
+   "event": "merge_group",
+   "head_branch": "gh-readonly-queue/main/pr-947-cfa22067fe4baa9ae861abc10d97a5b358fff80a",
+   "head_sha": "f2fffde3acca1bcf68533bf516c851d636cf743e",
+   "id": 35980597837,
+   "name": "CI",
+   "status": "completed"
+  },
+  {
+   "conclusion": "success",
+   "created_at": "2026-09-24T08:32:55Z",
+   "event": "merge_group",
+   "head_branch": "gh-readonly-queue/main/pr-945-a7942d7989e45ac26863188e7052e79bfe901893",
+   "head_sha": "cfa22067fe4baa9ae861abc10d97a5b358fff80a",
+   "id": 35975885753,
+   "name": "CI",
+   "status": "completed"
+  },
+  {
+   "conclusion": "success",
+   "created_at": "2026-09-24T05:26:52Z",
+   "event": "merge_group",
+   "head_branch": "gh-readonly-queue/main/pr-829-a89383d5dc85ed10f378c625ff845ed9177ad3f5",
+   "head_sha": "a7942d7989e45ac26863188e7052e79bfe901893",
+   "id": 35959975735,
+   "name": "CI",
+   "status": "completed"
+  }
+ ]
+}
