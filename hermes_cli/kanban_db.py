@@ -2230,7 +2230,14 @@ class Task:
     # tasks created from the CLI, the dashboard, or any path that doesn't
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
+    #
+    # The ``"unhomed"`` sentinel (:data:`UNHOMED_SESSION`, stamped by
+    # :func:`create_task` when a card is born with no session identity) is
+    # NEVER surfaced here: it loads as ``session_id=None`` + ``unhomed=True``
+    # so every notification/wake consumer of ``task.session_id`` keeps its
+    # pre-sentinel semantics (no phantom wake keyed ``"unhomed"``).
     session_id: Optional[str] = None
+    unhomed: bool = False
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -2323,8 +2330,10 @@ class Task:
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
             ),
             session_id=(
-                row["session_id"] if "session_id" in keys else None
+                None if "session_id" not in keys or is_unhomed(row["session_id"])
+                else row["session_id"]
             ),
+            unhomed=("session_id" in keys and is_unhomed(row["session_id"])),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
             ),
@@ -4824,6 +4833,143 @@ def _resolve_stored_model_pair(
 # reclaims first) are never re-checked against other cards.
 
 
+# Home stamp for a card born with NO session identity (cron, launchd, a plain
+# shell, a script calling the library). Never NULL: an unstamped card has no
+# home, so every session felt entitled to it (58/144 open cards, 2026-09-23).
+# ``unhomed`` is foreign to EVERY session -- a chat must take it over
+# explicitly (``--takeover``); the execution lane (no bound actor, the
+# assignee, the dispatched worker) is unaffected.
+UNHOMED_SESSION = "unhomed"
+
+
+def is_unhomed(session_id: Any) -> bool:
+    return str(session_id or "").strip() == UNHOMED_SESSION
+
+
+def _ambient_session_env(name: str) -> str:
+    """Per-session gateway context (ContextVar-first), env outside it."""
+    try:
+        from gateway.session_context import get_session_env
+
+        return (get_session_env(name, "") or "").strip()
+    except Exception:
+        return (os.environ.get(name) or "").strip()
+
+
+def format_origin_line(
+    session_id: Optional[str],
+    *,
+    created_by: Optional[str] = None,
+    now: Optional[float] = None,
+) -> str:
+    """``origin: <platform> <chat_name> (<chat_id>) · session <id> · <date>``.
+
+    The human-readable birth certificate prepended to a card body, so any
+    session reading the card sees whose it is without a DB lookup.
+    """
+    date = time.strftime("%Y-%m-%d", time.localtime(now if now is not None else time.time()))
+    if not session_id or is_unhomed(session_id):
+        who = f" · by {created_by}" if created_by else ""
+        return (
+            "origin: unhomed (no session identity: cron/script/shell)"
+            f"{who} · {date}"
+        )
+    platform = _ambient_session_env("HERMES_SESSION_PLATFORM") or "cli"
+    chat_name = _ambient_session_env("HERMES_SESSION_CHAT_NAME")
+    chat_id = _ambient_session_env("HERMES_SESSION_CHAT_ID")
+    where = platform
+    if chat_name:
+        where += f" {chat_name}"
+    if chat_id:
+        where += f" ({chat_id})"
+    return f"origin: {where} · session {session_id} · {date}"
+
+
+def body_has_origin(body: Optional[str]) -> bool:
+    return any(
+        line.strip().lower().startswith("origin:")
+        for line in (body or "").splitlines()
+    )
+
+
+def stamp_origin_body(body: Optional[str], origin_line: str) -> str:
+    """Prepend ``origin_line`` unless the body already carries one."""
+    if body_has_origin(body):
+        return body or ""
+    rest = (body or "").strip("\n")
+    return f"{origin_line}\n\n{rest}" if rest.strip() else origin_line
+
+
+def _resolve_birth_session(
+    conn: sqlite3.Connection, session_id: Optional[str], parents: Iterable[str]
+) -> str:
+    """THE home a new card is born with: explicit > first homed parent's
+    home (fan-out children belong to their root's session) > ``unhomed``."""
+    sid = (str(session_id).strip() if session_id else "")
+    if sid:
+        return sid
+    for pid in parents or ():
+        row = conn.execute(
+            "SELECT session_id FROM tasks WHERE id = ?", (pid,)
+        ).fetchone()
+        home = (row["session_id"] or "").strip() if row is not None else ""
+        if home and not is_unhomed(home):
+            return home
+    return UNHOMED_SESSION
+
+
+UNHOMED_BACKFILL_COMMENT = (
+    "origin: unknown (pre-stamp or cron) \u00b7 homed-by triage -- this card "
+    "had no home session; stamped '" + UNHOMED_SESSION + "' so no chat session "
+    "adopts it implicitly. The home session (or the triage sweep) re-homes "
+    "it with: hermes kanban update <id> --session <sid> --takeover \"<reason>\""
+)
+
+
+def find_homeless_open_tasks(conn: sqlite3.Connection) -> list[str]:
+    """Open (non-terminal, non-archived) cards with a NULL/empty home."""
+    return [
+        r["id"] for r in conn.execute(
+            "SELECT id FROM tasks WHERE (session_id IS NULL OR "
+            "TRIM(session_id) = '') AND status NOT IN ('done', 'archived') "
+            "ORDER BY created_at, id"
+        )
+    ]
+
+
+def backfill_unhomed(
+    conn: sqlite3.Connection, *, dry_run: bool = False, author: str = "kanban-home-lint"
+) -> list[str]:
+    """Stamp every homeless OPEN card ``unhomed`` + an explanatory comment.
+
+    Execution-lane write (no mutation actor): it restamps only rows that
+    have no home at all, so there is no home session to trespass on.
+    ``task_comments`` carries only a one-way ``session_ref`` fingerprint,
+    so a home cannot be recovered from comments; ``unhomed`` is the
+    honest value. Idempotent: a second run finds nothing.
+    """
+    ids = find_homeless_open_tasks(conn)
+    if dry_run:
+        return ids
+    done: list[str] = []
+    for tid in ids:
+        with write_txn(conn, allow_nested=True):
+            cur = conn.execute(
+                "UPDATE tasks SET session_id = ? WHERE id = ? AND "
+                "(session_id IS NULL OR TRIM(session_id) = '')",
+                (UNHOMED_SESSION, tid),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn, tid, "session_restamped",
+                {"session_id": UNHOMED_SESSION, "backfill": True},
+            )
+        add_comment(conn, tid, author=author, body=UNHOMED_BACKFILL_COMMENT)
+        done.append(tid)
+    return done
+
+
 class ForeignSessionMutationError(ValueError):
     """A chat-driven status/ownership mutation targeted a card whose home
     session is a different session. ``ValueError`` so every existing CLI /
@@ -5046,15 +5192,26 @@ def check_home_session(
         )
         return None
     override = (
-        '--foreign-ok "<reason>"' if actor.surface == "cli"
+        '--takeover "<reason>"' if actor.surface == "cli"
         else 'foreign_ok="<reason>"'
     )
+    if is_unhomed(home):
+        raise ForeignSessionMutationError(
+            f"refused {action} on {task_id}: it is UNHOMED (born with no "
+            f"session identity -- cron/script/shell), so no session owns it "
+            f"(caller session: {caller}). Comment instead: "
+            f"hermes kanban comment {task_id} \"...\", or take it over "
+            f"explicitly with {override} (adopt it for good: hermes kanban "
+            f"update {task_id} --session <yours> --takeover \"<reason>\"); "
+            f"the takeover is recorded as an event + audit comment."
+        )
     raise ForeignSessionMutationError(
         f"refused {action} on {task_id}: its home session is {home} "
         f"(caller session: {caller}). Status/ownership changes belong to the "
         f"home session or the assignee -- comment instead: "
         f"hermes kanban comment {task_id} \"...\" "
-        f"(or override with {override}, which posts an audit comment)."
+        f"(or take over with {override}, which records a takeover event + "
+        f"an audit comment the home session sees)."
     )
 
 
@@ -5071,6 +5228,25 @@ def record_foreign_action(
 ) -> None:
     """Append the audit comment for an overridden foreign-session mutation."""
     sess = ", ".join(actor.session_ids) or "no-session"
+    home_row = conn.execute(
+        "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    with write_txn(conn, allow_nested=True):
+        _append_event(
+            conn,
+            task_id,
+            "takeover",
+            {
+                "action": action,
+                "reason": actor.foreign_ok,
+                "by_sessions": list(actor.session_ids),
+                "by_profile": actor.profile,
+                "by_chat": _ambient_session_env("HERMES_SESSION_CHAT_NAME")
+                or _ambient_session_env("HERMES_SESSION_CHAT_ID")
+                or None,
+                "home": (home_row["session_id"] if home_row is not None else None),
+            },
+        )
     session_ref = None
     if actor.session_ids:
         try:
@@ -5082,8 +5258,8 @@ def record_foreign_action(
         task_id,
         author=actor.profile or "user",
         body=(
-            f"foreign-session action by {sess} ({actor.profile or 'unknown'}): "
-            f"{actor.foreign_ok} [{action}]"
+            f"takeover: foreign-session action by {sess} "
+            f"({actor.profile or 'unknown'}): {actor.foreign_ok} [{action}]"
         ),
         session_ref=session_ref,
     )
@@ -5252,6 +5428,16 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    # Home-session stamp at birth -- the ONE choke point every create path
+    # (CLI, kanban tool, swarm, dashboard, library callers) flows through, so
+    # no card can land without a home (never NULL) or without an origin line.
+    parents = tuple(parents or ())
+    created_by = created_by or _ambient_session_env("HERMES_SESSION_PROFILE") or None
+    session_id = _resolve_birth_session(conn, session_id, parents)
+    body = stamp_origin_body(
+        body, format_origin_line(session_id, created_by=created_by)
+    )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo

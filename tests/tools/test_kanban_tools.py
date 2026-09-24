@@ -517,6 +517,41 @@ def test_create_persists_model_override(worker_env):
         conn.close()
 
 
+def test_create_tool_stamps_session_and_origin(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260924_000000_toolsess")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "#ops")
+    d = json.loads(kt._handle_create({"title": "tool card", "assignee": "peer",
+                                      "body": "work"}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, d["task_id"])
+        assert t.session_id == "20260924_000000_toolsess"
+        assert t.body.splitlines()[0].startswith(
+            "origin: discord #ops \u00b7 session 20260924_000000_toolsess")
+    finally:
+        conn.close()
+
+
+def test_create_tool_without_session_is_unhomed(worker_env, monkeypatch):
+    """Cron/worker creates with no session env are born 'unhomed', never NULL."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    d = json.loads(kt._handle_create({"title": "orphan", "assignee": "peer"}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        raw = conn.execute("SELECT session_id FROM tasks WHERE id = ?",
+                           (d["task_id"],)).fetchone()
+        assert raw["session_id"] == kb.UNHOMED_SESSION
+    finally:
+        conn.close()
+
+
 def test_create_no_model_override_is_null(worker_env):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
