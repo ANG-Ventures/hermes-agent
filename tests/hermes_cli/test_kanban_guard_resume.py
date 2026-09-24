@@ -97,6 +97,27 @@ def test_inline_audit_comment_does_not_shift_ready_requeue(board, monkeypatch):
         assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
 
 
+def test_legacy_equal_length_inline_comment_requeues(board, monkeypatch):
+    import time
+
+    now = int(time.time())
+    monkeypatch.setattr(kbd.time, "time", lambda: now)
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy inline audit", assignee="worker")
+        pr = "https://github.com/o/r/pull/9"
+        with kb.write_txn(conn):
+            kb._insert_comment(conn, task_id, "worker", "x" * len(pr), now)
+        kb.add_comment(conn, task_id, "worker", pr)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+                         "WHERE task_id=? AND kind='commented'", (task_id,))
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue PR") == (True, None)
+        assert kbd.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(conn, task_id, "worker", "https://github.com/o/r/pull/10")
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+
 def test_dependency_intent_cannot_attach_to_second_promotion(board):
     with kbc.connect() as conn:
         child = kb.create_task(conn, title="implement", assignee="worker")

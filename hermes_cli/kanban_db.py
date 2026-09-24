@@ -1586,7 +1586,16 @@ def requeue_task(conn: sqlite3.Connection, task_id: str, *, actor: str, reason: 
             return False, "task not found"
         if row["status"] != "ready" or row["claim_lock"] is not None:
             return False, "requeue requires an unclaimed READY task"
-        _append_event(conn, task_id, "requeued", {"actor": actor, "reason": reason.strip()})
+        from hermes_cli.kanban_db_dispatch import _RESPAWN_GUARD_PR_URL_RE, _RESPAWN_GUARD_PR_WINDOW
+
+        pr_comment_id = next((c["id"] for c in conn.execute(
+            "SELECT id, body FROM task_comments WHERE task_id = ? "
+            "AND created_at >= ? ORDER BY id DESC",
+            (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+        ) if _RESPAWN_GUARD_PR_URL_RE.search(_lossy_text(c["body"]) or "")), None)
+        _append_event(conn, task_id, "requeued", {
+            "actor": actor, "reason": reason.strip(), "pr_comment_id": pr_comment_id,
+        })
     return True, None
 
 

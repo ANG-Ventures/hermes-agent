@@ -1613,6 +1613,17 @@ def check_respawn_guard(
         # work on the same PR until the parent completes. The promotion grants
         # one continuation spawn only; a later crash/reclaim stays guarded.
         # Event ids disambiguate transitions within one timestamp second.
+        # Explicit READY requeue snapshots the latest PR comment id. Historical
+        # commented events may be ambiguous when inline audit comments share
+        # the same second, author and length; the snapshot still recovers them.
+        if conn.execute(
+            "SELECT 1 FROM task_events i WHERE i.task_id = ? AND i.kind = 'requeued' "
+            "AND json_extract(i.payload, '$.pr_comment_id') = ? "
+            "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
+            "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
+            (task_id, c["id"]),
+        ).fetchone():
+            return None
         # New comments identify their event directly. For older comments,
         # correlate author/length within this second so unrelated inline audit
         # comments do not shift the event ordinal.
