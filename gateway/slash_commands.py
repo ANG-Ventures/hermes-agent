@@ -589,6 +589,9 @@ class GatewaySlashCommandsMixin:
             preserve_route_preferences=preserve_route_preferences,
         )
 
+        # Both calls can re-resolve provider credentials via
+        # model_switch.switch_model -> validate_requested_model, which may do a
+        # blocking GET of <base_url>/v1/models. Never on the event loop (t_515b7fce).
         if preserve_route_preferences:
             # Off the loop: re-resolves the persisted route's credentials
             # (config load + provider resolution; OAuth refresh can hit the
@@ -2655,7 +2658,10 @@ class GatewaySlashCommandsMixin:
                             except Exception:
                                 _sw_old_window = None
                             try:
-                                cached_entry[0].switch_model(
+                                # Off-loop: the in-place swap rebuilds clients and
+                                # can probe the provider (t_515b7fce).
+                                await asyncio.to_thread(
+                                    cached_entry[0].switch_model,
                                     new_model=result.new_model,
                                     new_provider=result.target_provider,
                                     api_key=result.api_key,
@@ -3080,7 +3086,10 @@ class GatewaySlashCommandsMixin:
                 except Exception:
                     _sw_old_window = None
                 try:
-                    cached_entry[0].switch_model(
+                    # Off-loop: the in-place swap rebuilds clients and can
+                    # probe the provider (t_515b7fce).
+                    await asyncio.to_thread(
+                        cached_entry[0].switch_model,
                         new_model=result.new_model,
                         new_provider=result.target_provider,
                         api_key=result.api_key,
@@ -4705,7 +4714,10 @@ class GatewaySlashCommandsMixin:
             return t("gateway.btw.no_history")
 
         try:
-            model, runtime_kwargs = self._resolve_session_agent_runtime(
+            # Off-loop: override rehydrate can re-resolve credentials and GET the
+            # provider's /v1/models synchronously (t_515b7fce).
+            model, runtime_kwargs = await asyncio.to_thread(
+                self._resolve_session_agent_runtime,
                 source=source,
             )
         except Exception:
@@ -5896,7 +5908,10 @@ class GatewaySlashCommandsMixin:
             platform_key = (
                 _platform_config_key(source.platform) if source.platform else None
             )
-            model, runtime_kwargs = self._resolve_session_agent_runtime(
+            # Off-loop: override rehydrate can re-resolve credentials and GET the
+            # provider's /v1/models synchronously (t_515b7fce).
+            model, runtime_kwargs = await asyncio.to_thread(
+                self._resolve_session_agent_runtime,
                 source=source,
                 session_key=session_key,
             )
