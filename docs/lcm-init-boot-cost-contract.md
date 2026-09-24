@@ -29,7 +29,9 @@ and nobody re-measured as the DB grew. Fixes: fork PRs #887 (`search_content`), 
 | Layer | File / test | What it catches | Proven red on |
 |---|---|---|---|
 | Source contract | `test_lcm_backfill_cost.py::test_init_path_has_no_unmarked_full_table_writes` | walks every method `_init_db` calls; any unbounded, unmarked `UPDATE`/`DELETE … messages` fails, naming the method | injected `UPDATE messages SET source=… WHERE source IS NULL` into `_ensure_source_column` |
-| Query plan | `test_lcm_init_cost_regression.py::test_second_open_issues_no_full_scan_of_messages` | traces every statement a second open issues, `EXPLAIN`s each on a fresh connection, fails on a bare `SCAN messages`; **a statement that cannot be explained is a finding, never a skip** | the 2026-09-22-morning `store.py` (both scans named), and tonight's gate alone |
+| Query plan | `test_lcm_init_cost_regression.py::test_second_open_issues_no_full_scan_of_guarded_tables` | traces every statement a steady-state engine construction **+ `on_session_start`** issues on the loading thread, `EXPLAIN`s each on a fresh connection, and fails on **any** `SCAN` of `messages`, `messages_fts*`, `summary_nodes`, `nodes_fts*` — **`USING COVERING INDEX` is NOT exempt** (a covering-index `COUNT(*)` still reads every row); only `LIMIT`-bounded statements are. **A statement that cannot be explained is a finding, never a skip** | the 2026-09-22-morning `store.py`; fork/main `df435998f9` (freeze #3: `COUNT(*) FROM messages` → `SCAN messages USING COVERING INDEX`, `COUNT(*) FROM messages_fts_docsize`, lifecycle-GC `SELECT DISTINCT session_id` ×2) |
+| Write lock | `…::test_engine_construction_needs_no_write_lock` | a steady-state engine construction must succeed while another connection holds `BEGIN IMMEDIATE`, busy timeout 0 — i.e. a no-op load issues **no write** and can never queue behind an in-flight writer | fork/main `df435998f9` (unconditional `messages_dedup_v1` / `schema_version` upserts, `_clear_integrity_failed` DELETE) |
+| Flag survival | `…::test_ordinary_open_keeps_background_corruption_flag` | an ordinary open must not erase the background scan's corruption flag | fork/main `df435998f9` |
 | Scale ratio | `…::test_init_time_does_not_scale_with_row_count` | 200 vs 20 000 rows, second-open time ratio must be < 5× | belt-and-suspenders; too small to feel a scan on its own |
 | Live signal | `plugins/context_engine/__init__.py` `PHASE=context_engine_load_slow` | any engine load that holds or waits on `_LOAD_LOCK` ≥ `HERMES_ENGINE_LOAD_SLOW_S` (5 s) logs one WARNING naming held/waited seconds and pointing here | — (observability, not a gate) |
 
@@ -37,6 +39,31 @@ Measured baseline, real fleet DB (10.9 GB), fixed tree: **init = 0.14 s over 99 
 slowest surviving statement is a 67 ms FTS block write. `/tmp/lcm-init-trace.py`-style replay:
 wrap `sqlite3.connect` with `set_trace_callback`, open `MessageStore(db_path=<real>)`, sort by
 inter-statement wall time.
+
+## Health checks that are O(rows) — the throttled lane (freeze #3)
+
+5. **A periodic health check is not a startup check either.** The FTS row-count parity check
+   (`_fts_count_parity_mismatch`: `COUNT(*) FROM <content table>` + `COUNT(*) FROM <fts>_docsize`)
+   is O(rows) — measured 13.4 s of a 17.9 s cold `MessageStore()` init on an APFS clone of the
+   fleet DB. Until 2026-09-24 it lived inside `_fts_needs_rebuild_structural` and ran on **every**
+   `MessageStore`/`SummaryDAG` construction under `_LOAD_LOCK`. Now:
+   - the load path (`throttle=True`) runs only the O(schema) structural check;
+   - parity is due at most once per `LCM_FTS_PARITY_CHECK_INTERVAL_HOURS` (default **6 h**; `0` =
+     every startup but still in the background; `<0` = never on startup), tracked by the
+     `metadata` key `fts_parity_checked_at:<fts table>`;
+   - when due it is dispatched to the same daemon thread as the deep integrity-check (own
+     connection, never under `_LOAD_LOCK`); a mismatch is recorded as the integrity-failed flag
+     for `/lcm doctor`, **not** rebuilt inline;
+   - the two COUNTs are read in one deferred transaction (one WAL snapshot). As two autocommit
+     reads, a concurrent ingest between them gave a false mismatch 15/300 times (5 %), and each
+     one triggered a full inline FTS rebuild (13 min + 6.5 min under `_LOAD_LOCK` on 2026-09-24);
+   - explicit `/lcm doctor repair apply` (`throttle=False`) still runs parity + deep check
+     synchronously.
+6. **Per-session-start work is on the same critical path.** The empty-lifecycle GC
+   (`LifecycleStateStore.prune_empty_sessions`) no longer holds `BEGIN IMMEDIATE` across two
+   `SELECT DISTINCT session_id` full scans. It uses indexed per-session probes, takes the write
+   lock only when there is something to delete, and runs at most once per
+   `empty_lifecycle_gc_interval_hours` (default 6 h) per process.
 
 ## Adding a new column with a legacy backfill — the recipe
 
@@ -67,4 +94,10 @@ Then run `tests/context_engine/test_lcm_backfill_cost.py` and
 
 - Incident 1: 2026-09-22 11:30–11:51 PDT, `search_content` scan, PR #887 (`d8b2d2448`).
 - Incident 2: 2026-09-22 20:56–21:20 and 21:28–21:38 PDT, `ingested_at` scan, PR #902 (`4964ea051`).
-- Regression layer + slow-load signal: this PR.
+- Regression layer + slow-load signal: PR #903 (`4806d08c8`). Its plan check exempted
+  `USING COVERING INDEX` and skipped every `messages_fts*` statement, so it passed on the freeze #3 code.
+- Incident 3: 2026-09-24, FTS parity `COUNT(*)` on every load (card t_d3963974). 163×
+  `PHASE=context_engine_load_slow`, held 49–64 s, waited up to 120 s, and two false-mismatch
+  inline rebuilds (held 779.8 s). The count was introduced by the original vendor import
+  `8b869633a4` (2026-06-16, `_fts_needs_rebuild_structural`). It was carried unchanged through
+  re-vendor `27b617846e` and was not touched by #887/#902/#903. The DB grew until the count mattered.
