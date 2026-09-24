@@ -11,6 +11,7 @@ one. A repo the worker created inside the workspace must still be captured,
 and a repo that exists but cannot be read must still fail closed.
 """
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -132,3 +133,54 @@ def test_only_a_dangling_gitfile_is_excused_not_a_broken_enclosing_repo(board):
 
     assert "survivor_unavailable" in str(excinfo.value)
     assert kb.get_task(board, tid).status != "done"
+
+
+def scratch_under_gitfile(conn, target):
+    """A scratch workspace whose parent `.git` is a gitfile naming ``target``."""
+    tid = kb.create_task(conn, title="scratch under a gitfile whose target exists")
+    ws = kb.resolve_workspace(kb.get_task(conn, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws.parent / ".git").write_text(f"gitdir: {target}\n")
+    kb.set_workspace_path(conn, tid, ws)
+    # Precondition: git refuses from the workspace exactly as it does under
+    # the tripwire, so only the target's EXISTENCE tells the two apart.
+    probe = subprocess.run(["git", "-C", str(ws), "rev-parse", "--show-toplevel"],
+                           capture_output=True)
+    assert probe.returncode == 128, probe
+    return tid, ws
+
+
+def assert_refused(conn, tid):
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(conn, tid, summary="PASS verdict")
+    assert "survivor_unavailable" in str(excinfo.value)
+    assert kb.get_task(conn, tid).status != "done"
+
+
+def test_a_gitfile_whose_target_exists_but_is_not_a_repo_stays_closed(board, tmp_path):
+    """Only an ABSENT gitdir target is the tripwire; an existing one may hold work."""
+    target = tmp_path / "gitdir-target-exists-but-is-not-a-repo"
+    target.mkdir()
+    (target / "stray.txt").write_text("not a git dir\n")
+    tid, _ws = scratch_under_gitfile(board, target)
+
+    assert_refused(board, tid)
+
+
+def test_a_linked_worktree_gitfile_whose_common_repo_is_broken_stays_closed(board, tmp_path):
+    """The linked-worktree shape: gitdir exists, its common repository is broken."""
+    common = tmp_path / "common"
+    common.mkdir()
+    git(common, "init", "-b", "main")
+    git(common, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--allow-empty", "-m", "base")
+    git(common, "worktree", "add", "-q", str(tmp_path / "linked"), "-b", "linked")
+    target = Path(git(tmp_path / "linked", "rev-parse", "--absolute-git-dir"))
+    assert target.parent.name == "worktrees" and target.is_dir()
+    # Break the COMMON repository (object store gone); the per-worktree
+    # gitdir the gitfile names is left intact.
+    shutil.rmtree(common / ".git" / "objects")
+    tid, _ws = scratch_under_gitfile(board, target)
+
+    assert target.exists()
+    assert_refused(board, tid)
