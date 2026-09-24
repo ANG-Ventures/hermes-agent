@@ -10903,7 +10903,7 @@ def configured_review_assignee() -> Optional[str]:
 
 DEFAULT_MAX_REVIEW_ROUNDS = 3
 MILESTONE_MARKER = "[milestone]"
-REVIEW_POLICIES = ("all", "milestone_only")
+REVIEW_POLICIES = ("all", "milestone_only", "none")
 
 
 def configured_max_review_rounds() -> int:
@@ -10929,7 +10929,11 @@ def configured_max_review_rounds() -> int:
 
 
 def configured_review_policy() -> str:
-    """``kanban.review_policy`` — ``all`` (default) or ``milestone_only``.
+    """``kanban.review_policy`` — ``all`` (default), ``milestone_only`` or ``none``.
+
+    ``none``: no card gets a reviewer session at all (Ace 2026-09-24 13:51 — Argus out of
+    kanban review; CI + the orchestrator merge pass are the gate). Every handoff completes
+    with ``review_skipped=policy_none``; only the ``human`` sentinel or force=True bypasses.
 
     ``milestone_only``: only *milestone* cards (see :func:`is_milestone_card`)
     are routed to ``kanban.review_assignee``; every other card that asks for
@@ -11274,14 +11278,15 @@ def request_review(
     # names a reviewer profile explicitly (workers were templated to pass
     # reviewer="argus" on every card — that IS the mechanism being removed).
     # Only the explicit ``human`` sentinel or force=True (operator) bypasses it.
+    _policy = configured_review_policy()
     if (
-        configured_review_policy() == "milestone_only"
+        _policy in ("milestone_only", "none")
         and not force
         and not is_human_reviewer(reviewer)
     ):
-        if not is_milestone_card(conn, task_id):
+        if _policy == "none" or not is_milestone_card(conn, task_id):
             skip_meta = dict(metadata or {})
-            skip_meta["review_skipped"] = "non_milestone"
+            skip_meta["review_skipped"] = "policy_none" if _policy == "none" else "non_milestone"
             done = complete_task(
                 conn, task_id, summary=summary, metadata=skip_meta,
                 expected_run_id=expected_run_id,

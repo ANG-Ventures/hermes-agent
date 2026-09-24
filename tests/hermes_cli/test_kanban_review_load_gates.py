@@ -263,3 +263,13 @@ def test_default_policy_all_is_unchanged(kanban_home, monkeypatch):
         assert kb.request_review(conn, tid, summary="s", reviewer="argus",
                                  expected_run_id=claimed.current_run_id) is True
         assert kb.get_task(conn, tid).status == "review"
+
+
+def test_review_policy_none_skips_every_card(tmp_path, monkeypatch):
+    """kanban.review_policy=none (live fleet value, Ace 2026-09-24) must never spawn a
+    reviewer — milestone or not — and must not silently map to ``all``."""
+    import hermes_cli.kanban_db as kb
+    assert "none" in kb.REVIEW_POLICIES
+    monkeypatch.setattr(kb, "_kanban_cfg", lambda: {"review_policy": "none"}, raising=False)
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "none")
+    assert kb.configured_review_policy() == "none"
