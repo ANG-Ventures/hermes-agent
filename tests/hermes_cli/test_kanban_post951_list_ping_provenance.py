@@ -145,17 +145,73 @@ def test_resolve_home_line_reads_state_db(kanban_home):
     assert _resolve_home_line(None) == ""
 
 
-def test_notifier_appends_home_to_ping_and_wake_text():
-    """Source contract: both the passive ping and the wake turn append the
-    resolved home line, which is computed in the worker-thread collector."""
-    import inspect
+def test_notifier_delivers_home_line_in_ping_and_wake(tmp_path, monkeypatch):
+    """Drive one real notifier tick (stub push adapter, notify+wake sub):
+    the delivered text ping AND the injected wake turn both carry the card's
+    resolved ``home:`` line (Argus r1 C1)."""
+    import asyncio
 
-    import gateway.kanban_watchers as kw
+    from gateway.config import Platform
+    from gateway.kanban_watchers import _resolve_home_line
+    from gateway.run import GatewayRunner
+    from hermes_state import SessionDB
 
-    src = inspect.getsource(kw)
-    assert '"home": home_line' in src
-    assert 'msg += "\\n" + d["home"]' in src
-    assert '_synth += "\\n" + d["home"]' in src
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-home.db"))
+    kb.init_db()
+    sid = "agent:main:telegram:dm:chat-1"
+    db = SessionDB()
+    try:
+        db.create_session(
+            session_id=sid,
+            source="telegram",
+            origin_json=json.dumps({"platform": "telegram", "chat_name": "ops"}),
+        )
+    finally:
+        db.close()
+    expected = f"home: telegram #ops · session {sid}"
+    assert _resolve_home_line(sid) == expected
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="home ping", assignee="worker", session_id=sid)
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                          chat_type="dm", delivery_mode="notify+wake")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    class Adapter:
+        def __init__(self):
+            self.sent, self.handled = [], []
+
+        async def send(self, chat_id, text, metadata=None):
+            self.sent.append(text)
+
+        async def handle_message(self, event):
+            self.handled.append(event)
+
+    adapter = Adapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    assert len(adapter.sent) == 1 and tid in adapter.sent[0]
+    assert expected in adapter.sent[0]
+    assert len(adapter.handled) == 1
+    assert expected in adapter.handled[0].text
 
 
 # --- item 4: task_events actor provenance ----------------------------------
@@ -230,3 +286,31 @@ def test_migration_adds_actor_columns_to_legacy_db(kanban_home):
             "SELECT actor_profile, actor_session_id FROM task_events WHERE task_id='t_x'"
         ).fetchone()
         assert legacy["actor_profile"] is None and legacy["actor_session_id"] is None
+
+
+def test_events_resolve_running_profile_for_session_callers(kanban_home, monkeypatch):
+    """Chat/gateway caller: session bound in-process, no profile env (only
+    worker spawns export it) -> actor_profile is the running profile, not
+    NULL (Argus r1 C2)."""
+    from gateway import session_context as sc
+    from hermes_cli import profiles
+
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setattr(sc, "resolve_current_session_id", lambda: HOME)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, HOME)
+        kb.add_comment(conn, tid, author="apollo", body="hi")
+        rows = _events(conn, tid)
+        assert rows
+        assert all(r["actor_profile"] == "apollo" for r in rows)
+        assert all(r["actor_session_id"] == HOME for r in rows)
+
+
+def test_events_without_session_do_not_guess_profile(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, HOME)
+        assert all(r["actor_profile"] is None for r in _events(conn, tid))

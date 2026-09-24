@@ -177,3 +177,22 @@ def test_cli_show_label_spans_lineage(lineage, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", C)
     assert "home:      this-session" in kc.run_slash(f"show {mine}")
     assert f"home:      other ({X1})" in kc.run_slash(f"show {theirs}")
+
+
+def test_cli_list_default_view_spans_lineage(lineage, monkeypatch):
+    """The default split view uses the SAME home definition as ``--home``:
+    after a rotation (A -> B -> C, one session_key) a chat's pre-rotation
+    cards are still home, not "from other sessions" (Argus r1 B1)."""
+    with kb.connect_closing() as conn:
+        mine_old = _card(conn, A)
+        mine_new = _card(conn, C)
+        theirs = _card(conn, X1)
+        lone = _card(conn, LONE)
+    monkeypatch.setenv("HERMES_SESSION_ID", C)
+    out = kc.run_slash("list")
+    assert mine_old in out and mine_new in out
+    assert theirs not in out and lone not in out
+    assert "2 cards from other sessions (--all to show)" in out
+    home_view = {t["id"] for t in json.loads(kc.run_slash("list --home --json"))}
+    shown = {tid for tid in (mine_old, mine_new, theirs, lone) if tid in out}
+    assert shown == home_view & {mine_old, mine_new, theirs, lone}

@@ -2398,7 +2398,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
         return 0
     home_view = _default_home_view(args)
     if home_view:
-        mine = [t for t in tasks if (t.session_id or "") == home_view]
+        # Home = this session's lineage, same definition as ``--home``.
+        home_session_ids = kb.home_ids(home_view)
+        mine = [t for t in tasks if t.session_id and t.session_id in home_session_ids]
         others = len(tasks) - len(mine)
         for t in mine:
             print(_fmt_task_line(t))

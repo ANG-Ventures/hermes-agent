@@ -4885,7 +4885,21 @@ def _event_actor() -> tuple[Optional[str], Optional[str]]:
     if session_id is None and not in_gateway:
         # In-process, the env belongs to another session -- never ours.
         session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
-    profile = (os.environ.get("HERMES_PROFILE") or "").strip() or None
+    profile = None
+    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        profile = (os.environ.get(env) or "").strip() or None
+        if profile:
+            break
+    if profile is None and session_id is not None:
+        # A chat/gateway caller with a session but no profile env (only
+        # worker spawns export it): the running profile IS the actor.
+        # Identity-less callers (no session) stay NULL.
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name() or None
+        except Exception:
+            profile = None
     return profile, session_id
 
 
