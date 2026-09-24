@@ -327,10 +327,48 @@ def _walk(workspace):
         stack.extend(children)
 
 
+def _dangling_gitfile(path):
+    """True when ``path/.git`` is a gitfile whose ``gitdir:`` target is absent.
+
+    Git stops its upward discovery at the FIRST ``.git`` it meets, so a
+    dangling gitfile there means no repository encloses anything below it:
+    there are no objects anywhere that could hold a survivor. This is the
+    deliberate tripwire shape (``kanban/workspaces/.git`` -> ``/nonexistent``,
+    incident t_82a5c853) that keeps scratch-workspace git off the live repo.
+    A ``.git`` DIRECTORY, or a gitfile whose target exists, is a repository
+    that may hold work, and stays fail-closed.
+    """
+    marker = path / ".git"
+    try:
+        if not marker.is_file():
+            return False
+        first = marker.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+    except OSError:
+        return False
+    if not first or not first[0].startswith("gitdir:"):
+        return False
+    target = Path(first[0][len("gitdir:"):].strip())
+    if not target.is_absolute():
+        target = path / target
+    try:
+        return not target.exists()
+    except OSError:
+        return False
+
+
 def _repos(workspace):
     """Find repos created inside scratch, including linked worktrees; no symlinks."""
     found = [here for here, is_repo in _walk(workspace) if is_repo]
-    if workspace not in found and any((p / ".git").exists() for p in (workspace, *workspace.parents)):
+    enclosing = next((p for p in (workspace, *workspace.parents) if (p / ".git").exists()), None)
+    if workspace not in found and enclosing is not None:
+        # Probe before inspecting: a scratch workspace under the tripwire
+        # gitfile makes every git call exit 128 "not a git repository", and
+        # that means NO enclosing repository -- not an unreadable one. Only
+        # the structural dangling-gitfile shape is excused; anything else
+        # that fails the probe still raises below.
+        probe = _git(workspace, "rev-parse", "--show-toplevel", check=False)
+        if probe.returncode and _dangling_gitfile(enclosing):
+            return found
         tracked = _git(workspace, "ls-files", "--", ".")
         if tracked.returncode == 0 and tracked.stdout:
             found.insert(0, workspace)
