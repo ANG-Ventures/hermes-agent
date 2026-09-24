@@ -29088,8 +29088,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Slash-command loops dispatch through the command
                         # path and never hit the post-turn completion hook —
                         # complete the tick immediately (caps + scheduling).
+                        # complete_tick runs the sync --until aux-LLM judge
+                        # (network) — keep it off the event loop, same as the
+                        # post-turn completion hook.
                         if wakeup.lstrip().startswith("/"):
-                            mgr.complete_tick("")
+                            await asyncio.to_thread(mgr.complete_tick, "")
                     except Exception as exc:
                         logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
                         try:
