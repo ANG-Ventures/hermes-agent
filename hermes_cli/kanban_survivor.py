@@ -1831,6 +1831,126 @@ def _vouched_repositories(survivor):
     return keys | _all_sidecar_repositories(survivor)
 
 
+def _authoritative_repositories(survivor):
+    """Repository keys a RECORDED survivor may authorise RECLAMATION for.
+
+    :func:`_vouched_repositories` answers "does the recovery index account for
+    this repository?" and must keep counting unbound refs, or the non-shrink
+    guard would drop them from the index. Deletion authority is a narrower
+    question with a different answer for exactly one shape: an UNBOUND operator
+    ref is a human assertion the kernel could not corroborate, and
+    :func:`_reusable` limits it to the one completion that asserted it.
+
+    The `missing <= absent` relaxation in :func:`preserve` consulted the wide
+    set, so an unbound `--survivor-pr` for a vanished repository recorded at
+    completion became standing authority in the SAME call's cleanup: the root
+    repository ignored the vanished one's directory, nothing captured it, and
+    reclamation `rmtree`d committed-but-unpublished bytes (Argus P9, t_60592755,
+    on both #924's base and head). Stored bundles and patches still vouch --
+    they hold the bytes themselves.
+    """
+    keys = set()
+    for entry in ((survivor or {}).get("refs") or ()):
+        if isinstance(entry, dict) and isinstance(entry.get("repository"), str) \
+                and not entry.get("unbound"):
+            keys.add(entry["repository"])
+    for entry in ((survivor or {}).get("bundles") or ()):
+        if isinstance(entry, dict) and isinstance(entry.get("repository"), str):
+            keys.add(entry["repository"])
+    return keys | _all_sidecar_repositories(survivor)
+
+
+_SHA1 = re.compile(r"[0-9a-f]{40}")
+
+
+def _holds_commit_by_stat(path, sha):
+    """Stat-only proof that the repository at `path` still holds `sha`.
+
+    `_replaced_orphans` runs on every completion AND reclamation pass, and the
+    terminal transition is gated on a fixed git-spawn budget
+    (test_kanban_terminal_transition_ref_cost). The common case -- the same
+    repository, dispatch commit still a loose object or still HEAD's ref --
+    is answerable from the object/ref files without a process.
+
+    Only POSITIVE answers are trusted: a loose object file named `sha` in THIS
+    repository's own `.git` directory, or `HEAD`'s ref file naming it, cannot
+    exist in a re-initialised repository. Anything else (a gitfile worktree,
+    packed objects or refs, an unreadable file) returns False and the caller
+    falls back to `git cat-file -e`, so this never decides "replaced".
+    """
+    if not isinstance(sha, str) or not _SHA1.fullmatch(sha):
+        return False
+    gitdir = path / ".git"
+    try:
+        if not gitdir.is_dir():
+            return False
+        if (gitdir / "objects" / sha[:2] / sha[2:]).is_file():
+            return True
+        head = (gitdir / "HEAD").read_text(encoding="ascii").strip()
+        if head.startswith("ref: "):
+            name = head[5:].strip()
+            if ".." in name.split("/"):
+                return False
+            head = (gitdir / name).read_text(encoding="ascii").strip()
+        return head == sha
+    except (OSError, ValueError):
+        return False
+
+
+def _replaced_orphans(workspace, bases):
+    """Recorded repositories re-initialised in place over ignored bytes.
+
+    `bases` binds a repository KEY to the commit it held at dispatch; the key
+    alone is not identity. Remove `a/.git`, `git init a` again and ignore the
+    old files, and every existing check is satisfied: `_repos` still returns
+    `a`, `bases - keys` is empty, `status --untracked-files=all` is clean -- yet
+    the new HEAD cannot reach the recorded commit, whose objects went with the
+    old `.git`, and the ignored files on disk are the only copy of that work.
+    Neither a landed claim nor a capture of the NEW repository covers them
+    (Argus P8, t_60592755: completion landed, workspace deleted, live and
+    bundle both lacked the bytes).
+
+    The discriminator is both conditions at once, which is what keeps the
+    positive control completing: the recorded commit is not an object in the
+    repository now at that path (identity replaced), AND that repository
+    ignores non-derived files (bytes no survivor can carry). A replacement
+    that commits the old files instead is captured normally.
+
+    Returns ``{key: [ignored entries...]}``; empty when nothing is orphaned.
+    """
+    orphans = {}
+    for key, sha in sorted((bases or {}).items()):
+        if not sha:
+            continue
+        path = workspace if key == "." else workspace / key
+        if not _is_repo_on_disk(path):
+            # Vanished outright (the `missing` arms own that shape), or a `.`
+            # base recorded from an ENCLOSING repository -- re-initialising in
+            # place would put a `.git` here. A stat, not a spawn: this runs on
+            # every completion and reclamation pass (ref-cost gate).
+            continue
+        if _holds_commit_by_stat(path, sha) or \
+                _git(path, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0:
+            continue  # same identity (or history still holds the dispatch commit)
+        listed = _git(path, "ls-files", "-z", "--others", "--ignored", "--exclude-standard",
+                      "--directory", "--", ".", check=False)
+        if listed.returncode:
+            # Cannot enumerate what is ignored: that is doubt, not "nothing".
+            orphans[key] = ["<unreadable>"]
+            continue
+        entries = []
+        for raw in listed.stdout.split(b"\0"):
+            name = raw.decode(errors="replace").rstrip("/")
+            if not name or any(part in _DERIVED_DIRS for part in Path(name).parts):
+                continue
+            if _is_repo_on_disk(path / name):
+                continue  # a nested repository is enumerated in its own right
+            entries.append(name)
+        if entries:
+            orphans[key] = entries
+    return orphans
+
+
 def _patch_carry(previous, survivor):
     """Recorded patch pointers the fresh row does not already hold.
 
@@ -2031,6 +2151,21 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 )
             return None
         workspace = workspace.resolve(strict=True)
+        orphans = _replaced_orphans(workspace, bases)
+        if orphans:
+            # Placed ahead of EVERY exit -- landed, ordinary capture, and the
+            # reclamation relaxation -- because each of them would otherwise
+            # certify the replacement repository and hand the old identity's
+            # ignored bytes to the reaper. No operator claim is accepted here:
+            # a ref for the OLD repository cannot vouch for files that exist
+            # only on this disk. The remedy is to resolve the bytes.
+            detail = "; ".join(f"{key}: {', '.join(names[:5])}" + (" ..." if len(names) > 5 else "")
+                               for key, names in orphans.items())
+            raise SurvivorUnavailable(
+                "survivor_unavailable: recorded repository replaced in place no longer holds "
+                f"its dispatch commit and ignores files no survivor captures ({detail}); "
+                "commit them to the replacement or remove them, then complete again"
+            )
         landed = (metadata or {}).get("landed")
         if cleanup and not landed and previous and previous.get("kind") == "landed":
             # Revalidate the recorded live commits before removing the workspace.
@@ -2116,6 +2251,19 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # `bases` is written once, before dispatch, so it does not know
             # about a repository the worker cloned afterwards.
             absent = _vouched_repositories(previous) - keys
+            # Coverage by an UNBOUND ref alone is not delete authority: it
+            # authorised the completion that recorded it and nothing more (see
+            # `_reusable`, `_authoritative_repositories`). Without this the
+            # same-call cleanup after an unbound completion `rmtree`d the
+            # vanished repository's ignored bytes.
+            unbound_only = absent - _authoritative_repositories(previous)
+            if unbound_only:
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: missing repositories "
+                    f"({', '.join(sorted(unbound_only))}) are vouched for only by an unbound "
+                    "operator survivor, which authorises one completion, not reclamation; "
+                    "re-assert a survivor bound to the card or recover the files by hand"
+                )
             # `missing <= absent` is the coverage test: every repository `bases`
             # says vanished must be one the recorded survivor actually accounts
             # for. A survivor vouching for some OTHER repository buys nothing.
