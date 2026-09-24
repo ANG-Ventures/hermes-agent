@@ -339,18 +339,24 @@ def _state_db_path() -> Path:
 
 _DEDUPE_SQL = """
 SELECT api_content, content FROM messages
- WHERE session_id = ? AND role = 'user'
+ WHERE session_id = ? AND role = 'user' AND active = 1
  ORDER BY id DESC LIMIT ?
 """
 
 
 def _persisted_recently_injected(session_id: str, deadline: float) -> bool:
-    """R3 against state.db: header in the session's last K persisted user rows?
+    """R3 against state.db: header in the session's last K REPLAYABLE user rows?
 
-    Independent of the replay pipeline, which may drop ``api_content``.
-    Read-only and bounded by ``deadline``.  A missing DB means nothing was
-    ever injected (False).  Any other failure counts as "maybe injected"
-    (True), so an unreadable transcript can never cause a duplicate block.
+    Independent of the replay pipeline, which may drop ``api_content``.  The
+    question is "will the model see the header on replay?", so only rows the
+    gateway reloads count: ``active = 1``, the same predicate
+    ``SessionDB.get_messages_as_conversation`` applies.  Rows undone/rewound
+    (active=0, compacted=0) or summarized away by in-place compaction
+    (active=0, compacted=1) are not replayed, so they do not dedupe.
+
+    Read-only and bounded by ``deadline``.  Any failure or ambiguity (missing
+    DB, unreadable DB, lock, timeout) returns False, i.e. INJECT: a duplicate
+    block costs ~335 tokens, a missing one defeats the feature.
     """
     path = _state_db_path()
     if not path.is_file():
@@ -361,8 +367,8 @@ def _persisted_recently_injected(session_id: str, deadline: float) -> bool:
             timeout=0, check_same_thread=False,
         )
     except sqlite3.Error as exc:
-        logger.info("kanban-home-cards: dedupe read failed: %s", exc)
-        return True
+        logger.info("kanban-home-cards: dedupe read failed (inject): %s", exc)
+        return False
     try:
         conn.execute("PRAGMA busy_timeout = 0")
         conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
@@ -378,8 +384,8 @@ def _persisted_recently_injected(session_id: str, deadline: float) -> bool:
                 raise
         return any(isinstance(v, str) and HEADER_PREFIX in v for row in rows for v in row)
     except sqlite3.Error as exc:
-        logger.info("kanban-home-cards: dedupe read failed: %s", exc)
-        return True
+        logger.info("kanban-home-cards: dedupe read failed (inject): %s", exc)
+        return False
     finally:
         conn.close()
 

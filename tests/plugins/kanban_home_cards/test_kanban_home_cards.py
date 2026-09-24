@@ -341,14 +341,15 @@ def test_R3_persisted_scan_is_per_session(mod, home):
     assert mod.on_pre_llm_call(session_id=SID, conversation_history=[])
 
 
-def test_R3_persisted_scan_unreadable_db_skips_block(mod, home):
+def test_R3_persisted_scan_unreadable_db_injects(mod, home):
+    # Apollo r3 ruling: any state.db ambiguity fails open to INJECT.
     _card(_board(home), "t_home0001", session_id=SID)
     from hermes_state import _default_db_path
 
     path = Path(_default_db_path())
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"not a sqlite database" * 100)
-    assert mod.on_pre_llm_call(session_id=SID, conversation_history=[]) is None
+    assert mod.on_pre_llm_call(session_id=SID, conversation_history=[])
 
 
 def test_R3_persisted_scan_missing_db_still_injects(mod, home):
@@ -369,6 +370,80 @@ def test_R3_persisted_scan_is_read_only(mod, home, monkeypatch):
     monkeypatch.setattr(mod.sqlite3, "connect", spy)
     mod._persisted_recently_injected(SID, time.monotonic() + 1)
     assert uris and all(u.endswith("?mode=ro") and "immutable" not in u for u in uris)
+
+
+# ── R3 tracks the REPLAYABLE transcript (Argus r2 F3, Apollo r3 ruling) ────
+# Dedupe asks "will the model see the header on replay?". Rows made inactive
+# (undo/rewind: active=0,compacted=0; in-place compaction: active=0,
+# compacted=1) are not replayed, so they must not suppress the block. Each test
+# goes through the real SessionDB transition, the real gateway replay
+# (timestamps ON), and a fresh plugin module (= process restart).
+
+def _user_ids(db, sid):
+    return [m["id"] for m in db.get_messages(sid) if m["role"] == "user"]
+
+
+def _restart_and_hook(sid, db):
+    from gateway.run import _build_gateway_agent_history
+
+    stored = db.get_messages_as_conversation(sid, include_timestamp=True,
+                                             repair_alternation=True)
+    hist, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
+    fresh = _load()  # new process: empty in-memory I1 gate
+    return hist, fresh.on_pre_llm_call(session_id=sid, platform="discord",
+                                       conversation_history=hist)
+
+
+def test_R3_rewind_past_header_reinjects_after_restart(mod, home):
+    _card(_board(home), "t_home0001", session_id=SID)
+    db = _state_db(mod, SID, 3, header_at=1)
+    header_uid = _user_ids(db, SID)[1]
+    db.rewind_to_message(SID, header_uid)
+    hist, out = _restart_and_hook(SID, db)
+    assert not any(mod.HEADER_PREFIX in str(m) for m in hist)  # not replayed
+    assert out and mod.HEADER_PREFIX in out["context"]
+
+
+def test_R3_rewind_after_header_keeps_dedupe_after_restart(mod, home):
+    _card(_board(home), "t_home0001", session_id=SID)
+    db = _state_db(mod, SID, 3, header_at=0)
+    db.rewind_to_message(SID, _user_ids(db, SID)[2])  # header row stays active
+    _, out = _restart_and_hook(SID, db)
+    assert out is None
+
+
+def test_R3_redo_restores_header_and_dedupe(mod, home):
+    _card(_board(home), "t_home0001", session_id=SID)
+    db = _state_db(mod, SID, 3, header_at=1)
+    uids = _user_ids(db, SID)
+    db.rewind_to_message(SID, uids[1])
+    inactive = [m["id"] for m in db.get_messages(SID, include_inactive=True)
+                if m["id"] >= uids[1]]
+    assert db.restore_ids(SID, inactive) == len(inactive)
+    _, out = _restart_and_hook(SID, db)
+    assert out is None
+
+
+def test_R3_inplace_compaction_summarizing_header_away_reinjects(mod, home):
+    _card(_board(home), "t_home0001", session_id=SID)
+    db = _state_db(mod, SID, 3, header_at=0)
+    db.archive_and_compact(SID, [
+        {"role": "user", "content": "[summary of earlier turns]"},
+        {"role": "assistant", "content": "ok"},
+    ])
+    _, out = _restart_and_hook(SID, db)
+    assert out and mod.HEADER_PREFIX in out["context"]
+
+
+def test_R3_K_window_counts_only_active_user_rows(mod, home):
+    # K=20 boundary over the replayable rows: 21 users, header on the oldest,
+    # then rewind the newest -> header is exactly the 20th active row back.
+    _card(_board(home), "t_home0001", session_id=SID)
+    db = _state_db(mod, SID, mod.DEDUPE_USER_ROWS + 1, header_at=0)
+    db.rewind_to_message(SID, _user_ids(db, SID)[-1])
+    assert len(_user_ids(db, SID)) == mod.DEDUPE_USER_ROWS
+    _, out = _restart_and_hook(SID, db)
+    assert out is None
 
 
 # ── I6 execution-lane exclusion ─────────────────────────────────────────────
