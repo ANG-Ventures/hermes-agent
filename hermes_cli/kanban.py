@@ -1704,7 +1704,8 @@ def _resolve_session_flag(value: Optional[str]) -> Optional[str]:
 def _home_label(session_id: Optional[str]) -> str:
     if not session_id:
         return "unstamped"
-    if session_id == _caller_session_id():
+    caller = _caller_session_id()
+    if caller and session_id in kb.home_ids(caller):
         return "this-session"
     return f"other ({session_id})"
 
@@ -2336,7 +2337,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
         if args.session and args.session != home:
             print("kanban: --home conflicts with --session", file=sys.stderr)
             return 2
-        args.session = home
+        # Home = this session's lineage (id rotations inside one chat).
+        home_session_ids = kb.home_ids(home)
+        args.session = None
+    else:
+        home_session_ids = None
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
@@ -2347,6 +2352,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             status=args.status,
             tenant=args.tenant,
             session_id=args.session,
+            session_ids=home_session_ids,
             include_archived=args.archived,
             order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id,
