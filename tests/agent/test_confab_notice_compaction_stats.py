@@ -7,7 +7,6 @@ from agent.confab_notice import is_metadata_only_tool_notice
 from plugins.context_engine.lcm.config import LCMConfig
 from plugins.context_engine.lcm.engine import LCMEngine
 from tests.agent.test_confab_notice_e2e import VALID_NOTICE, notice_env
-from tests.context_engine.test_compaction_render_e2e import _tool_heavy_turn
 
 
 def test_lcm_stats_identical_with_ui_only_events(notice_env, tmp_path):
@@ -16,7 +15,20 @@ def test_lcm_stats_identical_with_ui_only_events(notice_env, tmp_path):
     make_agent().run_conversation("first", conversation_history=[], task_id="writer")
     event = next(row for row in db.get_messages_as_conversation(sid)
                  if is_metadata_only_tool_notice(row))
-    baseline = _tool_heavy_turn(40)
+    big = " ".join(f"w{j}" for j in range(700))
+    baseline = []
+    for i in range(8):
+        call_id = f"call_{i}"
+        baseline.extend([
+            {"role": "user", "content": f"u{i} {big}"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": call_id, "type": "function", "function": {
+                    "name": "read_file", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": call_id, "content": f"result {i} {big}"},
+            {"role": "assistant", "content": f"a{i} {big}"},
+        ])
+    for index, row in enumerate(baseline):
+        row["_qa_id"] = index  # independent of the provenance mechanism
 
     def run(events):
         history = copy.deepcopy(baseline)
@@ -26,7 +38,7 @@ def test_lcm_stats_identical_with_ui_only_events(notice_env, tmp_path):
         agent.session_id = f"stats-{len(events)}"
         cc = LCMEngine(config=LCMConfig(
             database_path=str(tmp_path / f"lcm-{len(events)}.db"),
-            fresh_tail_count=4, leaf_chunk_tokens=120, context_threshold=0.01,
+            fresh_tail_count=8, leaf_chunk_tokens=1, context_threshold=0.01,
         ), hermes_home=str(tmp_path))
         cc.update_model("test-model", 200_000, provider="unit-test")
         cc.on_session_start(agent.session_id, hermes_home=str(tmp_path), model="test-model",
@@ -35,8 +47,12 @@ def test_lcm_stats_identical_with_ui_only_events(notice_env, tmp_path):
         seen = []
         original = compaction_stats.build_inturn_stats
         def capture(**kwargs):
+            # The caller strips stamps from the same list after the build;
+            # snapshot at the reader boundary, not after _compress_context.
+            inputs = {**kwargs, "messages": copy.deepcopy(kwargs["messages"]),
+                      "compressed": copy.deepcopy(kwargs["compressed"])}
             stats = original(**kwargs)
-            seen.append((kwargs, stats))
+            seen.append((inputs, stats))
             return stats
         response = MagicMock()
         response.choices = [MagicMock()]
@@ -50,6 +66,10 @@ def test_lcm_stats_identical_with_ui_only_events(notice_env, tmp_path):
             assert len(seen) == 1
             args, stats = seen[0]
             assert not stats.approx_attribution, "Option B must remain exact"
+            stamped = [row for row in args["compressed"] if "_src_idx" in row]
+            assert stamped, "LCM did not stamp a kept row; the exact path was not exercised"
+            assert all(args["messages"][row["_src_idx"]]["_qa_id"] == row["_qa_id"]
+                       for row in stamped)
             assert all(not is_metadata_only_tool_notice(row) for row in args["messages"])
             assert all(not is_metadata_only_tool_notice(row) for row in args["compressed"])
             return (stats.pre_messages, stats.post_messages, stats.folded_count,
@@ -60,4 +80,4 @@ def test_lcm_stats_identical_with_ui_only_events(notice_env, tmp_path):
 
     control = run([])
     assert run([1]) == control
-    assert run([1, 50]) == control
+    assert run([1, 31]) == control
