@@ -724,6 +724,23 @@ class TestConfabNoticeEndToEnd:
                         if is_metadata_only_tool_notice(row))
         assert event_at == (1 if survives == "predecessor" else len(compressed) - 1)
 
+    def test_compaction_notice_short_overlap_cannot_rebind_to_equal_tail(self, notice_env, stream):
+        make_agent, handler, db, sid, _ = notice_env
+        handler.response_queue[:] = [
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
+        ]
+        make_agent(stream=stream).run_conversation("first", conversation_history=[], task_id="writer")
+        event = next(m for m in db.get_messages_as_conversation(sid)
+                     if is_metadata_only_tool_notice(m))
+        twin = {"role": "user", "content": "same"}
+        history = [twin, event, dict(twin), {"role": "assistant", "content": "dropped"}]
+        agent = make_agent(stream=stream)
+        agent.context_compressor.compress = lambda input_rows, **kwargs: [dict(twin)]
+        compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
+        assert len(compressed) == 2
+        assert compressed[0]["content"] == "same"
+        assert is_metadata_only_tool_notice(compressed[1])
+
     def test_same_request_id_retry_has_one_durable_event(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env
         notice = {**VALID_NOTICE, "kind": "tool_call_as_text", "request_id": "same-rid"}
