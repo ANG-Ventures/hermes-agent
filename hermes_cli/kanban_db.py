@@ -12726,6 +12726,176 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Escalating hold after CONSECUTIVE rate-limited runs. The flat cooldown above
+# never escalated, so a card re-probed an exhausted pool every 5 minutes for
+# hours (measured 2026-09-22 over 7d: 3,706 rate_limited runs, zero inter-retry
+# gaps below 304s, 1,538 clustered at the floor; worst card retried 128x).
+# Streak N holds for ladder[N-1], capped at the last rung; the configured
+# cooldown stays the floor. Any non-rate_limited run resets the streak.
+RATE_LIMIT_BACKOFF_LADDER: tuple[int, ...] = (300, 900, 2700, 7200)  # 5m 15m 45m 2h
+
+# Board-wide circuit: >= trip rate_limited closes inside the window hold every
+# pool-bound spawn for one further window. The pool is down for everyone, so
+# per-card backoff alone still lets N cards each spend a probe.
+DEFAULT_RATE_LIMIT_TRIP = 5
+RATE_LIMIT_TRIP_WINDOW_SECONDS = 600  # 10 minutes
+_RATE_LIMIT_CIRCUIT_MARKER = ".rate_limit_circuit.json"
+
+
+def _rate_limit_hold_seconds(streak: int, *, base: int) -> int:
+    """Seconds to hold a card after ``streak`` consecutive rate-limited runs."""
+    if base <= 0:
+        return 0  # operator disabled the cooldown entirely
+    if streak <= 1:
+        return base
+    rung = RATE_LIMIT_BACKOFF_LADDER[min(streak, len(RATE_LIMIT_BACKOFF_LADDER)) - 1]
+    return max(base, rung)
+
+
+def consecutive_rate_limited_runs(conn: sqlite3.Connection, task_id: str) -> int:
+    """Trailing count of CLOSED runs whose outcome is ``rate_limited``."""
+    streak = 0
+    for r in conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT ?",
+        (task_id, len(RATE_LIMIT_BACKOFF_LADDER) + 1),
+    ):
+        if r["outcome"] != "rate_limited":
+            break
+        streak += 1
+    return streak
+
+
+def _resolve_rate_limit_trip() -> int:
+    """``kanban.rate_limit_trip`` (0 disables the circuit)."""
+    try:
+        from hermes_cli.config import load_config
+        value = int(load_config().get("kanban", {}).get("rate_limit_trip", DEFAULT_RATE_LIMIT_TRIP))
+        return value if value >= 0 else DEFAULT_RATE_LIMIT_TRIP
+    except Exception:
+        return DEFAULT_RATE_LIMIT_TRIP
+
+
+def rate_limit_circuits(
+    conn: sqlite3.Connection, *, now: int, trip: int,
+    window: int = RATE_LIMIT_TRIP_WINDOW_SECONDS,
+) -> dict[str, int]:
+    """``{pool_key: open_until}`` for every pool whose circuit is open now.
+
+    Only closes whose route is pool-bound count, grouped by the pool that
+    served them (``kanban_provider_health.pool_key``: relay family, or the one
+    sub a pinned lane hits) -- five openai-codex 429s are not claude-pool
+    evidence, and a bpr storm says nothing about apr (Argus r1, PR #953).
+    A close is charged to the pool that SERVED the run: a dispatch-time
+    route change (capped-pool fallback rung, lane override) is recorded as a
+    run-scoped ``dispatch_provider_fallback`` / ``dispatch_lane_route`` event
+    and wins; otherwise the route is re-derived from the card's pin + the
+    run's profile (Argus r2 G1: fallback-rung 429s charged to the primary).
+
+    Derived from ``task_runs`` alone (no in-memory latch), so it survives a
+    gateway restart: a pool trips at the latest close that completes ``trip``
+    of its rate-limited closes within ``window`` and holds for ``window``.
+    """
+    if trip <= 0:
+        return {}
+    from types import SimpleNamespace
+    from hermes_cli.kanban_provider_health import effective_provider, pool_key
+
+    rows = conn.execute(
+        "SELECT r.id, r.ended_at, r.profile, t.assignee, t.model_override, t.provider_override "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.outcome = 'rate_limited' AND r.ended_at IS NOT NULL AND r.ended_at >= ? "
+        "ORDER BY r.ended_at",
+        (now - 2 * window,),
+    ).fetchall()
+    served: dict[int, str] = {}
+    run_ids = [int(r["id"]) for r in rows]
+    for i in range(0, len(run_ids), 500):
+        chunk = run_ids[i:i + 500]
+        for ev in conn.execute(
+            "SELECT run_id, kind, payload FROM task_events WHERE run_id IN ("
+            + ",".join("?" * len(chunk)) + ") AND kind IN "
+            "('dispatch_lane_route', 'dispatch_provider_fallback') ORDER BY id",
+            chunk,
+        ):
+            try:
+                payload = json.loads(ev["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            field = "to_provider" if ev["kind"] == "dispatch_provider_fallback" else "provider"
+            if isinstance(payload, dict) and isinstance(payload.get(field), str):
+                served[int(ev["run_id"])] = payload[field]  # later event wins
+    keys: dict[tuple, Optional[str]] = {}
+    by_pool: dict[str, list[int]] = {}
+    for r in rows:
+        if int(r["id"]) in served:
+            route = (None, "served", served[int(r["id"])])
+        else:
+            route = (r["profile"] or r["assignee"], r["model_override"], r["provider_override"])
+        if route not in keys:
+            keys[route] = pool_key(effective_provider(SimpleNamespace(
+                assignee=route[0], model_override=route[1], provider_override=route[2],
+            )))
+        if keys[route] is not None:
+            by_pool.setdefault(keys[route], []).append(int(r["ended_at"]))
+    open_until: dict[str, int] = {}
+    for key, ends in by_pool.items():
+        tripped_at = None
+        for i in range(trip - 1, len(ends)):
+            if ends[i] - ends[i - trip + 1] <= window:
+                tripped_at = ends[i]
+        if tripped_at is not None and now < tripped_at + window:
+            open_until[key] = tripped_at + window
+    return open_until
+
+
+def _notify_rate_limit_circuit(
+    board: Optional[str], pool: str, until: int, trip: int, *, now: Optional[int] = None,
+) -> None:
+    """Post ONE #logs line per pool circuit EPISODE (marker file = latch).
+
+    Workers already running when a pool trips keep dying at 429 during the
+    hold, and every such close pushes ``until`` forward. That extends the same
+    episode: the latch is "the recorded hold for this pool has not lapsed yet",
+    never the exact ``until`` value (Argus F2: 4 notifies for one episode).
+    """
+    now = int(time.time()) if now is None else int(now)
+    try:
+        from hermes_cli import kanban_budget as _kbudget
+
+        marker = board_dir(board) / _RATE_LIMIT_CIRCUIT_MARKER
+        try:
+            seen = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:
+            seen = {}
+        if not isinstance(seen, dict):
+            seen = {}
+        prior = seen.get(pool)
+        same_episode = isinstance(prior, (int, float)) and now < int(prior)
+        if same_episode and int(prior) >= until:
+            return
+        seen[pool] = max(int(prior), until) if same_episode else until
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(seen), encoding="utf-8")
+        if same_episode:
+            return  # hold extended; already announced
+        script = _kbudget._notify_script_path()
+        if script is None:
+            return
+        import sys as _sys
+        body = (
+            f"🧯 Kanban '{board or 'default'}': rate-limit circuit OPEN for {pool} — "
+            f">= {trip} workers hit 429 within {RATE_LIMIT_TRIP_WINDOW_SECONDS // 60} min. "
+            f"Holding {pool} spawns until "
+            f"{time.strftime('%H:%M:%S', time.localtime(until))}; other pools unaffected."
+        )
+        _kbudget._run_notify([
+            _sys.executable, script, "--channel", "discord",
+            "--target", _kbudget.RECOVERY_TARGET, "--send", body,
+        ])
+    except Exception as exc:
+        _log.warning("kanban rate-limit circuit notify failed (%s: %s)", type(exc).__name__, exc)
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 # Event kinds that mean "an OPERATOR deliberately asked for this task to run
@@ -14624,11 +14794,17 @@ def detect_crashed_workers(
                     f"requeued without counting a failure"
                 )
                 event_kind = "rate_limited"
+                # This run is still open, so the streak it completes is the
+                # closed trailing streak + 1.
+                _rl_hold = _rate_limit_hold_seconds(
+                    consecutive_rate_limited_runs(conn, row["id"]) + 1,
+                    base=_resolve_rate_limit_cooldown_seconds(),
+                )
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
-                    "next_eligible_at": int(time.time()) + _resolve_rate_limit_cooldown_seconds(),
+                    "next_eligible_at": int(time.time()) + _rl_hold,
                 }
                 if exit_class:
                     event_payload["exit_class"] = exit_class
@@ -15527,6 +15703,14 @@ def check_respawn_guard(
         eligible_at = _respawn_guard_eligible_at(
             row["next_eligible_at"], failed_at, rl_cooldown,
         )
+        streak = 0
+        if latest_outcome == "rate_limited" and failed_at is not None:
+            # Escalate by the consecutive streak (5m/15m/45m/2h). Computed
+            # here, not only at release, so rows stamped before this ladder
+            # existed and any other release path are held too.
+            streak = consecutive_rate_limited_runs(conn, task_id)
+            laddered = failed_at + _rate_limit_hold_seconds(streak, base=rl_cooldown)
+            eligible_at = laddered if eligible_at is None else max(int(eligible_at), laddered)
         if eligible_at is not None and now < int(eligible_at):
             if detail is not None:
                 detail.update(
@@ -15534,6 +15718,8 @@ def check_respawn_guard(
                     recorded_at=failed_at,
                     eligible_at=int(eligible_at),
                 )
+                if streak > 1:
+                    detail["backoff_streak"] = streak
             return "rate_limit_cooldown"
         # Cooldown elapsed (or disabled) — allow the respawn. Return early
         # so the blocker_auth check below doesn't catch the rate-limit text
@@ -16824,14 +17010,29 @@ def _dispatch_once_locked(
     spawned = 0
     from hermes_cli.kanban_provider_health import (
         available_profile_fallback, capped_provider, configured_min_eligible,
-        configured_probes,
+        configured_box_health, configured_pool_health_urls, configured_probes,
+        effective_provider, pool_key,
     )
     health_probes = configured_probes()
     min_eligible = configured_min_eligible()
+    pool_urls = configured_pool_health_urls()
+    box_health = configured_box_health()
     health_cache: dict = {}
+    circuits: dict[str, int] = {}
+    try:
+        rl_trip = _resolve_rate_limit_trip()
+        circuits = rate_limit_circuits(conn, now=_tick_now, trip=rl_trip)
+        if not dry_run:
+            for _pool, _until in circuits.items():
+                _notify_rate_limit_circuit(board, _pool, _until, rl_trip, now=_tick_now)
+    except Exception as exc:
+        # Fail OPEN: a broken circuit query must never halt spawning.
+        _log.warning("kanban rate-limit circuit check failed (%s: %s)", type(exc).__name__, exc)
+        circuits = {}
 
     def provider_admission(task_id, assignee):
-        if not health_probes:
+        if (not health_probes and not any(pool_urls.values()) and not box_health
+                and not circuits):
             return False, None
         task = get_task(conn, task_id)
         if task is None:
@@ -16841,11 +17042,23 @@ def _dispatch_once_locked(
         # for cards with no pin of their own), so a capped profile default
         # under a healthy lane is admitted, and a capped lane still falls back.
         apply_lane_model_override(task, _lane_override_for(assignee), now=_tick_now)
-        payload = capped_provider(task, health_probes, health_cache, min_eligible=min_eligible)
+        route_provider = effective_provider(task)
+        circuit_pool = pool_key(route_provider)
+        if circuit_pool in circuits:
+            # An open circuit on THIS card's pool is a capacity verdict like
+            # provider_capped: hold unless a rung on another open pool exists.
+            payload = {"reason": "rate_limit_circuit", "provider": route_provider,
+                       "pool": circuit_pool, "until": circuits[circuit_pool]}
+        else:
+            payload = capped_provider(
+                task, health_probes, health_cache, min_eligible=min_eligible,
+                pool_urls=pool_urls, box_health=box_health,
+            )
         if payload is None:
             return False, None
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
+            pool_urls=pool_urls, skip_pools=frozenset(circuits), box_health=box_health,
         )
         if fallback is not None and fallback_flagship_banned(task_id, fallback[0]):
             # The flagship gate covers the post-fallback route too: a capped
@@ -16861,11 +17074,21 @@ def _dispatch_once_locked(
             fallback = None
         if fallback is not None:
             return False, (fallback, payload)
-        result.respawn_guarded.append((task_id, "provider_capped"))
+        result.respawn_guarded.append((task_id, payload["reason"]))
         if not dry_run:
             with write_txn(conn):
                 _append_event(conn, task_id, "deferred", payload)
         return True, None
+
+    def note_lane_route(claimed, source):
+        """Record the lane-override route on the run (in-memory only on the
+        card) so a rate-limited close is charged to the pool that served it."""
+        if source is None or not claimed.provider_override:
+            return
+        with write_txn(conn):
+            _append_event(conn, claimed.id, "dispatch_lane_route", {
+                "provider": claimed.provider_override, "model": claimed.model_override,
+            }, run_id=claimed.current_run_id)
 
     def apply_dispatch_fallback(claimed, selection):
         if selection is None:
@@ -17185,7 +17408,10 @@ def _dispatch_once_locked(
         # outlive its TTL / the capacity window as a permanent pin.
         route_source = apply_lane_model_override(
             claimed, _lane_override_for(claimed.assignee), now=_tick_now,
-        ) or ("card-override" if claimed.model_override else "profile-default")
+        )
+        note_lane_route(claimed, route_source)
+        route_source = route_source or (
+            "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             route_source = f"dispatch-fallback(capped {route_source})"
@@ -17376,7 +17602,10 @@ def _dispatch_once_locked(
         # precedence as the ready path: lane first, then capped-pool fallback.
         review_route_source = apply_lane_model_override(
             claimed, _lane_override_for(claimed.assignee), now=_tick_now,
-        ) or ("card-override" if claimed.model_override else "profile-default")
+        )
+        note_lane_route(claimed, review_route_source)
+        review_route_source = review_route_source or (
+            "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             review_route_source = f"dispatch-fallback(capped {review_route_source})"
