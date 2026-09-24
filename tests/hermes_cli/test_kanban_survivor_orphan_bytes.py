@@ -79,7 +79,7 @@ def _init(repo):
 
 def _commit(repo, name, text):
     (repo / name).parent.mkdir(parents=True, exist_ok=True)
-    (repo / name).write_text(text)
+    (repo / name).write_text(text, encoding="utf-8")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", name)
     return _git(repo, "rev-parse", "HEAD")
@@ -131,7 +131,7 @@ def test_replaced_identity_with_ignored_bytes_holds_landed_completion(board, rem
             "landed": [{"repo_path": str(live), "sha": new_head}]})
 
     assert kb.get_task(board, tid).status != "done"
-    assert (a / "lost_impl.py").read_text() == f"UNPUBLISHED_{tid}\n"
+    assert (a / "lost_impl.py").read_text(encoding="utf-8") == f"UNPUBLISHED_{tid}\n"
     assert "lost_impl.py" in _held(board, tid)
 
 
@@ -159,10 +159,10 @@ def test_replaced_identity_with_ignored_bytes_holds_reclamation(board, remote):
     ws, a = _dispatched(board, tid)
     assert ks.preserve(board, tid, {"changed_files": ["a/lost_impl.py"]})["kind"] == "bundle"
     _replace_in_place(a, ignore="lost_impl.py\n")
-    (a / "lost_impl.py").write_text("EDITED_AFTER_COMPLETION\n")
+    (a / "lost_impl.py").write_text("EDITED_AFTER_COMPLETION\n", encoding="utf-8")
 
     assert ks.remove_workspace_dir(board, tid, ws) is False
-    assert (a / "lost_impl.py").read_text() == "EDITED_AFTER_COMPLETION\n"
+    assert (a / "lost_impl.py").read_text(encoding="utf-8") == "EDITED_AFTER_COMPLETION\n"
     assert "replaced in place" in _held(board, tid)
 
 
@@ -172,7 +172,7 @@ def test_replaced_identity_that_commits_the_old_bytes_completes(board, remote, t
     ws, a = _dispatched(board, tid)
     new_head = _replace_in_place(a, ignore="*.tmp\n")
     live = _live_clone(tmp_path, a, "live-a")
-    assert (live / "lost_impl.py").read_text() == f"UNPUBLISHED_{tid}\n"
+    assert (live / "lost_impl.py").read_text(encoding="utf-8") == f"UNPUBLISHED_{tid}\n"
 
     kb.complete_task(board, tid, metadata={
         "changed_files": ["a/lost_impl.py", "a/new.py"],
@@ -190,7 +190,7 @@ def test_replaced_identity_ignoring_only_derived_dirs_completes(board, remote, t
     (a / "lost_impl.py").unlink()
     new_head = _replace_in_place(a, ignore="node_modules/\n__pycache__/\n")
     (a / "node_modules" / "pkg").mkdir(parents=True)
-    (a / "node_modules" / "pkg" / "index.js").write_text("x\n")
+    (a / "node_modules" / "pkg" / "index.js").write_text("x\n", encoding="utf-8")
     live = _live_clone(tmp_path, a, "live-a")
 
     kb.complete_task(board, tid, metadata={
@@ -209,7 +209,7 @@ def test_same_identity_repo_with_ignored_local_files_completes(board, remote, tm
     tid = kb.create_task(board, title="same identity")
     ws, a = _dispatched(board, tid)
     _commit(a, ".gitignore", "local.env\n")
-    (a / "local.env").write_text("TOKEN=x\n")
+    (a / "local.env").write_text("TOKEN=x\n", encoding="utf-8")
     head = _commit(a, "more.py", "more\n")
     live = _live_clone(tmp_path, a, "live-a")
 
@@ -240,7 +240,7 @@ def test_unbound_claim_completes_but_its_cleanup_keeps_ignored_bytes(board, remo
     # The one completion the override authorises still happens...
     assert kb.get_task(board, tid).status == "done"
     # ...but it buys no deletion: the vanished repo's bytes are still here.
-    assert (a / "lost_impl.py").read_text() == f"UNPUBLISHED_{tid}\n"
+    assert (a / "lost_impl.py").read_text(encoding="utf-8") == f"UNPUBLISHED_{tid}\n"
     assert "unbound" in _held(board, tid)
 
 
