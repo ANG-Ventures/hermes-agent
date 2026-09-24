@@ -260,17 +260,31 @@ def clone(url: str, dest: Optional[str] = None, git_opts: Sequence[str] = ()) ->
     """
     dest = dest or default_dest(url)
     cmd = ["git", "clone"]
+    opts = list(git_opts)
     fleet = parse_fleet_repo(url)
     if fleet is not None:
         owner, repo = fleet
         try:
             mirror = ensure_mirror(url, owner, repo)
             cmd += ["--reference-if-able", str(mirror)]
+            # A partial clone ignores the reference: git fetches every object
+            # the filter keeps instead of borrowing it. Measured on hermes-home:
+            # --filter=blob:none + reference = 170 MB of objects, reference
+            # alone = 1.2 MB. With a mirror the filter only makes it bigger.
+            dropped = [o for o in opts if o.startswith("--filter=")]
+            if dropped:
+                opts = [o for o in opts if o not in dropped]
+                print(
+                    f"kanban clone: ignoring {' '.join(dropped)} -- a filtered clone "
+                    "cannot borrow from the fleet mirror, and the mirror already "
+                    "holds every object",
+                    file=sys.stderr,
+                )
         except Exception as exc:  # noqa: BLE001 - degrade to a plain clone
             print(
                 f"kanban clone: mirror unavailable ({exc}); cloning without it",
                 file=sys.stderr,
             )
-    cmd += list(git_opts)
+    cmd += opts
     cmd += ["--", url, dest]
     return subprocess.run(cmd, check=False, env=_git_env()).returncode

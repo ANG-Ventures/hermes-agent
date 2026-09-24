@@ -163,9 +163,24 @@ def test_cli_forwards_the_git_clone_options_workers_use(fleet):
     assert (dest / ".git" / "shallow").exists(), "--depth not forwarded"
     assert not (dest / "big.txt").exists(), "--no-checkout not forwarded"
     assert _git("remote", cwd=dest) == "up", "--origin not forwarded"
-    assert _git("config", "--get", "remote.up.partialclonefilter", cwd=dest) == "blob:none"
+    # --filter is dropped when a mirror is in use: a partial clone ignores
+    # --reference and would download every object the filter keeps.
+    # Own-object count, not size-pack: --depth writes an empty (0-object) pack.
+    stats = _git("count-objects", "-v", cwd=dest).splitlines()
+    assert "count: 0" in stats and "in-pack: 0" in stats, stats
+    assert subprocess.run(["git", "config", "--get", "remote.up.partialclonefilter"],
+                          cwd=dest, capture_output=True).returncode == 1
     assert _git("config", "--get", "remote.up.fetch", cwd=dest) == "+refs/heads/main:refs/remotes/up/main"
     assert _git("config", "--get", "remote.up.tagopt", cwd=dest) == "--no-tags"
+
+
+def test_filter_is_kept_when_there_is_no_mirror(fleet, monkeypatch, capsys):
+    blocker = fleet / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv(kc.MIRRORS_ENV, str(blocker))
+    assert _run_cli(["--filter=blob:none", "https://github.com/Kyzcreig/demo.git", "f"]) == 0
+    assert _git("config", "--get", "remote.origin.partialclonefilter", cwd=fleet / "f") == "blob:none"
+    assert "mirror unavailable" in capsys.readouterr().err
 
 
 def test_cli_accepts_double_dash_before_url(fleet):
