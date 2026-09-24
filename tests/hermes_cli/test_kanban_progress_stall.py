@@ -5,13 +5,13 @@ onto heartbeat events by the worker bridge). The process probe is a veto only.
 
 Probe determinism (t_5457397a): the reclaim/stall POLICY tests still run a REAL
 worker process (so reclaim really terminates it) but feed the probe a
-deterministic ``ps`` table through the ``kb._process_cpu_table`` seam. Waiting
+deterministic per-pid CPU clock through the ``kb._process_cpu_seconds`` seam. Waiting
 for the real ``ps`` to read a fresh child as 0.0% is scheduler-dependent -- on
 Linux procps ``pcpu`` is lifetime cputime/elapsed, so a child whose startup
 burned 30 ms needs ~30 s before it rounds to 0.0, far longer on a loaded
-runner -- and it ejected unrelated PRs from the merge queue. The table is still
-parsed by the production ``_cpu_active_in_table``, so the children-never-veto
-rule is exercised for real. The real probe keeps its own integration tests:
+runner -- and it ejected unrelated PRs from the merge queue. The production
+``_worker_cpu_active`` still takes the two-sample delta over that seam, and
+the seam counts only the pid's OWN CPU, so children never veto. The real probe keeps its own integration tests:
 busy process -> active (fail-safe direction, load-immune) and in-flight process
 -> idle (skips with the measured reason when the host cannot show idle).
 """
@@ -37,6 +37,13 @@ def board(tmp_path, monkeypatch):
         yield conn
 
 
+@pytest.fixture(autouse=True)
+def _short_cpu_sample(monkeypatch):
+    """Keep the real delta probe, shorten its window: still two real CPU-time
+    samples of a real process, 100 ms apart instead of 500 ms."""
+    monkeypatch.setattr(kb, "_CPU_SAMPLE_SECONDS", 0.1)
+
+
 @pytest.fixture
 def silent_server():
     """A local 'provider' that accepts connections and never answers."""
@@ -53,7 +60,9 @@ def _reap_in_background(proc):
 
 
 class _FakePs:
-    """Deterministic ``ps`` table: every registered pid reads 0.0% CPU."""
+    """Deterministic per-pid CPU clock: a registered pid with ``pcpu`` 0 never
+    advances (idle); ``pcpu`` > 0 advances by that much on every read (busy).
+    An unregistered pid reads as exited (``psutil.NoSuchProcess``)."""
 
     def __init__(self):
         self.rows = []  # (pid, ppid, pcpu)
@@ -62,20 +71,25 @@ class _FakePs:
     def add(self, pid, ppid=None, pcpu=0.0):
         self.rows.append((int(pid), int(ppid if ppid is not None else os.getpid()), pcpu))
 
-    def __call__(self):
+    def __call__(self, pid):
+        import psutil
+
         self.reads += 1
-        return "".join(f"{p:>7} {pp:>7} {c:4.1f}\n" for p, pp, c in self.rows)
+        for p, _pp, c in self.rows:
+            if p == int(pid):
+                return float(c) * self.reads
+        raise psutil.NoSuchProcess(int(pid))
 
 
 @pytest.fixture
 def fake_ps(monkeypatch):
     fake = _FakePs()
-    monkeypatch.setattr(kb, "_process_cpu_table", fake)
+    monkeypatch.setattr(kb, "_process_cpu_seconds", fake)
     return fake
 
 
 def _wait_idle_real(pid, timeout=60.0):
-    """Wait until the REAL probe reads idle on 6 consecutive samples.
+    """Wait until the REAL delta probe reads idle on 3 consecutive samples.
 
     Only the real-probe integration test uses this. A miss caused by the host
     (``ps`` failing/timing out, or load above the core count) is a SKIP with
@@ -85,14 +99,16 @@ def _wait_idle_real(pid, timeout=60.0):
     deadline, streak, probe_errors = time.monotonic() + timeout, 0, []
     while time.monotonic() < deadline:
         try:
-            active = kb._cpu_active_in_table(kb._process_cpu_table(), pid)
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            before = kb._process_cpu_seconds(pid)
+            time.sleep(kb._CPU_SAMPLE_SECONDS)
+            active = kb._process_cpu_seconds(pid) > before
+        except Exception as exc:
             probe_errors.append(type(exc).__name__)
             active = True
         streak = 0 if active else streak + 1
-        if streak >= 6:
+        if streak >= 3:
             return
-        time.sleep(0.25)
+        time.sleep(0.1)
     load = os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0
     cores = os.cpu_count() or 1
     if probe_errors or load > cores:
@@ -290,20 +306,28 @@ def test_cpu_active_worker_vetoes_stale_progress(board, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", [
-    OSError("ps missing"),
-    subprocess.CalledProcessError(1, ["ps"]),
-    subprocess.TimeoutExpired(["ps"], 2),
+    OSError("proc unreadable"),
+    RuntimeError("probe blew up"),
+    "access_denied",
+    "psutil_missing",
 ])
 def test_process_probe_failure_never_authorizes_reclaim(board, monkeypatch, silent_server, failure):
+    import psutil
+
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
     # An UNINSTALLED table: skips the real-idle wait, but the probe itself stays
     # real so it runs into the broken ``ps`` below.
     proc = _in_flight_worker(silent_server, _FakePs())
     try:
-        def broken(*_a, **_kw):
-            raise failure
-        monkeypatch.setattr(subprocess, "run", broken)
+        if failure == "psutil_missing":
+            monkeypatch.setitem(sys.modules, "psutil", None)  # import -> ImportError
+        else:
+            exc = psutil.AccessDenied(proc.pid) if failure == "access_denied" else failure
+
+            def broken(*_a, **_kw):
+                raise exc
+            monkeypatch.setattr(psutil, "Process", broken)
         assert kb._worker_cpu_active(proc.pid) is True
         tid = _running(board, now, proc.pid, progress_at=now - 1600)
         assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == []
@@ -311,6 +335,39 @@ def test_process_probe_failure_never_authorizes_reclaim(board, monkeypatch, sile
         assert proc.poll() is None
     finally:
         proc.kill()
+
+
+def test_past_cpu_burn_does_not_veto_a_worker_idle_now():
+    """t_46a2f8a1: the veto answers "burning CPU NOW", not "ever burned CPU".
+
+    Linux ``ps -o pcpu`` is lifetime CPU / lifetime elapsed, so a worker that
+    did real work and then stalled read nonzero for hours and vetoed its own
+    reclaim. A real child burns ~1 s of CPU, signals, then blocks: the probe
+    must read it idle within a couple of samples of the signal.
+    """
+    code = (
+        "import sys,time\n"
+        "t=time.process_time()\n"
+        "while time.process_time()-t<1.0: pass\n"
+        "sys.stdout.write('x');sys.stdout.flush();sys.stdin.read()"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout.read(1) == b"x"  # the burn is over; it blocks from here
+        idle = [kb._worker_cpu_active(proc.pid) for _ in range(4)]
+        assert idle[-2:] == [False, False], idle
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_exited_process_reads_idle():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+    assert kb._worker_cpu_active(proc.pid) is False
 
 
 def test_run_without_progress_signal_is_unknown_and_never_reclaimed(board, monkeypatch, silent_server, fake_ps):

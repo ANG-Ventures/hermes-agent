@@ -15004,7 +15004,11 @@ def enforce_max_runtime(
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
-def _worker_cpu_active(pid: int) -> bool:
+# Window between the two CPU-time samples in :func:`_worker_cpu_active`.
+_CPU_SAMPLE_SECONDS = 0.5
+
+
+def _worker_cpu_active(pid: int, sample_seconds: Optional[float] = None) -> bool:
     """Veto only: a worker burning CPU right now is evidence against a stall.
 
     This probe can never *authorize* a reclaim on its own -- a worker blocked
@@ -15014,41 +15018,49 @@ def _worker_cpu_active(pid: int) -> bool:
     processes are deliberately NOT a veto: workers hold persistent idle
     children (execute_code kernels, LSP servers) for their whole life, and a
     healthy long tool call already advances ``progress_at`` through the tool
-    keepalive tickers. Unknown process state (``ps`` missing/failing/
-    unparseable) returns True so it never authorizes a kill.
+    keepalive tickers.
+
+    "Right now" is measured as a delta: two samples of the process's
+    cumulative user+system CPU time ``sample_seconds`` apart. ``ps -o pcpu``
+    cannot answer that question on Linux, where procps reports lifetime CPU
+    time divided by lifetime elapsed time: a process that burned 2 s of CPU
+    and then blocked still read 9.4% pcpu 21 s later on ACE-AI (0.000 s CPU
+    in the same window), so every stalled Linux worker that had ever done
+    real work vetoed its own reclaim, and a slow-starting test child could
+    not read idle within 30 s on a loaded CI runner (t_46a2f8a1).
+
+    A process that no longer exists reads idle (nothing to veto). Unknown
+    state (psutil missing, access denied, any other probe error) returns
+    True so it never authorizes a kill.
     """
     try:
-        return _cpu_active_in_table(_process_cpu_table(), pid)
-    except (OSError, ValueError, subprocess.SubprocessError):
+        import psutil
+    except ImportError:
         return True  # Unknown process state must not authorize a kill.
+    window = _CPU_SAMPLE_SECONDS if sample_seconds is None else sample_seconds
+    try:
+        before = _process_cpu_seconds(int(pid))
+        time.sleep(window)
+        after = _process_cpu_seconds(int(pid))
+    except psutil.NoSuchProcess:  # includes ZombieProcess: exited, not busy
+        return False
+    except Exception:
+        return True  # Unknown process state must not authorize a kill.
+    return after > before
 
 
-def _process_cpu_table() -> str:
-    """Raw ``pid ppid pcpu`` table from ``ps`` (the probe's only I/O).
+def _process_cpu_seconds(pid: int) -> float:
+    """Cumulative user+system CPU seconds of ``pid`` itself (the probe's only I/O).
 
-    Split out so tests can feed a deterministic table instead of depending on
-    a loaded host's scheduler to make a real child read 0.0% in time.
+    Split out (t_5457397a) so policy tests can feed a deterministic CPU clock
+    instead of depending on a loaded host's scheduler. Only the process's OWN
+    CPU is counted, so persistent idle children can never veto. Raises
+    ``psutil.NoSuchProcess`` for an exited pid.
     """
-    return subprocess.run(
-        ["ps", "-A", "-o", "pid=,ppid=,pcpu="],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
-        check=True,
-    ).stdout
+    import psutil
 
-
-def _cpu_active_in_table(table: str, pid: int) -> bool:
-    """Pure parse: True iff ``pid`` itself shows CPU > 0 (children never veto).
-
-    Raises ValueError on an unparseable row so the caller treats it as unknown.
-    """
-    for line in table.splitlines():
-        fields = line.split()
-        if len(fields) != 3:
-            continue
-        proc, cpu = int(fields[0]), float(fields[2])
-        if proc == pid and cpu > 0:
-            return True
-    return False
+    t = psutil.Process(pid).cpu_times()
+    return t.user + t.system
 
 
 def _run_progress_at(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[int]:
