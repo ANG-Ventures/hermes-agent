@@ -59,7 +59,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--matrix-file", type=Path, required=True, help="generate's matrix JSON file")
     parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--event", default="", help="github.event_name (legacy note off merge_group)")
+    parser.add_argument("--event", default="", help="github.event_name")
+    parser.add_argument("--managed", default="", help="explicit Phase-4 placement switch")
     args = parser.parse_args(argv)
     matrix = json.loads(args.matrix_file.read_text(encoding="utf-8"))
     durations = rtp._load_durations(ROOT)
@@ -69,7 +70,7 @@ def main(argv=None) -> int:
     (args.out_dir / "request.json").write_text(json.dumps(request, separators=(",", ":")) + "\n", encoding="utf-8")
     (args.out_dir / "local_matrix.json").write_text(json.dumps(local_matrix(matrix)), encoding="utf-8")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary and args.event != "merge_group":
+    if summary and (args.event != "merge_group" or args.managed != "true"):
         with open(summary, "a", encoding="utf-8") as fh:
             fh.write(f"CI overflow placement: `{LEGACY_NOTE}` (event `{args.event}` uses the original generate matrix).\n")
     return 0

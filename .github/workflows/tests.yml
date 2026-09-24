@@ -105,8 +105,9 @@ jobs:
         id: overflow
         env:
           EVENT_NAME: ${{ github.event_name }}
+          MANAGED_PLACEMENT: ${{ vars.CI_OVERFLOW_PLACEMENT_ENABLED }}
         run: |
-          python3 scripts/ci_overflow_request.py --matrix-file ci-overflow/matrix.json --out-dir ci-overflow --event "$EVENT_NAME"
+          python3 scripts/ci_overflow_request.py --matrix-file ci-overflow/matrix.json --out-dir ci-overflow --event "$EVENT_NAME" --managed "$MANAGED_PLACEMENT"
           echo "local_matrix=$(cat ci-overflow/local_matrix.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload CI overflow request
@@ -136,7 +137,9 @@ jobs:
   placement:
     name: Placement
     needs: generate
-    if: github.event_name == 'merge_group'
+    # Phase-2 static-routing switch: absent/invalid stays on the existing K/ARM
+    # split until Apollo explicitly activates managed placement in Phase 4.
+    if: github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # A dead placement (checkout/runner failure, 5-min kill) must not fail the
@@ -190,10 +193,10 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      # non-merge_group: original matrix (policy=legacy, excluded from the
-      # overflow budget). merge_group: the validated placement matrix, else the
-      # all-local matrix. No branch can hand fromJSON a missing output.
-      matrix: ${{ fromJSON(github.event_name != 'merge_group' && needs.generate.outputs.matrix || needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.matrix || needs.generate.outputs.local_matrix) }}
+      # Static routing remains the default for every event, including
+      # merge_group, until Phase-4 activation. Managed placement is selected
+      # only with the explicit switch; a failed plan then uses all-local.
+      matrix: ${{ fromJSON((github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && needs.generate.outputs.matrix || needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.matrix || needs.generate.outputs.local_matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -343,10 +346,9 @@ jobs:
   e2e:
     needs: [generate, placement]
     if: always() && !cancelled() && needs.generate.result == 'success'
-    # non-merge_group keeps the legacy expression (self-hosted e2e requires
-    # X64; hosted fallback keeps its standard label). merge_group REPLACES it:
-    # the validated plan's e2e labels (never ARM), else the fixed local pool.
-    runs-on: ${{ github.event_name != 'merge_group' && (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON('["ubuntu-latest"]')) || fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.e2e_runs_on || '["self-hosted","Linux","X64","hermes-ci"]') }}
+    # Static routing (including merge_group with the switch OFF) retains the
+    # legacy X64 expression. Managed mode uses plan labels or fixed local.
+    runs-on: ${{ (github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON('["ubuntu-latest"]')) || fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.e2e_runs_on || '["self-hosted","Linux","X64","hermes-ci"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout code

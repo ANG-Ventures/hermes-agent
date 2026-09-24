@@ -191,8 +191,9 @@ PLACEMENT_OUTCOMES = {
 }
 
 
-def _ctx(event, placement, runner_labels):
-    return {"github": {"event_name": event}, "vars": {"CI_RUNNER_LABELS": runner_labels},
+def _ctx(event, placement, runner_labels, enabled=False):
+    return {"github": {"event_name": event}, "vars": {"CI_RUNNER_LABELS": runner_labels,
+                                                       "CI_OVERFLOW_PLACEMENT_ENABLED": "true" if enabled else ""},
             "needs": {"generate": {"result": "success",
                                    "outputs": {"matrix": json.dumps(GEN_MATRIX),
                                                "local_matrix": json.dumps(local_matrix(GEN_MATRIX))}},
@@ -215,32 +216,39 @@ def check_fallback(doc: dict) -> list[str]:
     jobs, errors = doc["jobs"], []
     local = json.dumps(local_matrix(GEN_MATRIX))
     for event in ("pull_request", "push", "merge_group"):
-        for outcome, placement in PLACEMENT_OUTCOMES.items():
-            if (event == "merge_group") == (outcome == "skipped"):
-                continue  # placement runs exactly on merge_group
-            for labels in (None, '["self-hosted","hermes-ci"]'):
-                ctx = _ctx(event, copy.deepcopy(placement), labels)
-                where = f"{event}/{outcome}/labels={labels}"
-                status = {"always": True, "cancelled": False, "failure": False, "success": True}
-                try:
-                    for name in ("test", "e2e"):
-                        if not _job_runs(jobs[name], ctx):
-                            errors.append(f"{where}: {name} skipped")
-                    matrix = evaluate(jobs["test"]["strategy"]["matrix"], ctx, status)
-                    e2e = evaluate(jobs["e2e"]["runs-on"], ctx, status)
-                except (ValueError, SyntaxError, KeyError, TypeError) as exc:
-                    errors.append(f"{where}: {exc}")
-                    continue
-                if event != "merge_group":
-                    want, want_e2e = GEN_MATRIX, (["self-hosted", "hermes-ci", "X64"] if labels else ["ubuntu-latest"])
-                elif outcome == "valid":
-                    want, want_e2e = PLACED, X64
-                else:
-                    want, want_e2e = json.loads(local), POOL
-                if matrix != want:
-                    errors.append(f"{where}: wrong matrix selected")
-                if e2e != want_e2e:
-                    errors.append(f"{where}: e2e runs-on {e2e} != {want_e2e}")
+        for enabled in (False, True):
+            for outcome, placement in PLACEMENT_OUTCOMES.items():
+                for labels in (None, '["self-hosted","hermes-ci"]'):
+                    ctx = _ctx(event, copy.deepcopy(placement), labels, enabled)
+                    where = f"{event}/enabled={enabled}/{outcome}/labels={labels}"
+                    status = {"always": True, "cancelled": False, "failure": False, "success": True}
+                    try:
+                        runs_placement = _job_runs(jobs["placement"], ctx)
+                        if runs_placement != (event == "merge_group" and enabled):
+                            errors.append(f"{where}: placement {'ran' if runs_placement else 'skipped'} unexpectedly")
+                        # GitHub skips placement when the switch is OFF, regardless of a
+                        # stale output in the synthetic input.
+                        if not runs_placement:
+                            ctx["needs"]["placement"] = copy.deepcopy(PLACEMENT_OUTCOMES["skipped"])
+                        for name in ("test", "e2e"):
+                            if not _job_runs(jobs[name], ctx):
+                                errors.append(f"{where}: {name} skipped")
+                        matrix = evaluate(jobs["test"]["strategy"]["matrix"], ctx, status)
+                        e2e = evaluate(jobs["e2e"]["runs-on"], ctx, status)
+                    except (ValueError, SyntaxError, KeyError, TypeError) as exc:
+                        errors.append(f"{where}: {exc}")
+                        continue
+                    legacy_e2e = ["self-hosted", "hermes-ci", "X64"] if labels else ["ubuntu-latest"]
+                    if event != "merge_group" or not enabled:
+                        want, want_e2e = GEN_MATRIX, legacy_e2e
+                    elif outcome == "valid":
+                        want, want_e2e = PLACED, X64
+                    else:
+                        want, want_e2e = json.loads(local), POOL
+                    if matrix != want:
+                        errors.append(f"{where}: wrong matrix selected")
+                    if e2e != want_e2e:
+                        errors.append(f"{where}: e2e runs-on {e2e} != {want_e2e}")
     return errors
 
 
@@ -274,12 +282,26 @@ def test_mutating_managed_fallback_to_legacy_matrix_fails_integration():
     assert any("wrong matrix" in e for e in check_fallback(doc))
 
 
+def test_static_routing_switch_mutation_fails_integration():
+    doc = _tests_yml()
+    doc["jobs"]["placement"]["if"] = "github.event_name == 'merge_group'"
+    assert any("placement ran unexpectedly" in e for e in check_fallback(doc))
+    doc = _tests_yml()
+    doc["jobs"]["test"]["strategy"]["matrix"] = doc["jobs"]["test"]["strategy"]["matrix"].replace(
+        " || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true'", "")
+    assert any("wrong matrix" in e for e in check_fallback(doc))
+    doc = _tests_yml()
+    doc["jobs"]["e2e"]["runs-on"] = doc["jobs"]["e2e"]["runs-on"].replace(
+        " || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true'", "")
+    assert any("e2e runs-on" in e for e in check_fallback(doc))
+
+
 def test_if_predicates_exact():
     jobs = _tests_yml()["jobs"]
     for name in ("test", "e2e"):
         assert jobs[name]["if"] == IF_PREDICATE
         assert jobs[name]["needs"] == ["generate", "placement"]
-    assert jobs["placement"]["if"] == "github.event_name == 'merge_group'"
+    assert jobs["placement"]["if"] == "github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'"
 
 
 def test_placement_job_shape_and_permissions_exact():
@@ -298,6 +320,24 @@ def test_generate_emits_local_matrix_and_request_artifact():
     upload = next(s for s in gen["steps"] if s.get("id") == "request")
     assert upload["with"]["name"] == "ci-overflow-request-${{ github.run_id }}-${{ github.run_attempt }}"
     assert upload["with"]["path"] == "ci-overflow/request.json"
+    step = next(s for s in gen["steps"] if s.get("id") == "overflow")
+    assert step["env"]["MANAGED_PLACEMENT"] == "${{ vars.CI_OVERFLOW_PLACEMENT_ENABLED }}"
+    assert '--managed "$MANAGED_PLACEMENT"' in step["run"]
+
+
+def test_static_merge_group_summary_reports_legacy_policy(tmp_path):
+    src = tmp_path / "matrix.json"
+    src.write_text(json.dumps(GEN_MATRIX), encoding="utf-8")
+    for enabled in ("", "true"):
+        summary = tmp_path / "summary.md"
+        summary.write_text("", encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(ROOT / "scripts/ci_overflow_request.py"),
+                               "--matrix-file", str(src), "--out-dir", str(tmp_path / "out"),
+                               "--event", "merge_group", "--managed", enabled],
+                              env={"GITHUB_STEP_SUMMARY": str(summary), "PATH": "/usr/bin:/bin"},
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60, cwd=ROOT)
+        assert proc.returncode == 0, proc.stderr
+        assert ("policy=legacy, excluded_from_overflow_budget" in summary.read_text()) == (enabled != "true")
 
 
 def test_matrices_never_travel_through_env():
