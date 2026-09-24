@@ -44,6 +44,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -248,20 +249,35 @@ def test_concurrent_ingest_between_parity_counts_cannot_trigger_rebuild(tmp_path
     spec = build_message_fts_spec()
     committed = False
 
-    def after_first_count(sql: str) -> None:
-        nonlocal committed
-        if not committed and sql.strip().upper() == 'SELECT COUNT(*) FROM "MESSAGES"':
-            writer.execute(
-                "INSERT INTO messages(session_id, role, content, timestamp) "
-                "VALUES ('race', 'user', 'new turn', 1)"
-            )
-            writer.commit()
-            committed = True
+    class InterleavedConnection:
+        def __init__(self, conn):
+            self._conn = conn
 
-    reader.set_trace_callback(after_first_count)
+        @property
+        def in_transaction(self):
+            return self._conn.in_transaction
+
+        def execute(self, sql, *args):
+            nonlocal committed
+            # Execute a genuine concurrent writer COMMIT after the first count
+            # has already completed and immediately before the second COUNT.
+            # A trace callback fires at statement start (too early), so it
+            # cannot prove the distinct-snapshot race.
+            if sql.strip().upper().startswith('SELECT COUNT(*) FROM "MESSAGES_FTS_DOCSIZE"'):
+                writer.execute(
+                    "INSERT INTO messages(session_id, role, content, timestamp) "
+                    "VALUES ('race', 'user', 'new turn', 1)"
+                )
+                writer.commit()
+                committed = True
+            return self._conn.execute(sql, *args)
+
     try:
-        needs_rebuild = db_bootstrap._fts_needs_rebuild_structural(reader, spec)
-        assert committed, "probe never interleaved an ingest after the first parity count"
+        parity_check = getattr(
+            db_bootstrap, "_fts_count_parity_mismatch", db_bootstrap._fts_needs_rebuild_structural
+        )
+        needs_rebuild = parity_check(cast(sqlite3.Connection, InterleavedConnection(reader)), spec)
+        assert committed, "probe never interleaved an ingest between the parity counts"
         assert not needs_rebuild, "a concurrent valid FTS insert caused a false rebuild"
     finally:
         reader.close()

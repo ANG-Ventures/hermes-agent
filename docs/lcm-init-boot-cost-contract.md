@@ -9,6 +9,78 @@ process-wide engine-load lock. Each backfill was correct and cheap when it lande
 and nobody re-measured as the DB grew. Fixes: fork PRs #887 (`search_content`), #902
 (`ingested_at`), and this document's regression layer.
 
+## Freeze #3 (2026-09-24): parity COUNT plus a false-rebuild race
+
+This was **not generic I/O contention** and not “Kanban is too busy.” The
+restart burst created many LCM engine loads and active ingests; the *code* turned
+that combination into a false FTS parity mismatch and an enormous synchronous
+index rebuild. Aegis also uses LCM, but its independent gateway/database and
+small, low-concurrency workload do not exercise Apollo's 2.7 M-row DB with
+simultaneous Kanban children. A healthy Aegis chat is therefore no control for
+this load pattern.
+
+Measured on the live Apollo DB and an APFS clone, without mutating the live DB:
+
+- `EXPLAIN QUERY PLAN SELECT COUNT(*) FROM messages` → `SCAN TABLE messages
+  USING COVERING INDEX idx_msg_session_ts`; `messages_fts_docsize` → `SCAN
+  TABLE messages_fts_docsize`. A covering index is still a traversal of all
+  2.7 M rows. Cold clone: `MessageStore()` took 17.9 s; these two SELECTs
+  occupied 11.1 s and 2.35 s. Warm-cache standalone counts (~0.07/0.05 s)
+  understated the contended restart cost.
+- The original `_fts_needs_rebuild_structural` issued **two autocommit SELECTs**.
+  A concurrent valid message insert and FTS trigger commit between them made
+  the two snapshots disagree. Reproduced with a real SQLite writer: **15/300
+  parity calls falsely requested rebuild**; a deterministic interleaving test
+  fails on fork/main and passes with both reads in one deferred read transaction.
+- The real `apollo-loadlock-samples.log` sampled the lock holder at
+  `db_bootstrap.py:2885` (`_drop_fts_table`) at 05:07–05:10, then at `:3023`
+  (`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`) through 05:20;
+  `PHASE=context_engine_load_slow held=779.8s`. A second rebuild ran about
+  05:22–05:28. Up to 12 other threads waited on `_LOAD_LOCK`. These are direct
+  stack samples of **rebuilding**, not an inference from a slow log.
+- Two amplifiers were also observed: no-op engine loads unconditionally wrote
+  the `fts_integrity_failed` DELETE and the `messages_dedup_v1`/schema markers,
+  queuing behind the SQLite write lock; at session start, lifecycle GC ran
+  `SELECT DISTINCT session_id FROM messages/summary_nodes` under `BEGIN
+  IMMEDIATE` once its default 200-row threshold was exceeded (live: 11,108
+  lifecycle rows). The three undecryptable NULL `search_content` rows were
+  point-updated to NULL on **every** load, firing FTS update triggers despite
+  no change. A separate cold-clone trace measured 56.7 s in one such FTS
+  shadow write. These are distinct from the parity root cause and all sit on
+  the same restart fan-out path.
+
+**Code provenance (git, not chronology-as-causality):**
+
+- `8b869633a4` (2026-06-16 initial LCM vendor) already has the two COUNTs in
+  `db_bootstrap.py:308,317` and `MessageStore`/`SummaryDAG` registration calls.
+  The parity design did **not** originate in September.
+- `3174e25373` (2026-07-21) introduced the process-global `_LOAD_LOCK` to
+  prevent half-import races. `27b617846e` (2026-08-06 re-vendor) preserved the
+  COUNTs and the per-load FTS check; it did **not** newly introduce them.
+- `d8b2d2448e` (#887, 2026-09-23) gated/indexed the `search_content` backfill;
+  `4964ea0518` (#902) marked the `ingested_at` backfill. Neither changed
+  `_fts_needs_rebuild_structural`. `4806d08c8b` (#903) added this init-cost
+  test and slow-load logging, but the test **exempted `USING COVERING INDEX`
+  and skipped SQL mentioning `messages_fts`**, so it passed the bad COUNTs.
+  This PR strengthens the existing gate, rather than calling those prior fixes
+  the cause of freeze #3.
+
+**Fix:** The engine-load path does only O(1) FTS shape/metadata checks. The
+parity count is independently throttled (default 6 h, persisted per FTS table
+in metadata), dispatched with the existing background integrity worker, and
+retained on explicit `/lcm doctor` repair. Its two counts share one SQLite read
+snapshot. No-op loads take no SQLite write lock, NULL-to-NULL backfill writes
+are skipped, and empty-lifecycle GC uses indexed point probes and an
+in-process 6 h throttle rather than an immediate full `messages` traversal.
+A structural corruption/missing table still takes the existing repair path;
+background findings still surface through `/lcm doctor`.
+
+**Scope of verification:** isolated worktree with `PYTHONPATH=<worktree>`;
+`tests/context_engine/` passes. No fork merge, deploy or gateway restart is
+part of this PR. The final operational gate is a restart with concurrent
+Kanban workers and a real reply from Apollo; tests and a clone cannot claim
+that user-visible result in advance.
+
 ## The contract
 
 1. **`_init_db` is on every turn's critical path.** `load_context_engine()` runs it under
@@ -20,11 +92,16 @@ and nobody re-measured as the DB grew. Fixes: fork PRs #887 (`search_content`), 
    "run once" true across boots. `search_content` additionally uses a partial index
    (`idx_msg_search_content_null`) so the presence probe is O(1) even before the marker exists.
 3. **Any `UPDATE`/`DELETE`/`SELECT` against `messages` on the init path must be either
-   row-bounded** (`WHERE store_id`/`session_id`, `LIMIT ?`) **or marker-gated.**
+   row-bounded** (`WHERE store_id`/`session_id`, `LIMIT ?`) **or moved off the load path.**
+   A covering-index scan is still O(rows). A marker does not make a full scan safe
+   under `_LOAD_LOCK` on the first load after a restart or marker expiry.
 4. **Real work is batched and committed per batch** (`BACKFILL_BATCH_ROWS`), so a kill
    mid-backfill keeps its progress instead of redoing everything next boot.
+5. **Concurrent reads must share one snapshot.** Separate autocommit parity counts
+   straddled a valid FTS-triggered ingest and falsely authorized a full inline rebuild.
+   A no-op load must not acquire the SQLite write lock or erase a background finding.
 
-## The three enforcement layers (all in `tests/context_engine/`)
+## The enforcement layers (all in `tests/context_engine/`)
 
 | Layer | File / test | What it catches | Proven red on |
 |---|---|---|---|
@@ -32,6 +109,7 @@ and nobody re-measured as the DB grew. Fixes: fork PRs #887 (`search_content`), 
 | Query plan | `test_lcm_init_cost_regression.py::test_second_open_issues_no_full_scan_of_guarded_tables` | traces every statement a steady-state engine construction **+ `on_session_start`** issues on the loading thread, `EXPLAIN`s each on a fresh connection, and fails on **any** `SCAN` of `messages`, `messages_fts*`, `summary_nodes`, `nodes_fts*` — **`USING COVERING INDEX` is NOT exempt** (a covering-index `COUNT(*)` still reads every row); only `LIMIT`-bounded statements are. **A statement that cannot be explained is a finding, never a skip** | the 2026-09-22-morning `store.py`; fork/main `df435998f9` (freeze #3: `COUNT(*) FROM messages` → `SCAN messages USING COVERING INDEX`, `COUNT(*) FROM messages_fts_docsize`, lifecycle-GC `SELECT DISTINCT session_id` ×2) |
 | Write lock | `…::test_engine_construction_needs_no_write_lock` | a steady-state engine construction must succeed while another connection holds `BEGIN IMMEDIATE`, busy timeout 0 — i.e. a no-op load issues **no write** and can never queue behind an in-flight writer | fork/main `df435998f9` (unconditional `messages_dedup_v1` / `schema_version` upserts, `_clear_integrity_failed` DELETE) |
 | Flag survival | `…::test_ordinary_open_keeps_background_corruption_flag` | an ordinary open must not erase the background scan's corruption flag | fork/main `df435998f9` |
+| Parity race | `…::test_concurrent_ingest_between_parity_counts_cannot_trigger_rebuild` | commits a real message + FTS trigger between the two count reads; a valid ingest must not authorize rebuild | fork/main: `assert not needs_rebuild` fails; fixed: one read transaction succeeds |
 | Scale ratio | `…::test_init_time_does_not_scale_with_row_count` | 200 vs 20 000 rows, second-open time ratio must be < 5× | belt-and-suspenders; too small to feel a scan on its own |
 | Live signal | `plugins/context_engine/__init__.py` `PHASE=context_engine_load_slow` | any engine load that holds or waits on `_LOAD_LOCK` ≥ `HERMES_ENGINE_LOAD_SLOW_S` (5 s) logs one WARNING naming held/waited seconds and pointing here | — (observability, not a gate) |
 
