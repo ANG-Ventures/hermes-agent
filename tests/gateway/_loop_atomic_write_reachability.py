@@ -100,9 +100,9 @@ def _module_to_path(repo: Path, module: str) -> Path | None:
     return pkg if pkg.is_file() else None
 
 
-def _in_package_roots(repo: Path, path: Path) -> bool:
+def _in_package_roots(repo: Path, path: Path, roots=None) -> bool:
     rel = path.relative_to(repo).as_posix()
-    return any(rel == r or rel.startswith(r + "/") for r in PACKAGE_ROOTS)
+    return any(rel == r or rel.startswith(r + "/") for r in (roots or PACKAGE_ROOTS))
 
 
 def _imported_modules(path: Path) -> set[str]:
@@ -124,7 +124,7 @@ def _imported_modules(path: Path) -> set[str]:
     return out
 
 
-def derive_scanned_modules(repo: Path) -> frozenset[str]:
+def derive_scanned_modules(repo: Path, roots=None) -> frozenset[str]:
     """Modules reachable from ``GRAPH_ENTRY_MODULE`` that live in a scanned root.
 
     Returns repo-relative posix paths (``"gateway/session.py"``), so the caller
@@ -144,7 +144,7 @@ def derive_scanned_modules(repo: Path) -> frozenset[str]:
         rel = path.relative_to(repo).as_posix()
         if "/tests/" in rel or rel.startswith("tests/"):
             continue
-        if _in_package_roots(repo, path):
+        if _in_package_roots(repo, path, roots):
             kept.add(rel)
         for imported in _imported_modules(path):
             if imported not in seen_modules:
@@ -184,9 +184,37 @@ def _called_names(node: ast.AST) -> set[str]:
     return out
 
 
-def build_index(repo: Path, modules) -> dict:
+def _file_import_map(repo: Path, tree: ast.AST, modules) -> dict[str, str]:
+    """``local_name -> rel_path`` for every ``from X import name`` in a file.
+
+    Includes function-local imports (the gateway imports lazily almost
+    everywhere).  Only targets inside the scanned module set are kept.
+    """
+    out: dict[str, str] = {}
+    scanned = set(modules)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.level or not node.module:
+            continue
+        target = _module_to_path(repo, node.module)
+        if target is None:
+            continue
+        rel = target.relative_to(repo).as_posix()
+        if rel not in scanned:
+            continue
+        for alias in node.names:
+            out[alias.asname or alias.name] = (rel, alias.name)
+    return out
+
+
+# Per-file import maps, populated by ``build_index`` (keyed by rel path).
+_IMPORT_MAPS: dict[str, dict] = {}
+
+
+def build_index(repo: Path, modules, *, noqa_token: str | None = None) -> dict:
     """``(rel_path, fn_name) -> {"async", "calls", "line", "noqa"}``."""
+    token = noqa_token or _NOQA_TOKEN
     index: dict = {}
+    _IMPORT_MAPS.clear()
     for rel in sorted(modules):
         path = repo / rel
         try:
@@ -194,6 +222,7 @@ def build_index(repo: Path, modules) -> dict:
             tree = ast.parse(src)
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
+        _IMPORT_MAPS[rel] = _file_import_map(repo, tree, modules)
         lines = src.splitlines()
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -203,24 +232,43 @@ def build_index(repo: Path, modules) -> dict:
                 "async": isinstance(node, ast.AsyncFunctionDef),
                 "calls": _called_names(node),
                 "line": node.lineno,
-                "noqa": _NOQA_TOKEN in decl and bool(
-                    decl.split(_NOQA_TOKEN, 1)[1].strip()
+                "noqa": token in decl and bool(
+                    decl.split(token, 1)[1].strip()
                 ),
             }
     return index
 
 
-def _hits_sink(calls: set[str]) -> str | None:
-    for name in sorted(calls & _ATOMIC_SINK_NAMES):
+def _hits_sink(calls: set[str], sinks=None) -> str | None:
+    names, dotted_set = sinks or (_ATOMIC_SINK_NAMES, _OS_SINK_DOTTED)
+    for name in sorted(calls & names):
         return name
-    for dotted in sorted(_OS_SINK_DOTTED & calls):
+    for dotted in sorted(dotted_set & calls):
         return dotted
     return None
 
 
 def find_onloop_atomic_write_sites(repo: Path, modules) -> list[str]:
     """Return ``"<path> <async_fn> -> <sink> via <chain>"`` for each offender."""
-    index = build_index(repo, modules)
+    return find_onloop_sink_sites(repo, modules)
+
+
+def find_onloop_sink_sites(
+    repo: Path,
+    modules,
+    *,
+    sink_names=None,
+    sink_dotted=None,
+    noqa_token: str | None = None,
+    start_roots=None,
+) -> list[str]:
+    """Generic walk: coroutines (under ``start_roots``, default all) reaching a sink."""
+    sinks = (
+        (frozenset(sink_names), frozenset(sink_dotted or ()))
+        if sink_names is not None
+        else None
+    )
+    index = build_index(repo, modules, noqa_token=noqa_token)
     by_name: dict[str, list[tuple]] = defaultdict(list)
     for key in index:
         by_name[key[1]].append(key)
@@ -229,7 +277,11 @@ def find_onloop_atomic_write_sites(repo: Path, modules) -> list[str]:
     for key, info in sorted(index.items()):
         if not info["async"] or info["noqa"]:
             continue
-        found = _search(key, index, by_name)
+        if start_roots and not any(
+            key[0] == r or key[0].startswith(r + "/") for r in start_roots
+        ):
+            continue
+        found = _search(key, index, by_name, sinks)
         if found is not None:
             sink, chain = found
             offenders.append(
@@ -238,7 +290,7 @@ def find_onloop_atomic_write_sites(repo: Path, modules) -> list[str]:
     return sorted(offenders)
 
 
-def _search(start, index, by_name):
+def _search(start, index, by_name, sinks=None):
     """DFS from ``start``; return ``(sink, chain)`` or None.
 
     Callee resolution is deliberately CONSERVATIVE: a bare name resolves only
@@ -259,7 +311,7 @@ def _search(start, index, by_name):
         info = index.get(key)
         if info is None or info["noqa"]:
             continue
-        sink = _hits_sink(info["calls"])
+        sink = _hits_sink(info["calls"], sinks)
         if sink is not None:
             return sink, chain
         if depth >= _MAX_DEPTH:
@@ -309,6 +361,13 @@ def _resolve(name: str, current_file: str, start_file: str, index, by_name):
         if key in index:
             yield key
             return
+    # An explicit ``from X import name`` in the current file is unambiguous
+    # even when ``name`` is defined in several modules (``switch_model`` is:
+    # hermes_cli/model_switch.py, run_agent.py, agent/...).
+    imported = _IMPORT_MAPS.get(current_file, {}).get(name)
+    if imported is not None and imported in index:
+        yield imported
+        return
     unique = by_name.get(name, ())
     if len(unique) == 1:
         yield unique[0]

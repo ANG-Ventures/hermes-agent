@@ -11618,6 +11618,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 explicit_provider=provider,
                 user_providers=user_provs,
                 custom_providers=custom_provs,
+                # Credential re-resolution only: NO live /v1/models probe.
+                # This runs on the event loop (every /model persist and every
+                # lazy rehydrate); the probe is a sync urllib GET with a 5 s
+                # timeout that blocked Discord for 10 s on 2026-09-24.
+                probe_catalog=False,
             )
         except Exception:
             return None
