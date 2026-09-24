@@ -6140,7 +6140,6 @@ def add_comment(
             {
                 "author": author,
                 "len": len(body),
-                "comment_id": cur.lastrowid,
                 # Non-secret fingerprint only, so the event log stays
                 # attributable even if a comment row is later pruned.
                 **({"session_ref": session_ref} if session_ref else {}),
@@ -6522,6 +6521,15 @@ def _append_event(
     and the row carries NULL.
     """
     now = int(time.time())
+    if kind in _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS or (
+        kind == "dependency_wait" and (payload or {}).get("kind") == "dependency"
+    ) or (kind == "reclaimed" and (payload or {}).get("manual") is True):
+        # Snapshot comment causality in the same transaction as operator intent.
+        # Old commented events cannot be correlated with comment rows reliably.
+        payload = dict(payload or {})
+        payload["after_comment_id"] = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
+        ).fetchone()[0]
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
@@ -10499,17 +10507,8 @@ def requeue_task(
                 f"'ready' tasks (use unblock/reopen/triage-resolve/promote "
                 f"for other states)"
             )
-        # Snapshot the PR the operator intends to continue. Historical
-        # commented events may lack comment_id, so same-second inline audit
-        # comments cannot always be mapped back to their event unambiguously.
-        pr_comment_id = next((c["id"] for c in conn.execute(
-            "SELECT id, body FROM task_comments WHERE task_id = ? "
-            "AND created_at >= ? ORDER BY id DESC",
-            (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
-        ) if _RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None)
         _append_event(
-            conn, task_id, "requeued",
-            {"actor": actor, "reason": reason, "pr_comment_id": pr_comment_id},
+            conn, task_id, "requeued", {"actor": actor, "reason": reason},
         )
     return True, None
 
@@ -15023,67 +15022,25 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
     )
     if pr_comment is None:
         return False
-    # A READY requeue records the exact latest PR comment in its own txn.
-    # This works even on pre-upgrade boards whose 'commented' event cannot
-    # be mapped uniquely after an inline audit comment in the same second.
-    if conn.execute(
-        "SELECT 1 FROM task_events i WHERE i.task_id = ? AND i.kind = 'requeued' "
-        "AND json_extract(i.payload, '$.pr_comment_id') = ? "
-        "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
-        "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
-        (task_id, pr_comment["id"]),
-    ).fetchone():
-        return True
-    # New writes carry the exact comment id. Historical events lack it; match
-    # their author/length within the timestamp rather than counting unrelated
-    # inline audit comments (which do not emit 'commented' events).
-    event = conn.execute(
-        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
-        "AND json_extract(payload, '$.comment_id') = ? LIMIT 1",
-        (task_id, pr_comment["id"]),
-    ).fetchone()
-    if event is None:
-        offset = conn.execute(
-            "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
-            "AND created_at = ? AND author = ? AND length(body) = ? AND id < ? "
-            "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = task_comments.task_id "
-            "AND e.kind = 'commented' AND json_extract(e.payload, '$.comment_id') = task_comments.id)",
-            (task_id, pr_comment["created_at"], pr_comment["author"],
-             len(pr_comment["body"]), pr_comment["id"]),
-        ).fetchone()[0]
-        event = conn.execute(
-            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
-            "AND created_at = ? AND json_extract(payload, '$.author') = ? "
-            "AND json_extract(payload, '$.len') = ? "
-            "AND json_extract(payload, '$.comment_id') IS NULL "
-            "ORDER BY id LIMIT 1 OFFSET ?",
-            (task_id, pr_comment["created_at"], pr_comment["author"],
-             len(pr_comment["body"]), offset),
-        ).fetchone()
-    if event is None:
-        return False  # Imported comment without an event: fail closed.
-    pr_event_id = int(event["id"])
+    # The intent event snapshots the highest comment id atomically. No guess
+    # about which 'commented' event corresponds to this PR is needed: inline
+    # audit comments and historical trimmed bodies cannot skew the ordering.
+    # Pre-upgrade intent events have no marker; an equal-second tie resumes:
+    # one duplicate worker is recoverable, an indefinite guard is not.
     kinds = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
-    intent = conn.execute(
-        "SELECT 1 FROM task_events i WHERE i.task_id = ? AND i.id > ? "
+    return conn.execute(
+        "SELECT 1 FROM task_events i WHERE i.task_id = ? "
         f"AND (i.kind IN ({kinds}) OR "
-        "(i.kind = 'reclaimed' AND json_extract(i.payload, '$.manual') = 1)) "
+        "(i.kind = 'reclaimed' AND json_extract(i.payload, '$.manual') = 1) OR "
+        "(i.kind = 'dependency_wait' AND json_extract(i.payload, '$.kind') = 'dependency' "
+        "AND EXISTS (SELECT 1 FROM task_events p WHERE p.task_id = i.task_id "
+        "AND p.kind = 'promoted' AND p.id > i.id))) "
+        "AND (json_extract(i.payload, '$.after_comment_id') >= ? OR "
+        "(json_type(i.payload, '$.after_comment_id') IS NULL AND i.created_at >= ?)) "
         "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
         "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
-        (task_id, pr_event_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS),
-    ).fetchone()
-    if intent:
-        return True
-    # A worker dependency block grants a single continuation only AFTER its
-    # parents promote it; a review demotion has no $.kind='dependency'.
-    return conn.execute(
-        "SELECT 1 FROM task_events d JOIN task_events p "
-        "ON p.task_id = d.task_id AND p.kind = 'promoted' AND p.id > d.id "
-        "WHERE d.task_id = ? AND d.kind = 'dependency_wait' AND d.id > ? "
-        "AND json_extract(d.payload, '$.kind') = 'dependency' "
-        "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = d.task_id "
-        "AND s.kind = 'spawned' AND s.id > d.id) LIMIT 1",
-        (task_id, pr_event_id),
+        (task_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS,
+         pr_comment["id"], pr_comment["created_at"]),
     ).fetchone() is not None
 
 

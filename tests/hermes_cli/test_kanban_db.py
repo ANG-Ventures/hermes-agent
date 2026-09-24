@@ -3595,6 +3595,11 @@ def test_every_operator_intent_is_ordered_and_consumed(kanban_home, monkeypatch,
     with kb.connect() as conn:
         task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
         kb._append_event(conn, task_id, kind, {"actor": "operator"})
+        intent = kb.list_events(conn, task_id)[-1]
+        assert intent.payload is not None
+        assert intent.payload["after_comment_id"] == conn.execute(
+            "SELECT MAX(id) FROM task_comments WHERE task_id=?", (task_id,),
+        ).fetchone()[0]
         assert kb.check_respawn_guard(conn, task_id) is None
         kb._append_event(conn, task_id, "spawned", {"pid": 99999999})
         assert kb.check_respawn_guard(conn, task_id) == "active_pr"
@@ -3747,16 +3752,78 @@ def test_legacy_equal_length_inline_comment_does_not_block_requeue(kanban_home, 
         assert kb.check_respawn_guard(conn, task_id) == "active_pr"
 
 
+@pytest.mark.parametrize("inline_before", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_historical_pr_dependency_wait_resumes_despite_unmappable_comment_event(
+    kanban_home, all_assignees_spawnable, monkeypatch, inline_before, padded,
+):
+    """Old boards did not link commented events; trim/inline writes defeat correlation."""
+    now = int(time.time())
+    clock = {"now": now}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        if inline_before:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (child, "alice", "x" * len("https://github.com/o/r/pull/9"), now),
+            )
+            conn.commit()
+        pr = "https://github.com/o/r/pull/9"
+        kb.add_comment(conn, child, "alice", f" {pr} " if padded else pr)
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+            "WHERE task_id=? AND kind='commented'", (child,),
+        )
+        conn.commit()
+        assert kb.reopen_task(conn, parent, actor="qa", reason="rework") == (True, None)
+        clock["now"] += 2
+        assert kb.block_task(conn, child, reason="resume then complete", kind="dependency")
+        assert kb.complete_task(conn, parent)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
+        assert child in spawned
+
+
+@pytest.mark.parametrize("later_second", [False, True])
+def test_preupgrade_intent_resumes_on_equal_second(kanban_home, monkeypatch, later_second):
+    now = int(time.time())
+    clock = {"now": now}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        if later_second:
+            clock["now"] += 2
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="legacy") == (True, None)
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.after_comment_id', '$.pr_comment_id') "
+            "WHERE task_id=? AND kind='requeued'", (task_id,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
 def test_pr_intent_has_one_event_id_ordering_seam():
-    """PR override must not regress to second-resolution timestamp ordering."""
+    """PR identity comes only from comments; no guessed comment/event join."""
+    import ast
     import inspect
-    guard = inspect.getsource(kb.check_respawn_guard)
+    source = inspect.getsource(kb.check_respawn_guard)
     intent = inspect.getsource(kb._unused_operator_intent_after_pr)
-    assert guard.count("_unused_operator_intent_after_pr(conn, task_id)") == 1
-    assert "newest_pr_at" not in guard and "requeued_after" not in guard[guard.index("# 4. Recent GitHub PR comments."):]
-    assert "i.id > ?" in intent and "s.id > i.id" in intent
-    assert "d.id > ?" in intent and "s.id > d.id" in intent
-    assert "i.created_at >" not in intent and "s.created_at >" not in intent
+    tree = ast.parse(source + "\n" + intent)
+    sql_literals = [node.value.lower() for node in ast.walk(tree)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+    assert source.count("_unused_operator_intent_after_pr(conn, task_id)") == 1
+    assert "after_comment_id" in intent and "s.id > i.id" in intent
+    assert "json_type(i.payload, '$.after_comment_id') IS NULL AND i.created_at >= ?" in intent
+    assert not any("kind = 'commented'" in value for value in sql_literals)
+    assert not any("join task_comments" in value or "join task_events" in value
+                   for value in sql_literals)
 
 
 def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
