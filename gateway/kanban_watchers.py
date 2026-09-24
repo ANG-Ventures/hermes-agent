@@ -475,20 +475,22 @@ def _observe_workspace_refusal_outages(notifier, results) -> int:
     return delivered
 
 
-def _guard_stuck_cards(results) -> list[tuple[str, dict]]:
-    """Probe guarded cards on boards whose dispatcher tick actually ran."""
+def _guard_stuck_cards(results) -> tuple[list[tuple[str, dict]], set[str]]:
+    """Probe guarded cards; only successful board probes can prove recovery."""
     from hermes_cli import kanban_db as kb
 
     cards = []
+    observed_boards = set()
     for board, result in results or []:
         if result is None or getattr(result, "skipped_locked", False):
             continue
         try:
             with kb.connect_closing(board=board) as conn:
                 cards.extend((board, item) for item in kb.respawn_guard_stuck_tasks(conn))
+            observed_boards.add(board)
         except Exception:
             logger.exception("kanban dispatcher: guard-stuck probe failed on %s", board)
-    return cards
+    return cards, observed_boards
 
 
 class _GuardStuckNotifier:
@@ -497,9 +499,14 @@ class _GuardStuckNotifier:
     def __init__(self) -> None:
         self._delivered: set[tuple[str, str]] = set()
 
-    def observe(self, cards, send) -> int:
+    def observe(self, cards, send, observed_boards=None) -> int:
         current = {(board, item["task_id"]) for board, item in cards}
-        self._delivered.intersection_update(current)
+        if observed_boards is None:
+            observed_boards = {board for board, _ in cards}
+        self._delivered = {
+            key for key in self._delivered
+            if key[0] not in observed_boards or key in current
+        }
         delivered = 0
         for board, item in cards:
             key = board, item["task_id"]
@@ -2604,9 +2611,10 @@ class GatewayKanbanWatchersMixin:
                     # throttled, not broken). ``_stall_streak_is_bad`` consults the
                     # DispatchResult buckets so telemetry can tell "busy/throttled"
                     # from "genuinely stuck" instead of guessing.
-                    guard_stuck = await service(_guard_stuck_cards, results)
+                    guard_stuck, observed_boards = await service(_guard_stuck_cards, results)
                     guard_pages = await service(
                         guard_stuck_notifier.observe, guard_stuck, _send_guard_stuck_alert,
+                        observed_boards,
                     )
                     if guard_pages:
                         logger.error("kanban dispatcher: %d active_pr card(s) STUCK >30 min; "

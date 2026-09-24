@@ -15204,8 +15204,9 @@ def check_respawn_guard(
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     pr_urls: list[str] = []
     newest_pr_at = 0
+    newest_pr_comment_id = 0
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
+        "SELECT id, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
@@ -15213,7 +15214,8 @@ def check_respawn_guard(
         urls = [match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body)]
         if urls:
             pr_urls.extend(urls)
-            newest_pr_at = max(newest_pr_at, int(c["created_at"]))
+            if (int(c["created_at"]), int(c["id"])) > (newest_pr_at, newest_pr_comment_id):
+                newest_pr_at, newest_pr_comment_id = int(c["created_at"]), int(c["id"])
     if pr_urls:
         _kinds_sql = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
         requeued_after = conn.execute(
@@ -15236,22 +15238,37 @@ def check_respawn_guard(
         # ready 8h/14h behind ``active_pr`` after dependency_wait->promoted.
         # Event ids (not created_at) order the sequence: second-granularity
         # timestamps tie inside one tick.
+        # Match the PR-bearing comment to its event, not merely to its
+        # second-resolution timestamp. Later ordinary comments must not
+        # cancel a worker's earlier dependency-resume intent. Comments and
+        # their events are appended together by add_comment; their ordinal
+        # within a timestamp disambiguates multiple writes in one second.
+        comment_offset = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
+            "AND created_at = ? AND id < ?",
+            (task_id, newest_pr_at, newest_pr_comment_id),
+        ).fetchone()[0]
+        pr_event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? "
+            "AND kind = 'commented' AND created_at = ? ORDER BY id LIMIT 1 OFFSET ?",
+            (task_id, newest_pr_at, comment_offset),
+        ).fetchone()
+        # A missing event (e.g. an imported comment) cannot grant an
+        # exemption: retain the active-PR guard rather than guessing order.
+        pr_event_id = int(pr_event["id"]) if pr_event else 0
         dependency_resume = conn.execute(
             "SELECT 1 FROM task_events p "
             "WHERE p.task_id = ? AND p.kind = 'promoted' "
             "AND EXISTS (SELECT 1 FROM task_events d "
             "    WHERE d.task_id = p.task_id AND d.kind = 'dependency_wait' "
             "    AND json_extract(d.payload, '$.kind') = 'dependency' "
-            "    AND d.created_at >= ? AND d.id < p.id "
-            "    AND NOT EXISTS (SELECT 1 FROM task_events c "
-            "        WHERE c.task_id = d.task_id AND c.kind = 'commented' "
-            "        AND c.created_at >= ? AND c.id > d.id)) "
+            "    AND d.id > ? AND d.id < p.id) "
             "AND NOT EXISTS (SELECT 1 FROM task_events s "
             "    WHERE s.task_id = p.task_id AND s.kind = 'spawned' "
             "    AND s.id > p.id) "
             "LIMIT 1",
-            (task_id, newest_pr_at, newest_pr_at),
-        ).fetchone()
+            (task_id, pr_event_id),
+        ).fetchone() if pr_event_id else None
         if dependency_resume:
             return None
         resolver = pr_state_resolver or _PrStateResolver()
@@ -15328,7 +15345,7 @@ def respawn_guard_stuck_tasks(
             "guarded_since": first_at,
             "guarded_seconds": now - first_at,
             "guard_events": int(streak["n"]),
-            "clear_verb": f'kanban requeue {task_id} "<reason>"',
+            "clear_verb": f'hermes kanban requeue {task_id} "<reason>"',
         })
     return out
 

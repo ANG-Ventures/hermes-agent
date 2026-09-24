@@ -3528,6 +3528,23 @@ def test_dependency_wait_promoted_resumes_open_pr_once(kanban_home, all_assignee
         assert kb.check_respawn_guard(conn, child) == "active_pr"
 
 
+def test_dependency_wait_ordinary_comment_after_block_resumes_same_pr(kanban_home, all_assignees_spawnable, monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume", kind="dependency")
+        kb.add_comment(conn, child, "alice", "Waiting for parent; no new PR")
+        assert kb.complete_task(conn, parent)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
+        assert child in spawned
+
+
 def test_dependency_wait_before_newer_pr_comment_does_not_resume(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
     with kb.connect() as conn:
@@ -3563,7 +3580,9 @@ def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
         conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1860, tid))
         kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
         assert kb.respawn_guard_stuck_tasks(conn, now=now - 120) == []
-        assert [x["task_id"] for x in kb.respawn_guard_stuck_tasks(conn, now=now)] == [tid]
+        stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
+        assert [x["task_id"] for x in stuck] == [tid]
+        assert stuck[0]["clear_verb"] == f'hermes kanban requeue {tid} "<reason>"'
         kb._append_event(conn, tid, "requeued", {"actor": "operator", "reason": "retry"})
         assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
 
