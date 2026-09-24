@@ -243,9 +243,47 @@ def _emit_api_call_record(
 
 
 
+def _note_billed_response(agent: Any, response: Any) -> None:
+    """Register a transport-accepted (billed) response for loop accounting.
+
+    The per-call ledger row is written HERE, at the transport chokepoint, for
+    every HTTP-200 the provider returns. The conversation loop's session
+    counters and Blackbox ``_turn_calls`` only commit the response the loop
+    ACCEPTS; one it rejects afterwards (content-filter refusal, invalid shape,
+    length/empty retry, redirect crossing) and fails over from was still
+    billed, and used to vanish from the turn totals (I4 class 2).
+
+    Every billed response is therefore parked in ``agent._billed_unaccounted``
+    together with the route that produced it (the provider/model change on
+    failover, so they must be captured now). The loop's accept site consumes
+    the entry it commits; anything still parked at the next attempt, or at
+    turn end, is settled by
+    ``conversation_loop._settle_unaccepted_billed_responses``.
+    Fail-open: accounting must never break the call.
+    """
+    try:
+        pending = getattr(agent, "_billed_unaccounted", None)
+        if not isinstance(pending, list):
+            pending = []
+            agent._billed_unaccounted = pending
+        pending.append({
+            "response": response,
+            "provider": str(getattr(agent, "provider", "") or ""),
+            "model": str(getattr(agent, "model", "") or ""),
+            "base_url": str(getattr(agent, "base_url", "") or ""),
+            "api_mode": str(getattr(agent, "api_mode", "") or ""),
+            "turn_id": str(getattr(agent, "_current_turn_id", "") or ""),
+        })
+    except Exception:
+        logger.debug("billed-response registration failed", exc_info=True)
+
+
 def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[dict] = None) -> None:
     if response is None or getattr(response, "_api_call_failure_recorded", False):
         return
+    # Registered BEFORE the pooled-header guard below: a response whose ledger
+    # row cannot be attributed was still billed and must still be counted.
+    _note_billed_response(agent, response)
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
     if provider in _POOLED_PROVIDERS and not hasattr(response, "pool_headers"):
         _note_api_call_recording_failure(agent)
