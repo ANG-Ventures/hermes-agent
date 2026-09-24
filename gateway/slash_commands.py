@@ -137,6 +137,20 @@ def _stale_code_switch_guard_enabled() -> bool:
         return _STALE_CODE_SWITCH_GUARD_DEFAULT
 
 
+def _with_resolved_route(label: str, result: Any) -> str:
+    """Append the resolved ``provider/model`` pair to a /model confirmation.
+
+    The display label alone ("Claude BPX-5") hides a mis-split such as
+    ``claude-apr`` + ``name:claude-bpx-5/x``; the literal pair makes it
+    visible in the reply on every platform.
+    """
+    provider = str(getattr(result, "target_provider", "") or "").strip()
+    model = str(getattr(result, "new_model", "") or "").strip()
+    if not provider or not model:
+        return label
+    return f"{label} · `{provider}/{model}`"
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -2853,7 +2867,7 @@ class GatewaySlashCommandsMixin:
                         _fast_row = self._fast_unavailable_model_switch_row(result)
                         if _fast_row:
                             lines.append(_fast_row)
-                        lines.append(t("gateway.model.provider_label", provider=plabel))
+                        lines.append(t("gateway.model.provider_label", provider=_with_resolved_route(plabel, result)))
                         try:
                             # Read the ACTUAL post-switch effort off the agent
                             # (#467 rule 3) rather than re-resolving for the OLD
@@ -3276,7 +3290,7 @@ class GatewaySlashCommandsMixin:
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
             lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
-            lines.append(t("gateway.model.provider_label", provider=provider_label))
+            lines.append(t("gateway.model.provider_label", provider=_with_resolved_route(provider_label, result)))
             _fast_row = self._fast_unavailable_model_switch_row(result)
             if _fast_row:
                 lines.append(_fast_row)
