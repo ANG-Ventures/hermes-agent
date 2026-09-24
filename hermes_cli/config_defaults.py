@@ -3022,6 +3022,15 @@ DEFAULT_CONFIG = {
         "banned_worker_model_substrings": None,
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
+        # Implicit probe for claude relay-pool providers (claude-apr / -bpr /
+        # -apx-* / -bpx-*) with no explicit provider_health_probes entry: skip
+        # the spawn while the pool reports fewer than provider_health_min_eligible
+        # eligible seats. Unreachable/malformed probe fails OPEN. "" disables.
+        "pool_health_url": "http://127.0.0.1:18810/health",
+        # Board-wide circuit: this many rate_limited run closes within 10 min
+        # hold ALL pool-bound spawns for 10 min (one #logs line per trip).
+        # 0 disables.
+        "rate_limit_trip": 5,
         # CPU scheduling priority for dispatcher-spawned worker gateways, and
         # therefore for everything they spawn (terminal-tool children inherit
         # niceness). "background" (default) runs each worker at nice 19 — and,

@@ -1066,14 +1066,17 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     ]
 
     guard_reason = None
+    guard_payload: dict = {}
     for ev in events:
         if _event_kind(ev) != "respawn_guarded":
             continue
         if _event_ts(ev) < last_ready_ts:
             continue
-        reason = _parse_payload(ev).get("reason")
+        payload = _parse_payload(ev)
+        reason = payload.get("reason")
         if reason:
             guard_reason = str(reason)
+            guard_payload = payload
 
     guard_detail = ""
     data = {
@@ -1085,6 +1088,15 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if guard_reason:
         guard_detail = f" Current respawn guard: {guard_reason}."
         data["respawn_guard_reason"] = guard_reason
+        held_until = guard_payload.get("eligible_at")
+        if guard_reason == "rate_limit_cooldown" and isinstance(held_until, (int, float)):
+            # Escalating rate-limit backoff (5m/15m/45m/2h): say when it lifts.
+            data["held_until"] = int(held_until)
+            guard_detail += (
+                " held: rate_limit_backoff until "
+                + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(held_until)))
+                + "."
+            )
 
     return [Diagnostic(
         kind="stranded_in_ready",
