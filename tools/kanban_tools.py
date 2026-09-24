@@ -2690,6 +2690,61 @@ KANBAN_LINK_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Home-session guard binding (see kanban_db.check_home_session)
+# ---------------------------------------------------------------------------
+
+_FOREIGN_OK_PROP = {
+    "type": "string",
+    "description": (
+        "Only when the card's home session is ANOTHER session and you are "
+        "not its assignee: the reason you must act on it anyway. The action "
+        "is then allowed and the reason is posted as a comment the home "
+        "session sees. Omit otherwise -- prefer kanban_comment on foreign cards."
+    ),
+}
+for _schema in (KANBAN_COMPLETE_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_UNBLOCK_SCHEMA):
+    _schema["parameters"]["properties"]["foreign_ok"] = _FOREIGN_OK_PROP
+
+
+def _caller_profile() -> Optional[str]:
+    prof = os.environ.get("HERMES_PROFILE")
+    if prof:
+        return prof
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or None
+    except Exception:
+        return None
+
+
+def _with_mutation_actor(handler):
+    """Bind the calling session/profile for the kanban_db home-session guard.
+
+    The guard itself lives in ONE place (``kanban_db._home_session_guarded``);
+    this only tells it who is calling. Session ids mirror exactly what
+    ``kanban_create`` stamps (origin id, then the resolved current id), so a
+    card created by this session always matches it.
+    """
+
+    def wrapped(args: dict, **kw) -> str:
+        from hermes_cli import kanban_db as _kb
+        from tools.async_delegation import _current_origin_session_id
+
+        with _kb.mutation_actor(
+            session_ids=(_current_origin_session_id(), _current_session_id()),
+            profile=_caller_profile(),
+            foreign_ok=(args or {}).get("foreign_ok"),
+            surface="tool",
+        ):
+            return handler(args, **kw)
+
+    wrapped.__name__ = getattr(handler, "__name__", "wrapped")
+    wrapped.__wrapped__ = handler
+    return wrapped
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -2715,7 +2770,7 @@ registry.register(
     name="kanban_complete",
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
-    handler=_handle_complete,
+    handler=_with_mutation_actor(_handle_complete),
     check_fn=_check_kanban_mode,
     emoji="✔",
 )
@@ -2724,7 +2779,7 @@ registry.register(
     name="kanban_block",
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
-    handler=_handle_block,
+    handler=_with_mutation_actor(_handle_block),
     check_fn=_check_kanban_mode,
     emoji="⏸",
 )
@@ -2805,7 +2860,7 @@ registry.register(
     name="kanban_unblock",
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
-    handler=_handle_unblock,
+    handler=_with_mutation_actor(_handle_unblock),
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
 )
