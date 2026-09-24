@@ -15106,7 +15106,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             PriorLifeVerdict,
             classify_prior_life,
             read_last_event_loop_blocked_site,
-            read_planned_restart,
+            read_planned_restart_for_sentinel,
         )
 
         home = getattr(self, "_unclean_restart_home", None)
@@ -15122,12 +15122,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             site = getattr(self, "_unclean_restart_site", None)
             if site is None:
                 site = read_last_event_loop_blocked_site(home)
-            planned = None
-            try:
-                _ended = (sentinel or {}).get("prior_exited_at") or (sentinel or {}).get("prior_started_at")
-                planned = read_planned_restart(_ended, home)
-            except Exception:
-                planned = None
+            # Reference time + pid identity live in ONE helper: a SIGKILLed prior
+            # life has no prior_exited_at, and the old fallback to
+            # prior_started_at (the PREVIOUS boot) read a requested restart as
+            # UNPLANNED (2026-09-24 12:12).
+            planned = read_planned_restart_for_sentinel(sentinel, home)
             verdict = classify_prior_life(sentinel, site=site, planned=planned)
         except Exception:
             logger.debug("Prior-life verdict unavailable", exc_info=True)
