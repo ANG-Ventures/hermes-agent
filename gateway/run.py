@@ -24289,7 +24289,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
                     # uninstalled skill and give actionable guidance.
-                    _unavail_msg = _check_unavailable_skill(command)
+                    # rglob + read_text over every SKILL.md (900+ on the fleet)
+                    # — measured PHASE=event_loop_blocked 10 s; keep it off-loop.
+                    _unavail_msg = await asyncio.to_thread(_check_unavailable_skill, command)
                     if _unavail_msg:
                         return _unavail_msg
                     # Genuinely unrecognized /command: not a built-in, not a
@@ -26239,20 +26241,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     ),
                                     default=False,
                                 )
-                                _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
-                                    model=_hyg_model,
-                                    max_iterations=4,
-                                    quiet_mode=True,
-                                    skip_memory=not _hyg_checkpoint_required,
-                                    enabled_toolsets=["memory"],
-                                    session_id=session_entry.session_id,
-                                    session_db=_hyg_session_db,
-                                )
-                                _seed_hygiene_system_prompt(
-                                    _hyg_agent,
-                                    _hyg_session_row,
-                                )
+                                # OFF the event loop (2026-09-24): AIAgent.__init__
+                                # loads the context engine under the process-global
+                                # _LOAD_LOCK — 20-60 s while worker turns hold it —
+                                # and that was the PHASE=event_loop_blocked site
+                                # that stalled Discord heartbeats past the ~41 s
+                                # ACK window (7 socket drops in 50 min). The
+                                # compression call below was already off-loop;
+                                # construction must be too.
+                                def _build_hyg_agent():
+                                    _a = AIAgent(
+                                        **_hyg_runtime,
+                                        model=_hyg_model,
+                                        max_iterations=4,
+                                        quiet_mode=True,
+                                        skip_memory=not _hyg_checkpoint_required,
+                                        enabled_toolsets=["memory"],
+                                        session_id=session_entry.session_id,
+                                        session_db=_hyg_session_db,
+                                    )
+                                    _seed_hygiene_system_prompt(_a, _hyg_session_row)
+                                    return _a
+
+                                _hyg_agent = await asyncio.to_thread(_build_hyg_agent)
                                 # If compression must rebuild instead of retaining
                                 # the cached prompt, make the persisted result
                                 # deliberately stale for every real gateway surface.
