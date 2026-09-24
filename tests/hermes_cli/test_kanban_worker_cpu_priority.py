@@ -242,6 +242,114 @@ def test_knob_is_declared_in_config_defaults():
 
 
 # ---------------------------------------------------------------------------
+# (c) macOS: nice alone does not leave the gateway's QoS class (t_14c130aa)
+# ---------------------------------------------------------------------------
+
+
+def test_idle_mode_resolves_and_stays_niced():
+    assert kb.worker_cpu_priority_config({"worker_cpu_priority": "idle"}) == ("idle", 19)
+
+
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        ("background", ["/usr/sbin/taskpolicy", "-c", "utility"]),
+        ("idle", ["/usr/sbin/taskpolicy", "-b"]),
+        ("normal", []),
+    ],
+)
+def test_darwin_prefix_per_mode(monkeypatch, mode, expected):
+    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.os, "access", lambda path, flag: True)
+    assert kb.worker_darwin_qos_prefix(mode) == expected
+
+
+def test_darwin_prefix_is_empty_off_macos(monkeypatch):
+    monkeypatch.setattr(kb.sys, "platform", "linux")
+    assert kb.worker_darwin_qos_prefix("background") == []
+
+
+def test_darwin_prefix_degrades_when_taskpolicy_missing(monkeypatch):
+    """A missing wrapper must fall back to nice-only, never break the spawn."""
+    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.os, "access", lambda path, flag: False)
+    assert kb.worker_darwin_qos_prefix("background") == []
+
+
+@pytest.mark.parametrize(
+    "mode, expect_prefix",
+    [("background", True), ("idle", True), ("normal", False)],
+)
+def test_spawn_argv_carries_the_darwin_prefix(fresh_home, monkeypatch, mode, expect_prefix):
+    """The prefix must reach Popen, ahead of the unchanged worker argv."""
+    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(kb.os, "access", lambda path, flag: True)
+    nice = 0 if mode == "normal" else 19
+    monkeypatch.setattr(kb, "worker_cpu_priority_config", lambda cfg=None: (mode, nice))
+    cmd = _spawn_and_capture_kwargs(fresh_home, monkeypatch, f"t_{mode}")["cmd"]
+    prefix = kb.worker_darwin_qos_prefix(mode) if expect_prefix else []
+    assert cmd[: len(prefix)] == prefix
+    assert "-p" in cmd[len(prefix):] and cmd[len(prefix)] != "/usr/sbin/taskpolicy"
+
+
+_TASKPOLICY = "/usr/sbin/taskpolicy"
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not os.access(_TASKPOLICY, os.X_OK),
+    reason="macOS taskpolicy required",
+)
+def test_idle_prefix_puts_forked_and_execed_descendants_in_darwin_bg():
+    """Real process tree: darwin-BG survives fork AND exec below the worker.
+
+    PRIO_DARWIN_PROCESS is readable unprivileged, so this proves the
+    property end-to-end rather than trusting the argv. (The utility clamp of
+    'background' is only readable via root-only taskinfo; the fork/exec
+    inheritance mechanism is the same task-policy inheritance.)
+    """
+    prio_darwin_process = 4
+    program = (
+        "import os,sys,subprocess\n"
+        f"P={prio_darwin_process}\n"
+        "r,w=os.pipe()\n"
+        "if os.fork()==0:\n"
+        "    os.close(r)\n"
+        "    forked=os.getpriority(P,0)\n"
+        "    execed=subprocess.run([sys.executable,'-c',\n"
+        "        f'import os;print(os.getpriority({P},0))'],\n"
+        "        capture_output=True,text=True).stdout.strip()\n"
+        "    os.write(w,f'{forked} {execed}'.encode())\n"
+        "    os._exit(0)\n"
+        "os.close(w)\n"
+        "print(os.getpriority(P,0), os.read(r,64).decode())\n"
+    )
+    out = subprocess.run(
+        [*kb.worker_darwin_qos_prefix("idle"), sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["1", "1", "1"], out.stdout
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not os.access(_TASKPOLICY, os.X_OK),
+    reason="macOS taskpolicy required",
+)
+def test_taskpolicy_prefix_keeps_the_worker_pid():
+    """Exec-form: the dispatcher tracks Popen.pid, so it must BE the worker."""
+    proc = subprocess.Popen(
+        [*kb.worker_darwin_qos_prefix("background"), sys.executable, "-c",
+         "import os; print(os.getpid())"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    out, _ = proc.communicate(timeout=60)
+    assert int(out.strip()) == proc.pid
+
+
+# ---------------------------------------------------------------------------
 # Spawn observability: one auditable line per worker
 # ---------------------------------------------------------------------------
 
@@ -256,3 +364,4 @@ def test_spawn_logs_cpu_priority_line(fresh_home, monkeypatch, caplog):
     assert "task=t_logline" in line
     assert "cpu_priority=" in line
     assert "nice=" in line
+    assert "darwin_policy=" in line
