@@ -153,6 +153,7 @@ def _count(board, tid, kind):
 
 def test_run_7914_shape_stalls_at_15_reclaims_at_25_escalates_after_two(board, monkeypatch, silent_server, fake_ps):
     now = int(time.time())
+    real_time = time.time
     monkeypatch.setattr(kb.time, "time", lambda: now)
     proc = _in_flight_worker(silent_server, fake_ps)
     # Last real progress = the API call start 15 min ago; the wrapper keeps
@@ -180,6 +181,16 @@ def test_run_7914_shape_stalls_at_15_reclaims_at_25_escalates_after_two(board, m
         claimed = kb.claim_task(board, tid)
         board.execute("UPDATE task_runs SET started_at=? WHERE id=?", (now - 1500, claimed.current_run_id))
         board.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (again.pid, tid))
+        # The faked clock has advanced 600 s past the REAL one, so claim_task
+        # stamped its ``claimed`` event in the future of this worker's real
+        # creation. The owner-identity window (t_0ae83825) would then read the
+        # genuine worker as a recycled PID. Re-stamp the claim on the real
+        # clock, before the worker started, as a real dispatcher would.
+        board.execute(
+            "UPDATE task_events SET created_at=? WHERE task_id=? AND run_id=? "
+            "AND kind='claimed'",
+            (int(real_time()) - 60, tid, claimed.current_run_id),
+        )
         board.commit()
         _heartbeat(board, tid, now - 1500)
         kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500)

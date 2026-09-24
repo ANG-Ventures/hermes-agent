@@ -7905,6 +7905,126 @@ def _owner_identity(pid, claimed_at, spawned_at, start_token=None) -> str:
     return "verified" if started else "recycled"
 
 
+def _worker_owner_window(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: Optional[int],
+    run_id: Optional[int] = None,
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """The owner window ``(claimed_at, spawned_at, start_token)`` for ``pid``.
+
+    ``start_token`` is the clock-step-immune stamp the ``spawned`` event
+    recorded (t_21dfa673); when present :func:`_owner_identity` matches on it
+    and ignores the wall-clock bounds, exactly like the claim guard.
+
+    Feeds :func:`_owner_identity` for the TERMINATION and LIVENESS paths, so
+    they judge a live PID by the same rule the claim guard uses (t_0ae83825):
+    a live process at ``tasks.worker_pid`` is the recorded worker only if it
+    was created no earlier than its run's claim and no later than the
+    ``spawned`` event that recorded it.
+
+    ``run_id`` defaults to the card's ``current_run_id``. The lower bound is
+    that run's ``claimed`` event, falling back to the run's ``started_at``
+    and then the card's first ``started_at`` (a worker cannot predate the
+    card's first start). The upper bound is the newest ``spawned`` event of
+    the run that recorded this pid. A missing bound is ``None`` and is simply
+    not applied, so missing evidence can never prove a PID recycled.
+    """
+    if not pid:
+        return (None, None, None)
+    if run_id is None:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        run_id = row["current_run_id"] if row is not None else None
+    claimed_at = None
+    if run_id is not None:
+        ev = conn.execute(
+            "SELECT created_at FROM task_events WHERE task_id = ? "
+            "AND run_id = ? AND kind = 'claimed' ORDER BY id ASC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if ev is not None:
+            claimed_at = ev["created_at"]
+        else:
+            run = conn.execute(
+                "SELECT started_at FROM task_runs WHERE id = ?", (int(run_id),),
+            ).fetchone()
+            if run is not None:
+                claimed_at = run["started_at"]
+    if claimed_at is None:
+        row = conn.execute(
+            "SELECT started_at FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is not None:
+            claimed_at = row["started_at"]
+    spawned_at = None
+    if run_id is not None:
+        spawns = conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+            "AND kind = 'spawned' AND run_id = ? ORDER BY id DESC",
+            (task_id, int(run_id)),
+        ).fetchall()
+    else:
+        spawns = conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+            "AND kind = 'spawned' ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+    start_token = None
+    for ev in spawns:
+        try:
+            payload = json.loads(ev["payload"] or "{}")
+            if int(payload["pid"]) == int(pid):
+                spawned_at = ev["created_at"]
+                start_token = payload.get("start_token")
+                break
+        except (TypeError, ValueError, KeyError, AttributeError):
+            continue
+    return (claimed_at, spawned_at, start_token)
+
+
+def _recorded_worker_alive(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: Optional[int],
+    run_id: Optional[int] = None,
+) -> bool:
+    """True if ``pid`` is alive AND is not provably a recycled PID.
+
+    Liveness is not identity: a dead, unreaped worker's PID can be reused by
+    any process (measured on the live board: macOS daemons and another card's
+    worker). An ``unverified`` identity (create time unreadable) counts as
+    alive -- fail closed, never release beside a possible owner.
+    """
+    if not _pid_alive(pid):
+        return False
+    window = _worker_owner_window(conn, task_id, pid, run_id)
+    return _owner_identity(int(pid), *window) != "recycled"
+
+
+class _PendingTermination(tuple):
+    """A ``(worker_pid, claim_lock)`` pair plus its owner-identity window.
+
+    Deferred (post-commit) terminations are drained after the run that
+    recorded the pid has been closed, so the causal window is captured while
+    the evidence is at hand. Compares and unpacks exactly like the plain
+    2-tuple callers already use.
+    """
+
+    owner_window: tuple
+
+    def __new__(cls, pid, claim_lock, owner_window=(None, None)):
+        obj = super().__new__(cls, (pid, claim_lock))
+        obj.owner_window = tuple(owner_window)
+        return obj
+
+
+def _termination_window(entry) -> tuple:
+    """Owner window carried by a deferred termination entry, if any."""
+    return getattr(entry, "owner_window", (None, None))
+
+
 @_home_session_guarded("claim")
 def claim_task(
     conn: sqlite3.Connection,
@@ -8320,7 +8440,9 @@ def release_stale_claims(
         if (
             host_local
             and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            # Identity, not bare liveness: a recycled holder must not keep
+            # extending a dead worker's claim forever (t_0ae83825).
+            and _recorded_worker_alive(conn, row["id"], row["worker_pid"])
             and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
@@ -8361,6 +8483,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            owner_window=_worker_owner_window(conn, row["id"], row["worker_pid"]),
             conn=conn, task_id=row["id"],
         )
         # Never release a claim while our own worker is still alive: that would
@@ -8484,6 +8607,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        owner_window=_worker_owner_window(conn, task_id, row["worker_pid"]),
         conn=conn, task_id=task_id,
     )
     # Never release a claim while our host-local worker is alive or its
@@ -12176,7 +12300,13 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = _retry_status_for_run(
                     conn, row["id"], row["current_run_id"]
                 )
-                terminations.append((row["worker_pid"], row["claim_lock"]))
+                terminations.append(_PendingTermination(
+                    row["worker_pid"], row["claim_lock"],
+                    _worker_owner_window(
+                        conn, row["id"], row["worker_pid"],
+                        row["current_run_id"],
+                    ),
+                ))
                 run_id = _end_run(
                     conn,
                     row["id"],
@@ -12247,8 +12377,11 @@ def invalidate_descendants_for_parent_reopen(
         # Standalone call: we committed above, so the audit trail is durable
         # — safe to kill workers now. Composed calls leave this to the
         # caller (post-commit), preserving events-before-termination.
-        for pid, claim_lock in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock)
+        for entry in terminations:
+            pid, claim_lock = entry
+            _terminate_reclaimed_worker(
+                pid, claim_lock, owner_window=_termination_window(entry),
+            )
     return {"invalidated": invalidated, "terminations": terminations}
 
 
@@ -14590,11 +14723,27 @@ def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    owner_window: tuple,
     signal_fn=None,
     conn: Optional[sqlite3.Connection] = None,
     task_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    ``owner_window`` is the recorded run's owner window
+    ``(claimed_at, spawned_at, start_token)`` from :func:`_worker_owner_window`. It is a
+    REQUIRED keyword so no call site can signal a PID without an identity
+    check (t_0ae83825): liveness is not identity, and a dead, unreaped
+    worker's PID can be reused by an unrelated process -- a macOS daemon or
+    another card's live worker. A live PID is classified by
+    :func:`_owner_identity` BEFORE any signal:
+
+    * ``recycled`` -- provably not the recorded worker. Never signalled; the
+      recorded worker is gone, so ``terminated=True, identity_mismatch=True``.
+    * ``unverified`` -- create time unreadable. Fail CLOSED: never signalled
+      and never released (``liveness_unprovable``).
+    * ``verified`` -- signalled exactly as before.
+    """
     import signal
 
     info: dict[str, Any] = {
@@ -14652,10 +14801,27 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
 
+    if _pid_alive(pid):
+        identity = _owner_identity(int(pid), *owner_window)
+        info["owner_identity"] = identity
+        if identity == "recycled":
+            # The recorded worker is gone; this PID now belongs to someone
+            # else. Signalling it would kill an unrelated process, and
+            # holding the claim for it would defer forever.
+            info["identity_mismatch"] = True
+            info["terminated"] = True
+            return info
+        if identity == "unverified":
+            info["identity_unverifiable"] = True
+            info["liveness_unprovable"] = True
+            info["needs_attention"] = True
+            return info
+
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
     )
     if kill is None:
+        info["terminated"] = not _pid_alive(pid)
         return info
 
     info["termination_attempted"] = True
@@ -14666,6 +14832,13 @@ def _terminate_reclaimed_worker(
         # survival. Leaving terminated=False here would make the reclaim guard
         # misread a dead worker as still-alive and defer forever.
         info["terminated"] = True
+        return info
+    except PermissionError:
+        # Identity was verified above (or the pid was not visibly alive), so
+        # this is OUR recorded worker running under another uid: hold it and
+        # surface it rather than retrying silently every tick.
+        info["signal_error"] = "EPERM"
+        info["needs_attention"] = True
         return info
     except OSError:
         return info
@@ -14902,33 +15075,16 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        # SIGTERM then SIGKILL (5 s grace) through the shared helper, so the
+        # owner-identity check guards this path too (t_0ae83825): a recycled
+        # PID is never signalled and proves the recorded worker gone.
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn,
+            owner_window=_worker_owner_window(conn, tid, pid),
+            conn=conn, task_id=tid,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
-
-        if _pid_alive(pid):
+        killed = bool(termination.get("sigkill"))
+        if not termination.get("terminated"):
             # Signal delivery (including SIGKILL) is not proof of death.
             # Keep the owner and run intact until a later tick proves it gone.
             with write_txn(conn):
@@ -14941,8 +15097,12 @@ def enforce_max_runtime(
                     "SELECT 1 FROM task_events WHERE task_id=? AND kind='timeout_refused' "
                     "AND run_id=? LIMIT 1", (tid, current["current_run_id"]),
                 ).fetchone():
-                    _append_event(conn, tid, "timeout_refused",
-                                  {"pid": pid, "sigkill": killed, "needs_attention": True},
+                    refused = {"pid": pid, "sigkill": bool(termination.get("sigkill")),
+                               "needs_attention": True}
+                    for key in ("owner_identity", "identity_unverifiable", "signal_error"):
+                        if key in termination:
+                            refused[key] = termination[key]
+                    _append_event(conn, tid, "timeout_refused", refused,
                                   run_id=current["current_run_id"])
             continue
 
@@ -14964,6 +15124,8 @@ def enforce_max_runtime(
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                if termination.get("identity_mismatch"):
+                    payload["identity_mismatch"] = True
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -15134,7 +15296,8 @@ def detect_progress_stalls(
         if age < reclaim_seconds:
             continue
         termination = _terminate_reclaimed_worker(
-            pid, lock, conn=conn, task_id=row["id"],
+            pid, lock, owner_window=_worker_owner_window(conn, row["id"], pid, rid),
+            conn=conn, task_id=row["id"],
         )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
@@ -15231,6 +15394,7 @@ def detect_stale_running(
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn, conn=conn, task_id=tid,
+            owner_window=_worker_owner_window(conn, tid, pid),
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -15333,7 +15497,7 @@ def reconcile_orphaned_running(
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _pid_alive(pid):
+        if pid and _recorded_worker_alive(conn, tid, pid):
             # The recorded worker may still be doing real work — never
             # requeue beside a live process. Retry next tick.
             _log.debug(
@@ -15785,7 +15949,11 @@ def detect_crashed_workers(
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
-            if _pid_alive(row["worker_pid"]):
+            # Identity, not bare liveness: a recycled holder of a dead
+            # worker's PID must not hide the crash forever (t_0ae83825).
+            if _recorded_worker_alive(
+                conn, row["id"], row["worker_pid"], row["current_run_id"],
+            ):
                 continue
 
             pid = int(row["worker_pid"])
@@ -16594,6 +16762,9 @@ def _abort_lost_claim_spawn(
     if pid:
         termination = _terminate_reclaimed_worker(
             int(pid), task.claim_lock, conn=conn, task_id=task.id,
+            owner_window=_worker_owner_window(
+                conn, task.id, int(pid), task.current_run_id,
+            ),
         )
         payload.update(termination)
         if not termination.get("terminated"):

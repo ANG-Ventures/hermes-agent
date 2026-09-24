@@ -1277,6 +1277,9 @@ def _set_status_direct(
         termination = kanban_db._terminate_reclaimed_worker(
             held["worker_pid"], held["claim_lock"],
             conn=conn, task_id=task_id,
+            owner_window=kanban_db._worker_owner_window(
+                conn, task_id, held["worker_pid"],
+            ),
         )
         if kanban_db._worker_survived_termination(termination):
             kanban_db._refuse_reclaim_unproven_death(
@@ -1377,8 +1380,12 @@ def _set_status_direct(
                 task_id,
                 terminations,
             )
-    for pid, claim_lock in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+    for entry in terminations:
+        pid, claim_lock = entry
+        kanban_db._terminate_reclaimed_worker(
+            pid, claim_lock,
+            owner_window=kanban_db._termination_window(entry),
+        )
     # If we re-opened something, children may have gone stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
