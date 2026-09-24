@@ -13494,6 +13494,7 @@ def _terminate_reclaimed_worker(
         # claimer proves a never-stamped worker cannot be launched later.
         # An alive, inaccessible or malformed claimer remains unprovable.
         info["liveness_unprovable"] = True
+        claimer_pid = 0
         try:
             claimer_pid = int(str(claim_lock)[len(host_prefix):])
             if claimer_pid > 0 and hasattr(os, "kill"):
