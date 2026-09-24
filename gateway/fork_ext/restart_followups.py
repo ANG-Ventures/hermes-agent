@@ -20,9 +20,12 @@ spool failure is logged LOUDLY by the caller, never raised into the turn.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from pathlib import Path
@@ -58,6 +61,88 @@ NOT_CARRIED_FIELDS = {
     "suppress_public_echo": "bound to an open platform interaction that dies with the process",
     "deferred_reply_text": "bound to an open platform interaction that dies with the process",
 }
+
+
+# SessionSource admission signals that ``SessionSource.to_dict`` deliberately
+# does NOT serialise (t_43e058b7). Without them a follow-up admitted only by an
+# adapter-granted flag (``{PLATFORM}_ALLOW_BOTS`` -> ``is_bot``,
+# ``DISCORD_ALLOWED_ROLES`` -> ``role_authorized``, the authenticated relay ->
+# ``delivered_via_upstream_relay``) is refused as "Unauthorized user" on replay.
+#
+# Trust model. ``to_dict`` stays wire-safe (a peer or a persisted session row
+# must never be able to assert these). The restart spool instead records the
+# transport's verdict in a separate ``admission`` block and binds the WHOLE
+# record with an HMAC keyed by a per-home secret (``SPOOL_KEY_NAME``, 0600,
+# created by the gateway itself). On load:
+#   * MAC verifies  -> the admission flags are restored exactly as parked;
+#     the live policy (ALLOW_BOTS / ALLOWED_ROLES / relay adapter) is still
+#     re-evaluated by the normal intake, so a gate closed during the restart
+#     still refuses.
+#   * MAC missing / wrong (hand-written, edited, copied from another home, or
+#     written by a pre-fix build) -> NO trust flag is restored; only the
+#     fail-closed ``profile_route_rejected`` is honoured, since it can only
+#     tighten. A forged record therefore gains nothing it could not get by
+#     omitting the block.
+# Anyone able to read the key can already edit this home's .env/config and
+# grant themselves access directly, so the key adds no new trust root.
+# A replay the intake still refuses is reported as ``restart_followup_lost``
+# by the runner, never silently acknowledged.
+TRUST_GRANTING_ADMISSION_FIELDS = ("is_bot", "role_authorized", "delivered_via_upstream_relay")
+FAIL_CLOSED_ADMISSION_FIELDS = ("profile_route_rejected",)
+ADMISSION_FIELDS = TRUST_GRANTING_ADMISSION_FIELDS + FAIL_CLOSED_ADMISSION_FIELDS
+SPOOL_KEY_NAME = "restart_followups.key"
+
+
+def admission_fields(source: Any) -> Dict[str, bool]:
+    """The SessionSource admission flags, as strict bools (``is True``)."""
+    return {name: getattr(source, name, False) is True for name in ADMISSION_FIELDS}
+
+
+def _spool_key(home: Optional[Path] = None, *, create: bool) -> Optional[bytes]:
+    path = spool_dir(home).parent / SPOOL_KEY_NAME
+    try:
+        return bytes.fromhex(path.read_text(encoding="ascii").strip())
+    except FileNotFoundError:
+        if not create:
+            return None
+    except Exception:
+        logger.warning("restart follow-up spool key unreadable: %s", path, exc_info=True)
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
+            fh.write(secrets.token_hex(32))
+            fh.flush()
+            os.fsync(fh.fileno())
+    except FileExistsError:
+        pass  # a concurrent writer created it first; read theirs
+    except Exception:
+        logger.warning("restart follow-up spool key could not be created: %s", path, exc_info=True)
+        return None
+    return _spool_key(home, create=False)
+
+
+def _record_mac(key: bytes, record: Dict[str, Any]) -> str:
+    body = {k: v for k, v in record.items() if k != "mac" and not k.startswith("_")}
+    payload = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(key, payload, hashlib.sha256).hexdigest()
+
+
+def restored_admission(record: Dict[str, Any]) -> Dict[str, bool]:
+    """Admission flags a loaded record may apply to its rebuilt SessionSource."""
+    claimed = record.get("admission")
+    if not isinstance(claimed, dict):
+        return {}
+    if record.get("_admission_verified") is True:
+        return {name: claimed.get(name) is True for name in ADMISSION_FIELDS}
+    if any(claimed.get(name) is True for name in TRUST_GRANTING_ADMISSION_FIELDS):
+        logger.warning(
+            "PHASE=restart_followup_untrusted session=%s: admission flags are not "
+            "vouched for by this home's spool key; replaying WITHOUT them",
+            record.get("session_key"),
+        )
+    return {name: True for name in FAIL_CLOSED_ADMISSION_FIELDS if claimed.get(name) is True}
 
 
 def event_fields(event: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -117,11 +202,14 @@ def spool_followup(
     home: Optional[Path] = None,
     now: Optional[float] = None,
     event: Optional[Dict[str, Any]] = None,
+    admission: Optional[Dict[str, bool]] = None,
 ) -> Optional[Path]:
     """Durably record ONE follow-up. Returns the file path, or None on failure.
 
     ``event`` is the ``event_fields`` dict of the parked MessageEvent; without
     it the record replays as a plain user text message (version 1 shape).
+    ``admission`` is ``admission_fields(source)``; it is stored MAC-bound (see
+    the trust model above) and only restored when the MAC verifies.
     """
     if not session_key or not isinstance(text, str):
         return None
@@ -142,6 +230,11 @@ def spool_followup(
     }
     if event is not None:
         record["event"] = event
+    if admission:
+        record["admission"] = {k: admission.get(k) is True for k in ADMISSION_FIELDS}
+        key = _spool_key(home, create=True)
+        if key is not None:
+            record["mac"] = _record_mac(key, record)
     try:
         directory = spool_dir(home)
         directory.mkdir(parents=True, exist_ok=True)
@@ -177,6 +270,7 @@ def take_followups(
     except Exception:
         return records, stale
     current = time.time() if now is None else float(now)
+    key = _spool_key(home, create=False)
     for path in files:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
@@ -193,6 +287,12 @@ def take_followups(
                 stale += 1
                 path.rename(path.with_suffix(".stale"))
                 continue
+            mac = record.get("mac")
+            record["_admission_verified"] = bool(
+                key is not None
+                and isinstance(mac, str)
+                and hmac.compare_digest(mac, _record_mac(key, record))
+            )
             record["_spool_path"] = str(path)
             records.append(record)
         except Exception:

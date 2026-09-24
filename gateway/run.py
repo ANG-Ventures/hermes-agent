@@ -15777,7 +15777,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event that was parked. An event with a field that cannot be stored
         durably is refused and logged as lost by field name.
         """
-        from gateway.fork_ext.restart_followups import event_fields, spool_followup
+        from gateway.fork_ext.restart_followups import (
+            admission_fields,
+            event_fields,
+            spool_followup,
+        )
 
         fields = None
         if pending_event is not None:
@@ -15835,6 +15839,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     src_dict,
                     reason=self._status_action_label(),
                     event=fields,
+                    # Adapter-granted admission (is_bot / role_authorized /
+                    # relay) that SessionSource.to_dict never serialises;
+                    # MAC-bound so a forged record cannot assert it (t_43e058b7).
+                    admission=admission_fields(src),
                 )
             except Exception:
                 logger.debug("restart follow-up spool failed", exc_info=True)
@@ -15924,7 +15932,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _load_restart_followups(self) -> int:
         """Queue follow-ups spooled by the previous life into startup restore."""
         try:
-            from gateway.fork_ext.restart_followups import event_kwargs, take_followups
+            from gateway.fork_ext.restart_followups import (
+                event_kwargs,
+                restored_admission,
+                take_followups,
+            )
 
             records, stale = await asyncio.to_thread(take_followups)
         except Exception:
@@ -15936,9 +15948,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 carried = record.get("event")
                 kwargs = event_kwargs(carried) if isinstance(carried, dict) else {}
                 kwargs.setdefault("message_type", MessageType.TEXT)
+                source = SessionSource.from_dict(record["source"])
+                for flag, value in restored_admission(record).items():
+                    setattr(source, flag, value)
+                # In-process only: lets the intake report a replay it refuses
+                # as restart_followup_lost (the spool file is already acked).
+                source._restart_followup_session = record.get("session_key")
                 event = MessageEvent(
                     text=record["text"],
-                    source=SessionSource.from_dict(record["source"]),
+                    source=source,
                     **kwargs,
                 )
                 event._hermes_restart_followup_path = record["_spool_path"]
@@ -15957,6 +15975,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 stale,
             )
         return queued
+
+    def _report_refused_restart_followup(self, source: Any, reason: str) -> None:
+        """A replayed restart follow-up refused at intake is LOST, never silent.
+
+        Its spool file was acknowledged when the adapter accepted the replay,
+        so this log line is the only remaining trace (t_43e058b7).
+        """
+        session = getattr(source, "_restart_followup_session", None)
+        if not session:
+            return
+        logger.error(
+            "PHASE=restart_followup_lost session=%s reason=%s platform=%s chat=%s "
+            "user=%s: replayed follow-up refused at intake; it is DROPPED",
+            session,
+            reason,
+            getattr(getattr(source, "platform", None), "value", "unknown"),
+            getattr(source, "chat_id", None),
+            getattr(source, "user_id", None),
+        )
 
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
@@ -22839,6 +22876,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Dropping inbound message because its explicit profile route "
                 "targets an unserved profile"
             )
+            self._report_refused_restart_followup(source, "profile_route_rejected")
             return None
 
         # Internal events (e.g. background-process completion notifications)
@@ -22935,9 +22973,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized_for_source(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                self._report_refused_restart_followup(source, "unauthorized")
                 return None
         elif not self._is_user_authorized_for_source(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            self._report_refused_restart_followup(source, "unauthorized")
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
                 source.chat_type == "dm"
