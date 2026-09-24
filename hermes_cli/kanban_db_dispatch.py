@@ -2813,6 +2813,17 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         # A multiplexer dispatching for another profile must not hand it the launch
         # profile's .env settings / TERMINAL_* policy — a standalone dispatcher never would.
         strip_launch_profile_env(env, profile_home)
+    # All fleet Kanban workers commit under the shared GitHub identity. Pin
+    # both sides after profile/environment inheritance so an inherited test
+    # identity or per-profile gitconfig cannot poison a live-main landing.
+    # Git's GIT_AUTHOR_*/GIT_COMMITTER_* take precedence over `-c user.email`;
+    # author attribution to the acting agent belongs in the Kanban run/ledger.
+    env.update({
+        "GIT_AUTHOR_NAME": "Kyzcreig",
+        "GIT_AUTHOR_EMAIL": "9063726+Kyzcreig@users.noreply.github.com",
+        "GIT_COMMITTER_NAME": "Kyzcreig",
+        "GIT_COMMITTER_EMAIL": "9063726+Kyzcreig@users.noreply.github.com",
+    })
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id

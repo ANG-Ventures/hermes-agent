@@ -745,6 +745,54 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     env = captured["env"]
     assert env.get("HERMES_KANBAN_TASK") == tid
     assert env.get("HERMES_PROFILE") == "some-profile"
+    assert {key: env.get(key) for key in (
+        "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL",
+    )} == {
+        "GIT_AUTHOR_NAME": "Kyzcreig",
+        "GIT_COMMITTER_NAME": "Kyzcreig",
+        "GIT_AUTHOR_EMAIL": "9063726+Kyzcreig@users.noreply.github.com",
+        "GIT_COMMITTER_EMAIL": "9063726+Kyzcreig@users.noreply.github.com",
+    }
+
+
+def test_spawn_overrides_inherited_git_identity(kanban_home, monkeypatch):
+    """An inherited test identity cannot poison a worker's commits."""
+    for key, value in (
+        ("GIT_AUTHOR_NAME", "t"), ("GIT_COMMITTER_NAME", "fx"),
+        ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_EMAIL", "a@b.c"),
+    ):
+        monkeypatch.setenv(key, value)
+    captured = {}
+
+    class FakeProc:
+        pid = 99999
+
+    def fake_popen(cmd, **kwargs):
+        captured.update(kwargs["env"])
+        return FakeProc()
+
+    real_popen = subprocess.Popen
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="identity test", assignee="some-profile")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        kbd._default_spawn(task, str(kbw.resolve_workspace(task)))
+    finally:
+        conn.close()
+    assert captured["GIT_AUTHOR_NAME"] == captured["GIT_COMMITTER_NAME"] == "Kyzcreig"
+    assert captured["GIT_AUTHOR_EMAIL"] == captured["GIT_COMMITTER_EMAIL"] == "9063726+Kyzcreig@users.noreply.github.com"
+    # A per-command -c cannot override the worker environment in real Git.
+    monkeypatch.setattr("subprocess.Popen", real_popen)
+    for kind in ("AUTHOR", "COMMITTER"):
+        result = subprocess.run(
+            ["git", "-c", "user.name=Daedalus", "-c", "user.email=daedalus@fleet",
+             "var", f"GIT_{kind}_IDENT"],
+            env=captured, cwd=kanban_home, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, check=True,
+        )
+        assert result.stdout.startswith("Kyzcreig <9063726+Kyzcreig@users.noreply.github.com>")
 
 
 # ---------------------------------------------------------------------------
