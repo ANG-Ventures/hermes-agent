@@ -538,6 +538,25 @@ def test_equivalent_pin_is_accepted_and_gc_reaps(tmp_path, monkeypatch, axis):
     assert not a.exists() and not b.exists(), "equivalent pin blocked reclamation"
 
 
+@pytest.mark.parametrize("axis", ["case", "firmlink"])
+def test_conn_on_board_file_in_other_spelling_is_that_board(kanban_home, axis):
+    """_conn_is_board asks the connection's file; the same file in another
+    spelling is the same board, not a reason to open a second connection."""
+    import sqlite3
+
+    real = kb.kanban_db_path("default").resolve()
+    conn = sqlite3.connect(str(_variant(real, axis)))
+    try:
+        assert kb._conn_is_board(conn, "default") is True
+    finally:
+        conn.close()
+    other = sqlite3.connect(str(real.parent / "not-the-board.db"))
+    try:
+        assert kb._conn_is_board(other, "default") is False, "negative control"
+    finally:
+        other.close()
+
+
 def test_sandbox_with_native_pin_in_other_case_still_refuses(tmp_path, monkeypatch):
     """Positive control (incident shape, Argus round 2 C1): a sandboxed home
     whose pin reaches the machine's native home in another case must RAISE."""
