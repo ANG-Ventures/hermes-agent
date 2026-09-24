@@ -1606,6 +1606,7 @@ Shell hooks are registered by calling `agent.shell_hooks.register_from_config(cf
 
 ```yaml
 hooks:
+  missing_hook_policy: restore_then_fail_closed # Default; fail_open_and_page is explicit opt-in
   <event_name>:                  # Must be in VALID_HOOKS
     - matcher: "<regex>"         # Optional; used for pre/post_tool_call only
       command: "<shell command>" # Required; runs via shlex.split, shell=False
@@ -1683,7 +1684,7 @@ For events whose block directive is not honored (everything except `pre_tool_cal
 
 ### Fail-open vs fail-closed
 
-By default shell hooks **fail open**: a spawn error, timeout, or unparseable stdout logs a warning and the action proceeds. That is the right default for observability hooks — but wrong for security gates. A crashed secret-scanner must not silently allow the tool call it was supposed to vet.
+By default shell hooks **fail open** on ordinary spawn errors, timeouts, or unparseable stdout. That is the right default for observability hooks — but wrong for security gates. A crashed secret-scanner must not silently allow the tool call it was supposed to vet.
 
 Set `fail_closed: true` (or `failClosed: true`, the Cursor/Claude Code spelling) on a `pre_tool_call` entry to invert that:
 
@@ -1712,6 +1713,8 @@ With `fail_closed: true`, each of these now **blocks** the tool call with `hook 
 For fail-closed hooks, exit 0 alone is not authorization: emit `{"action":"allow"}` (or `{"decision":"allow"}`), a valid modify directive, or the legacy `{}` no-op after a successful policy check. Empty output now blocks. Exit 2 keeps its explicit block-message precedence. This policy is not an OS sandbox; registration, tool access, and the policy script itself must also be trusted.
 
 `fail_closed` only applies to blocking-capable events (`pre_tool_call` today); setting it on any other event logs a warning at config-parse time and is ignored. `hermes hooks test` reflects these semantics — the `parsed` line shows exactly the block shape the dispatcher would receive.
+
+A hook whose files are **absent on disk** is an infrastructure failure, not a policy verdict. Absence is measured, never inferred from output: the script is checked before it runs, and after any non-allow result the hook directory's tracked files in HEAD are compared with what exists on disk. A present hook whose output merely mentions `ImportError` or `No such file` keeps its own verdict. For a hook inside a git checkout (resolved from the hook path, not the profile home), Hermes writes **only the absent tracked files** of the hook's directory from HEAD's object store (including files excluded by sparse checkout), clears skip-worktree on exactly those files, and runs the hook once more. An existing file is never rewritten, so uncommitted edits and untracked files in the hook directory survive. Each file is published atomically without overwriting. Every repair attempt is ERROR-logged and paged through the fleet notify front door, deduplicated per profile and hook for ten minutes. A hook that is present but crashes (for example a broken import) is paged as "present but unloadable" and fails closed as a malfunction; nothing is restored. If the repair fails, a `fail_closed` `pre_tool_call` hook blocks with an infrastructure-labelled message. `hooks.missing_hook_policy` selects the behaviour: `restore_then_fail_closed` (default) repairs, then fails closed; `fail_closed` skips the repair; `fail_open_and_page` is an explicit security downgrade. A hook without `fail_closed` still fails open, and is paged. `hermes hooks test` may repair absent files but never pages. The repair applies to git-tracked hook directories; separately installed hooks require their own recovery mechanism.
 
 ### Worked examples
 

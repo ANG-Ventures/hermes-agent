@@ -1245,6 +1245,12 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "options": ["env", "bitwarden"],
         "category": "security",
     },
+    "hooks.missing_hook_policy": {
+        "type": "select",
+        "description": "What a shell hook whose files are absent on disk does (restore absent files, then fail closed)",
+        "options": ["restore_then_fail_closed", "fail_closed", "fail_open_and_page"],
+        "category": "security",
+    },
     "proxy.enforce_on_docker": {
         "type": "boolean",
         "description": "Refuse Docker sandboxes when egress is enabled but not configured/running",
