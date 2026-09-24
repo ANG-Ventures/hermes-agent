@@ -86,7 +86,7 @@ def lint_nodeids(repo: Path, nodeids: Sequence[str]) -> list[str]:
         proc = subprocess.run(
             [python_exe, "-m", "pytest", "--collect-only", "-q", "-o", "addopts=", "-p", "no:randomly", *batch],
             cwd=repo,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,

@@ -516,7 +516,7 @@ def _git(workspace_path: str, *args: str) -> Optional[str]:
             ["git", "-C", workspace_path, *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=_QUERY_TIMEOUT_SECONDS,
             check=False,
         )
@@ -777,7 +777,7 @@ def query_pr(repo: str, number: int) -> Optional[dict]:
             ["gh", "api", f"repos/{repo}/pulls/{number}"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=_QUERY_TIMEOUT_SECONDS,
             check=False,
         )
@@ -828,7 +828,7 @@ def repo_exists(slug: str) -> bool:
             ["gh", "api", f"repos/{slug}", "--jq", ".full_name"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=_QUERY_TIMEOUT_SECONDS,
             check=False,
         )

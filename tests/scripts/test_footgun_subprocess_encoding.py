@@ -232,3 +232,88 @@ class TestFullRepoScan:
                 f"a `# windows-footgun: ok` suppression."
             )
         # All matches are the expected PR #60741 sites — OK on this branch.
+
+
+# ---------------------------------------------------------------------------
+# Multi-line calls — AST pass in scan_file() (t_5e2ded8f)
+# ---------------------------------------------------------------------------
+
+
+def _scan_source(linter, tmp_path, source: str) -> list[int]:
+    """Run the real scan_file() and return line numbers flagged by RULE_NAME."""
+    f = tmp_path / "sample.py"
+    f.write_text(source, encoding="utf-8")
+    return [ln for ln, _, fg in linter.scan_file(f, linter.FOOTGUNS) if fg.name == RULE_NAME]
+
+
+class TestMultilineSubprocessCalls:
+
+    def test_flags_split_line_shape_from_mutation_gate(self, linter, tmp_path):
+        # The exact shape Argus found in scripts/ci_overflow_mutation_gate.py:
+        # subprocess.run( on one line, text=True on the continuation line.
+        src = (
+            "import subprocess, sys\n"
+            "result = subprocess.run([sys.executable, \"-m\", \"pytest\",\n"
+            "                         \"-k\", test], cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL)\n"
+        )
+        assert _scan_source(linter, tmp_path, src) == [3]
+
+    def test_flags_text_true_on_its_own_line(self, linter, tmp_path):
+        src = (
+            "import subprocess\n"
+            "out = subprocess.check_output(\n"
+            "    [\"git\", \"status\"],\n"
+            "    text=True,\n"
+            ")\n"
+        )
+        assert _scan_source(linter, tmp_path, src) == [4]
+
+    def test_flags_import_alias(self, linter, tmp_path):
+        src = "import subprocess as sp\nsp.Popen(\n    cmd,\n    text=True)\n"
+        assert _scan_source(linter, tmp_path, src) == [4]
+
+    def test_passes_explicitly_encoded_multiline_call(self, linter, tmp_path):
+        # encoding= on a different physical line than text=True.
+        src = (
+            "import subprocess\n"
+            "subprocess.run(\n"
+            "    cmd,\n"
+            "    text=True,\n"
+            "    encoding=\"utf-8\",\n"
+            "    errors=\"replace\",\n"
+            ")\n"
+        )
+        assert _scan_source(linter, tmp_path, src) == []
+
+    def test_passes_kwargs_splat(self, linter, tmp_path):
+        src = "import subprocess\nsubprocess.run(\n    cmd, text=True,\n    **opts)\n"
+        assert _scan_source(linter, tmp_path, src) == []
+
+    def test_passes_suppressed_anywhere_in_span(self, linter, tmp_path):
+        src = (
+            "import subprocess\n"
+            "subprocess.run(  # windows-footgun: ok — POSIX-only helper\n"
+            "    cmd,\n"
+            "    text=True)\n"
+        )
+        assert _scan_source(linter, tmp_path, src) == []
+
+    def test_passes_non_subprocess_and_text_false(self, linter, tmp_path):
+        src = (
+            "import subprocess\n"
+            "df.rename(\n    cols,\n    text=True)\n"
+            "subprocess.run(\n    cmd,\n    text=False)\n"
+        )
+        assert _scan_source(linter, tmp_path, src) == []
+
+    def test_single_report_when_line_rule_also_matches(self, linter, tmp_path):
+        src = "import subprocess\nsubprocess.run(cmd, text=True,\n    timeout=5)\n"
+        assert _scan_source(linter, tmp_path, src) == [2]
+
+    def test_mutation_gate_clean_and_its_unencoded_mutant_flagged(self, linter, tmp_path):
+        gate = REPO_ROOT / "scripts" / "ci_overflow_mutation_gate.py"
+        assert _scan_source(linter, tmp_path, gate.read_text(encoding="utf-8")) == []
+        encoded = ', encoding="utf-8", errors="replace"'
+        src = gate.read_text(encoding="utf-8")
+        assert src.count(encoded) == 1
+        assert len(_scan_source(linter, tmp_path, src.replace(encoded, ""))) == 1

@@ -467,7 +467,7 @@ def _install_sidecar() -> int:
         cwd=str(_sidecar_dir()),
         check=False,
         stderr=subprocess.PIPE,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     if proc.stderr:
         print(proc.stderr, end="", file=sys.stderr)
@@ -478,7 +478,7 @@ def _install_sidecar() -> int:
             cwd=str(_sidecar_dir()),
             check=False,
             stderr=subprocess.PIPE,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         if proc.stderr:
             print(proc.stderr, end="", file=sys.stderr)

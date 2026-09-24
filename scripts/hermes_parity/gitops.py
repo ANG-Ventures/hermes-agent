@@ -38,7 +38,7 @@ def run_git(
     proc = subprocess.run(
         cmd,
         input=input_text,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -56,7 +56,7 @@ def repo_root(start: Path | None = None) -> Path:
     here = (start or Path.cwd()).resolve()
     proc = subprocess.run(
         ["git", "-C", str(here), "rev-parse", "--show-toplevel"],
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -84,7 +84,7 @@ def require_remotes(repo: Path, names: Iterable[str] = ("fork", "origin")) -> No
 def git_version() -> tuple[int, int, int]:
     text = subprocess.run(
         ["git", "--version"],
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,

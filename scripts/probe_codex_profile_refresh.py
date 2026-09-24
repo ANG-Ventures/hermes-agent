@@ -136,7 +136,7 @@ def run_case(*, inherited=False, same_profile=False, independent=False,
                 env.pop("HERMES_TEST_HOME", None)
                 process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--worker", str(profile),
                                             str(i if independent else 0), mode if i == 0 or mode == "root-lock-only" else "normal"],
-                                           cwd=ROOT, env=env, text=True, bufsize=1,
+                                           cwd=ROOT, env=env, text=True, encoding="utf-8", errors="replace", bufsize=1,
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 processes.append(process)
                 assert receive(process) == {"event": "READY"}
