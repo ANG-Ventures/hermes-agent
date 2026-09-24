@@ -227,3 +227,54 @@ def test_read_only_exemption_refuses_non_name_trusted_bindings(tmp_path, binding
     rebound, _ = _forms(tmp_path, unsafe)
     assert not guard(ordinary, cwd=str(tmp_path))
     assert guard(rebound, cwd=str(tmp_path))
+
+
+_MUTATION_LOOP = (
+    "for line in reversed(open('{log}').read().splitlines()):\n"
+    "    d=json.loads(line)\n"
+    "    print(d)\n"
+)
+
+
+@pytest.mark.parametrize("prefix", [
+    # In-place mutation through a Load-context call binds no name, so no
+    # deny-list of binding shapes can see it; the whole-body allowlist must.
+    "import json, os\njson.__dict__.update(loads=os.system)\n",
+    "import json, os\nobject.__setattr__(json, 'loads', os.system)\n",
+    "import sys, os, types\nsys.modules.update(json=types.SimpleNamespace(loads=os.system))\nimport json\n",
+    "import json, os, builtins\nbuiltins.__dict__.update(print=lambda d: os.system(str(d)))\n",
+    "import json\nfrom io import *\n",
+    "import json\nimport importlib\n",
+    "import json\njson.decoder.scanstring.__class__\n",
+    "import json\nvars(json).update(loads=print)\n",
+    "import json\ngetattr(json, 'loads')\n",
+    "import json\ntype(json)\n",
+    "import json\ndef hook(value):\n    return value\n",
+    "import json\nhook = lambda value: value\n",
+    "import json\nwith open('/dev/null') as handle: pass\n",
+    "import json\nimport json as j\n",
+    "import json\nfrom pathlib import Path as P\n",
+    "import json\njson.JSONDecoder.decode = print\n",
+])
+def test_read_only_mask_requires_whole_body_allowlist(tmp_path, prefix):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    ordinary, _ = _forms(tmp_path, "import json\n" + _MUTATION_LOOP.format(log=log))
+    unsafe, _ = _forms(tmp_path, prefix + _MUTATION_LOOP.format(log=log))
+    assert not guard("echo ok; " + ordinary, cwd=str(tmp_path))
+    assert guard("echo ok; " + unsafe, cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("call", [
+    "subprocess.run(['sqlite3', 'x'], shell=True)",
+    "subprocess.run(cmd)",
+    "subprocess.Popen(['sqlite3', 'x'])",
+    "subprocess.run(['sqlite3', 'x'], env=dict())",
+    "json.load(open('/dev/null'))",
+])
+def test_read_only_mask_refuses_non_allowlisted_calls(tmp_path, call):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = "import json, subprocess\ncmd = ['sqlite3']\n" + call + "\n" + _MUTATION_LOOP.format(log=log)
+    heredoc, _ = _forms(tmp_path, body)
+    assert guard("echo ok; " + heredoc, cwd=str(tmp_path))

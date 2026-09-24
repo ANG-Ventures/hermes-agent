@@ -1926,6 +1926,154 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
     return text, False
 
 
+# Whole-body allowlist for ``_mask_read_only_python_paths``. A deny-list of
+# rebinding shapes cannot close "a spelling is not an identity": a trusted
+# object can be mutated IN PLACE through a Load-context call that binds
+# nothing. So the mask is granted only when every node of the body is
+# recognised; anything else keeps the conservative shell-reference scan.
+#
+# Soundness argument: with no class/def/lambda, no dunder access, no
+# reflective builtins and no import beyond json/subprocess/pathlib.Path, every
+# value in the body is a built-in data value (str/list/dict/set/file/
+# CompletedProcess), so the allowlisted methods below are data operations and
+# cannot reach or replace a callable the loop recognizer trusts.
+_MASK_SAFE_NODE_TYPES = (
+    ast.Module, ast.Import, ast.ImportFrom, ast.alias,
+    ast.Assign, ast.AugAssign, ast.Expr, ast.For, ast.If, ast.Try,
+    ast.ExceptHandler, ast.Continue, ast.Break, ast.Pass,
+    ast.Name, ast.Load, ast.Store, ast.Constant, ast.Attribute,
+    ast.Subscript, ast.Slice, ast.Call, ast.keyword,
+    ast.List, ast.Tuple, ast.Dict, ast.Set,
+    ast.JoinedStr, ast.FormattedValue,
+    ast.BoolOp, ast.BinOp, ast.UnaryOp, ast.Compare, ast.IfExp,
+    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.comprehension,
+    ast.boolop, ast.operator, ast.unaryop, ast.cmpop,
+)
+_MASK_SAFE_MODULES = frozenset({"json", "subprocess"})
+_MASK_SAFE_MODULE_CALLS = frozenset({("json", "loads"), ("json", "dumps"), ("subprocess", "run")})
+_MASK_SAFE_BUILTINS = frozenset({
+    "open", "reversed", "len", "print", "set", "list", "dict", "tuple",
+    "sorted", "str", "int", "float", "bool", "min", "max", "sum", "abs",
+    "round", "enumerate", "range", "zip", "any", "all", "isinstance",
+})
+_MASK_SAFE_EXCEPTIONS = frozenset({
+    "Exception", "ValueError", "KeyError", "TypeError", "IndexError",
+    "AttributeError", "OSError", "FileNotFoundError", "UnicodeDecodeError",
+})
+_MASK_SAFE_METHODS = frozenset({
+    "read", "read_text", "read_bytes", "splitlines", "split", "rsplit",
+    "strip", "lstrip", "rstrip", "lower", "upper", "startswith", "endswith",
+    "replace", "join", "get", "items", "keys", "values", "add", "append",
+    "extend", "count", "find", "encode", "decode", "isdigit",
+})
+_MASK_SUBPROCESS_KEYWORDS = frozenset({"capture_output", "text", "check", "timeout", "encoding", "errors"})
+_MASK_FORBIDDEN_NAMES = frozenset({
+    "sys", "builtins", "importlib", "types", "object", "type", "os",
+    "getattr", "setattr", "delattr", "exec", "eval", "compile",
+    "globals", "locals", "vars", "__import__", "__builtins__",
+})
+
+
+def _is_dunder(name: str) -> bool:
+    return name.startswith("__") and name.endswith("__")
+
+
+def _python_body_is_mask_safe(tree: ast.AST) -> bool:
+    """Return True only when EVERY node of *tree* is in the enumerated safe set."""
+    statements = list(getattr(tree, "body", ()))
+    # The extracted heredoc range ends with its delimiter line (``PY``/``EOF``),
+    # which parses as a trailing bare-name expression. Python never sees it
+    # (the shell consumes the delimiter), and a bare name load calls nothing.
+    if (statements and isinstance(statements[-1], ast.Expr)
+            and isinstance(statements[-1].value, ast.Name)
+            and not _is_dunder(statements[-1].value.id)
+            and statements[-1].value.id not in _MASK_FORBIDDEN_NAMES):
+        tree = ast.Module(body=statements[:-1], type_ignores=[])
+    imported: set[str] = set()
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, _MASK_SAFE_NODE_TYPES):
+            return False
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in _MASK_SAFE_MODULES or alias.asname is not None:
+                    return False
+                imported.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module != "pathlib" or node.level or any(
+                alias.name != "Path" or alias.asname is not None for alias in node.names
+            ):
+                return False  # also refuses ``from x import *``
+            imported.add("Path")
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            bound.add(node.name)
+        elif isinstance(node, ast.Name):
+            if _is_dunder(node.id) or node.id in _MASK_FORBIDDEN_NAMES:
+                return False
+            if isinstance(node.ctx, ast.Store):
+                bound.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            if _is_dunder(node.attr) or not isinstance(node.ctx, ast.Load):
+                return False
+        elif isinstance(node, ast.Subscript):
+            if not isinstance(node.ctx, ast.Load):
+                return False
+    protected = _MASK_SAFE_BUILTINS | _MASK_SAFE_EXCEPTIONS | _MASK_SAFE_MODULES | {"Path"}
+    if bound & protected:
+        return False
+    known = bound | imported | _MASK_SAFE_BUILTINS | _MASK_SAFE_EXCEPTIONS
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in known:
+            return False
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            if func.id == "Path":
+                if "Path" not in imported:
+                    return False
+            elif func.id not in _MASK_SAFE_BUILTINS:
+                return False
+            if func.id == "open" and not (
+                1 <= len(node.args) <= 2
+                and all(
+                    isinstance(arg, ast.Constant) and arg.value in {"r", "rb", "rt"}
+                    for arg in node.args[1:]
+                )
+                and all(kw.arg in {"encoding", "errors"} for kw in node.keywords)
+            ):
+                return False
+            continue
+        if not isinstance(func, ast.Attribute):
+            return False
+        receiver = func.value
+        if isinstance(receiver, ast.Name) and receiver.id in imported:
+            if (receiver.id, func.attr) not in _MASK_SAFE_MODULE_CALLS:
+                return False
+            if (receiver.id, func.attr) == ("subprocess", "run") and not (
+                len(node.args) == 1
+                and isinstance(node.args[0], (ast.List, ast.Tuple))
+                and all(
+                    isinstance(item, ast.Constant) and isinstance(item.value, str)
+                    for item in node.args[0].elts
+                )
+                and all(
+                    kw.arg in _MASK_SUBPROCESS_KEYWORDS and isinstance(kw.value, ast.Constant)
+                    for kw in node.keywords
+                )
+            ):
+                return False
+            continue
+        if func.attr not in _MASK_SAFE_METHODS:
+            return False
+        root = receiver
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
+            root = root.value
+        if isinstance(root, ast.Name) and root.id in imported:
+            return False
+    return True
+
+
 def _mask_read_only_python_paths(body: str) -> str:
     """Exclude literal paths read as diagnostic data, never executable input.
 
@@ -1938,46 +2086,15 @@ def _mask_read_only_python_paths(body: str) -> str:
         tree = ast.parse(body)
     except SyntaxError:
         return body
-    # A spelling is not an identity: rebinding any callable trusted by the
-    # diagnostic-loop recognizer can turn log data into executable input.
-    trusted_names = {"open", "reversed", "json", "len", "print", "Path", "set", "list"}
-    if any(
-        (isinstance(n, ast.Name) and n.id in trusted_names
-         and not isinstance(n.ctx, ast.Load))
-        or (isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name in trusted_names)
-        or (isinstance(n, ast.MatchMapping) and n.rest in trusted_names)
-        or (isinstance(n, ast.ExceptHandler) and n.name in trusted_names)
-        or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.arg))
-            and (n.name if not isinstance(n, ast.arg) else n.arg) in trusted_names)
-        or (isinstance(n, (ast.Import, ast.ImportFrom)) and any(
-            (a.asname or (a.name.split(".")[0] if isinstance(n, ast.Import) else a.name))
-            in trusted_names and not (
-                (isinstance(n, ast.Import) and a.name == "json" and a.asname is None)
-                or (isinstance(n, ast.ImportFrom) and n.module == "pathlib"
-                    and a.name == "Path" and a.asname is None)
-            ) for a in n.names
-        ))
-        or (isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Load))
-        or (isinstance(n, ast.Subscript) and not isinstance(n.ctx, ast.Load))
-        or (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            and n.func.id in {"setattr", "delattr", "exec", "eval", "globals", "locals", "vars", "__import__"})
-        for n in ast.walk(tree)
-    ):
+    # Whole-body allowlist, not a deny-list of rebinding shapes: see
+    # _python_body_is_mask_safe for why in-place mutation defeats deny-lists.
+    if not _python_body_is_mask_safe(tree):
         return body
     has_path = any(
         isinstance(node, ast.ImportFrom) and node.module == "pathlib"
         and any(alias.name == "Path" and alias.asname is None for alias in node.names)
         for node in ast.walk(tree)
     )
-    if any(
-        (isinstance(node, ast.Name) and node.id in {"Path", "print"} and isinstance(node.ctx, ast.Store))
-        or (isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in {"Path", "print"})
-        or (isinstance(node, ast.arg) and node.arg in {"Path", "print"})
-        or (isinstance(node, ast.ImportFrom) and node.module != "pathlib"
-            and any(alias.asname in {"Path", "print"} or alias.name in {"Path", "print"} for alias in node.names))
-        for node in ast.walk(tree)
-    ):
-        return body
     lines = body.splitlines(keepends=True)
     offsets = [0]
     for line in lines:
