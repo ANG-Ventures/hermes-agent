@@ -1,6 +1,6 @@
 name: kanban-home-cards
 version: "0.2.0"
-description: "Once per (process, session), prepend a compact, capped list of this session's OPEN home kanban cards to the first user turn (pre_llm_call context -> user-message api_content sidecar; never the system prompt). Cards come from one read of the cross-board home index kept current by the kanban write path (backfill: `hermes kanban home-index`). Skips kanban workers, delegate children and cron. Read-only, fail-open, 750 ms budget. Opt-in via `hermes plugins enable kanban-home-cards`."
+description: "Once per (process, session), prepend a compact, capped list of this session's OPEN home kanban cards to the first user turn (pre_llm_call context -> user-message api_content sidecar; never the system prompt). Cards come from one read of the cross-board home index kept current by the kanban write path (backfill: `hermes kanban home-index`). Skips kanban workers, delegate children and cron. Read-only, fail-open, 250 ms turn ceiling. Opt-in via `hermes plugins enable kanban-home-cards`."
 author: NousResearch
 hooks:
   - pre_llm_call

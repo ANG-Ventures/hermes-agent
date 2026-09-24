@@ -19,11 +19,15 @@ Invariants (spec plans/2026-09-24_session-start-home-cards.md §5):
 - I5 fail-open: the turn waits at most ``BUDGET_S``; never raises.  A
   timeout names the stage that was still running so it is attributable.
   Every first turn logs exactly one line.
-- P2 no cold state.db read gates the turn (t_11f2cf60 r3): lineage and
-  dedupe get ``STATE_WAIT_S`` on background threads; past that the home is
-  id + in-process parent + the lineage persisted in the index, and dedupe
-  defaults to inject.  The log line names ``lineage=state.db|index|
-  in-process`` and ``dedupe=clean|pending``.
+- P2 no cold state.db read gates the turn (t_11f2cf60 r3, t_15d21849):
+  lineage, dedupe and an index read over the fallback home (id +
+  in-process parent + the lineage persisted in the index) all start at
+  once on background threads; the turn blocks on ONE event until they
+  settle or ``BUDGET_S`` passes, then uses the best answer it has (exact
+  lineage > fallback home; dedupe not in yet = inject).  One timed wait,
+  so a host that oversleeps timed waits pays that slack once, not per
+  stage.  The log line names ``lineage=state.db|index|in-process`` and
+  ``dedupe=clean|pending``.
 - P1 no board fan-out on the turn path (t_11f2cf60): cards come from ONE
   read of the cross-board home index (``hermes_cli.kanban_home_index``),
   which the kanban write path keeps current.  A missing / not-backfilled /
@@ -63,13 +67,23 @@ TITLE_MAX = 60
 COMMENT_MAX = 70
 
 # ── budget (I5) ─────────────────────────────────────────────────────────────
-BUDGET_S = 0.75
-# Longest the turn waits for the state.db reads (lineage, dedupe); a cold
-# state.db after a restart takes 0.7-15 s (t_11f2cf60), so past this the
-# turn proceeds without them and they finish in the background.
-STATE_WAIT_S = 0.35
+# Hard ceiling on what the first turn waits for, end to end (t_15d21849 AC3:
+# a slow/locked/cold read degrades to skip in <= 250 ms, never holds init).
+# Measured on a copy of the live 77-board fleet under load (8 CPU burners, a
+# board writer, 8 concurrent session inits): warm path p95 164 ms, so the
+# index read fits; the 750 ms ceiling it replaces let a cold state.db hold
+# every first turn ~500 ms.
+# 0.22, not 0.25: the timeout path ends in a timed wait, and the loaded
+# Studio oversleeps those (measured 2026-09-24, load avg 17-24: wait(0.25)
+# returned after 383-397 ms; sliced into 2 ms waits, 251-265 ms).
+BUDGET_S = 0.22
+# The turn waits in slices this long.  macOS timer coalescing grows a timed
+# wait's slack with its length (a single 0.25 s wait overslept ~140 ms);
+# 2 ms slices keep the overshoot to ~15 ms.  A completion still wakes the
+# turn at once -- slicing only bounds the timeout path.
+WAIT_SLICE_S = 0.002
 # Busy wait on the home index's lock (a writer holds it for one small txn).
-INDEX_BUSY_S = 0.25
+INDEX_BUSY_S = 0.10
 # Upper bound on the probe thread's own state.db work (the turn stops
 # waiting at BUDGET_S; this only stops a wedged read from running forever).
 PROBE_MAX_S = 30.0
@@ -337,8 +351,10 @@ class _Bg:
     (``remember_home``) for the next first turn -- off the turn path.
     """
 
-    def __init__(self, name: str, fn, *args: Any) -> None:
+    def __init__(self, name: str, fn, *args: Any,
+                 wake: Optional[threading.Event] = None) -> None:
         self.value: Any = None
+        self._wake = wake
         self.error: Optional[str] = None
         self.ms: Optional[int] = None
         self.done = threading.Event()
@@ -355,6 +371,8 @@ class _Bg:
         finally:
             self.ms = _ms(t)
             self.done.set()
+            if self._wake is not None:
+                self._wake.set()
 
 
 def _resolve_lineage(session_id: str) -> tuple[str, ...]:
@@ -410,14 +428,16 @@ def on_pre_llm_call(
     parent_session_id: str = "",
     **_: Any,
 ) -> Optional[dict]:
-    """P2 (t_11f2cf60 r3): no cold state.db read gates the first turn.
+    """The first turn waits at most ``BUDGET_S`` (t_15d21849 AC3), once.
 
-    Lineage and dedupe (state.db) start on their own threads and get at most
-    ``STATE_WAIT_S``.  Whatever has not answered by then is not waited for:
-    lineage falls back to id + in-process parent + the lineage persisted in
-    the home index; dedupe falls back to INJECT (a duplicate block costs
-    ~335 tokens, a missing one defeats the feature).  Only the index read --
-    one small file -- sits on the turn path, inside ``BUDGET_S``.
+    Lineage (state.db), dedupe (state.db) and a fallback-home index read
+    start together.  When lineage answers, an exact-home index read starts.
+    The turn wakes on every completion and stops as soon as dedupe and the
+    best available index read are in; at ``BUDGET_S`` it takes what it has:
+    exact cards, else fallback-home cards (a subset of the truth -- can
+    under-count, never shows another chain's card), else nothing.  Dedupe
+    not in yet = INJECT (a duplicate block costs ~335 tokens, a missing one
+    defeats the feature).  Nothing here ever scans the boards.
     """
     try:
         sid = str(session_id or "")
@@ -429,30 +449,45 @@ def on_pre_llm_call(
             logger.info("kanban-home-cards: session=%s dedupe=history", sid)
             return None
         started = time.monotonic()
-        lin = _Bg("lineage", _resolve_lineage, sid)
-        dd = _Bg("dedupe", _persisted_recently_injected, sid, started + PROBE_MAX_S)
-        soft = started + STATE_WAIT_S
-        for bg in (lin, dd):
-            bg.done.wait(max(0.0, soft - time.monotonic()))
-        if dd.done.is_set() and dd.value is True:  # R3 (state.db)
-            logger.info("kanban-home-cards: session=%s dedupe=state.db ms=%d %s",
-                        sid, _ms(started), _stage_ms(lineage=lin, dedupe=dd))
-            return None
-        dedupe = "clean" if dd.done.is_set() else "pending"
-        ids = lin.value if (lin.done.is_set() and lin.error is None) else None
+        deadline = started + BUDGET_S
         parent = str(parent_session_id or "")
-        idx = _Bg("index", _read_cards, sid, ids, parent)
-        if not idx.done.wait(max(0.0, started + BUDGET_S - time.monotonic())):
+        wake = threading.Event()
+        lin = _Bg("lineage", _resolve_lineage, sid, wake=wake)
+        dd = _Bg("dedupe", _persisted_recently_injected, sid, started + PROBE_MAX_S, wake=wake)
+        fb = _Bg("index", _read_cards, sid, None, parent, wake=wake)
+        exact: Optional[_Bg] = None
+        while True:
+            wake.clear()  # before evaluating: a completion after this re-sets it
+            if dd.done.is_set() and dd.value is True:  # R3 (state.db)
+                logger.info("kanban-home-cards: session=%s dedupe=state.db ms=%d %s",
+                            sid, _ms(started), _stage_ms(lineage=lin, dedupe=dd))
+                return None
+            if exact is None and lin.done.is_set() and lin.error is None:
+                exact = _Bg("exact", _read_cards, sid, lin.value, parent, wake=wake)
+            if dd.done.is_set():
+                if exact is not None and exact.done.is_set():
+                    break
+                if lin.done.is_set() and lin.error is not None and fb.done.is_set():
+                    break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wake.wait(min(WAIT_SLICE_S, remaining))  # early on any completion
+        stages = _stage_ms(lineage=lin, dedupe=dd, index=fb, exact=exact)
+        pick = exact if (exact is not None and exact.done.is_set()) else (
+            fb if fb.done.is_set() else None)
+        if pick is None:
             logger.info(  # I5 — the turn never waits longer than BUDGET_S
                 "kanban-home-cards: session=%s unavailable=timeout stage=index ms=%d %s",
-                sid, _ms(started), _stage_ms(lineage=lin, dedupe=dd, index=idx),
+                sid, _ms(started), stages,
             )
             return None
-        if idx.error is not None:
-            logger.warning("kanban-home-cards: session=%s failed open: %s", sid, idx.error)
+        if pick.error is not None:
+            logger.warning("kanban-home-cards: session=%s failed open: %s", sid, pick.error)
             return None
-        source, result = idx.value
-        tail = f"lineage={source} dedupe={dedupe} " + _stage_ms(lineage=lin, dedupe=dd, index=idx)
+        source, result = pick.value
+        dedupe = "clean" if dd.done.is_set() else "pending"
+        tail = f"lineage={source} dedupe={dedupe} {stages}"
         if result[0] == "no-index":  # fail-open, never scan boards
             logger.info("kanban-home-cards: session=%s unavailable=%s ms=%d %s",
                         sid, result[1], _ms(started), tail)
