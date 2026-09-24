@@ -1,5 +1,13 @@
-"""Fail-closed contracts for the merge-queue attribution relay."""
+"""Fail-closed contracts for the merge-queue attribution relay.
+
+Every GitHub response shape used here is RECORDED from the real API (see
+tests/ci/fixtures/attribution_relay/*.json; each file carries its read-only
+capture command). Tests only choose WHICH recorded body a request receives;
+they never invent response fields.
+"""
+import copy
 import importlib.util
+import json
 import runpy
 from pathlib import Path
 
@@ -11,83 +19,137 @@ spec = importlib.util.spec_from_file_location("attribution_merge_group", PATH)
 relay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(relay)
 
-
-def entry(number, group_sha, pr_sha):
-    return {"headCommit": {"oid": group_sha},
-            "pullRequest": {"number": number, "headRefOid": pr_sha}}
+FIXTURES = Path(__file__).resolve().parent / "fixtures/attribution_relay"
+REPO = "ANG-Ventures/hermes-agent"
 
 
-def test_all_batch_members_required_not_just_last():
-    entries = [entry(1, "a" * 40, "1" * 40),
-               entry(2, "b" * 40, "2" * 40),
-               entry(3, "c" * 40, "3" * 40)]
-    assert relay.batch_members(entries, ["a" * 40, "b" * 40], "b" * 40) == [(1, "1" * 40), (2, "2" * 40)]
+def recorded(name):
+    return json.loads((FIXTURES / name).read_text())["response"]
 
 
-def test_unknown_or_missing_queue_commit_fails_closed():
-    with pytest.raises(ValueError):
-        relay.batch_members([entry(1, "a" * 40, "1" * 40)], ["x" * 40], "x" * 40)
-    with pytest.raises(ValueError):
-        relay.batch_members([], ["x" * 40], "x" * 40)
+STATUS_OK = recorded("status_attributed.json")          # real fleet/attribution=success
+STATUS_NONE = recorded("status_unattributed.json")      # real head without the context
+QUEUE_955 = recorded("graphql_queue_955.json")          # real single-entry queue
+COMPARE_955 = recorded("compare_group_955.json")        # real single-entry group compare
+COMPARE_SPAN = recorded("compare_span_945_955.json")    # real 3 consecutive queue commits
+RUNS = recorded("merge_group_runs.json")                # real merge_group runs
+
+# Real (PR number, PR head, queue commit) triples for 945, 947, 955, joined from
+# recorded merge_group runs (head_sha) and the recorded compare span.
+SPAN_BASE = "a7942d7989e45ac26863188e7052e79bfe901893"
+MEMBERS = [(945, "2536b20729c6e8ff20a34f7aa820cb311ebc7ab2", "cfa22067fe4baa9ae861abc10d97a5b358fff80a"),
+           (947, "88a1b30c5d05f7e234e88ef4efa1a83a191da072", "f2fffde3acca1bcf68533bf516c851d636cf743e"),
+           (955, "a9809aa3709262449095dab7821f54b1628403d3", "4956e38e1885f7d7b14e15e75120fbd9a161bbf1")]
 
 
-def test_status_must_be_success_for_exact_pr_head():
-    assert relay.has_success([{"context": "fleet/attribution", "state": "success", "sha": "1" * 40}], "1" * 40)
-    assert not relay.has_success([{"context": "fleet/attribution", "state": "success", "sha": "2" * 40}], "1" * 40)
-    assert not relay.has_success([{"context": "fleet/attribution", "state": "pending", "sha": "1" * 40}], "1" * 40)
-    assert not relay.has_success([], "1" * 40)
+def test_recorded_fixtures_are_what_the_relay_assumes():
+    # Combined-status objects carry no per-status sha (the r2 defect's premise).
+    assert STATUS_OK["statuses"] and all("sha" not in s for s in STATUS_OK["statuses"])
+    assert all("sha" not in s for s in recorded("statuses_attributed.json"))
+    # The span is exactly the three queue commits, in order.
+    assert [c["sha"] for c in COMPARE_SPAN["commits"]] == [m[2] for m in MEMBERS]
+    assert COMPARE_SPAN["total_commits"] == len(COMPARE_SPAN["commits"])
+    # merge_group run head_sha is each entry's queue commit; branch names the PR.
+    by_pr = {r["head_branch"].split("/pr-")[1].split("-")[0]: r["head_sha"] for r in RUNS}
+    for number, _, group_sha in MEMBERS:
+        assert by_pr[str(number)] == group_sha
+    node = QUEUE_955["data"]["repository"]["mergeQueue"]["entries"]["nodes"][0]
+    assert (node["pullRequest"]["number"], node["pullRequest"]["headRefOid"],
+            node["headCommit"]["oid"]) == MEMBERS[2]
+
+
+def test_has_success_on_recorded_combined_status():
+    assert relay.has_success(STATUS_OK)
+    failed = copy.deepcopy(STATUS_OK)
+    for s in failed["statuses"]:
+        s["state"] = "failure"
+    assert not relay.has_success(failed)
+    pending = copy.deepcopy(STATUS_OK)
+    for s in pending["statuses"]:
+        s["state"] = "pending"
+    assert not relay.has_success(pending)
+    assert not relay.has_success(STATUS_NONE)
+
+
+def queue_of(members, has_next=False):
+    """Recorded GraphQL body, with the recorded node repeated per real member."""
+    body = copy.deepcopy(QUEUE_955)
+    template = body["data"]["repository"]["mergeQueue"]["entries"]["nodes"][0]
+    nodes = []
+    for number, pr_head, group_sha in members:
+        node = copy.deepcopy(template)
+        node["pullRequest"]["number"] = number
+        node["pullRequest"]["headRefOid"] = pr_head
+        node["headCommit"]["oid"] = group_sha
+        nodes.append(node)
+    entries = body["data"]["repository"]["mergeQueue"]["entries"]
+    entries["nodes"] = nodes
+    entries["pageInfo"]["hasNextPage"] = has_next
+    return body
+
+
+def fake_github(queue, compare, attributed_heads, calls):
+    def api(path, token, payload=None):
+        calls.append(path)
+        if path == "graphql":
+            return queue
+        if "/compare/" in path:
+            return compare
+        for _, pr_head, _ in MEMBERS:
+            if path == f"repos/{REPO}/commits/{pr_head}/status?per_page=100":
+                # Association comes from the request: the body is whichever
+                # recorded response this head should receive.
+                return STATUS_OK if pr_head in attributed_heads else STATUS_NONE
+        raise AssertionError(f"unexpected API request: {path}")
+    return api
 
 
 @pytest.mark.parametrize("missing", [None, 0, 1, 2])
 def test_verify_requires_every_batch_head_status(monkeypatch, missing):
-    commits = [str(i) * 40 for i in range(1, 4)]
-    heads = [chr(ord("a") + i) * 40 for i in range(3)]
-    entries = [entry(i + 1, heads[i], commits[i]) for i in range(3)]
+    heads = {m[1] for i, m in enumerate(MEMBERS) if i != missing}
     calls = []
-
-    def fake_api(path, token, payload=None):
-        calls.append(path)
-        if path == "graphql":
-            return {"data": {"repository": {"mergeQueue": {"entries": {
-                "pageInfo": {"hasNextPage": False}, "nodes": entries}}}}}
-        if "/compare/" in path:
-            return {"total_commits": 3, "commits": [{"sha": sha} for sha in heads]}
-        for i, sha in enumerate(commits):
-            if path.endswith(f"/commits/{sha}/status"):
-                return {"statuses": [] if i == missing else [
-                    {"context": relay.CONTEXT, "state": "success", "sha": sha}]}
-        raise AssertionError(f"unexpected API request: {path}")
-
-    monkeypatch.setattr(relay, "api", fake_api)
+    monkeypatch.setattr(relay, "api", fake_github(queue_of(MEMBERS), COMPARE_SPAN, heads, calls))
     if missing is None:
-        relay.verify("owner/repo", "base", heads[-1], "token")
-        assert len([path for path in calls if path.endswith("/status")]) == 3
+        relay.verify(REPO, SPAN_BASE, MEMBERS[-1][2], "token")
+        assert sorted(p for p in calls if p.endswith("per_page=100") and "/status" in p) == sorted(
+            f"repos/{REPO}/commits/{m[1]}/status?per_page=100" for m in MEMBERS)
     else:
-        with pytest.raises(ValueError, match=f"PR #{missing + 1} head"):
-            relay.verify("owner/repo", "base", heads[-1], "token")
-    assert calls[0] == "graphql"
-    assert any("/compare/" in path for path in calls)
+        with pytest.raises(ValueError, match=f"PR #{MEMBERS[missing][0]} head"):
+            relay.verify(REPO, SPAN_BASE, MEMBERS[-1][2], "token")
+
+
+@pytest.mark.parametrize("attributed", [True, False])
+def test_verify_on_recorded_single_entry_group(monkeypatch, attributed):
+    heads = {MEMBERS[2][1]} if attributed else set()
+    monkeypatch.setattr(relay, "api", fake_github(QUEUE_955, COMPARE_955, heads, []))
+    base = "f2fffde3acca1bcf68533bf516c851d636cf743e"
+    if attributed:
+        relay.verify(REPO, base, MEMBERS[2][2], "token")
+    else:
+        with pytest.raises(ValueError, match="PR #955 head"):
+            relay.verify(REPO, base, MEMBERS[2][2], "token")
+
+
+def test_group_head_not_in_queue_fails_closed(monkeypatch):
+    monkeypatch.setattr(relay, "api", fake_github(queue_of(MEMBERS[:2]), COMPARE_SPAN,
+                                                  {m[1] for m in MEMBERS}, []))
+    with pytest.raises(ValueError, match="absent from merge queue"):
+        relay.verify(REPO, SPAN_BASE, MEMBERS[-1][2], "token")
 
 
 @pytest.mark.parametrize("defect", ["queue_overflow", "comparison_truncated", "graphql_errors"])
 def test_verify_rejects_incomplete_or_failed_discovery(monkeypatch, defect):
-    head = "a" * 40
-    def fake_api(path, token, payload=None):
-        if path == "graphql":
-            result = {"data": {"repository": {"mergeQueue": {"entries": {
-                "pageInfo": {"hasNextPage": defect == "queue_overflow"},
-                "nodes": [entry(1, head, "1" * 40)]}}}}}
-            if defect == "graphql_errors":
-                return {"errors": [{"message": "no access"}]}
-            return result
-        if "/compare/" in path:
-            return {"total_commits": 2 if defect == "comparison_truncated" else 1,
-                    "commits": [{"sha": head}]}
-        raise AssertionError("status lookup must not run after incomplete discovery")
-
-    monkeypatch.setattr(relay, "api", fake_api)
+    queue = queue_of(MEMBERS, has_next=defect == "queue_overflow")
+    if defect == "graphql_errors":
+        queue = {"errors": [{"message": "Resource not accessible by integration"}]}
+    compare = copy.deepcopy(COMPARE_SPAN)
+    if defect == "comparison_truncated":
+        compare["commits"] = compare["commits"][1:]
+    calls = []
+    monkeypatch.setattr(relay, "api", fake_github(queue, compare, {m[1] for m in MEMBERS}, calls))
     with pytest.raises(ValueError):
-        relay.verify("owner/repo", "base", head, "token")
+        relay.verify(REPO, SPAN_BASE, MEMBERS[-1][2], "token")
+    assert not any("/status" in p for p in calls)
 
 
 def test_main_exits_nonzero_when_api_unreachable(monkeypatch, capsys):
@@ -98,9 +160,9 @@ def test_main_exits_nonzero_when_api_unreachable(monkeypatch, capsys):
         raise urllib.error.URLError("unreachable")
 
     monkeypatch.setattr(urllib.request, "urlopen", unavailable)
-    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
-    monkeypatch.setenv("MERGE_GROUP_BASE_SHA", "base")
-    monkeypatch.setenv("MERGE_GROUP_HEAD_SHA", "head")
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    monkeypatch.setenv("MERGE_GROUP_BASE_SHA", SPAN_BASE)
+    monkeypatch.setenv("MERGE_GROUP_HEAD_SHA", MEMBERS[-1][2])
     monkeypatch.setenv("GH_TOKEN", "token")
     with pytest.raises(SystemExit) as exc:
         runpy.run_path(str(PATH), run_name="__main__")

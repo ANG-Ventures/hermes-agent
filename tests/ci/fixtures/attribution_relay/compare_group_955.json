@@ -1,0 +1,265 @@
+{
+ "capture": {
+  "captured_at": "2026-09-24T10:00:21Z",
+  "command": "gh api repos/ANG-Ventures/hermes-agent/compare/f2fffde3acca1bcf68533bf516c851d636cf743e...4956e38e1885f7d7b14e15e75120fbd9a161bbf1?per_page=250 --jq del(.files)"
+ },
+ "response": {
+  "ahead_by": 1,
+  "base_commit": {
+   "author": {
+    "avatar_url": "https://avatars.githubusercontent.com/u/9063726?v=4",
+    "events_url": "https://api.github.com/users/Kyzcreig/events{/privacy}",
+    "followers_url": "https://api.github.com/users/Kyzcreig/followers",
+    "following_url": "https://api.github.com/users/Kyzcreig/following{/other_user}",
+    "gists_url": "https://api.github.com/users/Kyzcreig/gists{/gist_id}",
+    "gravatar_id": "",
+    "html_url": "https://github.com/Kyzcreig",
+    "id": 9063726,
+    "login": "Kyzcreig",
+    "node_id": "MDQ6VXNlcjkwNjM3MjY=",
+    "organizations_url": "https://api.github.com/users/Kyzcreig/orgs",
+    "received_events_url": "https://api.github.com/users/Kyzcreig/received_events",
+    "repos_url": "https://api.github.com/users/Kyzcreig/repos",
+    "site_admin": false,
+    "starred_url": "https://api.github.com/users/Kyzcreig/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/Kyzcreig/subscriptions",
+    "type": "User",
+    "url": "https://api.github.com/users/Kyzcreig",
+    "user_view_type": "public"
+   },
+   "comments_url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/commits/f2fffde3acca1bcf68533bf516c851d636cf743e/comments",
+   "commit": {
+    "author": {
+     "date": "2026-09-24T09:19:50Z",
+     "email": "Kyzcreig@users.noreply.github.com",
+     "name": "Alexander Nikolas"
+    },
+    "comment_count": 0,
+    "committer": {
+     "date": "2026-09-24T09:19:50Z",
+     "email": "noreply@github.com",
+     "name": "GitHub"
+    },
+    "message": "feat(kanban): hermes kanban clone - reference clones against shared fleet mirrors (t_dad1edd7) (#947)\n\n* feat(kanban): `hermes kanban clone` - reference clones against shared fleet mirrors (t_dad1edd7)\n\nWorkers clone fleet repos by hand into scratch workspaces (159 clones on\n2026-09-23, 39 of hermes-home, each a full object store). The dispatcher\nnever clones, so dedupe has to live in a helper the worker calls.\n\n`hermes kanban clone <url> [dest] [-b branch]` runs\n`git clone --reference-if-able <root>/mirrors/<owner>/<repo>.git <url>`\nfor ANG-Ventures/* and Kyzcreig/* GitHub URLs. Mirrors are created lazily\n(bare, flock-serialised, tmp+rename so a half-built mirror is never\nvisible) with gc.auto=0 / gc.pruneExpire=never: a pruned mirror corrupts\nevery dependent clone. Non-fleet URLs clone normally; a mirror failure\ndegrades to a plain clone with a stderr warning. `clone` dispatches before\nkb.init_db() - it has no board state.\n\nKANBAN_GUIDANCE gains one line pointing workers at the helper (7311 chars,\ncap 8000).\n\nVerified:\n- tests/hermes_cli/test_kanban_clone.py 15 passed (real git transport via\n  url.insteadOf onto local bare repos; alternates present, count-objects\n  size 0, never-prune config written, mirror reused, non-fleet plain,\n  mirror failure degrades, CLI dispatch never touches kanban.db)\n- with test_kanban_tools, test_kanban_cli, test_prompt_builder in a\n  scrubbed env: 145 passed, 1 skipped\n- live: clone of ANG-Ventures/hermes-home via the helper -> alternates to\n  ~/.hermes/mirrors/ANG-Ventures/hermes-home.git/objects, 4.0K objects in\n  the checkout (mirror 164M), fsck --connectivity-only clean\n- ruff clean\n\n* fix(kanban clone): precious-objects mirrors, forwarded git-clone options, one deletion choke point (t_dad1edd7 r2)\n\nAddresses Argus QA r1 on #947.\n\nB1 test_workspace_deletion_has_one_choke_point: ensure_mirror no longer\ncalls shutil.rmtree. The mirror is built at a fixed staging path\n(<owner>/.<repo>.git.partial) via init --bare + config + fetch and renamed\ninto place; a failed build is resumed by the next caller instead of deleted.\n\nB3 never-prune: mirrors now get core.repositoryformatversion=1 +\nextensions.preciousObjects=true BEFORE the first fetch, so an explicit\n`git gc --prune=now` / `git prune` cannot drop objects dependents borrow.\ngc.* keys kept as defence in depth. Tests assert literal config values\n(not a loop over MIRROR_CONFIG), a behavioural gc --prune=now test with a\nprecious=False control arm that must corrupt, and the mirror root pinned\nto the fleet root under HERMES_HOME=<root>/profiles/<name>.\n\nB5b the helper forwards -q/-v, -n/--no-checkout, --single-branch,\n--no-single-branch, --no-tags, --recurse-submodules, --shallow-submodules,\n--sparse, -b, -o/--origin, --depth, --filter, --shallow-since,\n--shallow-exclude, and accepts `--` before the URL.\n\nC1 URL userinfo is stripped before it is written to the shared mirror's\nremote.origin.url. C2 inherited GIT_DIR/GIT_INDEX_FILE/... are scrubbed\nfrom every git subprocess.\n\nVerified (env -i, isolated HOME/HERMES_HOME):\n- test_kanban_clone.py + test_kanban_survivor.py: 59 passed\n- test_prompt_builder.py + test_kanban_cli.py: 77 passed, 1 skipped\n- mutants on copies, all killed: drop preciousObjects (3 fail), drop\n  gc.pruneExpire, drop formatversion=1, profile-home mirror root, no\n  userinfo strip, no option forwarding (1 fail each)\n- KANBAN_GUIDANCE 7360 < 8000; ruff clean\n\n* fix: a --filter clone ignores --reference; never forward/allow that pair (t_dad1edd7 r2)\n\nMeasured on the real hermes-home mirror + GitHub (git 2.53.0), objects in\nthe dependent clone with --reference-if-able <mirror> --no-checkout:\n  plain 1.2M | --depth 1 0.7M | --single-branch 0.8M | --filter=blob:none 170M\nA partial clone does not borrow from the alternate; it downloads every\nobject the filter keeps.\n\nkanban clone: with a mirror in use, --filter is dropped with a stderr note\n(kept when no mirror). Tests: forwarded-options test asserts 0 own objects\nand no partialclonefilter; filter kept without a mirror. 60 passed\n(test_kanban_clone + test_kanban_survivor, env -i); mutant keeping the\nfilter is killed; ruff clean.\n\n* fix(kanban clone): a killed first mirror build never poisons the mirror (t_dad1edd7 r3)\n\nQA r2 R1. r2 built each mirror in a FIXED staging repo that the next caller\nresumed. The terminal tool SIGTERMs then SIGKILLs a timed-out command. A\nkilled git fetch leaves tmp_pack_* files and ref/config locks that git never\nreuses. The next build then either promoted that residue into the precious\n(unprunable) mirror, or failed every later fetch on the stale ref lock and\ndegraded to plain clones with rc=0.\n\nNow every build runs in a fresh .<repo>.git.build-<random> staging repo. The\nnext builder, while holding the mirror flock, discards every dead staging\nrepo, including the r2 .partial name. The flock is held for the whole build\nand the kernel drops it when the builder dies, so any staging repo that\nexists under the lock is dead. A build is promoted only if it contains no\ntmp_* or *.lock files. A build that fails in-process is discarded before the\nerror is raised.\n\n_discard_dead_builds is a named, reviewed exception to kanban's\none-deletion-choke-point test. It only touches direct, non-symlink,\nrealpath-confined children named .<repo>.git.build-* or .<repo>.git.partial,\nnever a workspace.\n\nTests (all run the REAL git transport; the kill tests kill REAL helper\nsubprocesses):\n- killed_first_build_never_poisons_the_mirror: 8 terminal-tool-style kills\n  (SIGTERM to the group, SIGKILL after 1 s) spread across the build of a\n  24 MB / 1,500-branch fixture. After each kill, the next call must clone with\n  alternates, leave no residue or staging repo, and produce a mirror no larger\n  than 1.05x a clean build. At least half of the kills must land before\n  promotion (non-vacuity floor).\n- dead_build_residue_is_discarded_not_promoted: .build-* and .partial arms,\n  each with tmp_pack, tmp_idx, a ref lock and config.lock.\n- discard_only_touches_this_repos_staging: symlink out of the owner dir, and\n  symlink to the live mirror inside it.\n- K1/MX3: 6 concurrent first clones all get alternates, one mirror.\n- K1/MX4: an inherited GIT_INDEX_FILE, or GIT_DIR+GIT_WORK_TREE, leaves the\n  victim's index and config byte-identical.\n- K2: precious + pruneExpire are already set when the fetch runs.\n\nVerified:\n- clone + survivor + kanban_cli: 77 passed. ruff clean.\n- Mutants, each on its own worktree: 8/8 killed. MX3 no flock, MX4 no env\n  scrub, MX1 config after fetch, no discard on entry, no residue check, no\n  symlink guard, and the r2 source itself (born-red: 3 failed).\n- Real path, real GitHub, ANG-Ventures/hermes-home, sandbox mirrors root,\n  terminal-tool kills at 2 / 4.5 / 5 / 7 s. Each kill left a 5.9-132 MB\n  tmp_pack in its own staging repo. Each next call returned rc=0 with no\n  warning and promoted a residue-free precious mirror of 169,168-169,948K,\n  against 169,420K for a clean build. Each dependent had 4K of its own\n  objects and fsck 0.\n\n---------\n\nCo-authored-by: Kyzcreig <9063726+Kyzcreig@users.noreply.github.com>\nCo-authored-by: Apollo <apollo@angventures.io>",
+    "tree": {
+     "sha": "e9c46e452e8d56f9962ce1ccf42ebf69605c8be1",
+     "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/git/trees/e9c46e452e8d56f9962ce1ccf42ebf69605c8be1"
+    },
+    "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/git/commits/f2fffde3acca1bcf68533bf516c851d636cf743e",
+    "verification": {
+     "payload": "tree e9c46e452e8d56f9962ce1ccf42ebf69605c8be1\nparent cfa22067fe4baa9ae861abc10d97a5b358fff80a\nauthor Alexander Nikolas <Kyzcreig@users.noreply.github.com> 1790241590 +0000\ncommitter GitHub <noreply@github.com> 1790241590 +0000\n\nfeat(kanban): hermes kanban clone - reference clones against shared fleet mirrors (t_dad1edd7) (#947)\n\n* feat(kanban): `hermes kanban clone` - reference clones against shared fleet mirrors (t_dad1edd7)\n\nWorkers clone fleet repos by hand into scratch workspaces (159 clones on\n2026-09-23, 39 of hermes-home, each a full object store). The dispatcher\nnever clones, so dedupe has to live in a helper the worker calls.\n\n`hermes kanban clone <url> [dest] [-b branch]` runs\n`git clone --reference-if-able <root>/mirrors/<owner>/<repo>.git <url>`\nfor ANG-Ventures/* and Kyzcreig/* GitHub URLs. Mirrors are created lazily\n(bare, flock-serialised, tmp+rename so a half-built mirror is never\nvisible) with gc.auto=0 / gc.pruneExpire=never: a pruned mirror corrupts\nevery dependent clone. Non-fleet URLs clone normally; a mirror failure\ndegrades to a plain clone with a stderr warning. `clone` dispatches before\nkb.init_db() - it has no board state.\n\nKANBAN_GUIDANCE gains one line pointing workers at the helper (7311 chars,\ncap 8000).\n\nVerified:\n- tests/hermes_cli/test_kanban_clone.py 15 passed (real git transport via\n  url.insteadOf onto local bare repos; alternates present, count-objects\n  size 0, never-prune config written, mirror reused, non-fleet plain,\n  mirror failure degrades, CLI dispatch never touches kanban.db)\n- with test_kanban_tools, test_kanban_cli, test_prompt_builder in a\n  scrubbed env: 145 passed, 1 skipped\n- live: clone of ANG-Ventures/hermes-home via the helper -> alternates to\n  ~/.hermes/mirrors/ANG-Ventures/hermes-home.git/objects, 4.0K objects in\n  the checkout (mirror 164M), fsck --connectivity-only clean\n- ruff clean\n\n* fix(kanban clone): precious-objects mirrors, forwarded git-clone options, one deletion choke point (t_dad1edd7 r2)\n\nAddresses Argus QA r1 on #947.\n\nB1 test_workspace_deletion_has_one_choke_point: ensure_mirror no longer\ncalls shutil.rmtree. The mirror is built at a fixed staging path\n(<owner>/.<repo>.git.partial) via init --bare + config + fetch and renamed\ninto place; a failed build is resumed by the next caller instead of deleted.\n\nB3 never-prune: mirrors now get core.repositoryformatversion=1 +\nextensions.preciousObjects=true BEFORE the first fetch, so an explicit\n`git gc --prune=now` / `git prune` cannot drop objects dependents borrow.\ngc.* keys kept as defence in depth. Tests assert literal config values\n(not a loop over MIRROR_CONFIG), a behavioural gc --prune=now test with a\nprecious=False control arm that must corrupt, and the mirror root pinned\nto the fleet root under HERMES_HOME=<root>/profiles/<name>.\n\nB5b the helper forwards -q/-v, -n/--no-checkout, --single-branch,\n--no-single-branch, --no-tags, --recurse-submodules, --shallow-submodules,\n--sparse, -b, -o/--origin, --depth, --filter, --shallow-since,\n--shallow-exclude, and accepts `--` before the URL.\n\nC1 URL userinfo is stripped before it is written to the shared mirror's\nremote.origin.url. C2 inherited GIT_DIR/GIT_INDEX_FILE/... are scrubbed\nfrom every git subprocess.\n\nVerified (env -i, isolated HOME/HERMES_HOME):\n- test_kanban_clone.py + test_kanban_survivor.py: 59 passed\n- test_prompt_builder.py + test_kanban_cli.py: 77 passed, 1 skipped\n- mutants on copies, all killed: drop preciousObjects (3 fail), drop\n  gc.pruneExpire, drop formatversion=1, profile-home mirror root, no\n  userinfo strip, no option forwarding (1 fail each)\n- KANBAN_GUIDANCE 7360 < 8000; ruff clean\n\n* fix: a --filter clone ignores --reference; never forward/allow that pair (t_dad1edd7 r2)\n\nMeasured on the real hermes-home mirror + GitHub (git 2.53.0), objects in\nthe dependent clone with --reference-if-able <mirror> --no-checkout:\n  plain 1.2M | --depth 1 0.7M | --single-branch 0.8M | --filter=blob:none 170M\nA partial clone does not borrow from the alternate; it downloads every\nobject the filter keeps.\n\nkanban clone: with a mirror in use, --filter is dropped with a stderr note\n(kept when no mirror). Tests: forwarded-options test asserts 0 own objects\nand no partialclonefilter; filter kept without a mirror. 60 passed\n(test_kanban_clone + test_kanban_survivor, env -i); mutant keeping the\nfilter is killed; ruff clean.\n\n* fix(kanban clone): a killed first mirror build never poisons the mirror (t_dad1edd7 r3)\n\nQA r2 R1. r2 built each mirror in a FIXED staging repo that the next caller\nresumed. The terminal tool SIGTERMs then SIGKILLs a timed-out command. A\nkilled git fetch leaves tmp_pack_* files and ref/config locks that git never\nreuses. The next build then either promoted that residue into the precious\n(unprunable) mirror, or failed every later fetch on the stale ref lock and\ndegraded to plain clones with rc=0.\n\nNow every build runs in a fresh .<repo>.git.build-<random> staging repo. The\nnext builder, while holding the mirror flock, discards every dead staging\nrepo, including the r2 .partial name. The flock is held for the whole build\nand the kernel drops it when the builder dies, so any staging repo that\nexists under the lock is dead. A build is promoted only if it contains no\ntmp_* or *.lock files. A build that fails in-process is discarded before the\nerror is raised.\n\n_discard_dead_builds is a named, reviewed exception to kanban's\none-deletion-choke-point test. It only touches direct, non-symlink,\nrealpath-confined children named .<repo>.git.build-* or .<repo>.git.partial,\nnever a workspace.\n\nTests (all run the REAL git transport; the kill tests kill REAL helper\nsubprocesses):\n- killed_first_build_never_poisons_the_mirror: 8 terminal-tool-style kills\n  (SIGTERM to the group, SIGKILL after 1 s) spread across the build of a\n  24 MB / 1,500-branch fixture. After each kill, the next call must clone with\n  alternates, leave no residue or staging repo, and produce a mirror no larger\n  than 1.05x a clean build. At least half of the kills must land before\n  promotion (non-vacuity floor).\n- dead_build_residue_is_discarded_not_promoted: .build-* and .partial arms,\n  each with tmp_pack, tmp_idx, a ref lock and config.lock.\n- discard_only_touches_this_repos_staging: symlink out of the owner dir, and\n  symlink to the live mirror inside it.\n- K1/MX3: 6 concurrent first clones all get alternates, one mirror.\n- K1/MX4: an inherited GIT_INDEX_FILE, or GIT_DIR+GIT_WORK_TREE, leaves the\n  victim's index and config byte-identical.\n- K2: precious + pruneExpire are already set when the fetch runs.\n\nVerified:\n- clone + survivor + kanban_cli: 77 passed. ruff clean.\n- Mutants, each on its own worktree: 8/8 killed. MX3 no flock, MX4 no env\n  scrub, MX1 config after fetch, no discard on entry, no residue check, no\n  symlink guard, and the r2 source itself (born-red: 3 failed).\n- Real path, real GitHub, ANG-Ventures/hermes-home, sandbox mirrors root,\n  terminal-tool kills at 2 / 4.5 / 5 / 7 s. Each kill left a 5.9-132 MB\n  tmp_pack in its own staging repo. Each next call returned rc=0 with no\n  warning and promoted a residue-free precious mirror of 169,168-169,948K,\n  against 169,420K for a clean build. Each dependent had 4K of its own\n  objects and fsck 0.\n\n---------\n\nCo-authored-by: Kyzcreig <9063726+Kyzcreig@users.noreply.github.com>\nCo-authored-by: Apollo <apollo@angventures.io>",
+     "reason": "valid",
+     "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQBQJqtOtGCRC1aQ7uu5UhlAAATnAQAKrCLFNoz8oN9rjqPwtwkGm6\nnQqirYbLURUmAk+ddNFXIaBiMGDBXSb8SnGT8l88RVjsAYKFmup3kFQLYXc+Xl03\nvETwPvY6M16dR9OO7nT4PqTCQEFN5nARBwIxyk9uHsGKP5MwCzq0ypQ38lGLcUBf\nk3+RfOTACsk5rCO2HIPtL+bqnJdmhtxbP8ZK1sPkadxU8z3sIuGm8Av7e8EI087+\nYDRGLhfb/NovNH7fsPiqfChTeSkNiGz9HddhJNEozCdorrfF2RqoxNxPJ85n7U1N\nynVEK7k04z08vLrWrSIZ2Glgibr9+Jv0dInCd6Ccl641K7ehbc5vJQbQ/k66rmJC\nNktcffG/1b1sSnuOxo0iI1UIIypLKO5SyU7GaHxNlxk9TEZO8Cq5RYSISda3QT8x\nv+ZSLd2KUicwdEkAI/8+P7LN0LGAwujZgypBSrqQq9V55mBG2/av+Yp9t8wY++Zu\nPqNLfhLMoaffCnawPEBWRfDNjTAOTe1sXg2ICmDJT2f6/OVAY+DsME3opTYQ6eaw\nykW1zuwyXxz03VtPW20hsTqvEjTMI/c4xKNwoHX6kxVBXP6TzTdY5/5kOpMtOiNn\nfUzmxZ734BB53pj2RPqrzIhbZwf7W+TfqWUsuc6s4ycfnzIVaj4CEJ5O+UiXWi8H\nkuBBjCP4CefM3AMxGa97\n=i9To\n-----END PGP SIGNATURE-----\n",
+     "verified": true,
+     "verified_at": "2026-09-24T09:20:07Z"
+    }
+   },
+   "committer": {
+    "avatar_url": "https://avatars.githubusercontent.com/u/19864447?v=4",
+    "events_url": "https://api.github.com/users/web-flow/events{/privacy}",
+    "followers_url": "https://api.github.com/users/web-flow/followers",
+    "following_url": "https://api.github.com/users/web-flow/following{/other_user}",
+    "gists_url": "https://api.github.com/users/web-flow/gists{/gist_id}",
+    "gravatar_id": "",
+    "html_url": "https://github.com/web-flow",
+    "id": 19864447,
+    "login": "web-flow",
+    "node_id": "MDQ6VXNlcjE5ODY0NDQ3",
+    "organizations_url": "https://api.github.com/users/web-flow/orgs",
+    "received_events_url": "https://api.github.com/users/web-flow/received_events",
+    "repos_url": "https://api.github.com/users/web-flow/repos",
+    "site_admin": false,
+    "starred_url": "https://api.github.com/users/web-flow/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/web-flow/subscriptions",
+    "type": "User",
+    "url": "https://api.github.com/users/web-flow",
+    "user_view_type": "public"
+   },
+   "html_url": "https://github.com/ANG-Ventures/hermes-agent/commit/f2fffde3acca1bcf68533bf516c851d636cf743e",
+   "node_id": "C_kwDOSZnnV9oAKGYyZmZmZGUzYWNjYTFiY2Y2ODUzM2JmNTE2Yzg1MWQ2MzZjZjc0M2U",
+   "parents": [
+    {
+     "html_url": "https://github.com/ANG-Ventures/hermes-agent/commit/cfa22067fe4baa9ae861abc10d97a5b358fff80a",
+     "sha": "cfa22067fe4baa9ae861abc10d97a5b358fff80a",
+     "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/commits/cfa22067fe4baa9ae861abc10d97a5b358fff80a"
+    }
+   ],
+   "sha": "f2fffde3acca1bcf68533bf516c851d636cf743e",
+   "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/commits/f2fffde3acca1bcf68533bf516c851d636cf743e"
+  },
+  "behind_by": 0,
+  "commits": [
+   {
+    "author": {
+     "avatar_url": "https://avatars.githubusercontent.com/u/9063726?v=4",
+     "events_url": "https://api.github.com/users/Kyzcreig/events{/privacy}",
+     "followers_url": "https://api.github.com/users/Kyzcreig/followers",
+     "following_url": "https://api.github.com/users/Kyzcreig/following{/other_user}",
+     "gists_url": "https://api.github.com/users/Kyzcreig/gists{/gist_id}",
+     "gravatar_id": "",
+     "html_url": "https://github.com/Kyzcreig",
+     "id": 9063726,
+     "login": "Kyzcreig",
+     "node_id": "MDQ6VXNlcjkwNjM3MjY=",
+     "organizations_url": "https://api.github.com/users/Kyzcreig/orgs",
+     "received_events_url": "https://api.github.com/users/Kyzcreig/received_events",
+     "repos_url": "https://api.github.com/users/Kyzcreig/repos",
+     "site_admin": false,
+     "starred_url": "https://api.github.com/users/Kyzcreig/starred{/owner}{/repo}",
+     "subscriptions_url": "https://api.github.com/users/Kyzcreig/subscriptions",
+     "type": "User",
+     "url": "https://api.github.com/users/Kyzcreig",
+     "user_view_type": "public"
+    },
+    "comments_url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/commits/4956e38e1885f7d7b14e15e75120fbd9a161bbf1/comments",
+    "commit": {
+     "author": {
+      "date": "2026-09-24T09:35:22Z",
+      "email": "Kyzcreig@users.noreply.github.com",
+      "name": "Alexander Nikolas"
+     },
+     "comment_count": 0,
+     "committer": {
+      "date": "2026-09-24T09:35:22Z",
+      "email": "noreply@github.com",
+      "name": "GitHub"
+     },
+     "message": "Fix blackbox turn ID join with per-call ledger (#955)\n\n* fix(blackbox): persist agent turn id for call-ledger join\n\nVerified real plugin record_api_call -> on_session_end joins in fresh and migrated stores; 34 blackbox tests passed. Task t_9e89c30a.\n\n* test(blackbox): moa seam test looks up the turn under the finalizer's turn_id, not a fresh _turn_id() (PR #955 join fix)\n\n---------\n\nCo-authored-by: Apollo <apollo@angventures.io>\nCo-authored-by: apollo <apollo@fleet>",
+     "tree": {
+      "sha": "3e9079d1957f7db38095baa09a6720f67d1c0b98",
+      "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/git/trees/3e9079d1957f7db38095baa09a6720f67d1c0b98"
+     },
+     "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/git/commits/4956e38e1885f7d7b14e15e75120fbd9a161bbf1",
+     "verification": {
+      "payload": "tree 3e9079d1957f7db38095baa09a6720f67d1c0b98\nparent f2fffde3acca1bcf68533bf516c851d636cf743e\nauthor Alexander Nikolas <Kyzcreig@users.noreply.github.com> 1790242522 +0000\ncommitter GitHub <noreply@github.com> 1790242522 +0000\n\nFix blackbox turn ID join with per-call ledger (#955)\n\n* fix(blackbox): persist agent turn id for call-ledger join\n\nVerified real plugin record_api_call -> on_session_end joins in fresh and migrated stores; 34 blackbox tests passed. Task t_9e89c30a.\n\n* test(blackbox): moa seam test looks up the turn under the finalizer's turn_id, not a fresh _turn_id() (PR #955 join fix)\n\n---------\n\nCo-authored-by: Apollo <apollo@angventures.io>\nCo-authored-by: apollo <apollo@fleet>",
+      "reason": "valid",
+      "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQBQJqtO7qCRC1aQ7uu5UhlAAACcQQAJeMk8IUU14bG0FcbYYTKy2w\nw88DUnDYPEO+y7OqRD746st/MOPxEE1DSpUgResr2FpkwKtFnguC4nYmliOaWKqf\nk/5L+2n7ZJr5Yq4JTguOgwuQVWzbkW9TUI9kd+pS4i5jpt4i9AG6HtoncyKyP/Gc\ntPgpoctgKiHtaCG5fXFJZBfTqV5iwOKfTzyJ2zBlMFJrGSE9dOaT31y/xRRX/Ecr\nRrnQrFqiV48TJE9aF/lfOv+oL2rzj+37wlg/PVM5H6SHr0xJffJpIP8pnN3TwrEo\nh0u54e7TTXzZEef8luU3J1Gpvq7B3AtzmpI47avNRozZK+wNYa6EJtKRVElYCX1X\nDqaqoGPk/75MaE5dh/urCo401AQDRv8tMVd7t9b0/UkgP4bg7dSpBMFZ+sh7KkpN\nsr5NXLUuedcg8sgFNkHQg2a4nFlIQo9WKOh4DG0/98fIGtPSsaPvA4sIGLES3+25\nVnqsbhNEZl2hxki//yGbyAIyUmJHxKB1Te/QDOYM7OVqk5Lrd4+ZIUGW1BVfkcuS\nyFbqh2wEYajOA/P5E6NYmWt8LwkGm/B+GWQqDcKItLzWJaN37Bp+EUozksdGheb3\nKK5iDkZ/qgRP0DiyLNDdKQAckuA+iIB/IfmxvuGtfubO5lKxte1LIKKfIZKpNHf2\nNwayn6aFeyRPvGrq/5to\n=TUaW\n-----END PGP SIGNATURE-----\n",
+      "verified": true,
+      "verified_at": "2026-09-24T09:35:54Z"
+     }
+    },
+    "committer": {
+     "avatar_url": "https://avatars.githubusercontent.com/u/19864447?v=4",
+     "events_url": "https://api.github.com/users/web-flow/events{/privacy}",
+     "followers_url": "https://api.github.com/users/web-flow/followers",
+     "following_url": "https://api.github.com/users/web-flow/following{/other_user}",
+     "gists_url": "https://api.github.com/users/web-flow/gists{/gist_id}",
+     "gravatar_id": "",
+     "html_url": "https://github.com/web-flow",
+     "id": 19864447,
+     "login": "web-flow",
+     "node_id": "MDQ6VXNlcjE5ODY0NDQ3",
+     "organizations_url": "https://api.github.com/users/web-flow/orgs",
+     "received_events_url": "https://api.github.com/users/web-flow/received_events",
+     "repos_url": "https://api.github.com/users/web-flow/repos",
+     "site_admin": false,
+     "starred_url": "https://api.github.com/users/web-flow/starred{/owner}{/repo}",
+     "subscriptions_url": "https://api.github.com/users/web-flow/subscriptions",
+     "type": "User",
+     "url": "https://api.github.com/users/web-flow",
+     "user_view_type": "public"
+    },
+    "html_url": "https://github.com/ANG-Ventures/hermes-agent/commit/4956e38e1885f7d7b14e15e75120fbd9a161bbf1",
+    "node_id": "C_kwDOSZnnV9oAKDQ5NTZlMzhlMTg4NWY3ZDdiMTRlMTVlNzUxMjBmYmQ5YTE2MWJiZjE",
+    "parents": [
+     {
+      "html_url": "https://github.com/ANG-Ventures/hermes-agent/commit/f2fffde3acca1bcf68533bf516c851d636cf743e",
+      "sha": "f2fffde3acca1bcf68533bf516c851d636cf743e",
+      "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/commits/f2fffde3acca1bcf68533bf516c851d636cf743e"
+     }
+    ],
+    "sha": "4956e38e1885f7d7b14e15e75120fbd9a161bbf1",
+    "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/commits/4956e38e1885f7d7b14e15e75120fbd9a161bbf1"
+   }
+  ],
+  "diff_url": "https://github.com/ANG-Ventures/hermes-agent/compare/f2fffde3acca1bcf68533bf516c851d636cf743e...4956e38e1885f7d7b14e15e75120fbd9a161bbf1.diff",
+  "html_url": "https://github.com/ANG-Ventures/hermes-agent/compare/f2fffde3acca1bcf68533bf516c851d636cf743e...4956e38e1885f7d7b14e15e75120fbd9a161bbf1",
+  "merge_base_commit": {
+   "author": {
+    "avatar_url": "https://avatars.githubusercontent.com/u/9063726?v=4",
+    "events_url": "https://api.github.com/users/Kyzcreig/events{/privacy}",
+    "followers_url": "https://api.github.com/users/Kyzcreig/followers",
+    "following_url": "https://api.github.com/users/Kyzcreig/following{/other_user}",
+    "gists_url": "https://api.github.com/users/Kyzcreig/gists{/gist_id}",
+    "gravatar_id": "",
+    "html_url": "https://github.com/Kyzcreig",
+    "id": 9063726,
+    "login": "Kyzcreig",
+    "node_id": "MDQ6VXNlcjkwNjM3MjY=",
+    "organizations_url": "https://api.github.com/users/Kyzcreig/orgs",
+    "received_events_url": "https://api.github.com/users/Kyzcreig/received_events",
+    "repos_url": "https://api.github.com/users/Kyzcreig/repos",
+    "site_admin": false,
+    "starred_url": "https://api.github.com/users/Kyzcreig/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/Kyzcreig/subscriptions",
+    "type": "User",
+    "url": "https://api.github.com/users/Kyzcreig",
+    "user_view_type": "public"
+   },
+   "comments_url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/commits/f2fffde3acca1bcf68533bf516c851d636cf743e/comments",
+   "commit": {
+    "author": {
+     "date": "2026-09-24T09:19:50Z",
+     "email": "Kyzcreig@users.noreply.github.com",
+     "name": "Alexander Nikolas"
+    },
+    "comment_count": 0,
+    "committer": {
+     "date": "2026-09-24T09:19:50Z",
+     "email": "noreply@github.com",
+     "name": "GitHub"
+    },
+    "message": "feat(kanban): hermes kanban clone - reference clones against shared fleet mirrors (t_dad1edd7) (#947)\n\n* feat(kanban): `hermes kanban clone` - reference clones against shared fleet mirrors (t_dad1edd7)\n\nWorkers clone fleet repos by hand into scratch workspaces (159 clones on\n2026-09-23, 39 of hermes-home, each a full object store). The dispatcher\nnever clones, so dedupe has to live in a helper the worker calls.\n\n`hermes kanban clone <url> [dest] [-b branch]` runs\n`git clone --reference-if-able <root>/mirrors/<owner>/<repo>.git <url>`\nfor ANG-Ventures/* and Kyzcreig/* GitHub URLs. Mirrors are created lazily\n(bare, flock-serialised, tmp+rename so a half-built mirror is never\nvisible) with gc.auto=0 / gc.pruneExpire=never: a pruned mirror corrupts\nevery dependent clone. Non-fleet URLs clone normally; a mirror failure\ndegrades to a plain clone with a stderr warning. `clone` dispatches before\nkb.init_db() - it has no board state.\n\nKANBAN_GUIDANCE gains one line pointing workers at the helper (7311 chars,\ncap 8000).\n\nVerified:\n- tests/hermes_cli/test_kanban_clone.py 15 passed (real git transport via\n  url.insteadOf onto local bare repos; alternates present, count-objects\n  size 0, never-prune config written, mirror reused, non-fleet plain,\n  mirror failure degrades, CLI dispatch never touches kanban.db)\n- with test_kanban_tools, test_kanban_cli, test_prompt_builder in a\n  scrubbed env: 145 passed, 1 skipped\n- live: clone of ANG-Ventures/hermes-home via the helper -> alternates to\n  ~/.hermes/mirrors/ANG-Ventures/hermes-home.git/objects, 4.0K objects in\n  the checkout (mirror 164M), fsck --connectivity-only clean\n- ruff clean\n\n* fix(kanban clone): precious-objects mirrors, forwarded git-clone options, one deletion choke point (t_dad1edd7 r2)\n\nAddresses Argus QA r1 on #947.\n\nB1 test_workspace_deletion_has_one_choke_point: ensure_mirror no longer\ncalls shutil.rmtree. The mirror is built at a fixed staging path\n(<owner>/.<repo>.git.partial) via init --bare + config + fetch and renamed\ninto place; a failed build is resumed by the next caller instead of deleted.\n\nB3 never-prune: mirrors now get core.repositoryformatversion=1 +\nextensions.preciousObjects=true BEFORE the first fetch, so an explicit\n`git gc --prune=now` / `git prune` cannot drop objects dependents borrow.\ngc.* keys kept as defence in depth. Tests assert literal config values\n(not a loop over MIRROR_CONFIG), a behavioural gc --prune=now test with a\nprecious=False control arm that must corrupt, and the mirror root pinned\nto the fleet root under HERMES_HOME=<root>/profiles/<name>.\n\nB5b the helper forwards -q/-v, -n/--no-checkout, --single-branch,\n--no-single-branch, --no-tags, --recurse-submodules, --shallow-submodules,\n--sparse, -b, -o/--origin, --depth, --filter, --shallow-since,\n--shallow-exclude, and accepts `--` before the URL.\n\nC1 URL userinfo is stripped before it is written to the shared mirror's\nremote.origin.url. C2 inherited GIT_DIR/GIT_INDEX_FILE/... are scrubbed\nfrom every git subprocess.\n\nVerified (env -i, isolated HOME/HERMES_HOME):\n- test_kanban_clone.py + test_kanban_survivor.py: 59 passed\n- test_prompt_builder.py + test_kanban_cli.py: 77 passed, 1 skipped\n- mutants on copies, all killed: drop preciousObjects (3 fail), drop\n  gc.pruneExpire, drop formatversion=1, profile-home mirror root, no\n  userinfo strip, no option forwarding (1 fail each)\n- KANBAN_GUIDANCE 7360 < 8000; ruff clean\n\n* fix: a --filter clone ignores --reference; never forward/allow that pair (t_dad1edd7 r2)\n\nMeasured on the real hermes-home mirror + GitHub (git 2.53.0), objects in\nthe dependent clone with --reference-if-able <mirror> --no-checkout:\n  plain 1.2M | --depth 1 0.7M | --single-branch 0.8M | --filter=blob:none 170M\nA partial clone does not borrow from the alternate; it downloads every\nobject the filter keeps.\n\nkanban clone: with a mirror in use, --filter is dropped with a stderr note\n(kept when no mirror). Tests: forwarded-options test asserts 0 own objects\nand no partialclonefilter; filter kept without a mirror. 60 passed\n(test_kanban_clone + test_kanban_survivor, env -i); mutant keeping the\nfilter is killed; ruff clean.\n\n* fix(kanban clone): a killed first mirror build never poisons the mirror (t_dad1edd7 r3)\n\nQA r2 R1. r2 built each mirror in a FIXED staging repo that the next caller\nresumed. The terminal tool SIGTERMs then SIGKILLs a timed-out command. A\nkilled git fetch leaves tmp_pack_* files and ref/config locks that git never\nreuses. The next build then either promoted that residue into the precious\n(unprunable) mirror, or failed every later fetch on the stale ref lock and\ndegraded to plain clones with rc=0.\n\nNow every build runs in a fresh .<repo>.git.build-<random> staging repo. The\nnext builder, while holding the mirror flock, discards every dead staging\nrepo, including the r2 .partial name. The flock is held for the whole build\nand the kernel drops it when the builder dies, so any staging repo that\nexists under the lock is dead. A build is promoted only if it contains no\ntmp_* or *.lock files. A build that fails in-process is discarded before the\nerror is raised.\n\n_discard_dead_builds is a named, reviewed exception to kanban's\none-deletion-choke-point test. It only touches direct, non-symlink,\nrealpath-confined children named .<repo>.git.build-* or .<repo>.git.partial,\nnever a workspace.\n\nTests (all run the REAL git transport; the kill tests kill REAL helper\nsubprocesses):\n- killed_first_build_never_poisons_the_mirror: 8 terminal-tool-style kills\n  (SIGTERM to the group, SIGKILL after 1 s) spread across the build of a\n  24 MB / 1,500-branch fixture. After each kill, the next call must clone with\n  alternates, leave no residue or staging repo, and produce a mirror no larger\n  than 1.05x a clean build. At least half of the kills must land before\n  promotion (non-vacuity floor).\n- dead_build_residue_is_discarded_not_promoted: .build-* and .partial arms,\n  each with tmp_pack, tmp_idx, a ref lock and config.lock.\n- discard_only_touches_this_repos_staging: symlink out of the owner dir, and\n  symlink to the live mirror inside it.\n- K1/MX3: 6 concurrent first clones all get alternates, one mirror.\n- K1/MX4: an inherited GIT_INDEX_FILE, or GIT_DIR+GIT_WORK_TREE, leaves the\n  victim's index and config byte-identical.\n- K2: precious + pruneExpire are already set when the fetch runs.\n\nVerified:\n- clone + survivor + kanban_cli: 77 passed. ruff clean.\n- Mutants, each on its own worktree: 8/8 killed. MX3 no flock, MX4 no env\n  scrub, MX1 config after fetch, no discard on entry, no residue check, no\n  symlink guard, and the r2 source itself (born-red: 3 failed).\n- Real path, real GitHub, ANG-Ventures/hermes-home, sandbox mirrors root,\n  terminal-tool kills at 2 / 4.5 / 5 / 7 s. Each kill left a 5.9-132 MB\n  tmp_pack in its own staging repo. Each next call returned rc=0 with no\n  warning and promoted a residue-free precious mirror of 169,168-169,948K,\n  against 169,420K for a clean build. Each dependent had 4K of its own\n  objects and fsck 0.\n\n---------\n\nCo-authored-by: Kyzcreig <9063726+Kyzcreig@users.noreply.github.com>\nCo-authored-by: Apollo <apollo@angventures.io>",
+    "tree": {
+     "sha": "e9c46e452e8d56f9962ce1ccf42ebf69605c8be1",
+     "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/git/trees/e9c46e452e8d56f9962ce1ccf42ebf69605c8be1"
+    },
+    "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/git/commits/f2fffde3acca1bcf68533bf516c851d636cf743e",
+    "verification": {
+     "payload": "tree e9c46e452e8d56f9962ce1ccf42ebf69605c8be1\nparent cfa22067fe4baa9ae861abc10d97a5b358fff80a\nauthor Alexander Nikolas <Kyzcreig@users.noreply.github.com> 1790241590 +0000\ncommitter GitHub <noreply@github.com> 1790241590 +0000\n\nfeat(kanban): hermes kanban clone - reference clones against shared fleet mirrors (t_dad1edd7) (#947)\n\n* feat(kanban): `hermes kanban clone` - reference clones against shared fleet mirrors (t_dad1edd7)\n\nWorkers clone fleet repos by hand into scratch workspaces (159 clones on\n2026-09-23, 39 of hermes-home, each a full object store). The dispatcher\nnever clones, so dedupe has to live in a helper the worker calls.\n\n`hermes kanban clone <url> [dest] [-b branch]` runs\n`git clone --reference-if-able <root>/mirrors/<owner>/<repo>.git <url>`\nfor ANG-Ventures/* and Kyzcreig/* GitHub URLs. Mirrors are created lazily\n(bare, flock-serialised, tmp+rename so a half-built mirror is never\nvisible) with gc.auto=0 / gc.pruneExpire=never: a pruned mirror corrupts\nevery dependent clone. Non-fleet URLs clone normally; a mirror failure\ndegrades to a plain clone with a stderr warning. `clone` dispatches before\nkb.init_db() - it has no board state.\n\nKANBAN_GUIDANCE gains one line pointing workers at the helper (7311 chars,\ncap 8000).\n\nVerified:\n- tests/hermes_cli/test_kanban_clone.py 15 passed (real git transport via\n  url.insteadOf onto local bare repos; alternates present, count-objects\n  size 0, never-prune config written, mirror reused, non-fleet plain,\n  mirror failure degrades, CLI dispatch never touches kanban.db)\n- with test_kanban_tools, test_kanban_cli, test_prompt_builder in a\n  scrubbed env: 145 passed, 1 skipped\n- live: clone of ANG-Ventures/hermes-home via the helper -> alternates to\n  ~/.hermes/mirrors/ANG-Ventures/hermes-home.git/objects, 4.0K objects in\n  the checkout (mirror 164M), fsck --connectivity-only clean\n- ruff clean\n\n* fix(kanban clone): precious-objects mirrors, forwarded git-clone options, one deletion choke point (t_dad1edd7 r2)\n\nAddresses Argus QA r1 on #947.\n\nB1 test_workspace_deletion_has_one_choke_point: ensure_mirror no longer\ncalls shutil.rmtree. The mirror is built at a fixed staging path\n(<owner>/.<repo>.git.partial) via init --bare + config + fetch and renamed\ninto place; a failed build is resumed by the next caller instead of deleted.\n\nB3 never-prune: mirrors now get core.repositoryformatversion=1 +\nextensions.preciousObjects=true BEFORE the first fetch, so an explicit\n`git gc --prune=now` / `git prune` cannot drop objects dependents borrow.\ngc.* keys kept as defence in depth. Tests assert literal config values\n(not a loop over MIRROR_CONFIG), a behavioural gc --prune=now test with a\nprecious=False control arm that must corrupt, and the mirror root pinned\nto the fleet root under HERMES_HOME=<root>/profiles/<name>.\n\nB5b the helper forwards -q/-v, -n/--no-checkout, --single-branch,\n--no-single-branch, --no-tags, --recurse-submodules, --shallow-submodules,\n--sparse, -b, -o/--origin, --depth, --filter, --shallow-since,\n--shallow-exclude, and accepts `--` before the URL.\n\nC1 URL userinfo is stripped before it is written to the shared mirror's\nremote.origin.url. C2 inherited GIT_DIR/GIT_INDEX_FILE/... are scrubbed\nfrom every git subprocess.\n\nVerified (env -i, isolated HOME/HERMES_HOME):\n- test_kanban_clone.py + test_kanban_survivor.py: 59 passed\n- test_prompt_builder.py + test_kanban_cli.py: 77 passed, 1 skipped\n- mutants on copies, all killed: drop preciousObjects (3 fail), drop\n  gc.pruneExpire, drop formatversion=1, profile-home mirror root, no\n  userinfo strip, no option forwarding (1 fail each)\n- KANBAN_GUIDANCE 7360 < 8000; ruff clean\n\n* fix: a --filter clone ignores --reference; never forward/allow that pair (t_dad1edd7 r2)\n\nMeasured on the real hermes-home mirror + GitHub (git 2.53.0), objects in\nthe dependent clone with --reference-if-able <mirror> --no-checkout:\n  plain 1.2M | --depth 1 0.7M | --single-branch 0.8M | --filter=blob:none 170M\nA partial clone does not borrow from the alternate; it downloads every\nobject the filter keeps.\n\nkanban clone: with a mirror in use, --filter is dropped with a stderr note\n(kept when no mirror). Tests: forwarded-options test asserts 0 own objects\nand no partialclonefilter; filter kept without a mirror. 60 passed\n(test_kanban_clone + test_kanban_survivor, env -i); mutant keeping the\nfilter is killed; ruff clean.\n\n* fix(kanban clone): a killed first mirror build never poisons the mirror (t_dad1edd7 r3)\n\nQA r2 R1. r2 built each mirror in a FIXED staging repo that the next caller\nresumed. The terminal tool SIGTERMs then SIGKILLs a timed-out command. A\nkilled git fetch leaves tmp_pack_* files and ref/config locks that git never\nreuses. The next build then either promoted that residue into the precious\n(unprunable) mirror, or failed every later fetch on the stale ref lock and\ndegraded to plain clones with rc=0.\n\nNow every build runs in a fresh .<repo>.git.build-<random> staging repo. The\nnext builder, while holding the mirror flock, discards every dead staging\nrepo, including the r2 .partial name. The flock is held for the whole build\nand the kernel drops it when the builder dies, so any staging repo that\nexists under the lock is dead. A build is promoted only if it contains no\ntmp_* or *.lock files. A build that fails in-process is discarded before the\nerror is raised.\n\n_discard_dead_builds is a named, reviewed exception to kanban's\none-deletion-choke-point test. It only touches direct, non-symlink,\nrealpath-confined children named .<repo>.git.build-* or .<repo>.git.partial,\nnever a workspace.\n\nTests (all run the REAL git transport; the kill tests kill REAL helper\nsubprocesses):\n- killed_first_build_never_poisons_the_mirror: 8 terminal-tool-style kills\n  (SIGTERM to the group, SIGKILL after 1 s) spread across the build of a\n  24 MB / 1,500-branch fixture. After each kill, the next call must clone with\n  alternates, leave no residue or staging repo, and produce a mirror no larger\n  than 1.05x a clean build. At least half of the kills must land before\n  promotion (non-vacuity floor).\n- dead_build_residue_is_discarded_not_promoted: .build-* and .partial arms,\n  each with tmp_pack, tmp_idx, a ref lock and config.lock.\n- discard_only_touches_this_repos_staging: symlink out of the owner dir, and\n  symlink to the live mirror inside it.\n- K1/MX3: 6 concurrent first clones all get alternates, one mirror.\n- K1/MX4: an inherited GIT_INDEX_FILE, or GIT_DIR+GIT_WORK_TREE, leaves the\n  victim's index and config byte-identical.\n- K2: precious + pruneExpire are already set when the fetch runs.\n\nVerified:\n- clone + survivor + kanban_cli: 77 passed. ruff clean.\n- Mutants, each on its own worktree: 8/8 killed. MX3 no flock, MX4 no env\n  scrub, MX1 config after fetch, no discard on entry, no residue check, no\n  symlink guard, and the r2 source itself (born-red: 3 failed).\n- Real path, real GitHub, ANG-Ventures/hermes-home, sandbox mirrors root,\n  terminal-tool kills at 2 / 4.5 / 5 / 7 s. Each kill left a 5.9-132 MB\n  tmp_pack in its own staging repo. Each next call returned rc=0 with no\n  warning and promoted a residue-free precious mirror of 169,168-169,948K,\n  against 169,420K for a clean build. Each dependent had 4K of its own\n  objects and fsck 0.\n\n---------\n\nCo-authored-by: Kyzcreig <9063726+Kyzcreig@users.noreply.github.com>\nCo-authored-by: Apollo <apollo@angventures.io>",
+     "reason": "valid",
+     "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQBQJqtOtGCRC1aQ7uu5UhlAAATnAQAKrCLFNoz8oN9rjqPwtwkGm6\nnQqirYbLURUmAk+ddNFXIaBiMGDBXSb8SnGT8l88RVjsAYKFmup3kFQLYXc+Xl03\nvETwPvY6M16dR9OO7nT4PqTCQEFN5nARBwIxyk9uHsGKP5MwCzq0ypQ38lGLcUBf\nk3+RfOTACsk5rCO2HIPtL+bqnJdmhtxbP8ZK1sPkadxU8z3sIuGm8Av7e8EI087+\nYDRGLhfb/NovNH7fsPiqfChTeSkNiGz9HddhJNEozCdorrfF2RqoxNxPJ85n7U1N\nynVEK7k04z08vLrWrSIZ2Glgibr9+Jv0dInCd6Ccl641K7ehbc5vJQbQ/k66rmJC\nNktcffG/1b1sSnuOxo0iI1UIIypLKO5SyU7GaHxNlxk9TEZO8Cq5RYSISda3QT8x\nv+ZSLd2KUicwdEkAI/8+P7LN0LGAwujZgypBSrqQq9V55mBG2/av+Yp9t8wY++Zu\nPqNLfhLMoaffCnawPEBWRfDNjTAOTe1sXg2ICmDJT2f6/OVAY+DsME3opTYQ6eaw\nykW1zuwyXxz03VtPW20hsTqvEjTMI/c4xKNwoHX6kxVBXP6TzTdY5/5kOpMtOiNn\nfUzmxZ734BB53pj2RPqrzIhbZwf7W+TfqWUsuc6s4ycfnzIVaj4CEJ5O+UiXWi8H\nkuBBjCP4CefM3AMxGa97\n=i9To\n-----END PGP SIGNATURE-----\n",
+     "verified": true,
+     "verified_at": "2026-09-24T09:20:07Z"
+    }
+   },
+   "committer": {
+    "avatar_url": "https://avatars.githubusercontent.com/u/19864447?v=4",
+    "events_url": "https://api.github.com/users/web-flow/events{/privacy}",
+    "followers_url": "https://api.github.com/users/web-flow/followers",
+    "following_url": "https://api.github.com/users/web-flow/following{/other_user}",
+    "gists_url": "https://api.github.com/users/web-flow/gists{/gist_id}",
+    "gravatar_id": "",
+    "html_url": "https://github.com/web-flow",
+    "id": 19864447,
+    "login": "web-flow",
+    "node_id": "MDQ6VXNlcjE5ODY0NDQ3",
+    "organizations_url": "https://api.github.com/users/web-flow/orgs",
+    "received_events_url": "https://api.github.com/users/web-flow/received_events",
+    "repos_url": "https://api.github.com/users/web-flow/repos",
+    "site_admin": false,
+    "starred_url": "https://api.github.com/users/web-flow/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/web-flow/subscriptions",
+    "type": "User",
+    "url": "https://api.github.com/users/web-flow",
+    "user_view_type": "public"
+   },
+   "html_url": "https://github.com/ANG-Ventures/hermes-agent/commit/f2fffde3acca1bcf68533bf516c851d636cf743e",
+   "node_id": "C_kwDOSZnnV9oAKGYyZmZmZGUzYWNjYTFiY2Y2ODUzM2JmNTE2Yzg1MWQ2MzZjZjc0M2U",
+   "parents": [
+    {
+     "html_url": "https://github.com/ANG-Ventures/hermes-agent/commit/cfa22067fe4baa9ae861abc10d97a5b358fff80a",
+     "sha": "cfa22067fe4baa9ae861abc10d97a5b358fff80a",
+     "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/commits/cfa22067fe4baa9ae861abc10d97a5b358fff80a"
+    }
+   ],
+   "sha": "f2fffde3acca1bcf68533bf516c851d636cf743e",
+   "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/commits/f2fffde3acca1bcf68533bf516c851d636cf743e"
+  },
+  "patch_url": "https://github.com/ANG-Ventures/hermes-agent/compare/f2fffde3acca1bcf68533bf516c851d636cf743e...4956e38e1885f7d7b14e15e75120fbd9a161bbf1.patch",
+  "permalink_url": "https://github.com/ANG-Ventures/hermes-agent/compare/ANG-Ventures:f2fffde...ANG-Ventures:4956e38",
+  "status": "ahead",
+  "total_commits": 1,
+  "url": "https://api.github.com/repos/ANG-Ventures/hermes-agent/compare/f2fffde3acca1bcf68533bf516c851d636cf743e...4956e38e1885f7d7b14e15e75120fbd9a161bbf1"
+ }
+}

@@ -29,9 +29,14 @@ def batch_members(entries, commit_shas, head_sha):
     return members
 
 
-def has_success(statuses, sha):
+def has_success(combined_status):
+    """True if a combined-status response carries a success fleet/attribution.
+
+    The response belongs to the SHA named in the request URL; status objects
+    carry no sha of their own, so the association is never read from the body.
+    """
     return any(s.get("context") == CONTEXT and s.get("state") == "success"
-               and s.get("sha") == sha for s in statuses)
+               for s in combined_status["statuses"])
 
 
 def api(path, token, payload=None):
@@ -66,8 +71,8 @@ def verify(repo, base_sha, head_sha, token):
         raise ValueError("comparison truncated")
     members = batch_members(queue["nodes"], [c["sha"] for c in comparison["commits"]], head_sha)
     for number, sha in members:
-        status = api(f"repos/{repo}/commits/{sha}/status", token)
-        if not has_success(status["statuses"], sha):
+        status = api(f"repos/{repo}/commits/{sha}/status?per_page=100", token)
+        if not has_success(status):
             raise ValueError(f"PR #{number} head {sha} has no successful {CONTEXT} status")
         print(f"PR #{number} head {sha}: attributed")
     print(f"Group {head_sha}: {len(members)} attributed PR(s)")

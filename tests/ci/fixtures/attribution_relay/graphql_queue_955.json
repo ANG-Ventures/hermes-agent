@@ -1,0 +1,30 @@
+{
+ "capture": {
+  "captured_at": "2026-09-24T10:00:21Z",
+  "command": "gh api graphql -f query=query{repository(owner:\"ANG-Ventures\",name:\"hermes-agent\"){mergeQueue(branch:\"main\"){entries(first:100){pageInfo{hasNextPage} nodes{headCommit{oid} pullRequest{number headRefOid}}}}}}"
+ },
+ "response": {
+  "data": {
+   "repository": {
+    "mergeQueue": {
+     "entries": {
+      "nodes": [
+       {
+        "headCommit": {
+         "oid": "4956e38e1885f7d7b14e15e75120fbd9a161bbf1"
+        },
+        "pullRequest": {
+         "headRefOid": "a9809aa3709262449095dab7821f54b1628403d3",
+         "number": 955
+        }
+       }
+      ],
+      "pageInfo": {
+       "hasNextPage": false
+      }
+     }
+    }
+   }
+  }
+ }
+}
