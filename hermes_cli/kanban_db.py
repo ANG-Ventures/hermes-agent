@@ -403,6 +403,7 @@ def _fire_dispatch_tick_hook(
             result.reclaimed,
             result.promoted,
             result.reconciled_orphans,
+            result.ended_terminal_runs,
             result.crashed,
             result.stale,
             result.timed_out,
@@ -13387,6 +13388,10 @@ class DispatchResult:
     """Task ids requeued by :func:`reconcile_orphaned_running` this tick —
     ``running`` cards whose claim bookkeeping was broken (no valid claim,
     dead/gone worker). See the reconciliation pass for details."""
+    ended_terminal_runs: list[int] = field(default_factory=list)
+    """Run ids closed by :func:`end_orphaned_terminal_runs` this tick — runs
+    still open on a ``done``/``archived`` card (outcome
+    ``orphaned_terminal_task``)."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     spawn_routes: dict[str, str] = field(default_factory=dict)
@@ -14563,6 +14568,106 @@ def reconcile_orphaned_running(
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
         )
     return reconciled
+
+
+ORPHANED_TERMINAL_TASK_OUTCOME = "orphaned_terminal_task"
+
+
+def end_orphaned_terminal_runs(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+) -> list[int]:
+    """End ``task_runs`` rows still open on a card that is already terminal.
+
+    Every other reaper (``release_stale_claims``, ``detect_crashed_workers``,
+    ``enforce_max_runtime``, ``reconcile_orphaned_running``) selects from
+    ``tasks WHERE status = 'running'``. A run left open when its card reached
+    ``done``/``archived`` by some path that did not close it (run no longer
+    the card's ``current_run_id``, a transition that bypassed ``_end_run``,
+    manual SQL) is therefore invisible to all of them and stays ``running``
+    forever — four such rows sat on the live board for 2-3 days (card
+    t_cb91bfc4).
+
+    A row is ended when its task is ``done``/``archived`` AND either the
+    worker is provably gone (no pid, or a host-local pid that is not alive)
+    OR its last sign of life (heartbeat, else start) is older than the run's
+    ``max_runtime_seconds`` (default ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``).
+    A host-local live pid with a fresh heartbeat is left alone: that worker may
+    still be finalising after its own transition. Foreign-host pids cannot be
+    probed, so only the heartbeat arm applies to them.
+
+    Ends the row with ``status='reclaimed'``,
+    ``outcome='orphaned_terminal_task'`` and records an
+    ``orphaned_terminal_run_ended`` event. Returns the ended run ids.
+    """
+    now = int(time.time()) if now is None else int(now)
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        "SELECT r.id, r.task_id, r.worker_pid, r.claim_lock, r.started_at, "
+        "       r.last_heartbeat_at, r.max_runtime_seconds, t.status AS task_status "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.ended_at IS NULL AND t.status IN ('done', 'archived')"
+    ).fetchall()
+    ended: list[int] = []
+    for row in rows:
+        pid = row["worker_pid"]
+        host_local = str(row["claim_lock"] or "").startswith(host_prefix)
+        pid_dead = (not pid) or (host_local and not _pid_alive(int(pid)))
+        last_sign = row["last_heartbeat_at"] or row["started_at"]
+        limit = int(
+            row["max_runtime_seconds"] or DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        )
+        stale = last_sign is None or now - int(last_sign) > limit
+        if not (pid_dead or stale):
+            continue
+        run_id = int(row["id"])
+        payload = {
+            "reason": ORPHANED_TERMINAL_TASK_OUTCOME,
+            "task_status": row["task_status"],
+            "worker_pid": int(pid) if pid else None,
+            "claim_lock": row["claim_lock"],
+            "last_heartbeat_at": _opt_int_value(row["last_heartbeat_at"]),
+            "pid_dead": bool(pid_dead),
+            "heartbeat_stale": bool(stale),
+            "max_runtime_seconds": limit,
+            "now": now,
+        }
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs SET status = 'reclaimed', outcome = ?, "
+                "    error = ?, metadata = ?, ended_at = ?, "
+                "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND ended_at IS NULL",
+                (
+                    ORPHANED_TERMINAL_TASK_OUTCOME,
+                    f"run left open on a {row['task_status']} card; ended by reaper",
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                    run_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                continue
+            conn.execute(
+                "UPDATE tasks SET current_run_id = NULL "
+                "WHERE id = ? AND current_run_id = ?",
+                (row["task_id"], run_id),
+            )
+            _append_event(
+                conn, row["task_id"], "orphaned_terminal_run_ended", payload,
+                run_id=run_id,
+            )
+        ended.append(run_id)
+        _log.info(
+            "kanban reaper: ended run %s left open on %s task %s (pid=%r)",
+            run_id, row["task_status"], row["task_id"], pid,
+        )
+    return ended
+
+
+def _opt_int_value(value) -> Optional[int]:
+    return int(value) if value is not None else None
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -16988,6 +17093,9 @@ def _dispatch_once_locked(
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
+    # Runs left open on done/archived cards: every sweep above selects
+    # running cards only, so nothing else can ever close these rows.
+    result.ended_terminal_runs = end_orphaned_terminal_runs(conn)
     # Classify dead workers before TTL/staleness can erase their terminal status.
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
