@@ -1828,12 +1828,12 @@ def _holds_commit_by_stat(path, sha):
             return False
         if (gitdir / "objects" / sha[:2] / sha[2:]).is_file():
             return True
-        head = (gitdir / "HEAD").read_text().strip()
+        head = (gitdir / "HEAD").read_text(encoding="ascii").strip()
         if head.startswith("ref: "):
             name = head[5:].strip()
             if ".." in name.split("/"):
                 return False
-            head = (gitdir / name).read_text().strip()
+            head = (gitdir / name).read_text(encoding="ascii").strip()
         return head == sha
     except (OSError, ValueError):
         return False
