@@ -308,26 +308,34 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
+def _goal_mode_handoff_rejection(task, evidence: str, *, conn=None, task_id=None) -> Optional[str]:
     """Return a rejection reason when a goal-mode terminal handoff is premature."""
     if not task or not task.goal_mode or not _goal_judge_available():
         return None
-    verdict = "done"
-    reason = ""
-    try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-            last_response=evidence.strip(),
-        )
-    except Exception as judge_exc:
-        # Keep the existing fail-open semantics: an unavailable/broken
-        # auxiliary judge must not permanently wedge goal-mode work.
-        logger.warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
-            judge_exc,
-            exc_info=True,
-        )
-    return reason if verdict != "done" else None
+    from hermes_cli import kanban_db as kb
+
+    worker_run_id = _worker_run_id(task_id) if task_id else None
+    reason = "judge unavailable"
+    for _ in range(2 if worker_run_id is not None else 1):
+        try:
+            verdict, reason, parse_failed, _, transport_failed = judge_goal(
+                goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                last_response=evidence.strip(),
+                completion_handoff=True,
+            )
+        except Exception as exc:
+            verdict, reason, parse_failed, transport_failed = (
+                "continue", f"judge error: {type(exc).__name__}", False, True,
+            )
+        if not (parse_failed or transport_failed):
+            return reason if verdict != "done" else None
+    if conn is not None and task_id:
+        kb._append_event(conn, task_id, "judge_error", {"reason": reason}, run_id=worker_run_id)
+        conn.commit()
+        if worker_run_id is not None:
+            blocked = kb.block_task(conn, task_id, reason=reason, kind="transient", expected_run_id=worker_run_id)
+            return f"{reason}; task {'blocked transient after judge retry' if blocked else 'not blocked (run ownership changed)'}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +893,7 @@ def _handle_complete(args: dict, **kw) -> str:
             rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
+                conn=conn, task_id=tid,
             )
             if rejection is not None:
                 return tool_error(
@@ -1077,7 +1086,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            rejection = _goal_mode_handoff_rejection(task, summary, conn=conn, task_id=tid)
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "

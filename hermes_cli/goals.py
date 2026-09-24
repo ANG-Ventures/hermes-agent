@@ -1174,6 +1174,7 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    completion_handoff: bool = False,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1274,10 +1275,21 @@ def judge_goal(
         # Route through call_llm so auxiliary.goal_judge.* config
         # (provider/model/base_url, extra_body, reasoning_effort, retries)
         # all apply — the direct-create path dropped extra_body (#35566).
+        system_prompt = JUDGE_SYSTEM_PROMPT
+        if completion_handoff:
+            system_prompt += (
+                "\nKANBAN COMPLETION HANDOFF: This is the first attempt to complete "
+                "the task. Judge only the deliverables and verification evidence "
+                "in the proposed summary against the task criteria. Do not require "
+                "a prior kanban_complete call, a completed board state, or a "
+                "completion receipt; those cannot exist until after your verdict. "
+                "Ignore lifecycle-call requirements in the goal text when deciding "
+                "whether the substantive work is done.\n"
+            )
         resp = call_llm(
             task="goal_judge",
             messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,

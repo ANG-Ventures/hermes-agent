@@ -3685,7 +3685,7 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, conn=None, task_id=None) -> Optional[str]:
     """Apply the goal judge to every terminal worker handoff, including review."""
     if task is None or not task.goal_mode:
         return None
@@ -3700,22 +3700,28 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
 
     from hermes_cli.goals import judge_goal
 
-    verdict = "done"
-    reason = ""
-    try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-            last_response=evidence.strip(),
-        )
-    except Exception as judge_exc:
-        import logging as _logging
-
-        _logging.getLogger(__name__).warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
-            judge_exc,
-            exc_info=True,
-        )
-    return reason if verdict != "done" else None
+    worker_run_id = _worker_run_id_for(task_id) if task_id else None
+    reason = "judge unavailable"
+    for _ in range(2 if worker_run_id is not None else 1):
+        try:
+            verdict, reason, parse_failed, _, transport_failed = judge_goal(
+                goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                last_response=evidence.strip(),
+                completion_handoff=True,
+            )
+        except Exception as exc:
+            verdict, reason, parse_failed, transport_failed = (
+                "continue", f"judge error: {type(exc).__name__}", False, True,
+            )
+        if not (parse_failed or transport_failed):
+            return reason if verdict != "done" else None
+    if conn is not None and task_id:
+        kb._append_event(conn, task_id, "judge_error", {"reason": reason}, run_id=worker_run_id)
+        conn.commit()
+        if worker_run_id is not None:
+            blocked = kb.block_task(conn, task_id, reason=reason, kind="transient", expected_run_id=worker_run_id)
+            return f"{reason}; task {'blocked transient after judge retry' if blocked else 'not blocked (run ownership changed)'}"
+    return None
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -3772,6 +3778,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
+                conn=conn, task_id=tid,
             )
             if rejection is not None:
                 print(
@@ -4022,6 +4029,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         rejection = _goal_mode_handoff_rejection(
             kb.get_task(conn, tid),
             summary or "",
+            conn=conn, task_id=tid,
         )
         if rejection is not None:
             print(

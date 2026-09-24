@@ -288,6 +288,50 @@ def test_cli_goal_loop_stops_when_task_ownership_moves(monkeypatch):
 # CLI judge gate tests (hermes kanban complete bypass fix)
 # ---------------------------------------------------------------------------
 
+def test_completion_handoff_judge_does_not_require_prior_completion(monkeypatch):
+    from types import SimpleNamespace
+    from agent import auxiliary_client
+
+    prompts = []
+
+    def fake_call_llm(**kwargs):
+        system = kwargs["messages"][0]["content"]
+        prompts.append(system)
+        # A rubric that omits the lifecycle exception reproduces the circular
+        # rejection: evidence exists, but no completion receipt can exist yet.
+        done = "Do not require a prior kanban_complete call" in system
+        content = '{"verdict":"done","reason":"deliverables verified"}' if done else '{"verdict":"continue","reason":"kanban_complete not called"}'
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+    verdict, reason, *_ = goals.judge_goal(
+        goal="Print two canary phases and then call kanban_complete",
+        last_response="CANARY_PHASE1_NEW exit 0; CANARY_PHASE2_NEW exit 0",
+        completion_handoff=True,
+    )
+    assert verdict == "done", reason
+    assert len(prompts) == 1
+
+
+def test_cli_operator_completion_survives_judge_500(kanban_home, monkeypatch):
+    import argparse
+    from hermes_cli import kanban as cli
+    from agent import auxiliary_client
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Verified artifact", assignee="builder", goal_mode=True)
+        assert kb.claim_task(conn, tid)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda name: (object(), "judge"))
+    monkeypatch.setattr(goals, "judge_goal", lambda **kw: ("continue", "judge error: InternalServerError", False, None, True))
+    args = argparse.Namespace(task_ids=[tid], summary="artifact and test passed", result=None, metadata=None)
+    assert cli._cmd_complete(args) == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+        events = conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,)).fetchall()
+        assert any(e["kind"] == "judge_error" for e in events)
+
+
 class TestCLIJudgeGate:
     """hermes kanban complete must apply the same goal_mode judge gate as the
     kanban_complete tool (Issue #38367 sibling gap).
