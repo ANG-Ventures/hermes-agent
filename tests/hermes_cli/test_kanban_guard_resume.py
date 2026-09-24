@@ -88,7 +88,7 @@ def test_inline_audit_comment_does_not_shift_ready_requeue(board, monkeypatch):
     with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="inline audit", assignee="worker")
         with kb.write_txn(conn):
-            kb._insert_comment(conn, task_id, "operator", "audit note", now)
+            kb._insert_comment(conn, task_id, "worker", "x" * len("https://github.com/o/r/pull/9"), now)
         kb.add_comment(conn, task_id, "worker", "https://github.com/o/r/pull/9")
         assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
         assert kb.requeue_task(conn, task_id, actor="operator", reason="continue PR") == (True, None)
