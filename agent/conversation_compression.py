@@ -4155,7 +4155,44 @@ def compress_context(
                             engine_messages, current_tokens=approx_tokens
                         )
                     for index, event in tool_events:
-                        compressed.insert(min(index, len(compressed)), event)
+                        # The input index is not an index into the shorter
+                        # output. Anchor to the first surviving successor so
+                        # a notice cannot split parallel tool results (or
+                        # drift after the turn that originally followed it).
+                        landing = None
+                        for successor in messages[index + 1:]:
+                            if is_metadata_only_tool_notice(successor):
+                                continue
+                            for pos, candidate in enumerate(compressed):
+                                if candidate is successor or (
+                                    isinstance(candidate, dict)
+                                    and isinstance(successor, dict)
+                                    and (
+                                        (successor.get("tool_calls") and candidate.get("tool_calls") == successor["tool_calls"])
+                                        or (successor.get("role") == "tool" and candidate.get("tool_call_id") == successor.get("tool_call_id"))
+                                        or (successor.get("role") == candidate.get("role")
+                                            and successor.get("content") == candidate.get("content")
+                                            and not successor.get("tool_calls"))
+                                    )
+                                ):
+                                    landing = pos
+                                    break
+                            if landing is not None:
+                                break
+                        if landing is None:
+                            # Nothing after the event survived: keep it at
+                            # the end of the transcript, not at its stale
+                            # pre-compaction offset.
+                            landing = len(compressed)
+                        if landing < len(compressed) and compressed[landing].get("role") == "tool":
+                            # A replaced assistant can leave tool results as
+                            # the first surviving successors. Keep their run
+                            # contiguous with the assistant that issued it.
+                            while landing > 0 and compressed[landing - 1].get("role") == "tool":
+                                landing -= 1
+                            if landing > 0 and compressed[landing - 1].get("role") == "assistant" and compressed[landing - 1].get("tool_calls"):
+                                landing -= 1
+                        compressed.insert(landing, event)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.
