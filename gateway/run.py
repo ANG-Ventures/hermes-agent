@@ -15768,10 +15768,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pending: Any,
         source: Any = None,
     ) -> bool:
-        """Spool a follow-up the draining gateway cannot run; next boot replays it."""
-        text = pending if isinstance(pending, str) and pending.strip() else ""
-        if not text:
+        """Spool a follow-up the draining gateway cannot run; next boot replays it.
+
+        When ``pending_event`` exists the spooled record is that event itself
+        (original text plus every carried field: message_type, media,
+        internal, allow_gateway_control, metadata, reply/channel fields...),
+        not the derived ``pending`` string, so the boot replay is the same
+        event that was parked. An event with a field that cannot be stored
+        durably is refused and logged as lost by field name.
+        """
+        from gateway.fork_ext.restart_followups import event_fields, spool_followup
+
+        fields = None
+        if pending_event is not None:
+            fields, bad_field = event_fields(pending_event)
+            if fields is None:
+                logger.error(
+                    "PHASE=restart_followup_lost session=%s action=%s field=%s: "
+                    "the pending event cannot be stored durably; it is DROPPED",
+                    session_key or "?",
+                    self._status_action_label(),
+                    bad_field,
+                )
+                return False
             text = str(getattr(pending_event, "text", "") or "")
+        else:
+            text = pending if isinstance(pending, str) else ""
         src = getattr(pending_event, "source", None) or source
         src_dict = None
         try:
@@ -15779,16 +15801,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             src_dict = None
         path = None
-        if text.strip() and src_dict:
+        if src_dict:
             try:
-                from gateway.fork_ext.restart_followups import spool_followup
-
                 path = await asyncio.to_thread(
                     spool_followup,
                     session_key or "",
                     text,
                     src_dict,
                     reason=self._status_action_label(),
+                    event=fields,
                 )
             except Exception:
                 logger.debug("restart follow-up spool failed", exc_info=True)
@@ -15822,7 +15843,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for adapter in list((getattr(self, "adapters", None) or {}).values()):
             spooled += await self._spool_one_adapter_pending(adapter, seen)
         overflow = getattr(self, "_queued_events", None)
-        if isinstance(overflow, dict):
+        # _queued_events is a SessionFieldView (a MutableMapping, NOT a dict);
+        # a dict-only check here silently skipped every overflow tail (r5).
+        from collections.abc import Mapping as _Mapping
+
+        if isinstance(overflow, _Mapping):
             for key, events in list(overflow.items()):
                 for event in list(events or []):
                     if event is None or id(event) in seen:
@@ -15874,7 +15899,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _load_restart_followups(self) -> int:
         """Queue follow-ups spooled by the previous life into startup restore."""
         try:
-            from gateway.fork_ext.restart_followups import take_followups
+            from gateway.fork_ext.restart_followups import event_kwargs, take_followups
 
             records, stale = await asyncio.to_thread(take_followups)
         except Exception:
@@ -15883,10 +15908,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         queued = 0
         for record in records:
             try:
+                carried = record.get("event")
+                kwargs = event_kwargs(carried) if isinstance(carried, dict) else {}
+                kwargs.setdefault("message_type", MessageType.TEXT)
                 event = MessageEvent(
                     text=record["text"],
-                    message_type=MessageType.TEXT,
                     source=SessionSource.from_dict(record["source"]),
+                    **kwargs,
                 )
                 event._hermes_restart_followup_path = record["_spool_path"]
                 self._queue_startup_restore_event(event)

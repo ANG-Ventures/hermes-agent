@@ -45,6 +45,69 @@ def spool_dir(home: Optional[Path] = None) -> Path:
     return Path(home).joinpath(*_SPOOL_RELATIVE)
 
 
+# MessageEvent fields deliberately NOT carried across a restart. Everything
+# else on the dataclass is persisted by ``event_fields`` and restored by
+# ``event_kwargs``, so a replayed event keeps its identity (Argus r6: a plugin
+# injection with allow_gateway_control=False came back as a user slash
+# command; internal continuations came back user-authored; photos came back
+# as caption-only text).
+NOT_CARRIED_FIELDS = {
+    "text": "stored as the record's top-level text",
+    "source": "stored as the record's top-level source",
+    "raw_message": "platform SDK object; dies with the process",
+    "suppress_public_echo": "bound to an open platform interaction that dies with the process",
+    "deferred_reply_text": "bound to an open platform interaction that dies with the process",
+}
+
+
+def event_fields(event: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Serialise every carried MessageEvent field.
+
+    Returns ``(fields, None)`` or ``(None, field_name)`` naming the first field
+    that cannot be stored durably; the caller must then refuse to spool the
+    event (and log it) rather than replay a different event.
+    """
+    import dataclasses
+    from datetime import datetime
+
+    out: Dict[str, Any] = {}
+    for f in dataclasses.fields(event):
+        if f.name in NOT_CARRIED_FIELDS:
+            continue
+        value = getattr(event, f.name, None)
+        if f.name == "message_type":
+            value = getattr(value, "value", value)
+        elif isinstance(value, datetime):
+            value = value.isoformat()
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            return None, f.name
+        out[f.name] = value
+    return out, None
+
+
+def event_kwargs(fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Inverse of ``event_fields``: MessageEvent constructor kwargs."""
+    import dataclasses
+    from datetime import datetime
+
+    from gateway.platforms.base import MessageEvent, MessageType
+
+    known = {f.name for f in dataclasses.fields(MessageEvent)} - set(NOT_CARRIED_FIELDS)
+    kwargs: Dict[str, Any] = {}
+    for name, value in fields.items():
+        if name not in known:
+            logger.warning("restart follow-up field %r is unknown to this build; dropped", name)
+            continue
+        if name == "message_type":
+            value = MessageType(value)
+        elif name == "timestamp" and isinstance(value, str):
+            value = datetime.fromisoformat(value)
+        kwargs[name] = value
+    return kwargs
+
+
 def spool_followup(
     session_key: str,
     text: str,
@@ -53,15 +116,23 @@ def spool_followup(
     reason: str = "restart",
     home: Optional[Path] = None,
     now: Optional[float] = None,
+    event: Optional[Dict[str, Any]] = None,
 ) -> Optional[Path]:
-    """Durably record ONE follow-up. Returns the file path, or None on failure."""
-    if not session_key or not isinstance(text, str) or not text.strip():
+    """Durably record ONE follow-up. Returns the file path, or None on failure.
+
+    ``event`` is the ``event_fields`` dict of the parked MessageEvent; without
+    it the record replays as a plain user text message (version 1 shape).
+    """
+    if not session_key or not isinstance(text, str):
+        return None
+    has_media = bool(isinstance(event, dict) and event.get("media_urls"))
+    if not text.strip() and not has_media:
         return None
     if not isinstance(source, dict) or not source.get("platform") or not source.get("chat_id"):
         return None
     ts = time.time() if now is None else float(now)
     record = {
-        "version": 1,
+        "version": 2 if event is not None else 1,
         "session_key": session_key,
         "text": text,
         "source": source,
@@ -69,6 +140,8 @@ def spool_followup(
         "ts": ts,
         "pid": os.getpid(),
     }
+    if event is not None:
+        record["event"] = event
     try:
         directory = spool_dir(home)
         directory.mkdir(parents=True, exist_ok=True)
