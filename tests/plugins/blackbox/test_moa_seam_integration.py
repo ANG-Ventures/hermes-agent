@@ -239,7 +239,11 @@ moa:
         _turn_calls=[turn_call],
     )
 
-    row = store.get_turn("turn_moa_seam")
+    # The turns row is keyed by the turn_id the finalizer was given ("turn"), not by a
+    # fresh _turn_id() — that is the join fix under test in PR #955. The monkeypatch
+    # above must therefore NOT be what the row is found under.
+    assert store.get_turn("turn_moa_seam") is None
+    row = store.get_turn("turn")
     assert row is not None
     assert row["provider"] == "moa"
     assert row["model"] == "moa/default"
