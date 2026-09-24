@@ -244,6 +244,9 @@ class SessionSource:
     # Set locally by the relay transport (``ws_transport._event_from_wire``);
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
+    # Sole exception: the gateway's own restart spool carries it (with is_bot /
+    # role_authorized) in a separate MAC-bound ``admission`` block and restores
+    # it only when that MAC verifies — see gateway/fork_ext/restart_followups.py.
     delivered_via_upstream_relay: bool = False
 
     def __post_init__(self) -> None:
