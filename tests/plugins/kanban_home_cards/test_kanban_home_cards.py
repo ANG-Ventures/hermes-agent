@@ -291,6 +291,86 @@ def test_R3_multimodal_list_content_scanned(mod, home):
     assert mod.on_pre_llm_call(session_id=SID, conversation_history=hist) is None
 
 
+# ── R3 through the real gateway replay (Argus r1 F1) ────────────────────────
+# The gateway replays state.db rows through _build_gateway_agent_history. With
+# message timestamps on, every user row is rewritten and _build_replay_entry
+# drops the api_content sidecar, so the block is invisible in the replayed
+# history. R3 must still hold, because it reads the persisted rows.
+
+def _state_db(mod, sid: str, n_users: int, header_at=None):
+    from hermes_state import SessionDB
+
+    # SessionDB's own default path, the one the gateway writes to (the suite's
+    # conftest re-points it per test). Deliberately NOT the plugin's resolver,
+    # so a plugin that reads the wrong DB fails here instead of agreeing with itself.
+    db = SessionDB()
+    db.create_session(sid, "discord")
+    ts = time.time() - 3600
+    for i in range(n_users):
+        api = None
+        if header_at is not None and i == header_at:
+            api = f"u{i}\n\n[Your open cards — this session's home]\n- t_home0001 [ready] t"
+        db.append_message(sid, "user", f"u{i}", api_content=api, timestamp=ts + i)
+        db.append_message(sid, "assistant", "ok", timestamp=ts + i)
+    return db
+
+
+@pytest.mark.parametrize("inject_timestamps", [True, False])
+def test_R3_gateway_replay_restart_does_not_reinject(mod, home, inject_timestamps):
+    from gateway.run import _build_gateway_agent_history
+
+    _card(_board(home), "t_home0001", session_id=SID)
+    db = _state_db(mod, SID, 5, header_at=0)
+    stored = db.get_messages_as_conversation(SID, include_timestamp=True)
+    hist, _ = _build_gateway_agent_history(stored, inject_timestamps=inject_timestamps)
+    # Precondition: document which arm loses the sidecar.
+    assert ("api_content" in hist[0]) is (not inject_timestamps)
+    assert mod.on_pre_llm_call(session_id=SID, platform="discord",
+                               conversation_history=hist) is None
+
+
+def test_R3_persisted_window_is_K_user_rows(mod, home):
+    _card(_board(home), "t_home0001", session_id=SID)
+    _state_db(mod, SID, mod.DEDUPE_USER_ROWS + 1, header_at=0)  # 21st row back
+    assert mod.on_pre_llm_call(session_id=SID, conversation_history=[])
+
+
+def test_R3_persisted_scan_is_per_session(mod, home):
+    _card(_board(home), "t_home0001", session_id=SID)
+    _state_db(mod, FOREIGN, 3, header_at=0)  # header only in another session
+    assert mod.on_pre_llm_call(session_id=SID, conversation_history=[])
+
+
+def test_R3_persisted_scan_unreadable_db_skips_block(mod, home):
+    _card(_board(home), "t_home0001", session_id=SID)
+    from hermes_state import _default_db_path
+
+    path = Path(_default_db_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not a sqlite database" * 100)
+    assert mod.on_pre_llm_call(session_id=SID, conversation_history=[]) is None
+
+
+def test_R3_persisted_scan_missing_db_still_injects(mod, home):
+    _card(_board(home), "t_home0001", session_id=SID)
+    assert not (home / "state.db").exists()
+    assert mod.on_pre_llm_call(session_id=SID, conversation_history=[])
+
+
+def test_R3_persisted_scan_is_read_only(mod, home, monkeypatch):
+    _state_db(mod, SID, 1)
+    uris = []
+    real = mod.sqlite3.connect
+
+    def spy(database, *a, **kw):
+        uris.append(database)
+        return real(database, *a, **kw)
+
+    monkeypatch.setattr(mod.sqlite3, "connect", spy)
+    mod._persisted_recently_injected(SID, time.monotonic() + 1)
+    assert uris and all(u.endswith("?mode=ro") and "immutable" not in u for u in uris)
+
+
 # ── I6 execution-lane exclusion ─────────────────────────────────────────────
 
 @pytest.fixture

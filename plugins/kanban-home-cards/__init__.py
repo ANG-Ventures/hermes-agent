@@ -4,8 +4,10 @@ One ``pre_llm_call`` hook.  On the first turn THIS PROCESS runs for a
 ``session_id`` it returns ``{"context": <block>}`` listing the session's open
 home cards; every later turn it returns nothing.  Core appends the context to
 the current user message and persists the exact bytes in the ``api_content``
-sidecar, so the block joins the cached conversation prefix once and is
-replayed byte-for-byte afterwards.  The system prompt is never touched.
+sidecar.  Where the replay pipeline forwards that sidecar (CLI resume, gateway
+with message timestamps off) the block stays in the cached prefix; where it
+rewrites the row (gateway message timestamps on) the block is seen for one
+turn only.  The system prompt is never touched.
 
 Invariants (spec plans/2026-09-24_session-start-home-cards.md §5):
 
@@ -19,7 +21,11 @@ Invariants (spec plans/2026-09-24_session-start-home-cards.md §5):
 - I7 titles/comments are redacted and framed as data.
 - I8 read-only: ``mode=ro`` URIs + busy timeout, never ``immutable=1``.
 - R3 restart dedupe: a restarted process does not re-inject while the block
-  header is still inside the last ``DEDUPE_USER_ROWS`` user rows.
+  header is still inside the last ``DEDUPE_USER_ROWS`` user rows.  Checked
+  against the replayed history first, then against the session's persisted
+  rows in state.db (read-only, same budget): replay rewrites such as the
+  gateway's message timestamps drop the ``api_content`` sidecar, so the
+  replayed history alone cannot see an earlier block.
 """
 
 from __future__ import annotations
@@ -320,6 +326,64 @@ def _recently_injected(history: Any) -> bool:
     return False
 
 
+def _state_db_path() -> Path:
+    try:
+        from hermes_state import _default_db_path
+
+        return Path(_default_db_path())
+    except Exception:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "state.db"
+
+
+_DEDUPE_SQL = """
+SELECT api_content, content FROM messages
+ WHERE session_id = ? AND role = 'user'
+ ORDER BY id DESC LIMIT ?
+"""
+
+
+def _persisted_recently_injected(session_id: str, deadline: float) -> bool:
+    """R3 against state.db: header in the session's last K persisted user rows?
+
+    Independent of the replay pipeline, which may drop ``api_content``.
+    Read-only and bounded by ``deadline``.  A missing DB means nothing was
+    ever injected (False).  Any other failure counts as "maybe injected"
+    (True), so an unreadable transcript can never cause a duplicate block.
+    """
+    path = _state_db_path()
+    if not path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro", uri=True,
+            timeout=0, check_same_thread=False,
+        )
+    except sqlite3.Error as exc:
+        logger.info("kanban-home-cards: dedupe read failed: %s", exc)
+        return True
+    try:
+        conn.execute("PRAGMA busy_timeout = 0")
+        conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
+        while True:
+            try:
+                rows = conn.execute(_DEDUPE_SQL, (session_id, DEDUPE_USER_ROWS)).fetchall()
+                break
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and time.monotonic() + 0.02 < deadline:
+                    time.sleep(0.02)
+                    continue
+                raise
+        return any(isinstance(v, str) and HEADER_PREFIX in v for row in rows for v in row)
+    except sqlite3.Error as exc:
+        logger.info("kanban-home-cards: dedupe read failed: %s", exc)
+        return True
+    finally:
+        conn.close()
+
+
 def _first_sighting(session_id: str) -> bool:
     with _SEEN_LOCK:
         if session_id in _SEEN:
@@ -344,11 +408,17 @@ def on_pre_llm_call(
             return None
         if not _first_sighting(sid):  # I1 — marked before any DB work
             return None
-        if _recently_injected(conversation_history):  # R3
+        if _recently_injected(conversation_history):  # R3 (replayed history)
             return None
         started = time.monotonic()
+        if _persisted_recently_injected(sid, started + BUDGET_S):  # R3 (state.db)
+            return None
+        remaining = BUDGET_S - (time.monotonic() - started)
+        if remaining <= 0:
+            logger.info("kanban-home-cards: session=%s unavailable=timeout (dedupe)", sid)
+            return None
         try:
-            cards, stats = query_cards(home_ids(sid))
+            cards, stats = query_cards(home_ids(sid), budget_s=remaining)
         except _BudgetExceeded as exc:
             logger.info(
                 "kanban-home-cards: session=%s unavailable=timeout partial_cards=%d",
