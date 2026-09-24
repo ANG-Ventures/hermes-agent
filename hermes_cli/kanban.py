@@ -1678,7 +1678,7 @@ _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "claim", "complete", "block", "unblock", "archive", "assign", "reassign",
     "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
     "schedule", "requeue", "reopen", "reopen-review", "request-review",
-    "request-changes", "link", "specify", "decompose",
+    "request-changes", "link", "specify", "decompose", "workspace",
 })
 
 
@@ -4131,9 +4131,13 @@ def _cmd_workspace(args: argparse.Namespace) -> int:
         for task_id in ids:
             task = kb.get_task(conn, task_id)
             previous = task.workspace_path if task else None
-            ok, err = kb.reset_stranded_workspace(
-                conn, task_id, actor=actor, reason=args.reason, dry_run=args.dry_run,
-            )
+            try:
+                ok, err = kb.reset_stranded_workspace(
+                    conn, task_id, actor=actor, reason=args.reason, dry_run=args.dry_run,
+                )
+            except kb.ForeignSessionMutationError as exc:
+                # One foreign-home card must not abort a board-wide sweep.
+                ok, err = False, str(exc)
             if ok:
                 print(f"{verb} {task_id} (was {previous})")
             else:

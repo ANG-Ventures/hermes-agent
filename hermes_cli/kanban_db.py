@@ -12757,6 +12757,7 @@ def stranded_workspace_candidates(conn: sqlite3.Connection) -> list[str]:
     ]
 
 
+@_home_session_guarded("workspace")
 def reset_stranded_workspace(
     conn: sqlite3.Connection,
     task_id: str,
