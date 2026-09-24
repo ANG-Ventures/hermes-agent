@@ -15792,6 +15792,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return False
             text = str(getattr(pending_event, "text", "") or "")
+            # The post-turn drain may already have transcribed the voice
+            # follow-up (``pending`` = transcript). Keep that text, and drop
+            # the transcribed audio from the carried media so the replay does
+            # not transcribe it a second time. A media placeholder is NOT an
+            # override: the carried media rebuilds it on replay.
+            if (
+                isinstance(pending, str)
+                and pending.strip()
+                and pending != text
+                and pending != _build_media_placeholder(pending_event)
+            ):
+                urls = list(fields.get("media_urls") or [])
+                types = list(fields.get("media_types") or [])
+                keep = [
+                    i for i in range(len(urls))
+                    if not _event_media_is_stt_input(pending_event, i)
+                ]
+                fields["media_urls"] = [urls[i] for i in keep]
+                fields["media_types"] = [types[i] for i in keep if i < len(types)]
+                if not fields["media_urls"] and fields.get("message_type") in (
+                    MessageType.VOICE.value,
+                    MessageType.AUDIO.value,
+                ):
+                    fields["message_type"] = MessageType.TEXT.value
+                text = pending
         else:
             text = pending if isinstance(pending, str) else ""
         src = getattr(pending_event, "source", None) or source
