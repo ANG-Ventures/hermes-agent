@@ -8973,6 +8973,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
+        # t_e253d9d5: cancel_background_tasks() clears _pending_messages into
+        # a non-replayable flush file; let it spool follow-ups for boot
+        # replay first (see BasePlatformAdapter.cancel_background_tasks).
+        try:
+            adapter._shutdown_pending_sink = self._spool_one_adapter_pending
+        except Exception:
+            logger.debug("pending-sink install failed%s", suffix, exc_info=True)
         try:
             cancelled = await self._await_adapter_cleanup_with_timeout(
                 adapter.cancel_background_tasks(), timeout
@@ -15761,10 +15768,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pending: Any,
         source: Any = None,
     ) -> bool:
-        """Spool a follow-up the draining gateway cannot run; next boot replays it."""
-        text = pending if isinstance(pending, str) and pending.strip() else ""
-        if not text:
+        """Spool a follow-up the draining gateway cannot run; next boot replays it.
+
+        When ``pending_event`` exists the spooled record is that event itself
+        (original text plus every carried field: message_type, media,
+        internal, allow_gateway_control, metadata, reply/channel fields...),
+        not the derived ``pending`` string, so the boot replay is the same
+        event that was parked. An event with a field that cannot be stored
+        durably is refused and logged as lost by field name.
+        """
+        from gateway.fork_ext.restart_followups import event_fields, spool_followup
+
+        fields = None
+        if pending_event is not None:
+            fields, bad_field = event_fields(pending_event)
+            if fields is None:
+                logger.error(
+                    "PHASE=restart_followup_lost session=%s action=%s field=%s: "
+                    "the pending event cannot be stored durably; it is DROPPED",
+                    session_key or "?",
+                    self._status_action_label(),
+                    bad_field,
+                )
+                return False
             text = str(getattr(pending_event, "text", "") or "")
+            # The post-turn drain may already have transcribed the voice
+            # follow-up (``pending`` = transcript). Keep that text, and drop
+            # the transcribed audio from the carried media so the replay does
+            # not transcribe it a second time. A media placeholder is NOT an
+            # override: the carried media rebuilds it on replay.
+            if (
+                isinstance(pending, str)
+                and pending.strip()
+                and pending != text
+                and pending != _build_media_placeholder(pending_event)
+            ):
+                urls = list(fields.get("media_urls") or [])
+                types = list(fields.get("media_types") or [])
+                keep = [
+                    i for i in range(len(urls))
+                    if not _event_media_is_stt_input(pending_event, i)
+                ]
+                fields["media_urls"] = [urls[i] for i in keep]
+                fields["media_types"] = [types[i] for i in keep if i < len(types)]
+                if not fields["media_urls"] and fields.get("message_type") in (
+                    MessageType.VOICE.value,
+                    MessageType.AUDIO.value,
+                ):
+                    fields["message_type"] = MessageType.TEXT.value
+                text = pending
+        else:
+            text = pending if isinstance(pending, str) else ""
         src = getattr(pending_event, "source", None) or source
         src_dict = None
         try:
@@ -15772,16 +15826,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             src_dict = None
         path = None
-        if text.strip() and src_dict:
+        if src_dict:
             try:
-                from gateway.fork_ext.restart_followups import spool_followup
-
                 path = await asyncio.to_thread(
                     spool_followup,
                     session_key or "",
                     text,
                     src_dict,
                     reason=self._status_action_label(),
+                    event=fields,
                 )
             except Exception:
                 logger.debug("restart follow-up spool failed", exc_info=True)
@@ -15813,18 +15866,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         spooled = 0
         seen: set = set()
         for adapter in list((getattr(self, "adapters", None) or {}).values()):
-            slot = getattr(adapter, "_pending_messages", None)
-            if not isinstance(slot, dict):
-                continue
-            for key, event in list(slot.items()):
-                if event is None or id(event) in seen:
-                    continue
-                seen.add(id(event))
-                if await self._preserve_followup_across_restart(key, event, None):
-                    spooled += 1
-                    slot.pop(key, None)
+            spooled += await self._spool_one_adapter_pending(adapter, seen)
         overflow = getattr(self, "_queued_events", None)
-        if isinstance(overflow, dict):
+        # _queued_events is a SessionFieldView (a MutableMapping, NOT a dict);
+        # a dict-only check here silently skipped every overflow tail (r5).
+        from collections.abc import Mapping as _Mapping
+
+        if isinstance(overflow, _Mapping):
             for key, events in list(overflow.items()):
                 for event in list(events or []):
                     if event is None or id(event) in seen:
@@ -15834,10 +15882,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         spooled += 1
         return spooled
 
+    async def _spool_one_adapter_pending(self, adapter: Any, seen: Optional[set] = None) -> int:
+        """Spool one adapter's parked follow-ups (pending slot + debounce buffer).
+
+        Installed as the adapter's ``_shutdown_pending_sink`` by
+        ``_bounded_adapter_teardown`` so it runs inside
+        ``cancel_background_tasks()`` BEFORE that method drains the slot into
+        the non-replayable shutdown flush file.  An entry is removed only once
+        it is durably spooled; anything that fails to spool stays in the slot
+        and still reaches the #72680 flush file.
+        """
+        if seen is None:
+            seen = set()
+        spooled = 0
+        slot = getattr(adapter, "_pending_messages", None)
+        if isinstance(slot, dict):
+            for key, event in list(slot.items()):
+                if event is None or id(event) in seen:
+                    continue
+                seen.add(id(event))
+                if await self._preserve_followup_across_restart(key, event, None):
+                    spooled += 1
+                    if slot.get(key) is event:
+                        slot.pop(key, None)
+        store = getattr(adapter, "_text_debounce", None)
+        if isinstance(store, dict):
+            for key, state in list(store.items()):
+                event = getattr(state, "event", None)
+                if event is None or id(event) in seen:
+                    continue
+                seen.add(id(event))
+                if await self._preserve_followup_across_restart(key, event, None):
+                    spooled += 1
+                    if store.get(key) is state:
+                        store.pop(key, None)
+                        task = getattr(state, "task", None)
+                        if task is not None and not task.done():
+                            task.cancel()
+        return spooled
+
     async def _load_restart_followups(self) -> int:
         """Queue follow-ups spooled by the previous life into startup restore."""
         try:
-            from gateway.fork_ext.restart_followups import take_followups
+            from gateway.fork_ext.restart_followups import event_kwargs, take_followups
 
             records, stale = await asyncio.to_thread(take_followups)
         except Exception:
@@ -15846,10 +15933,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         queued = 0
         for record in records:
             try:
+                carried = record.get("event")
+                kwargs = event_kwargs(carried) if isinstance(carried, dict) else {}
+                kwargs.setdefault("message_type", MessageType.TEXT)
                 event = MessageEvent(
                     text=record["text"],
-                    message_type=MessageType.TEXT,
                     source=SessionSource.from_dict(record["source"]),
+                    **kwargs,
                 )
                 event._hermes_restart_followup_path = record["_spool_path"]
                 self._queue_startup_restore_event(event)

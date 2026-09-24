@@ -176,6 +176,56 @@ async def test_transcribed_pending_text_wins_over_raw_event_text(home):
 
 
 @pytest.mark.asyncio
+async def test_voice_transcript_wins_and_audio_is_not_carried_twice(home):
+    """Post-turn drain already transcribed the voice note: the spool keeps the
+    transcript as text, drops the transcribed audio (no second STT on replay),
+    and still carries the event's other identity fields."""
+    runner, _ = make_restart_runner()
+    runner._restart_requested = True
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=make_restart_source(chat_id="9"),
+        media_urls=["/cache/voice.ogg"],
+        media_types=["audio/ogg"],
+        internal=True,
+        metadata={"k": "v"},
+    )
+    assert await runner._preserve_followup_across_restart("k", event, "the transcript") is True
+    (record,) = [json.loads(p.read_text()) for p in rf.spool_dir(home).glob("*.json")]
+    assert record["text"] == "the transcript"
+    assert record["event"]["media_urls"] == []
+    assert record["event"]["media_types"] == []
+    assert record["event"]["message_type"] == "text"
+    assert record["event"]["internal"] is True
+    assert record["event"]["metadata"] == {"k": "v"}
+
+
+@pytest.mark.asyncio
+async def test_media_placeholder_is_not_spooled_as_text(home):
+    """A caption-less photo drains as a placeholder string; the carried media
+    rebuilds it on replay, so the spool keeps the raw (empty) text + media."""
+    from gateway.run import _build_media_placeholder
+
+    runner, _ = make_restart_runner()
+    runner._restart_requested = True
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.PHOTO,
+        source=make_restart_source(chat_id="9"),
+        media_urls=["/cache/p.jpg"],
+        media_types=["image/jpeg"],
+    )
+    placeholder = _build_media_placeholder(event)
+    assert placeholder
+    assert await runner._preserve_followup_across_restart("k", event, placeholder) is True
+    (record,) = [json.loads(p.read_text()) for p in rf.spool_dir(home).glob("*.json")]
+    assert record["text"] == ""
+    assert record["event"]["media_urls"] == ["/cache/p.jpg"]
+    assert record["event"]["message_type"] == "photo"
+
+
+@pytest.mark.asyncio
 async def test_stop_sweep_spools_follow_ups_parked_on_adapter(home):
     runner, adapter = make_restart_runner()
     runner._restart_requested = True

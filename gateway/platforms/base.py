@@ -8104,6 +8104,25 @@ class BasePlatformAdapter(ABC):
         self._background_tasks.clear()
         self._expected_cancelled_tasks.clear()
         self._session_tasks.clear()
+        # Restart replay ownership (t_e253d9d5): the runner installs a sink
+        # that spools follow-ups for replay on the next boot.  It must run
+        # HERE — after the cancelled tasks' late-arrival drains have
+        # re-queued into the slot, before the flush below clears it into a
+        # file that cannot be replayed as a turn.  Buffered debounce bursts
+        # are follow-ups too; fold them into the slot first so they are not
+        # cancelled and dropped with the debounce store below.
+        sink = getattr(self, "_shutdown_pending_sink", None)
+        if sink is not None:
+            store = self._text_debounce_store()
+            for _key in list(store.keys()):
+                try:
+                    await self._flush_text_debounce_now(_key)
+                except Exception:
+                    logger.debug("[%s] debounce fold before spool failed", self.name, exc_info=True)
+            try:
+                await sink(self)
+            except Exception:
+                logger.warning("[%s] shutdown pending-message sink failed", self.name, exc_info=True)
         # Flush pending messages to disk before clearing (#72680).
         # Off-loop: each payload ends in an unbounded os.replace, and this
         # runs while the other adapters are still draining.
