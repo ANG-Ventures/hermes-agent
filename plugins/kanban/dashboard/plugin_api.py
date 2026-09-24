@@ -1153,6 +1153,27 @@ def _set_status_direct(
     """
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
+    # Moving a card OFF running releases its claim. Prove the worker is gone
+    # FIRST, exactly like kanban_db.reclaim_task: releasing and then trying
+    # to kill (ignoring the result) let the dispatcher claim a second worker
+    # beside a survivor. A failed or unprovable termination refuses the move.
+    held = conn.execute(
+        "SELECT status, worker_pid, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if held is None:
+        return False
+    released_lock = held["claim_lock"]
+    if held["status"] == "running" and new_status != "running":
+        termination = kanban_db._terminate_reclaimed_worker(
+            held["worker_pid"], held["claim_lock"],
+        )
+        if kanban_db._worker_survived_termination(termination):
+            kanban_db._refuse_reclaim_unproven_death(
+                conn, task_id, held["claim_lock"], termination,
+                reason=f"dashboard status move to {new_status}",
+            )
+            return False
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
@@ -1161,6 +1182,12 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if prev["status"] == "running" and (
+            held["status"] != "running" or prev["claim_lock"] != released_lock
+        ):
+            # Claimed/re-claimed between the termination check and here;
+            # that owner was never checked. Refuse rather than release it.
             return False
 
         if prev["status"] == "running" and new_status == "ready":
@@ -1218,7 +1245,7 @@ def _set_status_direct(
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)",
             )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
+            # Worker already proven gone above; nothing left to terminate.
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",

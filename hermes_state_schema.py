@@ -897,6 +897,13 @@ class SessionSchemaMixin:
     cost_source TEXT,
     first_seen REAL,
     last_seen REAL,
+    -- UNKNOWN != 0 (agent/usage_pricing.py USAGE_UNKNOWN_FIELDS). Absorbing
+    -- per bucket; DEFAULT 0 so rebuilt/legacy rows read back "measured".
+    input_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    output_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+    usage_unknown INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 )"""
             )
@@ -904,13 +911,33 @@ class SessionSchemaMixin:
             # ``task`` NULL on old rows; COALESCE to '' can theoretically
             # collide with a genuine ''-task row — keep the first, drop the
             # duplicate rather than fail the heal.
+            #
+            # The UNKNOWN != 0 flag columns are copied only when the legacy
+            # table actually has them. _reconcile_columns() runs before this
+            # heal, so a table with the wrong PK may already carry them (added
+            # additively) — copying unconditionally would explode on a true
+            # pre-flag table, and NOT copying would silently reset a latched
+            # unknown back to "measured" during the rebuild.
+            legacy_cols = {
+                r[1] for r in cursor.execute(
+                    'PRAGMA table_info("session_model_usage_legacy_pk")'
+                ).fetchall()
+            }
+            flag_cols = [
+                c for c in (
+                    "input_tokens_unknown", "output_tokens_unknown",
+                    "cache_read_tokens_unknown", "cache_write_tokens_unknown",
+                    "usage_unknown",
+                ) if c in legacy_cols
+            ]
+            flag_list = ("".join(f", {c}" for c in flag_cols)) if flag_cols else ""
             cursor.execute(
-                """INSERT OR IGNORE INTO session_model_usage (
+                f"""INSERT OR IGNORE INTO session_model_usage (
                        session_id, model, billing_provider, billing_base_url,
                        billing_mode, task, api_call_count, input_tokens,
                        output_tokens, cache_read_tokens, cache_write_tokens,
                        reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                       cost_status, cost_source, first_seen, last_seen
+                       cost_status, cost_source, first_seen, last_seen{flag_list}
                    )
                    SELECT session_id, model,
                           COALESCE(billing_provider, ''),
@@ -920,7 +947,7 @@ class SessionSchemaMixin:
                           api_call_count, input_tokens,
                           output_tokens, cache_read_tokens, cache_write_tokens,
                           reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                          cost_status, cost_source, first_seen, last_seen
+                          cost_status, cost_source, first_seen, last_seen{flag_list}
                    FROM session_model_usage_legacy_pk"""
             )
             cursor.execute("DROP TABLE session_model_usage_legacy_pk")
@@ -1212,22 +1239,45 @@ class SessionSchemaMixin:
                                    cost_source TEXT,
                                    first_seen REAL,
                                    last_seen REAL,
+                                   -- UNKNOWN != 0 (agent/usage_pricing.py USAGE_UNKNOWN_FIELDS). Absorbing
+                                   -- per bucket; DEFAULT 0 so rebuilt/legacy rows read back "measured".
+                                   input_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+                                   output_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+                                   cache_read_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+                                   cache_write_tokens_unknown INTEGER NOT NULL DEFAULT 0,
+                                   usage_unknown INTEGER NOT NULL DEFAULT 0,
                                    PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
                                )"""
                         )
+                        # UNKNOWN != 0 flags: copy only when the v21 table
+                        # already carries them (the reconciler may have ADDed
+                        # them before this rebuild). Dropping them here would
+                        # silently reset a latched unknown to "measured".
+                        v21_cols = {
+                            r[1] for r in cursor.execute(
+                                'PRAGMA table_info("session_model_usage_v21")'
+                            ).fetchall()
+                        }
+                        v21_flags = "".join(
+                            f", {c}" for c in (
+                                "input_tokens_unknown", "output_tokens_unknown",
+                                "cache_read_tokens_unknown",
+                                "cache_write_tokens_unknown", "usage_unknown",
+                            ) if c in v21_cols
+                        )
                         cursor.execute(
-                            """INSERT INTO session_model_usage (
+                            f"""INSERT INTO session_model_usage (
                                    session_id, model, billing_provider, billing_base_url,
                                    billing_mode, task, api_call_count, input_tokens,
                                    output_tokens, cache_read_tokens, cache_write_tokens,
                                    reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                                   cost_status, cost_source, first_seen, last_seen
+                                   cost_status, cost_source, first_seen, last_seen{v21_flags}
                                )
                                SELECT session_id, model, billing_provider, billing_base_url,
                                       billing_mode, '', api_call_count, input_tokens,
                                       output_tokens, cache_read_tokens, cache_write_tokens,
                                       reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                                      cost_status, cost_source, first_seen, last_seen
+                                      cost_status, cost_source, first_seen, last_seen{v21_flags}
                                FROM session_model_usage_v21"""
                         )
                         cursor.execute("DROP TABLE session_model_usage_v21")

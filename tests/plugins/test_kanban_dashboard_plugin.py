@@ -428,7 +428,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         assert grandchild is not None and grandchild.status == "todo"
 
 
-def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
+def test_dashboard_reclaim_of_active_review_preserves_review_phase(client, monkeypatch):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="active review", assignee="reviewer")
         implementation = kb.claim_task(conn, task_id)
@@ -441,6 +441,18 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         )
         review = kb.claim_review_task(conn, task_id)
         assert review is not None
+        # The dashboard move must prove the reviewer gone before releasing
+        # (t_3a06ba8f): model a reviewer process that has already exited.
+        kb._set_worker_pid(conn, task_id, 999_998)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker",
+        lambda pid, lock, **_kw: {
+            "prev_pid": pid, "prev_lock": lock, "host_local": True,
+            "termination_attempted": True, "terminated": True,
+            "sigkill": False,
+        },
+    )
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{task_id}",

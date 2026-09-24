@@ -1380,6 +1380,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
+    p_gc.add_argument("--done-retention-days", type=int, default=3,
+                      help="Also remove workspaces of DONE tasks finished at least N days "
+                           "ago; same survivor/liveness/audit gates as archived "
+                           "(default: 3; negative disables)")
+    p_gc.add_argument("--dry-run", action="store_true",
+                      help="List the workspaces gc would try to remove; delete nothing")
 
     # --- repair ---
     p_repair = sub.add_parser(
@@ -3260,7 +3266,9 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         task = kb.get_task(conn, args.task_id) if ok else None
     if not ok:
         print(
-            f"cannot reclaim {args.task_id} (not running or unknown id)",
+            f"cannot reclaim {args.task_id} (not running, unknown id, or "
+            "worker not proven dead — inspect 'hermes kanban tail' for "
+            "reclaim_refused)",
             file=sys.stderr,
         )
         return 1
@@ -5425,11 +5433,38 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
     scratch_root = kb.workspaces_root()
     removed_ws = 0
+    dry_run = bool(getattr(args, "dry_run", False))
+    done_days = getattr(args, "done_retention_days", 3)
+    # DONE cards are swept too once they have been finished for done_days:
+    # completion cleanup is best-effort and refusals were never retried, so
+    # a done card's workspace otherwise lives until someone archives it.
+    # Every removal still goes through the same survivor/liveness/audit gates.
+    done_cutoff = (
+        int(time.time()) - done_days * 24 * 3600 if done_days is not None and done_days >= 0
+        else None
+    )
     with kb.connect_closing() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
+            "WHERE status = 'archived' OR (status = 'done' AND ? IS NOT NULL "
+            "AND COALESCE(completed_at, started_at, created_at) <= ?)",
+            (done_cutoff, done_cutoff),
         ).fetchall()
+    if dry_run:
+        would = []
+        for row in rows:
+            if row["workspace_kind"] not in ("scratch", "worktree"):
+                continue
+            p = row["workspace_path"] or (
+                str(scratch_root / row["id"]) if row["workspace_kind"] == "scratch" else None
+            )
+            if p and Path(p).is_dir():
+                would.append((row["id"], p))
+        for tid, p in would:
+            print(f"would-try {tid} {p}")
+        print(f"GC dry-run: {len(would)} workspace candidate(s); nothing removed "
+              "(survivor/liveness gates are evaluated only on a real run)")
+        return 0
     for row in rows:
         if row["workspace_kind"] == "worktree":
             # Backstop for worktrees that escaped the completion/archive hook

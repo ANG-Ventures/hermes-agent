@@ -3421,6 +3421,7 @@ from gateway.restart import (
     resolve_launchd_capped_drain,
     resolve_max_actionable_teardown_reserve_s,
     resolve_replace_takeover_grace_s,
+    resolve_stop_drain_deadline_s,
 )
 
 
@@ -8031,6 +8032,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _loop_liveness_watchdog: Optional[Any] = None
     _gateway_started_at: float = 0.0
     _shutdown_watchdog_done: Optional["threading.Event"] = None
+    # Deadline (seconds from the start of stop()) the shutdown watchdog was
+    # armed with, published by _stop_impl for the drain and cron-leash sites
+    # to CONSUME. None until stop() arms it (and on the PYTEST_CURRENT_TEST
+    # path, which never arms) — consumers fall back to recomputing it.
+    _armed_shutdown_deadline_s: Optional[float] = None
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
 
@@ -14850,17 +14856,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        wait_started = loop.time()
+        deadline = wait_started + timeout
         last_status_at = 0.0
+        # busy_policy=interrupt (safe-restart intent row) means "restart now".
+        # Re-read every second: the intent usually lands MID-wait (2026-09-23:
+        # wait began 03:59, deploy-lane interrupt intent 04:05, gateway then sat
+        # out the rest of the 1800 s cap until 04:29).
+        next_intent_check = 0.0
+        interrupt_capped = False
         while self._awaitable_work_count() > 0:
             now = loop.time()
+            if not interrupt_capped and now >= next_intent_check:
+                next_intent_check = now + 1.0
+                intent_cap = await self._interrupt_restart_intent_cap()
+                if intent_cap is not None:
+                    interrupt_capped = True
+                    deadline = min(deadline, now + intent_cap)
             if now >= deadline:
                 logger.warning(
                     "Restart after-turn wait timed out after %.0fs with %d "
                     "still active; proceeding to stop()/drain which may "
-                    "interrupt remaining work (#77184)",
-                    timeout,
+                    "interrupt remaining work (#77184)%s",
+                    now - wait_started,
                     self._active_work_count(),
+                    " [busy_policy=interrupt]" if interrupt_capped else "",
                 )
                 return False
             if (now - last_status_at) >= 30.0:
@@ -14892,14 +14912,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return True
 
+    async def _interrupt_restart_intent_cap(self) -> Optional[float]:
+        """After-turn cap (<=60 s) from a fresh busy_policy=interrupt intent, else None."""
+        try:
+            from gateway.fork_ext.unclean_restart_notice import (
+                interrupt_drain_cap,
+                read_interrupt_restart_intent,
+            )
+
+            row = await asyncio.to_thread(read_interrupt_restart_intent)
+            if row is None:
+                return None
+            cap = interrupt_drain_cap(row)
+        except Exception:
+            logger.debug("interrupt restart intent read failed", exc_info=True)
+            return None
+        logger.warning(
+            "PHASE=restart_interrupt_intent busy_policy=interrupt token=%s "
+            "initiator=%s origin=%s: capping after-turn wait to %.0fs "
+            "(restart_after_turn_timeout=%.0fs); still-running turns are "
+            "interrupted by the drain and marked resume_pending",
+            row.get("token") or "-",
+            row.get("initiator_profile") or "-",
+            row.get("origin_mode") or "-",
+            cap,
+            float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0),
+        )
+        return cap
+
+    @staticmethod
+    def _describe_restart_requester(depth: int = 2) -> str:
+        """``func@file:line`` of whoever called request_restart()."""
+        try:
+            frame = sys._getframe(depth)
+            return (
+                f"{frame.f_code.co_name}@"
+                f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+            )
+        except Exception:
+            return "unknown"
+
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+        requester = self._describe_restart_requester()
         if self._restart_task_started:
+            logger.info(
+                "Restart request from %s ignored: a restart is already in progress",
+                requester,
+            )
             return False
+        session_key = ""
         try:
             from gateway.session_context import get_session_env
             session_key = get_session_env("HERMES_SESSION_KEY", "")
             if session_key:
                 self._session_initiated_restart[session_key] = True
+        except Exception:
+            pass
+        self._restart_requester = requester
+        # 2026-09-23: "Restart requested with 16 active work unit(s)" had no
+        # requester on it; the forensics had to eliminate SIGTERM/FGR by
+        # absence. Name the caller on the line that starts the restart.
+        try:
+            logger.warning(
+                "PHASE=restart_requested requester=%s detached=%s via_service=%s "
+                "session=%s active_work=%d",
+                requester,
+                detached,
+                via_service,
+                session_key or "-",
+                self._active_work_count(),
+            )
         except Exception:
             pass
         self._restart_requested = True
@@ -14922,6 +15004,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._launch_detached_restart_command()
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart helper: %s", e)
+            # Written HERE (not at request time) so the row lands inside the
+            # boot notice's planned-restart window of the death it explains.
+            try:
+                from gateway.fork_ext.unclean_restart_notice import record_in_band_restart
+
+                await asyncio.to_thread(
+                    record_in_band_restart,
+                    requester,
+                    detail=f"detached={detached} via_service={via_service}",
+                )
+            except Exception:
+                logger.debug("in-band restart ledger row failed", exc_info=True)
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
 
@@ -15660,6 +15754,120 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             prepared += 1
         return prepared
 
+    async def _preserve_followup_across_restart(
+        self,
+        session_key: Optional[str],
+        pending_event: Any,
+        pending: Any,
+        source: Any = None,
+    ) -> bool:
+        """Spool a follow-up the draining gateway cannot run; next boot replays it."""
+        text = pending if isinstance(pending, str) and pending.strip() else ""
+        if not text:
+            text = str(getattr(pending_event, "text", "") or "")
+        src = getattr(pending_event, "source", None) or source
+        src_dict = None
+        try:
+            src_dict = src.to_dict() if src is not None else None
+        except Exception:
+            src_dict = None
+        path = None
+        if text.strip() and src_dict:
+            try:
+                from gateway.fork_ext.restart_followups import spool_followup
+
+                path = await asyncio.to_thread(
+                    spool_followup,
+                    session_key or "",
+                    text,
+                    src_dict,
+                    reason=self._status_action_label(),
+                )
+            except Exception:
+                logger.debug("restart follow-up spool failed", exc_info=True)
+        if path is not None:
+            logger.warning(
+                "PHASE=restart_followup_spooled session=%s action=%s chars=%d: "
+                "pending follow-up preserved; it replays on the next boot",
+                session_key or "?",
+                self._status_action_label(),
+                len(text),
+            )
+            return True
+        logger.error(
+            "PHASE=restart_followup_lost session=%s action=%s: could not spool "
+            "the pending follow-up; it is DROPPED",
+            session_key or "?",
+            self._status_action_label(),
+        )
+        return False
+
+    async def _spool_adapter_pending_for_restart(self) -> int:
+        """Spool follow-ups still parked in adapter queues when stop() tears down.
+
+        A message that arrives for a busy session during the drain is queued
+        on the adapter ("queued for the next turn after it comes back"); if
+        that session is interrupted rather than finishing, the queue dies with
+        the process. Sweep it into the restart spool first.
+        """
+        spooled = 0
+        seen: set = set()
+        for adapter in list((getattr(self, "adapters", None) or {}).values()):
+            slot = getattr(adapter, "_pending_messages", None)
+            if not isinstance(slot, dict):
+                continue
+            for key, event in list(slot.items()):
+                if event is None or id(event) in seen:
+                    continue
+                seen.add(id(event))
+                if await self._preserve_followup_across_restart(key, event, None):
+                    spooled += 1
+                    slot.pop(key, None)
+        overflow = getattr(self, "_queued_events", None)
+        if isinstance(overflow, dict):
+            for key, events in list(overflow.items()):
+                for event in list(events or []):
+                    if event is None or id(event) in seen:
+                        continue
+                    seen.add(id(event))
+                    if await self._preserve_followup_across_restart(key, event, None):
+                        spooled += 1
+        return spooled
+
+    async def _load_restart_followups(self) -> int:
+        """Queue follow-ups spooled by the previous life into startup restore."""
+        try:
+            from gateway.fork_ext.restart_followups import take_followups
+
+            records, stale = await asyncio.to_thread(take_followups)
+        except Exception:
+            logger.debug("restart follow-up spool load failed", exc_info=True)
+            return 0
+        queued = 0
+        for record in records:
+            try:
+                event = MessageEvent(
+                    text=record["text"],
+                    message_type=MessageType.TEXT,
+                    source=SessionSource.from_dict(record["source"]),
+                )
+                event._hermes_restart_followup_path = record["_spool_path"]
+                self._queue_startup_restore_event(event)
+                queued += 1
+            except Exception:
+                logger.warning(
+                    "PHASE=restart_followup_replay_failed session=%s",
+                    record.get("session_key"),
+                    exc_info=True,
+                )
+        if queued or stale:
+            logger.warning(
+                "PHASE=restart_followups_replayed queued=%d stale_skipped=%d",
+                queued,
+                stale,
+            )
+        return queued
+
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
@@ -15864,6 +16072,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 retry_delay = min(retry_delay * 2, 5.0)
                 continue
             queue.pop(0)
+            spool_path = getattr(event, "_hermes_restart_followup_path", None)
+            if spool_path:
+                from gateway.fork_ext.restart_followups import acknowledge_followup
+
+                await asyncio.to_thread(acknowledge_followup, spool_path)
             last_warning_at.pop(id(event), None)
             last_phase_warning_at.pop(id(event), None)
             logger.warning(
@@ -16935,13 +17148,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pool = getattr(self, "_startup_resume_pool", None)
             if pool is None:
                 from gateway.turn_admission import StartupResumePool
-                concurrency = getattr(self.config, "startup_resume_concurrency", 3)
-                if type(concurrency) is not int or concurrency <= 0:
+                # Default UNBOUNDED (Ace ruling 2026-09-23 09:40): every
+                # restart-interrupted session resumes at once. #827 set 3 to
+                # pace resumes onto a 10-thread executor; #936 removed that
+                # executor cap, so the pacing has nothing left to protect and
+                # only delays the sessions Ace is waiting on. A positive
+                # gateway.startup_resume_concurrency is still honoured as an
+                # explicit operator throttle.
+                concurrency = getattr(self.config, "startup_resume_concurrency", None)
+                if concurrency is not None and (type(concurrency) is not int or concurrency <= 0):
                     logger.warning(
-                        "Invalid gateway.startup_resume_concurrency value %r; using 3",
+                        "Invalid gateway.startup_resume_concurrency value %r; using unbounded",
                         concurrency,
                     )
-                    concurrency = 3
+                    concurrency = None
                 pool = self._startup_resume_pool = StartupResumePool(
                     concurrency
                 )
@@ -17661,8 +17881,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+        # Reset the queue BEFORE loading the spool: the loader claims (deletes)
+        # the spool files, so a reset after it would drop every follow-up.
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        # Follow-ups the previous life could not run (spooled while draining)
+        # enter the restore queue FIRST, ahead of anything newer.
+        try:
+            await self._load_restart_followups()
+        except Exception:
+            logger.debug("restart follow-up replay failed", exc_info=True)
         self._startup_restore_watchdog_task = asyncio.create_task(
             self._startup_restore_gate_watchdog()
         )
@@ -19911,6 +20139,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # delayed hard-exit in the worker.
             _watchdog_done = threading.Event()
             self._shutdown_watchdog_done = _watchdog_done
+            # Every watchdog event armed on this stop path. A re-arm disarms
+            # the previous thread and appends a fresh event, so the `finally`
+            # below must set ALL of them or a superseded thread keeps running
+            # to its own deadline and hard-exits a shutdown that completed.
+            _watchdog_events: list[threading.Event] = [_watchdog_done]
             _stop_started_at_box: dict[str, float] = {}
 
             def _shutdown_watchdog_snapshot() -> dict:
@@ -19925,15 +20158,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "effective_drain_timeout": effective_stop_drain_timeout(self),
                     "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
-                    "watchdog_delay_s": resolve_armed_shutdown_watchdog_delay(
-                        effective_stop_drain_timeout(self),
-                        getattr(self, "_launchd_exit_timeout_s", None),
-                        signal_driven=getattr(
-                            self, "_stop_requested_by_signal", False
-                        ),
-                        last_teardown_s=getattr(
-                            self, "_last_shutdown_teardown_s", None
-                        ),
+                    # The deadline CURRENTLY in force, read from what the
+                    # arming site published — not re-derived. A re-arm moves
+                    # it, and a forensic dump that recomputed the t=0 value
+                    # would report the superseded deadline for the very
+                    # hard-exit it is documenting.
+                    #
+                    # 🔴 FRAME: this is ABSOLUTE, measured from the start of
+                    # stop(). The dump's own top-level `delay_s`
+                    # (shutdown_watchdog._write_watchdog_dump) is RELATIVE to
+                    # the arming call. They coincide at the t=0 arming and
+                    # deliberately diverge after a re-arm (e.g. delay_s=249.1
+                    # alongside watchdog_delay_s=250.9); `phase_elapsed_s`
+                    # below is what reconciles them.
+                    "watchdog_delay_s": (
+                        getattr(self, "_armed_shutdown_deadline_s", None)
+                        if getattr(self, "_armed_shutdown_deadline_s", None)
+                        is not None
+                        else resolve_armed_shutdown_watchdog_delay(
+                            effective_stop_drain_timeout(self),
+                            getattr(self, "_launchd_exit_timeout_s", None),
+                            signal_driven=getattr(
+                                self, "_stop_requested_by_signal", False
+                            ),
+                            last_teardown_s=getattr(
+                                self, "_last_shutdown_teardown_s", None
+                            ),
+                        )
                     ),
                     "persistence_complete": False,
                     "phase_elapsed_s": (
@@ -19953,6 +20204,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     signal_driven=getattr(self, "_stop_requested_by_signal", False),
                     last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
                 )
+                # Publish the deadline the watchdog is ACTUALLY armed with so
+                # the drain and the cron leash below CONSUME it instead of
+                # re-deriving a variant. Re-derivation is the #838 defect
+                # class: the drain was fitted to `exit_timeout -
+                # hard_exit_reserve_s`, which equals the armed value only
+                # when the outer min() binds (the gui-clamped 60), and on a
+                # non-gui-clamped system-domain job the armed deadline is
+                # EARLIER — so the drain ran into the teardown window.
+                self._armed_shutdown_deadline_s = _watchdog_delay
                 arm_shutdown_watchdog(
                     _watchdog_delay,
                     done_event=_watchdog_done,
@@ -19960,15 +20220,221 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exit_code=1,
                 )
 
+            def _rearm_shutdown_watchdog(delay_s: float) -> None:
+                """Re-arm the hard-exit backstop to a LATER absolute deadline.
+
+                The watchdog is armed at the TOP of ``stop()`` from
+                ``effective_drain + max(grace, reserve)``, but that drain is
+                a RELATIVE budget that does not start until the pre-drain
+                phases finish. So the armed window silently absorbs the
+                pre-drain elapsed and the teardown reserve is what pays for
+                it — finding 4 of the #838 review, and the original 02:49
+                incident. Re-arming once the elapsed is KNOWN pushes
+                ``os._exit`` out by exactly that elapsed instead of charging
+                it to the teardown.
+
+                EXTEND-ONLY, and still bounded by the launchd SIGKILL wall
+                via ``resolve_launchd_shutdown_watchdog_delay`` inside
+                ``resolve_armed_shutdown_watchdog_delay`` — a re-arm can
+                never move the deadline earlier (which would hard-exit a
+                healthy shutdown sooner than promised) and can never push it
+                past ``exit_timeout - hard_exit_reserve_s`` (which launchd
+                would answer with SIGKILL anyway). When the wall already
+                binds there is nothing to extend and this is a no-op.
+
+                🔴 ONE exception to extend-only: a CURRENT deadline that is
+                itself past the wall is SHORTENED to the wall. That state is
+                reachable — see the ``_cur_past_wall`` comment below — and
+                extend-only was keeping a decorative ``os._exit`` armed
+                ~190s past an uncatchable SIGKILL. Shortening to the wall is
+                not "sooner than promised": launchd had already promised
+                less.
+
+                🔴 LAUNCHD-ONLY, because that bound only EXISTS there.
+                ``resolve_launchd_shutdown_watchdog_delay`` short-circuits
+                when there is no live ``ExitTimeOut`` (systemd, Docker/s6,
+                ``--external-supervisor``, foreground), so off launchd the
+                new deadline is a plainly uncapped
+                ``elapsed + drain + max(grace, reserve)`` and the re-arm
+                would push ``os._exit`` later on every SIGTERM that spends
+                >0.5s pre-drain, bounded by nothing. There is also nothing
+                to buy back there: ``resolve_stop_drain_deadline_s``
+                returns ``None`` without a launchd budget, so the drain and
+                the cron leash are never elapsed-charged in the first place
+                and finding 4's defect does not arise. Cost without
+                correctness — so the re-arm is gated to the path whose
+                invariant the docstring above actually states.
+
+                🔴 UNIT MISMATCH, handled here and nowhere else: ``delay_s``
+                and ``_armed_shutdown_deadline_s`` are ABSOLUTE, measured
+                from the start of ``stop()``, but ``arm_shutdown_watchdog``
+                takes a delay RELATIVE to the arming call
+                (``deadline = time.monotonic() + delay``). The top-of-stop()
+                arming happens at t=0, where the two coincide; a re-arm does
+                not. Handing the absolute value straight through charges the
+                pre-drain elapsed a SECOND time and schedules ``os._exit``
+                at ``elapsed + deadline`` — past launchd's SIGKILL whenever
+                the elapsed exceeds ``hard_exit_reserve_s``, which defeats
+                the backstop entirely (clamp 300 / drain 180 / teardown 70 /
+                elapsed 40: fires at 330 against a SIGKILL at 300). So the
+                absolute deadline is PUBLISHED for the drain and cron sites
+                and the REMAINING time is what gets armed.
+
+                🔴 FAIL-SAFE ORDERING. The replacement backstop is armed
+                BEFORE any shutdown state is committed and before the old
+                one is retired, and the whole body is contained: if arming
+                raises, ``stop()`` continues under the watchdog it already
+                had rather than unwinding at drain-fit — which would skip
+                drain, persist and teardown while the outer ``finally`` set
+                every event and disarmed the original too, leaving nothing
+                to ``os._exit`` before launchd's SIGKILL.
+
+                🔴 A SILENT arming failure is the reachable one, and it is
+                checked by RETURN VALUE, not by ``except``.
+                ``arm_shutdown_watchdog`` documents "Never raises" and wraps
+                its own ``Thread.start``, so the failure that actually
+                occurs — ``RuntimeError: can't start new thread`` under
+                thread/FD exhaustion, i.e. the very condition that wedges a
+                shutdown — used to walk the SUCCESS path: commit, then
+                ``_prev.set()`` retiring the live t=0 backstop in favour of a
+                thread that was never started. The process was then left with
+                no hard-exit at all. It now returns ``None`` in that case and
+                this bails out before committing anything.
+                """
+                if os.environ.get("PYTEST_CURRENT_TEST"):
+                    return
+                # No live ExitTimeOut => no wall => no cap and no benefit.
+                _budget = getattr(self, "_launchd_exit_timeout_s", None)
+                if not getattr(self, "_stop_requested_by_signal", False) or not _budget:
+                    return
+                try:
+                    _new = max(float(delay_s), 0.0)
+                except (TypeError, ValueError):
+                    return
+                _cur = getattr(self, "_armed_shutdown_deadline_s", None)
+                # Compare against the deadline already armed, measured from
+                # the same stop() start, so "later" is unambiguous.
+                #
+                # EXTEND-ONLY, with ONE exception: a deadline already PAST
+                # launchd's SIGKILL wall. `stop(restart=True)` arms with
+                # signal_driven=False, so resolve_launchd_shutdown_watchdog_
+                # delay short-circuits and publishes the RAW inner leash
+                # (drain 180 + grace 60 = 240 at clamp 60). If a supervisor
+                # SIGTERM then lands mid-stop, the re-arm's fresh value (50)
+                # is EARLIER and extend-only discarded it — leaving the real
+                # os._exit thread armed at stop()+240 against an uncatchable
+                # SIGKILL at 60. The watchdog was decorative on that path: a
+                # wedged teardown got SIGKILLed with no dump, no ledger entry
+                # and no ordered PID-file/runtime-lock release. Shortening is
+                # safe here precisely because the current deadline is one
+                # launchd will never honour, and the replacement is clamped
+                # to the wall rather than to anything the caller chose — so
+                # this can never hard-exit a healthy shutdown sooner than the
+                # supervisor would have killed it anyway.
+                _wall = resolve_max_actionable_teardown_reserve_s(_budget)
+                if _wall is None:
+                    # An unreadable budget has no actionable launchd wall;
+                    # the re-arm's launchd-only safety premise is absent.
+                    return
+                _cur_past_wall = _cur is not None and float(_cur) > _wall + 1e-9
+                if _cur_past_wall:
+                    _new = min(_new, _wall)
+                elif _cur is not None and _new <= float(_cur) + 0.5:
+                    return
+                # Absolute -> relative. Measured from the same stop() start
+                # the deadline is expressed in; if that start is unknown the
+                # elapsed is 0 and this degrades to the old behaviour rather
+                # than arming something shorter than intended.
+                _started = _stop_started_at_box.get("t")
+                _elapsed_now = (
+                    max(time.monotonic() - _started, 0.0)
+                    if _started is not None
+                    else 0.0
+                )
+                _remaining = max(_new - _elapsed_now, 0.0)
+                if _remaining <= 0.0:
+                    # The deadline has already passed; arming a zero delay is
+                    # a silent no-op in arm_shutdown_watchdog, and replacing
+                    # a live backstop with nothing is strictly worse than
+                    # leaving the current one in force.
+                    return
+                _prev = self._shutdown_watchdog_done
+                _fresh = threading.Event()
+                # Registered for cleanup BEFORE arming: if arming succeeds
+                # the outer finally must be able to retire the thread, and
+                # if it fails setting an event nothing waits on is a no-op.
+                _watchdog_events.append(_fresh)
+                try:
+                    # Arm the replacement FIRST. Nothing about the shutdown
+                    # state is committed and the old backstop is still in
+                    # force until this returns, so a failure here leaves
+                    # stop() exactly as it was.
+                    _armed_ev = arm_shutdown_watchdog(
+                        _remaining,
+                        done_event=_fresh,
+                        snapshot_fn=_shutdown_watchdog_snapshot,
+                        exit_code=1,
+                    )
+                except Exception:
+                    # Contained on purpose: propagating would unwind
+                    # _stop_impl_body at the drain fit — before drain,
+                    # persist and teardown — and the outer finally would
+                    # then set every event, disarming the ORIGINAL watchdog
+                    # too. That trades a missed deadline extension for an
+                    # unpersisted shutdown with no backstop at all.
+                    logger.warning(
+                        "Shutdown watchdog re-arm failed; continuing under "
+                        "the watchdog already armed at stop()+%.1fs",
+                        float(_cur) if _cur is not None else -1.0,
+                        exc_info=True,
+                    )
+                    return
+                if _armed_ev is None:
+                    # SILENT failure — the reachable one. The thread never
+                    # started, so committing here would retire a live
+                    # backstop for one that does not exist and advance the
+                    # published deadline to an instant nothing enforces.
+                    # Leave the t=0 watchdog in force; the drain and cron
+                    # leash keep consuming the deadline it was armed with.
+                    logger.warning(
+                        "Shutdown watchdog re-arm did not arm (thread start "
+                        "failed); continuing under the watchdog already armed "
+                        "at stop()+%.1fs",
+                        float(_cur) if _cur is not None else -1.0,
+                    )
+                    return
+                # Replacement is live — now commit, then retire the old one,
+                # so there is never an instant with no backstop at all.
+                self._shutdown_watchdog_done = _fresh
+                self._armed_shutdown_deadline_s = _new
+                if _prev is not None:
+                    _prev.set()
+                logger.info(
+                    "Shutdown watchdog re-armed to stop()+%.1fs (was "
+                    "stop()+%.1fs; %.1fs from now at elapsed %.1fs) — "
+                    "absorbing the measured pre-drain elapsed instead of "
+                    "charging it to the post-drain teardown reserve",
+                    _new,
+                    float(_cur) if _cur is not None else -1.0,
+                    _remaining,
+                    _elapsed_now,
+                )
+
             try:
                 await _stop_impl_body(
                     _kill_tool_subprocesses,
                     _stop_started_at_box,
+                    _rearm_shutdown_watchdog,
                 )
             finally:
-                _watchdog_done.set()
+                for _ev in _watchdog_events:
+                    _ev.set()
 
-        async def _stop_impl_body(_kill_tool_subprocesses, _stop_started_at_box) -> None:
+        async def _stop_impl_body(
+            _kill_tool_subprocesses,
+            _stop_started_at_box,
+            _rearm_shutdown_watchdog=None,
+        ) -> None:
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
@@ -20060,16 +20526,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the reserve. At the live geometry (clamp 60, drain 30, armed
             # 50) an 8s marking loop left a 12s window for a 15s reserve.
             # The cron branch below does the same thing for the same reason.
+            # THE ONE DEADLINE, resolved once here from the value the
+            # watchdog was ACTUALLY armed with, then consumed by BOTH the
+            # drain fit below and the cron leash further down. Two sites
+            # consuming one deadline is the whole point of #838's close-out;
+            # a site that re-derives it drifts from the instant os._exit
+            # really fires.
+            #
+            # Re-arm FIRST, with the elapsed now measured: the top-of-stop()
+            # arming could not know the pre-drain cost, so it charged it to
+            # the teardown reserve (finding 4). Extend-only and still capped
+            # by the launchd wall, so this either buys back exactly the
+            # elapsed or is a no-op. It must precede the deadline read below
+            # so the deadline reflects the watchdog now in force.
+            _drain_elapsed_at_fit = _phase_elapsed()
+            if callable(_rearm_shutdown_watchdog):
+                _rearm_shutdown_watchdog(
+                    resolve_armed_shutdown_watchdog_delay(
+                        effective_stop_drain_timeout(self),
+                        getattr(self, "_launchd_exit_timeout_s", None),
+                        signal_driven=getattr(
+                            self, "_stop_requested_by_signal", False
+                        ),
+                        last_teardown_s=getattr(
+                            self, "_last_shutdown_teardown_s", None
+                        ),
+                        elapsed_s=_drain_elapsed_at_fit,
+                    )
+                )
+            _stop_deadline_s = resolve_stop_drain_deadline_s(
+                effective_stop_drain_timeout(self),
+                getattr(self, "_launchd_exit_timeout_s", None),
+                signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+                armed_deadline_s=getattr(self, "_armed_shutdown_deadline_s", None),
+            )
             timeout = resolve_elapsed_adjusted_drain(
                 timeout,
                 getattr(self, "_launchd_exit_timeout_s", None),
                 signal_driven=getattr(self, "_stop_requested_by_signal", False),
-                elapsed_s=_phase_elapsed(),
+                elapsed_s=_drain_elapsed_at_fit,
                 # Same measured sample effective_stop_drain_timeout() fed the
                 # cap. Both derive the SAME deadline, so they must see the
                 # same teardown reserve or the drain is fitted against a
                 # window the watchdog does not actually grant.
                 last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+                # The deadline the watchdog was ACTUALLY armed with, captured
+                # at the arming site above. Not a re-derivation: `os._exit`
+                # fires at this instant, so the drain must end a teardown
+                # reserve before it.
+                armed_deadline_s=getattr(self, "_armed_shutdown_deadline_s", None),
             )
 
             _cron_at_start = self._active_cron_job_count()
@@ -20083,9 +20589,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cron_drain_cfg = getattr(
                 self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
             )
-            # Under launchd the real leash is launchd's own exit timeout, not
-            # our watchdog (drain + grace): a signal-driven stop that lets
-            # cron work push past it is SIGKILLed before cleanup runs.
+            # Under launchd the real leash is the ARMED watchdog deadline —
+            # the instant os._exit fires — minus the post-drain teardown
+            # reserve, i.e. THE ONE DEADLINE computed above. Clamping to the
+            # raw ExitTimeOut (launchd's SIGKILL wall) and holding back only
+            # CRON_DRAIN_CLEANUP_RESERVE_S was the #838 defect: it let the
+            # cron floor raise the budget back up to the hard-exit instant,
+            # silently undoing the elapsed adjustment made three statements
+            # earlier and consuming the whole teardown reserve.
             _cron_leash = resolve_shutdown_watchdog_delay(timeout)
             _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
             if getattr(self, "_stop_requested_by_signal", False) and _launchd_budget:
@@ -20094,7 +20605,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout,
                 _cron_drain_cfg,
                 watchdog_delay=_cron_leash,
-                elapsed=_phase_elapsed(),
+                elapsed=_drain_elapsed_at_fit,
+                # Consumed, not re-derived. None off the launchd signal path
+                # (or in tests that never arm), where the watchdog_delay
+                # leash above remains the honest answer.
+                deadline_s=_stop_deadline_s,
             )
             if _cron_at_start and _cron_timeout > timeout:
                 logger.info(
@@ -20425,6 +20940,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _task.cancel()
             self._background_tasks.clear()
 
+            try:
+                await self._spool_adapter_pending_for_restart()
+            except Exception:
+                logger.debug("adapter follow-up spool sweep failed", exc_info=True)
             self.adapters.clear()
             for _session_key in list(self._running_agents):
                 self._release_running_agent_state(_session_key)
@@ -37661,10 +38180,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
 
             if self._draining and (pending_event or pending):
-                logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
-                    session_key or "?",
-                    self._status_action_label(),
+                # Never silently drop it (2026-09-23: 4 follow-ups lost). The
+                # draining process may not start a new turn, so spool it for
+                # the next boot's startup-restore replay.
+                await self._preserve_followup_across_restart(
+                    session_key, pending_event, pending, source
                 )
                 pending_event = None
                 pending = None

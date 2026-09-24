@@ -158,13 +158,17 @@ def test_reclaim_records_the_preserved_status_in_board_history(conn):
     assert any("status_preserved" in (p or "") for p in payloads)
 
 
-def test_reclaim_still_returns_a_running_task_to_ready(conn):
-    """The primary reclaim contract is unchanged: running -> ready."""
-    tid = kb.create_task(conn, title="live worker", assignee="w")
+def test_reclaim_returns_proven_dead_running_task_to_ready(conn):
+    """Running -> ready still works when the worker is proven gone."""
+    tid = kb.create_task(conn, title="dead worker", assignee="w")
     kb.claim_task(conn, tid)
+    kb._set_worker_pid(conn, tid, 999999)
     assert _status(conn, tid) == "running"
 
-    assert kb.reclaim_task(conn, tid) is True
+    def absent_process(_pid, _sig):
+        raise ProcessLookupError
+
+    assert kb.reclaim_task(conn, tid, signal_fn=absent_process) is True
     assert _status(conn, tid) == "ready"
 
     spawned: list[str] = []

@@ -1011,7 +1011,9 @@ class GatewayConfig:
     # Turn slots held back for user turns so internal (hook/memory) turns can
     # never occupy the whole cap. 2 is the historical hard-coded value.
     user_turn_reserve: int = 2
-    startup_resume_concurrency: int = 3
+    # None = unbounded: every restart-interrupted session resumes at once
+    # (Ace ruling 2026-09-23). A positive int is an explicit operator throttle.
+    startup_resume_concurrency: Optional[int] = None
 
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
     # When True, the default profile's gateway serves inbound messages for every
@@ -1431,7 +1433,7 @@ class GatewayConfig:
             max_concurrent_sessions=max_concurrent_sessions,
             max_concurrent_turns=turn_limits["max_concurrent_turns"],
             user_turn_reserve=user_turn_reserve,
-            startup_resume_concurrency=turn_limits["startup_resume_concurrency"] or 3,
+            startup_resume_concurrency=turn_limits["startup_resume_concurrency"],
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,

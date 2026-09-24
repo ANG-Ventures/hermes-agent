@@ -59,15 +59,11 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
     env = os.environ.copy()
     env["TEMP"] = str(tmp_path)
     env["TMP"] = str(tmp_path)
-    # Generous hold: the assertions below must both land INSIDE it. 4s was
-    # too tight for a slow runner — the second sample slid past the hold,
-    # caught the cleared terminal state, and failed '' == 'Testing quiet
-    # update' (PR #90358 rerun, Aug 2026). 10s left no headroom once
-    # transient /progress retries entered the budget (publish wait ≤10s +
-    # stability window + retry sleeps), so: 30s, and every sampling deadline
-    # below is derived from the moment the held stage lands, keeping the
-    # whole window comfortably inside the hold.
-    env["HERMES_SELFTEST_HOLD_SECONDS"] = "30"
+    release_path = tmp_path / "release-self-test"
+    env["HERMES_SELFTEST_RELEASE_FILE"] = str(release_path)
+    # If the release-file branch is ignored, the fallback timer must expire
+    # before we can sample even one progress tick.
+    env["HERMES_SELFTEST_HOLD_SECONDS"] = "0"
 
     with output_path.open("wb") as output:
         process = subprocess.Popen(
@@ -87,7 +83,11 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
         )
 
     try:
-        deadline = time.monotonic() + 20
+        # Wait for the script's readiness event, not for PowerShell cold start
+        # to fit inside a 20s scheduling window. The CI failure had no output
+        # at all: it never reached the shim, let alone the progress assertion.
+        # This deadline is only a backstop for a genuinely stuck child.
+        deadline = time.monotonic() + 120
         shim_url = None
         while time.monotonic() < deadline:
             text = output_path.read_text(encoding="utf-8", errors="replace")
@@ -100,6 +100,7 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
             time.sleep(0.1)
 
         assert shim_url, output_path.read_text(encoding="utf-8", errors="replace")
+        assert process.poll() is None, "self-test exited before release file was written"
 
         # The URL prints BEFORE the orchestrator publishes its held stage —
         # sampling immediately races the publish and can catch the page's
@@ -108,14 +109,23 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
         # stage to actually land, THEN start the stability window.
         held_stage = "Testing quiet update"
         publish_deadline = time.monotonic() + 10
-        first = _read_progress(shim_url, publish_deadline)
+        try:
+            first = _read_progress(shim_url, publish_deadline)
+        except AssertionError as exc:
+            raise AssertionError("self-test listener closed before release file was written") from exc
         while first.get("message") != held_stage and time.monotonic() < publish_deadline:
             time.sleep(0.1)
             first = _read_progress(shim_url, publish_deadline)
         assert first["message"] == held_stage, first
 
-        time.sleep(1.5)
-        second = _read_progress(shim_url, time.monotonic() + 10)
+        # Observe an actual listener clock tick rather than sampling after a
+        # fixed sleep. The orchestrator stays held until we release it, even
+        # if either the test or listener loses the CPU between samples.
+        progress_deadline = time.monotonic() + 20
+        second = _read_progress(shim_url, progress_deadline)
+        while int(second["elapsed_seconds"]) <= int(first["elapsed_seconds"]) and time.monotonic() < progress_deadline:
+            time.sleep(0.1)
+            second = _read_progress(shim_url, progress_deadline)
 
         # The stage is whatever the orchestrator last published -- it must
         # reach the page verbatim and must not churn on its own.
@@ -127,8 +137,10 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
         # -- which is what a stalled update looks like to the user.
         assert int(second["elapsed_seconds"]) > int(first["elapsed_seconds"])
 
+        release_path.touch()
         assert process.wait(timeout=60) == 0
     finally:
+        release_path.touch()
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)

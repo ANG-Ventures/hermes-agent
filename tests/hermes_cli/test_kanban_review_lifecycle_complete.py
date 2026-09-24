@@ -310,8 +310,10 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
     assert task.current_run_id == review.current_run_id
 
 
-def test_reclaim_fails_safe_on_non_object_claim_provenance(conn) -> None:
+def test_reclaim_fails_safe_on_non_object_claim_provenance(conn, monkeypatch) -> None:
     task_id, _review = _claimed_review(conn, "Non-object claimed payload")
+    kb._set_worker_pid(conn, task_id, 999_998)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE task_events SET payload = '[]' "
@@ -332,12 +334,16 @@ def test_reclaim_fails_safe_on_non_object_claim_provenance(conn) -> None:
 def test_interrupted_review_runs_retry_in_review_phase(
     conn,
     reclaim_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task_id, review = _claimed_review(
         conn,
         f"Retry review after {reclaim_kind}",
         ttl_seconds=-1 if reclaim_kind == "expired_claim" else None,
     )
+    if reclaim_kind != "spawn_failure":
+        kb._set_worker_pid(conn, task_id, 999_998)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
 
     if reclaim_kind == "spawn_failure":
         assert not kb._record_spawn_failure(

@@ -355,7 +355,7 @@ _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
 
 
-def heartbeat_current_worker_from_env() -> bool:
+def heartbeat_current_worker_from_env(progress_at: Optional[float] = None) -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
 
@@ -400,7 +400,10 @@ def heartbeat_current_worker_from_env() -> bool:
             except (TypeError, ValueError):
                 run_id = None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_worker(
+                    conn, tid, note=None, expected_run_id=run_id,
+                    progress_at=progress_at,
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:
@@ -1294,6 +1297,13 @@ def _handle_attach(args: dict, **kw) -> str:
         data = base64.b64decode(str(content_b64), validate=True)
     except (binascii.Error, ValueError) as e:
         return tool_error(f"content_base64 is not valid base64: {e}")
+    import hashlib
+    digest = hashlib.sha256(data).hexdigest()
+    expected = args.get("expected_sha256")
+    if not isinstance(expected, str) or not expected.strip():
+        return tool_error("expected_sha256 is required")
+    if expected.lower() != digest:
+        return tool_error("expected_sha256 does not match decoded attachment bytes")
     content_type = args.get("content_type")
     board = args.get("board")
     try:
@@ -1308,7 +1318,7 @@ def _handle_attach(args: dict, **kw) -> str:
                 uploaded_by="agent",
                 board=board,
             )
-            return _ok(task_id=tid, attachment_id=att_id, size=len(data))
+            return _ok(task_id=tid, attachment_id=att_id, size=len(data), sha256=digest)
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:
@@ -2334,7 +2344,8 @@ KANBAN_ATTACH_SCHEMA = {
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
         "the task's attachments dir, capped at 25 MB. Prefer "
-        "kanban_attach_url when you only have a URL."
+        "kanban_attach_url when you only have a URL. Returns the verified "
+        "stored SHA-256; expected_sha256 is required to reject upstream payload changes."
     ),
     "parameters": {
         "type": "object",
@@ -2354,13 +2365,20 @@ KANBAN_ATTACH_SCHEMA = {
                 "type": "string",
                 "description": "The file contents, base64-encoded. Max 25 MB decoded.",
             },
+            "expected_sha256": {
+                "type": "string",
+                "description": (
+                    "SHA-256 hex digest of the original file bytes, computed before encoding. "
+                    "Rejects a payload altered before it reaches storage."
+                ),
+            },
             "content_type": {
                 "type": "string",
                 "description": "Optional MIME type (e.g. 'application/pdf').",
             },
             "board": _board_schema_prop(),
         },
-        "required": ["filename", "content_base64"],
+        "required": ["filename", "content_base64", "expected_sha256"],
     },
 }
 

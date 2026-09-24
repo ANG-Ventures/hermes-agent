@@ -1258,6 +1258,87 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("payload", [
+    pytest.param(b"column     aligned       value\n" * 350, id="spaces"),
+    pytest.param(bytes(range(256)) * 32, id="binary"),
+])
+def test_attach_returns_verified_stored_digest(worker_env, payload):
+    import base64
+    import hashlib
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    digest = hashlib.sha256(payload).hexdigest()
+    result = json.loads(kt._handle_attach({
+        "task_id": worker_env, "filename": "artifact.bin",
+        "content_base64": base64.b64encode(payload).decode("ascii"),
+        "expected_sha256": digest,
+    }))
+    assert result.get("ok") is True, result
+    assert result["sha256"] == digest
+    conn = kb.connect()
+    try:
+        attachment = kb.get_attachment(conn, result["attachment_id"])
+        assert attachment is not None
+        assert hashlib.sha256(Path(attachment.stored_path).read_bytes()).hexdigest() == digest
+    finally:
+        conn.close()
+
+
+def test_attach_rejects_digest_mismatch_without_storing(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_attach({
+        "task_id": worker_env, "filename": "artifact.bin", "content_base64": "YWJj",
+        "expected_sha256": "0" * 64,
+    }))
+    assert result.get("ok") is not True, result
+    assert "sha256" in result["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_requires_source_digest(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_attach({
+        "task_id": worker_env, "filename": "artifact.bin", "content_base64": "YWJj",
+    }))
+    assert "expected_sha256" in out["error"]
+
+
+def test_attach_rejects_corrupt_disk_write_without_row(worker_env, monkeypatch):
+    import base64
+    import hashlib
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original_write = Path.write_bytes
+    def corrupt_write(path, data):
+        return original_write(path, data.replace(b"     ", b" "))
+
+    monkeypatch.setattr(Path, "write_bytes", corrupt_write)
+    payload = b"column     aligned\n" * 400
+    out = json.loads(kt._handle_attach({
+        "task_id": worker_env, "filename": "artifact.txt",
+        "content_base64": base64.b64encode(payload).decode("ascii"),
+        "expected_sha256": hashlib.sha256(payload).hexdigest(),
+    }))
+    assert "write verification failed" in out["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+        assert list(kb.task_attachments_dir(worker_env).glob("*")) == []
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def allow_private_urls(monkeypatch):
     """Opt the SSRF guard into private/loopback targets for local fixtures.

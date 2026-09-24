@@ -36,8 +36,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -298,6 +300,133 @@ def _restart_ledger_path(home: Optional[Path] = None) -> Path:
     return base.joinpath(*_RESTART_LEDGER_RELATIVE)
 
 
+# ``in_band`` is written by the gateway ITSELF right before an in-band restart
+# enters ``stop()`` (SIGUSR1 / ``/restart`` / deferred arm). Incident 2026-09-23
+# 04:31: the in-band requester wrote no row, so the boot notice read
+# ``planned=False by=-`` for a restart the gateway had asked for itself.
+PLANNED_RESTART_EVENTS = ("kickstart", "intent", "in_band")
+
+# busy_policy=interrupt means "restart now". The gateway honours it by capping
+# its after-turn wait to at most this many seconds after it first SEES the
+# intent row, instead of sitting out ``restart_after_turn_timeout`` (1800 s).
+INTERRUPT_DRAIN_CAP_MAX_S = 60.0
+# An intent row older than this is a previous bounce, never the current one.
+INTERRUPT_INTENT_MAX_AGE_S = 3600.0
+
+
+def _current_profile(home: Optional[Path] = None) -> str:
+    # hermes --profile sets HERMES_HOME, not HERMES_PROFILE. The ledger is
+    # written into that profile's home; derive identity from the same root.
+    base = Path(home) if home is not None else _process_home()
+    if base.parent.name == "profiles":
+        return base.name
+    return (os.environ.get("HERMES_PROFILE") or "").strip() or "default"
+
+
+def _read_ledger_tail(home: Optional[Path] = None) -> Optional[str]:
+    path = _restart_ledger_path(home)
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > _LEDGER_TAIL_BYTES:
+                fh.seek(size - _LEDGER_TAIL_BYTES)
+                fh.readline()  # drop the partial first line
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def read_interrupt_restart_intent(
+    pid: Optional[int] = None,
+    *,
+    now: Optional[float] = None,
+    home: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """The newest fresh ``busy_policy=interrupt`` intent aimed at THIS process.
+
+    safe-restart.py writes an ``intent`` row into the target's ledger before it
+    spawns the watcher, carrying ``busy_policy`` and ``pid_before`` (the
+    target's pid). Incident 2026-09-23: the deploy lane ran with
+    ``--busy-policy interrupt`` at 04:05 while the gateway was already 6 min
+    into an 1800 s after-turn wait; nothing in the gateway read the policy, so
+    it waited until 04:29 and the watcher paged a false quiesce timeout.
+
+    Matching is deliberately strict (event, policy, profile, pid, freshness): a
+    stale row or one aimed at a previous pid must never cut a live wait short.
+    Fail-closed to ``None`` on any read/parse problem (= old behaviour).
+    """
+    pid = os.getpid() if pid is None else int(pid)
+    current = time.time() if now is None else float(now)
+    tail = _read_ledger_tail(home)
+    if not tail:
+        return None
+    profile = _current_profile(home)
+    for line in reversed(tail.splitlines()):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("event") != "intent" or row.get("busy_policy") != "interrupt":
+            continue
+        if (row.get("target_profile") or "default") != profile:
+            continue
+        try:
+            if int(row.get("pid_before")) != pid:
+                continue
+            age = current - float(row.get("epoch"))
+        except (TypeError, ValueError):
+            continue
+        if -60.0 <= age <= INTERRUPT_INTENT_MAX_AGE_S:
+            return row
+    return None
+
+
+def interrupt_drain_cap(row: Optional[Dict[str, Any]]) -> float:
+    """Seconds of after-turn grace an interrupt intent allows (0..60)."""
+    cap = INTERRUPT_DRAIN_CAP_MAX_S
+    try:
+        raw = float((row or {}).get("drain_cap_s"))
+        if math.isfinite(raw) and raw >= 0:
+            cap = raw
+    except (TypeError, ValueError):
+        pass
+    return min(cap, INTERRUPT_DRAIN_CAP_MAX_S)
+
+
+def record_in_band_restart(
+    requester: str,
+    *,
+    detail: str = "",
+    home: Optional[Path] = None,
+) -> bool:
+    """Append an ``in_band`` row so the next boot reads the restart as planned."""
+    try:
+        from datetime import datetime as _dt
+
+        rec = {
+            "ts": _dt.now().isoformat(timespec="seconds"),
+            "epoch": round(time.time(), 3),
+            "event": "in_band",
+            "token": "",
+            "target_profile": _current_profile(home),
+            "initiator_profile": f"self:{requester or 'unknown'}",
+            "origin_mode": "in_band",
+            "pid_before": os.getpid(),
+        }
+        if detail:
+            rec["detail"] = str(detail)[:500]
+        path = _restart_ledger_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        return True
+    except Exception:
+        logger.debug("in-band restart ledger row failed", exc_info=True)
+        return False
+
+
 def read_planned_restart(
     ended_at: Optional[str], home: Optional[Path] = None
 ) -> Optional[Dict[str, Any]]:
@@ -326,17 +455,10 @@ def read_planned_restart(
         ended_epoch = ended.timestamp()
     except (ValueError, OverflowError):
         return None
-    path = _restart_ledger_path(home)
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as fh:
-            if size > _LEDGER_TAIL_BYTES:
-                fh.seek(size - _LEDGER_TAIL_BYTES)
-                fh.readline()  # drop the partial first line
-            tail = fh.read().decode("utf-8", errors="replace")
-    except OSError:
+    tail = _read_ledger_tail(home)
+    if tail is None:
         return None
-    profile = (os.environ.get("HERMES_PROFILE") or "").strip() or "default"
+    profile = _current_profile(home)
     best: Optional[Dict[str, Any]] = None
     for line in tail.splitlines():
         try:
@@ -345,7 +467,7 @@ def read_planned_restart(
             continue
         if not isinstance(row, dict):
             continue
-        if row.get("event") not in ("kickstart", "intent"):
+        if row.get("event") not in PLANNED_RESTART_EVENTS:
             continue
         if (row.get("target_profile") or "default") != profile:
             continue
