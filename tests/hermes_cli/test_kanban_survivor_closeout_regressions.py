@@ -18,13 +18,23 @@ HOME_MERGE = "fd791c40dcfb2b58e08f0805bc512974cfedab19"
 HOMELAB = "https://github.com/Kyzcreig/ace-media-homelab.git"
 HOMELAB_MERGE = "deb2603bee7f566b44f13db4c411d612a88835a9"
 
+# These fixtures are the REAL merged PRs from the incident (card t_6d221fe6):
+# private GitHub repos, so they need the operator's git/gh credentials. CI has
+# none ("could not read Username"), so they carry the repo's standard
+# ``integration`` marker (deselected by addopts). Run locally with
+# ``-m integration``. The cwd/env contract they exercise is ALSO gated
+# hermetically below (``test_query_*``) against a local bare repo.
+LIVE_REMOTE = pytest.mark.integration
 
+
+@LIVE_REMOTE
 def test_merged_pr_landed_tree_binds_named_card_without_unbound():
     result = survivor._verified_explicit("t_3684ae00", None, "ANG-Ventures/hermes-home#457")
     assert result[None]["sha"] == HOME_MERGE
     assert result[None]["corroborated_by"] == "landed-tree"
 
 
+@LIVE_REMOTE
 def test_merged_pr_without_card_id_still_requires_unbound():
     with pytest.raises(survivor.SurvivorUnavailable, match="does not name"):
         survivor._verified_explicit("t_fc150853", None, "Kyzcreig/ace-media-homelab#195")
@@ -33,6 +43,7 @@ def test_merged_pr_without_card_id_still_requires_unbound():
     assert result[None]["sha"] == HOMELAB_MERGE
 
 
+@LIVE_REMOTE
 def test_merged_pr_tree_mismatch_remains_weak(monkeypatch):
     monkeypatch.setattr(ext, "_merged_tree_matches", lambda *a: False)
     with pytest.raises(survivor.SurvivorUnavailable, match="mention"):
@@ -47,18 +58,21 @@ def board(tmp_path, monkeypatch):
         yield conn
 
 
+@LIVE_REMOTE
 def test_real_merged_sha_reachable_from_default_branch():
     result = ext.verify_ref(f"{HOME}#{HOME_MERGE}")
     assert result["sha"] == HOME_MERGE
     assert result["branch"] == "refs/heads/main"
 
 
+@LIVE_REMOTE
 def test_real_merged_sha_reachable_from_clone_url_without_dot_git():
     result = ext.verify_ref(f"{HOME.removesuffix('.git')}#{HOME_MERGE}")
     assert result["sha"] == HOME_MERGE
     assert result["branch"] == "refs/heads/main"
 
 
+@LIVE_REMOTE
 def test_real_merged_sha_on_master_tip():
     result = ext.verify_ref(f"{HOMELAB}#{HOMELAB_MERGE}")
     assert result["sha"] == HOMELAB_MERGE
@@ -85,6 +99,7 @@ def test_capture_failure_names_step_and_error(board, monkeypatch):
         kb.complete_task(board, tid, metadata={"changed_files": ["code.py"]})
 
 
+@LIVE_REMOTE
 def test_explicit_verified_pr_does_not_drop_foreign_untracked_file(board):
     tid = kb.create_task(board, title="PR closure")
     ws = kb.resolve_workspace(kb.get_task(board, tid))
@@ -145,6 +160,7 @@ def test_survivor_none_cannot_reauthorize_workspace_removal(board):
     assert (ws / "host-patch.py").exists()
 
 
+@LIVE_REMOTE
 def test_oversize_foreign_checkout_does_not_discard_unpublished_bytes(board, monkeypatch):
     tid = kb.create_task(board, title="explicit PR and oversized checkout")
     ws = kb.resolve_workspace(kb.get_task(board, tid))
@@ -198,27 +214,32 @@ def tripwire_cwd(tmp_path, monkeypatch):
     return root / "t_cwdprobe"
 
 
+@LIVE_REMOTE
 def test_ref_verifies_from_tripwire_cwd(tripwire_cwd):
     """Argus r1 F1: ls-remote from an inherited scratch cwd exited 128."""
     result = ext.verify_ref(f"{HOMELAB}#{HOMELAB_MERGE}")
     assert result["sha"] == HOMELAB_MERGE
 
 
+@LIVE_REMOTE
 def test_merged_sha_ancestry_verifies_from_tripwire_cwd(tripwire_cwd):
     result = ext.verify_ref(f"{HOME}#{HOME_MERGE}")
     assert result["branch"] == "refs/heads/main"
 
 
+@LIVE_REMOTE
 def test_landed_tree_binds_from_tripwire_cwd(tripwire_cwd):
     result = survivor._verified_explicit("t_3684ae00", None, "ANG-Ventures/hermes-home#457")
     assert result[None]["corroborated_by"] == "landed-tree"
 
 
+@LIVE_REMOTE
 def test_inherited_git_dir_does_not_redirect_remote_probe(monkeypatch, tmp_path):
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "not-a-repo"))
     assert ext.verify_ref(f"{HOMELAB}#{HOMELAB_MERGE}")["sha"] == HOMELAB_MERGE
 
 
+@LIVE_REMOTE
 def test_unreachable_sha_names_default_branch_and_compare_status():
     """Argus r1 F4: the squashed PR head is known to GitHub but not on main."""
     with pytest.raises(survivor.SurvivorUnavailable) as exc:
@@ -376,3 +397,34 @@ def test_explicit_claim_persists_beside_captured_delta(board, monkeypatch, publi
     assert saved["claims"][0]["sha"] == HOMELAB_MERGE
     assert saved["notice"] != "NOT PUSHED"
     assert Path(saved["path"]).is_file()
+
+
+@pytest.fixture
+def bare_remote(tmp_path):
+    src = tmp_path / "src"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True, stdin=subprocess.DEVNULL)
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t")
+    subprocess.run(["git", "-C", str(src), "commit", "-q", "--allow-empty", "-m", "c"], check=True,
+                   stdin=subprocess.DEVNULL, env=env)
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(src), str(bare)], check=True,
+                   stdin=subprocess.DEVNULL)
+    sha = subprocess.run(["git", "-C", str(bare), "rev-parse", "HEAD"], check=True, capture_output=True,
+                         stdin=subprocess.DEVNULL).stdout.decode().strip()
+    return f"file://{bare}", sha
+
+
+def test_query_answers_from_tripwire_cwd(tripwire_cwd, bare_remote):
+    """Hermetic Argus r1 F1: the remote choke point must not inherit the tripwire cwd."""
+    url, sha = bare_remote
+    inherited = subprocess.run(["git", "ls-remote", "--heads", "--", url], capture_output=True,
+                               stdin=subprocess.DEVNULL)
+    assert inherited.returncode == 128, "without an explicit cwd the probe must reproduce F1"
+    assert f"{sha}\trefs/heads/main" in ext._query(["git", "ls-remote", "--heads", "--", url])
+
+
+def test_query_ignores_inherited_git_dir(monkeypatch, tmp_path, bare_remote):
+    url, sha = bare_remote
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "not-a-repo"))
+    assert sha in ext._query(["git", "ls-remote", "--heads", "--", url])
