@@ -79,6 +79,7 @@ from agent.fork_ext.compaction_ext import (
     _inturn_stats_render_eligible,
 )
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
+from agent.confab_notice import is_metadata_only_tool_notice
 from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
@@ -4062,6 +4063,13 @@ def compress_context(
                 )
 
         messages_before_compression = copy.deepcopy(messages)
+        # Presentation-only tool events are not conversation content. In
+        # particular, an event at index 0 must not become the system-prompt
+        # anchor to which a compressor appends its compaction note.
+        tool_events = [(i, copy.deepcopy(msg)) for i, msg in enumerate(messages)
+                       if is_metadata_only_tool_notice(msg)]
+        engine_messages = ([msg for msg in messages if not is_metadata_only_tool_notice(msg)]
+                           if tool_events else messages)
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
@@ -4122,7 +4130,7 @@ def compress_context(
                     cancel_event=_hard_cancel_event
                 ):
                     try:
-                        compressed = compress_fn(messages, **compress_kwargs)
+                        compressed = compress_fn(engine_messages, **compress_kwargs)
                     except TypeError:
                         # Strict-signature context engine (or a wrapper/mock whose
                         # signature inspection could not predict the rejection) that
@@ -4144,8 +4152,10 @@ def compress_context(
                         if _compression_kwargs_are_signature_proven(compress_fn):
                             raise
                         compressed = compress_fn(
-                            messages, current_tokens=approx_tokens
+                            engine_messages, current_tokens=approx_tokens
                         )
+                    for index, event in tool_events:
+                        compressed.insert(min(index, len(compressed)), event)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.

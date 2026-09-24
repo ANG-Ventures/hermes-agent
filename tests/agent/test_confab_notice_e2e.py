@@ -25,6 +25,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -32,6 +33,7 @@ from agent.confab_notice import (
     CONFAB_NOTICE_DISPLAY_KIND,
     CONFAB_NOTICE_FIELD,
     CONFAB_NOTICE_KEY,
+    is_metadata_only_tool_notice,
 )
 from hermes_state import SessionDB
 
@@ -239,6 +241,72 @@ class TestConfabNoticeEndToEnd:
         assert all("display_kind" not in m and "display_metadata" not in m for m in summary_messages)
         assert notice["request_id"] not in json.dumps(summary_messages)
 
+    def test_contentful_tagged_system_reaches_iteration_summary(self, notice_env, stream):
+        make_agent, handler, db, sid, statuses = notice_env
+        sentinel = "CONTENTFUL-TAGGED-SYSTEM-SUMMARY"
+        history = [{"role": "system", "content": sentinel,
+                    "display_kind": CONFAB_NOTICE_DISPLAY_KIND,
+                    "display_metadata": {CONFAB_NOTICE_KEY: {**VALID_NOTICE, "kind": "tool_call_as_text"}}}]
+        handler.response_queue.extend([("Trying.", None, "tool_calls"), ("Summary.", None)])
+        agent = make_agent(stream=stream)
+        agent.max_iterations = 1
+        agent.run_conversation("again", conversation_history=history, task_id="summary-content")
+        assert sentinel in json.dumps(_chat_requests(handler)[-1]["messages"])
+
+    @pytest.mark.parametrize("engine", ["builtin", "lcm"])
+    @pytest.mark.parametrize("index", [0, 1])
+    def test_compaction_keeps_tool_event_ephemeral(self, notice_env, stream, engine, index, tmp_path):
+        from agent.transports.anthropic import AnthropicTransport
+
+        make_agent, handler, db, sid, statuses = notice_env
+        handler.response_queue.extend([
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
+        ])
+        assert make_agent(stream=stream).run_conversation(
+            "first", conversation_history=[], task_id="writer"
+        )["final_response"] == "First."
+        event = next(m for m in db.get_messages_as_conversation(sid)
+                     if is_metadata_only_tool_notice(m))
+        handler.captured_requests = []
+        turns = [{"role": "user" if i % 2 == 0 else "assistant",
+                  "content": f"turn {i} " + " ".join(f"w{i}x{j}" for j in range(900))}
+                 for i in range(40)]
+        history = turns.copy()
+        history.insert(index, event)
+        agent = make_agent(stream=stream)
+        agent.ephemeral_system_prompt = "REAL-PROMPT-ANCHOR"
+        agent.compression_enabled = True
+        if engine == "lcm":
+            from plugins.context_engine.lcm.config import LCMConfig
+            from plugins.context_engine.lcm.engine import LCMEngine
+            config = LCMConfig(database_path=str(tmp_path / "lcm.db"), fresh_tail_count=1,
+                               leaf_chunk_tokens=1, context_threshold=0.01)
+            cc = LCMEngine(config=config, hermes_home=str(tmp_path))
+            cc.update_model("test-model", 200_000, provider="unit-test")
+            cc.on_session_start(sid, hermes_home=str(tmp_path), model="test-model",
+                                provider="unit-test", context_length=200_000, platform="pytest")
+            agent.context_compressor = cc
+        else:
+            cc = agent.context_compressor
+            cc.threshold_tokens = 2000
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = "compacted summary"
+        resp.usage = None
+        handler.response_queue.append(("Done.", None))
+        with patch("agent.auxiliary_client.call_llm", return_value=resp):
+            result = agent.run_conversation("next", conversation_history=history, task_id="compact")
+        assert len(result["messages"]) < len(history), "compaction did not shorten history"
+        wire = _chat_requests(handler)[-1]["messages"]
+        assert sum(m.get("role") == "system" for m in wire) == 1
+        assert "REAL-PROMPT-ANCHOR" in json.dumps(AnthropicTransport().build_kwargs(
+            model="claude-opus-4-6", messages=wire, tools=None, max_tokens=1024,
+            reasoning_config=None).get("system"))
+        assert any(is_metadata_only_tool_notice(m) for m in result["messages"])
+        persisted = [r for session in {sid, agent.session_id}
+                     for r in db.get_messages(session) if r.get("display_kind") == CONFAB_NOTICE_DISPLAY_KIND]
+        assert persisted and all(is_metadata_only_tool_notice(r) for r in persisted)
+
     def test_same_request_id_retry_has_one_durable_event(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env
         notice = {**VALID_NOTICE, "kind": "tool_call_as_text", "request_id": "same-rid"}
@@ -257,6 +325,7 @@ class TestConfabNoticeEndToEnd:
         assert len(_chat_requests(handler)) == 1
         assert result["final_response"] == guard
         assert len(_confab_statuses(statuses)) == 1
+        assert [r["content"] for r in db.get_messages(sid) if r["role"] == "assistant"] == [guard]
 
     @pytest.mark.parametrize("kind", ["tool_call_unparseable", "tool_call_as_text"])
     @pytest.mark.parametrize("prose", ["", "Work is incomplete."])
@@ -281,6 +350,7 @@ class TestConfabNoticeEndToEnd:
             metadata = json.loads(metadata)
         assert metadata[CONFAB_NOTICE_KEY] == notice
         assert not _confab_statuses(statuses)
+        assert [r["content"] for r in db.get_messages(sid) if r["role"] == "assistant"] == ["Recovered model answer."]
 
         history = db.get_messages_as_conversation(sid)
         handler.captured_requests = []
@@ -293,6 +363,7 @@ class TestConfabNoticeEndToEnd:
         assert "display_metadata" not in blob
         assert notice["grammar"] not in blob
         assert correction not in blob
+        assert "Recovered model answer." in blob
 
     @pytest.mark.parametrize("kind", ["tool_call_unparseable", "tool_call_as_text"])
     def test_tool_notice_recovery_exhausts_shared_budget(self, notice_env, stream, kind):
@@ -308,6 +379,7 @@ class TestConfabNoticeEndToEnd:
         assert not getattr(agent, "_empty_content_retries", 0)
         assert not any(m.get("_dropped_toolcall_nudge") for m in result["messages"])
         assert len([r for r in db.get_messages(sid) if r["display_kind"] == CONFAB_NOTICE_DISPLAY_KIND]) == 4
+        assert not [r for r in db.get_messages(sid) if r["role"] == "assistant"]
 
     def test_tool_notice_and_dropped_call_share_budget(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env
@@ -323,6 +395,7 @@ class TestConfabNoticeEndToEnd:
         assert result["failed"] is True
         assert not getattr(agent, "_empty_content_retries", 0)
         assert not any(m.get("_dropped_toolcall_nudge") for m in result["messages"])
+        assert not [r for r in db.get_messages(sid) if r["role"] == "assistant"]
 
     def test_status_shown_once_and_row_persisted(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env
