@@ -10490,7 +10490,7 @@ def configured_review_assignee() -> Optional[str]:
 
 DEFAULT_MAX_REVIEW_ROUNDS = 3
 MILESTONE_MARKER = "[milestone]"
-REVIEW_POLICIES = ("all", "milestone_only")
+REVIEW_POLICIES = ("all", "milestone_only", "none")
 
 
 def configured_max_review_rounds() -> int:
@@ -10516,7 +10516,7 @@ def configured_max_review_rounds() -> int:
 
 
 def configured_review_policy() -> str:
-    """``kanban.review_policy`` — ``all`` (default) or ``milestone_only``.
+    """``kanban.review_policy`` — ``all`` (default), ``milestone_only`` or ``none``.
 
     ``milestone_only``: only *milestone* cards (see :func:`is_milestone_card`)
     are routed to ``kanban.review_assignee``; every other card that asks for
@@ -10524,6 +10524,11 @@ def configured_review_policy() -> str:
     gate for slice work, the reviewer profile is functional QA at milestones.
     Applies even when a reviewer PROFILE is named explicitly; only the
     ``human`` sentinel or ``force=True`` bypasses it.
+
+    ``none``: NO card gets a reviewer session — every review request is
+    completed in place with a ``review_skipped`` event (milestones too).
+    Same ``human``/``force`` bypass. This is the "reviewer profile is
+    off" switch (Ace, 2026-09-24: Argus dropped from kanban review).
     """
     try:
         from hermes_cli.config import load_config
@@ -10861,14 +10866,17 @@ def request_review(
     # names a reviewer profile explicitly (workers were templated to pass
     # reviewer="argus" on every card — that IS the mechanism being removed).
     # Only the explicit ``human`` sentinel or force=True (operator) bypasses it.
+    policy = configured_review_policy()
     if (
-        configured_review_policy() == "milestone_only"
+        policy in ("milestone_only", "none")
         and not force
         and not is_human_reviewer(reviewer)
     ):
-        if not is_milestone_card(conn, task_id):
+        if policy == "none" or not is_milestone_card(conn, task_id):
             skip_meta = dict(metadata or {})
-            skip_meta["review_skipped"] = "non_milestone"
+            skip_meta["review_skipped"] = (
+                "policy_none" if policy == "none" else "non_milestone"
+            )
             done = complete_task(
                 conn, task_id, summary=summary, metadata=skip_meta,
                 expected_run_id=expected_run_id,
@@ -10876,16 +10884,17 @@ def request_review(
             if not done:
                 return _ret(
                     False,
-                    "review_policy=milestone_only: card is not a milestone and "
-                    "could not be completed in place (not running/ready, or "
+                    f"review_policy={policy}: review is skipped for this card and "
+                    "it could not be completed in place (not running/ready, or "
                     "expected_run_id mismatch)",
                 )
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "review_skipped",
-                    {"policy": "milestone_only", "summary": (summary or "")[:400] or None},
+                    {"policy": policy, "summary": (summary or "")[:400] or None},
                 )
-            return _ret(True, "review skipped (non-milestone card, kanban.review_policy=milestone_only) — card completed; CI is the gate")
+            why = "reviews off" if policy == "none" else "non-milestone card"
+            return _ret(True, f"review skipped ({why}, kanban.review_policy={policy}) — card completed; CI is the gate")
 
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):

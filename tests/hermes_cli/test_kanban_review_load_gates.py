@@ -214,6 +214,55 @@ def test_milestone_only_completes_slice_cards_in_place(kanban_home, monkeypatch)
         assert _events(conn, tid, "review_requested") == []
 
 
+def test_policy_none_skips_review_on_every_card(kanban_home, monkeypatch):
+    """``none`` completes slice AND milestone/parent cards in place; only the
+    human sentinel or force still opens a review round."""
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "none")
+    monkeypatch.setattr(kb, "configured_max_review_rounds", lambda: 0)
+    with kb.connect() as conn:
+        # a [milestone] card, explicitly naming a reviewer profile
+        tid = kb.create_task(conn, title="[milestone] ship it", assignee="builder")
+        claimed = kb.claim_task(conn, tid)
+        ok, reason = kb.request_review(
+            conn, tid, summary="PR #2 green", reviewer="argus",
+            expected_run_id=claimed.current_run_id, with_reason=True,
+        )
+        assert ok is True and "review skipped" in reason and "reviews off" in reason
+        assert kb.get_task(conn, tid).status == "done"
+        skipped = _events(conn, tid, "review_skipped")
+        assert skipped and skipped[0]["policy"] == "none"
+        assert _events(conn, tid, "review_requested") == []
+        # a plain slice card
+        tid2 = kb.create_task(conn, title="slice: add flag", assignee="builder")
+        claimed2 = kb.claim_task(conn, tid2)
+        ok2, _ = kb.request_review(
+            conn, tid2, summary="PR #3 green", expected_run_id=claimed2.current_run_id,
+            with_reason=True,
+        )
+        assert ok2 is True and kb.get_task(conn, tid2).status == "done"
+        # the human sentinel still gets a real review round
+        tid3 = kb.create_task(conn, title="[milestone] human eyes", assignee="builder")
+        claimed3 = kb.claim_task(conn, tid3)
+        ok3, _ = kb.request_review(
+            conn, tid3, summary="needs Ace", reviewer="human",
+            expected_run_id=claimed3.current_run_id, with_reason=True,
+        )
+        assert ok3 is True
+        assert kb.get_task(conn, tid3).status == "review"
+        assert _events(conn, tid3, "review_skipped") == []
+
+
+def test_policy_value_none_is_accepted_from_config(kanban_home, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: {"kanban": {"review_policy": "NONE "}}
+    )
+    assert kb.configured_review_policy() == "none"
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: {"kanban": {"review_policy": "bogus"}}
+    )
+    assert kb.configured_review_policy() == "all"
+
+
 def test_milestone_only_routes_marker_and_parent_cards(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "configured_review_policy", lambda: "milestone_only")
     monkeypatch.setattr(kb, "configured_max_review_rounds", lambda: 0)
