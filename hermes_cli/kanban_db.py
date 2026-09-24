@@ -2580,7 +2580,9 @@ CREATE TABLE IF NOT EXISTS task_events (
     run_id     INTEGER,
     kind       TEXT NOT NULL,
     payload    TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    actor_profile    TEXT,
+    actor_session_id TEXT
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -4276,6 +4278,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+    # Event provenance: who (profile + chat session) wrote the event. NULL for
+    # historical rows and for execution-lane writers with no identity.
+    if ev_cols and "actor_profile" not in ev_cols:
+        _add_column_if_missing(
+            conn, "task_events", "actor_profile", "actor_profile TEXT"
+        )
+    if ev_cols and "actor_session_id" not in ev_cols:
+        _add_column_if_missing(
+            conn, "task_events", "actor_session_id", "actor_session_id TEXT"
+        )
 
     # task_comments gained per-run / per-session provenance. Two concurrent
     # sessions on the SAME profile used to be indistinguishable on the board
@@ -4902,20 +4914,28 @@ def stamp_origin_body(body: Optional[str], origin_line: str) -> str:
 
 def _resolve_birth_session(
     conn: sqlite3.Connection, session_id: Optional[str], parents: Iterable[str]
-) -> str:
-    """THE home a new card is born with: explicit > first homed parent's
-    home (fan-out children belong to their root's session) > ``unhomed``."""
-    sid = (str(session_id).strip() if session_id else "")
-    if sid:
-        return sid
-    for pid in parents or ():
+) -> tuple[str, Optional[str]]:
+    """THE home a new card is born with, plus the ``origin:`` line it inherits.
+
+    1. The first homed parent, then the card the creating kanban worker run
+       was dispatched for: fan-out belongs to the HUMAN home of its lineage.
+       A parent's home wins over an explicit ``session_id``.
+    2. Inside a worker run with no homed lineage: ``unhomed`` -- never the
+       run's own per-run session id, which no human session reads.
+    3. Otherwise the explicit ``session_id``, else ``unhomed``.
+    """
+    worker_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    for tid in (*(parents or ()), *((worker_tid,) if worker_tid else ())):
         row = conn.execute(
-            "SELECT session_id FROM tasks WHERE id = ?", (pid,)
+            "SELECT session_id, body FROM tasks WHERE id = ?", (tid,)
         ).fetchone()
         home = (row["session_id"] or "").strip() if row is not None else ""
         if home and not is_unhomed(home):
-            return home
-    return UNHOMED_SESSION
+            return home, _origin_line(row["body"])
+    if worker_tid:
+        return UNHOMED_SESSION, None
+    sid = (str(session_id).strip() if session_id else "")
+    return (sid or UNHOMED_SESSION), None
 
 
 UNHOMED_BACKFILL_COMMENT = (
@@ -4990,6 +5010,51 @@ _MUTATION_ACTOR: ContextVar[Optional[MutationActor]] = ContextVar(
     "kanban_mutation_actor", default=None
 )
 _UNSTAMPED_WARNED: list[bool] = [False]
+# Provenance copy of the bound actor for ``task_events``. Unlike
+# ``_MUTATION_ACTOR`` the guard wrapper never clears it, so events written
+# inside a guarded mutator's body still record who asked for the mutation.
+_EVENT_ACTOR: ContextVar[Optional[MutationActor]] = ContextVar(
+    "kanban_event_actor", default=None
+)
+
+
+def _event_actor() -> tuple[Optional[str], Optional[str]]:
+    """``(actor_profile, actor_session_id)`` for a ``task_events`` row.
+
+    Same resolution order as the home-session guard's callers: the explicitly
+    bound actor (CLI / tool surface), then the in-process session context,
+    then the environment. ``(None, None)`` when there is no identity.
+    """
+    actor = _EVENT_ACTOR.get()
+    if actor is not None:
+        return actor.profile, (actor.session_ids[0] if actor.session_ids else None)
+    session_id: Optional[str] = None
+    in_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
+    try:
+        from gateway.session_context import resolve_current_session_id
+
+        session_id = (resolve_current_session_id() or "").strip() or None
+    except Exception:
+        session_id = None
+    if session_id is None and not in_gateway:
+        # In-process, the env belongs to another session -- never ours.
+        session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
+    profile = None
+    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        profile = (os.environ.get(env) or "").strip() or None
+        if profile:
+            break
+    if profile is None and session_id is not None:
+        # A chat/gateway caller with a session but no profile env (only
+        # worker spawns export it): the running profile IS the actor.
+        # Identity-less callers (no session) stay NULL.
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name() or None
+        except Exception:
+            profile = None
+    return profile, session_id
 
 
 @contextlib.contextmanager
@@ -5011,9 +5076,11 @@ def mutation_actor(
         surface=surface,
     )
     token = _MUTATION_ACTOR.set(actor)
+    ev_token = _EVENT_ACTOR.set(actor)
     try:
         yield actor
     finally:
+        _EVENT_ACTOR.reset(ev_token)
         _MUTATION_ACTOR.reset(token)
 
 
@@ -5136,6 +5203,52 @@ def home_guard_mode() -> str:
     return "warn" if str(value).strip().lower() == "warn" else "refuse"
 
 
+WORKER_FANOUT_MAX_DEPTH = 10
+
+
+def _worker_owns_card(
+    conn: sqlite3.Connection,
+    task_id: str,
+    worker_task_id: str,
+    session_ids: Iterable[str] = (),
+) -> bool:
+    """True when ``task_id`` belongs to the fan-out of the dispatched worker
+    run for ``worker_task_id``: it descends from that card through
+    ``task_links`` (any kind, depth <= :data:`WORKER_FANOUT_MAX_DEPTH`), or its
+    ``created`` event was written by this run's session (``actor_session_id``).
+    A card that only shares the worker card's human home is NOT owned."""
+    seen = {task_id}
+    frontier = [task_id]
+    for _ in range(WORKER_FANOUT_MAX_DEPTH):
+        if not frontier:
+            break
+        ph = ",".join("?" * len(frontier))
+        ups = [
+            r[0] for r in conn.execute(
+                f"SELECT parent_id FROM task_links WHERE child_id IN ({ph})",
+                frontier,
+            )
+            if r[0]
+        ]
+        if worker_task_id in ups:
+            return True
+        frontier = [u for u in ups if u not in seen]
+        seen.update(frontier)
+    sids = tuple(s for s in (session_ids or ()) if s)
+    if not sids:
+        return False
+    try:
+        ph = ",".join("?" * len(sids))
+        row = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'created' "
+            f"AND actor_session_id IN ({ph}) LIMIT 1",
+            (task_id, *sids),
+        ).fetchone()
+    except sqlite3.OperationalError:  # pre-provenance schema
+        return False
+    return row is not None
+
+
 def check_home_session(
     conn: sqlite3.Connection, task_id: str, action: str
 ) -> Optional[MutationActor]:
@@ -5176,6 +5289,15 @@ def check_home_session(
     if actor.profile and (row["assignee"] or "") == actor.profile:
         return None
     if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+        return None
+    # ...and the cards it fanned out: item 1 stamps a worker's children with
+    # the HUMAN home, so without this the guard refuses a worker on its own
+    # fan-out (link/assign/promote/archive...). Unrelated cards that merely
+    # share that home stay foreign.
+    worker_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if worker_tid and _worker_owns_card(
+        conn, task_id, worker_tid, actor.session_ids
+    ):
         return None
     for sid in actor.session_ids:
         if home in home_ids(sid) or home in _caller_session_lineage(sid):
@@ -5320,6 +5442,15 @@ def set_task_session(
     return True
 
 
+def _origin_line(body: Optional[str]) -> Optional[str]:
+    """The card's ``origin: ...`` provenance line (its first non-empty line)."""
+    for line in (body or "").splitlines():
+        line = line.strip()
+        if line:
+            return line if line.lower().startswith("origin:") else None
+    return None
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -5434,9 +5565,10 @@ def create_task(
     # no card can land without a home (never NULL) or without an origin line.
     parents = tuple(parents or ())
     created_by = created_by or _ambient_session_env("HERMES_SESSION_PROFILE") or None
-    session_id = _resolve_birth_session(conn, session_id, parents)
+    session_id, inherited_origin = _resolve_birth_session(conn, session_id, parents)
     body = stamp_origin_body(
-        body, format_origin_line(session_id, created_by=created_by)
+        body,
+        inherited_origin or format_origin_line(session_id, created_by=created_by),
     )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
@@ -7088,10 +7220,11 @@ def _append_event(
             "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
         ).fetchone()[0]
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
+    actor_profile, actor_session_id = _event_actor()
     conn.execute(
-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, pl, now),
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
+        "actor_profile, actor_session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_id, run_id, kind, pl, now, actor_profile, actor_session_id),
     )
     # Append-only mutation journal (card t_357330bf). This is the single choke
     # point every lifecycle mutation already flows through, so journaling here
@@ -12084,8 +12217,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "session_id, body FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
@@ -12093,6 +12226,8 @@ def decompose_triage_task(
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        root_home = (root_row["session_id"] or "").strip() or None
+        root_origin = _origin_line(root_row["body"])
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -12151,21 +12286,30 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # Decomposed children belong to the root's HOME session, and
+            # carry its origin line, exactly like any other parented card.
+            child_body = body if isinstance(body, str) else None
+            if root_origin and not _origin_line(child_body):
+                child_body = (
+                    f"{root_origin}\n\n{child_body}"
+                    if (child_body or "").strip() else root_origin
+                )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, session_id) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
-                    body if isinstance(body, str) else None,
+                    child_body,
                     assignee,
                     child_ws_kind,
                     child_ws_path,
                     tenant,
                     now,
                     (author or "decomposer"),
+                    root_home,
                 ),
             )
             _append_event(

@@ -305,6 +305,58 @@ _FAULT_FIELDS = (
 )
 
 
+def format_home_line(session_id: Optional[str], row: Optional[dict] = None) -> str:
+    """``home: <platform> #<channel> \u00b7 session <id>`` for a card's home
+    session, or ``""`` when the card has none. ``row`` is the state.db
+    ``sessions`` row (``origin_json`` / ``source`` / ``display_name``); when it
+    is missing only the session id is shown."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return ""
+    origin: dict = {}
+    if row:
+        raw = row.get("origin_json")
+        if raw:
+            try:
+                import json as _json
+
+                parsed = _json.loads(raw)
+                if isinstance(parsed, dict):
+                    origin = parsed
+            except (TypeError, ValueError):
+                origin = {}
+    platform = (origin.get("platform") or (row or {}).get("source") or "").strip()
+    channel = str(
+        origin.get("chat_name") or (row or {}).get("display_name")
+        or origin.get("chat_id") or ""
+    ).strip().lstrip("#")
+    where = platform
+    if channel:
+        where = f"{where} #{channel}" if where else f"#{channel}"
+    return f"home: {where} \u00b7 session {sid}" if where else f"home: session {sid}"
+
+
+def _resolve_home_line(session_id: Optional[str]) -> str:
+    """Blocking state.db lookup; call from a worker thread only."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return ""
+    row = None
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            row = db.get_session(sid)
+        finally:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
+    except Exception:
+        row = None
+    return format_home_line(sid, row)
+
+
 def _format_spawn_routes(routes, sources=None) -> str:
     """Format provider/model and source for every spawned task."""
 
@@ -1067,6 +1119,13 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    # Ping carries the card's home so a session
+                                    # receiving a forwarded ping can tell whether
+                                    # the card is its own. Resolved here (worker
+                                    # thread), never on the event loop.
+                                    home_line = _resolve_home_line(
+                                        getattr(task, "session_id", None) if task else None
+                                    )
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -1078,6 +1137,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "home": home_line,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -1312,6 +1372,8 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
+                        if d.get("home"):
+                            msg += "\n" + d["home"]
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
@@ -1508,6 +1570,8 @@ class GatewayKanbanWatchersMixin:
                                 assignee=_assignee,
                                 board=board_slug,
                             )
+                            if d.get("home"):
+                                _synth += "\n" + d["home"]
                             # Graph-safe wake turn (#70752): carry the worker's
                             # completion handoff into the synthetic turn and
                             # label it as an automatic notification so the woken
