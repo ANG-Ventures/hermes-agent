@@ -119,6 +119,13 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
         # test asserts (plugin-section resume). The probe's own byte-stability
         # is covered by tests/tools/test_env_probe.py.
         agent._environment_probe = False
+        # This test compares plugin-section bytes across fresh subprocesses.
+        # Live git status/log in the workspace snapshot can differ under CI
+        # load; that unrelated probe has its own tests. Pin both processes.
+        from agent import coding_context
+        coding_context.build_coding_workspace_block = (
+            lambda cwd=None: "Workspace (snapshot at session start):\\n- Root: /pinned"
+        )
 
         manager = PluginManager()
         manager._discovered = True
