@@ -14997,6 +14997,61 @@ def _respawn_guard_failure_reset_after(
     ).fetchone() is not None
 
 
+def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether the latest PR-bearing comment has an unconsumed resume intent.
+
+    Event ids establish causality even when writes share a timestamp. A spawn
+    consumes the intent; automatic crash reclaim cannot reuse it.
+    """
+    comments = conn.execute(
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY id DESC",
+        (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+    ).fetchall()
+    pr_comment = next(
+        (c for c in comments if _RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None,
+    )
+    if pr_comment is None:
+        return False
+    # add_comment writes one 'commented' event per comment in the same txn.
+    # The ordinal maps a comment to its event even for same-second writes.
+    offset = conn.execute(
+        "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
+        "AND created_at = ? AND id < ?",
+        (task_id, pr_comment["created_at"], pr_comment["id"]),
+    ).fetchone()[0]
+    event = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? "
+        "AND kind = 'commented' AND created_at = ? ORDER BY id LIMIT 1 OFFSET ?",
+        (task_id, pr_comment["created_at"], offset),
+    ).fetchone()
+    if event is None:
+        return False  # Imported comment without an event: fail closed.
+    pr_event_id = int(event["id"])
+    kinds = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
+    intent = conn.execute(
+        "SELECT 1 FROM task_events i WHERE i.task_id = ? AND i.id > ? "
+        f"AND (i.kind IN ({kinds}) OR "
+        "(i.kind = 'reclaimed' AND json_extract(i.payload, '$.manual') = 1)) "
+        "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
+        "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
+        (task_id, pr_event_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS),
+    ).fetchone()
+    if intent:
+        return True
+    # A worker dependency block grants a single continuation only AFTER its
+    # parents promote it; a review demotion has no $.kind='dependency'.
+    return conn.execute(
+        "SELECT 1 FROM task_events d JOIN task_events p "
+        "ON p.task_id = d.task_id AND p.kind = 'promoted' AND p.id > d.id "
+        "WHERE d.task_id = ? AND d.kind = 'dependency_wait' AND d.id > ? "
+        "AND json_extract(d.payload, '$.kind') = 'dependency' "
+        "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = d.task_id "
+        "AND s.kind = 'spawned' AND s.id > p.id) LIMIT 1",
+        (task_id, pr_event_id),
+    ).fetchone() is not None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection,
     task_id: str,
@@ -15203,73 +15258,13 @@ def check_respawn_guard(
     #    automatic dependency promotion and generic status events also defer.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     pr_urls: list[str] = []
-    newest_pr_at = 0
-    newest_pr_comment_id = 0
     for c in conn.execute(
-        "SELECT id, body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ?",
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        body = c["body"] or ""
-        urls = [match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body)]
-        if urls:
-            pr_urls.extend(urls)
-            if (int(c["created_at"]), int(c["id"])) > (newest_pr_at, newest_pr_comment_id):
-                newest_pr_at, newest_pr_comment_id = int(c["created_at"]), int(c["id"])
+        pr_urls.extend(match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"] or ""))
     if pr_urls:
-        _kinds_sql = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            f"AND (kind IN ({_kinds_sql}) OR (kind = 'reclaimed' "
-            "AND json_extract(payload, '$.manual') = 1)) LIMIT 1",
-            (task_id, newest_pr_at, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS),
-        ).fetchone()
-        if requeued_after:
-            return None
-        # A worker's OWN dependency block (``block_task(kind="dependency")``)
-        # recorded after the newest PR comment is intent to resume on that PR
-        # once the parents land. When the automatic ``promoted`` that ends the
-        # wait has not yet been followed by a spawn, the open PR is the
-        # continuation target -- not duplicate work. Any spawn after the
-        # promotion re-arms the guard, so a continuation run that then dies
-        # with the PR open is the founding crash-reclaim case again.
-        # 2026-09-23, t_7d7ff489: t_8e737f2c (PR #938) and t_32f44156 sat
-        # ready 8h/14h behind ``active_pr`` after dependency_wait->promoted.
-        # Event ids (not created_at) order the sequence: second-granularity
-        # timestamps tie inside one tick.
-        # Match the PR-bearing comment to its event, not merely to its
-        # second-resolution timestamp. Later ordinary comments must not
-        # cancel a worker's earlier dependency-resume intent. Comments and
-        # their events are appended together by add_comment; their ordinal
-        # within a timestamp disambiguates multiple writes in one second.
-        comment_offset = conn.execute(
-            "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
-            "AND created_at = ? AND id < ?",
-            (task_id, newest_pr_at, newest_pr_comment_id),
-        ).fetchone()[0]
-        pr_event = conn.execute(
-            "SELECT id FROM task_events WHERE task_id = ? "
-            "AND kind = 'commented' AND created_at = ? ORDER BY id LIMIT 1 OFFSET ?",
-            (task_id, newest_pr_at, comment_offset),
-        ).fetchone()
-        # A missing event (e.g. an imported comment) cannot grant an
-        # exemption: retain the active-PR guard rather than guessing order.
-        pr_event_id = int(pr_event["id"]) if pr_event else 0
-        dependency_resume = conn.execute(
-            "SELECT 1 FROM task_events p "
-            "WHERE p.task_id = ? AND p.kind = 'promoted' "
-            "AND EXISTS (SELECT 1 FROM task_events d "
-            "    WHERE d.task_id = p.task_id AND d.kind = 'dependency_wait' "
-            "    AND json_extract(d.payload, '$.kind') = 'dependency' "
-            "    AND d.id > ? AND d.id < p.id) "
-            "AND NOT EXISTS (SELECT 1 FROM task_events s "
-            "    WHERE s.task_id = p.task_id AND s.kind = 'spawned' "
-            "    AND s.id > p.id) "
-            "LIMIT 1",
-            (task_id, pr_event_id),
-        ).fetchone() if pr_event_id else None
-        if dependency_resume:
+        if _unused_operator_intent_after_pr(conn, task_id):
             return None
         resolver = pr_state_resolver or _PrStateResolver()
         for url in dict.fromkeys(pr_urls):

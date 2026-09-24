@@ -3572,6 +3572,81 @@ def test_requeue_ready_card_overrides_active_pr(kanban_home, monkeypatch):
         assert kb.check_respawn_guard(conn, task_id) is None
 
 
+@pytest.mark.parametrize("later_pr_second", [False, True])
+def test_requeue_intent_preceding_new_pr_is_not_reused(kanban_home, monkeypatch, later_pr_second):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue PR 9") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        if later_pr_second:
+            now += 1
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/10")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+@pytest.mark.parametrize("kind", kb._RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS)
+def test_every_operator_intent_is_ordered_and_consumed(kanban_home, monkeypatch, kind):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        kb._append_event(conn, task_id, kind, {"actor": "operator"})
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb._append_event(conn, task_id, "spawned", {"pid": 99999999})
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        # Even an intent newer than PR 9 must not authorize PR 10.
+        kb._append_event(conn, task_id, kind, {"actor": "operator"})
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/10")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_reclaim_intent_only_if_manual_and_not_consumed(kanban_home, monkeypatch, manual):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        kb._append_event(conn, task_id, "reclaimed", {"manual": manual})
+        assert (kb.check_respawn_guard(conn, task_id) is None) is manual
+        kb._append_event(conn, task_id, "spawned", {"pid": 99999999})
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_requeue_intent_consumed_after_dispatch_and_crash(kanban_home, all_assignees_spawnable, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, int(time.time()))
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue PR 9") == (True, None)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 99999999))
+        assert task_id in spawned
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        assert task_id in kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        spawned.clear()
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 99999999))
+        assert task_id not in spawned
+
+
+def test_pr_intent_has_one_event_id_ordering_seam():
+    """PR override must not regress to second-resolution timestamp ordering."""
+    import inspect
+    guard = inspect.getsource(kb.check_respawn_guard)
+    intent = inspect.getsource(kb._unused_operator_intent_after_pr)
+    assert guard.count("_unused_operator_intent_after_pr(conn, task_id)") == 1
+    assert "newest_pr_at" not in guard and "requeued_after" not in guard[guard.index("# 4. Recent GitHub PR comments."):]
+    assert "i.id > ?" in intent and "s.id > i.id" in intent
+    assert "d.id > ?" in intent and "s.id > p.id" in intent
+    assert "i.created_at >" not in intent and "s.created_at >" not in intent
+
+
 def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
     now = int(time.time())
     with kb.connect() as conn:
