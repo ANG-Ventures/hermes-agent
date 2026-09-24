@@ -1944,6 +1944,16 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         stage = "remote survivor verification"
         explicit = _verified_explicit(task_id, survivor_ref, survivor_pr,
                                       unbound=survivor_unbound)
+        if explicit and task.workspace_kind == "dir" and not cleanup:
+            # A shared directory is NEVER removed at completion. Its other
+            # repositories (including ignored review worktrees) belong to
+            # other cards, not this claim. Capture them neither as this card's
+            # evidence nor as a reason to veto a verified external survivor.
+            # The cleanup=True path still inspects every byte before deletion.
+            return _record(conn, task_id, _external(
+                conn, task_id, metadata, evidence, (), explicit,
+                discover=False, cleanup=False, previous=previous,
+            ), previous)
         claimed = bool((metadata or {}).get("changed_files"))
         # Review approval often has no new changed_files: inherit the implementer's claim.
         claimed = claimed or any(

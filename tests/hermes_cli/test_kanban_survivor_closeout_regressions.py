@@ -17,6 +17,26 @@ HOMELAB = "https://github.com/Kyzcreig/ace-media-homelab.git"
 HOMELAB_MERGE = "deb2603bee7f566b44f13db4c411d612a88835a9"
 
 
+def test_merged_pr_landed_tree_binds_named_card_without_unbound():
+    result = survivor._verified_explicit("t_3684ae00", None, "ANG-Ventures/hermes-home#457")
+    assert result[None]["sha"] == HOME_MERGE
+    assert result[None]["corroborated_by"] == "landed-tree"
+
+
+def test_merged_pr_without_card_id_still_requires_unbound():
+    with pytest.raises(survivor.SurvivorUnavailable, match="does not name"):
+        survivor._verified_explicit("t_fc150853", None, "Kyzcreig/ace-media-homelab#195")
+    result = survivor._verified_explicit("t_fc150853", None, "Kyzcreig/ace-media-homelab#195",
+                                         unbound=True)
+    assert result[None]["sha"] == HOMELAB_MERGE
+
+
+def test_merged_pr_tree_mismatch_remains_weak(monkeypatch):
+    monkeypatch.setattr(ext, "_merged_tree_matches", lambda *a: False)
+    with pytest.raises(survivor.SurvivorUnavailable, match="mention"):
+        survivor._verified_explicit("t_3684ae00", None, "ANG-Ventures/hermes-home#457")
+
+
 @pytest.fixture
 def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -131,3 +151,24 @@ def test_oversize_foreign_checkout_does_not_discard_unpublished_bytes(board, mon
                          survivor_unbound=True, metadata={"changed_files": ["source.py"]})
     assert (repo / "source.py").exists()
     assert kb.get_task(board, tid).status != "done"
+
+
+def test_explicit_pr_closes_shared_dir_without_claiming_foreign_worktree(board, tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    subprocess.run(["git", "init", "-q", str(shared)], check=True, stdin=subprocess.DEVNULL)
+    foreign = shared / ".worktrees" / "argus" / "another-card"
+    subprocess.run(["git", "init", "-q", str(foreign)], check=True, stdin=subprocess.DEVNULL)
+    (foreign / "unpublished.py").write_text("foreign work\n")
+    tid = kb.create_task(board, title="shared tree deliverable", workspace_kind="dir",
+                         workspace_path=str(shared))
+    monkeypatch.setattr(ext, "verify_pr", lambda *a, **kw: {
+        "remote": HOME, "branch": "refs/pull/457/head", "sha": HOME_MERGE,
+        "external": True, "corroborated_by": "landed-tree"})
+    assert kb.complete_task(board, tid, survivor_pr="ANG-Ventures/hermes-home#457")
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert saved["refs"][0]["sha"] == HOME_MERGE
+    assert saved["refs"][0]["repository"] == "."
+    assert (foreign / "unpublished.py").read_text() == "foreign work\n"
+    assert survivor.remove_workspace_dir(board, tid, shared) is False
+    assert (foreign / "unpublished.py").exists(), "a closeout claim is not deletion authority"

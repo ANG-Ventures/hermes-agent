@@ -2,6 +2,7 @@
 import json
 import re
 import subprocess
+import tempfile
 from urllib.parse import urlsplit
 
 from hermes_cli import kanban_db as kb
@@ -191,6 +192,57 @@ def verify_ref(claim, *, mined_for=None):
     return dict(verified, corroborated_by="branch") if mined_for else verified
 
 
+def _merged_tree_matches(slug, number, head, merge):
+    """Prove the PR head's merge into its actual parent produced the landed tree.
+
+    A squash merge rewrites the SHA, so ancestry of the PR head is insufficient.
+    Fetch only shallow Git objects into a disposable bare repository; the
+    explicit merge base comes from GitHub's comparison of the real merge parent
+    and reviewed head. Never treat a fetch/merge failure as corroboration.
+    """
+    parent = json.loads(_query(["gh", "api", f"repos/{slug}/git/commits/{merge}"]))
+    parents = parent.get("parents") or []
+    if not parents or not re.fullmatch(r"[0-9a-f]{40}", parents[0].get("sha", "")):
+        return False
+    base_parent = parents[0]["sha"]
+    comparison = json.loads(_query(["gh", "api", f"repos/{slug}/compare/{base_parent}...{head}"]))
+    base = (comparison.get("merge_base_commit") or {}).get("sha")
+    if not base or not re.fullmatch(r"[0-9a-f]{40}", base):
+        return False
+    with tempfile.TemporaryDirectory(prefix="kanban-pr-tree-") as directory:
+        def git(*args, timeout=45):
+            command = ["git", "-C", directory, *args]
+            try:
+                result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RemoteUnavailable(f"git {args[0]} did not answer ({type(exc).__name__}: {redact(str(exc))})") from exc
+            if result.returncode:
+                raise RemoteUnavailable(f"git {args[0]} exited {result.returncode} for {slug}")
+            return result.stdout.decode().strip()
+
+        git("init", "--bare", "-q")
+        url = f"https://github.com/{slug}.git"
+        # GitHub does not advertise every historical parent by raw SHA. Fetch
+        # the default line with bounded depth as well as the PR's reviewed head.
+        default = _query(["git", "ls-remote", "--symref", "--", url, "HEAD"])
+        branch = next((line.split("\t")[0].removeprefix("ref: ") for line in default.splitlines()
+                       if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD")), None)
+        if not branch:
+            return False
+        ancestry = json.loads(_query(["gh", "api", f"repos/{slug}/compare/{merge}...{branch.removeprefix('refs/heads/')}"]))
+        if ancestry.get("status") not in {"ahead", "identical"}:
+            return False
+        git("fetch", "-q", "--filter=blob:none", "--depth=100", url, branch,
+            f"refs/pull/{number}/head", timeout=90)
+        for sha in (base, base_parent, head, merge):
+            if subprocess.run(["git", "-C", directory, "cat-file", "-e", f"{sha}^{{commit}}"],
+                              stdin=subprocess.DEVNULL, capture_output=True).returncode:
+                git("fetch", "-q", "--filter=blob:none", "--depth=1", url, sha, timeout=90)
+        expected = git("merge-tree", "--write-tree", f"--merge-base={base}", base_parent, head,
+                       timeout=90).splitlines()[0]
+        return expected == git("rev-parse", f"{merge}^{{tree}}")
+
+
 def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
     """Resolve a PR claim against GitHub.
 
@@ -251,6 +303,9 @@ def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
                 return None
             if corroborated_by == "headRefName":
                 corroborated_by = "branch"
+            elif (corroborated_by in {"title", "body"} and state == "MERGED"
+                  and _merged_tree_matches(slug, number, head, merge)):
+                corroborated_by = "landed-tree"
     except (ValueError, TypeError, KeyError, AttributeError):
         return None
     verified = {"remote": f"https://github.com/{slug}.git", "branch": f"refs/pull/{number}/head",
