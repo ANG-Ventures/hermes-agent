@@ -1658,7 +1658,7 @@ def kanban_command(args: argparse.Namespace) -> int:
 _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "claim", "complete", "block", "unblock", "archive", "assign", "reassign",
     "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
-    "schedule", "reopen", "reopen-review", "request-review",
+    "schedule", "requeue", "reopen", "reopen-review", "request-review",
     "request-changes", "link", "specify", "decompose",
 })
 

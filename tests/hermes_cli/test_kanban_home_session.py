@@ -519,6 +519,36 @@ def test_cli_foreign_claim_is_refused(kanban_home, monkeypatch, capsys):
         assert kb.get_task(conn, tid).status == "ready"
 
 
+def test_cli_foreign_requeue_refused_then_override(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = _ready(conn)
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    out = kc.run_slash(f"requeue {tid} 'run now'")
+    assert f"refused requeue on {tid}" in out and HOME in out
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "requeued"]
+        assert _comments(conn, tid) == []
+    kc.run_slash(f"requeue {tid} 'run now' --foreign-ok 'recovery'")
+    with kb.connect_closing() as conn:
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "requeued"]
+        assert _comments(conn, tid) == [
+            f"foreign-session action by {OTHER} (apollo): recovery [requeue]"
+        ]
+
+
+def test_cli_assignee_can_requeue_foreign_home(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = _ready(conn)
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
+    monkeypatch.setenv("HERMES_PROFILE", "worker-a")
+    assert "Requeued" in kc.run_slash(f"requeue {tid} 'assigned work'")
+    with kb.connect_closing() as conn:
+        assert [e for e in kb.list_events(conn, tid) if e.kind == "requeued"]
+        assert _comments(conn, tid) == []
+
+
 def test_claim_allowed_for_home_session_and_assignee(kanban_home):
     with kb.connect_closing() as conn:
         mine = _ready(conn)
@@ -555,8 +585,8 @@ def test_run_slash_session_does_not_leak(kanban_home):
 import ast as _ast
 import re as _re
 
-# Writers of tasks.status/assignee/priority/session_id that are NOT guarded,
-# each with the reason it is execution lane (never bound from a chat).
+# Writers of tasks.status/assignee/priority/session_id or dispatch-intent
+# events that are NOT guarded, each with the reason it is execution lane.
 EXECUTION_LANE = {
     "_migrate_add_optional_columns": "schema migration at connect time",
     # Reasons are derived from the CALLERS, not the function's intent. The
@@ -610,7 +640,16 @@ def _writers():
         if not isinstance(node, _ast.FunctionDef):
             continue
         seg = _ast.get_source_segment(src, node) or ""
-        if _STATIC_WRITE.search(seg) or (
+        dispatch_intent = any(
+            isinstance(call, _ast.Call)
+            and isinstance(call.func, _ast.Name)
+            and call.func.id == "_append_event"
+            and len(call.args) > 2
+            and isinstance(call.args[2], _ast.Constant)
+            and call.args[2].value in kb._RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS
+            for call in _ast.walk(node)
+        )
+        if dispatch_intent or _STATIC_WRITE.search(seg) or (
             "UPDATE tasks" in seg and _DYNAMIC_WRITE.search(seg)
         ):
             out[node.name] = node
@@ -632,7 +671,7 @@ def test_every_status_writer_goes_through_the_guard():
         if not _is_guarded(node) and n not in EXECUTION_LANE
     )
     assert not unrouted, (
-        f"status/assignee/priority/session_id writers without "
+        f"status/assignee/priority/session_id or dispatch-intent writers without "
         f"@_home_session_guarded: {unrouted}. Guard them, or add them to "
         f"EXECUTION_LANE with the reason no chat surface can reach them."
     )

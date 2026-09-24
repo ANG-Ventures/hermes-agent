@@ -4979,12 +4979,11 @@ def record_foreign_action(
 def _home_session_guarded(action: str, task_param: str = "task_id"):
     """Decorate a status/ownership mutator with the home-session guard.
 
-    ``task_param`` names the parameter holding the card being mutated (the
-    child for :func:`link_tasks`, whose status a link can demote). Every
-    writer of ``tasks.status/assignee/priority/session_id`` either carries
-    this decorator or is an execution-lane internal listed in
-    ``tests/.../test_kanban_home_session.py::EXECUTION_LANE`` -- an AST
-    contract test fails on any other.
+    ``task_param`` names the parameter holding the card being mutated
+    (``child_id`` for :func:`link_tasks`, whose status a link can demote).
+    The contract test enumerates writers of ``tasks.status/assignee/priority/``
+    ``session_id`` plus dispatch-intent events. Each carries this decorator or
+    is an execution-lane internal listed in its ``EXECUTION_LANE`` table.
     """
 
     def deco(fn):
@@ -10733,6 +10732,7 @@ def request_changes(
     return True, implementer
 
 
+@_home_session_guarded("requeue")
 def requeue_task(
     conn: sqlite3.Connection,
     task_id: str,
