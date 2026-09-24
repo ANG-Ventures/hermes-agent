@@ -154,10 +154,10 @@ def verify_ref(claim, *, mined_for=None):
                         if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD")), None)
         if not default:
             return None
-        slug = re.fullmatch(rf"https://github\.com/({_SLUG})\.git", url)
+        slug = re.fullmatch(rf"https://github\.com/({_SLUG})(?:\.git)?", url)
         if slug:
             branch = default.removeprefix("refs/heads/")
-            comparison = json.loads(_query(["gh", "api", f"repos/{slug[1]}/compare/{sha}...{branch}"]))
+            comparison = json.loads(_query(["gh", "api", f"repos/{slug[1].removesuffix('.git')}/compare/{sha}...{branch}"]))
             if comparison.get("status") in {"ahead", "identical"}:
                 matches = {sha: [default]}
             else:

@@ -51,6 +51,12 @@ def test_real_merged_sha_reachable_from_default_branch():
     assert result["branch"] == "refs/heads/main"
 
 
+def test_real_merged_sha_reachable_from_clone_url_without_dot_git():
+    result = ext.verify_ref(f"{HOME.removesuffix('.git')}#{HOME_MERGE}")
+    assert result["sha"] == HOME_MERGE
+    assert result["branch"] == "refs/heads/main"
+
+
 def test_real_merged_sha_on_master_tip():
     result = ext.verify_ref(f"{HOMELAB}#{HOMELAB_MERGE}")
     assert result["sha"] == HOMELAB_MERGE
