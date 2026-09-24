@@ -261,3 +261,48 @@ def test_sampler_snapshot_older_than_60s_is_unknown():
     assert sample_pool(FixtureAPI(), now=stale).status == "unknown"
     fresh = datetime.now(timezone.utc) - timedelta(seconds=30)
     assert sample_pool(FixtureAPI(), now=fresh).status == "ok"
+
+
+# Diagnostic/input contracts pinned from the Argus #931 branch-flip census (t_dc4e55e7):
+# each case below kills a mutant that otherwise survived the whole suite.
+
+@pytest.mark.parametrize("name,kwargs,reason", [
+    ("unknown-overflow", {"status": "unknown"}, "local-queue"),
+    ("unknown-cloud-only", {"status": "unknown", "mode": "cloud-only"}, "local-queue"),
+    ("invalid-k-overflow", {"k": None}, "invalid-k"),
+    ("self-only", {"mode": "self-only"}, "local-queue"),
+    ("self-only-invalid-k", {"mode": "self-only", "k": None}, "invalid-k"),
+])
+def test_queued_local_reason_names_the_cause(name, kwargs, reason):
+    """When cloud is off, every job queues on the pool with the diagnostic reason, never local-idle/budget-queue."""
+    p = decide(idle=4, **kwargs)
+    assert [(j.reason, j.labels, j.reserved_minutes) for j in p.jobs] == [(reason, POOL, 0)] * 4, name
+
+
+def test_e2e_leads_when_no_core_slice():
+    """Without a core slice the e2e job takes first local priority; alone it is still planned."""
+    p = decide(idle=1, slices=SLICES[1:])
+    assert [(j.job_id, j.reason) for j in p.jobs] == [
+        ("e2e", "local-idle"), ("slice-0", "cloud-overflow"), ("slice-1", "cloud-overflow")]
+    assert [(j.job_id, j.reason) for j in decide(idle=1, slices=[]).jobs] == [("e2e", "local-idle")]
+
+
+@pytest.mark.parametrize("allowance", [-1, 1.5, True, "100", None])
+def test_invalid_allowance_rejected(allowance):
+    with pytest.raises(ValueError, match="invalid allowance"):
+        decide(allowance=allowance)
+
+
+@pytest.mark.parametrize("field", ["cost_slice", "cost_e2e"])
+@pytest.mark.parametrize("cost", [0, -5, 1.5, True])
+def test_invalid_reservation_cost_rejected(field, cost):
+    with pytest.raises(ValueError, match="invalid reservation cost"):
+        plan(SLICES, E2E, Snapshot(NOW, "ok", 2, 0, 0), Policy("overflow", 4, 0, **{field: cost}), 200)
+
+
+def test_arm_never_relabels_an_unreserved_slice():
+    """ARM goes only to slices that hold a cloud reservation, even when a lighter slice was budget-queued."""
+    p = decide(allowance=35 + 20 + 35, arm=2)
+    assert [(j.job_id, j.labels, j.reason) for j in p.jobs] == [
+        ("core-smoke", X64, "cloud-overflow"), ("e2e", X64, "cloud-overflow"),
+        ("slice-0", ARM, "cloud-overflow"), ("slice-1", POOL, "budget-queue")]
