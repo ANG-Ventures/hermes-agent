@@ -560,6 +560,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              "(== --session $HERMES_SESSION_ID)")
     p_list.add_argument("--archived", action="store_true",
                         help="Include archived tasks")
+    p_list.add_argument("--all", action="store_true", dest="all_sessions",
+                        help="Show every session's cards in full (default "
+                             "when a caller session is set: this session's "
+                             "cards, then one collapsed line for the rest)")
     p_list.add_argument("--json", action="store_true")
     p_list.add_argument(
         "--sort",
@@ -2392,9 +2396,35 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
+    home_view = _default_home_view(args)
+    if home_view:
+        mine = [t for t in tasks if (t.session_id or "") == home_view]
+        others = len(tasks) - len(mine)
+        for t in mine:
+            print(_fmt_task_line(t))
+        if not mine:
+            print("(no cards from this session)")
+        if others:
+            print(_collapsed_others_line(others))
+        return 0
     for t in tasks:
         print(_fmt_task_line(t))
     return 0
+
+
+def _collapsed_others_line(n: int) -> str:
+    return f"{n} card{'s' if n != 1 else ''} from other sessions (--all to show)"
+
+
+def _default_home_view(args: argparse.Namespace) -> Optional[str]:
+    """Home session to split the default text listing on, or None for the
+    flat listing. Only when a caller session exists and the caller asked for
+    no explicit session scope (``--all``/``--home``/``--session``)."""
+    if getattr(args, "all_sessions", False) or getattr(args, "home", False):
+        return None
+    if getattr(args, "session", None):
+        return None
+    return _caller_session_id()
 
 
 def _print_triage_banner(triage_ids, stranded) -> None:

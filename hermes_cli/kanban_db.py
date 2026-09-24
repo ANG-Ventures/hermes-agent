@@ -2571,7 +2571,9 @@ CREATE TABLE IF NOT EXISTS task_events (
     run_id     INTEGER,
     kind       TEXT NOT NULL,
     payload    TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    actor_profile    TEXT,
+    actor_session_id TEXT
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -4267,6 +4269,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+    # Event provenance: who (profile + chat session) wrote the event. NULL for
+    # historical rows and for execution-lane writers with no identity.
+    if ev_cols and "actor_profile" not in ev_cols:
+        _add_column_if_missing(
+            conn, "task_events", "actor_profile", "actor_profile TEXT"
+        )
+    if ev_cols and "actor_session_id" not in ev_cols:
+        _add_column_if_missing(
+            conn, "task_events", "actor_session_id", "actor_session_id TEXT"
+        )
 
     # task_comments gained per-run / per-session provenance. Two concurrent
     # sessions on the SAME profile used to be indistinguishable on the board
@@ -4844,6 +4856,37 @@ _MUTATION_ACTOR: ContextVar[Optional[MutationActor]] = ContextVar(
     "kanban_mutation_actor", default=None
 )
 _UNSTAMPED_WARNED: list[bool] = [False]
+# Provenance copy of the bound actor for ``task_events``. Unlike
+# ``_MUTATION_ACTOR`` the guard wrapper never clears it, so events written
+# inside a guarded mutator's body still record who asked for the mutation.
+_EVENT_ACTOR: ContextVar[Optional[MutationActor]] = ContextVar(
+    "kanban_event_actor", default=None
+)
+
+
+def _event_actor() -> tuple[Optional[str], Optional[str]]:
+    """``(actor_profile, actor_session_id)`` for a ``task_events`` row.
+
+    Same resolution order as the home-session guard's callers: the explicitly
+    bound actor (CLI / tool surface), then the in-process session context,
+    then the environment. ``(None, None)`` when there is no identity.
+    """
+    actor = _EVENT_ACTOR.get()
+    if actor is not None:
+        return actor.profile, (actor.session_ids[0] if actor.session_ids else None)
+    session_id: Optional[str] = None
+    in_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
+    try:
+        from gateway.session_context import resolve_current_session_id
+
+        session_id = (resolve_current_session_id() or "").strip() or None
+    except Exception:
+        session_id = None
+    if session_id is None and not in_gateway:
+        # In-process, the env belongs to another session -- never ours.
+        session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip() or None
+    return profile, session_id
 
 
 @contextlib.contextmanager
@@ -4865,9 +4908,11 @@ def mutation_actor(
         surface=surface,
     )
     token = _MUTATION_ACTOR.set(actor)
+    ev_token = _EVENT_ACTOR.set(actor)
     try:
         yield actor
     finally:
+        _EVENT_ACTOR.reset(ev_token)
         _MUTATION_ACTOR.reset(token)
 
 
@@ -6955,10 +7000,11 @@ def _append_event(
             "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
         ).fetchone()[0]
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
+    actor_profile, actor_session_id = _event_actor()
     conn.execute(
-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, pl, now),
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
+        "actor_profile, actor_session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_id, run_id, kind, pl, now, actor_profile, actor_session_id),
     )
     # Append-only mutation journal (card t_357330bf). This is the single choke
     # point every lifecycle mutation already flows through, so journaling here
