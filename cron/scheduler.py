@@ -3400,6 +3400,151 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+# ── Host-down gate (card t_8c04a5d2; contract from t_0a889b04) ──────────────
+# A host the owner deadman already declared DOWN must not be re-paged by every
+# consumer. notify.py gates script-originated sends; cron deliveries never pass
+# through notify.py, so the same policy is applied here, at the ONE choke point
+# every cron delivery (normal, retry-path, run-now, failure-streak nudge) uses.
+# The table is <fleet root>/scripts/lib/fleet-hosts.json, found by walking up
+# from HERMES_HOME; a host is DOWN while <fleet root>/<latch> exists. Absent
+# table => inert. Any error => deliver unchanged (fail open, never drop).
+_HOST_DOWN_ALERTS_CHAT = "1480528231286181948"  # fleet #alerts
+_HOST_DOWN_LOGS_CHAT = "1480525090331561984"  # fleet #logs
+_HOST_DOWN_LEDGER = "suppressed.jsonl"
+_FLEET_HOSTS_REL = Path("scripts") / "lib" / "fleet-hosts.json"
+
+
+def _host_down_fleet_root() -> Optional[Path]:
+    """Nearest HERMES_HOME ancestor holding scripts/lib/fleet-hosts.json."""
+    home = Path(get_hermes_home())
+    for cand in (home, *home.parents):
+        if (cand / _FLEET_HOSTS_REL).is_file():
+            return cand
+    return None
+
+
+def _host_down_named(message: str, cfg: dict) -> set:
+    named = set()
+    for host, h in (cfg.get("hosts") or {}).items():
+        h = h or {}
+        for ip in h.get("ips") or []:
+            if re.search(r"(?<![\d.])" + re.escape(ip) + r"(?!\d)", message):
+                named.add(host)
+        for name in (h.get("names") or []) + [host]:
+            if re.search(r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])",
+                         message, re.IGNORECASE):
+                named.add(host)
+    return named
+
+
+def _host_down_decision(message: str, cfg: dict, armed: dict,
+                        producers: List[str]) -> Optional[List[str]]:
+    """Mirror of notify.py ``_host_down_decision`` (keep the two in lockstep).
+
+    1. names any NOT-down host -> page unchanged; 2. names only down hosts ->
+    defer to them; 3. producer is a ``dependents`` entry of a down host ->
+    defer to it; 4. transport signature and no host named -> all down hosts.
+    """
+    if not armed:
+        return None
+    named = _host_down_named(message, cfg)
+    if named - set(armed):
+        return None
+    if named:
+        return sorted(named)
+    hosts = cfg.get("hosts") or {}
+    deps = sorted(h for h in armed
+                  if set(producers) & set((hosts.get(h) or {}).get("dependents") or []))
+    if deps:
+        return deps
+    sigs = cfg.get("transport_signatures") or []
+    if any(s in message for s in sigs):
+        return sorted(armed)
+    return None
+
+
+def _host_down_producers(job: dict) -> List[str]:
+    out: List[str] = []
+    script = job.get("script")
+    if script:
+        stem = re.sub(r"\.(py|sh)$", "", os.path.basename(str(script).split()[0]))
+        if stem:
+            out.append(stem)
+    for key in ("name", "id"):
+        val = str(job.get(key) or "").strip()
+        if val and val not in out:
+            out.append(val)
+    return out
+
+
+def _apply_host_down_gate(job: dict, content: str, targets: List[dict]):
+    """Return (content, targets) with #alerts targets demoted to #logs when the
+    message is about a host whose owner deadman latch is armed.
+
+    Never drops: the demoted message still delivers, prefixed
+    ``[host-down: H since TS — deferred to OWNER]``, and one ledger row per
+    deferred host is appended to <latch dir>/suppressed.jsonl so the owner's
+    recovery note (notify.py --host-down-summary) counts it.
+    """
+    try:
+        alerts_idx = [
+            i for i, t in enumerate(targets)
+            if str(t.get("platform", "")).lower() == "discord"
+            and str(t.get("chat_id")) == _HOST_DOWN_ALERTS_CHAT
+        ]
+        if not alerts_idx:
+            return content, targets
+        root = _host_down_fleet_root()
+        if root is None:
+            return content, targets
+        cfg = json.loads((root / _FLEET_HOSTS_REL).read_text())
+        armed = {}
+        for host, h in (cfg.get("hosts") or {}).items():
+            latch = (h or {}).get("latch")
+            if not latch:
+                continue
+            lp = root / latch
+            if lp.is_file():
+                armed[host] = {
+                    "since": lp.read_text().strip() or "?",
+                    "owner": h.get("owner") or f"{host}-deadman",
+                    "latch_path": lp,
+                }
+        if not armed:
+            return content, targets
+        producers = _host_down_producers(job)
+        # The owner deadman's own DOWN/recovery notes are exempt.
+        if set(producers) & {a["owner"] for a in armed.values()}:
+            return content, targets
+        hosts = _host_down_decision(content or "", cfg, armed, producers)
+        if not hosts:
+            return content, targets
+        first = armed[hosts[0]]
+        prefix = (f"[host-down: {', '.join(hosts)} since {first['since']} — "
+                  f"deferred to {first['owner']}]")
+        new_targets = [dict(t) for t in targets]
+        for i in alerts_idx:
+            new_targets[i]["chat_id"] = _HOST_DOWN_LOGS_CHAT
+            new_targets[i].pop("thread_id", None)
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "producer": producers[0] if producers else "unknown",
+            "head": (content or "").strip().splitlines()[0][:160] if (content or "").strip() else "",
+        }
+        for h in hosts:
+            try:
+                with (armed[h]["latch_path"].parent / _HOST_DOWN_LEDGER).open("a") as f:
+                    f.write(json.dumps(rec) + "\n")
+            except Exception as e:
+                logger.warning("host-down ledger write failed: %r", e)
+        logger.info("Job '%s': host-down gate deferred #alerts delivery to #logs (%s)",
+                    job.get("id"), ", ".join(hosts))
+        return f"{prefix} {content}", new_targets
+    except Exception as e:  # fail open: never lose a page to the gate itself
+        logger.warning("host-down gate error (delivering unchanged): %r", e)
+        return content, targets
+
+
 def _deliver_result(job: dict, content: str, success: bool = True, adapters=None, loop=None, *, wrap_override: Optional[bool] = None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -3435,6 +3580,8 @@ def _deliver_result(job: dict, content: str, success: bool = True, adapters=None
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
+
+    content, targets = _apply_host_down_gate(job, content, targets)
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
