@@ -7294,32 +7294,6 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 
-def _real_pid_started_in_claim(pid: int, claimed_at: float, spawned_at: float) -> bool:
-    """A live PID is its original owner only if it started in the claim window."""
-    started = None
-    try:
-        import psutil
-        started = psutil.Process(pid).create_time()
-    except Exception:  # optional psutil, or process vanished during the probe
-        pass
-    if started is None and os.name == "posix":
-        try:
-            from datetime import datetime
-            proc = subprocess.run(
-                ["ps", "-o", "lstart=", "-p", str(pid)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, timeout=1,
-                env={**os.environ, "LC_ALL": "C"}, check=False,
-            )
-            if proc.returncode == 0:
-                started = datetime.strptime(proc.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass
-    # Seconds-resolution event stamps can straddle the OS process timestamp.
-    return started is not None and claimed_at - 2 <= started <= spawned_at + 2
-
-
-_pid_started_in_claim = _real_pid_started_in_claim
 
 
 def _prior_worker_still_alive(
@@ -7329,16 +7303,20 @@ def _prior_worker_still_alive(
 
     A release outcome is not a death certificate: operator and worker calls
     can write identical outcomes, and a newer synthetic row can mask an older
-    owner. Inspect ended runs at both claim doors, before a second spawn.
-    A claimed-but-never-spawned run has no PID to probe here; its active claim
-    remains protected by the reclaim/reconcile guards.
+    owner. Inspect EVERY prior run at both claim doors, before a second
+    spawn -- ended or still open. An open run on a claimable card is a leaked
+    ``current_run_id`` (claim_task's invariant recovery closes it below); its
+    owner is exactly as able to be alive as an ended run's, so the ended_at
+    filter must not hide it. A claimed-but-never-spawned run has no PID to
+    probe here; its active claim remains protected by the reclaim/reconcile
+    guards.
     """
     # An outcome cannot certify exit: operators can write the same outcomes as
     # worker tools, and a newer synthetic row can hide an older live owner.
     runs = conn.execute(
-        "SELECT r.id, r.outcome, r.ended_at, t.max_runtime_seconds "
+        "SELECT r.id, r.outcome, r.ended_at, r.started_at, t.max_runtime_seconds "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
-        "WHERE r.task_id = ? AND r.ended_at IS NOT NULL ORDER BY r.id DESC",
+        "WHERE r.task_id = ? ORDER BY r.id DESC",
         (task_id,),
     ).fetchall()
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7350,7 +7328,7 @@ def _prior_worker_still_alive(
 
 
 def _spawned_owner_alive(conn, task_id, row, host_prefix):
-    """Probe one ended run's spawned owner using its durable event evidence."""
+    """Probe one prior run's spawned owner(s) using durable event evidence."""
 
     # _end_run clears task_runs.worker_pid, so the durable claimed/spawned
     # events are the record. Both claim doors emit ``claimed`` with the lock
@@ -7361,17 +7339,25 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
     # event of that run that recorded the lock (reclaimed.prev_lock, ...).
     # Explicitly bounded workers cannot still own a run this long after its
     # release, even when the PID has since been recycled.
-    if (row["max_runtime_seconds"] is not None
+    if (row["max_runtime_seconds"] is not None and row["ended_at"] is not None
             and time.time() > row["ended_at"] + row["max_runtime_seconds"]
             + RECLAIM_DEFER_GRACE_SECONDS):
         return None
     run_events = conn.execute(
-        "SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? "
-        "AND run_id = ? ORDER BY (kind = 'claimed') DESC, id ASC",
+        "SELECT id, kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND run_id = ? "
+        "ORDER BY (kind = 'claimed') DESC, id ASC",
         (task_id, row["id"]),
     ).fetchall()
     if not run_events:
         return None
+    # Lower edge of the run's causal window: a worker cannot exist before its
+    # claim committed. Legacy rows without a ``claimed`` event fall back to
+    # the run's started_at (stamped in the same claim txn).
+    claimed_at = next(
+        (ev["created_at"] for ev in run_events if ev["kind"] == "claimed"),
+        row["started_at"],
+    )
     lock = ""
     for ev in run_events:
         try:
@@ -7393,27 +7379,113 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
         "SELECT MIN(id) FROM task_events WHERE task_id = ? "
         "AND kind = 'claimed' AND id > ?", (task_id, boundary_id),
     ).fetchone()[0]
-    spawned = conn.execute(
-        "SELECT id, run_id, payload, created_at FROM task_events WHERE task_id = ? "
-        "AND kind = 'spawned' AND id >= ? "
+    # Probe EVERY spawn in the interval, not just the newest: a run stamped
+    # twice leaves an older PID that a later dead one must not vouch for.
+    # _set_worker_pid is the only worker_pid writer and always appends this
+    # event in the same txn, so an open run's row pid is covered here too.
+    spawns = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'spawned' AND id >= ? "
         "AND (run_id = ? OR (run_id IS NULL AND (? IS NULL OR id < ?))) "
-        "ORDER BY id DESC LIMIT 1",
+        "ORDER BY id DESC",
         (task_id, boundary_id, row["id"], next_claim, next_claim),
-    ).fetchone()
-    if spawned is None:
-        return None
-    try:
-        pid = int(json.loads(spawned["payload"] or "{}")["pid"])
-    except (TypeError, ValueError, KeyError):
-        return None
-    claimed_at = min(ev["created_at"] for ev in run_events)
-    if _pid_alive(pid) and _pid_started_in_claim(pid, claimed_at, spawned["created_at"]):
+    ).fetchall()
+    candidates = []
+    for spawned in spawns:
+        try:
+            pid = int(json.loads(spawned["payload"] or "{}")["pid"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        candidates.append((pid, spawned["run_id"] is None,
+                           spawned["created_at"]))
+    for pid, late, spawned_at in candidates:
+        if not _pid_alive(pid):
+            continue
+        # Liveness is not identity: the PID may now belong to an unrelated
+        # process (recycled PID). The owner is the process at this PID only
+        # if it was created inside this run's causal window.
+        identity = _owner_identity(pid, claimed_at, spawned_at)
+        if identity == "recycled":
+            continue
         return {"prev_pid": pid, "prev_lock": lock,
                 "prev_run_id": row["id"],
                 "prev_outcome": row["outcome"],
-                "late_spawn": spawned["run_id"] is None,
+                "prev_run_open": row["ended_at"] is None,
+                "late_spawn": late,
+                "owner_identity": identity,
                 "needs_attention": True}
     return None
+
+
+# Causal-window tolerances for owner identity, in seconds. Event timestamps
+# are integer seconds (floored), so allow 1 s before the claim and 2 s after
+# the spawned event. The window is deliberately ONE-SIDED around the spawn:
+# ``_set_worker_pid`` writes the ``spawned`` event inside write_txn AFTER
+# Popen, so under DB lock contention the event can lag the worker's real
+# creation by up to the busy timeout (measured -7.5 s / -19.6 s on genuine
+# workers). A symmetric +/-N s window around ``spawned_at`` would call those
+# genuine workers dead and let a second worker onto the card.
+_OWNER_CREATE_LEAD_SECONDS = 1.0
+_OWNER_CREATE_LAG_SECONDS = 2.0
+
+
+def _pid_create_time(pid: int) -> Optional[float]:
+    """Wall-clock epoch creation time of ``pid``, or None if unreadable."""
+    try:
+        import psutil
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:  # optional psutil, or process vanished during the probe
+        pass
+    if os.name == "posix":
+        try:
+            from datetime import datetime
+            proc = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(int(pid))],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, timeout=1,
+                env={**os.environ, "LC_ALL": "C"}, check=False,
+            )
+            if proc.returncode == 0:
+                return datetime.strptime(
+                    proc.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def _real_pid_started_in_claim(pid, claimed_at, spawned_at) -> Optional[bool]:
+    """Whether a live ``pid`` was created inside the run's causal window.
+
+    ``True``: created inside ``[claimed_at - 1 s, spawned_at + 2 s]``.
+    ``False``: created outside it -- provably not the recorded worker.
+    ``None``: create time unreadable. A missing bound is simply not applied,
+    so missing evidence never proves a PID recycled.
+    """
+    created = _pid_create_time(pid)
+    if created is None:
+        return None
+    if claimed_at is not None and created < float(claimed_at) - _OWNER_CREATE_LEAD_SECONDS:
+        return False
+    if spawned_at is not None and created > float(spawned_at) + _OWNER_CREATE_LAG_SECONDS:
+        return False
+    return True
+
+
+# Seam: tests with synthetic PIDs substitute a constant verdict here.
+_pid_started_in_claim = _real_pid_started_in_claim
+
+
+def _owner_identity(pid, claimed_at, spawned_at) -> str:
+    """Classify a LIVE pid against the run that recorded it.
+
+    Returns ``"verified"``, ``"recycled"`` (provably not the recorded
+    worker), or ``"unverified"`` (create time unreadable -- fail CLOSED, the
+    caller treats it as the owner).
+    """
+    started = _pid_started_in_claim(pid, claimed_at, spawned_at)
+    if started is None:
+        return "unverified"
+    return "verified" if started else "recycled"
 
 
 @_home_session_guarded("claim")
