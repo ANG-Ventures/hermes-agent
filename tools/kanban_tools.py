@@ -1074,6 +1074,21 @@ def _handle_request_review(args: dict, **kw) -> str:
                 )
             run = kb.latest_run(conn, tid)
             landed = kb.get_task(conn, tid)
+            if landed is not None and landed.status == "done":
+                # kanban.review_policy exempted this card from a review lane:
+                # it completed in place (a ``review_skipped`` event says why).
+                return _ok(
+                    task_id=tid,
+                    run_id=run.id if run else None,
+                    status="done",
+                    review_skipped=True,
+                    note=(
+                        f"review_policy={kb.configured_review_policy()}: this card "
+                        "completes without a same-card review; CI is the test gate "
+                        "and the orchestrator lands the PR. Your task is DONE — do "
+                        "not re-request review."
+                    ),
+                )
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,

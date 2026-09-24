@@ -10488,6 +10488,94 @@ def configured_review_assignee() -> Optional[str]:
     return value.strip()
 
 
+REVIEW_POLICIES = ("always", "milestone_only", "none")
+MILESTONE_TAG = "[milestone]"
+
+
+def configured_review_policy() -> str:
+    """``kanban.review_policy`` — which cards need a same-card review lane.
+
+    ``always`` (default): every ``request_review`` parks the card in ``review``.
+    ``milestone_only``: only a card tagged ``[milestone]`` (title or body) or
+    one that has children (a parent/graph card) goes to review; a plain slice
+    card completes in place — CI is the test gate, the reviewer is milestone QA.
+    ``none``: no card ever enters ``review``; every request completes in place.
+    Unknown values fall back to ``always`` so a typo can never silently skip
+    review.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get("review_policy")
+    except Exception:
+        return "always"
+    if not isinstance(value, str):
+        return "always"
+    value = value.strip().lower().replace("-", "_")
+    return value if value in REVIEW_POLICIES else "always"
+
+
+def _review_required(conn: sqlite3.Connection, task_id: str, policy: str) -> tuple[bool, str]:
+    """Whether ``task_id`` needs a review lane under ``policy``; returns ``(required, why)``."""
+    if policy == "none":
+        return False, "review_policy=none"
+    if policy != "milestone_only":
+        return True, f"review_policy={policy}"
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return True, "task not found"
+    text = f"{row['title'] or ''}\n{row['body'] or ''}".lower()
+    if MILESTONE_TAG in text:
+        return True, "milestone tag"
+    child = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,),
+    ).fetchone()
+    if child is not None:
+        return True, "parent card (has children)"
+    return False, "review_policy=milestone_only: slice card"
+
+
+def _skip_review_and_complete(
+    conn: sqlite3.Connection, task_id: str, *, summary: Optional[str],
+    metadata: Optional[dict], reviewer: Optional[str], expected_run_id: Optional[int],
+    policy: str, why: str,
+) -> Optional[tuple[bool, Optional[str]]]:
+    """Complete a review-exempt card in place and record a ``review_skipped`` event.
+
+    Reuses :func:`complete_task` so the ownership check, survivor
+    preservation and workspace cleanup are exactly the completion path's; the
+    event carries the reviewer the implementer asked for so the skip is
+    auditable. Returns ``None`` when the completion path cannot preserve the
+    worker's changes (:class:`SurvivorUnavailable`): the caller then falls
+    through to the ordinary review transition, so the work parks in ``review``
+    for a human/orchestrator instead of being refused or lost.
+    """
+    from hermes_cli.kanban_survivor import SurvivorUnavailable
+
+    result = summary if (summary and str(summary).strip()) else (
+        f"review skipped ({why}); completed in place")
+    try:
+        ok = complete_task(
+            conn, task_id, result=result, summary=summary, metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
+    except SurvivorUnavailable:
+        return None
+    if not ok:
+        return False, ("review skipped by policy but completion was refused "
+                       "(not running/ready, run mismatch, or parents unsatisfied)")
+    first = str(summary or "").strip().splitlines()
+    with write_txn(conn):
+        _append_event(conn, task_id, "review_skipped", {
+            "policy": policy, "why": why,
+            "reviewer_requested": reviewer,
+            "summary": (first[0][:400] if first else None),
+        })
+    return True, None
+
+
 def review_stale_minutes() -> int:
     """Minutes an unclaimed review card may sit before it is reported stale."""
     try:
@@ -10722,6 +10810,37 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    # kanban.review_policy: a card the policy exempts from same-card review
+    # COMPLETES here instead of parking in ``review`` on a reviewer profile.
+    # Evaluated before the transition so an exempt card never enters review.
+    policy = configured_review_policy()
+    required, why = _review_required(conn, task_id, policy)
+    if not required:
+        # Same live-claim fence as the review transition below: only the
+        # owning run (expected_run_id) or an explicit operator override
+        # (force=True) may close a card another worker is still holding.
+        fence = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if fence is None:
+            return _ret(False, "task not found")
+        if (
+            expected_run_id is None and not force
+            and fence["status"] == "running" and fence["claim_lock"] is not None
+        ):
+            return _ret(
+                False,
+                "task is running under a live claim; pass expected_run_id "
+                "(worker ownership) or force=True (explicit operator override)",
+            )
+        skipped = _skip_review_and_complete(
+            conn, task_id, summary=summary, metadata=metadata, reviewer=reviewer,
+            expected_run_id=expected_run_id, policy=policy, why=why,
+        )
+        if skipped is not None:
+            return _ret(*skipped)
+        # SurvivorUnavailable: the worker's changes could not be preserved by
+        # the completion path — park in review as before so nothing is lost.
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")

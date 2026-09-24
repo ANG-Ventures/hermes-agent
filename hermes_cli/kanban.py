@@ -4185,6 +4185,14 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 1
         persisted_run = kb.latest_run(conn, tid)
         display_summary = persisted_run.summary if persisted_run else None
+        landed = kb.get_task(conn, tid)
+        if landed is not None and landed.status == "done":
+            print(
+                f"Completed {tid} (review skipped: kanban.review_policy="
+                f"{kb.configured_review_policy()})"
+                + (f": {display_summary}" if display_summary else "")
+            )
+            return 0
         print(
             f"Requested review for {tid}"
             + (f": {display_summary}" if display_summary else "")
