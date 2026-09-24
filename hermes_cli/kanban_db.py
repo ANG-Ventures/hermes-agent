@@ -78,7 +78,9 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -4802,6 +4804,241 @@ def _resolve_stored_model_pair(
         return model, provider
 
 
+# ---------------------------------------------------------------------------
+# Home-session card ownership (foreign-session mutation guard)
+# ---------------------------------------------------------------------------
+#
+# ``tasks.session_id`` is a card's HOME session: the chat/agent session that
+# created it. A session acting from a chat may freely READ and COMMENT on any
+# card, but a status/ownership mutation of a card born in ANOTHER session is
+# refused unless the caller passes an explicit override reason, which is then
+# recorded as a comment the home session will see.
+#
+# The guard is keyed on an explicit caller context (:func:`mutation_actor`),
+# set once by each chat-facing surface (the ``hermes kanban`` CLI entry and
+# the ``kanban_*`` tool registration). When no actor is bound — the
+# dispatcher, reapers, the PR gate, direct library/test callers — the guard
+# is inert: it polices humans-and-agents acting from a chat, never the
+# execution lane. The body of a guarded mutator runs with the actor cleared,
+# so internal cascades (a completion promoting children, a reassign that
+# reclaims first) are never re-checked against other cards.
+
+
+class ForeignSessionMutationError(ValueError):
+    """A chat-driven status/ownership mutation targeted a card whose home
+    session is a different session. ``ValueError`` so every existing CLI /
+    tool error path already renders it as a clean refusal."""
+
+
+@dataclass(frozen=True)
+class MutationActor:
+    """Who is mutating, as seen by the home-session guard."""
+
+    session_ids: tuple[str, ...]
+    profile: Optional[str]
+    foreign_ok: Optional[str] = None
+    surface: str = "cli"  # "cli" | "tool" -- only shapes the refusal hint
+
+
+_MUTATION_ACTOR: ContextVar[Optional[MutationActor]] = ContextVar(
+    "kanban_mutation_actor", default=None
+)
+_UNSTAMPED_WARNED: list[bool] = [False]
+
+
+@contextlib.contextmanager
+def mutation_actor(
+    *,
+    session_ids: Iterable[Optional[str]] = (),
+    profile: Optional[str] = None,
+    foreign_ok: Optional[str] = None,
+    surface: str = "cli",
+):
+    """Bind the chat-facing caller for the home-session guard."""
+    ids = tuple(dict.fromkeys(
+        str(s).strip() for s in (session_ids or ()) if s and str(s).strip()
+    ))
+    actor = MutationActor(
+        session_ids=ids,
+        profile=(str(profile).strip() or None) if profile else None,
+        foreign_ok=(str(foreign_ok).strip() or None) if foreign_ok else None,
+        surface=surface,
+    )
+    token = _MUTATION_ACTOR.set(actor)
+    try:
+        yield actor
+    finally:
+        _MUTATION_ACTOR.reset(token)
+
+
+def _caller_session_lineage(session_id: str) -> tuple[str, ...]:
+    """Compression lineage of the caller's session (best effort).
+
+    Context compression rotates the physical session id; without this a
+    session would lose ownership of its own cards after its first
+    compaction. Consulted only on the mismatch path, never on the hot path.
+    """
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            lineage = db.get_compression_lineage(session_id)
+        finally:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
+        return tuple(str(x) for x in (lineage or ()) if x)
+    except Exception:
+        return ()
+
+
+def check_home_session(
+    conn: sqlite3.Connection, task_id: str, action: str
+) -> Optional[MutationActor]:
+    """Enforce home-session ownership for one mutation of ``task_id``.
+
+    Returns ``None`` when the mutation is allowed outright, the bound
+    :class:`MutationActor` when it is allowed ONLY via the ``foreign_ok``
+    override (the caller must then record the audit comment once the
+    mutation succeeds), and raises :class:`ForeignSessionMutationError` when
+    it is refused.
+    """
+    actor = _MUTATION_ACTOR.get()
+    if actor is None:
+        return None
+    row = conn.execute(
+        "SELECT session_id, assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None  # unknown id: the mutator reports it in its own words
+    home = (row["session_id"] or "").strip()
+    if not home:
+        if actor.surface == "cli" and not _UNSTAMPED_WARNED[0]:
+            _UNSTAMPED_WARNED[0] = True
+            print(
+                f"kanban: warning: {task_id} has no home session (legacy "
+                f"unstamped card) -- {action} allowed",
+                file=sys.stderr,
+            )
+        return None
+    # No chat-session identity (cron opener, wake script, a plain shell):
+    # that is the execution lane, not a chat acting on a foreign card.
+    if not actor.session_ids:
+        return None
+    if home in actor.session_ids:
+        return None
+    # Execution lane: the assignee works its card wherever it was born, and a
+    # dispatched worker always owns the card it was spawned for.
+    if actor.profile and (row["assignee"] or "") == actor.profile:
+        return None
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+        return None
+    for sid in actor.session_ids:
+        if home in _caller_session_lineage(sid):
+            return None
+    if actor.foreign_ok:
+        return actor
+    caller = ", ".join(actor.session_ids) or "none"
+    override = (
+        '--foreign-ok "<reason>"' if actor.surface == "cli"
+        else 'foreign_ok="<reason>"'
+    )
+    raise ForeignSessionMutationError(
+        f"refused {action} on {task_id}: its home session is {home} "
+        f"(caller session: {caller}). Status/ownership changes belong to the "
+        f"home session or the assignee -- comment instead: "
+        f"hermes kanban comment {task_id} \"...\" "
+        f"(or override with {override}, which posts an audit comment)."
+    )
+
+
+def _mutation_succeeded(result: Any) -> bool:
+    if result is None:  # ``-> None`` mutators (link_tasks) signal failure by raising
+        return True
+    if isinstance(result, tuple):
+        return bool(result and result[0])
+    return bool(result)
+
+
+def record_foreign_action(
+    conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor
+) -> None:
+    """Append the audit comment for an overridden foreign-session mutation."""
+    sess = ", ".join(actor.session_ids) or "no-session"
+    session_ref = None
+    if actor.session_ids:
+        try:
+            session_ref = derive_session_ref(actor.session_ids[0])
+        except Exception:
+            session_ref = None
+    add_comment(
+        conn,
+        task_id,
+        author=actor.profile or "user",
+        body=(
+            f"foreign-session action by {sess} ({actor.profile or 'unknown'}): "
+            f"{actor.foreign_ok} [{action}]"
+        ),
+        session_ref=session_ref,
+    )
+
+
+def _home_session_guarded(action: str, task_param: str = "task_id"):
+    """Decorate a status/ownership mutator with the home-session guard.
+
+    ``task_param`` names the parameter holding the card being mutated
+    (``child_id`` for :func:`link_tasks`, whose status a link can demote).
+    The contract test enumerates writers of ``tasks.status/assignee/priority/``
+    ``session_id`` plus dispatch-intent events. Each carries this decorator or
+    is an execution-lane internal listed in its ``EXECUTION_LANE`` table.
+    """
+
+    def deco(fn):
+        sig = inspect.signature(fn)
+        if task_param not in sig.parameters:
+            raise TypeError(f"{fn.__name__} has no parameter {task_param!r}")
+
+        @functools.wraps(fn)
+        def wrapper(conn, *args, **kwargs):
+            if _MUTATION_ACTOR.get() is None or kwargs.get("dry_run"):
+                return fn(conn, *args, **kwargs)
+            task_id = sig.bind_partial(conn, *args, **kwargs).arguments.get(task_param)
+            override = check_home_session(conn, str(task_id), action)
+            token = _MUTATION_ACTOR.set(None)
+            try:
+                result = fn(conn, *args, **kwargs)
+            finally:
+                _MUTATION_ACTOR.reset(token)
+            if override is not None and _mutation_succeeded(result):
+                record_foreign_action(conn, str(task_id), action, override)
+            return result
+
+        wrapper.__home_session_action__ = action
+        wrapper.__home_session_task_param__ = task_param
+        return wrapper
+
+    return deco
+
+
+@_home_session_guarded("update --session")
+def set_task_session(
+    conn: sqlite3.Connection, task_id: str, session_id: Optional[str]
+) -> bool:
+    """(Re)stamp a card's home session. ``None`` clears it (unstamped)."""
+    sid = (str(session_id).strip() or None) if session_id else None
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ?", (sid, task_id)
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "session_restamped", {"session_id": sid}
+        )
+    return True
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -5425,6 +5662,7 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+@_home_session_guarded("assign")
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
@@ -5771,6 +6009,14 @@ def apply_batch_route_writes(
         effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
         prepared.append((write, model, provider, effort))
 
+    # Home-session guard for every card in the batch, before the writer lock:
+    # one foreign card refuses the whole batch with nothing written.
+    overrides: dict[str, MutationActor] = {}
+    for write in writes:
+        ov = check_home_session(conn, write.task_id, "set-model")
+        if ov is not None:
+            overrides[write.task_id] = ov
+
     written: list[str] = []
     fields: dict[str, tuple[str, ...]] = {}
     skipped_now: dict[str, str] = {}
@@ -5806,6 +6052,8 @@ def apply_batch_route_writes(
     # batch never announces a mutation that did not happen.
     for task_id in written:
         notify_task_updated(conn, task_id, fields[task_id])
+        if task_id in overrides:
+            record_foreign_action(conn, task_id, "set-model", overrides[task_id])
     return written
 
 
@@ -5813,6 +6061,7 @@ def apply_batch_route_writes(
 # Links
 # ---------------------------------------------------------------------------
 
+@_home_session_guarded("link", task_param="child_id")
 def link_tasks(
     conn: sqlite3.Connection,
     parent_id: str,
@@ -7017,6 +7266,7 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
     return None
 
 
+@_home_session_guarded("claim")
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7542,6 +7792,7 @@ def release_stale_claims(
     return reclaimed
 
 
+@_home_session_guarded("reclaim")
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7658,6 +7909,7 @@ def reclaim_task(
     return True
 
 
+@_home_session_guarded("reassign")
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7885,6 +8137,7 @@ class EmptySupersedeError(ValueError):
         )
 
 
+@_home_session_guarded("complete")
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9751,6 +10004,7 @@ def edit_completed_task_result(
     return True
 
 
+@_home_session_guarded("block")
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10280,6 +10534,7 @@ def arm_review_stale_alerts(conn: sqlite3.Connection, entries: list[dict]) -> li
     return fresh
 
 
+@_home_session_guarded("request-review")
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10458,6 +10713,7 @@ def request_review(
     return _ret(True)
 
 
+@_home_session_guarded("request-changes")
 def request_changes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10577,6 +10833,7 @@ def request_changes(
     return True, implementer
 
 
+@_home_session_guarded("requeue")
 def requeue_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10615,6 +10872,8 @@ def requeue_task(
     return True, None
 
 
+
+@_home_session_guarded("reopen")
 def reopen_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10743,6 +11002,7 @@ def reopen_task(
     return True, None
 
 
+@_home_session_guarded("promote")
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10862,6 +11122,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
+@_home_session_guarded("unblock")
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -10923,6 +11184,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+@_home_session_guarded("reopen-review")
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``review`` -> ready (or todo) so the implementer re-runs.
 
@@ -11161,6 +11423,7 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+@_home_session_guarded("specify")
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11263,6 +11526,7 @@ def specify_triage_task(
 TRIAGE_RESOLVE_TARGETS = ("todo", "done", "archived")
 
 
+@_home_session_guarded("triage-resolve")
 def triage_resolve_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11389,6 +11653,7 @@ def triage_resolve_task(
     return True, None
 
 
+@_home_session_guarded("decompose")
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11655,6 +11920,7 @@ def decompose_triage_task(
     return child_ids
 
 
+@_home_session_guarded("archive")
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
@@ -12297,6 +12563,7 @@ def set_workspace_path(
     record_baseline(conn, task_id, path)
 
 
+@_home_session_guarded("set-model")
 def set_task_model(
     conn: sqlite3.Connection, task_id: str, model: Optional[str]
 ) -> int:
@@ -12347,6 +12614,7 @@ def set_branch_name(
 
 
 # ---------------------------------------------------------------------------
+@_home_session_guarded("schedule")
 def schedule_task(
     conn: sqlite3.Connection,
     task_id: str,
