@@ -55,11 +55,28 @@ def test_operator_requeue_ready_card(board):
         assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
         assert kb.requeue_task(conn, task_id, actor="operator", reason="again") == (True, None)
         assert kbd.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(conn, task_id, "worker", "status update without a PR")
+        assert kbd.check_respawn_guard(conn, task_id) is None
         with kb.write_txn(conn):
             kb._append_event(conn, task_id, "spawned", {"pid": 42})
         assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
         assert kb.block_task(conn, task_id, kind="needs_input", reason="wait")
         assert kb.requeue_task(conn, task_id, actor="operator", reason="again")[0] is False
+
+
+def test_ordinary_comment_after_wait_does_not_cancel_pr_resume(board):
+    with kbc.connect() as conn:
+        child = kb.create_task(conn, title="implement", assignee="worker")
+        claim = kb.claim_task(conn, child)
+        assert claim is not None
+        kb.add_comment(conn, child, "worker", "https://github.com/o/r/pull/9")
+        parent = kb.create_task(conn, title="prerequisite", assignee="worker")
+        kb.link_tasks(conn, parent, child, expected_child_run_id=claim.current_run_id)
+        assert kb.block_task(conn, child, kind="dependency", reason="resume")
+        kb.add_comment(conn, child, "worker", "parent still pending")
+        assert kb.complete_task(conn, parent, summary="prerequisite complete")
+        kb.recompute_ready(conn)
+        assert kbd.check_respawn_guard(conn, child) is None
 
 
 def test_new_pr_comment_after_wait_does_not_resume(board):

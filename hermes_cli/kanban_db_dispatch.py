@@ -1593,8 +1593,8 @@ def check_respawn_guard(
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
@@ -1613,30 +1613,41 @@ def check_respawn_guard(
         # work on the same PR until the parent completes. The promotion grants
         # one continuation spawn only; a later crash/reclaim stays guarded.
         # Event ids disambiguate transitions within one timestamp second.
+        # Match this PR-bearing comment to its corresponding commented event.
+        # Ordering by event id (rather than second-resolution timestamps or
+        # every subsequent comment) distinguishes a newer PR from ordinary
+        # status updates after the worker's dependency block.
+        comment_offset = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
+            "AND created_at = ? AND id < ?",
+            (task_id, int(c["created_at"] or 0), c["id"]),
+        ).fetchone()[0]
+        pr_event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
+            "AND created_at = ? ORDER BY id LIMIT 1 OFFSET ?",
+            (task_id, int(c["created_at"] or 0), comment_offset),
+        ).fetchone()
+        # Imported comments without a matching event cannot grant a resume.
+        pr_event_id = int(pr_event["id"]) if pr_event else 0
         resume = conn.execute(
             "SELECT 1 FROM task_events p WHERE p.task_id = ? AND p.kind = 'promoted' "
             "AND EXISTS (SELECT 1 FROM task_events d WHERE d.task_id = p.task_id "
             "AND d.kind = 'dependency_wait' AND json_extract(d.payload, '$.kind') = 'dependency' "
-            "AND d.created_at >= ? AND d.id < p.id "
-            "AND NOT EXISTS (SELECT 1 FROM task_events c WHERE c.task_id = d.task_id "
-            "AND c.kind = 'commented' AND c.created_at >= ? AND c.id > d.id)) "
+            "AND d.id > ? AND d.id < p.id) "
             "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = p.task_id "
             "AND s.kind = 'spawned' AND s.id > p.id) LIMIT 1",
-            (task_id, int(c["created_at"] or 0), int(c["created_at"] or 0)),
-        ).fetchone()
+            (task_id, pr_event_id),
+        ).fetchone() if pr_event_id else None
         if resume:
             return None
         # A READY card can also be deliberately retried by an operator without
         # the block/unblock status round trip.
         requeued = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'requeued' "
-            "AND created_at >= ? AND NOT EXISTS (SELECT 1 FROM task_events s "
+            "AND id > ? AND NOT EXISTS (SELECT 1 FROM task_events s "
             "WHERE s.task_id = ? AND s.kind = 'spawned' AND s.id > task_events.id) "
-            "AND NOT EXISTS (SELECT 1 FROM task_events c2 WHERE c2.task_id = ? "
-            "AND c2.kind = 'commented' AND c2.created_at >= ? AND c2.id > task_events.id) "
-            "LIMIT 1", (task_id, int(c["created_at"] or 0), task_id,
-                         task_id, int(c["created_at"] or 0)),
-        ).fetchone()
+            "LIMIT 1", (task_id, pr_event_id, task_id),
+        ).fetchone() if pr_event_id else None
         if requeued:
             return None
         return "active_pr"
