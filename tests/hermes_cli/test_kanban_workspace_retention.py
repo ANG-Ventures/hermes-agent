@@ -16,6 +16,7 @@ These tests drive the real lanes against a sealed temp home.
 from __future__ import annotations
 
 import argparse
+import signal
 import subprocess
 import sys
 import time
@@ -257,6 +258,43 @@ def test_cwd_scan_failure_retains_every_candidate(kanban_home, monkeypatch, fail
     assert calls, "the cwd scan was never attempted"
     audit = kb.workspace_deletion_log_path().read_text(encoding="utf-8")
     assert f"REFUSED\ttask={a.name}\t" in audit and "owner-has-live-run" in audit
+
+
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="POSIX interval timer")
+def test_cwd_stat_timeout_retains_candidate(kanban_home, monkeypatch):
+    """The GC budget includes the realpath/stat pass, not only lsof."""
+    _home_rooted_dir_card(kanban_home, "running")
+    old = _scratch(_mktask("old done"), "done", finished_days_ago=5)
+    _fake_lsof(monkeypatch, _listing("/", str(old.parent)))
+    monkeypatch.setattr(kb, "_CWD_SCAN_BUDGET_SECONDS", 0.05)
+    real_identity = kb._path_identity
+
+    def stalled_identity(path, memo=None):
+        if path == old and signal.getitimer(signal.ITIMER_REAL)[0] > 0:
+            time.sleep(2)
+        return real_identity(path, memo)
+
+    monkeypatch.setattr(kb, "_path_identity", stalled_identity)
+    started = time.monotonic()
+    assert _gc(done_retention_days=3) == 0
+    assert time.monotonic() - started < 1.5
+    assert old.is_dir(), "a stalled stat must fail CLOSED"
+    audit = kb.workspace_deletion_log_path().read_text(encoding="utf-8")
+    assert f"REFUSED\ttask={old.name}\t" in audit and "owner-has-live-run" in audit
+
+
+def test_cwd_budget_expired_after_scan_retains_candidate(kanban_home, monkeypatch):
+    _home_rooted_dir_card(kanban_home, "running")
+    old = _scratch(_mktask("old done"), "done", finished_days_ago=5)
+    _fake_lsof(monkeypatch, _listing("/"))
+    with kb.process_cwd_snapshot_scope():
+        kb._process_cwds()
+        token = kb._CWD_SCAN_DEADLINE.set(time.monotonic() - 1)
+        try:
+            assert kb._process_cwd_within(old) is True
+        finally:
+            kb._CWD_SCAN_DEADLINE.reset(token)
+    assert old.is_dir()
 
 
 def test_live_home_card_without_cwd_in_candidate_reaps_it(kanban_home, monkeypatch):

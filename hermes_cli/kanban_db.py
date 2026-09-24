@@ -85,6 +85,7 @@ import re
 import random
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -8192,6 +8193,45 @@ def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
 _CWD_SNAPSHOT_SCOPE: ContextVar[Optional[list]] = ContextVar(
     "kanban_cwd_snapshot_scope", default=None,
 )
+_CWD_SCAN_DEADLINE: ContextVar[Optional[float]] = ContextVar(
+    "kanban_cwd_scan_deadline", default=None,
+)
+_CWD_SCAN_BUDGET_SECONDS = 30
+
+
+@contextlib.contextmanager
+def _bounded_cwd_probe():
+    """Bound lsof AND filesystem probes to one GC-run budget; fail closed.
+
+    A stat of an lsof cwd on a dead mount can block independently of lsof.
+    SIGALRM interrupts that syscall on POSIX; in threads or on platforms
+    without interval timers we refuse reclamation rather than run unbounded.
+    """
+    deadline = _CWD_SCAN_DEADLINE.get()
+    if deadline is None:
+        yield
+        return
+    if (not hasattr(signal, "setitimer") or
+            threading.current_thread() is not threading.main_thread()):
+        raise TimeoutError("cwd probe cannot be bounded in this context")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("cwd probe budget exhausted")
+    previous = signal.getitimer(signal.ITIMER_REAL)
+    if previous[0] > 0:
+        raise TimeoutError("cwd probe cannot replace an existing alarm")
+    old_handler = signal.getsignal(signal.SIGALRM)
+
+    def expired(_signum, _frame):
+        raise TimeoutError("cwd probe budget exhausted")
+
+    signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def _path_identity(path: Path, memo: Optional[dict] = None) -> Optional[tuple[int, int]]:
@@ -8243,7 +8283,7 @@ def _same_path(a: Path, b: Path, memo: Optional[dict] = None) -> bool:
 
 
 def _pin_file_agrees(a: Path, b: Path) -> bool:
-    """Allow an uncreated DB pin only at the same parent and filename.
+    """Compare an uncreated DB pin by existing ancestor and exact missing tail.
 
     This is a pin agreement check, never scratch admission or ownership: an
     uncreated DB file has no filesystem identity until the first connection.
@@ -8252,7 +8292,9 @@ def _pin_file_agrees(a: Path, b: Path) -> bool:
         return True
     if _path_identity(a) is not None or _path_identity(b) is not None:
         return False
-    return a.name == b.name and _same_path(a.parent, b.parent)
+    ancestor_a, ancestor_b = _existing_ancestor(a), _existing_ancestor(b)
+    return (_same_path(ancestor_a, ancestor_b)
+            and a.parts[len(ancestor_a.parts):] == b.parts[len(ancestor_b.parts):])
 
 
 def _unknown_owner_may_claim(candidate: Path, stored: Path) -> bool:
@@ -8281,9 +8323,9 @@ def _scan_process_cwds() -> Optional[frozenset]:
     this process's own cwd, so a non-zero exit or an empty listing is a
     failed scan, never "nothing found"; callers must fail closed on None.
 
-    Names are kept exactly as lsof prints them; resolving every machine cwd
-    could block on a dead network mount outside the lsof timeout. The candidate
-    and only plausible matching cwds use the shared path identity.
+    Names are kept exactly as lsof prints them. Filesystem identity checks
+    are covered by the same GC-run deadline as the lsof call, so a dead mount
+    cannot leave the cwd probe stuck beyond its budget.
     """
     try:
         result = subprocess.run(
@@ -8313,9 +8355,13 @@ def process_cwd_snapshot_scope():
     and the rmtree.
     """
     token = _CWD_SNAPSHOT_SCOPE.set([])
+    deadline_token = _CWD_SCAN_DEADLINE.set(
+        time.monotonic() + _CWD_SCAN_BUDGET_SECONDS
+    )
     try:
         yield
     finally:
+        _CWD_SCAN_DEADLINE.reset(deadline_token)
         _CWD_SNAPSHOT_SCOPE.reset(token)
 
 
@@ -8336,22 +8382,23 @@ def _process_cwd_within(path: Path) -> bool:
     exempting that broad enclosing path from ownership. A failed or timed-out
     cwd scan answers True (preserve the path).
     """
-    cwds = _process_cwds()
-    if cwds is None:
-        return True
     try:
-        if _path_identity(path) is None:
-            return True
-        for cwd in cwds:
-            # A real lsof cwd exists. An unreadable one is unknown, not
-            # evidence that no process occupies the candidate.
-            if _path_identity(cwd) is None:
-                if _unknown_owner_may_claim(path, cwd):
-                    return True
-                continue
-            if _same_tree(cwd, path):
+        with _bounded_cwd_probe():
+            cwds = _process_cwds()
+            if cwds is None:
                 return True
-        return False
+            if _path_identity(path) is None:
+                return True
+            for cwd in cwds:
+                # A real lsof cwd exists. An unreadable one is unknown, not
+                # evidence that no process occupies the candidate.
+                if _path_identity(cwd) is None:
+                    if _unknown_owner_may_claim(path, cwd):
+                        return True
+                    continue
+                if _same_tree(cwd, path):
+                    return True
+            return False
     except (OSError, RuntimeError, ValueError):
         return True
 
