@@ -2793,7 +2793,9 @@ DEFAULT_CONFIG = {
     # command prompts the user for consent; subsequent runs reuse the
     # stored approval from ~/.hermes/shell-hooks-allowlist.json.
     # See `website/docs/user-guide/features/hooks.md` for schema + examples.
-    "hooks": {},
+    # missing_hook_policy: what a hook whose script (or a tracked sibling) is ABSENT does —
+    # restore_then_fail_closed | fail_closed | fail_open_and_page.
+    "hooks": {"missing_hook_policy": "restore_then_fail_closed"},
 
     # Auto-accept shell-hook registrations without a TTY prompt.  Also
     # toggleable per-invocation via --accept-hooks or HERMES_ACCEPT_HOOKS=1.
