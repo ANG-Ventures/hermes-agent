@@ -25,6 +25,13 @@ def board(tmp_path, monkeypatch):
         yield conn
 
 
+@pytest.fixture(autouse=True)
+def _short_cpu_sample(monkeypatch):
+    """Keep the real delta probe, shorten its window: still two real CPU-time
+    samples of a real process, 100 ms apart instead of 500 ms."""
+    monkeypatch.setattr(kb, "_CPU_SAMPLE_SECONDS", 0.1)
+
+
 @pytest.fixture
 def silent_server():
     """A local 'provider' that accepts connections and never answers."""
@@ -41,13 +48,18 @@ def _reap_in_background(proc):
 
 
 def _wait_idle(pid, timeout=30.0):
-    """Wait until the REAL probe reads idle on 6 consecutive samples."""
+    """Wait until the REAL probe reads idle on 3 consecutive samples.
+
+    Each sample is itself a CPU-time delta over ``_CPU_SAMPLE_SECONDS``, so
+    this waits for the process to STOP burning CPU, not for a lifetime
+    average to decay (the Linux ``ps -o pcpu`` flake, t_46a2f8a1).
+    """
     deadline, streak = time.monotonic() + timeout, 0
     while time.monotonic() < deadline:
         streak = 0 if kb._worker_cpu_active(pid) else streak + 1
-        if streak >= 6:
+        if streak >= 3:
             return
-        time.sleep(0.25)
+        time.sleep(0.1)
     pytest.fail(f"pid {pid} never read idle to the real probe")
 
 
@@ -217,18 +229,26 @@ def test_cpu_active_worker_vetoes_stale_progress(board, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", [
-    OSError("ps missing"),
-    subprocess.CalledProcessError(1, ["ps"]),
-    subprocess.TimeoutExpired(["ps"], 2),
+    OSError("proc unreadable"),
+    RuntimeError("probe blew up"),
+    "access_denied",
+    "psutil_missing",
 ])
 def test_process_probe_failure_never_authorizes_reclaim(board, monkeypatch, silent_server, failure):
+    import psutil
+
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
     proc = _in_flight_worker(silent_server)
     try:
-        def broken(*_a, **_kw):
-            raise failure
-        monkeypatch.setattr(subprocess, "run", broken)
+        if failure == "psutil_missing":
+            monkeypatch.setitem(sys.modules, "psutil", None)  # import -> ImportError
+        else:
+            exc = psutil.AccessDenied(proc.pid) if failure == "access_denied" else failure
+
+            def broken(*_a, **_kw):
+                raise exc
+            monkeypatch.setattr(psutil, "Process", broken)
         assert kb._worker_cpu_active(proc.pid) is True
         tid = _running(board, now, proc.pid, progress_at=now - 1600)
         assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == []
@@ -236,6 +256,39 @@ def test_process_probe_failure_never_authorizes_reclaim(board, monkeypatch, sile
         assert proc.poll() is None
     finally:
         proc.kill()
+
+
+def test_past_cpu_burn_does_not_veto_a_worker_idle_now():
+    """t_46a2f8a1: the veto answers "burning CPU NOW", not "ever burned CPU".
+
+    Linux ``ps -o pcpu`` is lifetime CPU / lifetime elapsed, so a worker that
+    did real work and then stalled read nonzero for hours and vetoed its own
+    reclaim. A real child burns ~1 s of CPU, signals, then blocks: the probe
+    must read it idle within a couple of samples of the signal.
+    """
+    code = (
+        "import sys,time\n"
+        "t=time.process_time()\n"
+        "while time.process_time()-t<1.0: pass\n"
+        "sys.stdout.write('x');sys.stdout.flush();sys.stdin.read()"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout.read(1) == b"x"  # the burn is over; it blocks from here
+        idle = [kb._worker_cpu_active(proc.pid) for _ in range(4)]
+        assert idle[-2:] == [False, False], idle
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_exited_process_reads_idle():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+    assert kb._worker_cpu_active(proc.pid) is False
 
 
 def test_run_without_progress_signal_is_unknown_and_never_reclaimed(board, monkeypatch, silent_server):
