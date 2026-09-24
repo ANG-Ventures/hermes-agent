@@ -19862,6 +19862,11 @@ def backfill_notify_sub_user_ids(
     pending: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
+        if is_unhomed(item.get("creator_session_id")):
+            # The 'unhomed' sentinel means "no creator provenance", exactly
+            # like a legacy NULL. Normalize at this reader so no resolver can
+            # mistake it for a raw session id and adopt on lane evidence.
+            item["creator_session_id"] = None
         if "delivery_metadata" in item:
             item["delivery_metadata"] = _decode_notify_delivery_metadata(
                 item.get("delivery_metadata")

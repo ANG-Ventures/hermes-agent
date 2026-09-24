@@ -33,10 +33,19 @@ Consumers — keep them on this one helper: `kanban list --home`, `kanban show`'
   the body already has an `origin:` line.
 - **`unhomed`** (cron/script/shell births) is foreign to every chat session;
   it loads as `Task.session_id=None, unhomed=True`, so notification/wake
-  routing is unchanged.
+  routing is unchanged. Raw-SQL readers of `tasks.session_id` must treat it
+  like NULL: `backfill_notify_sub_user_ids` (`kanban notify-repair`) maps it to
+  "no creator provenance", so a user-less card never adopts the lone human in
+  its chat.
 - **`kanban list`** with a caller session prints `THIS SESSION (n)` then
   `OTHER SESSIONS (m)`, one line each. `--this-session` (= `--home`) filters,
-  `--all` gives the flat view.
+  `--all` gives the flat view. The `kanban_list` tool does the same: this
+  session's cards in full under `tasks`, others collapsed to
+  `{id, status, title[, unhomed]}` under `other_sessions`; `all=true` is flat.
+- **Re-scope.** There is no `edit` verb. The title/body writers are
+  `specify` (guarded like every other mutator) and the dashboard's
+  `PATCH /tasks/:id`, which — like every dashboard mutation — runs with no
+  session identity (the human operator's surface) and is therefore unguarded.
 - **`--takeover REASON`** (alias of `--foreign-ok`) acts on a foreign or
   unhomed card; it writes a `takeover` event and a `takeover:` comment.
   `comment` is never guarded. Sessionless callers (cron sweeps) stay unguarded.
