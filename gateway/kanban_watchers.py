@@ -305,6 +305,63 @@ _FAULT_FIELDS = (
 )
 
 
+def _format_spawn_routes(routes, sources=None) -> str:
+    """Format provider/model and source for every spawned task."""
+
+    from hermes_cli.model_policy import route_kind
+
+    entries = dict(routes or {})
+    if not entries:
+        return "routes=-"
+    sources = dict(sources or {})
+    return "routes=" + "; ".join(
+        f"{task_id} route={route} source={sources.get(task_id, 'profile-default')} "
+        f"kind={route_kind(route)}"
+        for task_id, route in entries.items()
+    )
+
+
+def _format_lane_expiry(lane, route, successor="profile default") -> str:
+    return f"lane-model expired -> {successor} ({lane}: {route})"
+
+
+def _log_dispatch_tick(logger, slug, res) -> None:
+    """Log route choices and expiries, including ticks with no new workers."""
+    if res is None:
+        return
+    successors = getattr(res, "expired_lane_successors", None) or {}
+    for lane, route in (getattr(res, "expired_lane_models", None) or []):
+        logger.info(
+            "kanban dispatcher [%s]: %s",
+            slug,
+            _format_lane_expiry(lane, route, successors.get(lane, "profile default")),
+        )
+    spawned = getattr(res, "spawned", None)
+    guarded = getattr(res, "respawn_guarded", None)
+    parent_satisfied_sticky = getattr(res, "parent_satisfied_sticky", None)
+    if spawned or guarded or parent_satisfied_sticky:
+        # Quiet by default — log only actionable tick activity, including
+        # guarded tasks and satisfied dependency graphs still held by an
+        # explicit worker/operator block.
+        logger.info(
+            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s %s %s",
+            slug,
+            len(spawned or []),
+            res.reclaimed,
+            len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
+            len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
+            res.promoted,
+            len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+            _format_spawn_routes(
+                getattr(res, "spawn_routes", None),
+                getattr(res, "spawn_route_sources", None),
+            ),
+            _format_respawn_guarded_summary(guarded),
+            _format_parent_satisfied_sticky_summary(parent_satisfied_sticky),
+        )
+
+
 def _format_parent_satisfied_sticky_summary(task_ids) -> str:
     """Count and name explicit holds whose dependencies are already done."""
     ids = sorted(str(task_id) for task_id in (task_ids or []))
@@ -2425,11 +2482,6 @@ class GatewayKanbanWatchersMixin:
                     any_spawned = False
                     for slug, res in (results or []):
                         spawned = getattr(res, "spawned", None) if res is not None else None
-                        guarded = getattr(res, "respawn_guarded", None) if res is not None else None
-                        parent_satisfied_sticky = (
-                            getattr(res, "parent_satisfied_sticky", None)
-                            if res is not None else None
-                        )
                         refused = getattr(res, "workspace_refused", None) if res is not None else None
                         if spawned:
                             any_spawned = True
@@ -2445,23 +2497,7 @@ class GatewayKanbanWatchersMixin:
                                     slug, summary,
                                 )
                                 last_workspace_refusal_warn[slug] = (summary, now_s)
-                        if res is not None and (spawned or guarded or parent_satisfied_sticky):
-                            # Quiet by default — log only actionable tick activity,
-                            # including guarded tasks and satisfied dependency graphs
-                            # still held by an explicit worker/operator block.
-                            logger.info(
-                                "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s %s",
-                                slug,
-                                len(spawned or []),
-                                res.reclaimed,
-                                len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                                len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                                res.promoted,
-                                len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
-                                _format_respawn_guarded_summary(guarded),
-                                _format_parent_satisfied_sticky_summary(parent_satisfied_sticky),
-                            )
+                        _log_dispatch_tick(logger, slug, res)
                         # Stranded subtrees: children held in ``todo`` behind a
                         # parent only a human can clear. This CANNOT reach the
                         # stall detector below — that gate requires a non-empty

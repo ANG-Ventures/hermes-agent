@@ -2645,6 +2645,25 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Board-level, time-boxed model routing. A row here re-routes every spawn
+-- for its lane that does NOT carry its own per-card override, and expires on
+-- the dispatcher clock (``expires_at``) so a capacity workaround cannot
+-- become a standing default the way editing a profile's config.yaml does.
+-- ``assignee IS NULL`` is the board-wide lane; a row naming an assignee wins
+-- over it for that profile. One active row per lane (PRIMARY KEY collapses
+-- re-sets to an upsert), so ``lane-model set`` is idempotent.
+CREATE TABLE IF NOT EXISTS lane_model_overrides (
+    assignee     TEXT PRIMARY KEY,   -- '' == board-wide lane (NULL can't be a PK)
+    provider     TEXT NOT NULL,
+    model        TEXT NOT NULL,
+    reasoning_effort TEXT,
+    reason       TEXT,
+    firepower    TEXT,               -- justification when the model is flagship-class
+    created_by   TEXT,
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lane_model_expires ON lane_model_overrides(expires_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -4171,6 +4190,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
         )
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lane_model_overrides'"
+    ).fetchone():
+        _add_column_if_missing(
+            conn, "lane_model_overrides", "reasoning_effort", "reasoning_effort TEXT"
+        )
 
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
@@ -5433,6 +5458,8 @@ def set_model_override(
     model: Optional[str],
     provider: Optional[str] = None,
     *,
+    audit_comment_author: Optional[str] = None,
+    audit_comment_body: Optional[str] = None,
     flagship_override_reason: Optional[str] = None,
     flagship_override_author: Optional[str] = None,
 ) -> bool:
@@ -5448,48 +5475,147 @@ def set_model_override(
     Allowed on any non-archived task, including ``running`` ones — the
     override only takes effect on the NEXT dispatch, so setting it on a
     running task that's about to be reclaimed/retried is the primary
-    rate-limit-recovery flow. Returns True on success.
+    rate-limit-recovery flow. ``audit_comment_author`` and
+    ``audit_comment_body`` must be supplied together; the comment is committed
+    atomically with the override. ``flagship_override_reason`` (main's
+    ``--allow-flagship``) is translated into the ``flagship override:``
+    comment the dispatcher's flagship gate looks for. Returns True on success.
+    """
+    audit_comment_author, audit_comment_body = _flagship_reason_to_audit(
+        model, provider,
+        audit_comment_author=audit_comment_author,
+        audit_comment_body=audit_comment_body,
+        flagship_override_reason=flagship_override_reason,
+        flagship_override_author=flagship_override_author,
+    )
+    model, provider = _validate_model_override_args(
+        model, provider,
+        audit_comment_author=audit_comment_author,
+        audit_comment_body=audit_comment_body,
+    )
+    with write_txn(conn):
+        if not _set_model_override_locked(
+            conn, task_id, model, provider,
+            audit_comment_author=audit_comment_author,
+            audit_comment_body=audit_comment_body,
+        ):
+            return False
+    # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
+    notify_task_updated(conn, task_id, ("model_override", "provider_override"))
+    return True
+
+
+def _validate_model_override_args(
+    model: Optional[str],
+    provider: Optional[str],
+    *,
+    audit_comment_author: Optional[str] = None,
+    audit_comment_body: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Normalise + validate a route pair WITHOUT touching the database.
+
+    Split out of :func:`set_model_override` so a batch can validate every
+    card's arguments before it opens its single write transaction: argument
+    errors must never be discovered halfway through a batch, where some
+    cards have already been written.
     """
     model = (model or "").strip() or None
     provider = (provider or "").strip() or None
+    if bool(audit_comment_author) != bool(audit_comment_body):
+        raise ValueError(
+            "audit_comment_author and audit_comment_body must be supplied together"
+        )
     if provider and not model:
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
     model, provider = _resolve_stored_model_pair(model, provider)
-    from hermes_cli.model_policy import validate_worker_model
-
-    flagship_override_reason = validate_worker_model(
-        model,
-        allow_flagship_reason=flagship_override_reason,
+    # Main's flagship ban (model_policy) is the one predicate. A flagship
+    # route is only writable together with the ``flagship override:`` comment
+    # the dispatcher's flagship gate accepts, so a route this layer writes can
+    # never be one the dispatcher then silently refuses.
+    from hermes_cli.model_policy import (
+        FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+        flagship_model_error,
+        is_firepower_model,
     )
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if not row:
-            return False
-        if row["status"] == "archived":
-            raise RuntimeError(f"cannot set model override on archived task {task_id}")
-        conn.execute(
-            "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
-            (model, provider, task_id),
-        )
-        _append_event(
-            conn, task_id, "model_override_set",
-            {"model": model, "provider": provider},
-        )
-        if flagship_override_reason:
-            from hermes_cli.model_policy import override_comment
 
-            add_comment(
-                conn,
-                task_id,
-                flagship_override_author or "operator",
-                override_comment(flagship_override_reason),
-            )
-    # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
-    notify_task_updated(conn, task_id, ("model_override", "provider_override"))
+    if is_firepower_model(model):
+        body = (audit_comment_body or "").lstrip().casefold()
+        if not body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
+            raise ValueError(flagship_model_error(str(model)))
+    return model, provider
+
+
+def _flagship_reason_to_audit(
+    model: Optional[str],
+    provider: Optional[str],
+    *,
+    audit_comment_author: Optional[str],
+    audit_comment_body: Optional[str],
+    flagship_override_reason: Optional[str],
+    flagship_override_author: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Map main's ``flagship_override_reason`` onto the audit-comment pair.
+
+    Only a flagship route gets a comment (same as main: a reason on a
+    standard model is ignored). An explicit audit comment wins.
+    """
+    reason = (flagship_override_reason or "").strip()
+    if audit_comment_body or not reason:
+        return audit_comment_author, audit_comment_body
+    from hermes_cli.model_policy import is_firepower_model, override_comment
+
+    resolved, _ = _resolve_stored_model_pair(
+        (model or "").strip() or None, (provider or "").strip() or None,
+    )
+    if not is_firepower_model(resolved):
+        return audit_comment_author, audit_comment_body
+    return flagship_override_author or "operator", override_comment(reason)
+
+
+def _set_model_override_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    model: Optional[str],
+    provider: Optional[str],
+    *,
+    audit_comment_author: Optional[str] = None,
+    audit_comment_body: Optional[str] = None,
+) -> bool:
+    """Write one route override. MUST already be inside a ``write_txn``.
+
+    The status re-read happens here, inside the caller's transaction, so it
+    is the row state the write commits against — not a stale pre-check. A
+    batch therefore cannot half-commit when another connection archives a
+    selected card after selection: the ``RuntimeError`` raised here unwinds
+    the caller's transaction and every card in it.
+
+    ``model``/``provider`` must already have passed
+    :func:`_validate_model_override_args`.
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "archived":
+        raise RuntimeError(f"cannot set model override on archived task {task_id}")
+    conn.execute(
+        "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
+        (model, provider, task_id),
+    )
+    _append_event(
+        conn, task_id, "model_override_set",
+        {"model": model, "provider": provider},
+    )
+    if audit_comment_body:
+        add_comment(
+            conn,
+            task_id,
+            audit_comment_author or "",
+            audit_comment_body,
+        )
     return True
 
 
@@ -5512,25 +5638,166 @@ def set_reasoning_effort(
     """
     effort = normalize_reasoning_effort(effort)
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if not row:
+        if not _set_reasoning_effort_locked(conn, task_id, effort):
             return False
-        if row["status"] == "archived":
-            raise RuntimeError(
-                f"cannot set reasoning effort on archived task {task_id}"
-            )
-        conn.execute(
-            "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
-            (effort, task_id),
-        )
-        _append_event(
-            conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
-        )
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("reasoning_effort",))
     return True
+
+
+def _set_reasoning_effort_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    effort: Optional[str],
+) -> bool:
+    """Write one effort override. MUST already be inside a ``write_txn``.
+
+    Sibling of :func:`_set_model_override_locked`; same reason. ``effort``
+    must already have passed :func:`normalize_reasoning_effort`.
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "archived":
+        raise RuntimeError(
+            f"cannot set reasoning effort on archived task {task_id}"
+        )
+    conn.execute(
+        "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
+        (effort, task_id),
+    )
+    _append_event(
+        conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
+    )
+    return True
+
+
+@dataclass
+class BatchRouteWrite:
+    """One card's requested route/effort change inside a batch."""
+
+    task_id: str
+    touch_model: bool = False
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    audit_comment_author: Optional[str] = None
+    audit_comment_body: Optional[str] = None
+    touch_effort: bool = False
+    effort: Optional[str] = None
+    # The selection predicate that chose this card, re-checked under the
+    # batch's writer lock. ``None`` means "no constraint on that column".
+    require_statuses: Optional[frozenset] = None
+    require_assignees: Optional[frozenset] = None
+    # Selector-chosen cards (``--where`` / ``--all-active``) that stopped
+    # matching are SKIPPED and reported; an explicitly named card that
+    # stopped matching aborts the whole batch, exactly as it would have at
+    # selection time — an operator naming five cards must not get four.
+    skip_if_unmatched: bool = False
+
+
+def _batch_write_mismatch(conn: sqlite3.Connection, write: BatchRouteWrite) -> Optional[str]:
+    """Why ``write`` no longer matches its selection, or None. In-txn only."""
+
+    row = conn.execute(
+        "SELECT status, assignee FROM tasks WHERE id = ?", (write.task_id,),
+    ).fetchone()
+    if row is None:
+        return "no such task"
+    status = (row["status"] or "").lower()
+    if write.require_statuses is not None and status not in write.require_statuses:
+        return f"status is now {status}"
+    if (write.require_assignees is not None
+            and (row["assignee"] or "") not in write.require_assignees):
+        return f"assignee is now {row['assignee'] or '(none)'}"
+    return None
+
+
+def apply_batch_route_writes(
+    conn: sqlite3.Connection,
+    writes: Sequence[BatchRouteWrite],
+    *,
+    skipped: Optional[dict[str, str]] = None,
+) -> list[str]:
+    """Apply every route/effort write in ONE transaction, or none of them.
+
+    ``hermes kanban set-model`` selects N cards and then mutates them. Before
+    this primitive it called the individually-committing ``set_model_override``
+    / ``set_reasoning_effort`` in a loop, so a card that changed state AFTER
+    selection (another connection archives it; a worker claims it) failed
+    midway and left the cards ahead of it committed — a silently split route
+    across a batch the operator believed was one action, with no receipt
+    naming which cards moved.
+
+    Static prevalidation cannot close that: the interval between "we checked"
+    and "we wrote" is exactly where the race lives. The fix is to do the
+    checking and the writing inside one ``BEGIN IMMEDIATE`` — the per-card
+    status re-read in ``_set_model_override_locked`` then runs against the
+    same locked snapshot the UPDATE commits against, and any refusal unwinds
+    the whole batch.
+
+    The selection predicate itself (``require_statuses`` /
+    ``require_assignees``) is re-evaluated under the same lock: a card that
+    was ``ready`` when ``--where status=ready`` selected it and was completed
+    by another connection before this lock is no longer in the batch. Such a
+    selector-chosen card is left untouched and recorded in ``skipped``
+    (``task_id -> reason``); an explicitly named one aborts the batch.
+
+    Returns the ids written, in order. Raises ``RuntimeError`` (archived card,
+    or an explicit card that stopped matching) or ``ValueError`` (bad
+    arguments) having written NOTHING. Arguments are validated for every card
+    up front so an argument error also cannot reach the transaction
+    half-applied.
+    """
+    prepared: list[tuple[BatchRouteWrite, Optional[str], Optional[str], Optional[str]]] = []
+    for write in writes:
+        model, provider = (None, None)
+        if write.touch_model:
+            model, provider = _validate_model_override_args(
+                write.model, write.provider,
+                audit_comment_author=write.audit_comment_author,
+                audit_comment_body=write.audit_comment_body,
+            )
+        effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
+        prepared.append((write, model, provider, effort))
+
+    written: list[str] = []
+    fields: dict[str, tuple[str, ...]] = {}
+    skipped_now: dict[str, str] = {}
+    with write_txn(conn):
+        for write, model, provider, effort in prepared:
+            mismatch = _batch_write_mismatch(conn, write)
+            if mismatch is not None:
+                if not write.skip_if_unmatched:
+                    raise RuntimeError(
+                        f"{write.task_id}: {mismatch}; no cards were changed"
+                    )
+                skipped_now[write.task_id] = mismatch
+                continue
+            changed: tuple[str, ...] = ()
+            if write.touch_model:
+                if not _set_model_override_locked(
+                    conn, write.task_id, model, provider,
+                    audit_comment_author=write.audit_comment_author,
+                    audit_comment_body=write.audit_comment_body,
+                ):
+                    raise RuntimeError(f"no such task: {write.task_id}")
+                changed += ("model_override", "provider_override")
+            if write.touch_effort:
+                if not _set_reasoning_effort_locked(conn, write.task_id, effort):
+                    raise RuntimeError(f"no such task: {write.task_id}")
+                changed += ("reasoning_effort",)
+            if changed:
+                written.append(write.task_id)
+                fields[write.task_id] = changed
+    if skipped is not None:
+        skipped.update(skipped_now)
+    # Observers fire only AFTER the whole batch commits, so a rolled-back
+    # batch never announces a mutation that did not happen.
+    for task_id in written:
+        notify_task_updated(conn, task_id, fields[task_id])
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -7380,6 +7647,7 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    receipt: Optional[dict] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -7391,17 +7659,53 @@ def reassign_task(
 
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
+
+    ``reclaim_first`` makes this a two-step operation whose FIRST step is
+    irreversible (SIGTERM to a live worker, claim released) and whose second
+    can still fail. Returning a bare ``False`` there is a lie by omission:
+    the caller reports "nothing happened / still running" while the worker is
+    already dead. Pass ``receipt`` — a dict this function fills with
+    ``reclaimed`` (bool) and, on failure, ``reclaim_error`` (str) — to report
+    what actually happened. The reclaim leg never raises through this
+    function for the same reason the set-model batch catches by position:
+    an irreversible effect that already fired must not take its own receipt
+    down with it.
     """
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
-        reclaim_task(conn, task_id, reason=reason or "reassign")
-    # assign_task handles its own txn + the still-running guard.
+        try:
+            reclaimed = bool(reclaim_task(conn, task_id, reason=reason or "reassign"))
+            if receipt is not None:
+                receipt["reclaimed"] = reclaimed
+        except BaseException as exc:  # noqa: BLE001 - see docstring
+            if receipt is None:
+                raise
+            receipt["reclaimed"] = False
+            receipt["reclaim_error"] = (
+                f"{exc.__class__.__name__}: {exc or 'no detail'}; "
+                "worker may already have been signalled or claim released — "
+                f"inspect task {task_id}"
+            )
+            return False
+    # assign_task handles its own txn + the still-running guard. After a
+    # committed reclaim, *any* assign failure must preserve that receipt;
+    # even its post-commit observer can raise after assignment landed.
     try:
         return assign_task(conn, task_id, profile)
-    except RuntimeError:
-        # Task is still running and reclaim_first was False; caller
-        # needs to decide whether to retry with reclaim.
-        return False
+    except BaseException as exc:  # noqa: BLE001 - post-reclaim receipt boundary
+        if receipt is not None and receipt.get("reclaimed"):
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                f"cannot reassign {task_id}: currently running (claimed)."
+            ):
+                # A new claim raced the assign; do not repeat assign_task's
+                # advice to reclaim it (that now belongs to another worker).
+                return False
+            receipt["assign_error"] = f"{exc.__class__.__name__}: {exc or 'no detail'}"
+            return False
+        if isinstance(exc, RuntimeError):
+            # Existing still-running refusal without a reclaim.
+            return False
+        raise
 
 
 def _verify_created_cards(
@@ -12344,6 +12648,24 @@ class DispatchResult:
     dead/gone worker). See the reconciliation pass for details."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    spawn_routes: dict[str, str] = field(default_factory=dict)
+    """Effective ``provider/model`` route for each task spawned this tick."""
+    spawn_route_sources: dict[str, str] = field(default_factory=dict)
+    """Where each spawned task's route came from — ``card-override``,
+    ``lane-override(<n>s remaining)``, or ``profile-default``. Paired with
+    ``spawn_routes`` so a tick log can say WHY a worker got the model it got
+    instead of leaving an operator to guess which layer won."""
+    expired_lane_models: list[tuple[str, str]] = field(default_factory=list)
+    """Lane overrides retired this tick as ``(lane, route)``, where ``lane`` is
+    the assignee or ``*`` for the board-wide row. Reported exactly once — the
+    rows are deleted when they expire — so the tick log carries a single
+    ``lane-model expired -> <successor>`` line per window."""
+    expired_lane_successors: dict[str, str] = field(default_factory=dict)
+    """What routes each expired lane (keyed like ``expired_lane_models``) for
+    the rest of this tick: ``profile default``, or the lane override that is
+    still active — e.g. the board-wide lane under an expired assignee lane, or
+    a window renewed after the expiry pass. Read through the same memoized
+    lookup the spawns in this tick use, so the log and the routes agree."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -15698,6 +16020,35 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+
+    # ---- lane-model overrides (board-level, time-boxed routing) ----
+    # One clock read for the whole tick so every card in this pass sees the
+    # same TTL and a window cannot expire halfway through a batch.
+    _tick_now = int(time.time())
+    if not dry_run:
+        # Retire elapsed windows first: the rows are deleted, so each expiry
+        # is reported exactly once and the routing below can never read a
+        # stale override. A dry run reports the board as-is and writes nothing.
+        result.expired_lane_models = [
+            (row.assignee or "*", row.route)
+            for row in expire_lane_model_overrides(conn, now=_tick_now)
+        ]
+    _lane_override_cache: dict[str, Optional[LaneModelOverride]] = {}
+
+    def _lane_override_for(assignee: Optional[str]) -> Optional[LaneModelOverride]:
+        """Active override for ``assignee``, memoized for this tick."""
+        key = (assignee or "").strip()
+        if key not in _lane_override_cache:
+            _lane_override_cache[key] = get_lane_model_override(
+                conn, assignee=key or None, now=_tick_now,
+            )
+        return _lane_override_cache[key]
+
+    for _lane_key, _ in result.expired_lane_models:
+        result.expired_lane_successors[_lane_key] = lane_successor_label(
+            _lane_override_for(None if _lane_key == "*" else _lane_key)
+        )
+
     # First tick after process start: mark lost persisted paths before reapers
     # can make them spawnable. Do not repeat O(active tasks) DB transactions and
     # write probes every tick; candidates are rechecked just before claim below.
@@ -15944,12 +16295,28 @@ def _dispatch_once_locked(
         if task is None:
             return False, None
         task.assignee = assignee
+        # Health is judged on the EFFECTIVE route: lane override first (only
+        # for cards with no pin of their own), so a capped profile default
+        # under a healthy lane is admitted, and a capped lane still falls back.
+        apply_lane_model_override(task, _lane_override_for(assignee), now=_tick_now)
         payload = capped_provider(task, health_probes, health_cache, min_eligible=min_eligible)
         if payload is None:
             return False, None
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
         )
+        if fallback is not None and fallback_flagship_banned(task_id, fallback[0]):
+            # The flagship gate covers the post-fallback route too: a capped
+            # pool must not become a side door onto a banned model. Defer
+            # instead, exactly as if no healthy rung existed.
+            payload = {**payload, "fallback_refused": {
+                "model": fallback[0], "provider": fallback[1], "reason": "flagship",
+            }}
+            _log.warning(
+                "PHASE=kanban_flagship_fallback_refused task=%s model=%s provider=%s",
+                task_id, fallback[0], fallback[1],
+            )
+            fallback = None
         if fallback is not None:
             return False, (fallback, payload)
         result.respawn_guarded.append((task_id, "provider_capped"))
@@ -15976,18 +16343,57 @@ def _dispatch_once_locked(
     except Exception:
         _model_policy_config = {}
 
-    def flagship_refused(task_id: str) -> bool:
+    def fallback_flagship_banned(task_id: str, model: Optional[str]) -> bool:
+        """Whether a capped-pool fallback rung would put ``task_id`` on a
+        flagship model this tick's policy bans (alias-aware), with no
+        ``flagship override:`` comment on the card to authorize it."""
+        from hermes_cli.model_policy import (
+            FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+            is_firepower_model,
+        )
+
+        if not is_firepower_model(model, _model_policy_config):
+            return False
+        return conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? "
+            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
+            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
+        ).fetchone() is None
+
+    def flagship_refused(task_id: str, assignee: Optional[str] = None) -> bool:
+        """Main's flagship gate, applied to the route this spawn will USE.
+
+        The route is the card pin when there is one, otherwise the active lane
+        override (same precedence as :func:`apply_lane_model_override`). A
+        lane is checked against the policy loaded for THIS tick, so a ban
+        tightened after ``lane-model set`` cannot be walked around by the lane
+        the old policy admitted. A lane route is authorized by the lane's own
+        ``--allow-flagship``/``--firepower`` reason, or by the card's
+        ``flagship override:`` comment. Profile defaults are out of scope, as
+        on main: they are standing config, not a dispatch-time override.
+        """
         from hermes_cli.model_policy import (
             FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
             FLAGSHIP_REFUSAL_COMMENT_PREFIX,
             flagship_model_match,
+            is_firepower_model,
         )
 
         task = get_task(conn, task_id)
-        if task is None or not flagship_model_match(
-            task.model_override, _model_policy_config
-        ):
+        if task is None:
             return False
+        lane: Optional[LaneModelOverride] = None
+        if task.model_override:
+            model = task.model_override
+            if not flagship_model_match(model, _model_policy_config):
+                return False
+        else:
+            lane = _lane_override_for(assignee or task.assignee)
+            model = lane.model if lane is not None else None
+            if not is_firepower_model(model, _model_policy_config):
+                return False
+            if (lane.firepower or "").strip():
+                return False
         override = conn.execute(
             "SELECT 1 FROM task_comments WHERE task_id = ? "
             "AND lower(ltrim(body)) LIKE ? LIMIT 1",
@@ -15999,11 +16405,20 @@ def _dispatch_once_locked(
         result.flagship_refused.append(task_id)
         if dry_run:
             return True
-        body = (
-            f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model "
-            f"{task.model_override!r} is orchestrator-only; add "
-            f"'{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' to authorize."
-        )
+        if lane is None:
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model "
+                f"{model!r} is orchestrator-only; add "
+                f"'{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' to authorize."
+            )
+        else:
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model {model!r} from the "
+                f"lane-model override for {lane.assignee or '(board-wide)'} "
+                f"({lane.route}) is orchestrator-only; re-set the lane with "
+                f"--allow-flagship <reason>, clear it, or add "
+                f"'{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' to this card."
+            )
         already_logged = conn.execute(
             "SELECT 1 FROM task_comments WHERE task_id = ? AND body = ? LIMIT 1",
             (task_id, body),
@@ -16011,9 +16426,10 @@ def _dispatch_once_locked(
         if not already_logged:
             add_comment(conn, task_id, "dispatcher", body)
             _log.warning(
-                "PHASE=kanban_flagship_refused task=%s model=%s",
+                "PHASE=kanban_flagship_refused task=%s model=%s source=%s",
                 task_id,
-                task.model_override,
+                model,
+                "card-override" if lane is None else "lane-override",
             )
         return True
 
@@ -16138,7 +16554,7 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
-        if flagship_refused(row["id"]):
+        if flagship_refused(row["id"], row_assignee):
             continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -16215,7 +16631,22 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
-        apply_dispatch_fallback(claimed, fallback_selection)
+        # Route precedence at spawn (both lanes): card pin > active lane
+        # override > profile default gives the INTENDED route; then main's
+        # capped-pool dispatch fallback (#943) replaces that route iff its
+        # provider is capped. provider_admission() already probed health and
+        # picked the fallback against this same lane-applied route, and the
+        # flagship gate ran on the lane route (flagship_refused) and on the
+        # fallback model (fallback_flagship_banned), so what spawns is gated.
+        # Mutating the in-memory claimed Task is deliberate — neither the lane
+        # route nor the fallback may be persisted onto the card, or it would
+        # outlive its TTL / the capacity window as a permanent pin.
+        route_source = apply_lane_model_override(
+            claimed, _lane_override_for(claimed.assignee), now=_tick_now,
+        ) or ("card-override" if claimed.model_override else "profile-default")
+        if fallback_selection is not None:
+            apply_dispatch_fallback(claimed, fallback_selection)
+            route_source = f"dispatch-fallback(capped {route_source})"
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -16301,6 +16732,8 @@ def _dispatch_once_locked(
             # counter is cleared only on successful completion (see
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            result.spawn_routes[claimed.id] = effective_worker_route(claimed)
+            result.spawn_route_sources[claimed.id] = route_source
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
@@ -16362,7 +16795,7 @@ def _dispatch_once_locked(
                     (row["id"], row["assignee"], current)
                 )
                 continue
-        if flagship_refused(row["id"]):
+        if flagship_refused(row["id"], row["assignee"]):
             continue
         guard_detail = {}
         guard_reason = check_respawn_guard(
@@ -16395,7 +16828,16 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
-        apply_dispatch_fallback(claimed, fallback_selection)
+        # Review spawns are workers too: a capacity window that re-routes the
+        # ready lane but silently leaves reviewers on a capped provider would
+        # strand exactly the lane that unblocks everything else. Same
+        # precedence as the ready path: lane first, then capped-pool fallback.
+        review_route_source = apply_lane_model_override(
+            claimed, _lane_override_for(claimed.assignee), now=_tick_now,
+        ) or ("card-override" if claimed.model_override else "profile-default")
+        if fallback_selection is not None:
+            apply_dispatch_fallback(claimed, fallback_selection)
+            review_route_source = f"dispatch-fallback(capped {review_route_source})"
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -16477,6 +16919,8 @@ def _dispatch_once_locked(
                 conn, claimed, str(workspace), pid, board=board,
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            result.spawn_routes[claimed.id] = effective_worker_route(claimed)
+            result.spawn_route_sources[claimed.id] = review_route_source
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
@@ -16892,6 +17336,294 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
+@dataclass
+class LaneModelOverride:
+    """An active board-level model route with an expiry on the dispatcher clock."""
+
+    assignee: Optional[str]
+    provider: str
+    model: str
+    reasoning_effort: Optional[str] = None
+    reason: Optional[str] = None
+    firepower: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: int = 0
+    expires_at: int = 0
+
+    @property
+    def route(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+    def ttl_remaining(self, now: Optional[int] = None) -> int:
+        """Seconds left before the dispatcher stops applying this row."""
+
+        current = int(time.time()) if now is None else int(now)
+        return max(0, int(self.expires_at) - current)
+
+
+def _lane_model_row(row) -> LaneModelOverride:
+    return LaneModelOverride(
+        assignee=(row["assignee"] or None),
+        provider=row["provider"],
+        model=row["model"],
+        reasoning_effort=row["reasoning_effort"],
+        reason=row["reason"],
+        firepower=row["firepower"],
+        created_by=row["created_by"],
+        created_at=int(row["created_at"]),
+        expires_at=int(row["expires_at"]),
+    )
+
+
+def set_lane_model_override(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    model: str,
+    expires_at: int,
+    reasoning_effort: Optional[str] = None,
+    reason: Optional[str] = None,
+    assignee: Optional[str] = None,
+    firepower: Optional[str] = None,
+    created_by: Optional[str] = None,
+    now: Optional[int] = None,
+) -> LaneModelOverride:
+    """Install (or replace) the lane override for ``assignee``.
+
+    ``assignee=None`` sets the board-wide lane. Re-setting the same lane is an
+    upsert, so an operator extending a window never stacks duplicate rows.
+    """
+
+    created = int(time.time()) if now is None else int(now)
+    key = (assignee or "").strip()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO lane_model_overrides "
+            "(assignee, provider, model, reasoning_effort, reason, firepower, created_by, "
+            " created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(assignee) DO UPDATE SET "
+            "  provider=excluded.provider, model=excluded.model, "
+            "  reasoning_effort=excluded.reasoning_effort, "
+            "  reason=excluded.reason, firepower=excluded.firepower, "
+            "  created_by=excluded.created_by, created_at=excluded.created_at, "
+            "  expires_at=excluded.expires_at",
+            (
+                key, provider, model, reasoning_effort, reason, firepower, created_by,
+                created, int(expires_at),
+            ),
+        )
+    return LaneModelOverride(
+        assignee=(key or None), provider=provider, model=model,
+        reasoning_effort=reasoning_effort, reason=reason, firepower=firepower, created_by=created_by,
+        created_at=created, expires_at=int(expires_at),
+    )
+
+
+def get_lane_model_override(
+    conn: sqlite3.Connection,
+    *,
+    assignee: Optional[str] = None,
+    now: Optional[int] = None,
+) -> Optional[LaneModelOverride]:
+    """Return the active override for ``assignee``, or None.
+
+    An assignee-specific row beats the board-wide row. Expiry is exclusive —
+    a row is live strictly before ``expires_at`` — so the TTL boundary belongs
+    to the profile default and a 0-second window is never "briefly active".
+    """
+
+    current = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        "SELECT * FROM lane_model_overrides "
+        "WHERE assignee IN (?, '') AND expires_at > ? "
+        # '' (board-wide) sorts before any real name, so DESC puts the
+        # assignee-specific row first when both lanes are active.
+        "ORDER BY assignee DESC LIMIT 1",
+        ((assignee or "").strip(), current),
+    ).fetchone()
+    return _lane_model_row(row) if row else None
+
+
+def list_lane_model_overrides(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    include_expired: bool = False,
+) -> list[LaneModelOverride]:
+    """All lane overrides, active-only by default, board-wide lane first."""
+
+    current = int(time.time()) if now is None else int(now)
+    if include_expired:
+        rows = conn.execute(
+            "SELECT * FROM lane_model_overrides ORDER BY assignee ASC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM lane_model_overrides WHERE expires_at > ? "
+            "ORDER BY assignee ASC",
+            (current,),
+        ).fetchall()
+    return [_lane_model_row(row) for row in rows]
+
+
+def clear_lane_model_override(
+    conn: sqlite3.Connection,
+    *,
+    assignee: Optional[str] = None,
+) -> Optional[LaneModelOverride]:
+    """Drop the lane override for ``assignee``; return what was removed."""
+
+    key = (assignee or "").strip()
+    # Read and delete under ONE writer lock (same rule as
+    # clear_all_lane_model_overrides): a row read before the lock can be
+    # replaced by a concurrent ``lane-model set`` whose new window this call
+    # would then delete while reporting the old one.
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM lane_model_overrides WHERE assignee = ?", (key,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute("DELETE FROM lane_model_overrides WHERE assignee = ?", (key,))
+    return _lane_model_row(row)
+
+
+def clear_all_lane_model_overrides(
+    conn: sqlite3.Connection,
+) -> list[LaneModelOverride]:
+    """Drop EVERY lane override in one transaction; return what was removed.
+
+    Same atomicity rule as :func:`apply_batch_route_writes`: ``lane-model
+    clear --all`` is one operator action over N rows, so looping over the
+    single-row clear (which commits each delete separately) could both leave
+    the board half-cleared and report rows that a concurrent writer had
+    already removed. Reading and deleting under one ``write_txn`` makes the
+    returned list the rows this call actually deleted.
+    """
+
+    with write_txn(conn):
+        rows = [
+            _lane_model_row(row)
+            for row in conn.execute("SELECT * FROM lane_model_overrides").fetchall()
+        ]
+        if rows:
+            conn.execute("DELETE FROM lane_model_overrides")
+    return rows
+
+
+def expire_lane_model_overrides(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+) -> list[LaneModelOverride]:
+    """Delete every elapsed override and return them.
+
+    The dispatcher calls this once per tick. Because the rows are DELETED,
+    a given expiry is reported exactly once — the tick that retires the
+    override logs ``lane-model expired``, later ticks stay quiet.
+    """
+
+    current = int(time.time()) if now is None else int(now)
+    # Cheap unlocked probe so an idle tick never takes the writer lock.
+    if conn.execute(
+        "SELECT 1 FROM lane_model_overrides WHERE expires_at <= ? LIMIT 1",
+        (current,),
+    ).fetchone() is None:
+        return []
+    # The report is read under the same writer lock as the DELETE: a window
+    # renewed between an unlocked read and the delete must be neither
+    # deleted nor announced as expired.
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT * FROM lane_model_overrides WHERE expires_at <= ? "
+            "ORDER BY assignee ASC",
+            (current,),
+        ).fetchall()
+        if rows:
+            conn.execute(
+                "DELETE FROM lane_model_overrides WHERE expires_at <= ?", (current,),
+            )
+    return [_lane_model_row(row) for row in rows]
+
+
+def lane_successor_label(override: Optional[LaneModelOverride]) -> str:
+    """Name what routes a lane once an override row is gone.
+
+    ``override`` is the still-active lookup for that lane (see
+    :func:`get_lane_model_override`): None means the profile default, and a
+    surviving row — the board-wide lane under a retired assignee lane, or a
+    renewed window — is named with its route so receipts never claim
+    ``profile default`` while a lane is still routing the cards.
+    """
+
+    if override is None:
+        return "profile default"
+    scope = f"lane {override.assignee}" if override.assignee else "board-wide lane"
+    return f"{scope} {override.route}"
+
+
+def apply_lane_model_override(
+    task: Task,
+    override: Optional[LaneModelOverride],
+    *,
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """Route ``task`` through ``override`` when it has no override of its own.
+
+    Returns the ``source`` label for the spawn's route line, or ``None`` when
+    the lane override did not apply. A per-card override always wins: the card
+    is the narrower, explicitly-chosen instruction, and silently overwriting it
+    from a board-wide row would make ``set-model`` unreliable.
+    """
+
+    if override is None:
+        return None
+    if task.model_override:
+        return None
+    task.model_override = override.model
+    task.provider_override = override.provider
+    if task.reasoning_effort is None:
+        task.reasoning_effort = override.reasoning_effort
+    return f"lane-override({override.ttl_remaining(now)}s remaining)"
+
+
+def effective_worker_route(task: Task) -> str:
+    """Return the provider/model route a dispatcher spawn will use.
+
+    Card overrides win. Otherwise read the assignee profile's canonical model
+    block directly, matching the profile activated by ``_default_spawn``.
+    The helper is fail-soft because route announcement must never prevent a
+    worker from spawning.
+    """
+
+    model = task.model_override
+    provider = task.provider_override
+    if model:
+        try:
+            from hermes_cli.kanban_provider_health import model_override
+
+            model, provider = model_override(task)
+        except Exception:
+            pass
+    elif task.assignee:
+        try:
+            from pathlib import Path as _Path
+            from hermes_cli.profiles import _read_config_model, resolve_profile_env
+
+            model, provider = _read_config_model(
+                _Path(resolve_profile_env(task.assignee))
+            )
+        except Exception:
+            model = provider = None
+    model_label = str(model or "unknown").strip() or "unknown"
+    provider_label = str(provider or "unknown").strip() or "unknown"
+    qualified_prefix = f"{provider_label}/"
+    if provider_label != "unknown" and model_label.startswith(qualified_prefix):
+        model_label = model_label[len(qualified_prefix):]
+    return f"{provider_label}/{model_label}"
 
 
 def _default_spawn(
@@ -17557,10 +18289,33 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         if oldest_row and oldest_row["ts"] is not None else None
     )
 
+    # Active lane overrides ride along with the counts so `kanban stats` —
+    # the first thing anyone reads when workers behave oddly — shows that the
+    # board is re-routing spawns, and for how much longer. A silent override
+    # is the failure mode this feature exists to avoid.
+    try:
+        lane_overrides = [
+            {
+                "assignee": row.assignee,
+                "provider": row.provider,
+                "model": row.model,
+                "reason": row.reason,
+                "created_at": row.created_at,
+                "expires_at": row.expires_at,
+                "ttl_remaining_seconds": row.ttl_remaining(now),
+            }
+            for row in list_lane_model_overrides(conn, now=now)
+        ]
+    except sqlite3.Error:
+        # Stats must never fail closed on a board whose schema predates the
+        # table and hasn't been reopened through connect()'s migration pass.
+        lane_overrides = []
+
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "lane_model_overrides": lane_overrides,
         "now": now,
     }
 

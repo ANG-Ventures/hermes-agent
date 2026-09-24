@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import difflib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -477,10 +479,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "--model.")
     p_create.add_argument(
         "--allow-flagship",
+        "--firepower",
         default=None,
+        dest="allow_flagship",
         metavar="REASON",
         help="Allow an orchestrator-only flagship model for this task. "
-             "Requires a non-empty reason, recorded as a task comment.",
+             "Requires a non-empty reason, recorded as a task comment. "
+             "--firepower is an alias.",
     )
     p_create.add_argument(
         "--reasoning",
@@ -597,22 +602,42 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Set or clear a task's model/provider/effort override "
              "(takes effect on the next dispatch)",
     )
-    p_set_model.add_argument("task_id")
     p_set_model.add_argument(
-        "model", nargs="?", default=None,
-        help="Model to pin the worker to (or 'none' to clear the override)",
+        "task_ids", nargs="*", metavar="task_id",
+        help="One or more task ids. Omit when selecting with "
+             "--where/--all-active. The LAST positional is the model.",
     )
+    p_set_model.add_argument("--model", default=None, help="Model id (alternative to the last positional).")
+    p_set_model.add_argument("--model-json", default=None, help="Unified override object as JSON.")
     p_set_model.add_argument(
         "--provider", default=None,
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
     )
     p_set_model.add_argument(
+        "--where", nargs="+", default=None, metavar="KEY=VALUE",
+        help="Select cards by status/assignee instead of naming ids, e.g. "
+             "--where status=running,ready assignee=daedalus-opus. Only "
+             "active (non-done, non-archived) cards are considered.",
+    )
+    p_set_model.add_argument(
+        "--all-active", action="store_true", dest="all_active",
+        help="Select every active card on the board (excludes done/archived).",
+    )
+    p_set_model.add_argument(
+        "--reclaim", action="store_true",
+        help="Release the claim on selected RUNNING cards so the next "
+             "dispatch respawns them on the new route. Without this a "
+             "running worker keeps its old model until it finishes.",
+    )
+    p_set_model.add_argument(
         "--allow-flagship",
+        "--firepower",
         default=None,
+        dest="allow_flagship",
         metavar="REASON",
         help="Allow an orchestrator-only flagship model. Requires a non-empty "
-             "reason, recorded as a task comment.",
+             "reason, recorded as a task comment. --firepower is an alias.",
     )
     _effort_group = p_set_model.add_mutually_exclusive_group()
     _effort_group.add_argument(
@@ -627,6 +652,60 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--clear-effort", action="store_true", dest="clear_effort",
         help="Clear the per-task reasoning effort — the worker falls back "
              "to its profile's own agent.reasoning_effort.",
+    )
+
+    # --- lane-model (board-level, time-boxed routing) ---
+    p_lane_model = sub.add_parser(
+        "lane-model",
+        help="Time-boxed board-level model override applied at dispatch to "
+             "cards without their own override",
+    )
+    _lane_sub = p_lane_model.add_subparsers(dest="lane_action")
+    _lane_set = _lane_sub.add_parser(
+        "set", help="Install a lane override that expires on its TTL",
+    )
+    _lane_set.add_argument(
+        "route", nargs="?", default=None, metavar="PROVIDER/MODEL",
+        help="Route to pin the lane to, e.g. claude-bpx-19/claude-opus-5. "
+             "May also be given as --provider/--model.",
+    )
+    _lane_set.add_argument("--provider", default=None)
+    _lane_set.add_argument("--model", default=None)
+    _lane_set.add_argument("--model-json", default=None, help="Unified override object as JSON.")
+    _lane_set.add_argument("--effort", default=None, dest="reasoning_effort")
+    _lane_set.add_argument(
+        "--ttl", default=None, required=False, metavar="DURATION",
+        help="How long the override lives (30m, 2h, 1d). Required — an "
+             "override without an expiry is just a config edit with extra steps.",
+    )
+    _lane_set.add_argument(
+        "--reason", default=None,
+        help="Why the lane is being re-routed (shown in show/stats).",
+    )
+    _lane_set.add_argument(
+        "--assignee", default=None,
+        help="Restrict the override to one profile. Omit for board-wide.",
+    )
+    _lane_set.add_argument(
+        "--firepower", "--allow-flagship", default=None, dest="firepower",
+        metavar="REASON",
+        help="Required justification when the model is flagship/firepower-only "
+             "(same flagship ban as create/set-model --allow-flagship).",
+    )
+    _lane_show = _lane_sub.add_parser(
+        "show", help="Show active lane overrides and their remaining TTL",
+    )
+    _lane_show.add_argument("--json", action="store_true", dest="as_json")
+    _lane_clear = _lane_sub.add_parser(
+        "clear", help="Remove a lane override before its TTL elapses",
+    )
+    _lane_clear.add_argument(
+        "--assignee", default=None,
+        help="Lane to clear. Omit for the board-wide override.",
+    )
+    _lane_clear.add_argument(
+        "--all", action="store_true", dest="clear_all",
+        help="Clear every lane override on the board.",
     )
 
     # --- reclaim / reassign (recovery) ---
@@ -1434,6 +1513,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "lane-model": _cmd_lane_model,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -2398,23 +2478,347 @@ def _cmd_assign(args: argparse.Namespace) -> int:
     return 0
 
 
+_ACTIVE_STATUSES = ("ready", "running", "todo", "blocked", "triage", "scheduled", "review")
+"""Statuses a batch selector treats as live work.
+
+Terminal rows (``done``/``archived``) are excluded: re-routing a finished card
+changes nothing and would make ``--all-active`` report work it didn't do.
+"""
+
+
+def _known_providers() -> set[str]:
+    """Every provider name this install can actually route to.
+
+    Union of the built-in registry (plugins under ``plugins/model-providers``)
+    and the user's ``providers:`` config block, which is where fleet-local
+    pools like ``claude-bpx-19`` are defined. Names and aliases both count.
+    """
+
+    known: set[str] = set()
+    try:
+        import providers as _providers
+
+        for profile in _providers.list_providers():
+            name = getattr(profile, "name", None)
+            if name:
+                known.add(str(name))
+            for alias in (getattr(profile, "aliases", None) or ()):
+                known.add(str(alias))
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config
+
+        configured = load_config().get("providers")
+        if isinstance(configured, dict):
+            known.update(str(k) for k in configured)
+    except Exception:
+        pass
+    return known
+
+
+def _validate_provider(provider: Optional[str]) -> Optional[str]:
+    """Return an error message when ``provider`` isn't routable, else None.
+
+    A typo'd provider is otherwise invisible until a worker spawns and fails.
+    If discovery yields no providers, refuse instead of persisting an
+    unvalidated route; configured custom providers remain usable.
+    """
+
+    if not provider:
+        return None
+    known = _known_providers()
+    if not known:
+        return "provider discovery unavailable (registry and configured providers are empty); refusing unvalidated route"
+    if provider in known:
+        return None
+    suggestions = difflib.get_close_matches(provider, sorted(known), n=3, cutoff=0.6)
+    hint = f" (did you mean: {', '.join(suggestions)}?)" if suggestions else ""
+    return f"unknown provider {provider!r}{hint}"
+
+
+def _parse_ttl(value: str) -> int:
+    """Parse ``30s``/``45m``/``2h``/``1d`` (or bare seconds) into seconds."""
+
+    raw = str(value or "").strip().lower()
+    if not raw:
+        raise ValueError("--ttl needs a duration (e.g. 2h)")
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    multiplier = units.get(raw[-1], 1) if raw[-1] in units else 1
+    number = raw[:-1] if raw[-1] in units else raw
+    try:
+        magnitude = float(number)
+    except ValueError:
+        raise ValueError(
+            f"bad --ttl {value!r}; use a duration like 30m, 2h, or 1d"
+        ) from None
+    seconds = int(magnitude * multiplier)
+    if seconds <= 0:
+        raise ValueError(
+            f"bad --ttl {value!r}; a lane override must expire in the future"
+        )
+    return seconds
+
+
+def _format_ttl(seconds: int) -> str:
+    """Compact human duration for route/status lines."""
+
+    seconds = max(0, int(seconds))
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if seconds >= size:
+            value = seconds / size
+            # Drop a trailing '.0' so 2h reads as "2h", not "2.0h". Formatting
+            # the integer case separately avoids a str.replace() here, which
+            # the gate-dominance lint flags as a relocating call.
+            if value == int(value):
+                return f"{int(value)}{unit}"
+            return f"{value:.1f}{unit}"
+    return f"{seconds}s"
+
+
+def _parse_where(clauses: list[str]) -> tuple[dict[str, list[str]], Optional[str]]:
+    """Parse ``--where status=running,ready assignee=x`` into a filter dict."""
+
+    filters: dict[str, list[str]] = {}
+    allowed = {"status", "assignee"}
+    for clause in clauses or []:
+        key, sep, raw = str(clause).partition("=")
+        key = key.strip().lower()
+        if not sep or not key:
+            return {}, f"bad --where clause {clause!r}; expected key=value"
+        if key not in allowed:
+            return {}, (
+                f"unsupported --where key {key!r}; "
+                f"supported: {', '.join(sorted(allowed))}"
+            )
+        values = [v.strip() for v in raw.split(",") if v.strip()]
+        if not values:
+            return {}, f"--where {key} needs at least one value"
+        filters.setdefault(key, []).extend(values)
+    return filters, None
+
+
+def _select_batch_tasks(
+    conn,
+    *,
+    task_ids: list[str],
+    where: dict[str, list[str]],
+    all_active: bool,
+) -> tuple[list, Optional[str]]:
+    """Resolve the batch selection into concrete tasks.
+
+    Explicit ids are authoritative and a missing one is an error — an operator
+    naming five cards must not silently get four.
+    """
+
+    if task_ids:
+        tasks = []
+        for task_id in task_ids:
+            task = kb.get_task(conn, task_id)
+            if task is None:
+                return [], f"no such task: {task_id}"
+            if task.status not in _ACTIVE_STATUSES:
+                return [], f"cannot set model override on {task.status} task {task_id}"
+            tasks.append(task)
+        return tasks, None
+
+    rows = [
+        task for task in kb.list_tasks(conn, limit=100000)
+        if task.status in _ACTIVE_STATUSES
+    ]
+    if where:
+        statuses = {s.lower() for s in where.get("status", [])}
+        assignees = {a for a in where.get("assignee", [])}
+        if statuses:
+            rows = [t for t in rows if (t.status or "").lower() in statuses]
+        if assignees:
+            rows = [t for t in rows if (t.assignee or "") in assignees]
+    elif not all_active:
+        return [], "set-model needs task ids, --where, or --all-active"
+    return rows, None
+
+
+def _run_batch_reclaims(
+    conn,
+    tasks: list,
+    *,
+    reason: str,
+) -> tuple[list[tuple[str, bool]], dict[str, str]]:
+    """Reclaim every card of an already-committed route batch, never raising.
+
+    This runs AFTER ``apply_batch_route_writes`` has committed, because
+    ``reclaim_task`` SIGTERMs a live worker — an irreversible side effect a
+    rollback could not undo, so it must not live inside the route
+    transaction.
+
+    That ordering makes every failure down here a *post-commit* failure: the
+    routes are already durable, and an exception escaping this loop takes the
+    receipt naming them with it. The operator is then left believing nothing
+    happened while N cards carry a new route. Enumerating exception types is
+    not a fix for that — the previous version caught ``(ValueError,
+    RuntimeError)`` and a real ``sqlite3.OperationalError`` ("database is
+    locked") from ``reclaim_task``'s own ``BEGIN IMMEDIATE`` walked straight
+    past it. So this function catches by POSITION, not by type: anything
+    raised after the commit becomes a per-card refusal string and the caller
+    always gets a receipt.
+
+    ``BaseException`` is deliberate. ``KeyboardInterrupt`` / ``SystemExit``
+    mid-batch is the same honesty problem, so they are recorded, the loop
+    stops, the remaining cards are reported as not attempted, and the caller
+    still prints the receipt and exits non-zero.
+
+    Returns ``(applied, errors)`` where ``applied`` has one entry per task in
+    order and ``errors`` maps a task id to why its reclaim did not happen.
+    """
+    applied: list[tuple[str, bool]] = []
+    errors: dict[str, str] = {}
+    interrupted = False
+    for task in tasks:
+        if interrupted:
+            applied.append((task.id, False))
+            errors[task.id] = "reclaim not attempted (batch interrupted)"
+            continue
+        # A card that was not claimed at selection time has nothing to
+        # reclaim, and reclaim_task returning False for it is the designed
+        # no-op — not a race. Only a card we SAW claimed and then could not
+        # reclaim changed state underneath us, and that is worth naming.
+        was_claimed = task.status == "running" or task.claim_lock is not None
+        try:
+            redispatched = bool(kb.reclaim_task(conn, task.id, reason=reason))
+        except (KeyboardInterrupt, SystemExit) as exc:
+            interrupted = True
+            applied.append((task.id, False))
+            errors[task.id] = (
+                f"reclaim interrupted ({exc.__class__.__name__}); "
+                "the worker may already have been signalled"
+            )
+            continue
+        except BaseException as exc:  # noqa: BLE001 - see docstring
+            applied.append((task.id, False))
+            errors[task.id] = (
+                f"{exc.__class__.__name__}: {exc or 'no detail'} "
+                "(the worker may already have been signalled — check "
+                f"`hermes kanban show {task.id}`)"
+            )
+            continue
+        if not redispatched and was_claimed:
+            errors[task.id] = (
+                "prior claim was not reclaimed (card changed after selection; "
+                "it may be claimed again — inspect current status)"
+            )
+        applied.append((task.id, redispatched))
+    return applied, errors
+
+
+# Any `t_*` token is treated as an INTENDED task id, not just well-formed hex.
+# Matching only `t_[0-9a-f]+` would silently reclassify a typo'd id (`t_nope`)
+# as the model name, so the command would "succeed" against the wrong thing
+# instead of reporting `no such task`.
+_TASK_ID_RE = re.compile(r"^t_\w+$", re.IGNORECASE)
+
+
+def _cli_model_override(args, *, allow_ttl=False):
+    """Parse the shared override object; explicit flags may not conflict with JSON."""
+    from hermes_cli.model_override import parse_model_override
+
+    text = getattr(args, "model_json", None)
+    flags = {
+        key: value for key, value in (
+            ("model", getattr(args, "model", None)),
+            ("provider", getattr(args, "provider", None)),
+            ("reasoning_effort", getattr(args, "reasoning_effort", None)),
+            # set-model/create: dest=allow_flagship; lane-model: dest=firepower.
+            ("firepower", getattr(args, "allow_flagship", None) or getattr(args, "firepower", None)),
+            ("ttl", getattr(args, "ttl", None)),
+        ) if value is not None and (allow_ttl or key != "ttl")
+    }
+    if text is not None:
+        if flags:
+            raise ValueError("--model-json cannot be combined with model override flags")
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--model-json: {exc}") from exc
+    else:
+        raw = flags or None
+    # CLI checks the resolved per-card/per-lane route below, including
+    # provider-only inheritance; keep its actionable --firepower wording.
+    return parse_model_override(raw, field="model", allow_ttl=allow_ttl, enforce_firepower=False)
+
+
+def _split_ids_and_model(
+    positionals: list[str],
+) -> tuple[list[str], Optional[str], bool]:
+    """Split ``<id>... [model]`` into ids, model, and whether a model was given.
+
+    Task ids are recognised by shape (``t_<hex>``) rather than position, so
+    ``set-model t_a t_b model-x`` and ``set-model model-x --where …`` both
+    parse unambiguously and a batch can't silently swallow its model as a
+    sixth card id.
+    """
+
+    ids = [tok for tok in positionals if _TASK_ID_RE.match(tok)]
+    rest = [tok for tok in positionals if not _TASK_ID_RE.match(tok)]
+    if len(rest) > 1 or (ids and any(tok.startswith("t-") or tok.startswith("t_") for tok in rest)):
+        raise ValueError(f"invalid task id or extra positional: {', '.join(rest)}")
+    if not rest:
+        return ids, None, False
+    return ids, rest[0], True
+
+
 def _cmd_set_model(args: argparse.Namespace) -> int:
-    model = args.model
-    if model is not None and model.lower() in {"none", "-", "null", ""}:
-        model = None
-    provider = getattr(args, "provider", None)
-    effort = getattr(args, "reasoning_effort", None)
+    positionals = list(getattr(args, "task_ids", None) or [])
+    try:
+        parsed_ids, raw_model, model_given = _split_ids_and_model(positionals)
+        if raw_model is not None and getattr(args, "model", None) is not None:
+            raise ValueError("model given both positionally and with --model")
+        if (getattr(args, "provider", None) and getattr(args, "reasoning_effort", None)
+                and not (raw_model or getattr(args, "model", None) or getattr(args, "model_json", None))):
+            raise ValueError("--provider requires a model when combined with --effort")
+        args.model = raw_model if model_given else getattr(args, "model", None)
+        if getattr(args, "reasoning_effort", None) is not None:
+            args.reasoning_effort = kb.normalize_reasoning_effort(args.reasoning_effort)
+        clearing = args.model is None or str(args.model).lower() in {"none", "-", "null", ""}
+        if clearing and not getattr(args, "model_json", None):
+            args.model = None
+        override = _cli_model_override(args) if (not clearing or getattr(args, "model_json", None)
+                                                 or getattr(args, "provider", None)
+                                                 or getattr(args, "reasoning_effort", None)) else None
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    args.task_ids = parsed_ids
+    model = override.model if override else None
+    provider = override.provider if override else getattr(args, "provider", None)
+    model_given = model_given or bool(model) or bool(provider)
+    effort = override.reasoning_effort if override else getattr(args, "reasoning_effort", None)
     clear_effort = bool(getattr(args, "clear_effort", False))
+    # --allow-flagship (main) and --firepower (alias) share dest=allow_flagship.
+    firepower_reason = (
+        override.firepower if override and override.firepower
+        else getattr(args, "allow_flagship", None)
+    )
+    from hermes_cli.model_policy import (
+        canonical_model_pair,
+        firepower_guard_error,
+        is_firepower_model,
+        override_comment,
+    )
+    if model:
+        model, provider = canonical_model_pair(model, provider)
     # The two knobs are independent: with --effort/--clear-effort and no
     # positional model, the model override is left untouched (absent means
     # "unchanged" here, not "clear"). Without either effort flag the
     # historical contract holds — a missing or 'none' positional clears the
     # model/provider override.
-    touch_model = args.model is not None or (effort is None and not clear_effort)
+    touch_model = model_given or (effort is None and not clear_effort)
     if provider and not touch_model:
         print("kanban: --provider requires a model", file=sys.stderr)
         return 2
-    flagship_reason = getattr(args, "allow_flagship", None) if touch_model else None
+    guard_error = firepower_guard_error(model, firepower_reason)
+    if guard_error:
+        print(f"kanban: {guard_error}", file=sys.stderr)
+        return 2
     if effort is not None:
         # Validate BEFORE any write so `set-model <id> <model> --effort typo`
         # can't half-apply (model committed, effort rejected).
@@ -2429,44 +2833,427 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 2
+    # Provider typos are refused BEFORE any write, and for the whole batch —
+    # a half-applied batch is worse than a rejected one because the operator
+    # can't tell which cards moved.
+    if touch_model and provider:
+        provider_error = _validate_provider(provider)
+        if provider_error:
+            print(f"kanban: {provider_error}", file=sys.stderr)
+            return 2
+
+    where, where_error = _parse_where(getattr(args, "where", None) or [])
+    if where_error:
+        print(f"kanban: {where_error}", file=sys.stderr)
+        return 2
+    all_active = bool(getattr(args, "all_active", False))
+    task_ids = list(getattr(args, "task_ids", None) or [])
+    reclaim = bool(getattr(args, "reclaim", False))
+    if task_ids and (where or all_active):
+        print(
+            "kanban: pass task ids OR a selector (--where/--all-active), not both",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Declared before the try so the post-commit receipt path below can still
+    # name what moved even if the `with` block raises after the routes were
+    # written.
+    tasks: list = []
+    inherited_models: dict[str, str] = {}
+    applied: list[tuple[str, bool]] = []
+    cleared_routes: dict[str, str] = {}
+    reclaim_errors: dict[str, str] = {}
+    skipped: dict[str, str] = {}
+    batch_error: Optional[str] = None
+    committed = False
     try:
         with kb.connect_closing() as conn:
-            if touch_model:
-                ok = kb.set_model_override(
-                    conn,
-                    args.task_id,
-                    model,
-                    provider=provider,
-                    flagship_override_reason=flagship_reason,
-                    flagship_override_author=_profile_author(),
+            tasks, select_error = _select_batch_tasks(
+                conn, task_ids=task_ids, where=where, all_active=all_active,
+            )
+            if select_error:
+                print(f"kanban: {select_error}", file=sys.stderr)
+                return 2
+            if not tasks:
+                print("kanban: selector matched no tasks", file=sys.stderr)
+                return 1
+            # A provider-only object retains each card's current model. Resolve
+            # the whole batch before writing so a missing profile route cannot
+            # leave earlier cards half-updated.
+            if touch_model and provider and not model:
+                for task in tasks:
+                    inherited = task.model_override or kb.effective_worker_route(task).split("/", 1)[-1]
+                    if not inherited or inherited == "unknown":
+                        print(f"kanban: cannot resolve model for {task.id}", file=sys.stderr)
+                        return 2
+                    inherited, _ = canonical_model_pair(inherited, provider)
+                    guard = firepower_guard_error(inherited, firepower_reason)
+                    if guard:
+                        print(f"kanban: {guard}", file=sys.stderr)
+                        return 2
+                    inherited_models[task.id] = inherited
+            # Build the WHOLE batch first, then commit it in one transaction.
+            # Looping over individually-committing setters is what let a card
+            # that changed status after selection (archived/claimed by another
+            # connection) fail midway with earlier cards already pinned — a
+            # split route with no receipt. Prevalidation cannot close that
+            # window; a single write_txn can.
+            # The selection is re-checked inside the write transaction (see
+            # apply_batch_route_writes): a card that stops matching between
+            # this SELECT and the writer lock — completed, archived, claimed
+            # out of a status=ready selector, reassigned — is not written.
+            if task_ids:
+                require_statuses = frozenset(_ACTIVE_STATUSES)
+                require_assignees = None
+            else:
+                wanted = {s.lower() for s in where.get("status", [])}
+                require_statuses = frozenset(
+                    s for s in _ACTIVE_STATUSES if not wanted or s in wanted
                 )
-                if not ok:
-                    print(f"no such task: {args.task_id}", file=sys.stderr)
-                    return 1
-            if effort is not None or clear_effort:
-                ok = kb.set_reasoning_effort(
-                    conn, args.task_id, None if clear_effort else effort,
+                require_assignees = (
+                    frozenset(where["assignee"]) if where.get("assignee") else None
                 )
-                if not ok:
-                    print(f"no such task: {args.task_id}", file=sys.stderr)
-                    return 1
-    except (ValueError, RuntimeError) as exc:
+            writes: list[kb.BatchRouteWrite] = []
+            for task in tasks:
+                if touch_model and not model and not provider:
+                    lane = kb.get_lane_model_override(conn, assignee=task.assignee)
+                    cleared_routes[task.id] = lane.route if lane else "profile-default"
+                write = kb.BatchRouteWrite(
+                    task_id=task.id,
+                    require_statuses=require_statuses,
+                    require_assignees=require_assignees,
+                    skip_if_unmatched=not task_ids,
+                )
+                if touch_model:
+                    effective_model = model or inherited_models.get(task.id)
+                    firepower = is_firepower_model(effective_model)
+                    write.touch_model = True
+                    write.model = effective_model
+                    write.provider = provider
+                    if firepower:
+                        write.audit_comment_author = _profile_author()
+                        # Same comment main's create/set-model writes, so
+                        # the dispatcher's flagship gate authorizes it.
+                        write.audit_comment_body = override_comment(
+                            firepower_reason,
+                        )
+                if effort is not None or clear_effort:
+                    write.touch_effort = True
+                    write.effort = None if clear_effort else effort
+                writes.append(write)
+
+            written = set(kb.apply_batch_route_writes(conn, writes, skipped=skipped))
+            # PAST THIS LINE THE ROUTES ARE DURABLE. Nothing below may let an
+            # exception escape without the operator learning which cards
+            # moved — that is the whole honest-partial contract, and it is
+            # why the reclaim loop catches by position rather than by type.
+            committed = True
+            tasks = [task for task in tasks if task.id in written]
+
+            # --reclaim runs only AFTER the route batch has committed, and
+            # deliberately NOT inside it: reclaim_task SIGTERMs a live worker,
+            # an irreversible side effect that a rollback could not undo. Its
+            # per-card outcome is reported individually below, so a reclaim
+            # that refuses one card is visible rather than silent.
+            #
+            # A set-model on a RUNNING card is otherwise silent: the live
+            # worker keeps its old route and the change only lands if the
+            # card happens to be re-dispatched. --reclaim makes that explicit
+            # by releasing the claim so the next tick respawns on the new
+            # route.
+            #
+            # No status re-check inside the loop on purpose: reclaim_task is
+            # already the authority on what is reclaimable (it refuses
+            # anything not running/claimed, and preserves
+            # blocked/triage/scheduled rather than laundering them into
+            # ready). Re-testing status at this layer would be a second,
+            # drifting copy of that rule.
+            if reclaim:
+                applied, reclaim_errors = _run_batch_reclaims(
+                    conn, tasks,
+                    reason=f"set-model reclaim -> {provider or ''}/{model or ''}".strip("/"),
+                )
+            else:
+                applied = [(task.id, False) for task in tasks]
+    except BaseException as exc:  # noqa: BLE001 - re-raised unless committed
+        if not committed:
+            # Nothing was written, so a bare error line is the whole truth.
+            # Non-(ValueError|RuntimeError) still propagates: an unexpected
+            # crash before any write has no receipt to protect, and
+            # swallowing it would hide a real bug.
+            if not isinstance(exc, (ValueError, RuntimeError)):
+                raise
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        # Committed. Something between the commit and the end of the `with`
+        # block failed anyway (connection teardown, an observer, an
+        # interrupt). The routes are durable, so fall through to the receipt
+        # instead of surfacing a bare error that names no card.
+        batch_error = (
+            f"{exc.__class__.__name__}: {exc or 'no detail'}"
+        )
+        if not applied:
+            applied = [(task.id, False) for task in tasks]
+
+    # A single explicitly-named card keeps the original human sentences —
+    # that is an established user-facing contract and the per-card flow reads
+    # better as prose. The machine-readable `t_x: route=... applies=...` line
+    # is what a BATCH needs, where one line per card is the whole point.
+    single = len(applied) == 1 and bool(task_ids)
+    for task_id, redispatched in applied:
+        # `--reclaim` asked for a redispatch. If it did not happen, saying
+        # `applies=next-dispatch` alone is technically true but reads as
+        # normal — the refusal line below is what names it, and this keeps
+        # the two consistent.
+        applies = "redispatch" if redispatched else "next-dispatch"
+        if single:
+            if touch_model and (model or provider):
+                label = f"{provider}:{model or inherited_models[task_id]}" if provider else model
+                suffix = (
+                    " (reclaimed; redispatches now)" if redispatched
+                    else " (applies on next dispatch)"
+                )
+                print(f"Set model override on {task_id}: {label}{suffix}")
+            elif touch_model:
+                print(f"Cleared model override on {task_id} "
+                      f"(next route={cleared_routes[task_id]})")
+            if clear_effort:
+                print(f"Cleared reasoning effort on {task_id} "
+                      "(worker uses its profile's agent.reasoning_effort)")
+            elif effort is not None:
+                print(f"Set reasoning effort on {task_id}: {effort} "
+                      "(applies on next dispatch)")
+            continue
+        if touch_model and (model or provider):
+            route = f"{provider}/{model or inherited_models[task_id]}" if provider else model
+            print(f"{task_id}: route={route} applies={applies}")
+        elif touch_model:
+            print(
+                f"{task_id}: route={cleared_routes[task_id]} applies={applies} "
+                "(model override cleared)"
+            )
+        if clear_effort:
+            print(f"{task_id}: effort=profile-default applies={applies}")
+        elif effort is not None:
+            print(f"{task_id}: effort={effort} applies={applies}")
+    # Selector-chosen cards that stopped matching before the writer lock were
+    # NOT written; name each one so the receipt covers every selected card.
+    for task_id, why in skipped.items():
+        print(f"{task_id}: skipped ({why}; no longer matches the selector) route unchanged")
+    # A reclaim that failed after its route committed is named explicitly —
+    # the receipt above already told the operator the route moved, so staying
+    # quiet here would leave them believing the worker was respawned.
+    for task_id, message in reclaim_errors.items():
+        print(
+            f"kanban: {task_id}: route applied but reclaim failed: {message}",
+            file=sys.stderr,
+        )
+    if batch_error:
+        # Post-commit failure outside the per-card reclaim loop. The receipt
+        # above is still the truth about what was written; this names why the
+        # command is nonetheless not a success.
+        print(
+            "kanban: routes above were applied, but the batch did not finish "
+            f"cleanly: {batch_error}",
+            file=sys.stderr,
+        )
+    if skipped and not applied:
+        print("kanban: every selected card stopped matching; nothing written",
+              file=sys.stderr)
+        return 1
+    return 1 if (reclaim_errors or batch_error) else 0
+
+
+def _lane_label(assignee: Optional[str]) -> str:
+    return assignee or "(board-wide)"
+
+
+def _cmd_lane_model(args: argparse.Namespace) -> int:
+    action = getattr(args, "lane_action", None) or "show"
+    if action == "set":
+        return _cmd_lane_model_set(args)
+    if action == "clear":
+        return _cmd_lane_model_clear(args)
+    return _cmd_lane_model_show(args)
+
+
+def _cmd_lane_model_set(args: argparse.Namespace) -> int:
+    from hermes_cli.model_policy import (
+        canonical_model_pair,
+        firepower_guard_error,
+        format_firepower_audit,
+        is_firepower_model,
+    )
+
+    provider = getattr(args, "provider", None)
+    model = getattr(args, "model", None)
+    route = getattr(args, "route", None)
+    if route and (provider or model or getattr(args, "model_json", None)):
+        print("kanban: route cannot be combined with --model/--provider/--model-json", file=sys.stderr)
+        return 2
+    if route:
+        # `provider/model` is the primary spelling; the split is on the FIRST
+        # slash so model ids that themselves contain slashes survive intact.
+        head, sep, tail = route.partition("/")
+        if not sep or not head or not tail:
+            print(
+                f"kanban: bad route {route!r}; expected <provider>/<model>",
+                file=sys.stderr,
+            )
+            return 2
+        provider, model = head, tail
+    if route:
+        args.provider, args.model = provider, model
+    try:
+        parsed = _cli_model_override(args, allow_ttl=True)
+    except ValueError as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
-    if touch_model:
-        if model:
-            label = f"{provider}:{model}" if provider else model
-            print(f"Set model override on {args.task_id}: {label} "
-                  "(applies on next dispatch)")
+    provider, model = parsed.provider if parsed else None, parsed.model if parsed else None
+    if model:
+        model, provider = canonical_model_pair(model, provider)
+    reasoning_effort = parsed.reasoning_effort if parsed else None
+    if not provider or not model:
+        print(
+            "kanban: lane-model set needs <provider>/<model> "
+            "(or --provider and --model)",
+            file=sys.stderr,
+        )
+        return 2
+
+    ttl_raw = parsed.ttl if parsed else None
+    if not ttl_raw:
+        # The TTL is the whole point: it is what makes this different from
+        # editing a profile's config.yaml and forgetting to revert it.
+        print(
+            "kanban: lane-model set requires --ttl (e.g. --ttl 2h); "
+            "an override with no expiry is a config edit, not a window",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        ttl_seconds = _parse_ttl(ttl_raw)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+
+    provider_error = _validate_provider(provider)
+    if provider_error:
+        print(f"kanban: {provider_error}", file=sys.stderr)
+        return 2
+
+    firepower_reason = parsed.firepower if parsed else None
+    guard_error = firepower_guard_error(model, firepower_reason)
+    if guard_error:
+        print(f"kanban: {guard_error}", file=sys.stderr)
+        return 2
+
+    assignee = getattr(args, "assignee", None)
+    reason = (getattr(args, "reason", None) or "").strip()
+    if not reason:
+        print("kanban: lane-model set requires --reason", file=sys.stderr)
+        return 2
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        override = kb.set_lane_model_override(
+            conn,
+            provider=provider,
+            model=model,
+            expires_at=now + ttl_seconds,
+            reasoning_effort=reasoning_effort,
+            reason=reason,
+            assignee=assignee,
+            firepower=firepower_reason,
+            created_by=_profile_author(),
+            now=now,
+        )
+    scope = f"assignee={assignee}" if assignee else "assignee=(board-wide)"
+    print(
+        f"lane-model set: route={override.route} {scope} "
+        f"ttl={_format_ttl(ttl_seconds)} applies=next-dispatch"
+    )
+    if reason:
+        print(f"  reason: {reason}")
+    if is_firepower_model(model) and firepower_reason:
+        print(f"  {format_firepower_audit(model, provider, firepower_reason)}")
+    print(
+        "  cards with their own --model/--provider override are unaffected; "
+        "on expiry the lane falls back to the board-wide lane if one is "
+        "active, else its profile default"
+    )
+    return 0
+
+
+def _cmd_lane_model_show(args: argparse.Namespace) -> int:
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        overrides = kb.list_lane_model_overrides(conn, now=now)
+    if getattr(args, "as_json", False):
+        print(json.dumps([
+            {
+                "assignee": row.assignee,
+                "provider": row.provider,
+                "model": row.model,
+                "route": row.route,
+                "reason": row.reason,
+                "firepower": row.firepower,
+                "created_by": row.created_by,
+                "created_at": row.created_at,
+                "expires_at": row.expires_at,
+                "ttl_remaining_seconds": row.ttl_remaining(now),
+            }
+            for row in overrides
+        ], indent=2))
+        return 0
+    if not overrides:
+        print("(no active lane-model overrides)")
+        return 0
+    for row in overrides:
+        print(
+            f"{_lane_label(row.assignee)}: route={row.route} "
+            f"ttl={_format_ttl(row.ttl_remaining(now))} remaining"
+        )
+        if row.reason:
+            print(f"  reason: {row.reason}")
+        if row.firepower:
+            print(f"  firepower: {row.firepower}")
+        if row.created_by:
+            print(f"  set by: {row.created_by}")
+    return 0
+
+
+def _cmd_lane_model_clear(args: argparse.Namespace) -> int:
+    assignee = getattr(args, "assignee", None)
+    clear_all = bool(getattr(args, "clear_all", False))
+    with kb.connect_closing() as conn:
+        if clear_all:
+            # One transaction for the whole sweep — see
+            # clear_all_lane_model_overrides. Listing and then deleting row by
+            # row is the same partial-commit class as the set-model batch.
+            removed = kb.clear_all_lane_model_overrides(conn)
         else:
-            print(f"Cleared model override on {args.task_id} "
-                  "(worker uses its profile default)")
-    if clear_effort:
-        print(f"Cleared reasoning effort on {args.task_id} "
-              "(worker uses its profile's agent.reasoning_effort)")
-    elif effort is not None:
-        print(f"Set reasoning effort on {args.task_id}: {effort} "
-              "(applies on next dispatch)")
+            one = kb.clear_lane_model_override(conn, assignee=assignee)
+            removed = [one] if one else []
+        # Name what routes each cleared lane NOW: clearing an assignee lane
+        # under a live board-wide lane does not return it to the profile
+        # default, and saying so would be the same false receipt class.
+        now = int(time.time())
+        successors = {
+            row.assignee: kb.lane_successor_label(
+                kb.get_lane_model_override(conn, assignee=row.assignee, now=now)
+            )
+            for row in removed
+        }
+    if not removed:
+        target = "any lane" if clear_all else _lane_label(assignee)
+        print(f"no lane-model override set for {target}", file=sys.stderr)
+        return 1
+    for row in removed:
+        print(
+            f"Cleared lane-model override for {_lane_label(row.assignee)} "
+            f"(was {row.route}); lane now routes via {successors[row.assignee]}"
+        )
     return 0
 
 
@@ -2500,13 +3287,43 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
+    reclaim_first = bool(getattr(args, "reclaim", False))
+    # `--reclaim` SIGTERMs the live worker and releases the claim BEFORE the
+    # assign is attempted. If the assign then refuses, the old "cannot
+    # reassign (still running — pass --reclaim)" line was actively false: the
+    # reclaim had already happened and the worker was already dead. Carry the
+    # receipt so the failure path can say what really landed.
+    receipt: dict = {}
     with kb.connect_closing() as conn:
         ok = kb.reassign_task(
             conn, args.task_id, profile,
-            reclaim_first=bool(getattr(args, "reclaim", False)),
+            reclaim_first=reclaim_first,
             reason=getattr(args, "reason", None),
+            receipt=receipt,
         )
+    reclaimed = bool(receipt.get("reclaimed"))
     if not ok:
+        if receipt.get("reclaim_error"):
+            print(
+                f"kanban: {args.task_id}: reclaim failed, task NOT reassigned: "
+                f"{receipt['reclaim_error']}",
+                file=sys.stderr,
+            )
+            return 1
+        if reclaimed:
+            detail = (
+                f"; assign failed ({receipt['assign_error']}); assignment outcome "
+                "may have changed — inspect the card"
+                if receipt.get("assign_error") else
+                "; assign refused (the card may have been claimed again) — "
+                "inspect the current status before retrying"
+            )
+            print(
+                f"kanban: {args.task_id}: claim WAS reclaimed (the prior "
+                f"worker was signalled){detail}",
+                file=sys.stderr,
+            )
+            return 1
         print(
             f"cannot reassign {args.task_id} "
             f"(unknown id, or still running — pass --reclaim to release first)",
@@ -2516,7 +3333,7 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     print(
         f"Reassigned {args.task_id} to "
         f"{profile or '(unassigned)'}"
-        + (" (claim reclaimed)" if getattr(args, "reclaim", False) else "")
+        + (" (claim reclaimed)" if reclaimed else "")
     )
     return 0
 
@@ -3464,6 +4281,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                     spawned_unwatched.append(_tid)
             except Exception:
                 pass
+    from hermes_cli.model_policy import route_kind
+
     if getattr(args, "json", False):
         # The human-readable tick prints the awaiting-HUMAN detector below;
         # without this key a JSON consumer is exactly as blind as it was
@@ -3484,8 +4303,24 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
             "spawned": [
-                {"task_id": tid, "assignee": who, "workspace": ws}
+                {
+                    "task_id": tid,
+                    "assignee": who,
+                    "workspace": ws,
+                    "route": res.spawn_routes.get(tid),
+                    "route_kind": route_kind(res.spawn_routes.get(tid)),
+                    "route_source": res.spawn_route_sources.get(tid),
+                }
                 for (tid, who, ws) in res.spawned
+            ],
+            "expired_lane_models": [
+                {
+                    "lane": lane,
+                    "route": route,
+                    "successor": (getattr(res, "expired_lane_successors", None) or {})
+                    .get(lane, "profile default"),
+                }
+                for (lane, route) in getattr(res, "expired_lane_models", []) or []
             ],
             "spawned_unwatched": spawned_unwatched,
             "skipped_unassigned": res.skipped_unassigned,
@@ -3574,7 +4409,22 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
-        print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+        route = res.spawn_routes.get(tid, "unknown/unknown")
+        source = res.spawn_route_sources.get(tid)
+        # source= names WHICH layer chose the route (card / lane window /
+        # profile). Without it a lane override is invisible in the tick log
+        # and looks like the profile default silently changed.
+        source_part = f" source={source}" if source else ""
+        print(
+            f"  - {tid}  ->  {who}  @ {ws or '-'}  route={route}{source_part} "
+            f"kind={route_kind(route)}{tag}"
+        )
+    successors = getattr(res, "expired_lane_successors", None) or {}
+    for lane, route in getattr(res, "expired_lane_models", []) or []:
+        print(
+            f"lane-model expired ({lane}: {route}) -> "
+            f"{successors.get(lane, 'profile default')}"
+        )
     collision_warnings = getattr(res, "collision_warnings", [])
     if collision_warnings:
         print("WARNING — pre-dispatch file collision(s); dispatch continued:")
@@ -3966,6 +4816,21 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
+    # Print active lane overrides FIRST: when spawns are being re-routed
+    # board-wide, that's the context for every number below it.
+    lane_overrides = stats.get("lane_model_overrides") or []
+    if lane_overrides:
+        print("Active lane-model overrides:")
+        for row in lane_overrides:
+            lane = row.get("assignee") or "(board-wide)"
+            ttl = _format_ttl(int(row.get("ttl_remaining_seconds") or 0))
+            reason = row.get("reason")
+            suffix = f" — {reason}" if reason else ""
+            print(
+                f"  {lane}: route={row.get('provider')}/{row.get('model')} "
+                f"ttl={ttl} remaining{suffix}"
+            )
+        print()
     print("By status:")
     for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         n = stats["by_status"].get(k, 0)

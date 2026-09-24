@@ -1204,6 +1204,133 @@ def test_reassign_endpoint_switches_profile(client):
         conn2.close()
 
 
+def test_reassign_endpoint_reports_reclaim_that_landed_before_assign_refused(
+    client, monkeypatch,
+):
+    """HTTP 409 must not say 'still running' after the worker was reclaimed."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="victim", assignee="worker-a")
+        assert kb.claim_task(conn, task_id, claimer="probe-claimer")
+
+    monkeypatch.setattr(kb, "assign_task", lambda conn, tid, profile: False)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/reassign",
+        json={"profile": "worker-b", "reclaim_first": True},
+    )
+
+    assert r.status_code == 409
+    assert "WAS reclaimed" in r.json()["detail"]
+    assert "still running" not in r.json()["detail"]
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT status, claim_lock, assignee FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["claim_lock"] is None
+        assert row["assignee"] == "worker-a"
+
+
+def test_bulk_reassign_reports_reclaim_that_landed_before_assign_refused(
+    client, monkeypatch,
+):
+    """The bulk endpoint's per-id receipt must expose the killed worker."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="victim", assignee="worker-a")
+        assert kb.claim_task(conn, task_id, claimer="probe-claimer")
+
+    monkeypatch.setattr(kb, "assign_task", lambda conn, tid, profile: False)
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [task_id], "assignee": "worker-b", "reclaim_first": True,
+        },
+    )
+
+    assert r.status_code == 200
+    entry = r.json()["results"][0]
+    assert entry["id"] == task_id
+    assert entry["ok"] is False
+    assert entry["reclaimed"] is True
+    assert "claim WAS reclaimed" in entry["error"]
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_reassign_post_reclaim_sqlite_lock_has_receipt(client, monkeypatch, bulk):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="locked assign", assignee="worker-a")
+        assert kb.claim_task(conn, task_id, claimer="old")
+    original = kb.reclaim_task
+    holders = []
+
+    def lock_after_reclaim(conn, tid, **kwargs):
+        result = original(conn, tid, **kwargs)
+        assert result
+        conn.execute("PRAGMA busy_timeout=75")
+        import sqlite3
+        other = sqlite3.connect(kb.kanban_db_path(), check_same_thread=False)
+        other.execute("BEGIN IMMEDIATE")
+        holders.append(other)
+        return result
+
+    monkeypatch.setattr(kb, "reclaim_task", lock_after_reclaim)
+    try:
+        if bulk:
+            r = client.post("/api/plugins/kanban/tasks/bulk", json={
+                "ids": [task_id], "assignee": "worker-b", "reclaim_first": True,
+            })
+        else:
+            r = client.post(f"/api/plugins/kanban/tasks/{task_id}/reassign", json={
+                "profile": "worker-b", "reclaim_first": True,
+            })
+    finally:
+        for holder in holders:
+            holder.rollback()
+            holder.close()
+    assert r.status_code == (200 if bulk else 409)
+    result = r.json()["results"][0] if bulk else r.json()
+    detail = result["error"] if bulk else result["detail"]
+    assert task_id in detail and "reclaimed" in detail.lower()
+    assert "database is locked" in detail
+    if bulk:
+        assert result["reclaimed"] is True
+    with kb.connect() as conn:
+        row = kb.get_task(conn, task_id)
+        assert row is not None and row.status == "ready" and row.assignee == "worker-a"
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_reassign_new_claim_does_not_report_card_no_longer_running(client, monkeypatch, bulk):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="new claim", assignee="worker-a")
+        assert kb.claim_task(conn, task_id, claimer="old")
+    original = kb.reclaim_task
+
+    def claim_after_reclaim(conn, tid, **kwargs):
+        result = original(conn, tid, **kwargs)
+        assert result
+        with kb.connect() as other:
+            assert kb.claim_task(other, tid, claimer="new")
+        return result
+
+    monkeypatch.setattr(kb, "reclaim_task", claim_after_reclaim)
+    if bulk:
+        r = client.post("/api/plugins/kanban/tasks/bulk", json={
+            "ids": [task_id], "assignee": "worker-b", "reclaim_first": True,
+        })
+    else:
+        r = client.post(f"/api/plugins/kanban/tasks/{task_id}/reassign", json={
+            "profile": "worker-b", "reclaim_first": True,
+        })
+    assert r.status_code == (200 if bulk else 409)
+    result = r.json()["results"][0] if bulk else r.json()
+    detail = result["error"] if bulk else result["detail"]
+    assert "no longer running" not in detail and "retry without" not in detail
+    assert "reclaimed" in detail.lower()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "running"
+
+
 # ---------------------------------------------------------------------------
 # Diagnostics endpoint (/api/plugins/kanban/diagnostics)
 # ---------------------------------------------------------------------------
