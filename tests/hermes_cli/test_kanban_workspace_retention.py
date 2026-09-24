@@ -283,17 +283,65 @@ def test_cwd_stat_timeout_retains_candidate(kanban_home, monkeypatch):
     assert f"REFUSED\ttask={old.name}\t" in audit and "owner-has-live-run" in audit
 
 
-def test_cwd_budget_expired_after_scan_retains_candidate(kanban_home, monkeypatch):
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="POSIX interval timer")
+def test_cwd_scan_identity_timeout_retains_all_candidates(kanban_home, monkeypatch):
+    _home_rooted_dir_card(kanban_home, "running")
+    a = _scratch(_mktask("old a"), "done", finished_days_ago=5)
+    b = _scratch(_mktask("old b"), "done", finished_days_ago=5)
+    scanned_cwd = kanban_home / "scan-cwd"
+    scanned_cwd.mkdir()
+    calls = _fake_lsof(monkeypatch, _listing(str(scanned_cwd)))
+    monkeypatch.setattr(kb, "_CWD_SCAN_BUDGET_SECONDS", 0.05)
+    real_identity = kb._path_identity
+
+    def stalled_identity(path, memo=None):
+        if path == scanned_cwd and signal.getitimer(signal.ITIMER_REAL)[0] > 0:
+            time.sleep(2)
+        return real_identity(path, memo)
+
+    monkeypatch.setattr(kb, "_path_identity", stalled_identity)
+    started = time.monotonic()
+    assert _gc(done_retention_days=3) == 0
+    assert time.monotonic() - started < 1.5
+    assert a.is_dir() and b.is_dir(), "a timed-out cwd identity scan fails closed"
+    assert len(calls) == 1, "failed scan must be cached"
+
+
+def test_gc_deletion_time_does_not_exhaust_cwd_scan_budget(kanban_home, monkeypatch):
+    """One slow removal cannot make later free candidates look occupied."""
+    _home_rooted_dir_card(kanban_home, "running")
+    first = _scratch(_mktask("first"), "done", finished_days_ago=5)
+    free = _scratch(_mktask("free"), "done", finished_days_ago=5)
+    held = _scratch(_mktask("held"), "done", finished_days_ago=5)
+    nested = held / "nested"
+    nested.mkdir()
+    calls = _fake_lsof(monkeypatch, _listing("/", str(nested)))
+    monkeypatch.setattr(kb, "_CWD_SCAN_BUDGET_SECONDS", 0.05)
+    real_remove = kb.safe_remove_workspace_dir
+
+    def delayed_remove(path, **kw):
+        result = real_remove(path, **kw)
+        if Path(path) == first:
+            time.sleep(0.1)  # A real removal can take longer than the scan budget.
+        return result
+
+    monkeypatch.setattr(kb, "safe_remove_workspace_dir", delayed_remove)
+    assert _gc(done_retention_days=3) == 0
+    assert not first.exists() and not free.exists()
+    assert nested.is_dir(), "cached nested cwd must still protect later work"
+    assert len(calls) == 1
+
+
+def test_cwd_snapshot_survives_elapsed_scan_budget(kanban_home, monkeypatch):
     _home_rooted_dir_card(kanban_home, "running")
     old = _scratch(_mktask("old done"), "done", finished_days_ago=5)
-    _fake_lsof(monkeypatch, _listing("/"))
+    calls = _fake_lsof(monkeypatch, _listing("/"))
+    monkeypatch.setattr(kb, "_CWD_SCAN_BUDGET_SECONDS", 0.05)
     with kb.process_cwd_snapshot_scope():
-        kb._process_cwds()
-        token = kb._CWD_SCAN_DEADLINE.set(time.monotonic() - 1)
-        try:
-            assert kb._process_cwd_within(old) is True
-        finally:
-            kb._CWD_SCAN_DEADLINE.reset(token)
+        assert kb._process_cwd_within(old) is False
+        time.sleep(0.1)
+        assert kb._process_cwd_within(old) is False
+    assert len(calls) == 1
     assert old.is_dir()
 
 

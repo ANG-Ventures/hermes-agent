@@ -109,6 +109,21 @@ def test_unknown_owner_fallback_only_refuses():
                                     "_durable_audit_log_path"])
 
 
+def test_pin_agree_checks_use_missing_aware_identity():
+    """All pin agreement sites handle uncreated ancestors via the same seam."""
+    tree = ast.parse(Path(inspect.getfile(kb)).read_text(encoding="utf-8"))
+    functions = {fn.name: fn for fn in tree.body if isinstance(fn, ast.FunctionDef)}
+    for name in ("_pin_divergence_is_a_hazard",
+                 "_refuse_if_override_escapes_hermes_home", "_pin_file_agrees"):
+        fn = functions[name]
+        assert "_pin_tree_agrees" in _called(fn) or "_pin_missing_parts" in _called(fn)
+        assert not ({"_same_tree", "_same_path"} & _called(fn)), (
+            f"{name} bypassed missing-aware pin identity"
+        )
+    assert "_pin_missing_parts" in _called(functions["_pin_tree_agrees"])
+    assert "_pin_file_agrees" in _called(functions["_refuse_if_pin_contradicts_board_arg"])
+
+
 def test_gc_path_contract_rejects_new_raw_owner_leaf_and_descriptor():
     source = Path(inspect.getfile(kb)).read_text(encoding="utf-8")
     old = "and _same_tree(resolved, managed_root / row[\"id\"], spelling_memo)"

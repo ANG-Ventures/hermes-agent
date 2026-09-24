@@ -783,7 +783,7 @@ def _pin_divergence_is_a_hazard(target: Path) -> bool:
         return False
     # Spelling-blind: a pin naming the live home in another case/firmlink
     # spelling still reaches production (card t_ee808d83 class sweep).
-    return _same_tree(_existing_ancestor(target), native)
+    return _pin_tree_agrees(target, native)
 
 
 class KanbanPinDivergenceError(RuntimeError):
@@ -853,7 +853,7 @@ def _refuse_if_override_escapes_hermes_home(override: Path) -> None:
     # spelling-blind, so a pin naming a file inside the root in another
     # case/firmlink spelling must be recognised here or it would be refused
     # as an escape (card t_ee808d83, Argus round 2 N1).
-    if _same_tree(_existing_ancestor(target), root):
+    if _pin_tree_agrees(target, root):
         _CHECKED_OVERRIDE_ESCAPES.add(key)
         return  # override lives inside the HERMES_HOME-derived root: normal.
     if not _pin_divergence_is_a_hazard(target):
@@ -8193,30 +8193,23 @@ def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
 _CWD_SNAPSHOT_SCOPE: ContextVar[Optional[list]] = ContextVar(
     "kanban_cwd_snapshot_scope", default=None,
 )
-_CWD_SCAN_DEADLINE: ContextVar[Optional[float]] = ContextVar(
-    "kanban_cwd_scan_deadline", default=None,
-)
 _CWD_SCAN_BUDGET_SECONDS = 30
 
 
 @contextlib.contextmanager
 def _bounded_cwd_probe():
-    """Bound lsof AND filesystem probes to one GC-run budget; fail closed.
+    """Bound lsof, cwd identity snapshot, and a candidate stat; fail closed.
 
-    A stat of an lsof cwd on a dead mount can block independently of lsof.
-    SIGALRM interrupts that syscall on POSIX; in threads or on platforms
-    without interval timers we refuse reclamation rather than run unbounded.
+    The deadline starts with a probe, never with the GC removal loop: a slow
+    rmtree must not spend the following candidate's probe budget. All lsof
+    cwd ancestors are resolved in the first probe and cached for this run.
+    A stat on a dead mount can block independently of lsof. SIGALRM interrupts
+    it on POSIX; threads/platforms without timers refuse reclamation.
     """
-    deadline = _CWD_SCAN_DEADLINE.get()
-    if deadline is None:
-        yield
-        return
+    deadline = time.monotonic() + _CWD_SCAN_BUDGET_SECONDS
     if (not hasattr(signal, "setitimer") or
             threading.current_thread() is not threading.main_thread()):
         raise TimeoutError("cwd probe cannot be bounded in this context")
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError("cwd probe budget exhausted")
     previous = signal.getitimer(signal.ITIMER_REAL)
     if previous[0] > 0:
         raise TimeoutError("cwd probe cannot replace an existing alarm")
@@ -8227,7 +8220,7 @@ def _bounded_cwd_probe():
 
     signal.signal(signal.SIGALRM, expired)
     try:
-        signal.setitimer(signal.ITIMER_REAL, remaining)
+        signal.setitimer(signal.ITIMER_REAL, max(deadline - time.monotonic(), 0.000001))
         yield
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
@@ -8282,19 +8275,36 @@ def _same_path(a: Path, b: Path, memo: Optional[dict] = None) -> bool:
     return first is not None and first == second
 
 
+def _pin_missing_parts(path: Path) -> tuple[Optional[tuple[int, int]], tuple[str, ...]]:
+    """Pin-only identity: nearest existing ancestor ID and exact missing tail."""
+    ancestor = _existing_ancestor(path)
+    return _path_identity(ancestor), path.parts[len(ancestor.parts):]
+
+
+def _pin_tree_agrees(child: Path, parent: Path) -> bool:
+    """Pin-only containment: filesystem identity plus exact uncreated tail.
+
+    Never use this for scratch admission or ownership. Missing paths have no
+    identity there; only the pin resolver needs to agree before mkdir.
+    """
+    child_base, child_tail = _pin_missing_parts(child)
+    parent_base, parent_tail = _pin_missing_parts(parent)
+    if child_base is None or parent_base is None:
+        return False
+    if not parent_tail:
+        return _same_tree(_existing_ancestor(child), parent)
+    return child_base == parent_base and child_tail[:len(parent_tail)] == parent_tail
+
+
 def _pin_file_agrees(a: Path, b: Path) -> bool:
     """Compare an uncreated DB pin by existing ancestor and exact missing tail.
 
     This is a pin agreement check, never scratch admission or ownership: an
     uncreated DB file has no filesystem identity until the first connection.
     """
-    if _same_path(a, b):
-        return True
-    if _path_identity(a) is not None or _path_identity(b) is not None:
-        return False
-    ancestor_a, ancestor_b = _existing_ancestor(a), _existing_ancestor(b)
-    return (_same_path(ancestor_a, ancestor_b)
-            and a.parts[len(ancestor_a.parts):] == b.parts[len(ancestor_b.parts):])
+    identity_a, tail_a = _pin_missing_parts(a)
+    identity_b, tail_b = _pin_missing_parts(b)
+    return identity_a is not None and identity_a == identity_b and tail_a == tail_b
 
 
 def _unknown_owner_may_claim(candidate: Path, stored: Path) -> bool:
@@ -8323,9 +8333,9 @@ def _scan_process_cwds() -> Optional[frozenset]:
     this process's own cwd, so a non-zero exit or an empty listing is a
     failed scan, never "nothing found"; callers must fail closed on None.
 
-    Names are kept exactly as lsof prints them. Filesystem identity checks
-    are covered by the same GC-run deadline as the lsof call, so a dead mount
-    cannot leave the cwd probe stuck beyond its budget.
+    Names are kept exactly as lsof prints them. The first candidate's probe
+    resolves every cwd ancestor under a single 30s deadline and caches the
+    result; later candidates get fresh bounded identity checks.
     """
     try:
         result = subprocess.run(
@@ -8355,23 +8365,43 @@ def process_cwd_snapshot_scope():
     and the rmtree.
     """
     token = _CWD_SNAPSHOT_SCOPE.set([])
-    deadline_token = _CWD_SCAN_DEADLINE.set(
-        time.monotonic() + _CWD_SCAN_BUDGET_SECONDS
-    )
     try:
         yield
     finally:
-        _CWD_SCAN_DEADLINE.reset(deadline_token)
         _CWD_SNAPSHOT_SCOPE.reset(token)
 
 
-def _process_cwds() -> Optional[frozenset]:
+def _process_cwds() -> Optional[tuple[frozenset, tuple]]:
+    """Cache cwd ancestor identities as well as lsof output under one deadline."""
     slot = _CWD_SNAPSHOT_SCOPE.get()
-    if slot is None:
-        return _scan_process_cwds()
-    if not slot:
-        slot.append(_scan_process_cwds())
-    return slot[0]
+    if slot is not None and slot:
+        return slot[0]
+    try:
+        with _bounded_cwd_probe():
+            cwds = _scan_process_cwds()
+            snapshot = None
+            if cwds is not None:
+                known, unknown = set(), []
+                for cwd in cwds:
+                    if _path_identity(cwd) is None:
+                        unknown.append(cwd)
+                        continue
+                    current = Path(os.path.realpath(os.path.expanduser(str(cwd))))
+                    while True:
+                        identity = _path_identity(current)
+                        if identity is None:
+                            unknown.append(cwd)
+                            break
+                        known.add(identity)
+                        if current == current.parent:
+                            break
+                        current = current.parent
+                snapshot = (frozenset(known), tuple(unknown))
+    except (OSError, RuntimeError, ValueError):
+        snapshot = None
+    if slot is not None:
+        slot.append(snapshot)
+    return snapshot
 
 
 def _process_cwd_within(path: Path) -> bool:
@@ -8382,21 +8412,21 @@ def _process_cwd_within(path: Path) -> bool:
     exempting that broad enclosing path from ownership. A failed or timed-out
     cwd scan answers True (preserve the path).
     """
+    snapshot = _process_cwds()
+    if snapshot is None:
+        return True
     try:
+        # Candidate identity is separately bounded; it does not consume or
+        # consult the cached cwd scan's deadline after a slow deletion.
         with _bounded_cwd_probe():
-            cwds = _process_cwds()
-            if cwds is None:
+            identity = _path_identity(path)
+            if identity is None:
                 return True
-            if _path_identity(path) is None:
+            known, unknown = snapshot
+            if identity in known:
                 return True
-            for cwd in cwds:
-                # A real lsof cwd exists. An unreadable one is unknown, not
-                # evidence that no process occupies the candidate.
-                if _path_identity(cwd) is None:
-                    if _unknown_owner_may_claim(path, cwd):
-                        return True
-                    continue
-                if _same_tree(cwd, path):
+            for cwd in unknown:
+                if _unknown_owner_may_claim(path, cwd):
                     return True
             return False
     except (OSError, RuntimeError, ValueError):

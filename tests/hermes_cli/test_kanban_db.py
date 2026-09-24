@@ -1169,6 +1169,37 @@ def test_uncreated_pin_agreement_requires_exact_missing_tail(tmp_path):
     assert not kb._pin_file_agrees(board, tmp_path / "MISSING" / "boards" / "kanban.db")
 
 
+def test_identical_pin_under_uncreated_home_does_not_refuse(tmp_path, monkeypatch):
+    home = tmp_path / "missing" / ".hermes"
+    pin = home / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    monkeypatch.setattr(kb, "_pin_divergence_is_a_hazard", lambda target: True)
+    kb._CHECKED_OVERRIDE_ESCAPES.clear()
+    try:
+        assert kb.kanban_db_path() == pin
+    finally:
+        kb._CHECKED_OVERRIDE_ESCAPES.clear()
+
+
+def test_missing_pin_agreement_is_shared_by_both_guards(tmp_path, monkeypatch):
+    """An uncreated home and an uncreated DB use the same exact-tail rule."""
+    home = tmp_path / "missing" / ".hermes"
+    pin = home / "boards" / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    monkeypatch.setattr(kb, "_pin_divergence_is_a_hazard", lambda target: True)
+    kb._CHECKED_OVERRIDE_ESCAPES.clear()
+    try:
+        assert kb.kanban_db_path() == pin
+        assert kb._pin_tree_agrees(pin, home)
+        assert not kb._pin_tree_agrees(tmp_path / "MISSING" / ".hermes" / "kanban.db", home)
+        assert not kb._pin_tree_agrees(tmp_path / "missing" / ".HERMES" / "kanban.db", home)
+        assert not kb._pin_tree_agrees(tmp_path / "missing" / "other" / "kanban.db", home)
+    finally:
+        kb._CHECKED_OVERRIDE_ESCAPES.clear()
+
+
 def test_no_refusal_when_board_arg_is_none(_pin_contradiction_env):
     """board=None means the pin IS the intended source of truth — no conflict."""
     assert kb.kanban_db_path() == _pin_contradiction_env
