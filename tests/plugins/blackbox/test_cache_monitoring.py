@@ -188,3 +188,120 @@ def test_backfill_cli_dryrun_then_backup_and_apply(db, monkeypatch, capsys):
     cli.main()
     assert "verified: lane_family=1" in capsys.readouterr().out
     assert len(list(db.parent.glob("turns-before-cache-backfill-*.db"))) == 1
+
+
+# --- r2 (Argus F1/F3) -------------------------------------------------------
+
+# RECORDED: the bpr lane's streamed chat-completion usage as captured live by
+# Argus (probe_tiers_opus.out, 2026-09-24): the bridge flattened the split.
+_BPR_USAGE_PRE_SPLIT = {
+    "prompt_tokens": 20975, "completion_tokens": 12, "total_tokens": 20987,
+    "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 20970},
+}
+# The same shape after claude-bpx emits the CLI's own split (bridge change in
+# the linked claude-bpx PR); inner keys are the CLI's recorded usage.cache_creation.
+_BPR_USAGE_WITH_SPLIT = {
+    **_BPR_USAGE_PRE_SPLIT,
+    "prompt_tokens_details": {
+        "cached_tokens": 0, "cache_creation_tokens": 20970,
+        "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                           "ephemeral_1h_input_tokens": 20970},
+    },
+}
+
+
+def _sdk_usage(payload):
+    """Parse through the real OpenAI SDK model, as the chat transport does."""
+    from openai.types import CompletionUsage
+    return CompletionUsage.model_validate(payload)
+
+
+def test_bpr_openai_shaped_split_is_recorded_and_flattened_shape_stays_null(db):
+    for seq, payload in enumerate((_BPR_USAGE_WITH_SPLIT, _BPR_USAGE_PRE_SPLIT)):
+        blackbox.record_api_call(turn_id="bpr", seq=seq, ts=seq + 1, provider="claude-bpr",
+                                 model="claude-opus-5-5", usage=_sdk_usage(payload),
+                                 api_mode="chat_completions", sub_key="sub-vps-16",
+                                 attribution="wire", http_status=200,
+                                 relay_synthetic=False, route_id=None)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT lane_family, cache_write, cache_write_5m, cache_write_1h "
+                            "FROM turn_api_calls WHERE turn_id='bpr' ORDER BY seq").fetchall() == [
+                                ("bpx/bpr", 20970, 0, 20970), ("bpx/bpr", 20970, None, None)]
+
+
+def _call(turn, seq, status, write, inp=100, with_usage=None):
+    if with_usage is None:
+        with_usage = status == 200
+    usage = (SimpleNamespace(input_tokens=inp, output_tokens=5, cache_read_input_tokens=0,
+                             cache_creation_input_tokens=write) if with_usage else None)
+    blackbox.record_api_call(turn_id=turn, seq=seq, ts=seq + 1, provider="claude-apr",
+                             model="m", usage=usage, api_mode="anthropic_messages",
+                             sub_key=None, attribution="wire", http_status=status,
+                             relay_synthetic=False, route_id=None)
+
+
+def test_first_call_miss_skips_a_failed_first_attempt(db):
+    # 429 (zero usage) then a cold 50k write: the classification belongs to the
+    # first SUCCESSFUL call. Control: the same turn without the failed attempt.
+    _call("retry", 0, 429, 0)
+    _call("retry", 1, 200, 50_000)
+    _call("control", 0, 200, 50_000)
+    for tid in ("retry", "control"):
+        store.insert_turn(TurnRecord(turn_id=tid, chat_id=tid, ts_start=1, ts_end=2))
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT turn_id, first_call_cache_miss FROM turns "
+                            "WHERE turn_id IN ('retry','control') ORDER BY turn_id").fetchall() == [
+                                ("control", 1), ("retry", 1)]
+
+
+def test_first_call_miss_filters_status_and_empty_usage_independently(db):
+    # A failed attempt that still reported usage (e.g. a 529 mid-stream with a
+    # warm read) must not classify the turn: the status filter alone decides.
+    _call("err_with_usage", 0, 529, 0, inp=100, with_usage=True)
+    _call("err_with_usage", 1, 200, 50_000)
+    # A status-less attempt with an all-zero usage (synthetic/empty) must not
+    # classify the turn either: the usage filter alone decides.
+    _call("empty_ok", 0, None, 0, inp=0, with_usage=True)
+    _call("empty_ok", 1, 200, 50_000)
+    for tid in ("err_with_usage", "empty_ok"):
+        store.insert_turn(TurnRecord(turn_id=tid, chat_id=tid, ts_start=1, ts_end=2))
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT turn_id, first_call_cache_miss FROM turns WHERE turn_id "
+                            "IN ('err_with_usage','empty_ok') ORDER BY turn_id").fetchall() == [
+                                ("empty_ok", 1), ("err_with_usage", 1)]
+
+
+@pytest.mark.parametrize("first_row", [
+    # zero-usage failure (the live case: 55 argus turns)
+    "('h',0,1,'claude-apr',429,0,0,0)",
+    # a failed attempt that still carried partial usage: status alone must exclude it
+    "('h',0,1,'claude-apr',529,100,0,0)",
+    # a 200 with no usage (relay-synthetic / empty): usage alone must exclude it
+    "('h',0,1,'claude-apr',200,0,0,0)",
+])
+def test_backfill_first_call_miss_uses_first_successful_measured_call(db, first_row):
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO turns(turn_id, chat_id, ts_start, ts_end) VALUES ('h','c',1,2)")
+        conn.execute("INSERT INTO turn_api_calls(turn_id,seq,ts,provider,http_status,"
+                     "input_tokens,cache_read,cache_write) VALUES "
+                     f"{first_row}, ('h',1,2,'claude-apr',200,100,0,50000)")
+    store.backfill_cache_monitoring()
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT first_call_cache_miss FROM turns WHERE turn_id='h'").fetchone() == (1,)
+
+
+def test_multiple_compactions_keep_first_before_last_after():
+    from agent.conversation_compression import _record_blackbox_compaction
+    agent = SimpleNamespace(_blackbox_compaction={"idle_compaction_fired": False})
+    _record_blackbox_compaction(agent, trigger="threshold", before=5000, after=900,
+                                telemetry=None, cost_sink={"usd": 0.01, "calls": 1, "unknown": False})
+    _record_blackbox_compaction(agent, trigger="threshold", before=4000, after=700,
+                                telemetry=None, cost_sink={"usd": 0.02, "calls": 2, "unknown": False})
+    state = agent._blackbox_compaction
+    assert (state["compaction_tokens_before"], state["compaction_tokens_after"],
+            state["compaction_cost_usd"]) == (5000, 700, 0.03)
+    # An unpriced sink poisons the total; it is never silently summed.
+    _record_blackbox_compaction(agent, trigger="threshold", before=3000, after=600,
+                                telemetry={"aux_cost_usd": 0.5},
+                                cost_sink={"usd": 0.0, "calls": 1, "unknown": True})
+    assert state["compaction_cost_usd"] is None

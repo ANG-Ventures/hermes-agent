@@ -3205,16 +3205,30 @@ def finalize_context_engine_compression_notification(
 
 def _record_blackbox_compaction(agent: Any, *, trigger: str | None,
                                 before: int | None, after: int | None,
-                                telemetry: dict | None) -> None:
-    """Record only committed work; an incomplete aux price remains unknown."""
+                                telemetry: dict | None,
+                                cost_sink: dict | None = None) -> None:
+    """Record only committed work; an incomplete aux price remains unknown.
+
+    Several compactions in one turn: ``compaction_tokens_before`` keeps the
+    FIRST compaction's pre-size (the context the turn arrived with),
+    ``compaction_tokens_after`` the LAST one's post-size, and the cost sums.
+    """
     state = getattr(agent, "_blackbox_compaction", None)
     if not isinstance(state, dict):
         return
     state["idle_compaction_fired"] = state.get("idle_compaction_fired", False) or trigger == "idle_resume"
-    state["compaction_tokens_before"] = before
+    if state.get("compaction_tokens_before") is None:
+        state["compaction_tokens_before"] = before
     state["compaction_tokens_after"] = after
-    # Chunk digests are additional unpriced calls. Do not report a partial sum.
-    cost = telemetry.get("aux_cost_usd") if isinstance(telemetry, dict) and not telemetry.get("chunking") else None
+    # Primary source: the engine-agnostic aux cost sink (covers LCM, which
+    # never fills _last_compression_telemetry, and chunk digests). Fallback:
+    # the builtin compressor's own telemetry when no call_llm was observed.
+    from agent.auxiliary_client import aux_cost_sink_total
+    if isinstance(cost_sink, dict) and cost_sink.get("calls"):
+        cost = aux_cost_sink_total(cost_sink)
+    else:
+        # Chunk digests are additional unpriced calls. Do not report a partial sum.
+        cost = telemetry.get("aux_cost_usd") if isinstance(telemetry, dict) and not telemetry.get("chunking") else None
     if cost is not None and not state.get("compaction_cost_unknown"):
         state["compaction_cost_usd"] = round((state.get("compaction_cost_usd") or 0) + cost, 12)
     else:
@@ -3297,6 +3311,11 @@ def compress_context(
     _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
     _trigger_source = "manual" if force else "auto"
+    # Engine-agnostic compaction pricing: every auxiliary call the engine makes
+    # inside ``compress`` (builtin summarizer, LCM leaf/condensed passes, any
+    # plugin engine) is priced into this sink via ``call_llm``.
+    from agent.auxiliary_client import new_aux_cost_sink
+    _blackbox_cost_sink = new_aux_cost_sink()
     try:
         agent._compression_attempt_id = _attempt_id
         setattr(agent.context_compressor, "_compression_telemetry_seed", {
@@ -4104,6 +4123,7 @@ def compress_context(
         # streamed total ceiling (see _aux_stream_total_ceiling) instead of
         # outliving the SDK's inactivity timeout indefinitely.
         from agent.auxiliary_client import (
+            aux_cost_sink,
             aux_interrupt_protection,
             aux_progress_hook,
         )
@@ -4139,7 +4159,7 @@ def compress_context(
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
-                ):
+                ), aux_cost_sink(_blackbox_cost_sink):
                     try:
                         compressed = compress_fn(messages, **compress_kwargs)
                     except TypeError:
@@ -5698,10 +5718,25 @@ def compress_context(
             commit_started_at=_commit_started_at,
         )
         if _commit_status == "committed":
+            # before/after on ONE basis: both are request-level rough estimates
+            # (messages + system prompt + tools). ``approx_tokens`` is the
+            # caller's messages-only figure and would make after > before.
+            _bb_before = locals().get("_pre_request_est")
+            if _bb_before is None:
+                try:
+                    _bb_before = estimate_request_tokens_rough(
+                        messages_before_compression
+                        if messages_before_compression is not None else messages,
+                        system_prompt=system_message or "",
+                        tools=agent.tools or None,
+                    )
+                except Exception:
+                    _bb_before = None
             _record_blackbox_compaction(
-                agent, trigger=trigger_reason, before=approx_tokens,
+                agent, trigger=trigger_reason, before=_bb_before,
                 after=_compressed_est,
                 telemetry=getattr(agent.context_compressor, "_last_compression_telemetry", None),
+                cost_sink=_blackbox_cost_sink,
             )
         return compressed, new_system_prompt
     finally:

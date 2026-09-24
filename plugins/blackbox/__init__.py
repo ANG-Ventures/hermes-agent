@@ -57,14 +57,26 @@ _lock = Lock()
 _sessions: dict[str, dict[str, Any]] = {}
 
 
+def _field(obj: Any, key: str) -> Any:
+    return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+
 def _cache_creation_tiers(usage: Any) -> tuple[int | None, int | None]:
-    """Keep unreported cache tiers NULL rather than imputing them."""
-    creation = usage.get("cache_creation") if isinstance(usage, dict) else getattr(usage, "cache_creation", None)
-    if creation is None:
+    """Keep unreported cache tiers NULL rather than imputing them.
+
+    Two wire shapes carry the split: Anthropic-native ``usage.cache_creation``
+    (apx/apr, direct), and the OpenAI-shaped bpx/bpr bridge egress
+    ``usage.prompt_tokens_details.cache_creation`` (same inner keys).
+    """
+    creation = _field(usage, "cache_creation")
+    if not creation:
+        details = _field(usage, "prompt_tokens_details")
+        creation = _field(details, "cache_creation") if details is not None else None
+    if not creation or isinstance(creation, (int, float, str)):
         return None, None
     def value(key: str) -> int | None:
-        raw = creation.get(key) if isinstance(creation, dict) else getattr(creation, key, None)
-        return int(raw) if raw is not None else None
+        raw = _field(creation, key)
+        return int(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else None
     return value("ephemeral_5m_input_tokens"), value("ephemeral_1h_input_tokens")
 
 

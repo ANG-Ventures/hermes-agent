@@ -504,6 +504,11 @@ def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
                                  (input_tokens + cache_read + cache_write) THEN 1
                             ELSE 0 END
                 FROM turn_api_calls WHERE turn_id = turns.turn_id
+                  -- First SUCCESSFUL call: a 429/5xx/timeout attempt carries
+                  -- zero usage and would hide the cold write on the retry.
+                  AND (http_status IS NULL OR http_status BETWEEN 200 AND 299)
+                  AND COALESCE(input_tokens, 0) + COALESCE(cache_read, 0)
+                      + COALESCE(cache_write, 0) > 0
                 ORDER BY seq LIMIT 1)
         WHERE turn_id = ?
     """, (turn_id,))
