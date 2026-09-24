@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
 import urllib.request
+from datetime import datetime
+from pathlib import Path
 
 
 _log = logging.getLogger(__name__)
@@ -29,6 +33,12 @@ _PINNED_FAMILY_RELAY = {"apx": "claude-apr", "bpx": "claude-bpr"}
 # / ``unreachable`` are deliberately excluded: they are not rate-limit evidence.
 _SUB_EXHAUSTED_FIELDS = ("exhausted", "capped_quota")
 _PROBE_TIMEOUT_SECONDS = 1  # bounded: probes run inside the dispatch tick
+# Box bridge /health bodies measured 8-15 KB (2026-09-24) and grow with their
+# diagnostics; a truncated read would parse as garbage and fail open silently.
+_MAX_HEALTH_BYTES = 1 << 20
+# Box bridge ``usage_limits`` windows whose ``status: rejected`` is a certain
+# 429 for every request to that sub until the window resets.
+_BOX_LIMIT_WINDOWS = ("five_hour", "seven_day")
 
 # (url, scope) -> "capped" | "ok" | "unreachable". Logged on TRANSITION only: a
 # 60s dispatcher logging every held spawn would emit ~1,440 identical lines/day.
@@ -86,6 +96,78 @@ def configured_pool_health_urls() -> dict[str, str]:
             if isinstance(family, str) and isinstance(url, str):
                 urls[family.strip().lower()] = url.strip()
     return urls
+
+
+def configured_box_health() -> bool:
+    """``kanban.pool_box_health`` (default True): judge pinned claude-apx/bpx-N
+    lanes on their own sub box's bridge ``/health``. Non-bool -> default."""
+    from hermes_cli.config import load_config
+    try:
+        value = load_config().get("kanban", {}).get("pool_box_health", True)
+    except Exception:
+        return True
+    return value if isinstance(value, bool) else True
+
+
+def _usage_registry_path() -> Path:
+    """The usage registry the claude-apx/bpx provider plugins route through
+    (``plugins/model-providers/_registry_route.py`` ``_registry_path``)."""
+    override = os.environ.get("HERMES_USAGE_REGISTRY", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".hermes" / "config" / "usage-registry.json"
+
+
+def box_health_url(sub: str) -> str | None:
+    """``<bridge_route_base_url>/health`` of the box serving ``sub``, or None.
+
+    apx-N and bpx-N reach the same subscription (one quota), so both lanes are
+    judged on the one bridge that reports that sub's ``usage_limits``.
+    """
+    try:
+        data = json.loads(_usage_registry_path().read_text())
+    except Exception:
+        return None
+    subs = data.get("subs") if isinstance(data, dict) else None
+    for row in subs if isinstance(subs, list) else ():
+        if isinstance(row, dict) and row.get("key") == sub:
+            base = row.get("bridge_route_base_url")
+            if isinstance(base, str) and base.strip().startswith(("http://", "https://")):
+                return base.strip().rstrip("/") + "/health"
+            return None
+    return None
+
+
+def _epoch(value) -> float | None:
+    if type(value) in (int, float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _box_rejection(data: dict, now: float):
+    """``(window, resets_at)`` for a CURRENT ``rejected`` usage window, else None.
+
+    ``usage_limits`` is captured from the box's last upstream response. A held
+    box gets no traffic, so a rejection whose ``resets_at`` has passed is
+    stale -- treated as admit, or the gate would hold the box forever.
+    """
+    limits = data.get("usage_limits")
+    if not isinstance(limits, dict):
+        return None
+    for window in _BOX_LIMIT_WINDOWS:
+        w = limits.get(window)
+        if not isinstance(w, dict) or w.get("status") != "rejected":
+            continue
+        resets = _epoch(w.get("resets_at"))
+        if resets is not None and resets <= now:
+            continue
+        return window, w.get("resets_at")
+    return None
 
 
 def _note_probe_state(url: str, provider, state: str, detail: str = "", scope=None) -> None:
@@ -159,7 +241,7 @@ def _fetch(url: str, cache: dict, provider):
         cache[url] = None
         try:
             with urllib.request.urlopen(url, timeout=_PROBE_TIMEOUT_SECONDS) as response:
-                data = json.loads(response.read(65536))
+                data = json.loads(response.read(_MAX_HEALTH_BYTES))
             cache[url] = data if isinstance(data, dict) else None
             if cache[url] is None:
                 _note_probe_state(url, provider, "unreachable", "non-object body")
@@ -174,36 +256,67 @@ def _reset_at(data: dict):
     return reset_at if type(reset_at) in (int, float, str) else None
 
 
+def _valid_url(url) -> bool:
+    return isinstance(url, str) and url.startswith(("http://", "https://"))
+
+
+def _pinned_sub_capped(provider, sub: str, relay_url, cache: dict, box_health: bool):
+    """Held only on positive evidence that THIS sub is out of quota.
+
+    1. its family relay lists it ``exhausted`` / ``capped_quota``;
+    2. else its own box bridge reports a current ``rejected`` usage window.
+    The relays track only the subs they pool (live 2026-09-24: 82.8% of
+    pinned-lane closes were on subs no relay lists), so (2) is what covers
+    most pinned lanes (Argus r2 G2). Every probe failure fails OPEN.
+    """
+    data = _fetch(relay_url, cache, provider) if _valid_url(relay_url) else None
+    if data is not None:
+        listed = [f for f in _SUB_EXHAUSTED_FIELDS
+                  if isinstance(data.get(f), list) and sub in data[f]]
+        if listed:
+            _note_probe_state(relay_url, provider, "capped",
+                              f"{sub} in {'/'.join(listed)}", scope=sub)
+            return {"reason": "provider_capped", "provider": provider, "sub": sub,
+                    "reset_at": _reset_at(data)}
+        _note_probe_state(relay_url, provider, "ok", scope=sub)
+    if not box_health:
+        return None
+    box_url = box_health_url(sub)
+    if box_url is None:
+        return None
+    box = _fetch(box_url, cache, provider)
+    if box is None:
+        return None
+    rejected = _box_rejection(box, time.time())
+    if rejected is not None:
+        _note_probe_state(box_url, provider, "capped",
+                          f"{sub} usage_limits.{rejected[0]} rejected", scope=sub)
+        return {"reason": "provider_capped", "provider": provider, "sub": sub,
+                "window": rejected[0], "reset_at": rejected[1]}
+    _note_probe_state(box_url, provider, "ok", scope=sub)
+    return None
+
+
 def capped_provider(
     task, probes: dict, cache: dict, *, min_eligible: int = 1,
-    pool_urls: dict | None = None,
+    pool_urls: dict | None = None, box_health: bool = True,
 ) -> dict | None:
     if not probes and not pool_urls:
         return None
     provider = effective_provider(task)
     url = (probes or {}).get(provider)
-    sub = None
     if url is None and pool_urls:
         # No explicit probe: ask the pool that actually SERVES this provider.
         route = pool_route(provider)
         if route is not None:
+            if route[1] is not None:
+                return _pinned_sub_capped(
+                    provider, route[1], pool_urls.get(route[0]), cache, box_health)
             url = pool_urls.get(route[0])
-            sub = route[1]
-    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+    if not _valid_url(url):
         return None
     data = _fetch(url, cache, provider)
     if data is None:
-        return None
-    if sub is not None:
-        # Pinned single-box lane: only positive evidence that THIS sub is out
-        # of quota holds it. Unlisted (unknown to the relay) admits.
-        listed = [f for f in _SUB_EXHAUSTED_FIELDS
-                  if isinstance(data.get(f), list) and sub in data[f]]
-        if listed:
-            _note_probe_state(url, provider, "capped", f"{sub} in {'/'.join(listed)}", scope=sub)
-            return {"reason": "provider_capped", "provider": provider, "sub": sub,
-                    "reset_at": _reset_at(data)}
-        _note_probe_state(url, provider, "ok", scope=sub)
         return None
     if (
         (type(data.get("eligible_count")) in (int, float)
@@ -220,7 +333,7 @@ def capped_provider(
 
 def available_profile_fallback(
     task, probes: dict, cache: dict, *, min_eligible: int = 1,
-    pool_urls: dict | None = None, skip_pools=frozenset(),
+    pool_urls: dict | None = None, skip_pools=frozenset(), box_health: bool = True,
 ) -> tuple[str, str] | None:
     """Pick a healthy configured profile rung without changing the task row.
 
@@ -255,6 +368,7 @@ def available_profile_fallback(
         )
         if capped_provider(
             candidate, probes, cache, min_eligible=min_eligible, pool_urls=pool_urls,
+            box_health=box_health,
         ) is None:
             return model, provider
     return None

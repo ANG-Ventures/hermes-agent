@@ -12369,7 +12369,11 @@ def rate_limit_circuits(
     served them (``kanban_provider_health.pool_key``: relay family, or the one
     sub a pinned lane hits) -- five openai-codex 429s are not claude-pool
     evidence, and a bpr storm says nothing about apr (Argus r1, PR #953).
-    The route is re-derived from the card's pin + the run's profile.
+    A close is charged to the pool that SERVED the run: a dispatch-time
+    route change (capped-pool fallback rung, lane override) is recorded as a
+    run-scoped ``dispatch_provider_fallback`` / ``dispatch_lane_route`` event
+    and wins; otherwise the route is re-derived from the card's pin + the
+    run's profile (Argus r2 G1: fallback-rung 429s charged to the primary).
 
     Derived from ``task_runs`` alone (no in-memory latch), so it survives a
     gateway restart: a pool trips at the latest close that completes ``trip``
@@ -12381,16 +12385,36 @@ def rate_limit_circuits(
     from hermes_cli.kanban_provider_health import effective_provider, pool_key
 
     rows = conn.execute(
-        "SELECT r.ended_at, r.profile, t.assignee, t.model_override, t.provider_override "
+        "SELECT r.id, r.ended_at, r.profile, t.assignee, t.model_override, t.provider_override "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE r.outcome = 'rate_limited' AND r.ended_at IS NOT NULL AND r.ended_at >= ? "
         "ORDER BY r.ended_at",
         (now - 2 * window,),
     ).fetchall()
+    served: dict[int, str] = {}
+    run_ids = [int(r["id"]) for r in rows]
+    for i in range(0, len(run_ids), 500):
+        chunk = run_ids[i:i + 500]
+        for ev in conn.execute(
+            "SELECT run_id, kind, payload FROM task_events WHERE run_id IN ("
+            + ",".join("?" * len(chunk)) + ") AND kind IN "
+            "('dispatch_lane_route', 'dispatch_provider_fallback') ORDER BY id",
+            chunk,
+        ):
+            try:
+                payload = json.loads(ev["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            field = "to_provider" if ev["kind"] == "dispatch_provider_fallback" else "provider"
+            if isinstance(payload, dict) and isinstance(payload.get(field), str):
+                served[int(ev["run_id"])] = payload[field]  # later event wins
     keys: dict[tuple, Optional[str]] = {}
     by_pool: dict[str, list[int]] = {}
     for r in rows:
-        route = (r["profile"] or r["assignee"], r["model_override"], r["provider_override"])
+        if int(r["id"]) in served:
+            route = (None, "served", served[int(r["id"])])
+        else:
+            route = (r["profile"] or r["assignee"], r["model_override"], r["provider_override"])
         if route not in keys:
             keys[route] = pool_key(effective_provider(SimpleNamespace(
                 assignee=route[0], model_override=route[1], provider_override=route[2],
@@ -16444,12 +16468,13 @@ def _dispatch_once_locked(
     spawned = 0
     from hermes_cli.kanban_provider_health import (
         available_profile_fallback, capped_provider, configured_min_eligible,
-        configured_pool_health_urls, configured_probes, effective_provider,
-        pool_key,
+        configured_box_health, configured_pool_health_urls, configured_probes,
+        effective_provider, pool_key,
     )
     health_probes = configured_probes()
     min_eligible = configured_min_eligible()
     pool_urls = configured_pool_health_urls()
+    box_health = configured_box_health()
     health_cache: dict = {}
     circuits: dict[str, int] = {}
     try:
@@ -16464,7 +16489,8 @@ def _dispatch_once_locked(
         circuits = {}
 
     def provider_admission(task_id, assignee):
-        if not health_probes and not any(pool_urls.values()) and not circuits:
+        if (not health_probes and not any(pool_urls.values()) and not box_health
+                and not circuits):
             return False, None
         task = get_task(conn, task_id)
         if task is None:
@@ -16484,13 +16510,13 @@ def _dispatch_once_locked(
         else:
             payload = capped_provider(
                 task, health_probes, health_cache, min_eligible=min_eligible,
-                pool_urls=pool_urls,
+                pool_urls=pool_urls, box_health=box_health,
             )
         if payload is None:
             return False, None
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
-            pool_urls=pool_urls, skip_pools=frozenset(circuits),
+            pool_urls=pool_urls, skip_pools=frozenset(circuits), box_health=box_health,
         )
         if fallback is not None and fallback_flagship_banned(task_id, fallback[0]):
             # The flagship gate covers the post-fallback route too: a capped
@@ -16511,6 +16537,16 @@ def _dispatch_once_locked(
             with write_txn(conn):
                 _append_event(conn, task_id, "deferred", payload)
         return True, None
+
+    def note_lane_route(claimed, source):
+        """Record the lane-override route on the run (in-memory only on the
+        card) so a rate-limited close is charged to the pool that served it."""
+        if source is None or not claimed.provider_override:
+            return
+        with write_txn(conn):
+            _append_event(conn, claimed.id, "dispatch_lane_route", {
+                "provider": claimed.provider_override, "model": claimed.model_override,
+            }, run_id=claimed.current_run_id)
 
     def apply_dispatch_fallback(claimed, selection):
         if selection is None:
@@ -16830,7 +16866,10 @@ def _dispatch_once_locked(
         # outlive its TTL / the capacity window as a permanent pin.
         route_source = apply_lane_model_override(
             claimed, _lane_override_for(claimed.assignee), now=_tick_now,
-        ) or ("card-override" if claimed.model_override else "profile-default")
+        )
+        note_lane_route(claimed, route_source)
+        route_source = route_source or (
+            "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             route_source = f"dispatch-fallback(capped {route_source})"
@@ -17021,7 +17060,10 @@ def _dispatch_once_locked(
         # precedence as the ready path: lane first, then capped-pool fallback.
         review_route_source = apply_lane_model_override(
             claimed, _lane_override_for(claimed.assignee), now=_tick_now,
-        ) or ("card-override" if claimed.model_override else "profile-default")
+        )
+        note_lane_route(claimed, review_route_source)
+        review_route_source = review_route_source or (
+            "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             review_route_source = f"dispatch-fallback(capped {review_route_source})"

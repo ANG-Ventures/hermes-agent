@@ -124,6 +124,7 @@ def home(tmp_path, monkeypatch):
     h.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(h))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_USAGE_REGISTRY", raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
     monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "normal")
     getattr(ph, "_PROBE_STATE", {}).clear()
@@ -767,3 +768,271 @@ def test_dispatch_dry_run_does_not_notify(home, pool, monkeypatch):
         kb.create_task(conn, title="pool", assignee="a")
         kb.dispatch_once(conn, dry_run=True)
         assert sent == []
+
+
+# ---------------------------------------------------------------------------
+# r3 -- G2: a pinned box is judged on ITS OWN bridge /health (Argus r2)
+# ---------------------------------------------------------------------------
+# Live 2026-09-24: both relays list only local + sub-vps-1..9/11/12/15, so the
+# relay lists never mention sub-vps-10/16/19/20/22 (82.8% of pinned-lane
+# closes over 7d). Each box's bridge /health carries ``usage_limits`` straight
+# from the upstream response headers; seven_day=rejected there is a certain 429.
+
+
+class _Box:
+    """Loopback fake of one sub box's bridge GET /health (``usage_limits``)."""
+
+    def __init__(self):
+        self.five_hour = "allowed"
+        self.seven_day = "allowed"
+        self.resets_at = "2099-01-01T00:00:00.000Z"
+        self.hits = 0
+        box = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                box.hits += 1
+                window = lambda st: {"utilization": 100 if st == "rejected" else 10,
+                                     "resets_at": box.resets_at, "status": st}
+                rejected = "rejected" in (box.five_hour, box.seven_day)
+                body = json.dumps({
+                    "status": "ok", "service": "claude-bridge",
+                    "usage_limits": {
+                        "five_hour": window(box.five_hour),
+                        "seven_day": window(box.seven_day),
+                        "overall_status": "rejected" if rejected else "allowed",
+                    },
+                    "padding": "x" * 90000,  # live bodies are 8-15 KB and growing
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def box():
+    b = _Box()
+    yield b
+    b.close()
+
+
+def _registry(home: Path, subs: dict):
+    """usage-registry.json at the path the claude-apx/bpx plugins read."""
+    cfg = home / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "usage-registry.json").write_text(json.dumps({"subs": [
+        {"key": k, "bridge_route_base_url": v, "route_base_url": v + "/unused"}
+        for k, v in subs.items()
+    ]}))
+
+
+def test_G2_unlisted_pinned_sub_held_when_its_box_reports_rejected(home, bpr, box):
+    bpr.eligible = 9  # relay healthy and does NOT list sub-vps-19
+    box.seven_day = "rejected"
+    _registry(home, {"sub-vps-19": box.base})
+    got = ph.capped_provider(_task("claude-bpx-19"), {}, {}, pool_urls=_urls(None, bpr.url))
+    assert got is not None and got["reason"] == "provider_capped"
+    assert got["sub"] == "sub-vps-19"
+    assert box.hits == 1
+
+
+def test_G2_apx_lane_shares_the_sub_box_verdict(home, apr, box):
+    box.five_hour = "rejected"
+    _registry(home, {"sub-vps-19": box.base})
+    assert ph.capped_provider(
+        _task("claude-apx-19"), {}, {}, pool_urls=_urls(apr.url)) is not None
+
+
+def test_G2_box_allowed_admits(home, bpr, box):
+    _registry(home, {"sub-vps-19": box.base})
+    assert ph.capped_provider(
+        _task("claude-bpx-19"), {}, {}, pool_urls=_urls(None, bpr.url)) is None
+    assert box.hits == 1
+
+
+def test_G2_stale_rejection_past_its_reset_admits(home, bpr, box):
+    """usage_limits is captured from the LAST response; a held box sends no
+    traffic, so a rejection whose window already reset must not hold forever."""
+    box.seven_day = "rejected"
+    box.resets_at = "2000-01-01T00:00:00.000Z"
+    _registry(home, {"sub-vps-19": box.base})
+    assert ph.capped_provider(
+        _task("claude-bpx-19"), {}, {}, pool_urls=_urls(None, bpr.url)) is None
+
+
+def test_G2_box_unreachable_or_unregistered_fails_open(home, bpr):
+    _registry(home, {"sub-vps-19": _dead_url().rsplit("/", 1)[0]})
+    assert ph.capped_provider(
+        _task("claude-bpx-19"), {}, {}, pool_urls=_urls(None, bpr.url)) is None
+    # sub missing from the registry entirely
+    assert ph.capped_provider(
+        _task("claude-bpx-20"), {}, {}, pool_urls=_urls(None, bpr.url)) is None
+    (home / "config" / "usage-registry.json").unlink()
+    assert ph.capped_provider(
+        _task("claude-bpx-19"), {}, {}, pool_urls=_urls(None, bpr.url)) is None
+
+
+def test_G2_box_probe_runs_even_with_family_relay_disabled(home, box):
+    box.seven_day = "rejected"
+    _registry(home, {"sub-vps-19": box.base})
+    assert ph.capped_provider(_task("claude-bpx-19"), {}, {}, pool_urls=_urls()) is not None
+
+
+def test_G2_box_probe_knob_off_admits(home, bpr, box):
+    box.seven_day = "rejected"
+    _registry(home, {"sub-vps-19": box.base})
+    _config(home, pool_box_health=False)
+    assert ph.configured_box_health() is False
+    assert ph.capped_provider(
+        _task("claude-bpx-19"), {}, {}, pool_urls=_urls(None, bpr.url),
+        box_health=ph.configured_box_health()) is None
+    assert box.hits == 0
+
+
+def test_G2_box_health_knob_via_production_loader(home):
+    assert ph.configured_box_health() is True
+    _config(home, pool_box_health=False)
+    assert ph.configured_box_health() is False
+    _config(home, pool_box_health="junk")
+    assert ph.configured_box_health() is True
+
+
+def test_G2_dispatch_holds_pinned_card_on_rejected_unlisted_box(home, apr, bpr, box):
+    apr.eligible = bpr.eligible = 9
+    box.seven_day = "rejected"
+    _registry(home, {"sub-vps-19": box.base})
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    _profile(home, "pin", "claude-bpx-19")
+    tid, seen, res = _dispatch_one("pin")
+    assert seen == []
+    assert (tid, "provider_capped") in res.respawn_guarded
+
+
+def test_G2_fallback_skips_rung_whose_box_is_rejected(home, apr, bpr, box):
+    """CLASS-SWEEP: the live chain's rungs (claude-bpx-16, -10) are unlisted
+    subs; a rung on a rejected box must be skipped for the next rung."""
+    apr.eligible, bpr.eligible = 4, 0
+    box.seven_day = "rejected"
+    _registry(home, {"sub-vps-16": box.base})
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    p = home / "profiles" / "fb"
+    p.mkdir(parents=True)
+    (p / "config.yaml").write_text(json.dumps({
+        "model": {"provider": "claude-bpr", "default": "m"},
+        "fallback_providers": [
+            {"provider": "claude-bpx-16", "model": "m16"},
+            {"provider": "claude-apr", "model": "mapr"},
+        ],
+    }))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="x", assignee="fb")
+        seen: list = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        assert seen == [tid]
+        assert _events(conn, tid, "dispatch_provider_fallback")[-1]["to_provider"] == "claude-apr"
+
+
+# ---------------------------------------------------------------------------
+# r3 -- G1: a close counts against the pool that SERVED the run (Argus r2)
+# ---------------------------------------------------------------------------
+
+
+def _fb_chain_profile(home, chain, provider="claude-bpr"):
+    p = home / "profiles" / "fb"
+    p.mkdir(parents=True, exist_ok=True)
+    (p / "config.yaml").write_text(json.dumps({
+        "model": {"provider": provider, "default": "m"}, "fallback_providers": chain,
+    }))
+
+
+def _close_running_rate_limited(conn, now):
+    rows = conn.execute(
+        "SELECT id, task_id FROM task_runs WHERE ended_at IS NULL ORDER BY id").fetchall()
+    for i, r in enumerate(rows):
+        conn.execute("UPDATE task_runs SET status='rate_limited', outcome='rate_limited', "
+                     "ended_at=? WHERE id=?", (now - 300 + 30 * i, r["id"]))
+        conn.execute("UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL, "
+                     "worker_pid=NULL WHERE id=?", (r["task_id"],))
+    conn.commit()
+    return len(rows)
+
+
+def test_G1_fallback_rung_429s_open_the_rungs_circuit_not_the_primary(home, apr, bpr, monkeypatch):
+    from hermes_cli import kanban_budget as kbud
+
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: None)
+    apr.eligible, bpr.eligible = 4, 0
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url), max_spawn=50,
+            max_in_progress_per_profile=50)
+    _fb_chain_profile(home, [
+        {"provider": "claude-bpx-16", "model": "m16"},
+        {"provider": "claude-apr", "model": "mapr"},
+    ])
+    with kb.connect_closing() as conn:
+        first = [kb.create_task(conn, title=f"s{i}", assignee="fb") for i in range(5)]
+        kb.dispatch_once(conn, spawn_fn=_spawner([]))
+        rungs = [_events(conn, t, "dispatch_provider_fallback")[-1]["to_provider"] for t in first]
+        assert rungs == ["claude-bpx-16"] * 5
+        now = int(time.time())
+        assert _close_running_rate_limited(conn, now) == 5
+        circuits = kb.rate_limit_circuits(conn, now=now, trip=5)
+        assert set(circuits) == {"sub-vps-16"}
+        nxt = kb.create_task(conn, title="next", assignee="fb")
+        seen: list = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        assert seen == [nxt]
+        assert _events(conn, nxt, "dispatch_provider_fallback")[-1]["to_provider"] == "claude-apr"
+
+
+def test_G1_fallback_onto_non_pool_rung_does_not_charge_the_primary(home):
+    """A capped claude-bpr card served by an openai-codex rung: its 429s are
+    codex evidence, never claude-bpr's."""
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        for i in range(5):
+            tid = kb.create_task(conn, title=f"c{i}", assignee="z", model_override="m",
+                                 provider_override="claude-bpr")
+            conn.execute("INSERT INTO task_runs (task_id, profile, status, outcome, "
+                         "started_at, ended_at) VALUES (?, 'z', 'rate_limited', "
+                         "'rate_limited', ?, ?)", (tid, now - 400 + 30 * i, now - 300 + 30 * i))
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "dispatch_provider_fallback", {
+                    "from_provider": "claude-bpr", "to_provider": "openai-codex",
+                    "to_model": "gpt"}, run_id=run_id)
+        conn.commit()
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {}
+
+
+def test_G1_lane_routed_429s_charge_the_lane_pool(home, apr, bpr, monkeypatch):
+    """CLASS-SWEEP: a lane override is the other in-memory route change; its
+    runs are served by the lane provider, not the profile default."""
+    from hermes_cli import kanban_budget as kbud
+
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: None)
+    apr.eligible = bpr.eligible = 9
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url), max_spawn=50,
+            max_in_progress_per_profile=50)
+    _profile(home, "ln", "claude-bpr")
+    with kb.connect_closing() as conn:
+        kb.set_lane_model_override(conn, provider="claude-apr", model="lm", assignee="ln",
+                                   expires_at=int(time.time()) + 3600, reason="window")
+        for i in range(5):
+            kb.create_task(conn, title=f"l{i}", assignee="ln")
+        kb.dispatch_once(conn, spawn_fn=_spawner([]))
+        now = int(time.time())
+        assert _close_running_rate_limited(conn, now) == 5
+        assert set(kb.rate_limit_circuits(conn, now=now, trip=5)) == {"claude-apr"}

@@ -3034,6 +3034,11 @@ DEFAULT_CONFIG = {
             "claude-apr": "http://127.0.0.1:18810/health",
             "claude-bpr": "http://127.0.0.1:18811/health",
         },
+        # Pinned claude-apx-N / -bpx-N lanes not listed by any relay are judged
+        # on their own sub box: GET <usage-registry bridge_route_base_url>/health
+        # and hold while a usage_limits window (five_hour / seven_day) reports
+        # "rejected" and has not reset. Unreachable/unregistered fails OPEN.
+        "pool_box_health": True,
         # Per-pool circuit: this many rate_limited run closes on ONE pool within
         # 10 min hold that pool's spawns for 10 min (one #logs line per trip).
         # Non-pool providers never count. 0 disables.
