@@ -1407,6 +1407,86 @@ def build_session_key(
     return ":".join(str(part) for part in key_parts)
 
 
+class _StoreLock:
+    """``SessionStore._lock``: a plain mutex that never covers disk or SQLite I/O.
+
+    t_cc8533d1: on 2026-09-24 06:57-06:59 the gateway event loop sat ~100 s in
+    ``_ensure_loaded`` waiting for this lock while worker threads held it
+    across back-to-back routing saves, each spending SQLite's 20 s
+    busy_timeout on a contended ``state.db``.  ``_save()`` was called inside
+    ``with self._lock`` from ~25 methods, so a locked database became a
+    locked event loop.
+
+    Persistence entry points (``_persist_routing_data``,
+    ``_dispatch_sessions_json_save``, the single-entry upsert) hand their
+    work to :meth:`defer` when the calling thread owns this lock.  Deferred
+    work runs in :meth:`release`, AFTER the underlying mutex is released and
+    in registration order.  The snapshot each closure writes was already
+    captured under the lock, so ordering is still governed by the routing
+    generation counter (see ``_persist_routing_data``).
+
+    Error semantics match the old inline save: a deferred failure propagates
+    out of the ``with`` block that scheduled it.  If the block itself raised,
+    that exception wins and deferred failures are logged.
+    """
+
+    __slots__ = ("_mutex", "_owner", "_deferred")
+
+    def __init__(self) -> None:
+        self._mutex = threading.Lock()
+        self._owner: Optional[int] = None
+        self._deferred: List[Callable[[], None]] = []
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        acquired = self._mutex.acquire(blocking, timeout)
+        if acquired:
+            self._owner = threading.get_ident()
+        return acquired
+
+    def _release_and_collect(self) -> List[Callable[[], None]]:
+        deferred, self._deferred = self._deferred, []
+        self._owner = None
+        self._mutex.release()
+        return deferred
+
+    @staticmethod
+    def _run_deferred(deferred, *, suppress: bool) -> None:
+        first: Optional[BaseException] = None
+        for work in deferred:
+            try:
+                work()
+            except BaseException as exc:  # noqa: BLE001 -- re-raised below
+                if suppress or first is not None:
+                    logger.warning(
+                        "gateway.session: deferred store I/O failed: %s", exc,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+                else:
+                    first = exc
+        if first is not None:
+            raise first
+
+    def release(self) -> None:
+        self._run_deferred(self._release_and_collect(), suppress=False)
+
+    def locked(self) -> bool:
+        return self._mutex.locked()
+
+    def held_by_current_thread(self) -> bool:
+        return self._owner == threading.get_ident() and self._mutex.locked()
+
+    def defer(self, work: Callable[[], None]) -> None:
+        if not self.held_by_current_thread():
+            raise RuntimeError("_StoreLock.defer() requires the calling thread to hold the lock")
+        self._deferred.append(work)
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._run_deferred(self._release_and_collect(), suppress=exc_type is not None)
+
+
 class _SessionFlight:
     def __init__(self) -> None:
         self.event = threading.Event()
@@ -1460,10 +1540,12 @@ class SessionStore:
         # the handle recovers, before a whole-index save can replace DB rows.
         self._routing_db_loaded = False
         self._routing_fallback_baseline: Optional[Dict[str, Any]] = None
-        self._lock = threading.Lock()
-        # Serialize whole-index persistence without holding ``_lock`` across
-        # SQLite / fsync. Each writer snapshots the latest state only after
-        # acquiring this lock, preventing stale delayed writes.
+        # ``_StoreLock`` never covers SQLite / fsync: persistence scheduled
+        # while it is held runs after release (t_cc8533d1).
+        self._lock = _StoreLock()
+        # Serialize whole-index persistence (always outside ``_lock``). A
+        # writer whose snapshot generation is not newer than the last
+        # persisted one is skipped, preventing stale delayed writes.
         self._save_lock = threading.Lock()
         self._routing_generation = 0
         self._persisted_routing_generation = 0
@@ -1662,6 +1744,20 @@ class SessionStore:
             )
             return True
     
+    def _defer_while_locked(self, work: Callable[[], None]) -> bool:
+        """Schedule *work* for after ``_lock`` is released, if we hold it.
+
+        The single choke point that keeps SQLite / fsync out of the store
+        lock (t_cc8533d1).  Returns ``False`` when the calling thread does not
+        own a ``_StoreLock`` (no lock held, or a test double), in which case
+        the caller performs the I/O inline as before.
+        """
+        lock = getattr(self, "_lock", None)
+        if isinstance(lock, _StoreLock) and lock.held_by_current_thread():
+            lock.defer(work)
+            return True
+        return False
+
     def _ensure_loaded(self) -> None:
         """Load sessions index from disk if not already loaded."""
         with self._lock:
@@ -1686,6 +1782,54 @@ class SessionStore:
         except Exception:
             return str(self.sessions_dir)
 
+    def _with_lock_released(self, fn):
+        """Run *fn* with ``_lock`` temporarily released, if this thread holds it.
+
+        Only for the load step, which callers perform first in their critical
+        section (t_cc8533d1).  Lock-free callers (tests, test doubles) run *fn*
+        inline.
+        """
+        lock = getattr(self, "_lock", None)
+        if not (isinstance(lock, _StoreLock) and lock.held_by_current_thread()):
+            return fn()
+        deferred = lock._release_and_collect()
+        try:
+            # Work deferred earlier in this critical section runs now, while
+            # the lock is down; its failure propagates like any deferred save.
+            lock._run_deferred(deferred, suppress=False)
+            return fn()
+        finally:
+            lock.acquire()
+
+    def _read_routing_sources(self):
+        """Read state.db routing rows and legacy sessions.json. No store state touched."""
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        db_rows: Dict[str, str] = {}
+        db_load_succeeded = False
+        # getattr: some tests build partially-initialized stores without
+        # __init__ (same pattern as _prune_stale_sessions_locked).
+        _db = getattr(self, "_db", None)
+        if _db:
+            loader = getattr(_db, "load_gateway_routing_entries", None)
+            if callable(loader):
+                try:
+                    db_rows = dict(loader(scope=self._routing_scope()))
+                    db_load_succeeded = True
+                except Exception as e:
+                    logger.warning(
+                        "gateway.session: state.db routing load failed: %s", e
+                    )
+        legacy_data = None
+        legacy_error = None
+        sessions_file = self.sessions_dir / "sessions.json"
+        if sessions_file.exists():
+            try:
+                with open(sessions_file, "r", encoding="utf-8") as f:
+                    legacy_data = json.load(f)
+            except Exception as e:
+                legacy_error = e
+        return db_rows, db_load_succeeded, legacy_data, legacy_error
+
     def _ensure_loaded_locked(self) -> None:
         """Load the routing index. Must be called with self._lock held.
 
@@ -1695,45 +1839,42 @@ class SessionStore:
         the DB doesn't have, then persisted to the DB on the next _save).
         """
         if self._loaded:
-            self._reconcile_recovered_routing_locked()
+            self._reconcile_recovered_routing_locked(allow_release=True)
             return
 
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        # The reads below (state.db gateway_routing + legacy sessions.json)
+        # run with ``_lock`` RELEASED when the caller holds a ``_StoreLock``
+        # (t_cc8533d1).  Loading is the first step of every locked block, so
+        # dropping the lock here exposes no half-applied state; if another
+        # thread finished the load meanwhile, its result wins.
+        sources = self._with_lock_released(self._read_routing_sources)
+        if self._loaded:
+            self._reconcile_recovered_routing_locked(allow_release=False)
+            return
+        db_rows, db_load_succeeded, legacy_data, legacy_error = sources
 
-        # Primary: state.db gateway_routing table. getattr: some tests build
-        # partially-initialized stores without __init__ (same pattern as
-        # _prune_stale_sessions_locked).
+        # Primary: state.db gateway_routing table.
         db_had_entries = False
-        db_load_succeeded = False
-        _db = getattr(self, "_db", None)
-        if _db:
-            loader = getattr(_db, "load_gateway_routing_entries", None)
-            if callable(loader):
+        if db_load_succeeded:
+            for key, entry_json in db_rows.items():
                 try:
-                    for key, entry_json in loader(scope=self._routing_scope()).items():
-                        try:
-                            entry_data = json.loads(entry_json)
-                            if isinstance(entry_data, dict):
-                                self._entries[key] = SessionEntry.from_dict(entry_data)
-                        except (ValueError, KeyError, TypeError) as e:
-                            logger.warning(
-                                "Skipping invalid routing entry %r: %s", key, e
-                            )
-                    db_had_entries = bool(self._entries)
-                    db_load_succeeded = True
-                except Exception as e:
+                    entry_data = json.loads(entry_json)
+                    if isinstance(entry_data, dict):
+                        self._entries[key] = SessionEntry.from_dict(entry_data)
+                except (ValueError, KeyError, TypeError) as e:
                     logger.warning(
-                        "gateway.session: state.db routing load failed: %s", e
+                        "Skipping invalid routing entry %r: %s", key, e
                     )
+            db_had_entries = bool(self._entries)
 
         # Legacy import: sessions.json (pre-migration installs, or entries
         # written by an older gateway after a downgrade). Only fills keys the
         # DB didn't provide — DB entries win.
-        sessions_file = self.sessions_dir / "sessions.json"
-        if sessions_file.exists():
+        if legacy_error is not None:
+            print(f"[gateway] Warning: Failed to load sessions: {legacy_error}")
+        elif legacy_data is not None:
             try:
-                with open(sessions_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = legacy_data
                 imported = 0
                 for key, entry_data in data.items():
                     # Keys starting with "_" are documentation/metadata sentinels
@@ -2030,15 +2171,50 @@ class SessionStore:
         with any legacy activity are retained. A ``None`` DB handle (SQLite
         unavailable) is a no-op. DB errors are non-fatal — startup must never
         fail here.
+
+        When the caller holds a ``_StoreLock`` the per-route state.db lookups
+        run after the lock is released (``_prune_stale_sessions_off_lock``,
+        t_cc8533d1); lock-free callers (tests) get the synchronous pass.
         """
         db = getattr(self, "_db", None)
         if not db or not self._entries:
             return
+        if self._defer_while_locked(self._prune_stale_sessions_off_lock):
+            return
+        plan = self._plan_stale_prune(db, list(self._entries.items()))
+        if plan is not None:
+            self._apply_stale_prune_locked(plan, expected=None)
 
+    def _prune_stale_sessions_off_lock(self) -> None:
+        """Startup prune with the DB lookups outside ``_lock``.
+
+        Snapshot the routes under the lock, query state.db without it, then
+        apply under the lock only to routes that still hold the entry object
+        the decision was made on (a route touched meanwhile is left alone).
+        """
+        db = getattr(self, "_db", None)
+        if not db:
+            return
+        with self._lock:
+            items = list(self._entries.items())
+        if not items:
+            return
+        plan = self._plan_stale_prune(db, items)
+        if plan is None:
+            return
+        with self._lock:
+            self._apply_stale_prune_locked(plan, expected=dict(items))
+
+    def _plan_stale_prune(self, db, items):
+        """Decide stale / repointed routes. Performs the state.db I/O.
+
+        Returns ``(stale_keys, repointed)`` or ``None`` when a DB error made
+        the pass unsafe (logged; pruning is skipped entirely, as before).
+        """
         stale_keys: list = []
-        recovered_keys = 0
+        repointed: Dict[str, "SessionEntry"] = {}
         try:
-            for key, entry in self._entries.items():
+            for key, entry in items:
                 row = db.get_session(entry.session_id)
                 # row is None        -> keep active/recent legacy; reap only an
                 #                       old route with no evidence of activity
@@ -2094,8 +2270,7 @@ class SessionStore:
                             row["end_reason"],
                             recovered_entry.session_id,
                         )
-                        self._entries[key] = recovered_entry
-                        recovered_keys += 1
+                        repointed[key] = recovered_entry
                         continue
 
                     # A non-None recovery with the SAME session id is a
@@ -2127,12 +2302,25 @@ class SessionStore:
                 "gateway.session: stale-entry pruning skipped due to DB error: %s",
                 exc,
             )
-            return
+            return None
+        return stale_keys, repointed
 
+    def _apply_stale_prune_locked(self, plan, *, expected) -> None:
+        """Apply a prune plan. Caller holds ``_lock`` (or is lock-free)."""
+        stale_keys, repointed = plan
+        changed = False
         for key in stale_keys:
-            del self._entries[key]
-
-        if stale_keys or recovered_keys:
+            if expected is not None and self._entries.get(key) is not expected.get(key):
+                continue
+            if key in self._entries:
+                del self._entries[key]
+                changed = True
+        for key, recovered_entry in repointed.items():
+            if expected is not None and self._entries.get(key) is not expected.get(key):
+                continue
+            self._entries[key] = recovered_entry
+            changed = True
+        if changed:
             self._save()
 
     def entries(self):
@@ -2160,12 +2348,24 @@ class SessionStore:
     def _seed_chat_model_pins_locked(self) -> None:
         from gateway.chat_model_pins import ChatModelPins
 
-        pins = ChatModelPins(self.sessions_dir)
+        seeds = []
         for entry in sorted(self._entries.values(), key=lambda e: e.updated_at, reverse=True):
             key = self._chat_pin_key(entry.session_key)
             identity = entry.model_override_identity or entry.model_override
             if key and sanitize_model_override_identity(identity) and not entry._model_override_identity_invalid:
+                seeds.append((key, identity))
+        if not seeds:
+            return
+        pins = ChatModelPins(self.sessions_dir)
+
+        def _write_seeds() -> None:
+            # INSERT OR IGNORE: an explicit pin written meanwhile wins.
+            for key, identity in seeds:
                 pins.set(*key, identity, seed=True)
+
+        # chat-model-pins.sqlite3 writes: after ``_lock`` release (t_cc8533d1).
+        if not self._defer_while_locked(_write_seeds):
+            _write_seeds()
 
     def lookup_chat_model_pin(self, source: SessionSource):
         """Read the destination's pin independently of the emitting session."""
@@ -2259,8 +2459,14 @@ class SessionStore:
         self._routing_generation = getattr(self, "_routing_generation", 0) + 1
         return self._routing_generation
 
-    def _reconcile_recovered_routing_locked(self) -> None:
-        """Merge authoritative rows after a fallback-only startup load."""
+    def _reconcile_recovered_routing_locked(self, *, allow_release: bool = False) -> None:
+        """Merge authoritative rows after a fallback-only startup load.
+
+        ``allow_release`` (the load step only) reads state.db with ``_lock``
+        released; elsewhere the read stays in place. That path is reached only
+        after a failed initial state.db load, and every ``_ensure_loaded_locked``
+        call has already reconciled with the lock released (t_cc8533d1).
+        """
         baseline = getattr(self, "_routing_fallback_baseline", None)
         if getattr(self, "_routing_db_loaded", False) or baseline is None:
             return
@@ -2270,11 +2476,20 @@ class SessionStore:
         if not callable(loader):
             return
         try:
-            durable = loader(scope=self._routing_scope())
+            if allow_release:
+                durable = self._with_lock_released(
+                    lambda: loader(scope=self._routing_scope())
+                )
+            else:
+                durable = loader(scope=self._routing_scope())
         except Exception as exc:
             logger.warning(
                 "gateway.session: recovered state.db routing load failed: %s", exc
             )
+            return
+        # Another thread may have reconciled while the lock was released.
+        baseline = getattr(self, "_routing_fallback_baseline", None)
+        if getattr(self, "_routing_db_loaded", False) or baseline is None:
             return
 
         current = {key: entry.to_dict() for key, entry in self._entries.items()}
@@ -2306,9 +2521,13 @@ class SessionStore:
         """Capture immutable routing data and a monotonic generation."""
         self._reconcile_recovered_routing_locked()
         self._assert_unique_session_routes()
+        generation = self._next_routing_generation_locked()
+        # Read by ``_publish_persisted_entry``: a full snapshot numbered above
+        # a single-entry write supersedes it on disk.
+        self._last_full_snapshot_generation = generation
         return (
             {key: entry.to_dict() for key, entry in self._entries.items()},
-            self._next_routing_generation_locked(),
+            generation,
         )
 
     def _persist_routing_data(
@@ -2319,7 +2538,20 @@ class SessionStore:
         require_primary: bool = False,
         retired_keys=(),
     ) -> None:
-        """Serialize all whole-index writers through one durable write lock."""
+        """Serialize all whole-index writers through one durable write lock.
+
+        Never runs under ``_lock``: a caller holding it gets this write
+        deferred until release (see ``_StoreLock``).
+        """
+        if self._defer_while_locked(
+            lambda: self._persist_routing_data(
+                data,
+                generation,
+                require_primary=require_primary,
+                retired_keys=retired_keys,
+            )
+        ):
+            return
         from gateway.routing_identity import SessionKeyConflict
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
@@ -2426,7 +2658,17 @@ class SessionStore:
         mirror is the PRIMARY copy for this write and its failure must
         propagate to the caller.  In that case the write stays inline even on
         a loop thread: correctness outranks latency, and it is the rare path.
+        A caller holding ``_lock`` gets the write deferred until release.
         """
+        if self._defer_while_locked(
+            lambda: self._dispatch_sessions_json_save(
+                data,
+                generation,
+                retired_keys=retired_keys,
+                must_be_synchronous=must_be_synchronous,
+            )
+        ):
+            return
         if must_be_synchronous or not self._loop_is_running():
             self._save_sessions_json(
                 data, **({"retired_keys": retired_keys} if retired_keys else {})
@@ -2635,8 +2877,11 @@ class SessionStore:
         *,
         entry_data: Optional[Dict[str, Any]] = None,
         lock_held: bool = False,
-    ) -> None:
+    ) -> Optional[int]:
         """Persist ONE routing entry via UPSERT — the per-turn fast path.
+
+        Returns the routing revision allocated to this write (``None`` when
+        the key vanished before capture).
 
         The steady-state turn only bumps ``updated_at`` /
         ``last_prompt_tokens`` on one entry; routing that through the
@@ -2704,8 +2949,31 @@ class SessionStore:
             with self._lock:
                 captured = _capture()
         if captured is None:
-            return
+            return None
         entry_json, revision, candidate_entry = captured
+        persist = lambda inline_lock_held=False: self._persist_captured_entry(  # noqa: E731
+            session_key, entry_json, revision, candidate_entry,
+            lock_held=inline_lock_held,
+        )
+        # ``lock_held`` callers keep the capture atomic with their critical
+        # section, but the SQLite upsert (and any full-rewrite fallback) runs
+        # after ``_lock`` is released (t_cc8533d1).
+        if not self._defer_while_locked(persist):
+            # Reached with the lock still held only for a non-``_StoreLock``
+            # test double; keep the old in-place fallback snapshot there.
+            persist(lock_held)
+        return revision
+
+    def _persist_captured_entry(
+        self,
+        session_key: str,
+        entry_json: str,
+        revision: int,
+        candidate_entry: Optional[Dict[str, Any]],
+        *,
+        lock_held: bool = False,
+    ) -> None:
+        """Write one captured routing entry; the I/O half of ``_save_entry``."""
         _db = getattr(self, "_db", None)
         saver = getattr(_db, "save_gateway_routing_entry", None) if _db else None
         if callable(saver):
@@ -2742,7 +3010,6 @@ class SessionStore:
             # the candidate entry so the fallback persists the intended
             # transition rather than re-snapshotting the unchanged live value.
             if lock_held:
-                # Caller already holds _lock — build snapshot in-place.
                 fallback_data: Dict[str, Any] = {
                     key: current.to_dict()
                     for key, current in self._entries.items()
@@ -4010,11 +4277,15 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None:
                 return
-            cleaned = sanitize_model_override(override)
-            from gateway.chat_model_pins import ChatModelPins
             pin_key = self._chat_pin_key(session_key)
-            if pin_key and (override is None or sanitize_model_override_identity(override)):
-                ChatModelPins(self.sessions_dir).set(*pin_key, override)
+        cleaned = sanitize_model_override(override)
+        if pin_key and (override is None or sanitize_model_override_identity(override)):
+            # chat-model-pins.sqlite3 write: outside ``_lock`` (t_cc8533d1).
+            from gateway.chat_model_pins import ChatModelPins
+            ChatModelPins(self.sessions_dir).set(*pin_key, override)
+        with self._lock:
+            if self._entries.get(session_key) is not entry:
+                return
             if entry.model_override == cleaned:
                 return
             entry.model_override = cleaned
@@ -4023,43 +4294,57 @@ class SessionStore:
     def clear_model_route_override(self, session_key: str) -> bool:
         """Atomically clear authoritative identity and its legacy mirror.
 
-        Both fields are mutated under the store lock and persisted from one
-        routing snapshot. If the primary persistence fails, the in-memory entry
-        is rolled back and the exception is propagated. Once state.db commits,
-        an optional JSON-mirror failure is only a warning and memory remains
-        consistent with the authoritative primary.
+        Both fields are cleared in one routing snapshot, persisted with the
+        store lock released (t_cc8533d1), then published in memory.  If the
+        primary persistence fails the live entry is untouched and the
+        exception propagates.  Once state.db commits, an optional JSON-mirror
+        failure is only a warning and memory remains consistent with the
+        authoritative primary.
         """
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
-            old_identity = entry.model_override_identity
-            old_legacy = entry.model_override
-            old_invalid = entry._model_override_identity_invalid
-            entry.model_override_identity = None
-            entry._model_override_identity_invalid = False
-            entry.model_override = None
-            try:
-                self._save(require_primary=True)
-            except BaseException:
-                entry.model_override_identity = old_identity
-                entry._model_override_identity_invalid = old_invalid
-                entry.model_override = old_legacy
-                raise
-            from gateway.chat_model_pins import ChatModelPins
+            candidate = replace(
+                entry,
+                model_override_identity=None,
+                model_override=None,
+            )
+            candidate._model_override_identity_invalid = False
+            self._reconcile_recovered_routing_locked()
+            self._assert_unique_session_routes()
+            generation = self._next_routing_generation_locked()
+            self._last_full_snapshot_generation = generation
+            data = {key: current.to_dict() for key, current in self._entries.items()}
+            data[session_key] = candidate.to_dict()
             pin_key = self._chat_pin_key(session_key)
-            if pin_key:
-                ChatModelPins(self.sessions_dir).set(*pin_key, None)
-            return True
+
+        self._persist_routing_data(data, generation, require_primary=True)
+
+        def _publish(current: "SessionEntry") -> None:
+            current.model_override_identity = None
+            current._model_override_identity_invalid = False
+            current.model_override = None
+
+        self._publish_persisted_entry(session_key, entry, generation, _publish)
+        if pin_key:
+            from gateway.chat_model_pins import ChatModelPins
+            ChatModelPins(self.sessions_dir).set(*pin_key, None)
+        return True
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""
         with self._lock:
             self._ensure_loaded_locked()
-            present, pin = self.get_chat_model_pin(session_key)
+            pin_key = self._chat_pin_key(session_key)
+        if pin_key:
+            # chat-model-pins.sqlite3 read: outside ``_lock`` (t_cc8533d1).
+            from gateway.chat_model_pins import ChatModelPins
+            present, pin = ChatModelPins(self.sessions_dir).get(*pin_key)
             if present and pin is None:
                 return None
+        with self._lock:
             entry = self._entries.get(session_key)
             if entry is None:
                 return None
@@ -4086,6 +4371,10 @@ class SessionStore:
         The opaque token is returned to the caller and must be supplied to
         :meth:`clear_turn_active`.  Re-marking replaces the previous token so
         a stale asynchronous unwind cannot clear a newer turn.
+
+        Persist-before-publish without holding ``_lock`` across SQLite
+        (t_cc8533d1): the candidate is captured under the lock, written with
+        the lock released, then published under the lock again.
         """
         token = uuid.uuid4().hex
         with self._lock:
@@ -4102,16 +4391,16 @@ class SessionStore:
             # understand the exact marker fields.
             candidate["updated_at"] = now.isoformat()
 
-            # Persist before publishing the marker in memory.  If the durable
-            # write raises, a later unrelated save cannot leak an unowned token.
-            self._save_entry(
-                session_key,
-                entry_data=candidate,
-                lock_held=True,
-            )
-            entry.active_turn_token = token
-            entry.active_turn_started_at = now
-            entry.updated_at = now
+        # Persist before publishing the marker in memory.  If the durable
+        # write raises, a later unrelated save cannot leak an unowned token.
+        revision = self._save_entry(session_key, entry_data=candidate)
+
+        def _publish(current: "SessionEntry") -> None:
+            current.active_turn_token = token
+            current.active_turn_started_at = now
+            current.updated_at = now
+
+        self._publish_persisted_entry(session_key, entry, revision, _publish)
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:
@@ -4128,16 +4417,44 @@ class SessionStore:
             candidate["active_turn_token"] = None
             candidate["active_turn_started_at"] = None
 
-            # Keep the live token until the clear is durable.  A failed write
-            # therefore remains retryable instead of becoming a false mismatch.
-            self._save_entry(
-                session_key,
-                entry_data=candidate,
-                lock_held=True,
-            )
-            entry.active_turn_token = None
-            entry.active_turn_started_at = None
+        # Keep the live token until the clear is durable.  A failed write
+        # therefore remains retryable instead of becoming a false mismatch.
+        revision = self._save_entry(session_key, entry_data=candidate)
+
+        def _publish(current: "SessionEntry") -> None:
+            if current.active_turn_token == token:
+                current.active_turn_token = None
+                current.active_turn_started_at = None
+
+        self._publish_persisted_entry(session_key, entry, revision, _publish)
         return True
+
+    def _publish_persisted_entry(
+        self,
+        session_key: str,
+        entry: "SessionEntry",
+        revision: Optional[int],
+        publish: Callable[["SessionEntry"], None],
+    ) -> None:
+        """Apply a durably-written candidate to the live entry, under ``_lock``.
+
+        The write happened with ``_lock`` released, so another thread may have
+        taken a full routing snapshot between capture and publish.  That
+        snapshot lacks this transition and, being numbered above *revision*,
+        supersedes the single-entry record on disk.  Re-persist in that case
+        so the published state is durable again (deferred past the lock).
+        Skipped when the entry was replaced (reset/switch) meanwhile.
+        """
+        with self._lock:
+            current = self._entries.get(session_key)
+            if current is not entry:
+                return
+            publish(current)
+            if (
+                revision is not None
+                and getattr(self, "_last_full_snapshot_generation", 0) > revision
+            ):
+                self._save()
 
     def recover_interrupted_turns(
         self,

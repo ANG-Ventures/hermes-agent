@@ -15791,11 +15791,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         every existing routing/freshness/authorization gate passes.
         """
         self._auto_resume_decisions = {}
-        self._reconcile_deferred_restarts_at_boot()
+        await asyncio.to_thread(self._reconcile_deferred_restarts_at_boot)
         # The finished-work check is mode-independent: a bystander resume costs
         # a full LLM turn in prompt mode exactly as it does in auto mode, so it
         # must run before the auto-only early return below.
-        self._sweep_resume_requests()
+        await asyncio.to_thread(self._sweep_resume_requests)
         await self._prepare_boot_resume_work_check(platform=platform)
         if _resume_interrupted_turns_mode() not in _RESUME_UNATTENDED_MODES:
             return 0
@@ -18072,7 +18072,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # history keeps causing the agent to hang).  Auto-suspend it so the
         # user gets a clean slate on the next message.
         try:
-            stuck = self._suspend_stuck_loop_sessions()
+            stuck = await asyncio.to_thread(self._suspend_stuck_loop_sessions)
             if stuck:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
         except Exception as e:
@@ -19480,7 +19480,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # long / "never" reset windows, whose cached AIAgents would
                 # otherwise pin memory for the gateway's entire lifetime.
                 try:
-                    _idle_evicted = self._sweep_idle_cached_agents()
+                    _idle_evicted = await asyncio.to_thread(self._sweep_idle_cached_agents)
                     if _idle_evicted:
                         logger.info(
                             "Agent cache idle sweep: evicted %d agent(s)",
@@ -20735,7 +20735,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _agent is _AGENT_PENDING_SENTINEL:
                     continue
                 try:
-                    _marked, _reason, _alert = self._mark_resume_pending_for_shutdown(_sk)
+                    _marked, _reason, _alert = await asyncio.to_thread(
+                        self._mark_resume_pending_for_shutdown, _sk
+                    )
                     if _marked:
                         _pre_drain_keys.append(_sk)
                     if _alert:
@@ -21030,8 +21032,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # 180s drain timed out — genuinely interrupted in-flight work.
                         # A self-initiated restart here becomes restart_consumed_interrupted
                         # (auto-surfaces on boot) instead of restart_consumed (silent).
-                        _marked, _reason, _alert = self._mark_resume_pending_for_shutdown(
-                            _sk, interrupted=True
+                        _marked, _reason, _alert = await asyncio.to_thread(
+                            self._mark_resume_pending_for_shutdown, _sk, interrupted=True
                         )
                         if _alert:
                             await self._notify_restart_loop_suspended(_sk)
@@ -25675,11 +25677,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # its message_id is already in this session's transcript AND the update
         # is within the restart-recovery scope, suppress the duplicate answer.
         # Fail-OPEN in every uncertain case (never drop a genuine message).
-        if self._is_telegram_boot_redelivered_duplicate(event, session_entry):
+        if await asyncio.to_thread(
+            self._is_telegram_boot_redelivered_duplicate, event, session_entry
+        ):
             return None
         # SPEC INV-6: record companion answerable rows for a multi-update
         # aggregate so a future re-delivery of a non-first constituent suppresses.
-        self._persist_telegram_aggregate_constituents(event, session_entry)
+        await asyncio.to_thread(
+            self._persist_telegram_aggregate_constituents, event, session_entry
+        )
 
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
@@ -27469,7 +27475,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # succeeded and subsequent messages should no longer receive
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
-                self._apply_post_turn_resume_gate(session_key)
+                await asyncio.to_thread(self._apply_post_turn_resume_gate, session_key)
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
@@ -29167,7 +29173,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_id": route.get("user_id", ""),
                         "user_name": route.get("user_name", ""),
                     }
-                    source = self._build_process_event_source(evt_stub)
+                    source = await asyncio.to_thread(self._build_process_event_source, evt_stub)
                     if source is None:
                         continue
                     try:
