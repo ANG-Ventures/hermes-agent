@@ -2179,7 +2179,13 @@ class SessionStore:
         db = getattr(self, "_db", None)
         if not db or not self._entries:
             return
-        if self._defer_while_locked(self._prune_stale_sessions_off_lock):
+        lock = getattr(self, "_lock", None)
+        if isinstance(lock, _StoreLock) and lock.held_by_current_thread():
+            # Synchronous but with ``_lock`` released: the caller's critical
+            # section (and its return value, e.g. ``snapshot_entries``) must
+            # already see pruned routes, yet the per-route state.db lookups
+            # must not run under the lock (t_cc8533d1).
+            self._with_lock_released(self._prune_stale_sessions_off_lock)
             return
         plan = self._plan_stale_prune(db, list(self._entries.items()))
         if plan is not None:
