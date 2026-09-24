@@ -4,15 +4,20 @@ Measured 2026-09-22: 3,706 ``rate_limited`` runs in 7d; 42% ran >2 min
 (boot, load skills + card + repo, make real calls) before dying at 429 with
 no output. Three brakes, each tested here and each mutation-checked:
 
-1. POOL-HEALTH ADMISSION -- a worker whose provider is the shared claude relay
-   pool (claude-apr / claude-bpr / claude-apx-* / claude-bpx-*) is not spawned
-   while the pool's ``/health`` reports ``eligible_count`` below the minimum.
-   Uses ``kanban.pool_health_url`` when ``provider_health_probes`` has no
-   explicit entry. Non-pool providers never probe. Probe failure fails OPEN.
+1. POOL-HEALTH ADMISSION -- each claude worker is admitted on the capacity of
+   the pool that will actually SERVE it (Argus r1, PR #953):
+   claude-apr -> the apr relay's ``/health`` aggregate (:18810),
+   claude-bpr -> the bpr relay's aggregate (:18811),
+   claude-apx-N / claude-bpx-N -> ONE sub box (``local`` for N=0, else
+   ``sub-vps-N``); held only when that sub is listed ``exhausted`` /
+   ``capped_quota`` by its family's relay (apx->apr, bpx->bpr). Unlisted = admit.
+   ``kanban.pool_health_urls`` maps relay family -> URL; an explicit
+   ``provider_health_probes`` entry still wins. Probe failure fails OPEN.
 2. ESCALATING PER-TASK BACKOFF -- consecutive rate_limited runs hold the task
    for 5m, 15m, 45m, then 2h (cap); any non-rate_limited run resets it.
-3. TICK CIRCUIT -- >= ``kanban.rate_limit_trip`` rate_limited closes inside a
-   10-minute window hold ALL pool-bound spawns for 10 minutes; notified once.
+3. TICK CIRCUIT -- >= ``kanban.rate_limit_trip`` rate_limited closes OF ONE POOL
+   inside a 10-minute window hold that pool's spawns for 10 minutes; notified
+   once per pool trip. Non-pool (e.g. openai-codex) closes never count.
 
 Hermetic: a real loopback HTTP server stands in for the pool, run rows carry
 explicit timestamps relative to a single ``now``.
@@ -43,6 +48,8 @@ class _Pool:
 
     def __init__(self):
         self.eligible = 3
+        self.exhausted: list = []
+        self.capped_quota: list = []
         self.hits = 0
         pool = self
 
@@ -52,6 +59,7 @@ class _Pool:
                 body = json.dumps({
                     "status": "ok" if pool.eligible else "all_capped",
                     "eligible_count": pool.eligible, "pool_size": 15,
+                    "exhausted": pool.exhausted, "capped_quota": pool.capped_quota,
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -77,6 +85,26 @@ def pool():
     p = _Pool()
     yield p
     p.close()
+
+
+@pytest.fixture
+def apr():
+    p = _Pool()
+    yield p
+    p.close()
+
+
+@pytest.fixture
+def bpr():
+    p = _Pool()
+    yield p
+    p.close()
+
+
+def _urls(apr_url=None, bpr_url=None) -> dict:
+    """``kanban.pool_health_urls`` with BOTH families explicit (never the
+    production loopback defaults, which a test host may really be serving)."""
+    return {"claude-apr": apr_url or "", "claude-bpr": bpr_url or ""}
 
 
 def _dead_url() -> str:
@@ -144,22 +172,34 @@ def _events(conn, tid, kind):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("provider,expected", [
-    ("claude-apr", True), ("claude-bpr", True), ("claude-apx-3", True),
-    ("claude-bpx-22", True), ("CLAUDE-BPX-7", True),
-    ("openai-codex", False), ("anthropic", False), ("claude-api-proxy", False),
-    ("", False), (None, False),
+def test_pool_health_urls_default_and_config_via_production_loader(home):
+    assert ph.configured_pool_health_urls() == {
+        "claude-apr": "http://127.0.0.1:18810/health",
+        "claude-bpr": "http://127.0.0.1:18811/health",
+    }
+    _config(home, pool_health_urls={"claude-bpr": "http://127.0.0.1:9/h"})
+    # A partial map overrides only the named family.
+    assert ph.configured_pool_health_urls() == {
+        "claude-apr": "http://127.0.0.1:18810/health",
+        "claude-bpr": "http://127.0.0.1:9/h",
+    }
+    _config(home, pool_health_urls={"claude-apr": ""})
+    assert ph.configured_pool_health_urls()["claude-apr"] == ""
+    _config(home, pool_health_urls="junk")
+    assert ph.configured_pool_health_urls()["claude-apr"] == "http://127.0.0.1:18810/health"
+
+
+@pytest.mark.parametrize("provider,key", [
+    ("claude-apr", ("claude-apr", None)),
+    ("claude-bpr", ("claude-bpr", None)),
+    ("claude-apx-0", ("claude-apr", "local")),
+    ("claude-apx-7", ("claude-apr", "sub-vps-7")),
+    ("claude-bpx-22", ("claude-bpr", "sub-vps-22")),
+    ("CLAUDE-BPX-10", ("claude-bpr", "sub-vps-10")),
+    ("openai-codex", None), ("claude-bpx-x", None), (None, None),
 ])
-def test_is_pool_provider(provider, expected):
-    assert ph.is_pool_provider(provider) is expected
-
-
-def test_pool_health_url_default_and_config_via_production_loader(home):
-    assert ph.configured_pool_health_url() == "http://127.0.0.1:18810/health"
-    _config(home, pool_health_url="http://127.0.0.1:9/h")
-    assert ph.configured_pool_health_url() == "http://127.0.0.1:9/h"
-    _config(home, pool_health_url="")
-    assert ph.configured_pool_health_url() == ""
+def test_pool_route(provider, key):
+    assert ph.pool_route(provider) == key
 
 
 def _task(provider):
@@ -167,50 +207,91 @@ def _task(provider):
     return SimpleNamespace(model_override="m", provider_override=provider, assignee="a")
 
 
-def test_pool_provider_capped_via_pool_url(home, pool):
+def test_relay_provider_capped_on_its_own_relay(home, pool):
     pool.eligible = 0
-    got = ph.capped_provider(_task("claude-bpx-22"), {}, {}, pool_url=pool.url)
-    assert got is not None and got["provider"] == "claude-bpx-22"
+    got = ph.capped_provider(_task("claude-bpr"), {}, {}, pool_urls=_urls(bpr_url=pool.url))
+    assert got is not None and got["provider"] == "claude-bpr"
 
 
 def test_pool_provider_admitted_when_eligible(home, pool):
     pool.eligible = 2
-    assert ph.capped_provider(_task("claude-apr"), {}, {}, pool_url=pool.url) is None
+    assert ph.capped_provider(_task("claude-apr"), {}, {}, pool_urls=_urls(pool.url)) is None
 
 
 def test_min_eligible_threshold(home, pool):
     pool.eligible = 2
     assert ph.capped_provider(
-        _task("claude-apr"), {}, {}, pool_url=pool.url, min_eligible=3,
+        _task("claude-apr"), {}, {}, pool_urls=_urls(pool.url), min_eligible=3,
     ) is not None
 
 
 def test_non_pool_provider_never_probes(home, pool):
     pool.eligible = 0
-    assert ph.capped_provider(_task("openai-codex"), {}, {}, pool_url=pool.url) is None
+    assert ph.capped_provider(
+        _task("openai-codex"), {}, {}, pool_urls=_urls(pool.url, pool.url)) is None
     assert pool.hits == 0
 
 
-def test_empty_pool_url_disables(home, pool):
+def test_empty_family_url_disables(home, pool):
     pool.eligible = 0
-    assert ph.capped_provider(_task("claude-apr"), {}, {}, pool_url="") is None
+    assert ph.capped_provider(_task("claude-apr"), {}, {}, pool_urls=_urls(None, pool.url)) is None
     assert pool.hits == 0
 
 
-def test_explicit_probe_entry_wins_over_pool_url(home, pool):
+def test_explicit_probe_entry_wins_over_pool_urls(home, pool):
     pool.eligible = 0
     probes = {"claude-apr": _dead_url()}
     # The explicit (dead) URL is used, so the gate fails open rather than
-    # reading the capped pool_url.
-    assert ph.capped_provider(_task("claude-apr"), probes, {}, pool_url=pool.url) is None
+    # reading the capped family relay.
+    assert ph.capped_provider(_task("claude-apr"), probes, {}, pool_urls=_urls(pool.url)) is None
     assert pool.hits == 0
+
+
+# --- pinned single-box lanes (claude-apx-N / claude-bpx-N) -----------------
+
+
+def test_pinned_lane_held_only_when_its_own_sub_exhausted(home, apr, bpr):
+    apr.eligible = bpr.eligible = 0  # relay aggregates say NOTHING about box 22
+    bpr.exhausted = ["sub-vps-3"]
+    urls = _urls(apr.url, bpr.url)
+    assert ph.capped_provider(_task("claude-bpx-22"), {}, {}, pool_urls=urls) is None
+    bpr.exhausted = ["sub-vps-22"]
+    got = ph.capped_provider(_task("claude-bpx-22"), {}, {}, pool_urls=urls)
+    assert got is not None and got["sub"] == "sub-vps-22"
+
+
+def test_pinned_lane_held_when_sub_quota_capped(home, bpr):
+    bpr.eligible = 9
+    bpr.capped_quota = ["sub-vps-10"]
+    assert ph.capped_provider(
+        _task("claude-bpx-10"), {}, {}, pool_urls=_urls(None, bpr.url)) is not None
+
+
+def test_pinned_apx_zero_maps_to_local_on_apr_relay(home, apr, bpr):
+    apr.exhausted = ["local"]
+    urls = _urls(apr.url, bpr.url)
+    assert ph.capped_provider(_task("claude-apx-0"), {}, {}, pool_urls=urls) is not None
+    # The bpx family reads the bpr relay, which does not list local.
+    assert ph.capped_provider(_task("claude-bpx-0"), {}, {}, pool_urls=urls) is None
+    assert bpr.hits == 1
+
+
+def test_pinned_lane_admitted_when_relay_healthy_but_sub_exhausted_is_other(home, apr):
+    apr.eligible = 5
+    apr.exhausted = ["sub-vps-4"]
+    assert ph.capped_provider(_task("claude-apx-5"), {}, {}, pool_urls=_urls(apr.url)) is None
+
+
+def test_pinned_lane_fails_open_when_relay_unreachable(home):
+    assert ph.capped_provider(
+        _task("claude-bpx-22"), {}, {}, pool_urls=_urls(None, _dead_url())) is None
 
 
 def test_unreachable_fails_open_and_warns_once(home, caplog):
     url = _dead_url()
     caplog.set_level(logging.DEBUG, logger="hermes_cli.kanban_provider_health")
     for _ in range(3):
-        assert ph.capped_provider(_task("claude-apr"), {}, {}, pool_url=url) is None
+        assert ph.capped_provider(_task("claude-apr"), {}, {}, pool_urls=_urls(url)) is None
     warns = [r for r in caplog.records
              if r.levelno >= logging.WARNING and url in r.getMessage()]
     assert len(warns) == 1
@@ -220,18 +301,18 @@ def test_capped_state_logged_once_per_transition(home, pool, caplog):
     caplog.set_level(logging.INFO, logger="hermes_cli.kanban_provider_health")
     pool.eligible = 0
     for _ in range(3):
-        ph.capped_provider(_task("claude-apr"), {}, {}, pool_url=pool.url)
+        ph.capped_provider(_task("claude-apr"), {}, {}, pool_urls=_urls(pool.url))
     pool.eligible = 4
     for _ in range(3):
-        ph.capped_provider(_task("claude-apr"), {}, {}, pool_url=pool.url)
+        ph.capped_provider(_task("claude-apr"), {}, {}, pool_urls=_urls(pool.url))
     lines = [r.getMessage() for r in caplog.records if pool.url in r.getMessage()]
     assert len(lines) == 2, lines
 
 
 def test_dispatch_holds_pool_worker_when_pool_empty(home, pool):
     pool.eligible = 0
-    _config(home, pool_health_url=pool.url)
-    _profile(home, "a", "claude-bpx-22")
+    _config(home, pool_health_urls=_urls(bpr_url=pool.url))
+    _profile(home, "a", "claude-bpr")
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="pool bound", assignee="a")
         observed = []
@@ -245,7 +326,7 @@ def test_dispatch_holds_pool_worker_when_pool_empty(home, pool):
 
 def test_dispatch_non_pool_worker_unaffected_by_empty_pool(home, pool):
     pool.eligible = 0
-    _config(home, pool_health_url=pool.url)
+    _config(home, pool_health_urls=_urls(pool.url, pool.url))
     _profile(home, "b", "openai-codex")
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="codex", assignee="b")
@@ -256,13 +337,86 @@ def test_dispatch_non_pool_worker_unaffected_by_empty_pool(home, pool):
 
 
 def test_dispatch_fails_open_when_pool_unreachable(home):
-    _config(home, pool_health_url=_dead_url())
+    _config(home, pool_health_urls=_urls(_dead_url()))
     _profile(home, "a", "claude-apr")
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="pool bound", assignee="a")
         observed = []
         kb.dispatch_once(conn, spawn_fn=_spawner(observed))
         assert observed == [tid]
+
+
+# --- Argus r1 two-pool cases, through the real dispatch_once ----------------
+
+
+def _dispatch_one(assignee):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="x", assignee=assignee)
+        seen: list = []
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        return tid, seen, res
+
+
+def test_A_bpr_worker_held_when_bpr_empty_even_if_apr_healthy(home, apr, bpr):
+    apr.eligible, bpr.eligible = 5, 0
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    _profile(home, "daedalus-opus", "claude-bpr")
+    tid, seen, res = _dispatch_one("daedalus-opus")
+    assert seen == []
+    assert (tid, "provider_capped") in res.respawn_guarded
+    assert bpr.hits == 1 and apr.hits == 0
+
+
+def test_B_bpr_worker_spawns_when_bpr_healthy_even_if_apr_empty(home, apr, bpr):
+    apr.eligible, bpr.eligible = 0, 8
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    _profile(home, "daedalus-opus", "claude-bpr")
+    tid, seen, _ = _dispatch_one("daedalus-opus")
+    assert seen == [tid]
+    assert apr.hits == 0
+
+
+def test_C_pinned_box_ignores_relay_aggregate(home, apr, bpr):
+    apr.eligible, bpr.eligible = 0, 0
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    _profile(home, "pin", "claude-bpx-22")
+    tid, seen, _ = _dispatch_one("pin")
+    assert seen == [tid]  # both relays empty, box 22 not listed -> admitted
+
+
+def test_C2_pinned_box_held_on_its_own_exhaustion_while_relay_healthy(home, apr, bpr):
+    apr.eligible, bpr.eligible = 9, 9
+    bpr.exhausted = ["sub-vps-22"]
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    _profile(home, "pin", "claude-bpx-22")
+    tid, seen, res = _dispatch_one("pin")
+    assert seen == []
+    assert (tid, "provider_capped") in res.respawn_guarded
+
+
+def test_fallback_rung_judged_on_its_own_pool(home, apr, bpr):
+    """CLASS-SWEEP: available_profile_fallback must consult each rung's own
+    pool, so a capped bpr card falls back to a healthy apr rung but never onto
+    an exhausted pinned box."""
+    apr.eligible, bpr.eligible = 4, 0
+    apr.exhausted = ["sub-vps-16"]
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    p = home / "profiles" / "fb"
+    p.mkdir(parents=True)
+    (p / "config.yaml").write_text(json.dumps({
+        "model": {"provider": "claude-bpr", "default": "m"},
+        "fallback_providers": [
+            {"provider": "claude-apx-16", "model": "m16"},
+            {"provider": "claude-apr", "model": "mapr"},
+        ],
+    }))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="x", assignee="fb")
+        seen: list = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        assert seen == [tid]
+        ev = _events(conn, tid, "dispatch_provider_fallback")
+        assert ev and ev[-1]["to_provider"] == "claude-apr"
 
 
 # ---------------------------------------------------------------------------
@@ -365,8 +519,10 @@ def test_diag_shows_backoff_hold():
 # ---------------------------------------------------------------------------
 
 
-def _rl_burst(conn, ends):
-    tid = kb.create_task(conn, title="storm", assignee="z")
+def _rl_burst(conn, ends, provider="claude-apr"):
+    """A finished card whose runs closed rate_limited at ``ends`` on ``provider``."""
+    tid = kb.create_task(conn, title="storm", assignee="z", model_override="m",
+                         provider_override=provider)
     conn.execute("UPDATE tasks SET status='done', completed_at=strftime('%s','now') WHERE id=?", (tid,))
     _runs(conn, tid, [("rate_limited", e) for e in ends])
     return tid
@@ -377,7 +533,7 @@ def test_circuit_opens_on_trip_within_window(home):
     with kb.connect_closing() as conn:
         ends = [now - 400, now - 300, now - 200, now - 100, now - 60]
         _rl_burst(conn, ends)
-        assert kb.rate_limit_circuit_open_until(conn, now=now, trip=5) == now - 60 + 600
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {"claude-apr": now - 60 + 600}
 
 
 def test_circuit_stays_open_ten_minutes_after_trip(home):
@@ -386,14 +542,14 @@ def test_circuit_stays_open_ten_minutes_after_trip(home):
         # Tripped 9 min ago; the window has since emptied but the hold stands.
         t = now - 540
         _rl_burst(conn, [t - 200, t - 150, t - 100, t - 50, t])
-        assert kb.rate_limit_circuit_open_until(conn, now=now, trip=5) == t + 600
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {"claude-apr": t + 600}
 
 
 def test_circuit_closed_below_trip(home):
     now = int(time.time())
     with kb.connect_closing() as conn:
         _rl_burst(conn, [now - 300, now - 200, now - 100, now - 60])
-        assert kb.rate_limit_circuit_open_until(conn, now=now, trip=5) is None
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {}
 
 
 def test_circuit_closed_when_spread_beyond_window(home):
@@ -401,14 +557,43 @@ def test_circuit_closed_when_spread_beyond_window(home):
     with kb.connect_closing() as conn:
         _rl_burst(conn, [now - 2400, now - 1800, now - 1200, now - 601, now - 10])
         # Five closes, but no five of them within any 600s span.
-        assert kb.rate_limit_circuit_open_until(conn, now=now, trip=5) is None
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {}
 
 
 def test_circuit_trip_zero_disables(home):
     now = int(time.time())
     with kb.connect_closing() as conn:
         _rl_burst(conn, [now - 50] * 8)
-        assert kb.rate_limit_circuit_open_until(conn, now=now, trip=0) is None
+        assert kb.rate_limit_circuits(conn, now=now, trip=0) == {}
+
+
+def test_circuit_ignores_non_pool_closes(home):
+    """D (unit): five openai-codex 429s are not claude-pool evidence."""
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        _rl_burst(conn, [now - 250, now - 200, now - 150, now - 100, now - 50],
+                  provider="openai-codex")
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {}
+
+
+def test_circuit_is_per_pool(home):
+    """Closes on two pools never sum into one trip; each pool trips alone."""
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        _rl_burst(conn, [now - 250, now - 200, now - 150], provider="claude-apr")
+        _rl_burst(conn, [now - 120, now - 90], provider="claude-bpr")
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {}
+        _rl_burst(conn, [now - 80, now - 70, now - 60], provider="claude-bpr")
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {"claude-bpr": now - 60 + 600}
+
+
+def test_circuit_pinned_lanes_key_by_sub(home):
+    """claude-apx-7 and claude-bpx-7 share sub-vps-7: one box, one circuit."""
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        _rl_burst(conn, [now - 250, now - 200, now - 150], provider="claude-apx-7")
+        _rl_burst(conn, [now - 100, now - 50], provider="claude-bpx-7")
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {"sub-vps-7": now - 50 + 600}
 
 
 def test_rate_limit_trip_knob_via_production_loader(home):
@@ -423,7 +608,7 @@ def test_dispatch_circuit_holds_pool_only_and_notifies_once(home, pool, monkeypa
     from hermes_cli import kanban_budget as kbud
 
     pool.eligible = 5  # the pool LOOKS healthy; the circuit still holds
-    _config(home, pool_health_url=pool.url)
+    _config(home, pool_health_urls=_urls(pool.url, pool.url))
     _profile(home, "a", "claude-apr")
     _profile(home, "b", "openai-codex")
     sent = []
@@ -444,10 +629,134 @@ def test_dispatch_circuit_holds_pool_only_and_notifies_once(home, pool, monkeypa
         assert "--target" in sent[0] and kbud.RECOVERY_TARGET in sent[0]
 
 
+def test_D_codex_429s_do_not_trip_claude_circuit(home, apr, monkeypatch):
+    from hermes_cli import kanban_budget as kbud
+
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: None)
+    apr.eligible = 12
+    _config(home, pool_health_urls=_urls(apr.url))
+    _profile(home, "argus", "claude-apr")
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        _rl_burst(conn, [now - 250, now - 200, now - 150, now - 100, now - 50],
+                  provider="openai-codex")
+        claude_t = kb.create_task(conn, title="claude", assignee="argus")
+        seen: list = []
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        assert seen == [claude_t]
+        assert not [r for r in res.respawn_guarded if r[1] == "rate_limit_circuit"]
+
+
+def test_dispatch_circuit_holds_only_the_tripped_pool(home, apr, bpr, monkeypatch):
+    from hermes_cli import kanban_budget as kbud
+
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: None)
+    apr.eligible = bpr.eligible = 5
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    _profile(home, "a", "claude-apr")
+    _profile(home, "b", "claude-bpr")
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        _rl_burst(conn, [now - 250, now - 200, now - 150, now - 100, now - 50],
+                  provider="claude-bpr")
+        on_apr = kb.create_task(conn, title="apr", assignee="a")
+        on_bpr = kb.create_task(conn, title="bpr", assignee="b")
+        seen: list = []
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        assert seen == [on_apr]
+        assert (on_bpr, "rate_limit_circuit") in res.respawn_guarded
+
+
+def test_circuited_card_falls_back_to_rung_on_open_pool(home, apr, bpr, monkeypatch):
+    """CLASS-SWEEP: a circuit on the card's pool is a capacity verdict like
+    provider_capped -- a healthy rung on another pool is taken, a rung on the
+    SAME circuited pool is not."""
+    from hermes_cli import kanban_budget as kbud
+
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: None)
+    apr.eligible = bpr.eligible = 5
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    p = home / "profiles" / "fb"
+    p.mkdir(parents=True)
+    (p / "config.yaml").write_text(json.dumps({
+        "model": {"provider": "claude-bpr", "default": "m"},
+        "fallback_providers": [{"provider": "claude-apr", "model": "mapr"}],
+    }))
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        _rl_burst(conn, [now - 250, now - 200, now - 150, now - 100, now - 50],
+                  provider="claude-bpr")
+        tid = kb.create_task(conn, title="x", assignee="fb")
+        seen: list = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        assert seen == [tid]
+        assert _events(conn, tid, "dispatch_provider_fallback")[-1]["to_provider"] == "claude-apr"
+
+
+def test_circuited_card_never_falls_back_onto_another_circuited_pool(home, apr, bpr, monkeypatch):
+    from hermes_cli import kanban_budget as kbud
+
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: None)
+    apr.eligible = bpr.eligible = 5  # sub-vps-3 not listed exhausted: health admits it
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url))
+    p = home / "profiles" / "fb"
+    p.mkdir(parents=True)
+    (p / "config.yaml").write_text(json.dumps({
+        "model": {"provider": "claude-bpr", "default": "m"},
+        "fallback_providers": [{"provider": "claude-bpx-3", "model": "m3"}],
+    }))
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        ends = [now - 250, now - 200, now - 150, now - 100, now - 50]
+        _rl_burst(conn, ends, provider="claude-bpr")
+        _rl_burst(conn, ends, provider="claude-apx-3")  # sub-vps-3 circuit open too
+        tid = kb.create_task(conn, title="x", assignee="fb")
+        seen: list = []
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        assert seen == []
+        assert (tid, "rate_limit_circuit") in res.respawn_guarded
+
+
+def test_notify_once_per_episode_even_as_closes_extend_the_hold(home, pool, monkeypatch):
+    """Argus F2: workers already running when the circuit trips keep dying at
+    429 during the hold; each close pushes ``until`` forward. That must extend
+    the SAME episode, not re-arm the #logs latch."""
+    from hermes_cli import kanban_budget as kbud
+
+    _config(home, pool_health_urls=_urls(pool.url, pool.url))
+    _profile(home, "a", "claude-apr")
+    sent = []
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: "/x/notify.py")
+    monkeypatch.setattr(kbud, "_run_notify", lambda argv: sent.append(argv))
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        tid = _rl_burst(conn, [now - 250, now - 200, now - 150, now - 100, now - 50])
+        kb.create_task(conn, title="pool", assignee="a")
+        kb.dispatch_once(conn)
+        for ended in (now - 30, now - 20, now - 10):
+            _runs(conn, tid, [("rate_limited", ended)])
+            kb.dispatch_once(conn)
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {"claude-apr": now - 10 + 600}
+    assert len(sent) == 1
+
+
+def test_notify_again_for_a_new_episode_after_the_hold_lapsed(home, monkeypatch):
+    from hermes_cli import kanban_budget as kbud
+
+    sent = []
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: "/x/notify.py")
+    monkeypatch.setattr(kbud, "_run_notify", lambda argv: sent.append(argv))
+    kb._notify_rate_limit_circuit(None, "claude-apr", 1_000, 5, now=500)
+    kb._notify_rate_limit_circuit(None, "claude-apr", 1_060, 5, now=560)   # same episode
+    kb._notify_rate_limit_circuit(None, "claude-bpr", 1_060, 5, now=560)   # other pool
+    kb._notify_rate_limit_circuit(None, "claude-apr", 2_000, 5, now=1_400)  # lapsed -> new
+    assert len(sent) == 3
+
+
 def test_dispatch_dry_run_does_not_notify(home, pool, monkeypatch):
     from hermes_cli import kanban_budget as kbud
 
-    _config(home, pool_health_url=pool.url)
+    _config(home, pool_health_urls=_urls(pool.url, pool.url))
     _profile(home, "a", "claude-apr")
     sent = []
     monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: "/x/notify.py")

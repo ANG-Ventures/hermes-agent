@@ -3022,14 +3022,21 @@ DEFAULT_CONFIG = {
         "banned_worker_model_substrings": None,
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
-        # Implicit probe for claude relay-pool providers (claude-apr / -bpr /
-        # -apx-* / -bpx-*) with no explicit provider_health_probes entry: skip
-        # the spawn while the pool reports fewer than provider_health_min_eligible
-        # eligible seats. Unreachable/malformed probe fails OPEN. "" disables.
-        "pool_health_url": "http://127.0.0.1:18810/health",
-        # Board-wide circuit: this many rate_limited run closes within 10 min
-        # hold ALL pool-bound spawns for 10 min (one #logs line per trip).
-        # 0 disables.
+        # Implicit pre-spawn probe per claude relay FAMILY (used when
+        # provider_health_probes has no explicit entry). claude-apr / -bpr are
+        # held while their OWN relay reports fewer than
+        # provider_health_min_eligible eligible seats; pinned claude-apx-N /
+        # -bpx-N (one sub box each) are held only when that sub ("local" for
+        # N=0, else "sub-vps-N") is listed exhausted/capped_quota by the apx->apr
+        # / bpx->bpr relay. Unreachable/malformed probe fails OPEN. A partial
+        # map overrides only the named family; "" disables that family.
+        "pool_health_urls": {
+            "claude-apr": "http://127.0.0.1:18810/health",
+            "claude-bpr": "http://127.0.0.1:18811/health",
+        },
+        # Per-pool circuit: this many rate_limited run closes on ONE pool within
+        # 10 min hold that pool's spawns for 10 min (one #logs line per trip).
+        # Non-pool providers never count. 0 disables.
         "rate_limit_trip": 5,
         # CPU scheduling priority for dispatcher-spawned worker gateways, and
         # therefore for everything they spawn (terminal-tool children inherit
