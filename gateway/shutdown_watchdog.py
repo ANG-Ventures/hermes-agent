@@ -272,6 +272,42 @@ def _arm_loop_floor_timer(
     return _LoopFloorTimerHandle(loop, resolved_interval)
 
 
+def _format_loop_thread_stack(thread_id: Optional[int]) -> tuple[str, str]:
+    """Return ``(site, stack)`` for *thread_id* via ``sys._current_frames``.
+
+    ``site`` is the innermost frame as ``file:line in func`` — the blocked
+    call the loop is stuck in. ``stack`` is the full formatted stack. Never
+    raises: this runs on the watchdog thread right before a hard exit.
+    """
+    try:
+        import traceback
+
+        if thread_id is None:
+            return "unknown", "(loop thread id unknown)"
+        frame = sys._current_frames().get(thread_id)
+        if frame is None:
+            return "unknown", f"(no frame for thread {thread_id})"
+        site = f"{frame.f_code.co_filename}:{frame.f_lineno} in {frame.f_code.co_name}"
+        return site, "".join(traceback.format_stack(frame))
+    except Exception as exc:  # pragma: no cover - defensive
+        return "unknown", f"(stack capture failed: {exc!r})"
+
+
+def _resolve_loop_thread_id(loop: asyncio.AbstractEventLoop) -> int:
+    """Best-effort ident of the thread running *loop*.
+
+    The gateway arms the watchdog from inside the loop, so the caller's
+    thread is the loop thread; otherwise fall back to the main thread (where
+    the gateway loop runs).
+    """
+    try:
+        if asyncio.get_running_loop() is loop:
+            return threading.get_ident()
+    except RuntimeError:
+        pass
+    return threading.main_thread().ident or threading.get_ident()
+
+
 def start_loop_liveness_watchdog(
     loop: asyncio.AbstractEventLoop,
     *,
@@ -281,8 +317,15 @@ def start_loop_liveness_watchdog(
     starvation_load_factor: float = DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
     starvation_max_hold_s: float = DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
     exit_code: int = GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    loop_thread_id: Optional[int] = None,
 ) -> Optional[_LoopLivenessWatchdogHandle]:
     """Start an out-of-loop watchdog that hard-exits after missed probes.
+
+    Every missed probe logs ``PHASE=loop_liveness_blocked_site`` with the
+    loop thread's innermost frame and full stack (``sys._current_frames``),
+    so a watchdog restart is attributable from the log alone — no py-spy
+    needed (card t_71ea46ce: the 2026-09-24 kill was only attributable via
+    the Discord heartbeat traceback).
 
     The guard is on by default; operators opt out with
     ``gateway.loop_watchdog: false`` in config.yaml (enforced by the caller,
@@ -293,6 +336,9 @@ def start_loop_liveness_watchdog(
     timeout = probe_timeout
     strikes_limit = max_strikes
     stop_event = threading.Event()
+    watched_thread_id = (
+        loop_thread_id if loop_thread_id is not None else _resolve_loop_thread_id(loop)
+    )
 
     def _wait_for_probe(probe_event: threading.Event) -> Optional[bool]:
         deadline = time.monotonic() + timeout
@@ -333,6 +379,21 @@ def start_loop_liveness_watchdog(
             if stop_event.is_set():
                 return
             strikes += 1
+            # Attribute the stall BEFORE any exit decision: this line is what
+            # survives in gateway.error.log when os._exit follows.
+            try:
+                site, stack = _format_loop_thread_stack(watched_thread_id)
+                logger.error(
+                    "PHASE=loop_liveness_blocked_site strikes=%d/%s "
+                    "blocked_for>=%.1fs site=%s\nloop thread stack:\n%s",
+                    strikes,
+                    strikes_limit,
+                    strikes * (interval + timeout),
+                    site,
+                    stack,
+                )
+            except Exception:
+                pass
             if strikes < strikes_limit:
                 continue
 

@@ -8617,6 +8617,12 @@ class GatewaySlashCommandsMixin:
             from agent.skill_commands import reload_skills
 
             result = await loop.run_in_executor(None, reload_skills)
+            try:
+                from gateway.run import invalidate_unavailable_skill_index
+
+                invalidate_unavailable_skill_index()
+            except Exception:
+                pass
             added = result.get("added", [])      # [{"name", "description"}, ...]
             removed = result.get("removed", [])  # [{"name", "description"}, ...]
             total = result.get("total", 0)

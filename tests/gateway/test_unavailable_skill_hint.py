@@ -100,3 +100,52 @@ def test_unknown_command_still_returns_none(
         assert gateway_run._check_unavailable_skill("no-such-skill") is None
 
 
+
+
+def test_index_is_built_once_and_reused_across_calls(
+    tmp_skills: Path,
+) -> None:
+    """Card t_71ea46ce: the tree is NOT walked per unknown command.
+
+    Before: every call rglob'd + read every SKILL.md (906 on Apollo) on the
+    event loop. Now repeated lookups hit the cached slug index; a new skill
+    (category-dir mtime change) or /reload-skills invalidation rebuilds it.
+    """
+    from gateway import run as gateway_run
+
+    _write_skill(tmp_skills, "creative/ascii-art", "ascii-art")
+    gateway_run.invalidate_unavailable_skill_index()
+    with patch(
+        "tools.skills_tool._get_disabled_skill_names", return_value={"new-thing"}
+    ), patch(
+        "agent.skill_utils.get_all_skills_dirs", return_value=[tmp_skills]
+    ):
+        before = gateway_run._UNAVAILABLE_SKILL_INDEX_BUILDS
+        for _ in range(5):
+            assert gateway_run._check_unavailable_skill("no-such-skill") is None
+        assert gateway_run._UNAVAILABLE_SKILL_INDEX_BUILDS - before == 1
+
+        # Adding a skill changes a category dir mtime -> index rebuilds.
+        import os, time as _t
+        md = _write_skill(tmp_skills, "creative/new-thing", "new-thing")
+        future = _t.time() + 5
+        os.utime(md.parent.parent, (future, future))
+        msg = gateway_run._check_unavailable_skill("new-thing")
+        assert msg is not None and "disabled" in msg
+        assert gateway_run._UNAVAILABLE_SKILL_INDEX_BUILDS - before == 2
+
+        # Explicit invalidation (the /reload-skills path) forces one rebuild.
+        gateway_run.invalidate_unavailable_skill_index()
+        gateway_run._check_unavailable_skill("no-such-skill")
+        gateway_run._check_unavailable_skill("no-such-skill")
+        assert gateway_run._UNAVAILABLE_SKILL_INDEX_BUILDS - before == 3
+
+
+def test_reload_skills_command_invalidates_the_index() -> None:
+    import inspect
+    from gateway import slash_commands
+
+    src = inspect.getsource(slash_commands)
+    body = src[src.index("async def _handle_reload_skills_command"):]
+    body = body[: body.index("\n    async def ", 10)] if "\n    async def " in body[10:] else body
+    assert "invalidate_unavailable_skill_index()" in body
