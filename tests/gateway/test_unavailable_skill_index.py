@@ -15,6 +15,7 @@ import pytest
 
 from gateway import run as gateway_run
 from gateway import shutdown_watchdog
+from tools import skill_usage
 
 
 def _write_skill(root: Path, rel: str, name: str) -> None:
@@ -43,6 +44,54 @@ def test_index_walks_once_then_serves_from_cache(tmp_path, monkeypatch):
     idx2 = gateway_run._skill_slug_index((root,))
     assert "alpha-skill" in idx1 and idx2 is idx1
     assert len(calls) == 1  # second call did not re-read
+
+
+def test_usage_sidecars_do_not_rebuild_index(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    _write_skill(root, "cat/alpha", "Alpha")
+    monkeypatch.setattr(skill_usage, "_skills_dir", lambda: root)
+    reads = []
+    real = gateway_run._skill_slug_from_frontmatter
+    monkeypatch.setattr(
+        gateway_run, "_skill_slug_from_frontmatter",
+        lambda p: (reads.append(p), real(p))[1],
+    )
+    initial = gateway_run._skill_slug_index((root,))
+    assert len(reads) == 1
+    for writer in (
+        lambda: skill_usage.bump_view("alpha"),
+        lambda: skill_usage.bump_use("alpha"),
+        lambda: skill_usage.record_create_destination("alpha", shared=False),
+    ):
+        writer()
+        assert gateway_run._skill_slug_index((root,)) is initial
+        assert len(reads) == 1
+
+
+def test_hidden_curator_churn_does_not_rebuild_index(tmp_path):
+    root = tmp_path / "skills"
+    _write_skill(root, "cat/alpha", "Alpha")
+    initial = gateway_run._skill_slug_index((root,))
+    for hidden in (".archive", ".curator_backups", ".hub"):
+        _write_skill(root, f"{hidden}/obsolete", "Obsolete")
+        assert gateway_run._skill_slug_index((root,)) is initial
+
+
+def test_index_rebuilds_when_a_flat_skill_is_added(tmp_path):
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "Alpha")
+    assert "beta" not in gateway_run._skill_slug_index((root,))
+    _write_skill(root, "beta", "Beta")
+    assert "beta" in gateway_run._skill_slug_index((root,))
+
+
+def test_index_rebuilds_when_a_flat_skill_is_removed(tmp_path):
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "Alpha")
+    assert "alpha" in gateway_run._skill_slug_index((root,))
+    (root / "alpha" / "SKILL.md").unlink()
+    (root / "alpha").rmdir()
+    assert "alpha" not in gateway_run._skill_slug_index((root,))
 
 
 def test_index_rebuilds_when_a_skill_is_added(tmp_path):

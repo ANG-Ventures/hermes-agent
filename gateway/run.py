@@ -4305,7 +4305,7 @@ def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None
 # _check_unavailable_skill rglob'd + read ~906 SKILL.md files on the event loop
 # for every unknown /command. The walk now happens once (off-loop, see
 # _check_unavailable_skill_async) and is reused until the roots change shape
-# (root / first-level dir mtimes) or /reload-skills invalidates it.
+# (visible root children / first-level dir mtimes) or /reload-skills invalidates it.
 _SkillSlugIndex = Dict[str, List[Tuple[str, Path]]]
 _skill_slug_index_cache: Dict[Tuple[str, ...], Tuple[Tuple[Tuple[str, int], ...], _SkillSlugIndex]] = {}
 _skill_slug_index_lock = threading.Lock()
@@ -4318,21 +4318,24 @@ _UNAVAILABLE_SKILL_HINT_BUDGET_S = 0.75
 
 
 def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], ...]:
-    """Cheap change detector: mtime of each root and of its immediate subdirs.
+    """Track visible root child names and immediate directory mtimes.
 
-    Adding/removing ``<root>/<category>/<skill>/`` bumps the category dir's
-    mtime; a flat ``<root>/<skill>/`` bumps the root's. Deeper edits (renaming
-    a skill's frontmatter) are picked up by /reload-skills.
+    Category mtimes detect skill additions/removals within categories; child
+    names detect flat skill additions/removals. Hidden telemetry/curator files
+    and directories never invalidate the index. /reload-skills picks up deeper
+    edits such as a frontmatter rename.
     """
     out: List[Tuple[str, int]] = []
     for root in roots:
         try:
-            out.append((str(root), root.stat().st_mtime_ns))
+            out.append((str(root), 0))
             with os.scandir(root) as entries:
                 for entry in entries:
+                    if entry.name.startswith("."):
+                        continue
                     try:
-                        if entry.is_dir():
-                            out.append((entry.path, entry.stat().st_mtime_ns))
+                        mtime = entry.stat().st_mtime_ns if entry.is_dir() else -1
+                        out.append((entry.path, mtime))
                     except OSError:
                         continue
         except OSError:
