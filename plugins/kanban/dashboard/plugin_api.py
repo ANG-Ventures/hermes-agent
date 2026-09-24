@@ -973,12 +973,10 @@ class UpdateTaskBody(BaseModel):
 
 
 def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
-    """Route a task leaving the ``review`` lane through ``reopen_review_task``
-    (proper transition: stale-run recovery, parent re-gate, ``review_reopened``
-    event) instead of a raw status write. Returns the transition result, or
-    ``None`` when the task isn't in ``review`` so the caller falls through to
-    its normal handling. Shared by the single-task and bulk status handlers so
-    the review-reopen routing can't drift between them.
+    """Refuse review -> implementer shortcuts in single and bulk status routes.
+
+    A reviewer must claim the review and call request_changes with all lenses.
+    Return None only when the task is not in review.
     """
     if current is not None and getattr(current, "status", None) == "review":
         return kanban_db.reopen_review_task(conn, task_id)
@@ -993,6 +991,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        if task.status == "review" and payload.status in ("ready", "todo"):
+            raise HTTPException(
+                status_code=409,
+                detail="Claim review and request changes with a full coverage comment; direct review reopening is retired",
+            )
 
         review_assignee_deferred = (
             payload.status == "review" and payload.assignee is not None
@@ -1068,6 +1071,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
+                remaining = kanban_db.get_task(conn, task_id)
+                if s in ("ready", "todo") and remaining and remaining.status == "review":
+                    raise HTTPException(status_code=409, detail="Claim review and request changes with a full coverage comment; direct review reopening is retired")
                 # For ``ready``, name the blocking parent(s) so the dashboard
                 # can render an actionable toast instead of a silent no-op.
                 # See #26744.
@@ -1502,6 +1508,10 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 task = kanban_db.get_task(conn, tid)
                 if task is None:
                     entry.update(ok=False, error="not found")
+                    results.append(entry)
+                    continue
+                if task.status == "review" and payload.status in ("ready", "todo"):
+                    entry.update(ok=False, error="claim review and request changes with full coverage")
                     results.append(entry)
                     continue
                 if payload.archive:

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.kanban_review_helpers import covered_request_changes
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
@@ -60,6 +61,11 @@ def test_review_tools_redact_handoff_and_route_changes(
 
     monkeypatch.setenv("HERMES_PROFILE", "argus")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    # Tool and CLI exercise the real transition; seed the coverage comment
+    # without consuming the review run.
+    with kb.connect() as conn:
+        from tests.kanban_review_helpers import record_review_coverage
+        record_review_coverage(conn, review_worker)
     change_secret = "sk-" + "B" * 32
     changed = json.loads(
         tools._handle_request_changes({
@@ -147,6 +153,9 @@ def test_review_cli_round_trip_preserves_handoff(
         review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
         assert review is not None
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    from tests.kanban_review_helpers import record_review_coverage
+    with kb.connect() as conn:
+        record_review_coverage(conn, task_id)
 
     output = kc.run_slash(
         f"request-changes {task_id} 'cover the malformed payload case'"
@@ -191,7 +200,7 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
 
         review = kb.claim_review_task(conn, direct_id)
         assert review is not None
-        assert kb.request_changes(
+        assert covered_request_changes(
             conn,
             direct_id,
             reason=f"change {secret}",
@@ -268,18 +277,17 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
     with kb.connect() as conn:
         assert kb.list_comments(conn, invalid_id) == []
 
-    success_output = kc.run_slash(
+    refused_output = kc.run_slash(
         f'reopen-review {review_id} --reason "revise {secret}"'
     )
-    assert "Reopened" in success_output
-    assert secret not in success_output
+    assert "cannot reopen" in refused_output
+    assert secret not in refused_output
     with kb.connect() as conn:
         task = kb.get_task(conn, review_id)
         assert task is not None
-        assert task.status == "ready"
+        assert task.status == "review"
         comments = kb.list_comments(conn, review_id)
-        assert len(comments) == 1
-        assert secret not in comments[0].body
+        assert comments == []
 
 
 def test_goal_mode_review_handoff_cannot_bypass_judge(

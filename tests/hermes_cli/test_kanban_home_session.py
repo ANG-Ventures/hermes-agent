@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.kanban_review_helpers import covered_request_changes
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
@@ -409,8 +410,7 @@ _ROUND2 = {
     "reopen": (_done, lambda c, t: kb.reopen_task(c, t, actor="apollo", reason="r")),
     "request-review": (_ready, lambda c, t: kb.request_review(
         c, t, summary="s", reviewer="argus", force=True)),
-    "reopen-review": (_review, lambda c, t: kb.reopen_review_task(c, t)),
-    "request-changes": (_review_run, lambda c, t: kb.request_changes(c, t, reason="fix")),
+    "request-changes": (_review_run, lambda c, t: covered_request_changes(c, t, reason="fix")),
     "link": (_ready, _link),
     "specify": (_triage, lambda c, t: kb.specify_triage_task(c, t, body="spec")),
     "decompose": (_triage, lambda c, t: kb.decompose_triage_task(

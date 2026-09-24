@@ -1909,7 +1909,8 @@ def test_respawn_guard_allows_open_pr_after_changes_requested(
         assert review is not None
 
         now += requeue_delay
-        assert kb.request_changes(
+        from tests.kanban_review_helpers import covered_request_changes
+        assert covered_request_changes(
             conn, task_id, reason="Fix the edge case",
             expected_run_id=review.current_run_id,
         ) == (True, "alice")

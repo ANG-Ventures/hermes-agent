@@ -11542,6 +11542,70 @@ def request_review(
     return _ret(True)
 
 
+_REVIEW_LENSES = ("contract", "execution", "cross-vendor", "mutation")
+
+
+def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[str]:
+    """Require a current-run, parseable review record before returning work.
+
+    A prior round's comment cannot certify the current head.  The batch id is
+    recorded in the comment, not inferred from a model's unsupported claim.
+    """
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND run_id = ? "
+        "AND body LIKE '%review_coverage:%' ORDER BY id DESC",
+        (task_id, run_id),
+    ).fetchall()
+    if not rows:
+        return "missing review_coverage comment on this review run (use kanban_block(kind=capability) if a lens cannot run)"
+    line = next((line.strip().split("review_coverage:", 1)[1].strip()
+                 for line in rows[0]["body"].splitlines()
+                 if line.strip().startswith("review_coverage:")), None)
+    if not line:
+        return "missing review_coverage JSON line"
+    try:
+        coverage = json.loads(line)
+    except (ValueError, TypeError):
+        return "invalid review_coverage JSON"
+    if not isinstance(coverage, dict):
+        return "review_coverage must be a JSON object"
+    lenses = coverage.get("lenses")
+    if not isinstance(lenses, dict):
+        return "missing lenses object"
+    for lens in _REVIEW_LENSES:
+        state = lenses.get(lens)
+        if state == "done":
+            continue
+        if (isinstance(state, str) and state.startswith("n/a: ")
+                and state[5:].strip()
+                and not any(word in state.lower() for word in ("cannot", "could not", "unavailable", "failed"))):
+            continue
+        return f"missing/invalid lens {lens}: use 'done' or 'n/a: <applicability reason>'; inability to run requires kanban_block(kind=capability)"
+    count = coverage.get("findings")
+    if type(count) is not int or count < 1:
+        return "findings must be an integer >= 1"
+    items = coverage.get("items")
+    if (not isinstance(items, list) or len(items) != count
+            or any(not isinstance(item, str) or not item.strip() for item in items)):
+        return "items must list exactly findings nonempty findings"
+    minutes = coverage.get("review_minutes")
+    if type(minutes) is not int or minutes < 0:
+        return "review_minutes must be a nonnegative integer"
+    battery = coverage.get("battery")
+    if not isinstance(battery, str) or not battery.strip() or battery == "none":
+        return "battery must name an attachment or be 'seeded'/'none-first-round'"
+    previous_rounds = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
+        (task_id,),
+    ).fetchone()[0]
+    if previous_rounds and battery in ("seeded", "none-first-round"):
+        return "battery must name the persistent attachment on re-review"
+    batch = coverage.get("batch_id")
+    if not isinstance(batch, str) or not batch.strip():
+        return "batch_id must identify the single delegate_task batch in this comment"
+    return None
+
+
 @_home_session_guarded("request-changes")
 def request_changes(
     conn: sqlite3.Connection,
@@ -11615,6 +11679,9 @@ def request_changes(
         implementer = requested_payload.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             return False, "review handoff has no valid implementer provenance"
+        coverage_error = _validate_review_coverage(conn, task_id, int(current_run_id))
+        if coverage_error:
+            return False, coverage_error
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
             reviewer = _canonical_assignee(reviewer)
@@ -12015,71 +12082,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 @_home_session_guarded("reopen-review")
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``review`` -> ready (or todo) so the implementer re-runs.
+    """Legacy verdict bypass retired: claim the review and request changes.
 
-    The "changes requested" counterpart of :func:`request_review`: sends the
-    task back out of the review lane so the dispatcher re-runs the implementer
-    on the new comments. Mirrors :func:`unblock_task` (parent re-gating,
-    defensive stale-run close, ``consecutive_failures`` preserved) and emits a
-    ``review_reopened`` event.
-
-    Deliberately does NOT touch ``block_recurrences``/``block_kind``: review is
-    not a block, so there is no loop counter to reset. (A stale counter from a
-    genuine block *before* review is left intact — only :func:`complete_task`
-    clears it.) Returns False when the task is missing or not in ``review``.
+    A parked review has no reviewer-run evidence. Moving it directly to its
+    implementer evades the full-review coverage gate on request_changes.
+    Kept as a refusal for existing CLI/dashboard callers; no state is changed.
     """
-    now = int(time.time())
-    with write_txn(conn):
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("review",), now=now,
-            note="invariant recovery on review reopen",
-        )
-        new_status = _landing_status_after_parents(conn, task_id)
-        review_event = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'review_requested' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        try:
-            handoff = (
-                json.loads(review_event["payload"])
-                if review_event and review_event["payload"]
-                else {}
-            )
-        except (json.JSONDecodeError, TypeError):
-            handoff = {}
-        implementer = handoff.get("implementer")
-        if not isinstance(implementer, str) or not implementer.strip():
-            implementer = None
-        assignee_sql = ", assignee = ?" if implementer else ""
-        params: tuple[Any, ...] = (
-            (new_status, implementer, task_id)
-            if implementer
-            else (new_status, task_id)
-        )
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            # consecutive_failures deliberately PRESERVED: review reopen is
-            # not a success signal; only complete_task resets the breaker
-            # counter (mirrors unblock_task, #35072).
-            + assignee_sql
-            + " WHERE id = ? AND status = 'review'",
-            params,
-        )
-        if cur.rowcount != 1:
-            return False
-        payload: dict[str, Any] = {"status": new_status}
-        if implementer:
-            payload["implementer"] = implementer
-        _append_event(
-            conn,
-            task_id,
-            "review_reopened",
-            payload if payload != {"status": "ready"} else None,
-        )
-        return True
+    return False
 
 
 def invalidate_descendants_for_parent_reopen(

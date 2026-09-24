@@ -2331,7 +2331,10 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
         "implementer with concrete required changes. This closes the review "
         "run, reapplies parent dependency gating, and requeues the task without "
         "using block-loop accounting. Only use from a task claimed from the "
-        "review column; use kanban_block only for a genuine external blocker."
+        "review column. First post a current-run review_coverage JSON comment "
+        "with lenses (contract, execution, cross-vendor, mutation), findings, "
+        "items, review_minutes, battery and batch_id. If a lens cannot run, "
+        "use kanban_block(kind=capability), not partial review."
     ),
     "parameters": {
         "type": "object",

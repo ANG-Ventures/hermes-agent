@@ -225,7 +225,7 @@ def test_task_detail_includes_links_and_events(client):
 # ---------------------------------------------------------------------------
 
 
-def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
+def test_patch_review_lifecycle_preserves_handoff_and_refuses_shortcut(client):
     secret = "ghp_" + "D" * 40
     task = client.post(
         "/api/plugins/kanban/tasks", json={"title": "review me", "assignee": "builder"},
@@ -263,11 +263,23 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
         f"/api/plugins/kanban/tasks/{task['id']}",
         json={"status": "ready"},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["task"]["status"] == "ready"
-    assert response.json()["task"]["assignee"] == "builder"
+    assert response.status_code == 409, response.text
+    assert "full coverage" in response.json()["detail"]
+    combined = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "todo", "assignee": "builder"},
+    )
+    assert combined.status_code == 409, combined.text
+    bulk = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task["id"]], "status": "ready", "assignee": "builder"},
+    )
+    assert bulk.status_code == 200, bulk.text
+    assert bulk.json()["results"][0]["ok"] is False
     with kb.connect() as conn:
-        assert any(
+        assert kb.get_task(conn, task["id"]).status == "review"
+        assert kb.get_task(conn, task["id"]).assignee == "reviewer"
+        assert not any(
             event.kind == "review_reopened"
             for event in kb.list_events(conn, task["id"])
         )

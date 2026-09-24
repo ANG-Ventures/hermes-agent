@@ -797,6 +797,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_claim.add_argument("task_id")
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
                          help="Claim TTL in seconds (default: 900)")
+    p_claim.add_argument("--review", action="store_true",
+                         help="Claim a parked review run (human-only boards)")
 
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
@@ -1062,12 +1064,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_request_changes.add_argument("task_id")
     p_request_changes.add_argument(
-        "reason", nargs="+", help="Concrete changes required before re-review",
+        "reason", nargs="+", help="Concrete changes required; first post a current-run review_coverage JSON comment",
+    )
+    p_request_changes.add_argument(
+        "--coverage", default=None,
+        help="Review coverage JSON; records a run-attributed comment before transition (human CLI)",
     )
 
     p_reopen_review = sub.add_parser(
         "reopen-review",
-        help="Send one or more review tasks back for changes (review -> ready/todo)",
+        help="Retired: claim review and request-changes with a full coverage comment instead",
     )
     p_reopen_review.add_argument("task_ids", nargs="+")
     p_reopen_review.add_argument(
@@ -3753,7 +3759,8 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        claim = kb.claim_review_task if args.review else kb.claim_task
+        task = claim(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -4350,6 +4357,16 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
+        if args.coverage is not None:
+            task = kb.get_task(conn, tid)
+            if task is None or task.status != "running" or task.current_run_id is None:
+                print(f"cannot record coverage for {tid}: no active review run", file=sys.stderr)
+                return 1
+            kb.add_comment(
+                conn, tid, _profile_author(),
+                "review_coverage: " + str(kb.redact_review_value(args.coverage)),
+                run_id=task.current_run_id,
+            )
         ok, detail = kb.request_changes(
             conn,
             tid,
@@ -4383,7 +4400,7 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
         for tid in ids:
             if not kb.reopen_review_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot reopen {tid} (not in review?)", file=sys.stderr)
+                print(f"cannot reopen {tid}: legacy bypass retired; claim review and use request-changes with full coverage", file=sys.stderr)
             else:
                 if reason:
                     kb.add_comment(
