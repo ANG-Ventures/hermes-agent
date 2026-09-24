@@ -845,6 +845,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  "refuses the completion (see --survivor-unbound). Repeatable: "
                                  "qualify each claim as <workspace-relative-repo>=<claim> when "
                                  "more than one recorded repository vanished.")
+    p_complete.add_argument("--survivor-none", action="store_true",
+                            help="Record work deployed outside a repository; requires --reason "
+                                 "naming an existing follow-up card; never authorizes workspace deletion.")
+    p_complete.add_argument("--reason", default=None,
+                            help="Why --survivor-none has no remote ref; include the follow-up card id.")
     p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
                                  "gh pr view (state OPEN or MERGED) AND required to name this "
@@ -3846,16 +3851,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_ref = getattr(args, "survivor_ref", None)
     survivor_pr = getattr(args, "survivor_pr", None)
     survivor_unbound = getattr(args, "survivor_unbound", None) or None
+    survivor_none = getattr(args, "survivor_none", False)
+    survivor_reason = getattr(args, "reason", None)
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
-                         or survivor_unbound or superseded_by):
+                         or survivor_unbound or survivor_none or survivor_reason or superseded_by):
         print(
             "kanban: --summary / --metadata / --superseded-by / --survivor-ref / "
-            "--survivor-pr / --survivor-unbound are per-task "
+            "--survivor-pr / --survivor-unbound / --survivor-none / --reason are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
         )
+        return 2
+    if survivor_none != bool(survivor_reason) or (survivor_none and (survivor_ref or survivor_pr or survivor_unbound)):
+        print("kanban: --survivor-none requires --reason and cannot combine with survivor claims", file=sys.stderr)
         return 2
     if survivor_unbound and not (survivor_ref or survivor_pr):
         print(
@@ -3906,6 +3916,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     survivor_ref=survivor_ref,
                     survivor_pr=survivor_pr,
                     survivor_unbound=survivor_unbound,
+                    survivor_none=survivor_none,
+                    survivor_reason=survivor_reason,
                     superseded_by=superseded_by,
                 )
             except kb.EmptySupersedeError as supersede_err:

@@ -8385,6 +8385,8 @@ def complete_task(
     survivor_ref: Optional[Union[str, Sequence[str]]] = None,
     survivor_pr: Optional[Union[str, Sequence[str]]] = None,
     survivor_unbound: Union[bool, str, Sequence[Union[bool, str]], None] = None,
+    survivor_none: bool = False,
+    survivor_reason: Optional[str] = None,
     superseded_by: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -8491,14 +8493,20 @@ def complete_task(
         conn, task_id, metadata,
         survivor_ref=survivor_ref, survivor_pr=survivor_pr,
         survivor_unbound=survivor_unbound,
+        survivor_none=survivor_none, survivor_reason=survivor_reason,
         evidence=[t for t in (summary, result) if t],
     )
     if survivor:
         metadata = dict(metadata or {}, survivor=survivor)
         if survivor['kind'] == 'patch':
             survivor_note = (
-                f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} NOT PUSHED"
+                f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} "
+                f"{survivor.get('notice') or 'NOT PUSHED'}"
             )
+            if survivor.get("claims"):
+                survivor_note += " claims=" + " ".join(
+                    f"{ref.get('pr') or ref['remote']}@{ref['sha']}" for ref in survivor["claims"]
+                )
         elif survivor['kind'] == 'bundle':
             survivor_note = f"survivor=bundle {survivor['sidecar']} NOT PUSHED"
         elif survivor['kind'] == 'landed':
@@ -8506,6 +8514,8 @@ def complete_task(
                 f"{entry['repository']}@{entry['sha']} ({entry['matched_by']})"
                 for entry in survivor["landed"]
             )
+        elif survivor['kind'] == 'none':
+            survivor_note = f"survivor=none follow-up={survivor['follow_up_card']}"
         else:
             survivor_note = "survivor=ref " + " ".join(
                 f"{ref.get('repository_path') or ref['remote']}/{ref['branch']}@{ref['sha']}"
