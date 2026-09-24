@@ -4734,6 +4734,20 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+        # Cross-board home index (t_11f2cf60): mirror the cards this commit
+        # (or any earlier event-writing commit on this board) touched, from
+        # the committed rows. Every guarded mutator and every execution-lane
+        # writer commits here. Best-effort, never raises.
+        _sync_home_index(conn)
+
+
+def _sync_home_index(conn: sqlite3.Connection) -> None:
+    try:
+        from hermes_cli import kanban_home_index
+
+        kanban_home_index.sync_after_commit(conn)
+    except Exception:  # pragma: no cover - the index is a mirror, never a gate
+        pass
 
 
 # ---------------------------------------------------------------------------

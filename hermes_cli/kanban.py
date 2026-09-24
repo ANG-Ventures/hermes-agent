@@ -1181,6 +1181,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    # --- home-index (cross-board index read by kanban-home-cards) ---
+    p_hidx = sub.add_parser(
+        "home-index",
+        help="Rebuild (default) or --check the cross-board home-card index "
+             "from every board; prints drift (missing/extra/stale rows)",
+    )
+    p_hidx.add_argument("--check", action="store_true",
+                        help="Report drift only; exit 1 when drift >= 1")
+    p_hidx.add_argument("--json", action="store_true")
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1598,6 +1608,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
+            "home-index": _cmd_home_index,
             "log":      _cmd_log,
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -4966,6 +4977,30 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\n(stopped)")
         return 0
+
+
+def _cmd_home_index(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_home_index
+
+    check = bool(getattr(args, "check", False))
+    report = kanban_home_index.resync(check_only=check)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        mode = "check" if check else "sync"
+        print(
+            f"home-index {mode}: boards={report['boards']} rows={report['rows']} "
+            f"drift={report['drift']} (missing={report['missing']} "
+            f"extra={report['extra']} stale={report['stale']}) "
+            f"errors={len(report['errors'])} path={kanban_home_index.index_path()}"
+        )
+        for line in report["samples"]:
+            print(f"  {line}")
+        for err in report["errors"]:
+            print(f"  error: {err}")
+    if report["errors"]:
+        return 2
+    return 1 if (check and report["drift"]) else 0
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
