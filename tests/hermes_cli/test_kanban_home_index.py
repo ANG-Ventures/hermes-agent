@@ -185,3 +185,67 @@ def test_cli_home_index_check_exit_codes(home, capsys):
     assert run(["home-index"]) == 0
     assert run(["home-index", "--check"]) == 0
     assert "drift=0" in capsys.readouterr().out
+
+
+# ── CLASS-SWEEP: writers that leave no surviving event (Argus r2 B2) ────────
+# Each converges at its own write_txn commit (identity diff), or at the next
+# write_txn commit on that board when it used a raw transaction.
+
+def test_delete_task_leaves_no_ghost(home):
+    hi.resync()
+    with _conn(home) as conn:
+        tid = kb.create_task(conn, title="x", session_id=SID)
+        assert (("default", tid, "ready")) in _ids()
+        assert kb.delete_task(conn, tid)
+    assert _ids() == set()
+    assert hi.resync(check_only=True)["drift"] == 0
+
+
+def test_delete_archived_task_leaves_no_ghost(home):
+    hi.resync()
+    with _conn(home) as conn:
+        keep = kb.create_task(conn, title="keep", session_id=SID)
+        tid = kb.create_task(conn, title="x", session_id=SID, )
+        assert kb.archive_task(conn, tid)
+        assert kb.delete_archived_task(conn, tid)
+    assert _ids() == {("default", keep, "ready")}
+    assert hi.resync(check_only=True)["drift"] == 0
+
+
+def test_raw_unstamp_converges_at_next_commit(home):
+    """kanban_transfer's scrub sets session_id = NULL with no event."""
+    hi.resync()
+    conn = _conn(home)
+    tid = kb.create_task(conn, title="x", session_id=SID)
+    conn.execute("UPDATE tasks SET session_id = NULL WHERE id = ?", (tid,))
+    conn.commit()
+    kb.create_task(conn, title="unrelated", session_id=OTHER)
+    conn.close()
+    assert _ids() == set()
+    assert hi.resync(check_only=True)["drift"] == 0
+
+
+def test_raw_status_and_title_rewrite_inside_write_txn_converges(home):
+    """kanban_swarm / quota_repair / dashboard raw UPDATEs inside write_txn."""
+    hi.resync()
+    conn = _conn(home)
+    tid = kb.create_task(conn, title="old", session_id=SID)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked', title = 'new' WHERE id = ?", (tid,))
+    got = hi.open_cards([SID])
+    conn.close()
+    assert [(c["id"], c["status"], c["title"]) for c in got] == [(tid, "blocked", "new")]
+    assert hi.resync(check_only=True)["drift"] == 0
+
+
+def test_raw_restamp_moves_home_at_next_commit(home):
+    hi.resync()
+    conn = _conn(home)
+    tid = kb.create_task(conn, title="x", session_id=SID)
+    conn.execute("UPDATE tasks SET session_id = ? WHERE id = ?", (OTHER, tid))
+    conn.commit()
+    with kb.write_txn(conn):
+        pass
+    conn.close()
+    assert _ids() == set()
+    assert {t for _, t, _ in _ids((OTHER,))} == {tid}

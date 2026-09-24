@@ -17,8 +17,13 @@ Invariants (spec plans/2026-09-24_session-start-home-cards.md §5):
 - I3 hard cap: <= ``MAX_CARDS`` lines, each <= ``MAX_LINE`` chars, block <=
   ``MAX_CHARS`` incl. header + overflow; truncation by whole lines only.
 - I5 fail-open: the turn waits at most ``BUDGET_S``; never raises.  A
-  timeout names the stage that was still running (lineage / dedupe /
-  index) so it is attributable.  Every first turn logs exactly one line.
+  timeout names the stage that was still running so it is attributable.
+  Every first turn logs exactly one line.
+- P2 no cold state.db read gates the turn (t_11f2cf60 r3): lineage and
+  dedupe get ``STATE_WAIT_S`` on background threads; past that the home is
+  id + in-process parent + the lineage persisted in the index, and dedupe
+  defaults to inject.  The log line names ``lineage=state.db|index|
+  in-process`` and ``dedupe=clean|pending``.
 - P1 no board fan-out on the turn path (t_11f2cf60): cards come from ONE
   read of the cross-board home index (``hermes_cli.kanban_home_index``),
   which the kanban write path keeps current.  A missing / not-backfilled /
@@ -59,6 +64,10 @@ COMMENT_MAX = 70
 
 # ── budget (I5) ─────────────────────────────────────────────────────────────
 BUDGET_S = 0.75
+# Longest the turn waits for the state.db reads (lineage, dedupe); a cold
+# state.db after a restart takes 0.7-15 s (t_11f2cf60), so past this the
+# turn proceeds without them and they finish in the background.
+STATE_WAIT_S = 0.35
 # Busy wait on the home index's lock (a writer holds it for one small txn).
 INDEX_BUSY_S = 0.25
 # Upper bound on the probe thread's own state.db work (the turn stops
@@ -315,70 +324,101 @@ def _unavailable(reason: str) -> str:
     return f"[Your open cards: unavailable ({reason}) — {LIST_HINT}]"[:MAX_UNAVAILABLE]
 
 
-# ── probe (I5) ──────────────────────────────────────────────────────────────
+# ── probe (I5, P2) ──────────────────────────────────────────────────────────
 def _ms(since: float) -> int:
     return int((time.monotonic() - since) * 1000)
 
 
-class _Probe:
-    """One session's reads (lineage -> dedupe -> index) on a daemon thread.
+class _Bg:
+    """Run ``fn(*args)`` on a daemon thread; the turn polls ``done``.
 
-    The turn waits at most ``BUDGET_S`` for it.  ``stage`` always names the
-    step in flight, so a caller that stops waiting can attribute the
-    timeout.  ``result`` is ``("dedupe",)``, ``("cards", cards)``,
-    ``("no-index", reason)`` or ``("error", msg)``.
+    The thread outlives a turn that stopped waiting, so a cold read still
+    completes and warms its cache (``home_ids``) / persists its answer
+    (``remember_home``) for the next first turn -- off the turn path.
     """
 
-    def __init__(self, session_id: str) -> None:
-        self.session_id = session_id
-        self.stage = "lineage"
-        self.stage_ms: dict[str, int] = {}
-        self.result: tuple = ()
+    def __init__(self, name: str, fn, *args: Any) -> None:
+        self.value: Any = None
+        self.error: Optional[str] = None
+        self.ms: Optional[int] = None
         self.done = threading.Event()
-
-    def start(self) -> "_Probe":
-        threading.Thread(target=self._run, name="kanban-home-cards-probe",
+        self._fn, self._args = fn, args
+        threading.Thread(target=self._run, name=f"kanban-home-cards-{name}",
                          daemon=True).start()
-        return self
 
     def _run(self) -> None:
+        t = time.monotonic()
         try:
-            from hermes_cli.kanban_home_index import IndexUnavailable
-
-            t = time.monotonic()
-            ids = home_ids(self.session_id)
-            self.stage_ms["lineage"] = _ms(t)
-            self.stage, t = "dedupe", time.monotonic()
-            dup = _persisted_recently_injected(self.session_id, t + PROBE_MAX_S)
-            self.stage_ms["dedupe"] = _ms(t)
-            if dup:
-                self.result = ("dedupe",)
-                return
-            self.stage, t = "index", time.monotonic()
-            try:
-                cards = query_cards(ids)
-            except IndexUnavailable as exc:
-                self.result = ("no-index", str(exc))
-                return
-            finally:
-                self.stage_ms["index"] = _ms(t)
-            self.result = ("cards", cards)
+            self.value = self._fn(*self._args)
         except Exception as exc:
-            self.result = ("error", str(exc))
+            self.error = str(exc)
         finally:
+            self.ms = _ms(t)
             self.done.set()
 
 
-def _stage_ms(probe: _Probe) -> str:
-    return " ".join(f"{k}_ms={v}" for k, v in probe.stage_ms.items())
+def _resolve_lineage(session_id: str) -> tuple[str, ...]:
+    """state.db lineage (cached per process), persisted into the home index
+    so a cold process can answer it without state.db next time."""
+    ids = home_ids(session_id)
+    try:
+        from hermes_cli import kanban_home_index
+
+        # Own thread: the index write must not delay the lineage answer.
+        threading.Thread(target=kanban_home_index.remember_home, args=(session_id, ids),
+                         name="kanban-home-cards-remember", daemon=True).start()
+    except Exception:
+        pass
+    return ids
+
+
+def _read_cards(session_id: str, ids: Optional[Sequence[str]],
+                parent_session_id: str) -> tuple:
+    """Index stage.  ``ids`` is the resolved lineage, or None when state.db
+    did not answer in time: then the home is the in-process id + parent plus
+    the lineage persisted in the index (a subset of the truth -- it can
+    under-count, never show another chain's card).  Returns
+    ``(lineage_source, result)``; ``result`` as in :func:`on_pre_llm_call`."""
+    from hermes_cli import kanban_home_index
+
+    if ids is not None:
+        source, home = "state.db", tuple(ids)
+    else:
+        known = kanban_home_index.known_home(session_id, timeout_s=INDEX_BUSY_S)
+        source = "index" if known else "in-process"
+        home = tuple(sorted({session_id, *([parent_session_id] if parent_session_id else []),
+                             *known}))
+    try:
+        return source, ("cards", query_cards(home))
+    except kanban_home_index.IndexUnavailable as exc:
+        return source, ("no-index", str(exc))
+
+
+def _stage_ms(**stages: Optional[_Bg]) -> str:
+    out = []
+    for name, bg in stages.items():
+        if bg is None:
+            continue
+        out.append(f"{name}_ms={bg.ms}" if bg.done.is_set() else f"{name}_ms=pending")
+    return " ".join(out)
 
 
 def on_pre_llm_call(
     session_id: str = "",
     platform: str = "",
     conversation_history: Any = None,
+    parent_session_id: str = "",
     **_: Any,
 ) -> Optional[dict]:
+    """P2 (t_11f2cf60 r3): no cold state.db read gates the first turn.
+
+    Lineage and dedupe (state.db) start on their own threads and get at most
+    ``STATE_WAIT_S``.  Whatever has not answered by then is not waited for:
+    lineage falls back to id + in-process parent + the lineage persisted in
+    the home index; dedupe falls back to INJECT (a duplicate block costs
+    ~335 tokens, a missing one defeats the feature).  Only the index read --
+    one small file -- sits on the turn path, inside ``BUDGET_S``.
+    """
     try:
         sid = str(session_id or "")
         if not sid or _excluded(platform):
@@ -389,32 +429,38 @@ def on_pre_llm_call(
             logger.info("kanban-home-cards: session=%s dedupe=history", sid)
             return None
         started = time.monotonic()
-        probe = _Probe(sid).start()
-        if not probe.done.wait(BUDGET_S):  # I5 — the turn never waits longer
-            logger.info(
-                "kanban-home-cards: session=%s unavailable=timeout stage=%s ms=%d %s",
-                sid, probe.stage, _ms(started), _stage_ms(probe),
+        lin = _Bg("lineage", _resolve_lineage, sid)
+        dd = _Bg("dedupe", _persisted_recently_injected, sid, started + PROBE_MAX_S)
+        soft = started + STATE_WAIT_S
+        for bg in (lin, dd):
+            bg.done.wait(max(0.0, soft - time.monotonic()))
+        if dd.done.is_set() and dd.value is True:  # R3 (state.db)
+            logger.info("kanban-home-cards: session=%s dedupe=state.db ms=%d %s",
+                        sid, _ms(started), _stage_ms(lineage=lin, dedupe=dd))
+            return None
+        dedupe = "clean" if dd.done.is_set() else "pending"
+        ids = lin.value if (lin.done.is_set() and lin.error is None) else None
+        parent = str(parent_session_id or "")
+        idx = _Bg("index", _read_cards, sid, ids, parent)
+        if not idx.done.wait(max(0.0, started + BUDGET_S - time.monotonic())):
+            logger.info(  # I5 — the turn never waits longer than BUDGET_S
+                "kanban-home-cards: session=%s unavailable=timeout stage=index ms=%d %s",
+                sid, _ms(started), _stage_ms(lineage=lin, dedupe=dd, index=idx),
             )
             return None
-        kind = probe.result[0] if probe.result else "error"
-        if kind == "dedupe":  # R3 (state.db)
-            logger.info("kanban-home-cards: session=%s dedupe=state.db ms=%d %s",
-                        sid, _ms(started), _stage_ms(probe))
+        if idx.error is not None:
+            logger.warning("kanban-home-cards: session=%s failed open: %s", sid, idx.error)
             return None
-        if kind == "no-index":  # fail-open, never scan boards
+        source, result = idx.value
+        tail = f"lineage={source} dedupe={dedupe} " + _stage_ms(lineage=lin, dedupe=dd, index=idx)
+        if result[0] == "no-index":  # fail-open, never scan boards
             logger.info("kanban-home-cards: session=%s unavailable=%s ms=%d %s",
-                        sid, probe.result[1], _ms(started), _stage_ms(probe))
+                        sid, result[1], _ms(started), tail)
             return None
-        if kind != "cards":
-            logger.warning("kanban-home-cards: session=%s failed open: %s", sid,
-                           probe.result[1] if len(probe.result) > 1 else "no result")
-            return None
-        cards = probe.result[1]
+        cards = result[1]
         block = render(cards)
-        logger.info(
-            "kanban-home-cards: session=%s cards=%d chars=%d ms=%d %s",
-            sid, len(cards), len(block or ""), _ms(started), _stage_ms(probe),
-        )
+        logger.info("kanban-home-cards: session=%s cards=%d chars=%d ms=%d %s",
+                    sid, len(cards), len(block or ""), _ms(started), tail)
         return {"context": block} if block else None
     except Exception as exc:  # I5 — never raise into the turn
         logger.warning("kanban-home-cards: failed open: %s", exc)

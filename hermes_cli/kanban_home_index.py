@@ -12,6 +12,7 @@ Layout: ``<kanban_home>/kanban/home_index.db``::
           last_activity, ev, updated_at)     -- PK (board, task_id)
     boards(board, last_event_id, db_path)    -- per-board sync watermark
     meta(key, value)                         -- 'backfilled_at'
+    homes(session_id, ids, updated_at)       -- last resolved home lineage
 
 Write path (:func:`sync_after_commit`) runs from ``kanban_db.write_txn``
 after every outer COMMIT -- the one transaction boundary that guarded
@@ -23,9 +24,16 @@ or a raw INSERT) is picked up by the next commit on that board, and a
 per-row ``ev`` (the task's max event id) makes concurrent flushes converge:
 an older snapshot never overwrites a newer one.
 
-A writer that changes a card WITHOUT an event row is not seen by the write
-path; :func:`resync` (CLI ``kanban home-index``; daily cron) rebuilds from
-all boards and reports that drift instead of trusting it away.
+Writers that change a card WITHOUT a surviving event row (``delete_task``
+drops the task's events; ``kanban_transfer``'s scrub, ``kanban_swarm`` and
+raw dashboard UPDATEs skip ``task_events``) are caught by an identity diff
+that runs on the same commit: the board's stamped ``(id, session_id,
+status, title)`` set is fingerprinted on every commit (~4 ms on a 1.7k-task
+board) and, when it or the event watermark moved, diffed against the
+index's rows for that board -- deleted, unstamped, re-stamped and retitled
+cards converge at that commit, or at the next ``write_txn`` commit on that
+board when the writer used its own transaction.  :func:`resync` (CLI
+``kanban home-index``; daily cron) remains the backstop and reports drift.
 
 Best-effort by contract: nothing here may fail or slow a board write beyond
 a short bounded wait; every error is swallowed (logged at debug).
@@ -78,7 +86,20 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS homes (
+    session_id TEXT PRIMARY KEY,
+    ids        TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
+
+# Stamped identity: what decides which session a card is shown to.
+_IDENT_SQL = (
+    "SELECT id, session_id, status, title FROM tasks "
+    "WHERE session_id IS NOT NULL AND session_id != ''"
+)
+# Persisted lineages older than this are pruned on write.
+HOMES_TTL_S = 30 * 86400
 
 # Same projection the plugin used to run on every board (last comment,
 # last activity across events/comments), now run once per written card.
@@ -182,9 +203,10 @@ def _is_backfilled(idx: sqlite3.Connection) -> bool:
 
 
 # ── write path ──────────────────────────────────────────────────────────────
-# Per-process: board db file -> last event id this process already flushed.
-# Lets a commit with nothing new (the common case) skip opening the index.
-_FLUSHED: dict[str, int] = {}
+# Per-process: board db file -> (last event id, stamped-identity fingerprint)
+# this process already flushed.  Lets a commit that moved neither (the common
+# case) skip opening the index.
+_FLUSHED: dict[str, tuple[int, int]] = {}
 _FLUSH_LOCK = threading.Lock()
 
 
@@ -219,8 +241,10 @@ def sync_after_commit(conn: sqlite3.Connection) -> int:
             return 0
         file = conn.execute("PRAGMA database_list").fetchone()[2]
         top = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+        ident = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(_IDENT_SQL)}
+        mark = (int(top), hash(frozenset(ident.items())))
         with _FLUSH_LOCK:
-            if _FLUSHED.get(file) == top:
+            if _FLUSHED.get(file) == mark:
                 return 0
         path = index_path()
         if not path.is_file():
@@ -237,6 +261,14 @@ def sync_after_commit(conn: sqlite3.Connection) -> int:
             ids = [r[0] for r in conn.execute(
                 "SELECT DISTINCT task_id FROM task_events WHERE id > ? AND id <= ?",
                 (wm, top))]
+            # Identity diff: converge writers that left no surviving event
+            # (delete_task, transfer scrub, swarm, raw dashboard UPDATEs).
+            have = {r[0]: (r[1], r[2], r[3]) for r in idx.execute(
+                "SELECT task_id, session_id, status, title FROM cards WHERE board = ?",
+                (slug,))}
+            drifted = [t for t, v in ident.items() if have.get(t) != v]
+            drifted += [t for t in have if t not in ident]
+            ids = list(dict.fromkeys([*ids, *drifted]))
             rows: list = []
             for i in range(0, len(ids), 500):
                 chunk = ids[i:i + 500]
@@ -261,7 +293,7 @@ def sync_after_commit(conn: sqlite3.Connection) -> int:
         finally:
             idx.close()
         with _FLUSH_LOCK:
-            _FLUSHED[file] = top
+            _FLUSHED[file] = mark
         return n
     except Exception as exc:  # the index is a mirror, never a gate
         logger.debug("kanban home index: sync skipped: %s", exc)
@@ -368,6 +400,67 @@ def resync(*, check_only: bool = False) -> dict:
 def _sample(report: dict, line: str) -> None:
     if len(report["samples"]) < 20:
         report["samples"].append(line)
+
+
+# ── persisted lineage (turn path fallback) ──────────────────────────────────
+def remember_home(session_id: str, ids: Iterable[str]) -> bool:
+    """Persist a resolved home lineage so a COLD process can answer it
+    without state.db.  Off the turn path (the plugin's lineage thread calls
+    it after ``home_ids`` returns).  Lineage only grows, so a stale row is a
+    subset of the truth: it can under-count, never show a foreign card.
+    Only writes into an existing, backfilled index.  Never raises."""
+    try:
+        sid = str(session_id or "")
+        members = sorted({str(x) for x in ids if x} | {sid}) if sid else []
+        if len(members) < 2:
+            return False  # {sid} alone adds nothing over the exact id
+        path = index_path()
+        if not path.is_file():
+            return False
+        idx = _open_rw(path)
+        try:
+            if not _is_backfilled(idx):
+                return False
+            now = time.time()
+            idx.execute("BEGIN IMMEDIATE")
+            try:
+                idx.execute(
+                    "INSERT INTO homes (session_id, ids, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET ids = excluded.ids, "
+                    "updated_at = excluded.updated_at",
+                    (sid, "\n".join(members), now),
+                )
+                idx.execute("DELETE FROM homes WHERE updated_at < ?", (now - HOMES_TTL_S,))
+                idx.execute("COMMIT")
+            except Exception:
+                idx.execute("ROLLBACK")
+                raise
+        finally:
+            idx.close()
+        return True
+    except Exception as exc:
+        logger.debug("kanban home index: remember_home skipped: %s", exc)
+        return False
+
+
+def known_home(session_id: str, *, timeout_s: float = 0.25) -> frozenset[str]:
+    """The last persisted home lineage of ``session_id`` (empty if none or
+    the index cannot answer).  Read-only, bounded, never raises."""
+    try:
+        path = index_path()
+        if not session_id or not path.is_file():
+            return frozenset()
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True,
+                               timeout=timeout_s, check_same_thread=False)
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {int(timeout_s * 1000)}")
+            row = conn.execute("SELECT ids FROM homes WHERE session_id = ?",
+                               (session_id,)).fetchone()
+        finally:
+            conn.close()
+        return frozenset(x for x in (row[0].split("\n") if row else ()) if x)
+    except Exception:
+        return frozenset()
 
 
 # ── read path (turn path) ───────────────────────────────────────────────────

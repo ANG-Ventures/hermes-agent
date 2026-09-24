@@ -621,26 +621,85 @@ def test_I5_budget_is_750ms(mod):
     assert mod.BUDGET_S == 0.75
 
 
-def test_I5_lineage_timeout_names_stage(mod, home, monkeypatch, caplog):
-    _card(_board(home), "t_home0001", session_id=SID)
-    monkeypatch.setattr(mod, "BUDGET_S", 0.2)
-    monkeypatch.setattr(mod, "home_ids", lambda s: time.sleep(1) or (s,))
+def _slow(value, secs=3.0):
+    return lambda *a, **k: time.sleep(secs) or value
+
+
+# ── P2: no cold state.db read gates the first turn (t_11f2cf60 r3) ──────────
+
+def test_P2_slow_lineage_still_renders_exact_id_cards_within_budget(mod, home, monkeypatch, caplog):
+    _card(_board(home), "t_home0001", session_id=SID, title="exact id card")
+    monkeypatch.setattr(mod, "home_ids", _slow((SID,)))
     with caplog.at_level("INFO", logger=mod.logger.name):
         t = time.monotonic()
-        assert mod.on_pre_llm_call(session_id=SID) is None
-        assert time.monotonic() - t < 0.2 + 0.5
-    line = next(r.getMessage() for r in caplog.records if "unavailable=timeout" in r.getMessage())
-    assert "stage=lineage" in line and "ms=" in line
+        out = mod.on_pre_llm_call(session_id=SID)
+        took = time.monotonic() - t
+    assert out and "exact id card" in out["context"]
+    assert took < mod.BUDGET_S + 0.1
+    line = next(r.getMessage() for r in caplog.records if "cards=1" in r.getMessage())
+    assert "lineage=in-process" in line and "lineage_ms=pending" in line
 
 
-def test_I5_dedupe_timeout_names_stage(mod, home, monkeypatch, caplog):
-    _card(_board(home), "t_home0001", session_id=SID)
-    monkeypatch.setattr(mod, "BUDGET_S", 0.2)
-    monkeypatch.setattr(mod, "_persisted_recently_injected",
-                        lambda *a: time.sleep(1) or False)
+def test_P2_slow_lineage_uses_in_process_parent(mod, home, monkeypatch):
+    parent = "20260924_110000_pppppp"
+    d = _board(home)
+    _card(d, "t_prnt0001", session_id=parent, title="parent card")
+    _card(d, "t_frgn0001", session_id=FOREIGN, title="foreign card")
+    monkeypatch.setattr(mod, "home_ids", _slow((SID,)))
+    out = mod.on_pre_llm_call(session_id=SID, parent_session_id=parent)
+    assert "parent card" in out["context"] and "foreign card" not in out["context"]
+
+
+def test_P2_slow_lineage_uses_lineage_persisted_in_index(mod, home, monkeypatch, caplog):
+    from hermes_cli import kanban_home_index
+
+    grand = "20260924_100000_gggggg"
+    d = _board(home)
+    _card(d, "t_gran0001", session_id=grand, title="grandparent card")
+    _card(d, "t_frgn0001", session_id=FOREIGN, title="foreign card")
+    assert kanban_home_index.remember_home(SID, (SID, grand))
+    monkeypatch.setattr(mod, "home_ids", _slow((SID,)))
     with caplog.at_level("INFO", logger=mod.logger.name):
-        assert mod.on_pre_llm_call(session_id=SID) is None
-    assert any("stage=dedupe" in r.getMessage() for r in caplog.records)
+        out = mod.on_pre_llm_call(session_id=SID)
+    assert "grandparent card" in out["context"] and "foreign card" not in out["context"]
+    assert any("lineage=index" in r.getMessage() for r in caplog.records)
+
+
+def test_P2_completed_lineage_is_persisted_for_the_next_cold_process(mod, home, monkeypatch):
+    from hermes_cli import kanban_home_index
+
+    parent = "20260924_110000_pppppp"
+    _card(_board(home), "t_home0001", session_id=SID)
+    monkeypatch.setattr(mod, "home_ids", lambda s: (parent, s))
+    assert mod.on_pre_llm_call(session_id=SID)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not kanban_home_index.known_home(SID):
+        time.sleep(0.02)
+    assert kanban_home_index.known_home(SID) == frozenset({SID, parent})
+
+
+def test_P2_remember_home_skips_trivial_and_unbackfilled(home):
+    from hermes_cli import kanban_home_index
+
+    assert kanban_home_index.remember_home(SID, (SID,)) is False
+    assert kanban_home_index.remember_home(SID, (SID, FOREIGN)) is False  # no index yet
+    assert kanban_home_index.known_home(SID) == frozenset()
+
+
+def test_P2_slow_dedupe_injects_and_says_pending(mod, home, monkeypatch, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    monkeypatch.setattr(mod, "_persisted_recently_injected", _slow(True))
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        t = time.monotonic()
+        out = mod.on_pre_llm_call(session_id=SID)
+        took = time.monotonic() - t
+    assert out and took < mod.BUDGET_S + 0.1
+    line = next(r.getMessage() for r in caplog.records if "cards=1" in r.getMessage())
+    assert "dedupe=pending" in line and "dedupe_ms=pending" in line
+
+
+def test_P2_state_wait_leaves_room_for_the_index(mod):
+    assert mod.STATE_WAIT_S + mod.INDEX_BUSY_S < mod.BUDGET_S
 
 
 def test_I5_index_timeout_names_stage(mod, home, monkeypatch, caplog):
@@ -648,7 +707,9 @@ def test_I5_index_timeout_names_stage(mod, home, monkeypatch, caplog):
     monkeypatch.setattr(mod, "BUDGET_S", 0.2)
     monkeypatch.setattr(mod, "query_cards", lambda ids: time.sleep(1) or [])
     with caplog.at_level("INFO", logger=mod.logger.name):
+        t = time.monotonic()
         assert mod.on_pre_llm_call(session_id=SID) is None
+        assert time.monotonic() - t < 0.2 + 0.1
     line = next(r.getMessage() for r in caplog.records if "unavailable=timeout" in r.getMessage())
     assert "stage=index" in line and "lineage_ms=" in line and "dedupe_ms=" in line
 
@@ -658,7 +719,7 @@ def test_success_log_carries_stage_timings(mod, home, caplog):
     with caplog.at_level("INFO", logger=mod.logger.name):
         assert mod.on_pre_llm_call(session_id=SID)
     line = next(r.getMessage() for r in caplog.records if "cards=1" in r.getMessage())
-    for f in ("ms=", "lineage_ms=", "dedupe_ms=", "index_ms="):
+    for f in ("ms=", "lineage_ms=", "dedupe_ms=", "index_ms=", "lineage=state.db", "dedupe=clean"):
         assert f in line, (f, line)
 
 
