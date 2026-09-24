@@ -3,6 +3,7 @@ mutation guard (kanban_db.check_home_session / _home_session_guarded)."""
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -117,10 +118,63 @@ def test_compaction_lineage_keeps_ownership(kanban_home, monkeypatch):
 
 
 def test_unstamped_legacy_card_is_allowed(kanban_home):
+    # A PRE-EXISTING NULL row (created before birth-stamping); create_task
+    # itself can no longer produce one.
     with kb.connect_closing() as conn:
-        tid = _card(conn, session_id=None)
+        tid = _card(conn)
+        conn.execute("UPDATE tasks SET session_id = NULL WHERE id = ?", (tid,))
+        conn.commit()
         with kb.mutation_actor(session_ids=(OTHER,), profile="apollo"):
             assert kb.unblock_task(conn, tid)
+
+
+def test_sessionless_create_is_born_unhomed_never_null(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="cron card", assignee="worker-a")
+        raw = conn.execute(
+            "SELECT session_id, body FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert raw["session_id"] == kb.UNHOMED_SESSION
+        assert raw["body"].startswith("origin: unhomed")
+        task = kb.get_task(conn, tid)
+        # Sentinel never leaks to notification/wake consumers.
+        assert task.session_id is None and task.unhomed is True
+
+
+def test_child_inherits_parent_home(kanban_home):
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="root", assignee="worker-a", session_id=HOME)
+        kid = kb.create_task(conn, title="kid", assignee="worker-b", parents=(root,))
+        assert kb.get_task(conn, kid).session_id == HOME
+
+
+def test_explicit_session_stamps_origin_line_once(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", body="do it", session_id=HOME)
+        body = kb.get_task(conn, tid).body
+        assert body.splitlines()[0].startswith("origin: ")
+        assert f"session {HOME}" in body.splitlines()[0]
+        assert body.endswith("do it")
+        pre = kb.create_task(conn, title="t2", body="origin: x\nbody", session_id=HOME)
+        assert kb.get_task(conn, pre).body == "origin: x\nbody"
+
+
+def test_unhomed_card_refused_for_chat_session_and_takeover_records_event(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="cron card", assignee="worker-a")
+        assert kb.block_task(conn, tid, reason="x")
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo"):
+            with pytest.raises(kb.ForeignSessionMutationError, match="UNHOMED"):
+                kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "blocked"
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="adopting orphan"):
+            assert kb.unblock_task(conn, tid)
+        kinds = [r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
+        assert "takeover" in kinds
+        assert any("takeover:" in c and "adopting orphan" in c
+                   for c in _comments(conn, tid))
 
 
 def test_foreign_ok_allows_and_leaves_audit_comment(kanban_home):
@@ -131,7 +185,7 @@ def test_foreign_ok_allows_and_leaves_audit_comment(kanban_home):
             assert kb.unblock_task(conn, tid)
         assert kb.get_task(conn, tid).status != "blocked"
         assert _comments(conn, tid) == [
-            f"foreign-session action by {OTHER} (apollo): "
+            f"takeover: foreign-session action by {OTHER} (apollo): "
             "home session is gone [unblock]"
         ]
 
@@ -190,7 +244,9 @@ def test_cli_show_prints_home(kanban_home, monkeypatch):
     with kb.connect_closing() as conn:
         mine = _card(conn, session_id=HOME, blocked=False)
         theirs = _card(conn, session_id=OTHER, blocked=False)
-        legacy = _card(conn, session_id=None, blocked=False)
+        legacy = _card(conn, blocked=False)
+        conn.execute("UPDATE tasks SET session_id = NULL WHERE id = ?", (legacy,))
+        conn.commit()
     assert "home:      this-session" in kc.run_slash(f"show {mine}")
     out = kc.run_slash(f"show {theirs}")
     assert f"session:   {OTHER}" in out
@@ -221,7 +277,7 @@ def test_cli_foreign_complete_refused_then_override(kanban_home, monkeypatch):
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "done"
         assert any(
-            b.startswith(f"foreign-session action by {OTHER} (apollo): home session closed")
+            b.startswith(f"takeover: foreign-session action by {OTHER} (apollo): home session closed")
             for b in _comments(conn, tid)
         )
 
@@ -238,8 +294,11 @@ def test_cli_comment_on_foreign_card_is_unaffected(kanban_home, monkeypatch):
 def test_cli_legacy_card_warns_once(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
     with kb.connect_closing() as conn:
-        a = _card(conn, session_id=None)
-        b = _card(conn, session_id=None)
+        a = _card(conn)
+        b = _card(conn)
+        # Legacy pre-stamp NULL rows (create_task can no longer produce them).
+        conn.execute("UPDATE tasks SET session_id = NULL WHERE id IN (?, ?)", (a, b))
+        conn.commit()
     out = kc.run_slash(f"unblock {a} {b}")
     assert out.count("has no home session") == 1
 
@@ -534,7 +593,7 @@ def test_cli_foreign_requeue_refused_then_override(kanban_home, monkeypatch):
     with kb.connect_closing() as conn:
         assert [e for e in kb.list_events(conn, tid) if e.kind == "requeued"]
         assert _comments(conn, tid) == [
-            f"foreign-session action by {OTHER} (apollo): recovery [requeue]"
+            f"takeover: foreign-session action by {OTHER} (apollo): recovery [requeue]"
         ]
 
 
@@ -589,6 +648,12 @@ import re as _re
 # events that are NOT guarded, each with the reason it is execution lane.
 EXECUTION_LANE = {
     "_migrate_add_optional_columns": "schema migration at connect time",
+    "backfill_unhomed": (
+        "callers: `kanban home-lint --backfill` (operator/cron). Writes ONLY "
+        "rows whose session_id IS NULL/empty (WHERE-clause re-checked in the "
+        "UPDATE), i.e. cards with no home to trespass on; never reassigns a "
+        "homed card"
+    ),
     # Reasons are derived from the CALLERS, not the function's intent. The
     # chat-reachable ones (CLI verb / tool / dashboard) say why a foreign
     # session still cannot change another card's status or ownership.
@@ -739,3 +804,104 @@ def test_every_tool_reaching_a_guarded_writer_binds_the_actor():
         if calls & guarded and name not in wrapped:
             missing.append(name)
     assert not missing, f"tool handlers reaching guarded writers unbound: {missing}"
+
+
+# --- t_4de62657: birth stamping, session-first list, --takeover, home-lint ---
+
+
+def test_cli_create_stamps_session_and_origin_line(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "#sub-vps-n")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "1550")
+    out = kc.run_slash("create 'cli card' --body 'do the thing' --json")
+    tid = json.loads(out[out.index("{"):])["id"]
+    with kb.connect_closing() as conn:
+        t = kb.get_task(conn, tid)
+    assert t.session_id == HOME
+    first = t.body.splitlines()[0]
+    assert first.startswith("origin: discord #sub-vps-n (1550) \u00b7 session " + HOME)
+
+
+def test_cli_create_without_session_is_unhomed(kanban_home):
+    out = kc.run_slash("create 'cron card' --json")
+    tid = json.loads(out[out.index("{"):])["id"]
+    with kb.connect_closing() as conn:
+        raw = conn.execute("SELECT session_id FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert raw["session_id"] == kb.UNHOMED_SESSION
+
+
+def test_cli_takeover_flag_is_the_override(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+    assert "refused unblock" in kc.run_slash(f"unblock {tid}")
+    kc.run_slash(f"unblock {tid} --takeover 'home chat is dead'")
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "blocked"
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "takeover"]
+        assert len(ev) == 1 and ev[0].payload["reason"] == "home chat is dead"
+        assert ev[0].payload["home"] == HOME
+        assert ev[0].payload["by_sessions"] == [OTHER]
+
+
+def test_cli_comment_on_foreign_card_always_allowed(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+    kc.run_slash(f"comment {tid} 'fyi from another chat'")
+    with kb.connect_closing() as conn:
+        assert "fyi from another chat" in _comments(conn, tid)
+
+
+def test_cli_list_groups_this_session_first(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        mine = kb.create_task(conn, title="mine", assignee="w", session_id=HOME)
+        theirs = kb.create_task(conn, title="theirs", assignee="w", session_id=OTHER)
+        orphan = kb.create_task(conn, title="orphan", assignee="w")
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    out = kc.run_slash("list")
+    this_at, other_at = out.index("THIS SESSION (1)"), out.index("OTHER SESSIONS (2)")
+    assert this_at < out.index(mine) < other_at
+    assert out.index(theirs) > other_at and out.index(orphan) > other_at
+    assert f"  {theirs} \u00b7 ready \u00b7 theirs" in out
+    assert f"  {orphan} \u00b7 ready \u00b7 orphan [unhomed]" in out
+    flat = kc.run_slash("list --all")
+    assert "THIS SESSION" not in flat and mine in flat and theirs in flat
+    only = kc.run_slash("list --this-session")
+    assert mine in only and theirs not in only and orphan not in only
+
+
+def test_cli_list_without_session_is_flat(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="x", assignee="w", session_id=HOME)
+    out = kc.run_slash("list")
+    assert tid in out and "THIS SESSION" not in out
+
+
+def test_home_lint_silent_when_green_and_backfill(kanban_home, capsys):
+    with kb.connect_closing() as conn:
+        a = kb.create_task(conn, title="a", assignee="w", session_id=HOME)
+        b = kb.create_task(conn, title="b", assignee="w", session_id=HOME)
+        done = kb.create_task(conn, title="d", assignee="w", session_id=HOME)
+        conn.execute("UPDATE tasks SET session_id = NULL WHERE id IN (?, ?)", (b, done))
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (done,))
+        conn.commit()
+    args = argparse.Namespace(backfill=False, dry_run=False, json=False)
+    assert kc._cmd_home_lint(args) == 1
+    out = capsys.readouterr().out
+    assert b in out and a not in out and done not in out
+    assert kc._cmd_home_lint(argparse.Namespace(backfill=True, dry_run=True, json=False)) == 0
+    with kb.connect_closing() as conn:
+        assert kb.find_homeless_open_tasks(conn) == [b]
+    capsys.readouterr()
+    assert kc._cmd_home_lint(argparse.Namespace(backfill=True, dry_run=False, json=False)) == 0
+    with kb.connect_closing() as conn:
+        raw = conn.execute("SELECT session_id FROM tasks WHERE id = ?", (b,)).fetchone()
+        assert raw["session_id"] == kb.UNHOMED_SESSION
+        assert any(c.startswith("origin: unknown (pre-stamp or cron)") for c in _comments(conn, b))
+        assert kb.backfill_unhomed(conn) == []  # idempotent
+    capsys.readouterr()
+    assert kc._cmd_home_lint(argparse.Namespace(backfill=False, dry_run=False, json=False)) == 0
+    assert capsys.readouterr().out == ""  # silent when green

@@ -659,6 +659,9 @@ def _handle_list(args: dict, **kw) -> str:
     include_archived, bool_error = _parse_bool_arg(args, "include_archived")
     if bool_error:
         return tool_error(bool_error)
+    flat, bool_error = _parse_bool_arg(args, "all")
+    if bool_error:
+        return tool_error(bool_error)
     limit = args.get("limit")
     if limit is None:
         limit = KANBAN_LIST_DEFAULT_LIMIT
@@ -689,8 +692,43 @@ def _handle_list(args: dict, **kw) -> str:
             )
             truncated = len(rows) > limit
             tasks = rows[:limit]
+            # Session-first view (same rule as ``hermes kanban list``): when
+            # the caller has a session, only THIS session's cards come back
+            # in full; every other session's card collapses to
+            # id/status/title. ``all=true`` restores the flat view.
+            grouped: dict[str, Any] = {}
+            home = frozenset()
+            if not flat:
+                from tools.async_delegation import _current_origin_session_id
+
+                for sid in (_current_origin_session_id(), _current_session_id()):
+                    home |= kb.home_ids(sid)
+            if home:
+                mine = [t for t in tasks if t.session_id and t.session_id in home]
+                others = [t for t in tasks if not (t.session_id and t.session_id in home)]
+                summaries = [_task_summary_dict(kb, conn, t) for t in mine]
+                grouped = {
+                    "grouped": True,
+                    "this_session_count": len(mine),
+                    "other_sessions": [
+                        {
+                            "id": t.id,
+                            "status": t.status,
+                            "title": t.title,
+                            **({"unhomed": True} if getattr(t, "unhomed", False) else {}),
+                        }
+                        for t in others
+                    ],
+                    "other_sessions_note": (
+                        "not yours: comment, don't act (foreign_ok/--takeover "
+                        "REASON to act; all=true for the flat view)"
+                    ),
+                }
+            else:
+                summaries = [_task_summary_dict(kb, conn, t) for t in tasks]
             return json.dumps({
-                "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
+                "tasks": summaries,
+                **grouped,
                 "count": len(tasks),
                 "limit": limit,
                 "truncated": truncated,
@@ -1969,6 +2007,15 @@ KANBAN_LIST_SCHEMA = {
             "limit": {
                 "type": "integer",
                 "description": "Optional maximum rows to return (default 50, max 200).",
+            },
+            "all": {
+                "type": "boolean",
+                "description": (
+                    "Flat view. By default, when this session has a home, "
+                    "only its own cards are returned in full under `tasks` "
+                    "and other sessions' cards are collapsed under "
+                    "`other_sessions`."
+                ),
             },
             "board": _board_schema_prop(),
         },
