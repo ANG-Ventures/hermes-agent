@@ -2392,13 +2392,21 @@ def quote_sql_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
-def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+def _fts_structural_problem(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> str:
+    """Why the FTS table needs a structural rebuild, or ``""`` when it is sound.
+
+    Returns a short reason so the caller can LOG it: a structural rebuild of a
+    2.5 M-row index is a 13-minute write transaction (measured 2026-09-24,
+    fleet DB, twice in one hour) and until then it ran silently — the only
+    trace was a ``PHASE=context_engine_load_slow`` line minutes later.
+    """
     shadow_tables = get_fts_shadow_table_names(spec.table_name)
     existing_tables = get_existing_table_names(conn, [spec.table_name, *shadow_tables])
     if spec.table_name not in existing_tables:
-        return True
-    if any(name not in existing_tables for name in shadow_tables):
-        return True
+        return "fts table missing"
+    missing_shadows = [name for name in shadow_tables if name not in existing_tables]
+    if missing_shadows:
+        return "shadow table(s) missing: " + ", ".join(missing_shadows)
 
     try:
         info = conn.execute(
@@ -2408,18 +2416,40 @@ def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalConten
         sql = (info[0] if info else "") or ""
         normalized = sql.lower()
         if "virtual table" not in normalized or "using fts5" not in normalized:
-            return True
+            return f"not an fts5 virtual table: {sql[:120]!r}"
 
         columns = conn.execute(
             f"PRAGMA table_info({quote_sql_identifier(spec.table_name)})"
         ).fetchall()
         column_names = {row[1] for row in columns if len(row) > 1}
         if spec.indexed_column not in column_names:
-            return True
-    except sqlite3.DatabaseError:
-        return True
+            return (
+                f"indexed column {spec.indexed_column!r} not in table_info "
+                f"{sorted(column_names)!r}"
+            )
+    except sqlite3.DatabaseError as exc:
+        # NOTE: this also fires on a TRANSIENT error (SQLITE_BUSY on the
+        # schema read). Rebuilding on a transient error is a known hazard;
+        # the reason is logged by the caller so the next incident says so.
+        return f"schema probe raised {type(exc).__name__}: {exc}"
 
-    return False
+    return ""
+
+
+def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    return bool(_fts_structural_problem(conn, spec))
+
+
+def _fts_size_hint(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> int:
+    """O(1) size hint for log lines (max rowid, never COUNT(*))."""
+    try:
+        row = conn.execute(
+            f"SELECT MAX({quote_sql_identifier(spec.content_rowid)}) "
+            f"FROM {quote_sql_identifier(spec.content_table)}"
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
+    except sqlite3.DatabaseError:
+        return -1
 
 
 def _fts_count_parity_mismatch(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
@@ -2928,7 +2958,18 @@ def _fts_needs_rebuild(
     now: float | None = None,
     throttle: bool = False,
 ) -> bool:
-    if _fts_needs_rebuild_structural(conn, spec):
+    problem = _fts_structural_problem(conn, spec)
+    if problem:
+        logger.warning(
+            "LCM FTS '%s' needs a structural rebuild: %s (content rows ~%d, "
+            "startup_path=%s). A rebuild is ONE write transaction over every "
+            "row — minutes on a large DB — and it holds the engine-load lock "
+            "when it runs on the startup path.",
+            spec.table_name,
+            problem,
+            _fts_size_hint(conn, spec),
+            throttle,
+        )
         return True
     if not throttle:
         # Explicit repair (``/lcm doctor repair apply``): full synchronous
@@ -3238,6 +3279,7 @@ def _repair_external_content_fts_body(
                 _clear_integrity_failed(conn, spec)
                 conn.commit()
                 return {"rebuilt": False, "degraded": True, "triggers_recreated": False}
+        rebuild_started = time.monotonic()
         _drop_fts_table(conn, spec.table_name)
         conn.execute(
             f"""
@@ -3250,6 +3292,9 @@ def _repair_external_content_fts_body(
         )
         conn.execute(
             f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}) VALUES('rebuild')"
+        )
+        logger.warning(
+            "LCM FTS '%s' rebuilt in %.1fs", spec.table_name, time.monotonic() - rebuild_started
         )
         rebuilt = True
 
