@@ -17892,7 +17892,44 @@ def worker_cpu_priority_config(
     mode = str(raw or "").strip().lower()
     if mode == "normal":
         return ("normal", 0)
+    if mode == "idle":
+        return ("idle", WORKER_BACKGROUND_NICE)
     return ("background", WORKER_BACKGROUND_NICE)
+
+
+# macOS: nice(2) only reorders threads INSIDE one scheduling class. Darwin's
+# real levers are the task QoS clamp and the darwin-BG flag, which also set
+# the disk I/O tier. Both are inherited across fork/exec. The QoS clamp can
+# only be applied at spawn time (posix_spawnattr_set_qos_clamp_np) — there is
+# no setpriority() form — so it rides as an exec-form ``taskpolicy`` prefix:
+# taskpolicy execs the worker in place (same pid, same argv once running).
+#
+# Measured on the M3 Ultra, 2026-09-24 (16 spinners x 5s, 61% host idle):
+#   unclamped            15.9 cores   iotier 0 (IMPORTANT)
+#   -c utility            3.8 cores   iotier 1 (STANDARD), P+E cores
+#   -b (darwin BG)        0.1 cores   iotier 2, E-cores only
+# "background" = utility clamp: batch work sits strictly below an
+# Interactive gateway without collapsing worker throughput. "idle" = darwin
+# BG for hosts where the gateway must win at any cost to worker speed.
+WORKER_DARWIN_TASKPOLICY = "/usr/sbin/taskpolicy"
+_WORKER_DARWIN_POLICY_ARGS = {
+    "background": ("-c", "utility"),
+    "idle": ("-b",),
+}
+
+
+def worker_darwin_qos_prefix(mode: str) -> "list[str]":
+    """Return the exec-form ``taskpolicy`` argv prefix for *mode*, or ``[]``.
+
+    Empty off macOS, for ``normal``, and when ``taskpolicy`` is missing — a
+    missing wrapper must degrade to nice-only, never refuse the spawn.
+    """
+    args = _WORKER_DARWIN_POLICY_ARGS.get(mode)
+    if not args or sys.platform != "darwin":
+        return []
+    if not os.access(WORKER_DARWIN_TASKPOLICY, os.X_OK):
+        return []
+    return [WORKER_DARWIN_TASKPOLICY, *args]
 
 
 def _build_worker_priority_preexec(nice_value: int):
@@ -18771,16 +18808,22 @@ def _default_spawn(
     # the seam the 2026-09-20 load-538 incident escaped through.
     cpu_priority_mode, cpu_nice = worker_cpu_priority_config()
     priority_preexec = _build_worker_priority_preexec(cpu_nice)
+    # macOS: nice alone leaves the worker in the gateway's own QoS class and
+    # I/O tier, so worker pytest/git storms still starve the resident gateway
+    # (t_14c130aa). Clamp QoS via exec-form taskpolicy; it keeps the pid.
+    darwin_prefix = worker_darwin_qos_prefix(cpu_priority_mode)
+    spawn_cmd = [*darwin_prefix, *cmd]
     _log.info(
-        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s",
+        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s darwin_policy=%s",
         task.id,
         profile_arg,
         cpu_priority_mode,
         cpu_nice,
+        " ".join(darwin_prefix[1:]) or "-",
     )
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
+            spawn_cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,

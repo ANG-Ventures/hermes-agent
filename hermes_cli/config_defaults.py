@@ -3051,6 +3051,11 @@ DEFAULT_CONFIG = {
         # interactive responsiveness, not a throughput cap: an otherwise idle
         # machine still gives workers the whole CPU. Set "normal" to opt out
         # and leave workers at the dispatcher's inherited priority.
+        # On macOS "background" also clamps the worker tree to utility QoS
+        # (exec-form `taskpolicy -c utility`: lower CPU class AND disk I/O
+        # tier than an Interactive gateway); "idle" uses darwin background
+        # (`taskpolicy -b`: E-cores only, heavy I/O throttle — the gateway
+        # always wins, but worker throughput drops sharply under load).
         # (2026-09-20: a worker's runaway busy-loops drove the host to load
         # 538/32 cores and starved the resident gateway's event loop into two
         # watchdog hard-exits and a 12-minute boot.)
