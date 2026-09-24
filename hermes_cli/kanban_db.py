@@ -7809,7 +7809,8 @@ def reclaim_task(
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
     If the worker was signalled but survived, or if this host holds the
-    claim but its worker pid cannot be resolved, reclamation FAILS CLOSED.
+    claim without a worker pid and its claimer may still be alive,
+    reclamation FAILS CLOSED.
     The card retains its owner and emits a ``reclaim_refused`` event marked
     ``needs_attention``. A human must resolve the worker outside this path;
     an operator request alone does not prove the worker is gone.
@@ -13489,16 +13490,20 @@ def _terminate_reclaimed_worker(
     info["host_local"] = True
 
     if not pid or pid <= 0:
-        # OUR host holds this claim but no worker pid was ever stamped, so
-        # there is nothing to signal — and, critically, no evidence of death
-        # either. Flag that explicitly instead of returning a payload that
-        # looks identical to a clean "nothing to do".
-        #
-        # The pre-fix code returned here BEFORE setting host_local, so the
-        # event claimed the worker was some other host's problem. Measured on
-        # t_09180e10 (2026-09-22): `prev_pid: null, host_local: false` on a
-        # card whose lock was `mac-studio-m3u:71817` — our own host.
+        # The local claimer may still be launching the worker. Only an absent
+        # claimer proves a never-stamped worker cannot be launched later.
+        # An alive, inaccessible or malformed claimer remains unprovable.
         info["liveness_unprovable"] = True
+        try:
+            claimer_pid = int(str(claim_lock)[len(host_prefix):])
+            if claimer_pid > 0 and hasattr(os, "kill"):
+                os.kill(claimer_pid, 0)
+        except ProcessLookupError:
+            info["liveness_unprovable"] = False
+            info["terminated"] = True
+            info["claimer_pid_dead"] = claimer_pid
+        except (ValueError, OSError):
+            pass
         return info
 
     kill = signal_fn if signal_fn is not None else (
@@ -13543,10 +13548,10 @@ def _worker_survived_termination(termination: dict) -> bool:
     """True when a host-local worker has NOT been proven gone.
 
     A signalled-but-still-alive worker is positive liveness evidence. A
-    missing pid is UNKNOWN liveness — not death evidence. Neither may release
-    the claim, because that would let the dispatcher spawn a second worker
-    beside the first. A proven-dead worker (including ProcessLookupError on
-    SIGTERM) and non-local claims use the normal release path.
+    missing worker pid is UNKNOWN liveness unless the host-local claimer is
+    proven dead. Unknown liveness must not release a claim: it could spawn a
+    second worker beside the first. Proven-dead and non-local claims use the
+    normal release path.
     """
     if not termination.get("host_local") or termination.get("terminated"):
         return False
