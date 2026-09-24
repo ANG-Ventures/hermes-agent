@@ -17192,13 +17192,36 @@ def _dispatch_once_locked(
     from hermes_cli.kanban_provider_health import (
         available_profile_fallback, capped_provider, configured_min_eligible,
         configured_box_health, configured_pool_health_urls, configured_probes,
-        effective_provider, pool_key,
+        configured_pool_spawns_per_eligible, effective_provider, pool_budget_eligible,
+        pool_key,
     )
     health_probes = configured_probes()
     min_eligible = configured_min_eligible()
     pool_urls = configured_pool_health_urls()
     box_health = configured_box_health()
     health_cache: dict = {}
+    pool_spawns_per_eligible = configured_pool_spawns_per_eligible()
+    admitted_this_tick: dict[str, int] = {}
+    admitted_routes: dict[str, str | None] = {}
+
+    def pool_budget(provider):
+        pool = pool_key(provider)
+        if pool is None or pool_spawns_per_eligible == 0:
+            return None
+        eligible = pool_budget_eligible(provider, health_probes, health_cache, pool_urls)
+        if eligible is None:
+            return None  # Unknown probe: fail open.
+        admitted = admitted_this_tick.get(pool, 0)
+        if admitted < eligible * pool_spawns_per_eligible:
+            return None
+        return {"reason": "pool_budget", "provider": provider,
+                "pool": pool, "eligible": eligible, "admitted": admitted}
+
+    def charge_pool(task_id):
+        pool = admitted_routes.pop(task_id, None)
+        if pool is not None:
+            admitted_this_tick[pool] = admitted_this_tick.get(pool, 0) + 1
+
     circuits: dict[str, int] = {}
     try:
         rl_trip = _resolve_rate_limit_trip()
@@ -17235,11 +17258,15 @@ def _dispatch_once_locked(
                 task, health_probes, health_cache, min_eligible=min_eligible,
                 pool_urls=pool_urls, box_health=box_health,
             )
+            if payload is None:
+                payload = pool_budget(route_provider)
         if payload is None:
+            admitted_routes[task_id] = circuit_pool
             return False, None
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
             pool_urls=pool_urls, skip_pools=frozenset(circuits), box_health=box_health,
+            budget_available=lambda provider: pool_budget(provider) is None,
         )
         if fallback is not None and fallback_flagship_banned(task_id, fallback[0]):
             # The flagship gate covers the post-fallback route too: a capped
@@ -17254,6 +17281,7 @@ def _dispatch_once_locked(
             )
             fallback = None
         if fallback is not None:
+            admitted_routes[task_id] = pool_key(fallback[1])
             return False, (fallback, payload)
         result.respawn_guarded.append((task_id, payload["reason"]))
         if not dry_run:
@@ -17564,6 +17592,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            charge_pool(row["id"])
             spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
@@ -17683,6 +17712,7 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = route_source
+            charge_pool(claimed.id)
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
@@ -17768,6 +17798,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            charge_pool(row["id"])
             spawned += 1
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
@@ -17873,6 +17904,7 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = review_route_source
+            charge_pool(claimed.id)
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (

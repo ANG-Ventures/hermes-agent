@@ -3115,6 +3115,9 @@ DEFAULT_CONFIG = {
         # For configured provider_health_probes, prefer a healthy fallback
         # if fewer than this many pool seats can serve the selected model.
         "provider_health_min_eligible": 1,
+        # Per-tick pool admission budget: eligible relay subs * this value.
+        # Pinned apx/bpx lanes each spend one sub's budget. 0 = unlimited.
+        "pool_spawns_per_eligible": 2,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create
