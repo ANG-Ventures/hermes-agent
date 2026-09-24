@@ -460,11 +460,28 @@ def _terminate_reclaimed_worker(
         "terminated": False,
         "sigkill": False,
     }
-    if not pid or pid <= 0 or not claim_lock:
+    if not claim_lock:
         return info
     if not str(claim_lock).startswith(_kb._host_prefix()):
         return info
     info["host_local"] = True
+
+    if not pid or pid <= 0:
+        # The gateway may still be launching a worker before stamping its PID.
+        # Only a dead local claimer proves that this launch cannot finish.
+        info["liveness_unprovable"] = True
+        claimer_pid = 0
+        try:
+            claimer_pid = int(str(claim_lock)[len(_kb._host_prefix()):])
+            if claimer_pid > 0 and hasattr(os, "kill"):
+                os.kill(claimer_pid, 0)
+        except ProcessLookupError:
+            info["liveness_unprovable"] = False
+            info["terminated"] = True
+            info["claimer_pid_dead"] = claimer_pid
+        except (ValueError, OSError):
+            pass
+        return info
 
     kill = _kill_fn(signal_fn)
     if kill is None:
@@ -560,16 +577,17 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
 
 
 def _worker_survived_termination(termination: dict) -> bool:
-    """True when we tried to kill our own host-local worker and it is still alive.
+    """True when our worker survived or a local launch is still possible.
 
     Reclaiming then would release the claim and spawn a second worker while the
-    first still runs — the duplication loop. Only host-local workers we actually
-    signalled count; a non-local lock or no-op attempt (no ``os.kill``) must fall
-    through to the normal release path since we cannot manage that worker anyway.
+    first still runs — the duplication loop. A missing worker PID with a live
+    or unprovable claimer must also hold the claim. Non-local claims still use
+    the existing release policy.
     """
     return bool(
         termination.get("host_local")
-        and (termination.get("termination_attempted") or termination.get("signal_refused"))
+        and (termination.get("termination_attempted") or termination.get("signal_refused")
+             or termination.get("liveness_unprovable"))
         and not termination.get("terminated")
     )
 
