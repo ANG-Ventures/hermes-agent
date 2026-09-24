@@ -255,7 +255,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # a later /undo lands on as "your message (no text)". Drop it from
     # persistence; the resumed turn's assistant reply still persists. (2026-07-16)
     "_empty_resume_synthetic",
-    # kanban worker stop-guard: narrated exit without kanban_complete/block
+    # kanban worker stop-guard: the synthetic user nudge sent after a narrated
+    # exit without kanban_complete/block. Only the nudge carries this flag;
+    # the assistant candidate is real output and is persisted with
+    # finish_reason="kanban_terminal_required" (t_4eeb0202).
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
     # empty tool_calls array): the interim narration-only assistant turn
