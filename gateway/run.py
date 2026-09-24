@@ -7560,7 +7560,34 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            # Stop-during-pre-flight gate (2026-09-24 incident, Discord
+            # #claude-bridge): a /stop that lands while this turn is still
+            # in pre-flight (agent not yet built, slot holds the PENDING
+            # sentinel) bumps the run generation but has no agent to
+            # interrupt. Without this check the turn then enters
+            # run_conversation anyway, acquires the durable turn lease and
+            # runs to completion — 87 API calls over an hour — with every
+            # result discarded as stale, while the user's replacement turn
+            # waits the full lease budget and dies with "Another Hermes
+            # process kept this session busy too long". Refuse to start.
+            if not ctx._run_still_current():
+                logger.warning(
+                    "Refusing to start stale turn for %s — generation %s was "
+                    "invalidated during pre-flight (stopped); no lease acquired, "
+                    "no API calls",
+                    ctx.session_key or "?",
+                    ctx.run_generation,
+                )
+                result = {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 0,
+                    "interrupted": True,
+                    "completed": False,
+                    "stale_run_generation": True,
+                }
+            else:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
