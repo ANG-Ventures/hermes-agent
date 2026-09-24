@@ -15949,6 +15949,7 @@ def respawn_guard_stuck_tasks(
             out.append({
                 "task_id": task_id, "assignee": row["assignee"],
                 "reason": "prior_worker_still_alive",
+                "status": row["status"],
                 "guarded_since": rejected["first_at"],
                 "guarded_seconds": now - rejected["first_at"],
                 "guard_events": rejected["n"],

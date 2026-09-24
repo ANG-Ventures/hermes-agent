@@ -526,8 +526,10 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
         logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
         return False
     if item.get("reason") == "prior_worker_still_alive":
+        # Both the ready and review claim doors refuse; name the card's lane.
+        lane = str(item.get("status") or "ready").upper()
         detail = (
-            "READY card: prior_worker_still_alive claim rejected >15 min\n"
+            f"{lane} card: prior_worker_still_alive claim rejected >15 min\n"
             f"Prior PID: `{item.get('prev_pid')}` · Inspect: `{item['clear_verb']}`\n"
             "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
         )
@@ -2643,7 +2645,7 @@ class GatewayKanbanWatchersMixin:
                     if now - last_warn_at >= 300:
                         if guard_stuck:
                             logger.warning(
-                                "kanban dispatcher STUCK: %d READY card(s) continuously "
+                                "kanban dispatcher STUCK: %d card(s) continuously "
                                 "guarded. See per-card diagnostics in #alerts.",
                                 len(guard_stuck),
                             )

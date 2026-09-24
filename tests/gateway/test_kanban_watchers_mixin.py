@@ -283,6 +283,14 @@ def test_guard_stuck_sender_routes_to_alerts(tmp_path, monkeypatch):
     assert "97056" in pid_message
     assert "hermes kanban show t_pid" in pid_message
     assert "requeue alone cannot bypass" in pid_message
+    assert "READY card: prior_worker_still_alive" in pid_message  # no status -> ready door
+    assert _send_guard_stuck_alert("default", {
+        "task_id": "t_rev", "reason": "prior_worker_still_alive", "status": "review",
+        "prev_pid": 97057, "clear_verb": "hermes kanban show t_rev",
+    })
+    review_message = calls[-1][0][calls[-1][0].index("--send") + 1]
+    assert "REVIEW card: prior_worker_still_alive" in review_message
+    assert "READY" not in review_message
 
 
 def test_stall_respawn_guard_is_benign_not_bad():

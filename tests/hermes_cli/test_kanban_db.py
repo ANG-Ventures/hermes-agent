@@ -3949,6 +3949,7 @@ def test_prior_worker_claim_rejections_page_after_continuous_15_minutes(kanban_h
         stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
         assert [(x["task_id"], x["reason"]) for x in stuck] == [(tid, "prior_worker_still_alive")]
         assert stuck[0]["prev_pid"] == 42
+        assert stuck[0]["status"] == status  # drives the REVIEW/READY page wording
         assert stuck[0]["clear_verb"] == kb.render_operator_command("default", "show", tid)
         kb._append_event(conn, tid, "claimed", {"lock": "new"})
         assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
@@ -3966,6 +3967,20 @@ def test_prior_worker_page_requires_current_claim_door(kanban_home):
             "reason": "prior_worker_still_alive", "source_status": "review",
         })
         assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
+
+
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_active_pr_stuck_page_is_ready_lane_only(kanban_home, status):
+    """active_pr is a ready-door respawn guard; a review-lane card must not page it."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="guarded", assignee="alice")
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1860, tid))
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        stuck = [x for x in kb.respawn_guard_stuck_tasks(conn, now=now) if x["reason"] == "active_pr"]
+        assert [x["task_id"] for x in stuck] == ([tid] if status == "ready" else [])
 
 
 def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
