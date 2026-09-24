@@ -45,6 +45,7 @@ def _make_agent_stub(agent_cls):
     agent._COMBINED_REVIEW_PROMPT = "review both"
     agent.enabled_toolsets = ["memory", "skills"]
     agent.disabled_toolsets = []
+    agent.tools = []
     agent._chat_id = "c1"
     agent._chat_name = "chan"
     agent._chat_type = "channel"

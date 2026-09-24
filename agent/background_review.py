@@ -1272,6 +1272,16 @@ def build_cache_parity_fork(
     )
     review_agent._memory_write_origin = write_origin
     review_agent._memory_write_context = write_origin
+    if not _routed:
+        # The constructor skips external memory providers to keep the review
+        # isolated, so its freshly assembled tool list omits provider-injected
+        # schemas (e.g. mem0_*). Copy the parent's final request snapshot,
+        # not just its toolset config: tools[] precedes system/messages in the
+        # cached prefix. Dispatch remains restricted by the thread whitelist.
+        review_agent.tools = copy.deepcopy(agent.tools)
+        review_agent.valid_tool_names = {
+            tool["function"]["name"] for tool in review_agent.tools
+        }
     # The review fork pins the parent's cached system prompt and keeps
     # ``tools[]`` byte-identical to the parent so its outbound request
     # hits the same provider cache prefix (see the toolset-parity note
