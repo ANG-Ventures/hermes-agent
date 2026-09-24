@@ -4154,42 +4154,53 @@ def compress_context(
                         compressed = compress_fn(
                             engine_messages, current_tokens=approx_tokens
                         )
-                    for index, event in tool_events:
-                        # The input index is not an index into the shorter
-                        # output. Anchor to the first surviving successor so
-                        # a notice cannot split parallel tool results (or
-                        # drift after the turn that originally followed it).
-                        landing = None
-                        for successor_index in range(index + 1, len(messages)):
-                            successor = messages[successor_index]
-                            if is_metadata_only_tool_notice(successor):
-                                continue
-                            def same_row(candidate):
-                                if not isinstance(candidate, dict) or not isinstance(successor, dict):
-                                    return candidate is successor
-                                if candidate.get("role") != successor.get("role"):
-                                    return False
-                                if successor.get("tool_calls"):
-                                    return candidate.get("tool_calls") == successor["tool_calls"]
-                                if successor.get("role") == "tool":
-                                    return candidate.get("tool_call_id") == successor.get("tool_call_id")
-                                return (not candidate.get("tool_calls")
-                                        and candidate.get("content") == successor.get("content"))
+                    if tool_events:
+                        # Engines preserve a leading head and a trailing tail,
+                        # replacing the middle with a summary. Match only those
+                        # contiguous regions by position: a content-equal twin
+                        # in the head is not a survivor from the dropped middle.
+                        original = [(i, msg) for i, msg in enumerate(messages)
+                                    if not is_metadata_only_tool_notice(msg)]
 
-                            # Compression keeps a suffix, but may copy its rows.
-                            # Distinguish equal-text turns by their occurrence
-                            # counted from the end, not by the first equal row.
-                            rank = sum(same_row(row) for row in messages[successor_index:])
-                            matches = [pos for pos, row in enumerate(compressed) if same_row(row)]
-                            if len(matches) >= rank:
-                                landing = matches[-rank]
-                            if landing is not None:
-                                break
-                        if landing is None:
-                            # Nothing after the event survived: keep it at
-                            # the end of the transcript, not at its stale
-                            # pre-compaction offset.
-                            landing = len(compressed)
+                        def same_row(source, candidate):
+                            if not isinstance(source, dict) or not isinstance(candidate, dict):
+                                return source is candidate
+                            if source.get("role") != candidate.get("role"):
+                                return False
+                            if source.get("tool_calls"):
+                                return source["tool_calls"] == candidate.get("tool_calls")
+                            if source.get("role") == "tool":
+                                return source.get("tool_call_id") == candidate.get("tool_call_id")
+                            return (not candidate.get("tool_calls")
+                                    and source.get("content") == candidate.get("content"))
+
+                        surviving = {}
+                        head = 0
+                        while (head < min(len(original), len(compressed))
+                               and same_row(original[head][1], compressed[head])):
+                            surviving[original[head][0]] = head
+                            head += 1
+                        tail = 0
+                        while (tail < min(len(original) - head, len(compressed) - head)
+                               and same_row(original[-tail - 1][1], compressed[-tail - 1])):
+                            surviving[original[-tail - 1][0]] = len(compressed) - tail - 1
+                            tail += 1
+                        boundary = max(head, len(compressed) - tail)
+
+                    placements = []
+                    for index, event in tool_events:
+                        successor = next((surviving[i] for i in range(index + 1, len(messages))
+                                          if i in surviving), None)
+                        predecessor = next((surviving[i] for i in range(index - 1, -1, -1)
+                                            if i in surviving), None)
+                        if successor is not None:
+                            landing = successor
+                        elif predecessor is not None:
+                            landing = predecessor + 1
+                        else:
+                            # Neither original neighbour survived: keep the
+                            # event at the summary/tail boundary, not in head.
+                            landing = boundary
                         if landing < len(compressed) and compressed[landing].get("role") == "tool":
                             # A replaced assistant can leave tool results as
                             # the first surviving successors. Keep their run
@@ -4198,6 +4209,10 @@ def compress_context(
                                 landing -= 1
                             if landing > 0 and compressed[landing - 1].get("role") == "assistant" and compressed[landing - 1].get("tool_calls"):
                                 landing -= 1
+                        placements.append((landing, event))
+                    # Compute all anchors against the same engine output;
+                    # reverse insertion preserves input order at shared boundaries.
+                    for landing, event in reversed(placements):
                         compressed.insert(landing, event)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate

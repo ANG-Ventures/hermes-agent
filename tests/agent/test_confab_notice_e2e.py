@@ -441,6 +441,102 @@ class TestConfabNoticeEndToEnd:
             if positions:
                 assert positions[-1] < event_idx, "event moved before its original predecessor"
 
+    @pytest.mark.parametrize("engine", ["builtin", "lcm"])
+    @pytest.mark.parametrize("event_position", [1, 3, 7, 19])
+    def test_compaction_event_stays_between_original_neighbours_with_head_twins(
+        self, notice_env, stream, engine, event_position, tmp_path
+    ):
+        make_agent, handler, db, sid, _ = notice_env
+        handler.response_queue[:] = [
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
+        ]
+        make_agent(stream=stream).run_conversation("first", conversation_history=[], task_id="writer")
+        event = next(m for m in db.get_messages_as_conversation(sid)
+                     if is_metadata_only_tool_notice(m))
+        big = " ".join(f"w{j}" for j in range(700))
+        history: list[dict] = [{"role": "user", "content": "start"},
+                               {"role": "assistant", "content": "Done."}]
+        for i in range(8):
+            call_id = f"call_headtwin_{i}"
+            history.extend([
+                {"role": "user", "content": f"u{i} {big}"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": call_id, "type": "function",
+                     "function": {"name": "read_file", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": call_id, "content": f"result {call_id} {big}"},
+                {"role": "assistant", "content": "Done."},
+            ])
+
+        def run(arm):
+            rows = json.loads(json.dumps(history))
+            if arm == "event":
+                rows.insert(event_position, dict(event))
+            agent = make_agent(stream=stream)
+            agent.session_id = f"headtwin-{engine}-{event_position}-{arm}"
+            agent.compression_enabled = True
+            if engine == "lcm":
+                from plugins.context_engine.lcm.config import LCMConfig
+                from plugins.context_engine.lcm.engine import LCMEngine
+                cc = LCMEngine(config=LCMConfig(
+                    database_path=str(tmp_path / f"{arm}.db"), fresh_tail_count=8,
+                    leaf_chunk_tokens=1, context_threshold=0.01), hermes_home=str(tmp_path))
+                cc.update_model("test-model", 200_000, provider="unit-test")
+                cc.on_session_start(agent.session_id, hermes_home=str(tmp_path), model="test-model",
+                                    provider="unit-test", context_length=200_000, platform="pytest")
+                agent.context_compressor = cc
+            else:
+                agent.context_compressor.threshold_tokens = 8000
+                agent.context_compressor._generate_summary = lambda *a, **kw: "compacted summary"
+            response = MagicMock()
+            response.choices = [MagicMock()]
+            response.choices[0].message.content = "compacted summary"
+            response.usage = None
+            handler.captured_requests = []
+            handler.response_queue[:] = [("Done.", None)]
+            with patch("agent.auxiliary_client.call_llm", return_value=response):
+                agent.run_conversation("next question", conversation_history=rows, task_id="compact")
+            assert agent.context_compressor.compression_count > 0
+            wire1 = _chat_requests(handler)[-1]["messages"]
+            stored = db.get_messages_as_conversation(agent.session_id)
+            handler.captured_requests = []
+            handler.response_queue[:] = [("Second.", None)]
+            resumed = make_agent(stream=stream)
+            resumed.session_id = agent.session_id
+            resumed.compression_enabled = False
+            resumed.run_conversation("follow up", conversation_history=stored, task_id="resume")
+            return wire1, _chat_requests(handler)[-1]["messages"], stored
+
+        control1, control2, control_rows = run("control")
+        event1, event2, event_rows = run("event")
+        def projection(rows):
+            return [(m.get("role"), m.get("content"), m.get("tool_calls"), m.get("tool_call_id"))
+                    for m in rows if not is_metadata_only_tool_notice(m)]
+        assert projection(event1) == projection(control1)
+        assert projection(event2) == projection(control2)
+        assert projection(event_rows) == projection(control_rows)
+        event_indices = [i for i, m in enumerate(event_rows) if is_metadata_only_tool_notice(m)]
+        assert len(event_indices) == 1
+        index = event_indices[0]
+        summary = next(i for i, m in enumerate(event_rows)
+                       if "compacted summary" in str(m.get("content")))
+        if event_position == 1:
+            if any(m.get("content") == "start" for m in control_rows):
+                assert index == 1, "head event moved behind its original successor"
+                assert event_rows[index - 1]["content"] == "start"
+                assert event_rows[index + 1]["content"] == "Done."
+            else:
+                assert index > summary, "event with no surviving head neighbour entered the head"
+        elif event_position in (3, 7):
+            assert index > summary, "dropped-middle event moved into the protected head"
+        else:
+            predecessor = history[event_position - 1]["content"]
+            successor = history[event_position]["content"]
+            if any(m.get("content") == predecessor for m in control_rows):
+                assert event_rows[index - 1]["content"] == predecessor
+                assert event_rows[index + 1]["content"] == successor
+            else:
+                assert index > summary, "event from the dropped middle entered protected head"
+
     def test_contentful_tagged_system_is_not_stripped_before_compression(self, notice_env, stream):
         make_agent, handler, db, sid, _ = notice_env
         tagged = {"role": "system", "content": "CONTENTFUL-COMPRESS-ANCHOR",
