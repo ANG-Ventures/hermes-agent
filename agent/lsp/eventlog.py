@@ -55,6 +55,7 @@ _announced_active: set = set()        # keys: (server_id, workspace_root)
 _announced_unavailable: set = set()   # keys: (server_id, binary_path_or_name)
 _announced_no_root: set = set()       # keys: (server_id, file_path)
 _announced_no_server: set = set()     # keys: (server_id,)
+_announced_host_cap: set = set()      # keys: (server_id,)
 
 
 def _short_path(file_path: str) -> str:
@@ -188,6 +189,16 @@ def log_spawn_failed(server_id: str, workspace_root: str, exc: BaseException) ->
     )
 
 
+def log_host_cap_reached(server_id: str, cap: int) -> None:
+    """This process wanted a server but the host already runs ``lsp.max_servers_per_host`` of them.
+    INFO once per server_id per process (the "one line" an operator greps for), DEBUG thereafter."""
+    if _announce_once(_announced_host_cap, (server_id,)):
+        _emit(server_id, logging.INFO,
+              f"host at lsp.max_servers_per_host={cap}; running without LSP (shell linter only) until a slot frees")
+    else:
+        _emit(server_id, logging.DEBUG, "host LSP cap still reached")
+
+
 def log_reaped(keys: List[Tuple[str, str]], idle_timeout: float) -> None:
     """Idle clients were shut down by the reaper.  INFO — one line per
     sweep so users can correlate memory drops with LSP activity.
@@ -214,6 +225,7 @@ def reset_announce_caches() -> None:
         _announced_unavailable.clear()
         _announced_no_root.clear()
         _announced_no_server.clear()
+        _announced_host_cap.clear()
 
 
 __all__ = [
@@ -229,5 +241,6 @@ __all__ = [
     "log_server_error",
     "log_spawn_failed",
     "log_reaped",
+    "log_host_cap_reached",
     "reset_announce_caches",
 ]
