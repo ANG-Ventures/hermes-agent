@@ -960,6 +960,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_workspace = sub.add_parser(
+        "workspace",
+        help="Workspace maintenance (recover scratch cards stranded by mount loss)",
+    )
+    _ws_sub = p_workspace.add_subparsers(dest="workspace_action")
+    _ws_reset = _ws_sub.add_parser(
+        "reset",
+        help="Clear a stranded scratch card's dead workspace_path so the "
+             "dispatcher recreates <root>/<board>/<id>",
+    )
+    _ws_reset.add_argument("task_ids", nargs="*")
+    _ws_reset.add_argument(
+        "--all-stranded", action="store_true",
+        help="Reset every scratch card whose persisted path is gone",
+    )
+    _ws_reset.add_argument("--dry-run", action="store_true")
+    _ws_reset.add_argument("--reason", default=None, help="Recorded on the workspace_reset event")
+
     p_requeue = sub.add_parser("requeue", help="Explicitly retry a READY card held by the respawn guard")
     p_requeue.add_argument("task_id")
     p_requeue.add_argument("reason", nargs="+", help="Required operator reason")
@@ -1586,6 +1604,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "requeue":  _cmd_requeue,
+            "workspace": _cmd_workspace,
             "reopen":   _cmd_reopen,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
@@ -1743,6 +1762,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule",
     "unblock",
     "requeue",
+    "workspace",
     "reopen",
     "promote",
     "triage-resolve",
@@ -4087,6 +4107,40 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_workspace(args: argparse.Namespace) -> int:
+    if getattr(args, "workspace_action", None) != "reset":
+        print("usage: kanban workspace reset (<task_id>... | --all-stranded) [--dry-run]",
+              file=sys.stderr)
+        return 2
+    ids = list(args.task_ids or [])
+    if bool(ids) == bool(args.all_stranded):
+        print("kanban workspace reset: give task id(s) or --all-stranded (not both)",
+              file=sys.stderr)
+        return 2
+    actor = _profile_author()
+    verb = "Would reset" if args.dry_run else "Reset"
+    refused = 0
+    with kb.connect_closing() as conn:
+        if args.all_stranded:
+            ids = kb.stranded_workspace_candidates(conn)
+            if not ids:
+                print("No stranded scratch workspaces.")
+                return 0
+        for task_id in ids:
+            task = kb.get_task(conn, task_id)
+            previous = task.workspace_path if task else None
+            ok, err = kb.reset_stranded_workspace(
+                conn, task_id, actor=actor, reason=args.reason, dry_run=args.dry_run,
+            )
+            if ok:
+                print(f"{verb} {task_id} (was {previous})")
+            else:
+                refused += 1
+                print(f"cannot reset {task_id}: {err}", file=sys.stderr)
+    # --all-stranded is best-effort over candidates; explicit ids must all land.
+    return 1 if refused and not args.all_stranded else 0
 
 
 def _cmd_requeue(args: argparse.Namespace) -> int:

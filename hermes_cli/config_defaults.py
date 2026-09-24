@@ -2991,6 +2991,12 @@ DEFAULT_CONFIG = {
     "kanban": {
         "workspaces_root": None,
         "workspaces_root_require_mount": False,
+        # Let the dispatcher itself clear a scratch card stranded by mount
+        # loss (persisted path gone, root mounted + writable again) when the
+        # lost tree provably held nothing: no worker ever spawned into it, or
+        # a survivor pointer records its work on a remote. Off by default;
+        # the manual verb is ``hermes kanban workspace reset --all-stranded``.
+        "workspaces_auto_unstrand": False,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The

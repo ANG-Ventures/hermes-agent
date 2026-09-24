@@ -384,3 +384,294 @@ def test_unwritable_mount_refuses_before_claim(home, monkeypatch):
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == 'ready'
+
+
+
+# ---------------------------------------------------------------------------
+# Recovery verb for stranded scratch cards (t_a0839b2e).
+#
+# 2026-09-24: a ramscratch force-recreate left 12 READY scratch cards refused
+# every tick with stranded_by_mount_loss and NO verb to clear the dead
+# persisted path. ``workspace reset`` is that verb; the dispatcher names it.
+# ---------------------------------------------------------------------------
+
+import shutil
+
+from hermes_cli import kanban as kc
+from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND
+
+
+def _mounted_root(home, monkeypatch):
+    root = home / 'volume' / 'kanban-workspaces'
+    root.mkdir(parents=True)
+    configure(home, root)
+    monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
+    return root
+
+
+def _stranded_card(conn, root, *, kind='scratch', title='stranded'):
+    """A card whose persisted workspace lived on a volume that was recreated."""
+    task_id = kb.create_task(conn, title=title, assignee='default')
+    path = kb.resolve_workspace(
+        SimpleNamespace(id=task_id, workspace_kind='scratch', workspace_path=None),
+        board='default',
+    )
+    kb.set_workspace_path(conn, task_id, path)
+    if kind != 'scratch':
+        conn.execute('UPDATE tasks SET workspace_kind=? WHERE id=?', (kind, task_id))
+    return task_id, path
+
+
+def _lose_mount(root):
+    # The live incident: the volume is force-recreated, so the root comes
+    # back mounted + writable but every per-card directory under it is gone.
+    shutil.rmtree(root)
+    root.mkdir(parents=True)
+
+
+def test_mount_loss_e2e_reset_lets_dispatcher_recreate(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _stranded_card(conn, root)
+        conn.execute(
+            "UPDATE task_workspace_survivors SET bases=? WHERE task_id=?",
+            ('{"old-clone": "deadbeef"}', task_id),
+        )
+        _lose_mount(root)
+        calls = []
+        spawn = lambda task, *_a, **_k: calls.append(task.id)  # noqa: E731
+
+        stuck = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert task_id in stuck.stranded_by_mount_loss
+        assert not calls and not path.exists()
+
+        out = kc.run_slash(f'workspace reset {task_id}')
+        assert 'reset' in out.lower() and task_id in out, out
+        task = kb.get_task(conn, task_id)
+        assert task.workspace_path is None
+        assert task.status == 'ready'
+        # The stale baseline named repos in the DESTROYED tree; it must not
+        # survive, or record_baseline (record-once) never re-baselines.
+        assert conn.execute(
+            'SELECT bases FROM task_workspace_survivors WHERE task_id=?', (task_id,),
+        ).fetchone() is None
+        kinds = [r[0] for r in conn.execute(
+            'SELECT kind FROM task_events WHERE task_id=? ORDER BY id', (task_id,))]
+        assert 'workspace_reset' in kinds
+
+        healed = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert task_id not in healed.stranded_by_mount_loss
+        assert task_id in calls
+        assert path.is_dir()
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
+
+
+@pytest.mark.parametrize('kind', ['worktree', 'dir'])
+def test_reset_refuses_non_scratch(home, monkeypatch, kind):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _stranded_card(conn, root, kind=kind)
+        _lose_mount(root)
+        ok, err = kb.reset_stranded_workspace(conn, task_id, actor='op')
+        assert not ok and kind in err
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
+
+
+def test_reset_refuses_when_path_still_exists(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _stranded_card(conn, root)
+        ok, err = kb.reset_stranded_workspace(conn, task_id, actor='op')
+        assert not ok and 'exists' in err
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
+
+
+def test_reset_refuses_while_root_is_unmounted(home, monkeypatch):
+    # Path missing because the MOUNT is gone: it may come back on remount, so
+    # forgetting it would orphan real work. Refuse and name the real problem.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _stranded_card(conn, root)
+        shutil.rmtree(root)
+        monkeypatch.setattr('os.path.ismount', lambda p: False)
+        ok, err = kb.reset_stranded_workspace(conn, task_id, actor='op')
+        assert not ok and 'workspaces_root_unmounted' in err
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
+
+
+def test_reset_refuses_running_card(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _stranded_card(conn, root)
+        _lose_mount(root)
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        ok, err = kb.reset_stranded_workspace(conn, task_id, actor='op')
+        assert not ok and 'running' in err
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
+
+
+def test_reset_keeps_recorded_survivor_evidence(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, _path = _stranded_card(conn, root)
+        conn.execute(
+            "UPDATE task_workspace_survivors SET bases=?, survivor=? WHERE task_id=?",
+            ('{"repo": "abc"}', '{"kind": "pr", "ref": "o/r#1"}', task_id),
+        )
+        _lose_mount(root)
+        ok, err = kb.reset_stranded_workspace(conn, task_id, actor='op')
+        assert ok, err
+        row = conn.execute(
+            'SELECT bases, survivor FROM task_workspace_survivors WHERE task_id=?',
+            (task_id,),
+        ).fetchone()
+        assert row['bases'] == '{}'
+        assert row['survivor'] == '{"kind": "pr", "ref": "o/r#1"}'
+
+
+def test_reset_all_stranded_touches_only_eligible_cards(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        lost_a, _ = _stranded_card(conn, root, title='a')
+        lost_b, _ = _stranded_card(conn, root, title='b')
+        wt, wt_path = _stranded_card(conn, root, kind='worktree', title='wt')
+        _lose_mount(root)
+        alive = kb.create_task(conn, title='alive', assignee='default')
+        alive_path = kb.resolve_workspace(
+            SimpleNamespace(id=alive, workspace_kind='scratch', workspace_path=None),
+            board='default',
+        )
+        kb.set_workspace_path(conn, alive, alive_path)
+
+        dry = kc.run_slash('workspace reset --all-stranded --dry-run')
+        assert lost_a in dry and lost_b in dry
+        assert kb.get_task(conn, lost_a).workspace_path is not None
+
+        out = kc.run_slash('workspace reset --all-stranded')
+        assert lost_a in out and lost_b in out
+        assert kb.get_task(conn, lost_a).workspace_path is None
+        assert kb.get_task(conn, lost_b).workspace_path is None
+        assert kb.get_task(conn, wt).workspace_path == str(wt_path)
+        assert kb.get_task(conn, alive).workspace_path == str(alive_path)
+
+
+def test_reset_cli_needs_exactly_one_target(home):
+    out = kc.run_slash('workspace reset')
+    assert '--all-stranded' in out
+
+
+def test_stranded_refusal_names_the_recovery_command(home, monkeypatch, caplog):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, _ = _stranded_card(conn, root)
+        _lose_mount(root)
+        with caplog.at_level('WARNING'):
+            kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        assert any(
+            'stranded_by_mount_loss' in r.getMessage()
+            and STRANDED_RECOVERY_COMMAND in r.getMessage()
+            for r in caplog.records
+        )
+        payload = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='stranded_by_mount_loss'", (task_id,),
+        ).fetchone()[0]
+        assert STRANDED_RECOVERY_COMMAND in payload
+
+
+def test_restranding_after_reset_is_recorded_again(home, monkeypatch):
+    # Reset recreates the SAME <root>/<board>/<id> path, so a second loss has a
+    # byte-identical reason. The dedupe must not hide it behind the old event.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _stranded_card(conn, root)
+        _lose_mount(root)
+        kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        assert kb.reset_stranded_workspace(conn, task_id, actor='op')[0]
+        kb.set_workspace_path(conn, task_id, kb.resolve_workspace(
+            kb.get_task(conn, task_id), board='default'))
+        _lose_mount(root)
+        kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        assert conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id=? "
+            "AND kind='stranded_by_mount_loss'", (task_id,),
+        ).fetchone()[0] == 2
+
+
+def _auto_unstrand(home, root, enabled):
+    import yaml as _yaml
+    cfg = _yaml.safe_load((home / 'config.yaml').read_text())
+    cfg['kanban']['workspaces_auto_unstrand'] = enabled
+    (home / 'config.yaml').write_text(_yaml.safe_dump(cfg))
+
+
+def test_auto_unstrand_is_off_by_default(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, _ = _stranded_card(conn, root)
+        _lose_mount(root)
+        for _ in range(2):
+            result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+            assert task_id in result.stranded_by_mount_loss
+        assert kb.get_task(conn, task_id).workspace_path is not None
+
+
+def test_auto_unstrand_heals_card_with_nothing_to_lose(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    _auto_unstrand(home, root, True)
+    with kb.connect_closing() as conn:
+        task_id, path = _stranded_card(conn, root)
+        _lose_mount(root)
+        calls = []
+        spawn = lambda task, *_a, **_k: calls.append(task.id)  # noqa: E731
+        first = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert task_id not in first.stranded_by_mount_loss
+        assert task_id not in [t for t, _ in first.workspace_refused]
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='workspace_reset'",
+            (task_id,),
+        ).fetchone()
+        assert ev is not None and 'auto' in ev[0]
+        kb.dispatch_once(conn, spawn_fn=spawn)
+        assert task_id in calls and path.is_dir()
+
+
+def test_auto_unstrand_keeps_card_whose_worker_ran_without_remote_evidence(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    _auto_unstrand(home, root, True)
+    with kb.connect_closing() as conn:
+        task_id, path = _stranded_card(conn, root)
+        # A worker ran in the lost tree and no survivor pointer proves its work
+        # reached a remote: auto-reset could discard unrecoverable work.
+        kb._append_event(conn, task_id, 'spawned', {'pid': 4242})
+        _lose_mount(root)
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        assert task_id in result.stranded_by_mount_loss
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
+
+
+def test_auto_unstrand_heals_card_with_recorded_remote_survivor(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    _auto_unstrand(home, root, True)
+    with kb.connect_closing() as conn:
+        task_id, _ = _stranded_card(conn, root)
+        kb._append_event(conn, task_id, 'spawned', {'pid': 4242})
+        conn.execute(
+            "UPDATE task_workspace_survivors SET survivor=? WHERE task_id=?",
+            ('{"kind": "pr", "ref": "o/r#1"}', task_id),
+        )
+        _lose_mount(root)
+        calls = []
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id),
+        )
+        assert task_id not in result.stranded_by_mount_loss
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='workspace_reset'",
+            (task_id,),
+        ).fetchone()
+        assert ev is not None and 'survivor_recorded' in ev[0]
+        # The startup scan heals it; the ready loop in the SAME tick recreates
+        # the empty scratch dir and spawns.
+        assert task_id in calls
+        assert Path(kb.get_task(conn, task_id).workspace_path).is_dir()

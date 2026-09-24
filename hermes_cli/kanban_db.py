@@ -12630,8 +12630,19 @@ def _validate_workspace_admission(
     return None
 
 
+def _stranded_event_payload(reason: str) -> dict:
+    from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND
+
+    payload = {"reason": reason}
+    if reason.startswith("stranded_by_mount_loss:"):
+        payload["recovery"] = STRANDED_RECOVERY_COMMAND
+    return payload
+
+
 def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
-    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    from hermes_cli.kanban_workspace_policy import (
+        STRANDED_RECOVERY_COMMAND, WorkspaceUnavailable, auto_unstrand_enabled,
+    )
 
     task = get_task(conn, task_id)
     if task is None:
@@ -12640,6 +12651,27 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
         _validate_workspace_admission(task, board=board, conn=conn, dry_run=dry_run)
     except WorkspaceUnavailable as exc:
         reason = str(exc)
+        if (
+            not dry_run
+            and reason.startswith("stranded_by_mount_loss:")
+            and task.status in ("ready", "review")
+            and auto_unstrand_enabled()
+        ):
+            evidence = _unstrand_evidence(conn, task_id)
+            if evidence is not None:
+                ok, _err = reset_stranded_workspace(
+                    conn, task_id, actor="dispatcher",
+                    reason=f"auto_unstrand: {evidence}", board=board,
+                )
+                if ok:
+                    # Healed. From the startup scan, the ready loop in the same
+                    # tick re-reads the card and recreates <root>/<board>/<id>;
+                    # from the ready loop itself, the card spawns next tick.
+                    _log.warning(
+                        "kanban dispatch: auto-unstranded task=%s (%s)",
+                        task_id, evidence,
+                    )
+                    return True
         # Only a spawnable lane refusal is a dispatcher fault. Startup
         # reconciliation also scans todo/running tasks so their lost path is
         # durable and visible, but must not make unrelated ready work look stuck.
@@ -12654,19 +12686,174 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
         if stranded and task_id not in result.stranded_by_mount_loss:
             result.stranded_by_mount_loss.append(task_id)
         event_kind = "stranded_by_mount_loss" if stranded else "workspace_refused"
-        _log.warning("kanban dispatch: %s task=%s", reason, task_id)
+        if reason.startswith("stranded_by_mount_loss:"):
+            _log.warning(
+                "kanban dispatch: %s task=%s (recover: %s)",
+                reason, task_id, STRANDED_RECOVERY_COMMAND,
+            )
+        else:
+            _log.warning("kanban dispatch: %s task=%s", reason, task_id)
         if not dry_run:
             with write_txn(conn):
+                # A ``workspace_reset`` ends the previous stranding episode:
+                # the recreated path is byte-identical, so a second loss must
+                # not be deduped against the first one's event.
                 previous = conn.execute(
-                    "SELECT payload FROM task_events WHERE task_id=? "
-                    "AND kind=? ORDER BY id DESC LIMIT 1",
+                    "SELECT kind, payload FROM task_events WHERE task_id=? "
+                    "AND kind IN (?, 'workspace_reset') ORDER BY id DESC LIMIT 1",
                     (task_id, event_kind),
                 ).fetchone()
-                payload = {"reason": reason}
-                if previous is None or json.loads(previous[0]) != payload:
+                payload = _stranded_event_payload(reason)
+                if (
+                    previous is None
+                    or previous[0] != event_kind
+                    or json.loads(previous[1]) != payload
+                ):
                     _append_event(conn, task_id, event_kind, payload)
         return True
     return False
+
+
+# Statuses whose card may have its dead scratch path cleared. ``running`` has a
+# live claim (reclaim first); ``done``/``archived`` never dispatch again.
+_WORKSPACE_RESET_STATUSES = frozenset(
+    {"triage", "todo", "scheduled", "ready", "blocked", "review"}
+)
+
+
+def _unstrand_evidence(conn, task_id: str) -> Optional[str]:
+    """Why the lost scratch tree cannot have held unrecoverable work, or None.
+
+    Scratch cards carry no branch column, so "the work is on a remote (rule 0)"
+    is only provable from the board itself: either no worker ever spawned into
+    the tree, or a recorded survivor pointer names where its work landed.
+    """
+    spawned = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='spawned' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if spawned is None:
+        return "never_spawned"
+    survivor = conn.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if survivor is not None and survivor[0]:
+        return "survivor_recorded"
+    return None
+
+
+def stranded_workspace_candidates(conn: sqlite3.Connection) -> list[str]:
+    """Scratch cards in a resettable status whose persisted path is gone."""
+    rows = conn.execute(
+        "SELECT id, workspace_path, status FROM tasks "
+        "WHERE workspace_path IS NOT NULL AND workspace_path != '' "
+        "AND COALESCE(workspace_kind, 'scratch') = 'scratch' ORDER BY id"
+    ).fetchall()
+    return [
+        row["id"] for row in rows
+        if row["status"] in _WORKSPACE_RESET_STATUSES
+        and not os.path.lexists(Path(row["workspace_path"]).expanduser())
+    ]
+
+
+def reset_stranded_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: Optional[str] = None,
+    board: Optional[str] = None,
+    dry_run: bool = False,
+) -> tuple[bool, Optional[str]]:
+    """Clear a stranded scratch card's dead ``workspace_path``.
+
+    The recovery half of mount-loss admission: ``validate_persisted`` refuses a
+    vanished path forever (fail-closed, correct), so without this verb a
+    stranded card needs hand-written SQL. Only the exact stranded state is
+    reset: scratch kind, resettable status, path absent (``lexists``), and the
+    dispatcher's own admission refusing with ``stranded_by_mount_loss`` — which
+    it only reaches after the root passed ``validate_mount``, i.e. the volume
+    is mounted and writable again, so the old path is not coming back. With
+    the root still unmounted the path may reappear on remount, so we refuse.
+
+    The survivor baseline is cleared too: ``record_baseline`` is record-once
+    and the old ``bases`` describe repos in the destroyed tree. A recorded
+    survivor pointer / hold is evidence and is kept (``bases`` reset only).
+
+    Returns ``(True, None)`` on success, ``(False, reason)`` if refused.
+    """
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+
+    task = get_task(conn, task_id)
+    if task is None:
+        return False, f"task {task_id} not found"
+    kind = task.workspace_kind or "scratch"
+    if kind != "scratch":
+        return False, (
+            f"task {task_id} is {kind}-kind; reset only applies to scratch "
+            f"workspaces (a {kind} path is operator-owned; restore it or edit the card)"
+        )
+    if not task.workspace_path:
+        return False, f"task {task_id} has no persisted workspace_path; nothing to reset"
+    if task.status not in _WORKSPACE_RESET_STATUSES:
+        hint = " (reclaim it first)" if task.status == "running" else ""
+        return False, f"task {task_id} is {task.status!r}; cannot reset its workspace{hint}"
+    path = Path(task.workspace_path).expanduser()
+    if os.path.lexists(path):
+        return False, f"task {task_id} workspace {path} still exists; nothing is stranded"
+    try:
+        _validate_workspace_admission(task, board=board, conn=conn, dry_run=True)
+    except WorkspaceUnavailable as exc:
+        refusal = str(exc)
+        if not refusal.startswith("stranded_by_mount_loss:"):
+            return False, (
+                f"task {task_id} is refused as {refusal}; fix the workspace root "
+                "first (a remount may bring the path back)"
+            )
+    else:
+        return False, (
+            f"task {task_id} is not stranded: its path is outside every guarded "
+            "root, so the dispatcher recreates it itself"
+        )
+    if dry_run:
+        return True, None
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET workspace_path = NULL WHERE id = ? "
+            "AND workspace_path = ? AND status = ?",
+            (task_id, task.workspace_path, task.status),
+        )
+        if not cur.rowcount:
+            return False, f"task {task_id} changed during reset; retry"
+        survivor = conn.execute(
+            "SELECT held_reason, survivor FROM task_workspace_survivors WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if survivor is None:
+            baseline = "none"
+        elif survivor[0] is None and survivor[1] is None:
+            conn.execute("DELETE FROM task_workspace_survivors WHERE task_id=?", (task_id,))
+            baseline = "cleared"
+        else:
+            conn.execute(
+                "UPDATE task_workspace_survivors SET bases='{}' WHERE task_id=?",
+                (task_id,),
+            )
+            baseline = "bases_reset_survivor_kept"
+        _append_event(conn, task_id, "workspace_reset", {
+            "actor": actor,
+            "reason": reason or "stranded_by_mount_loss",
+            "previous_path": task.workspace_path,
+            "survivor_baseline": baseline,
+        })
+    add_comment(
+        conn, task_id, actor,
+        f"Workspace reset: {task.workspace_path} was lost with its volume "
+        "(stranded_by_mount_loss). The dispatcher recreates an EMPTY scratch "
+        "workspace on the next tick; resume from your remote branch/PR.",
+    )
+    return True, None
 
 
 def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
@@ -12700,7 +12887,7 @@ def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
         _append_event(
             conn, task_id,
             "stranded_by_mount_loss" if stranded else "workspace_refused",
-            {"reason": reason}, run_id=closed_run_id,
+            _stranded_event_payload(reason), run_id=closed_run_id,
         )
 
 
