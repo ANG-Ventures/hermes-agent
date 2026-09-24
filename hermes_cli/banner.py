@@ -290,7 +290,7 @@ def _local_head_sha() -> Optional[str]:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             cwd=str(repo_dir),
         )
         if result.returncode == 0:

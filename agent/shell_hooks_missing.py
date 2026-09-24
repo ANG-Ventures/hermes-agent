@@ -247,7 +247,7 @@ def page_missing_hook(path: str, outcome: str = "files missing") -> bool:
         proc = subprocess.run(
             [str(notify), "--severity", "high", "--source", "shell-hooks",
              "--body", f"shell hook {path}: {outcome} (infrastructure failure, not a policy verdict)"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.error("missing shell hook %s: page delivery failed: %s", path, exc)

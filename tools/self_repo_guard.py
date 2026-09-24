@@ -570,7 +570,7 @@ def _read_git_alias(executable: str, target: Path, alias: str) -> str | None:
         result = subprocess.run(
             [executable, "-C", str(target), "config", "--get", f"alias.{alias}"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=1,
             check=False,
         )

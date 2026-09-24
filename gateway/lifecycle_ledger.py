@@ -303,7 +303,7 @@ def _run_log_command(argv: list, timeout: float) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         timeout=timeout,
-        text=True,
+        text=True, encoding="utf-8",
         errors="replace",
     )
     return proc.stdout or ""

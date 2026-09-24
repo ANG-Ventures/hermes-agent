@@ -73,7 +73,7 @@ def _git_runtime_identity(root: Path) -> dict[str, Any]:
                 ["git", "-C", str(root), *args],
                 check=False,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=1,
             )
         except (OSError, subprocess.SubprocessError) as exc:
