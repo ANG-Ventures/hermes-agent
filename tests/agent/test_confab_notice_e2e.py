@@ -627,8 +627,12 @@ class TestConfabNoticeEndToEnd:
             if isinstance(source_index, int):
                 assert (source_index < event_position) == (i < event_index), (
                     engine, event_position, source_index, i, event_index)
-        assert sum(is_metadata_only_tool_notice(row)
-                   for row in db.get_messages_as_conversation(agent.session_id)) == 1
+        stored = db.get_messages_as_conversation(agent.session_id)
+        stored_event_at = next(i for i, row in enumerate(stored)
+                               if is_metadata_only_tool_notice(row))
+        assert sum(is_metadata_only_tool_notice(row) for row in stored) == 1
+        assert stored_event_at == event_index, "persistence moved the event in the timeline"
+        first_wire = _chat_requests(handler)[-1]["messages"]
         handler.captured_requests = []
         handler.response_queue[:] = [("Second.", None)]
         resumed = make_agent(stream=stream)
@@ -636,8 +640,10 @@ class TestConfabNoticeEndToEnd:
         resumed.compression_enabled = False
         resumed.run_conversation("follow up", conversation_history=db.get_messages_as_conversation(
             agent.session_id), task_id="resume")
-        assert all(not is_metadata_only_tool_notice(m)
-                   for m in _chat_requests(handler)[-1]["messages"])
+        second_wire = _chat_requests(handler)[-1]["messages"]
+        assert all(not is_metadata_only_tool_notice(m) for m in second_wire)
+        assert [call["id"] for row in first_wire for call in row.get("tool_calls", [])] == [
+            call["id"] for row in second_wire for call in row.get("tool_calls", [])]
 
     def test_contentful_tagged_system_is_not_stripped_before_compression(self, notice_env, stream):
         make_agent, handler, db, sid, _ = notice_env
