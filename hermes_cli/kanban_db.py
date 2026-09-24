@@ -7259,6 +7259,7 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
     return None
 
 
+@_home_session_guarded("claim")
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,

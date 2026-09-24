@@ -414,9 +414,24 @@ def _slash_runner(session_id):
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
     runner._session_key_for_source = lambda source: "agent:main:telegram:dm:c1"
-    runner.session_store = SimpleNamespace(
-        entry_for=lambda key: SimpleNamespace(session_id=session_id)
-    )
+    # The runner's REAL async_session_store property wraps this raw store in
+    # gateway.session.AsyncSessionStore, so the method the handler awaits is
+    # the one the facade actually offloads. The raw lookup asserts it runs
+    # OFF the event loop (a sync store call on the loop fails the test).
+    import asyncio
+
+    def _entry_for(key):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("raw session_store.entry_for ran on the event loop")
+        if isinstance(session_id, BaseException):
+            raise session_id
+        return SimpleNamespace(session_id=session_id)
+
+    runner.session_store = SimpleNamespace(entry_for=_entry_for)
     return runner
 
 
@@ -457,6 +472,79 @@ async def test_gateway_slash_binds_invoking_session(kanban_home, monkeypatch):
         assert kb.get_task(conn, tid).status == "blocked"
 
 
+@pytest.mark.asyncio
+async def test_gateway_slash_session_resolution_failure_is_logged(
+        kanban_home, monkeypatch, caplog):
+    """A failed lookup degrades to sessionless -- but never silently."""
+    import logging
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    runner = _slash_runner(RuntimeError("store offline"))
+    with caplog.at_level(logging.WARNING):
+        out = await GatewayRunner._handle_kanban_command(
+            runner, _slash_event("/kanban create 'x' --json"))
+    tid = json.loads(out)["id"]
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).session_id is None
+    assert any("could not resolve invoking session" in r.getMessage()
+               and "store offline" in r.getMessage() for r in caplog.records)
+
+
+# --- claim: chat-reachable CLI verb, so guarded ---------------------------
+
+
+def test_foreign_claim_is_refused(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _ready(conn)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo"):
+            with pytest.raises(kb.ForeignSessionMutationError) as exc:
+                kb.claim_task(conn, tid)
+        assert f"refused claim on {tid}" in str(exc.value)
+        t = kb.get_task(conn, tid)
+        assert (t.status, t.claim_lock) == ("ready", None)
+
+
+def test_cli_foreign_claim_is_refused(kanban_home, monkeypatch, capsys):
+    with kb.connect_closing() as conn:
+        tid = _ready(conn)
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    rc = kc.kanban_command(kc.build_parser(_subparsers()).parse_args(
+        ["claim", tid]))
+    assert rc == 1
+    assert f"refused claim on {tid}" in capsys.readouterr().err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_claim_allowed_for_home_session_and_assignee(kanban_home):
+    with kb.connect_closing() as conn:
+        mine = _ready(conn)
+        with kb.mutation_actor(session_ids=(HOME,), profile="apollo"):
+            assert kb.claim_task(conn, mine) is not None
+        assert kb.get_task(conn, mine).status == "running"
+        theirs = _ready(conn, assignee="worker-a")
+        with kb.mutation_actor(session_ids=(OTHER,), profile="worker-a"):
+            assert kb.claim_task(conn, theirs) is not None
+        assert kb.get_task(conn, theirs).status == "running"
+
+
+def test_dispatcher_tick_still_claims_stamped_card(kanban_home, monkeypatch):
+    """A real dispatch_once tick claims a card stamped by some chat session:
+    the dispatcher binds no actor, so the claim guard is inert there."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    spawned = []
+    with kb.connect_closing() as conn:
+        tid = _ready(conn, session_id=OTHER)
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id))
+        assert kb.get_task(conn, tid).status == "running"
+    assert spawned == [tid]
+
+
 def test_run_slash_session_does_not_leak(kanban_home):
     kc.run_slash("list", session_id=HOME)
     assert kc._SLASH_SESSION_ID.get() is None
@@ -471,11 +559,26 @@ import re as _re
 # each with the reason it is execution lane (never bound from a chat).
 EXECUTION_LANE = {
     "_migrate_add_optional_columns": "schema migration at connect time",
-    "recompute_ready": "global todo->ready promotion cascade",
-    "claim_task": "dispatcher/worker claim of a ready card",
-    "claim_review_task": "dispatcher claim of a review card",
-    "heartbeat_claim": "the claiming worker extending its own lease",
-    "heartbeat_worker": "the running worker's liveness write",
+    # Reasons are derived from the CALLERS, not the function's intent. The
+    # chat-reachable ones (CLI verb / tool / dashboard) say why a foreign
+    # session still cannot change another card's status or ownership.
+    "recompute_ready": (
+        "callers: CLI list (kanban.py), kanban_list tool, dashboard, "
+        "dispatcher. Board-wide todo->ready cascade with no task argument and "
+        "no per-card choice: it only promotes cards whose parents are ALL "
+        "done, the same result the next dispatcher tick produces"),
+    "claim_review_task": (
+        "callers: dispatcher only (no CLI verb, tool or slash path)"),
+    "heartbeat_claim": (
+        "callers: kanban_heartbeat tool + worker auto-heartbeat. Writes only "
+        "claim_expires (never status/assignee/priority; the regex hit is the "
+        "WHERE status='running'), and only when claim_lock == the caller's "
+        "own lock, so a foreign process matches no row"),
+    "heartbeat_worker": (
+        "callers: CLI heartbeat, kanban_heartbeat tool, auto-heartbeat. Writes "
+        "only last_heartbeat_at + a heartbeat event on an already-running "
+        "card (the regex hit is the WHERE status='running'); it cannot "
+        "change status, assignee, priority or the claim"),
     "release_stale_claims": "reaper",
     "invalidate_descendants_for_parent_reopen": "cascade of a (guarded) reopen",
     "_release_claim_for_workspace_refusal": "dispatcher spawn refusal",

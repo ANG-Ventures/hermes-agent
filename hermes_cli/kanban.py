@@ -1652,9 +1652,11 @@ def kanban_command(args: argparse.Namespace) -> int:
 
 # Status/ownership subcommands policed by the home-session guard
 # (kanban_db.check_home_session). Runtime actions (dispatch, daemon, gc,
-# claim, heartbeat) are deliberately absent: they are the execution lane.
+# heartbeat) are deliberately absent: they are the execution lane. ``claim``
+# is guarded: the verb is chat-reachable and a foreign claim would hold the
+# home card's lease (the assignee / its dispatched worker stay exempt).
 _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
-    "complete", "block", "unblock", "archive", "assign", "reassign",
+    "claim", "complete", "block", "unblock", "archive", "assign", "reassign",
     "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
     "schedule", "reopen", "reopen-review", "request-review",
     "request-changes", "link", "specify", "decompose",

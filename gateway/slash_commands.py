@@ -886,13 +886,21 @@ class GatewaySlashCommandsMixin:
         # The invoking chat session, passed EXPLICITLY: create stamps it as the
         # card's home and the home-session guard compares against it. Never
         # read from env here -- os.environ is shared by every session.
+        # Read-only lookup through the ONE awaited store boundary (never a
+        # sync store call on the event loop, never get_or_create).
         invoking_session_id = None
         try:
-            _entry = self.session_store.entry_for(
+            _entry = await self.async_session_store.entry_for(
                 self._session_key_for_source(event.source)
             )
             invoking_session_id = getattr(_entry, "session_id", None) or None
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "/kanban: could not resolve invoking session (%s); "
+                "running sessionless -- home-session guard skipped, create "
+                "leaves the card unstamped",
+                exc,
+            )
             invoking_session_id = None
 
         try:
