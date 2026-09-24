@@ -288,54 +288,20 @@ _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 
 def _goal_judge_available() -> bool:
-    """True when an auxiliary client is configured for the goal judge.
-
-    ``judge_goal`` is fail-open at the source: when no auxiliary model can
-    be reached it returns a ``"continue"`` verdict that is indistinguishable
-    from a real "not done yet" judgment. The completion gate must not treat
-    that as a rejection, or an unconfigured/degraded auxiliary model would
-    wedge every ``goal_mode`` worker (it could never close its own task).
-
-    So we probe availability first and only enforce the gate when a judge is
-    actually reachable. This mirrors the same client lookup ``judge_goal``
-    performs internally.
-    """
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return False
-    return client is not None and bool(model)
+    """Tool-surface judge availability probe; see ``goals.goal_judge_available``."""
+    from hermes_cli.goals import goal_judge_available
+    return goal_judge_available()
 
 
 def _goal_mode_handoff_rejection(task, evidence: str, *, conn=None, task_id=None) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
-    if not task or not task.goal_mode or not _goal_judge_available():
-        return None
-    from hermes_cli import kanban_db as kb
-
-    worker_run_id = _worker_run_id(task_id) if task_id else None
-    reason = "judge unavailable"
-    for _ in range(2 if worker_run_id is not None else 1):
-        try:
-            verdict, reason, parse_failed, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                last_response=evidence.strip(),
-                completion_handoff=True,
-            )
-        except Exception as exc:
-            verdict, reason, parse_failed, transport_failed = (
-                "continue", f"judge error: {type(exc).__name__}", False, True,
-            )
-        if not (parse_failed or transport_failed):
-            return reason if verdict != "done" else None
-    if conn is not None and task_id:
-        kb._append_event(conn, task_id, "judge_error", {"reason": reason}, run_id=worker_run_id)
-        conn.commit()
-        if worker_run_id is not None:
-            blocked = kb.block_task(conn, task_id, reason=reason, kind="transient", expected_run_id=worker_run_id)
-            return f"{reason}; task {'blocked transient after judge retry' if blocked else 'not blocked (run ownership changed)'}"
-    return None
+    """Tool-surface wiring of the shared goal-mode handoff gate."""
+    from hermes_cli.goals import kanban_handoff_rejection
+    return kanban_handoff_rejection(
+        task, evidence, conn=conn, task_id=task_id,
+        worker_run_id_for=_worker_run_id,
+        judge_available=_goal_judge_available,
+        judge=judge_goal,
+    )
 
 
 # ---------------------------------------------------------------------------
