@@ -1117,6 +1117,83 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_claim_refused_live_owner(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``ready`` or ``review`` card keeps being refused because a prior
+    worker process is still alive.
+
+    ``claim_task`` / ``claim_review_task`` fail CLOSED when a previous run's
+    spawned process is still running (``claim_rejected`` with reason
+    ``prior_worker_still_alive``). That is correct -- a second worker beside
+    a live one double-lands commits -- but it must not be silent: the card
+    sits unclaimed and only its raw event log says why. This rule surfaces
+    the refusal once it has persisted past a short grace (a worker that is
+    mid-exit clears within a tick or two), for READY and REVIEW cards alike.
+    It clears as soon as a later ``claimed`` event lands.
+    """
+    status = _task_field(task, "status")
+    if status not in ("ready", "review"):
+        return []
+    if _task_field(task, "claim_lock"):
+        return []
+    grace = float(cfg.get("claim_refused_threshold_seconds", 5 * 60))
+
+    streak_start = 0
+    last = None
+    count = 0
+    for ev in events:
+        kind = _event_kind(ev)
+        if kind == "claimed":
+            streak_start, last, count = 0, None, 0
+            continue
+        if kind != "claim_rejected":
+            continue
+        payload = _parse_payload(ev)
+        if payload.get("reason") != "prior_worker_still_alive":
+            continue
+        ts = _event_ts(ev)
+        if not streak_start:
+            streak_start = ts
+        last = (ts, payload)
+        count += 1
+    if last is None:
+        return []
+    age = now - streak_start
+    if age < grace:
+        return []
+    last_ts, payload = last
+    pid = payload.get("prev_pid")
+    run_id = payload.get("prev_run_id")
+    identity = payload.get("owner_identity") or "unverified"
+    severity = "critical" if age >= grace * 6 else "error"
+    return [Diagnostic(
+        kind="claim_refused_live_owner",
+        severity=severity,
+        title=f"{status.capitalize()} card held: prior worker PID {pid} still alive",
+        detail=(
+            f"Dispatch refused to start a second worker because PID {pid} "
+            f"from run {run_id} is still running (owner identity: "
+            f"{identity}). The card will be claimed automatically once that "
+            f"process exits. If it is hung, inspect it and stop it; do not "
+            f"stop an unrelated process that merely reuses the PID."
+        ),
+        actions=[DiagnosticAction(
+            kind="cli_hint",
+            label="Inspect the holding process",
+            payload={"command": f"ps -o pid,lstart,command -p {pid}"},
+        )],
+        first_seen_at=streak_start,
+        last_seen_at=last_ts,
+        count=count,
+        data={
+            "prev_pid": pid,
+            "prev_run_id": run_id,
+            "owner_identity": identity,
+            "status": status,
+            "refused_for_seconds": int(age),
+        },
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _STALE_QUANTITY_RE = re.compile(
@@ -1228,6 +1305,7 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_claim_refused_live_owner,
     _rule_stranded_in_ready,
     _rule_stale_quantity_in_body,
 ]

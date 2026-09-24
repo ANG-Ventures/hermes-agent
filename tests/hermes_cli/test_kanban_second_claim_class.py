@@ -600,3 +600,191 @@ def test_ttl_expiry_requeues_host_local_claim_whose_worker_is_proven_dead(
     spawned, _ = _dispatch(conn)
     assert tid in spawned
     assert _row(conn, tid)["current_run_id"] != first.current_run_id
+
+
+# ---------------------------------------------------------------------------
+# Owner identity: a live PID counts as the prior owner only if its process was
+# created inside the recording run's causal window
+# [claimed_at - 1 s, spawned_at + 2 s]. Liveness alone is not identity: a
+# recycled PID must not strand the card, and a genuine worker whose
+# ``spawned`` event was delayed by DB lock contention must still be refused.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def real_identity(conn, monkeypatch):
+    """Restore the REAL owner-identity verdict (the ``conn`` fixture stubs it
+    for synthetic PIDs); these arms use real processes and timestamps."""
+    monkeypatch.setattr(kb, "_pid_started_in_claim", kb._real_pid_started_in_claim)
+
+
+def _sleeper():
+    return subprocess.Popen(["/bin/sleep", "60"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _stop(proc):
+    proc.terminate()
+    proc.wait(timeout=5)
+
+
+def _backdate_run(conn, run_id, seconds=7200):
+    """Make the run's claim/spawn look ``seconds`` old, so a process started
+    now provably post-dates the worker the run recorded (a recycled PID)."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_events SET created_at = created_at - ? "
+            "WHERE run_id = ? AND kind IN ('claimed', 'spawned')",
+            (seconds, run_id))
+        conn.execute(
+            "UPDATE task_runs SET started_at = started_at - ? WHERE id = ?",
+            (seconds, run_id))
+
+
+def _released_with_real_holder(conn, title):
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    first = kb.claim_task(conn, tid)
+    assert first is not None
+    proc = _sleeper()
+    kb._set_worker_pid(conn, tid, proc.pid)
+    assert kb.block_task(conn, tid, reason="operator pause")
+    assert kb.unblock_task(conn, tid)
+    return tid, first, proc
+
+
+def test_recycled_pid_does_not_strand_ready_card(conn, real_identity):
+    tid, first, proc = _released_with_real_holder(conn, "recycled, claim door")
+    try:
+        _backdate_run(conn, first.current_run_id)
+        spawned, _ = _dispatch(conn)
+        assert proc.poll() is None, "holder must stay alive for the arm to mean anything"
+        assert tid in spawned
+        assert not _events(conn, tid, "claim_rejected")
+    finally:
+        _stop(proc)
+
+
+def _review_handoff_with_real_holder(conn, title):
+    tid = kb.create_task(conn, title=title, assignee="builder")
+    builder = kb.claim_task(conn, tid)
+    assert builder is not None
+    proc = _sleeper()
+    kb._set_worker_pid(conn, tid, proc.pid)
+    assert kb.request_review(conn, tid, summary="for review", reviewer="argus",
+                             expected_run_id=builder.current_run_id)
+    return tid, builder, proc
+
+
+def test_recycled_pid_does_not_strand_review_card(conn, real_identity):
+    tid, builder, proc = _review_handoff_with_real_holder(conn, "recycled, review door")
+    try:
+        _backdate_run(conn, builder.current_run_id)
+        assert kb.claim_review_task(conn, tid) is not None
+        assert proc.poll() is None
+        assert not _events(conn, tid, "claim_rejected")
+    finally:
+        _stop(proc)
+
+
+def test_genuine_live_implementer_still_blocks_review_door(conn, real_identity):
+    tid, _, proc = _review_handoff_with_real_holder(conn, "genuine, review door")
+    try:
+        assert kb.claim_review_task(conn, tid) is None
+        rej = _events(conn, tid, "claim_rejected")[-1]
+        assert rej["prev_pid"] == proc.pid
+        assert rej["owner_identity"] == "verified"
+        assert _row(conn, tid)["status"] == "review"
+    finally:
+        _stop(proc)
+
+
+def test_genuine_live_owner_refused_with_verified_identity(conn, real_identity):
+    tid, _, proc = _released_with_real_holder(conn, "genuine, claim door")
+    try:
+        spawned, _ = _dispatch(conn)
+        assert tid not in spawned
+        rej = _events(conn, tid, "claim_rejected")[-1]
+        assert rej["prev_pid"] == proc.pid
+        assert rej["owner_identity"] == "verified"
+    finally:
+        _stop(proc)
+
+
+def test_lock_lagged_spawn_event_still_identifies_genuine_owner(conn, real_identity):
+    """``_set_worker_pid`` writes ``spawned`` in a write txn AFTER Popen, so a
+    held DB lock delays the event while the worker already runs. That worker
+    is genuine and must still block a second claim."""
+    import sqlite3
+    import threading
+
+    import psutil
+
+    tid = kb.create_task(conn, title="lock-lagged spawn", assignee="worker")
+    first = kb.claim_task(conn, tid)
+    assert first is not None
+    proc = _sleeper()
+    try:
+        holding = threading.Event()
+        hold_seconds = 6.5
+
+        def hold_lock():
+            other = sqlite3.connect(str(kb.kanban_db_path(board="default")),
+                                    timeout=30, isolation_level=None)
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                holding.set()
+                time.sleep(hold_seconds)
+                other.execute("COMMIT")
+            finally:
+                other.close()
+
+        t = threading.Thread(target=hold_lock)
+        t.start()
+        assert holding.wait(10)
+        kb._set_worker_pid(conn, tid, proc.pid)
+        t.join()
+
+        spawned_at = [
+            r["created_at"] for r in conn.execute(
+                "SELECT created_at FROM task_events WHERE task_id=? "
+                "AND kind='spawned'", (tid,))
+        ][-1]
+        lag = spawned_at - psutil.Process(proc.pid).create_time()
+        assert lag > 5, f"lock hold did not delay the spawned event (lag={lag:.2f}s)"
+
+        assert kb.block_task(conn, tid, reason="operator pause")
+        assert kb.unblock_task(conn, tid)
+        spawned, _ = _dispatch(conn)
+        assert tid not in spawned
+        rej = _events(conn, tid, "claim_rejected")[-1]
+        assert rej["prev_pid"] == proc.pid
+        assert rej["owner_identity"] == "verified"
+    finally:
+        _stop(proc)
+
+
+def test_unreadable_create_time_fails_closed(conn, real_identity, monkeypatch):
+    """Recycled-shaped run, but the holder's start time cannot be read: no
+    evidence it is someone else, so the claim is refused."""
+    tid, first, proc = _released_with_real_holder(conn, "unreadable create time")
+    try:
+        _backdate_run(conn, first.current_run_id)
+        monkeypatch.setattr(kb, "_pid_create_time", lambda pid: None)
+        spawned, _ = _dispatch(conn)
+        assert tid not in spawned
+        rej = _events(conn, tid, "claim_rejected")[-1]
+        assert rej["prev_pid"] == proc.pid
+        assert rej["owner_identity"] == "unverified"
+    finally:
+        _stop(proc)
+
+
+def test_boot_time_holder_is_not_the_owner(conn, real_identity, monkeypatch):
+    """PID 1 (and Linux's kthreadd, PID 2) was created before any claim, so it
+    can never be the worker a run recorded."""
+    tid, first = _live_claim(conn, "boot-time holder", pid=1)
+    assert kb.block_task(conn, tid, reason="operator")
+    assert kb.unblock_task(conn, tid)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == 1)
+    spawned, _ = _dispatch(conn)
+    assert tid in spawned
