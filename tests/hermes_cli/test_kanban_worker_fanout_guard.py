@@ -138,3 +138,80 @@ def test_every_guarded_cli_verb_shares_the_exemption(worker_env, verb):
     assert "refused" not in ok, ok
     bad = kc.run_slash(verb.format(card=unrelated))
     assert "refused" in bad, bad
+
+
+# --- Argus r3 C3/C4: the exemption's boundary (direction + event kind) ------
+
+
+@pytest.fixture
+def family_env(tmp_path, monkeypatch):
+    """ROOT -> {W, S}; U unrelated. All share the human home and are created
+    with NO worker identity, so only the task_links walk can own anything.
+    The worker is dispatched for W."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in (KT, "HERMES_SESSION_ID", "HERMES_PROFILE", "HERMES_PROFILE_NAME"):
+        monkeypatch.delenv(var, raising=False)
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="root", assignee="apollo",
+                              session_id=HUMAN, body=ORIGIN)
+        w = kb.create_task(conn, title="W", assignee="daedalus", parents=(root,),
+                           session_id=HUMAN, body=ORIGIN)
+        s = kb.create_task(conn, title="S", assignee="argus", parents=(root,),
+                           session_id=HUMAN, body=ORIGIN)
+        u = kb.create_task(conn, title="U", assignee="argus",
+                           session_id=HUMAN, body=ORIGIN)
+    monkeypatch.setenv(KT, w)
+    monkeypatch.setenv("HERMES_SESSION_ID", WORKER_RUN)
+    monkeypatch.setenv("HERMES_PROFILE", "daedalus")
+    assert kb.home_guard_mode() == "refuse"
+    return {"root": root, "w": w, "s": s, "u": u}
+
+
+def _status(task_id):
+    with kb.connect_closing() as conn:
+        return kb.get_task(conn, task_id).status
+
+
+@pytest.mark.parametrize("target", ["root", "s"])
+def test_worker_refused_on_ancestor_and_sibling_cli(family_env, target):
+    """C3: ownership walks UP from the target to W only. W's ancestor and
+    W's sibling are not W's fan-out, so a guarded CLI verb stays refused
+    and the DB row is unchanged."""
+    card = family_env[target]
+    own = _create("A", [family_env["w"]])
+    kc.run_slash(f"archive {own}")
+    assert _status(own) == "archived"  # control: own child is allowed
+    out = kc.run_slash(f"archive {card}")
+    assert "refused" in out, out
+    assert _status(card) != "archived"
+
+
+@pytest.mark.parametrize("target", ["root", "s"])
+def test_worker_refused_on_ancestor_and_sibling_tool(family_env, target):
+    """C3 on the tool surface: link(own child -> ancestor/sibling) is
+    guarded on the child end and must write no row."""
+    card = family_env[target]
+    own = _create("A", [family_env["w"]])
+    res = _tool_link(own, card)
+    assert "refused link" in json.dumps(res), res
+    assert (own, card) not in _links()
+
+
+def test_worker_comment_does_not_adopt_unrelated_card(family_env):
+    """C4: only the ``created`` event proves this run made a card. A comment
+    the worker run writes on an unrelated same-home card must not make it
+    owned: a guarded mutation afterwards is still refused."""
+    u = family_env["u"]
+    kc.run_slash(f'comment {u} "fyi"')
+    with kb.connect_closing() as conn:
+        kinds = {r[0] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? "
+            "AND actor_session_id = ?", (u, WORKER_RUN))}
+    assert kinds and "created" not in kinds, kinds  # the comment is attributed
+    out = kc.run_slash(f"archive {u}")
+    assert "refused" in out, out
+    assert _status(u) != "archived"
