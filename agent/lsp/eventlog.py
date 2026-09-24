@@ -28,7 +28,9 @@ _announced_unavailable: set = set()   # keys: (server_id, binary_path_or_name)
 _announced_no_root: set = set()       # keys: (server_id, file_path)
 _announced_skipped: set = set()       # keys: (server_id, workspace_root)
 _announced_excluded: set = set()      # keys: (server_id, workspace_root)
-_ALL_BUCKETS = (_announced_active, _announced_unavailable, _announced_no_root, _announced_skipped, _announced_excluded)
+_announced_host_cap: set = set()      # keys: (server_id,)
+_ALL_BUCKETS = (_announced_active, _announced_unavailable, _announced_no_root, _announced_skipped, _announced_excluded,
+                _announced_host_cap)
 
 
 def _short_path(file_path: str) -> str:
@@ -131,6 +133,14 @@ def log_root_excluded(server_id: str, workspace_root: str, file_path: str, *, in
     _emit_once(_announced_excluded, (server_id, workspace_root), server_id, logging.INFO,
                f"skipping {_short_path(file_path)}: {workspace_root} {why}",
                f"skipping {_short_path(file_path)}: {workspace_root} excluded")
+
+
+def log_host_cap_reached(server_id: str, cap: int) -> None:
+    """This process wanted a server but the host already runs ``lsp.max_servers_per_host`` of them.
+    INFO once per server_id per process (the "one line" an operator greps for), DEBUG thereafter."""
+    _emit_once(_announced_host_cap, (server_id,), server_id, logging.INFO,
+               f"host at lsp.max_servers_per_host={cap}; running without LSP (shell linter only) until a slot frees",
+               "host LSP cap still reached")
 
 
 def log_reaped(keys: List[Tuple[str, str]], idle_timeout: float) -> None:

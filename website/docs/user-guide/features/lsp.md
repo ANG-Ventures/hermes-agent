@@ -238,6 +238,14 @@ lsp:
   # clamped to 30 so a sweep can never reap a client mid-operation.
   idle_timeout: 600
 
+  # Running language servers allowed per OS user, across every agent
+  # process on the machine (each process otherwise runs its own server —
+  # pyright is 200-950 MB). Past the cap a process runs without LSP (the
+  # shell linter still runs), logs one INFO line, and tries again on a
+  # later edit once a slot frees. Slots are file locks the OS releases
+  # when a holder exits, so a crashed process never leaks one. 0 = no cap.
+  max_servers_per_host: 6
+
   # Per-server overrides (all optional).
   servers:
     pyright:

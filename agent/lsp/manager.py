@@ -20,7 +20,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from agent.lsp import eventlog
+from agent.lsp import eventlog, host_slots
 from agent.lsp.client import DIAGNOSTICS_DOCUMENT_WAIT, LSPClient, _diagnostic_key as _diag_key
 from agent.lsp.servers import SERVERS, ServerContext, ServerDef, custom_servers, find_server_for_file, language_id_for
 from agent.lsp.workspace import clear_cache, resolve_workspace_for_file
@@ -28,6 +28,7 @@ from agent.lsp.workspace import clear_cache, resolve_workspace_for_file
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+DEFAULT_MAX_SERVERS_PER_HOST = 6
 _DELTA_BASELINE_CAP = 256  # per-file pre-write snapshots; paths never written again would otherwise live forever (#62950)
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
 
@@ -131,6 +132,7 @@ class LSPService:
         broken_retry_seconds: float = 0.0,
         warmup_timeout: float = 0.0,
         exclude_roots: Any = None,
+        max_servers_per_host: int = 0,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -148,6 +150,8 @@ class LSPService:
         # bare string here means "exclude that workspace", and excluding nothing would re-pay the stall it
         # was meant to avoid.
         self._exclude_roots: Optional[List[str]] = _parse_exclude_roots(exclude_roots)
+        # 0 = unlimited.  One slot per running server process, shared by every agent process of this OS user.
+        self._max_servers_per_host = max(0, int(max_servers_per_host))
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -159,6 +163,7 @@ class LSPService:
         self._broken: Dict[_Key, float] = {}
         self._spawning: Dict[_Key, asyncio.Future] = {}
         self._last_used: Dict[_Key, float] = {}
+        self._slots: Dict[_Key, host_slots.HostSlot] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
         # abs file path → diagnostics snapshot taken immediately before a write.
@@ -205,6 +210,7 @@ class LSPService:
             broken_retry_seconds=_float_or(lsp_cfg.get("broken_retry_seconds"), 0.0),
             warmup_timeout=_float_or(lsp_cfg.get("warmup_timeout"), 0.0),
             exclude_roots=lsp_cfg.get("exclude_roots"),
+            max_servers_per_host=int(_float_or(lsp_cfg.get("max_servers_per_host"), DEFAULT_MAX_SERVERS_PER_HOST)),
         )
 
     def _server_for(self, file_path: str) -> Optional[ServerDef]:
@@ -251,7 +257,32 @@ class LSPService:
         if self._is_broken(key):
             eventlog.log_skipped_broken(srv.server_id, key[1], file_path, retry_in=self._broken_retry_in(key))
             return False
+        if not self._has_capacity(srv, key[1]):
+            eventlog.log_host_cap_reached(srv.server_id, self._max_servers_per_host)
+            return False
         return True
+
+    def _has_capacity(self, srv: ServerDef, root: str) -> bool:
+        """True when a client for this root already runs, or a host slot is free right now.
+        Probe only (acquire + release): the spawn takes its own slot and loses a race gracefully."""
+        if self._max_servers_per_host <= 0:
+            return True
+        with self._state_lock:
+            client = self._clients.get(_client_key(srv, root))
+        if client is not None and client.is_running:
+            return True
+        slot = host_slots.acquire(self._max_servers_per_host)
+        if slot is None:
+            return False
+        slot.release()
+        return True
+
+    def _release_slot(self, key: _Key) -> None:
+        """Drop the host slot held for ``key``'s server; caller has already removed the client."""
+        with self._state_lock:
+            slot = self._slots.pop(key, None)
+        if slot is not None:
+            slot.release()
 
     def _root_excluded(self, root: str) -> bool:
         """True iff ``root`` matches an ``lsp.exclude_roots`` glob (or the key is misconfigured)."""
@@ -393,6 +424,7 @@ class LSPService:
             client = self._clients.pop(ckey, None)
             self._last_used.pop(ckey, None)
         if client is not None:
+            self._release_slot(ckey)
             try:
                 # Fire-and-forget shutdown — we're already on a slow path.
                 self._loop.run(client.shutdown(), timeout=1.0)
@@ -427,6 +459,7 @@ class LSPService:
             "disabled_servers": sorted(self._disabled_servers),
             "broken_retry_seconds": self._broken_retry, "warmup_timeout": self._warmup_timeout,
             "exclude_roots": list(self._exclude_roots) if self._exclude_roots is not None else "INVALID",
+            "max_servers_per_host": self._max_servers_per_host,
         }
 
     # ---- async internals ----
@@ -518,13 +551,21 @@ class LSPService:
                 return None
             return await self._attach_root(srv, client, root) if client is not None else None
         try:
+            slot = host_slots.acquire(self._max_servers_per_host)
+            if slot is None:
+                # Host is at lsp.max_servers_per_host: run without LSP, NOT broken — a later edit retries.
+                eventlog.log_host_cap_reached(srv.server_id, self._max_servers_per_host)
+                spawning.set_result(None)
+                return None
             client = await self._spawn_client(srv, root)
             if client is None:
+                slot.release()
                 self._mark_broken((srv.server_id, root))
             else:
                 with self._state_lock:
                     self._clients[key] = client
                     self._last_used[key] = time.time()
+                    self._slots[key] = slot
                 eventlog.log_active(srv.server_id, root)
             spawning.set_result(client)
             return client
@@ -591,6 +632,8 @@ class LSPService:
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
                 self._last_used.pop(key, None)
+        for key in idle_keys:
+            self._release_slot(key)
         if clients:
             eventlog.log_reaped([(c.server_id, c.workspace_root) for c in clients], self._idle_timeout)
             await asyncio.gather(*(client.shutdown() for client in clients), return_exceptions=True)
@@ -643,6 +686,7 @@ class LSPService:
             clients = [self._clients.pop(key) for key in dead_keys]
             for key in dead_keys:
                 self._last_used.pop(key, None)
+            slots = [self._slots.pop(key) for key in dead_keys if key in self._slots]
             trims = [(c, [f for f in c.workspace_folders if is_gone(f)]) for c in self._clients.values()]
         for client, folders in trims:
             for folder in folders:
@@ -653,6 +697,8 @@ class LSPService:
         if clients:
             eventlog.log_released([(c.server_id, c.workspace_root) for c in clients], reason)
             await asyncio.gather(*(client.shutdown() for client in clients), return_exceptions=True)
+        for slot in slots:
+            slot.release()
         return len(clients)
 
     async def _shutdown_async(self) -> None:
@@ -665,7 +711,10 @@ class LSPService:
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            slots, self._slots = list(self._slots.values()), {}
         await asyncio.gather(*(c.shutdown() for c in clients), return_exceptions=True)
+        for slot in slots:
+            slot.release()
 
 
 __all__ = ["LSPService"]
