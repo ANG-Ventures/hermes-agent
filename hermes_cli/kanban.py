@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import difflib
 import json
 import os
@@ -517,6 +518,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--session", default=None, metavar="SESSION_ID",
+                          help="Home session to stamp on the card (default: "
+                               "$HERMES_SESSION_ID when set; 'none' = unstamped)")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -551,6 +555,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_list.add_argument("--session", default=None,
                         help="Filter by originating chat/agent session id "
                              "(set on tasks created from inside an ACP loop)")
+    p_list.add_argument("--home", action="store_true",
+                        help="Only cards whose home session is this session "
+                             "(== --session $HERMES_SESSION_ID)")
     p_list.add_argument("--archived", action="store_true",
                         help="Include archived tasks")
     p_list.add_argument("--json", action="store_true")
@@ -865,7 +872,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_edit = sub.add_parser(
         "edit",
-        help="Edit recovery fields on an already-completed task",
+        aliases=["update"],
+        help="Edit recovery fields on an already-completed task, or "
+             "(re)stamp its home session with --session",
     )
     p_edit.add_argument("task_id")
     p_edit.add_argument(
@@ -898,6 +907,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         dest="clear_model",
         help="Clear the per-task model override (revert to the assignee "
              "profile default). Mutually exclusive with --model.",
+    )
+    p_edit.add_argument(
+        "--session",
+        default=None,
+        metavar="SESSION_ID",
+        help="(Re)stamp the card's home session ('none' = unstamped).",
     )
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
@@ -944,6 +959,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_requeue = sub.add_parser("requeue", help="Explicitly retry a READY card held by the respawn guard")
+    p_requeue.add_argument("task_id")
+    p_requeue.add_argument("reason", nargs="+", help="Required operator reason")
 
     p_reopen = sub.add_parser(
         "reopen",
@@ -1431,6 +1450,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Board to repair (also accepted before the repair verb)")
 
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
+    for _name in _HOME_GUARDED_ACTIONS:
+        _p = sub.choices.get(_name)
+        if _p is not None and "foreign_ok" not in {a.dest for a in _p._actions}:
+            _p.add_argument(
+                "--foreign-ok",
+                dest="foreign_ok",
+                default=None,
+                metavar="REASON",
+                help="Act on a card whose home session is another session; "
+                     "REASON is posted as a comment the home session sees.",
+            )
     return kanban_parser
 
 
@@ -1551,9 +1581,11 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
+            "update":   _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "requeue":  _cmd_requeue,
             "reopen":   _cmd_reopen,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
@@ -1583,8 +1615,26 @@ def kanban_command(args: argparse.Namespace) -> int:
         if not handler:
             print(f"kanban: unknown action {action!r}", file=sys.stderr)
             return 2
+        actor_scope = contextlib.nullcontext()
+        caller_sid = _caller_session_id() if action in _HOME_GUARDED_ACTIONS else None
+        if action in _HOME_GUARDED_ACTIONS and not caller_sid:
+            # No chat-session identity (plain shell, cron opener, launchd):
+            # the guard is session-vs-session, so an unattributed caller is
+            # never refused -- behaviour is exactly as before the guard.
+            print(
+                "note: no session identity \u2014 home-session guard skipped",
+                file=sys.stderr,
+            )
+        elif action in _HOME_GUARDED_ACTIONS:
+            actor_scope = kb.mutation_actor(
+                session_ids=(caller_sid,),
+                profile=_profile_author(),
+                foreign_ok=getattr(args, "foreign_ok", None),
+                surface="cli",
+            )
         try:
-            return int(handler(args) or 0)
+            with actor_scope:
+                return int(handler(args) or 0)
         except (ValueError, RuntimeError) as exc:
             # A survivor refusal carries its operator-only hint on the
             # exception, not in the persisted message, so render it HERE --
@@ -1599,6 +1649,66 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+# Status/ownership subcommands policed by the home-session guard
+# (kanban_db.check_home_session). Runtime actions (dispatch, daemon, gc,
+# heartbeat) are deliberately absent: they are the execution lane. ``claim``
+# is guarded: the verb is chat-reachable and a foreign claim would hold the
+# home card's lease (the assignee / its dispatched worker stay exempt).
+_HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
+    "claim", "complete", "block", "unblock", "archive", "assign", "reassign",
+    "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
+    "schedule", "requeue", "reopen", "reopen-review", "request-review",
+    "request-changes", "link", "specify", "decompose",
+})
+
+
+# The invoking chat session when the CLI runs IN-PROCESS for a gateway
+# ``/kanban`` slash command. The gateway passes it explicitly to
+# :func:`run_slash`; env is never consulted there (it is process-global and
+# shared by every concurrent session).
+_SLASH_SESSION_ID: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "kanban_slash_session_id", default=None
+)
+
+
+def _caller_session_id() -> Optional[str]:
+    """THE caller-identity read for every CLI site: the ``create`` stamp
+    (:func:`_resolve_session_flag`), ``show``'s home label, ``list --home`` and
+    the guard's actor binding. Order: explicit slash-path session, then the
+    ContextVar-first resolver shared with ``tools/kanban_tools``, then env."""
+    explicit = (_SLASH_SESSION_ID.get() or "").strip()
+    if explicit:
+        return explicit
+    try:
+        from gateway.session_context import resolve_current_session_id
+
+        resolved = (resolve_current_session_id() or "").strip()
+        if resolved:
+            return resolved
+        if os.environ.get("_HERMES_GATEWAY") == "1":
+            return None  # in-process: env is another session's, never ours
+    except Exception:
+        pass
+    return (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
+
+
+def _resolve_session_flag(value: Optional[str]) -> Optional[str]:
+    """``--session`` for create: explicit id, 'none' = NULL, omitted = env."""
+    if value is None:
+        return _caller_session_id()
+    value = value.strip()
+    return None if value.lower() in ("", "none") else value
+
+
+def _home_label(session_id: Optional[str]) -> str:
+    if not session_id:
+        return "unstamped"
+    caller = _caller_session_id()
+    if caller and session_id in kb.home_ids(caller):
+        return "this-session"
+    return f"other ({session_id})"
+
 
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
@@ -1628,9 +1738,11 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach-rm",
     "complete",
     "edit",
+    "update",
     "block",
     "schedule",
     "unblock",
+    "requeue",
     "reopen",
     "promote",
     "triage-resolve",
@@ -2130,6 +2242,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     initial_status=getattr(args, "initial_status", "running"),
                     triage=bool(getattr(args, "triage", False)),
                 ),
+                session_id=_resolve_session_flag(getattr(args, "session", None)),
             )
             task = kb.get_task(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
@@ -2212,6 +2325,23 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
+    if getattr(args, "home", False):
+        home = _caller_session_id()
+        if not home:
+            print(
+                "kanban: --home needs $HERMES_SESSION_ID (not set in this "
+                "shell); pass --session <id> explicitly",
+                file=sys.stderr,
+            )
+            return 2
+        if args.session and args.session != home:
+            print("kanban: --home conflicts with --session", file=sys.stderr)
+            return 2
+        # Home = this session's lineage (id rotations inside one chat).
+        home_session_ids = kb.home_ids(home)
+        args.session = None
+    else:
+        home_session_ids = None
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
@@ -2222,6 +2352,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             status=args.status,
             tenant=args.tenant,
             session_id=args.session,
+            session_ids=home_session_ids,
             include_archived=args.archived,
             order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id,
@@ -2326,6 +2457,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
+            "home": _home_label(task.session_id),
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -2380,6 +2512,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
+    print(f"  session:   {task.session_id or '-'}")
+    print(f"  home:      {_home_label(task.session_id)}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
@@ -3685,37 +3819,16 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
-    if task is None or not task.goal_mode:
-        return None
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, conn=None, task_id=None) -> Optional[str]:
+    """CLI-surface wiring of the shared goal-mode handoff gate (complete + review)."""
+    from hermes_cli import goals
 
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return None
-    if client is None or not model:
-        return None
-
-    from hermes_cli.goals import judge_goal
-
-    verdict = "done"
-    reason = ""
-    try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-            last_response=evidence.strip(),
-        )
-    except Exception as judge_exc:
-        import logging as _logging
-
-        _logging.getLogger(__name__).warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
-            judge_exc,
-            exc_info=True,
-        )
-    return reason if verdict != "done" else None
+    return goals.kanban_handoff_rejection(
+        task, evidence, conn=conn, task_id=task_id,
+        worker_run_id_for=_worker_run_id_for,
+        judge_available=goals.goal_judge_available,
+        judge=goals.judge_goal,
+    )
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -3772,6 +3885,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
+                conn=conn, task_id=tid,
             )
             if rejection is not None:
                 print(
@@ -3831,16 +3945,25 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     # --model / --clear-model are independent edits that apply to any task.
     do_result = getattr(args, "result", None) is not None
     do_model = model_override is not None or clear_model
+    new_session = getattr(args, "session", None)
+    do_session = new_session is not None
 
-    if not do_result and not do_model:
+    if not do_result and not do_model and not do_session:
         print(
-            "kanban: nothing to edit (pass --result, --model, or --clear-model)",
+            "kanban: nothing to edit (pass --result, --model, --clear-model, "
+            "or --session)",
             file=sys.stderr,
         )
         return 2
 
     rc = 0
     with kb.connect_closing() as conn:
+        if do_session:
+            sid = None if new_session.strip().lower() in ("", "none") else new_session.strip()
+            if not kb.set_task_session(conn, args.task_id, sid):
+                print(f"cannot restamp {args.task_id} (unknown id)", file=sys.stderr)
+                return 1
+            print(f"Home session of {args.task_id}: {sid or 'unstamped'}")
         if do_model:
             # --clear-model writes NULL; --model X writes X literally. The
             # None sentinel ("--model omitted") never reaches here.
@@ -3966,6 +4089,17 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_requeue(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip()
+    with kb.connect_closing() as conn:
+        ok, err = kb.requeue_task(conn, args.task_id, actor=_profile_author(), reason=reason)
+    if not ok:
+        print(f"cannot requeue {args.task_id}: {err}", file=sys.stderr)
+        return 1
+    print(f"Requeued {args.task_id}: {reason}")
+    return 0
+
+
 def _cmd_reopen(args: argparse.Namespace) -> int:
     """Reverse a false completion so the real work can be re-dispatched."""
     reason = " ".join(args.reason).strip() if args.reason else ""
@@ -4022,6 +4156,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         rejection = _goal_mode_handoff_rejection(
             kb.get_task(conn, tid),
             summary or "",
+            conn=conn, task_id=tid,
         )
         if rejection is not None:
             print(
@@ -5339,7 +5474,10 @@ def _cmd_specify(args: argparse.Namespace) -> int:
     ok_count = 0
     fail_count = 0
     for tid in ids:
-        outcome = spec.specify_task(tid, author=author)
+        try:
+            outcome = spec.specify_task(tid, author=author)
+        except kb.ForeignSessionMutationError as exc:
+            outcome = spec.SpecifyOutcome(tid, False, str(exc))
         if outcome.ok:
             ok_count += 1
         else:
@@ -5412,7 +5550,10 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
     ok_count = 0
     for tid in ids:
-        outcome = decomp.decompose_task(tid, author=author)
+        try:
+            outcome = decomp.decompose_task(tid, author=author)
+        except kb.ForeignSessionMutationError as exc:
+            outcome = decomp.DecomposeOutcome(tid, False, str(exc))
         if outcome.ok:
             ok_count += 1
         if want_json:
@@ -5672,13 +5813,25 @@ Read-only commands are safe while an agent is running.\
 """
 
 
-def run_slash(rest: str) -> str:
+def run_slash(rest: str, *, session_id: Optional[str] = None) -> str:
     """Execute a ``/kanban …`` string and return captured stdout/stderr.
 
     ``rest`` is everything after ``/kanban`` (may be empty).  Used from
     both the interactive CLI (``self._handle_kanban_command``) and the
     gateway (``_handle_kanban_command``) so formatting is identical.
+
+    ``session_id`` is the invoking chat session. The gateway passes it
+    explicitly so ``create`` stamps it and the home-session guard sees it;
+    ``None`` falls back to :func:`_caller_session_id`'s normal resolution.
     """
+    token = _SLASH_SESSION_ID.set((session_id or "").strip() or None)
+    try:
+        return _run_slash(rest)
+    finally:
+        _SLASH_SESSION_ID.reset(token)
+
+
+def _run_slash(rest: str) -> str:
     import io
     import contextlib
 

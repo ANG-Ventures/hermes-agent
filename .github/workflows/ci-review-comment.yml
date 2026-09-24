@@ -24,6 +24,8 @@ on:
     # when the run actually starts, and it also fires on re-runs, which
     # ``requested`` does not.
     types: [in_progress]
+    # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
+    branches-ignore: [ci-overflow-ledger]
 
 permissions:
   contents: read

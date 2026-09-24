@@ -292,6 +292,8 @@ def _cmd_test(args) -> None:
 
 
 def _print_run_result(result: Dict[str, Any]) -> None:
+    if result.get("infra_failure"):
+        print(f"      infrastructure failure: {result['infra_failure']} (diagnostic only; no page sent)")
     if result.get("error"):
         # Operator channel: prefer the detailed reason. `error` is the redacted
         # model-facing form and cannot distinguish e.g. EACCES from ENOEXEC.

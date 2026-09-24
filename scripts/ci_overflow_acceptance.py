@@ -123,14 +123,15 @@ def matrix_budget() -> CheckResult:
             raw = command(sys.executable, "scripts/run_tests_parallel.py", "--generate-slices", "16", "--test-scope", scope,
                           "--self-hosted-slots", "4", "--self-hosted-labels", '["self-hosted","hermes-ci"]', "--arm-hosted-slices", "3").strip()
             matrix = json.loads(raw)
-            if scope != "full" and len(matrix["slice"]) != 2:
+            # plugin + core smoke, plus a dependents slice since #929; 16 = failed open.
+            if scope != "full" and len(matrix["slice"]) not in (2, 3):
                 raise ValueError("scoped generator failed open; no scoped measurement")
             local = copy.deepcopy(matrix)
             for row in local["slice"]:
                 row["runs_on"] = '["self-hosted","Linux","X64","hermes-ci"]'
             # Actions outputs are key=value plus newline; placement emits one more matrix.
-            generate = output_bytes(f"matrix={raw}\nlocal_matrix={json.dumps(local)}\n")
-            placement = output_bytes(f"matrix={raw}\ne2e_runs_on=[\"ubuntu-latest\"]\nvalidated_plan=true\n")
+            generate = output_bytes(f"matrix={raw}\nlocal_matrix={json.dumps(local)}\nrequest_digest=sha256:{'0' * 64}\n")
+            placement = output_bytes(f"matrix={raw}\ne2e_runs_on=[\"ubuntu-latest\"]\nplan_valid=true\n")
             counts[scope] = {"slices": len(matrix["slice"]), "generate_bytes_utf16": generate,
                              "placement_bytes_utf16": placement, "run_bytes_utf16": generate + placement}
         allowed = all(v["generate_bytes_utf16"] < 750 * 1024 and v["placement_bytes_utf16"] < 750 * 1024

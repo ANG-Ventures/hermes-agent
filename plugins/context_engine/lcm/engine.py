@@ -458,6 +458,27 @@ def _merge_adjacent_assistant_messages(
     return collapsed
 
 
+# Per-process throttle for the empty-lifecycle GC pass (keyed by DB path). The
+# pass is bounded now (indexed probes), but it still walks every lifecycle row
+# and runs from on_session_start on EVERY agent init; once per interval per
+# process is plenty for garbage that accumulates over days. In-process on
+# purpose: a durable marker would itself be a write on the session-start path.
+_LIFECYCLE_GC_LAST_RUN: dict[str, float] = {}
+_LIFECYCLE_GC_LOCK = threading.Lock()
+
+
+def _lifecycle_gc_due(db_path: str, interval_hours: float) -> bool:
+    if interval_hours <= 0:
+        return True
+    now = time.time()
+    with _LIFECYCLE_GC_LOCK:
+        last = _LIFECYCLE_GC_LAST_RUN.get(db_path)
+        if last is not None and (now - last) < interval_hours * 3600.0:
+            return False
+        _LIFECYCLE_GC_LAST_RUN[db_path] = now
+        return True
+
+
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
@@ -2644,6 +2665,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # don't accumulate forever.
         if (
             self._config.empty_lifecycle_gc_enabled
+            and _lifecycle_gc_due(
+                str(getattr(self._lifecycle, "db_path", "")),
+                self._config.empty_lifecycle_gc_interval_hours,
+            )
             and self._lifecycle.row_count() > self._config.empty_lifecycle_gc_threshold
         ):
             protected = {str(self._session_id)} if self._session_id else None

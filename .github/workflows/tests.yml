@@ -34,7 +34,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
+      # Legacy/original matrix: the ONLY matrix non-merge_group events run.
       matrix: ${{ steps.matrix.outputs.matrix }}
+      # CI overflow (spec §5.1): the same slices with every runs_on forced to
+      # the local X64 pool — the merge_group fallback when placement has no
+      # validated plan. Never the legacy matrix: that one may already carry
+      # unreserved hosted labels.
+      local_matrix: ${{ steps.overflow.outputs.local_matrix }}
+      request_digest: ${{ steps.request.outputs.artifact-digest }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -85,10 +92,101 @@ jobs:
             --self-hosted-labels "$CI_RUNNER_LABELS" \
             --arm-hosted-slices="$CI_ARM_HOSTED_SLICES")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          # A full matrix (~350 KB) exceeds Linux's 128 KB per-env-string limit
+          # (E2BIG), so overflow tooling reads it from a file, never env/argv.
+          mkdir -p ci-overflow
+          printf '%s' "$MATRIX" > ci-overflow/matrix.json
+
+      - name: Build CI overflow request and local matrix
+        # Relabels the matrix above; never recomputes membership. The request
+        # holds slice ids, core flag and duration weights only — no files,
+        # no test contents, no shell. The external ci-overflow-controller reads
+        # it with its own credential; nothing privileged enters this workflow.
+        id: overflow
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANAGED_PLACEMENT: ${{ vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' }}
+        run: |
+          python3 scripts/ci_overflow_request.py --matrix-file ci-overflow/matrix.json --out-dir ci-overflow --event "$EVENT_NAME" --managed "$MANAGED_PLACEMENT"
+          if [[ "$EVENT_NAME" == "merge_group" && "$MANAGED_PLACEMENT" == "true" ]]; then
+            echo "local_matrix=$(cat ci-overflow/local_matrix.json)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload CI overflow request
+        id: request
+        # A failed upload only means no plan: placement falls back to local.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-overflow-request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-overflow/request.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload local matrix for placement
+        # Placement's input (too large for env). Not the controller's request.
+        if: github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-overflow-local-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-overflow/local_matrix.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # Read-only consumer of the external controller's ledger plan (spec §5.1).
+  # merge_group only; any failure/timeout/mismatch leaves plan_valid unset or
+  # false and the test/e2e jobs below select generate.local_matrix instead.
+  placement:
+    name: Placement
+    needs: generate
+    # Phase-2 static-routing switch: absent/invalid stays on the existing K/ARM
+    # split until Apollo explicitly activates managed placement in Phase 4.
+    if: github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # A dead placement (checkout/runner failure, 5-min kill) must not fail the
+    # required check: the fallback already ran every slice locally. Only a
+    # validated plan ever writes plan_valid=true, so this cannot admit one.
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      e2e_runs_on: ${{ steps.plan.outputs.e2e_runs_on }}
+      plan_valid: ${{ steps.plan.outputs.plan_valid }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download local matrix
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-overflow-local-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-overflow
+
+      - name: Read validated plan from ci-overflow-ledger
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_REPOSITORY_ID: ${{ github.repository_id }}
+          CI_RUN_ID: ${{ github.run_id }}
+          CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CI_HEAD_SHA: ${{ github.sha }}
+          CI_REQUEST_DIGEST: ${{ needs.generate.outputs.request_digest }}
+          CI_MATRIX_FILE: ci-overflow/local_matrix.json
+        run: python3 scripts/ci_overflow_placement.py place
 
   test:
     name: Run tests ${{ matrix.slice.name }}
-    needs: generate
+    needs: [generate, placement]
+    # always(): run even though placement is skipped (non-merge_group) or
+    # failed/timed out (merge_group local fallback). Placement changes labels
+    # only; membership always comes from generate.
+    if: always() && !cancelled() && needs.generate.result == 'success'
     # Per-slice runner class, stamped by the generate job (see its
     # `Generate test slices` step for the measurement and the fail-safe
     # semantics). Not `vars.CI_RUNNER_LABELS` directly: one label set for the
@@ -98,7 +196,10 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.generate.outputs.matrix) }}
+      # Static routing remains the default for every event, including
+      # merge_group, until Phase-4 activation. Managed placement is selected
+      # only with the explicit switch; a failed plan then uses all-local.
+      matrix: ${{ fromJSON((github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && needs.generate.outputs.matrix || needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.matrix || needs.generate.outputs.local_matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -246,8 +347,11 @@ jobs:
           key: test-durations-${{ github.run_id }}
 
   e2e:
-    # Self-hosted e2e requires X64; hosted fallback keeps its standard label.
-    runs-on: ${{ contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON('["ubuntu-latest"]') }}
+    needs: [generate, placement]
+    if: always() && !cancelled() && needs.generate.result == 'success'
+    # Static routing (including merge_group with the switch OFF) retains the
+    # legacy X64 expression. Managed mode uses plan labels or fixed local.
+    runs-on: ${{ (github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON('["ubuntu-latest"]')) || fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.e2e_runs_on || '["self-hosted","Linux","X64","hermes-ci"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout code
@@ -304,3 +408,28 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+  # Required-work aggregate for this workflow. A reusable workflow whose inner
+  # jobs were SKIPPED still reports success to ci.yaml's all-checks-pass, so a
+  # skipped test/e2e (e.g. a broken fallback predicate) would be
+  # skipped-success. This job turns any non-success generate/test/e2e result
+  # into a visible failure (spec §3.7).
+  tests-complete:
+    name: Tests complete
+    needs: [generate, placement, test, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Fail on skipped or failed required tests
+        # Results only: toJSON(needs) carries both matrices (~700 KB) and
+        # exceeds the 128 KB per-env-string limit (E2BIG, run 35892732551).
+        env:
+          GENERATE_RESULT: ${{ needs.generate.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: python3 scripts/ci_overflow_placement.py gate

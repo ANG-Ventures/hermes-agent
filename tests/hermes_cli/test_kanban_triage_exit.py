@@ -398,12 +398,16 @@ def test_triage_resolve_records_who_and_why(kanban_home: Path) -> None:
 
         events = [e for e in kb.list_events(conn, parent) if e.kind == "triage_resolved"]
         assert len(events) == 1
+        comments = kb.list_comments(conn, parent)
+        # Intent events snapshot max(task_comments.id) at emit time
+        # (respawn-guard PR ordering); the inline audit comment lands first.
         assert events[0].payload == {
             "to": "todo",
             "reason": "talked to the author; retry is fine",
             "actor": "ace",
+            "after_comment_id": max(c.id for c in comments),
         }
-        bodies = [c.body for c in kb.list_comments(conn, parent)]
+        bodies = [c.body for c in comments]
         assert any(b.startswith("TRIAGE-RESOLVE -> todo:") for b in bodies)
 
 

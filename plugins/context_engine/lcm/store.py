@@ -490,6 +490,16 @@ class MessageStore:
                     search_content = _index_safe_text(plain_content, self._ingest_protection_config)
                 except RuntimeError:
                     search_content = None
+                if search_content is None:
+                    # Undecryptable row: search_content is ALREADY NULL. Writing
+                    # NULL over NULL is a no-op for the row but fires
+                    # ``msg_fts_update`` (delete + re-insert into the FTS5
+                    # index). On the fleet DB (3 such rows, 2.5 M-doc index)
+                    # that trigger write cost 4-57 s per boot holding the
+                    # write lock — on EVERY engine load, since the rows stay
+                    # NULL forever. Leave them alone; the loop's no-progress
+                    # guard below terminates the pass.
+                    continue
                 try:
                     self._conn.execute(
                         "UPDATE messages SET search_content = ? WHERE store_id = ?",

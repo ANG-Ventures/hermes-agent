@@ -890,8 +890,30 @@ class GatewaySlashCommandsMixin:
 
         is_create = action == "create"
 
+        # The invoking chat session, passed EXPLICITLY: create stamps it as the
+        # card's home and the home-session guard compares against it. Never
+        # read from env here -- os.environ is shared by every session.
+        # Read-only lookup through the ONE awaited store boundary (never a
+        # sync store call on the event loop, never get_or_create).
+        invoking_session_id = None
         try:
-            output = await asyncio.to_thread(run_slash, text)
+            _entry = await self.async_session_store.entry_for(
+                self._session_key_for_source(event.source)
+            )
+            invoking_session_id = getattr(_entry, "session_id", None) or None
+        except Exception as exc:
+            logger.warning(
+                "/kanban: could not resolve invoking session (%s); "
+                "running sessionless -- home-session guard skipped, create "
+                "leaves the card unstamped",
+                exc,
+            )
+            invoking_session_id = None
+
+        try:
+            output = await asyncio.to_thread(
+                run_slash, text, session_id=invoking_session_id
+            )
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
@@ -6023,17 +6045,25 @@ class GatewaySlashCommandsMixin:
                 ),
                 default=False,
             )
-            tmp_agent = AIAgent(
-                **runtime_kwargs,
-                model=model,
-                max_iterations=4,
-                quiet_mode=True,
-                skip_memory=not _checkpoint_required,
-                enabled_toolsets=["memory"],
-                session_id=session_entry.session_id,
-                session_db=getattr(self._session_db, "_db", self._session_db),
-            )
-            _seed_hygiene_system_prompt(tmp_agent, session_row)
+            # OFF the event loop (2026-09-24): AIAgent.__init__ loads the
+            # context engine under the process-global _LOAD_LOCK (20-60 s while
+            # worker turns hold it) — a PHASE=event_loop_blocked site that
+            # stalled Discord heartbeats past the ~41 s ACK window.
+            def _build_tmp_agent():
+                _a = AIAgent(
+                    **runtime_kwargs,
+                    model=model,
+                    max_iterations=4,
+                    quiet_mode=True,
+                    skip_memory=not _checkpoint_required,
+                    enabled_toolsets=["memory"],
+                    session_id=session_entry.session_id,
+                    session_db=getattr(self._session_db, "_db", self._session_db),
+                )
+                _seed_hygiene_system_prompt(_a, session_row)
+                return _a
+
+            tmp_agent = await asyncio.to_thread(_build_tmp_agent)
             # Keep the real source platform during construction so external
             # context engines bind correctly. If compression has to rebuild the
             # prompt, stamp that provider-less fallback as stale for the next

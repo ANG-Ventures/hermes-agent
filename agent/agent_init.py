@@ -2184,6 +2184,30 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Pool-capacity retry policy (agent.capacity_retry_attempts /
+    # agent.capacity_retry_max_wait_s). A relay 503 "no eligible sub"
+    # (``FailoverReason.pool_exhausted``) stays on the SAME provider for up to
+    # ``attempts`` tries / ``max_wait_s`` seconds before the fallback chain
+    # (a host move that costs a full-history bridge replay). ``attempts: 0``
+    # restores the pre-policy behaviour (generic jitter, fallback at
+    # ``api_max_retries``). See agent/retry_utils.py::capacity_retry_wait.
+    from agent.retry_utils import (
+        CAPACITY_RETRY_DEFAULT_ATTEMPTS,
+        CAPACITY_RETRY_DEFAULT_MAX_WAIT_S,
+    )
+    try:
+        _cap_attempts = int(_agent_section.get("capacity_retry_attempts", CAPACITY_RETRY_DEFAULT_ATTEMPTS))
+        _cap_attempts = max(_cap_attempts, 0)
+    except (TypeError, ValueError):
+        _cap_attempts = CAPACITY_RETRY_DEFAULT_ATTEMPTS
+    try:
+        _cap_max_wait = float(_agent_section.get("capacity_retry_max_wait_s", CAPACITY_RETRY_DEFAULT_MAX_WAIT_S))
+        _cap_max_wait = max(_cap_max_wait, 0.0)
+    except (TypeError, ValueError):
+        _cap_max_wait = CAPACITY_RETRY_DEFAULT_MAX_WAIT_S
+    agent._capacity_retry_attempts = _cap_attempts
+    agent._capacity_retry_max_wait_s = _cap_max_wait
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)

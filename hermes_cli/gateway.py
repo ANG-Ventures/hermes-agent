@@ -5283,6 +5283,15 @@ def generate_launchd_plist() -> str:
     <key>KeepAlive</key>
     <true/>
 
+    <!-- ProcessType Interactive: without it launchd files a LaunchAgent as
+         TASK_APPTYPE_DAEMON_STANDARD and clamps the WHOLE job — gateway and
+         every child it spawns — to utility QoS (latency tier 3, E-core
+         biased, disk iotier 1). The user-facing gateway must not share a
+         class with its own batch workers; kanban workers are re-clamped to
+         utility at spawn (kanban.worker_cpu_priority). -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
     <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
          to 30s so a crash-looping gateway can't hammer launchd into a rapid
          respawn storm; ExitTimeOut is the graceful-drain headroom before

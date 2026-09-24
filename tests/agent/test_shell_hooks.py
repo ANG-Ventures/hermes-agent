@@ -734,7 +734,7 @@ class TestErrorChannelSplit:
             "being copied onto the operator channel for no diagnostic gain"
         )
 
-    def test_spawn_enoexec_detail_distinguishes_errno(self, monkeypatch):
+    def test_spawn_enoexec_detail_distinguishes_errno(self, monkeypatch, tmp_path):
         """ENOEXEC must reach the operator channel with the errno, not just the class.
 
         This is the branch that actually populates ``error_detail`` on a spawn
@@ -742,7 +742,9 @@ class TestErrorChannelSplit:
         every platform rather than depending on the loader rejecting a crafted
         binary.
         """
-        planted = "/tmp/hook-with-s3cr3t-in-argv.sh"
+        # The script exists on disk: an ABSENT script is the missing-hook path, not a spawn error.
+        planted = str(tmp_path / "hook-with-s3cr3t-in-argv.sh")
+        Path(planted).write_text("#!/bin/sh\n")
 
         def _raise_enoexec(*args, **kwargs):
             raise OSError(8, "Exec format error", planted)
@@ -1090,7 +1092,8 @@ class TestFailSemanticsEndToEnd:
             "action": "block", "message": "rm -rf is not permitted",
         }
 
-    def test_fail_closed_missing_command_blocks(self, tmp_path):
+    def test_fail_closed_missing_command_is_infra_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(shell_hooks, "_page_missing_hook", lambda path, *outcome: True)
         spec = shell_hooks.ShellHookSpec(
             event="pre_tool_call",
             command=str(tmp_path / "does-not-exist.sh"),
@@ -1098,8 +1101,9 @@ class TestFailSemanticsEndToEnd:
         )
         cb = shell_hooks._make_callback(spec)
         result = cb(tool_name="terminal", args={"command": "ls"})
-        assert result is not None and result["action"] == "block"
-        assert "failed closed" in result["message"]
+        assert result["action"] == "block"
+        assert "infrastructure failure" in result["message"]
+        assert "not a policy verdict" in result["message"]
 
     def test_run_once_reflects_exit_2_block(self, tmp_path):
         """hermes hooks test must mirror production semantics."""

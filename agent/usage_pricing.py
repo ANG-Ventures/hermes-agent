@@ -534,6 +534,25 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://openai.com/index/previewing-gpt-5-6-sol/",
         pricing_version="openai-gpt-5.6-2026-07",
     ),
+    # ── OpenAI GPT-5.5 ──────────────────────────────────────────────────
+    # OpenAI and models.dev/openai: $5 input, $0.50 cached, $30 output / 1M;
+    # >272K prompt: $10/$1/$45 for the whole request. Cache writes are not
+    # separately listed on the official pricing page; do not invent a rate.
+    (
+        "openai",
+        "gpt-5.5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("30.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/models/gpt-5.5",
+        pricing_version="openai-gpt-5.5-2026-09",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("10.00"),
+        output_cost_per_million_above=Decimal("45.00"),
+        cache_read_cost_per_million_above=Decimal("1.00"),
+    ),
     # ── OpenAI GPT-6 Astra ───────────────────────────────────────────────
     # GA 2026-09-04. OpenAI's flagship; replaces gpt-5.6-sol as the codex
     # workhorse. Cache read is the standard 0.1x input discount; cache write

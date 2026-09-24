@@ -2793,7 +2793,9 @@ DEFAULT_CONFIG = {
     # command prompts the user for consent; subsequent runs reuse the
     # stored approval from ~/.hermes/shell-hooks-allowlist.json.
     # See `website/docs/user-guide/features/hooks.md` for schema + examples.
-    "hooks": {},
+    # missing_hook_policy: what a hook whose script (or a tracked sibling) is ABSENT does —
+    # restore_then_fail_closed | fail_closed | fail_open_and_page.
+    "hooks": {"missing_hook_policy": "restore_then_fail_closed"},
 
     # Auto-accept shell-hook registrations without a TTY prompt.  Also
     # toggleable per-invocation via --accept-hooks or HERMES_ACCEPT_HOOKS=1.
@@ -3022,6 +3024,27 @@ DEFAULT_CONFIG = {
         "banned_worker_model_substrings": None,
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
+        # Implicit pre-spawn probe per claude relay FAMILY (used when
+        # provider_health_probes has no explicit entry). claude-apr / -bpr are
+        # held while their OWN relay reports fewer than
+        # provider_health_min_eligible eligible seats; pinned claude-apx-N /
+        # -bpx-N (one sub box each) are held only when that sub ("local" for
+        # N=0, else "sub-vps-N") is listed exhausted/capped_quota by the apx->apr
+        # / bpx->bpr relay. Unreachable/malformed probe fails OPEN. A partial
+        # map overrides only the named family; "" disables that family.
+        "pool_health_urls": {
+            "claude-apr": "http://127.0.0.1:18810/health",
+            "claude-bpr": "http://127.0.0.1:18811/health",
+        },
+        # Pinned claude-apx-N / -bpx-N lanes not listed by any relay are judged
+        # on their own sub box: GET <usage-registry bridge_route_base_url>/health
+        # and hold while a usage_limits window (five_hour / seven_day) reports
+        # "rejected" and has not reset. Unreachable/unregistered fails OPEN.
+        "pool_box_health": True,
+        # Per-pool circuit: this many rate_limited run closes on ONE pool within
+        # 10 min hold that pool's spawns for 10 min (one #logs line per trip).
+        # Non-pool providers never count. 0 disables.
+        "rate_limit_trip": 5,
         # CPU scheduling priority for dispatcher-spawned worker gateways, and
         # therefore for everything they spawn (terminal-tool children inherit
         # niceness). "background" (default) runs each worker at nice 19 — and,
@@ -3030,6 +3053,11 @@ DEFAULT_CONFIG = {
         # interactive responsiveness, not a throughput cap: an otherwise idle
         # machine still gives workers the whole CPU. Set "normal" to opt out
         # and leave workers at the dispatcher's inherited priority.
+        # On macOS "background" also clamps the worker tree to utility QoS
+        # (exec-form `taskpolicy -c utility`: lower CPU class AND disk I/O
+        # tier than an Interactive gateway); "idle" uses darwin background
+        # (`taskpolicy -b`: E-cores only, heavy I/O throttle — the gateway
+        # always wins, but worker throughput drops sharply under load).
         # (2026-09-20: a worker's runaway busy-loops drove the host to load
         # 538/32 cores and starved the resident gateway's event loop into two
         # watchdog hard-exits and a 12-minute boot.)
@@ -3094,6 +3122,9 @@ DEFAULT_CONFIG = {
         # For configured provider_health_probes, prefer a healthy fallback
         # if fewer than this many pool seats can serve the selected model.
         "provider_health_min_eligible": 1,
+        # Per-tick pool admission budget: eligible relay subs * this value.
+        # Pinned apx/bpx lanes each spend one sub's budget. 0 = unlimited.
+        "pool_spawns_per_eligible": 2,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create

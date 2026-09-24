@@ -475,7 +475,87 @@ def _observe_workspace_refusal_outages(notifier, results) -> int:
     return delivered
 
 
-def _stall_streak_is_bad(ready_pending, any_spawned, results) -> bool:
+def _guard_stuck_cards(results) -> tuple[list[tuple[str, dict]], set[str]]:
+    """Probe guarded cards; only successful board probes can prove recovery."""
+    from hermes_cli import kanban_db as kb
+
+    cards = []
+    observed_boards = set()
+    for board, result in results or []:
+        if result is None or getattr(result, "skipped_locked", False):
+            continue
+        try:
+            with kb.connect_closing(board=board) as conn:
+                cards.extend(
+                    (board, item)
+                    for item in kb.respawn_guard_stuck_tasks(conn, board=board)
+                )
+            observed_boards.add(board)
+        except Exception:
+            logger.exception("kanban dispatcher: guard-stuck probe failed on %s", board)
+    return cards, observed_boards
+
+
+class _GuardStuckNotifier:
+    """Page once per (board, card) until it recovers; retry failed sends."""
+
+    def __init__(self) -> None:
+        self._delivered: set[tuple[str, str]] = set()
+
+    def observe(self, cards, send, observed_boards=None) -> int:
+        current = {(board, item["task_id"]) for board, item in cards}
+        if observed_boards is None:
+            observed_boards = {board for board, _ in cards}
+        self._delivered = {
+            key for key in self._delivered
+            if key[0] not in observed_boards or key in current
+        }
+        delivered = 0
+        for board, item in cards:
+            key = board, item["task_id"]
+            if key not in self._delivered and send(board, item):
+                self._delivered.add(key)
+                delivered += 1
+        return delivered
+
+
+def _send_guard_stuck_alert(board: str, item: dict) -> bool:
+    """Best-effort #alerts page with the exact recovery verb."""
+    script = Path.home() / ".hermes" / "scripts" / "notify.py"
+    if not script.is_file():
+        logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
+        return False
+    if item.get("reason") == "prior_worker_still_alive":
+        # Both the ready and review claim doors refuse; name the card's lane.
+        lane = str(item.get("status") or "ready").upper()
+        detail = (
+            f"{lane} card: prior_worker_still_alive claim rejected >15 min\n"
+            f"Prior PID: `{item.get('prev_pid')}` · Inspect: `{item['clear_verb']}`\n"
+            "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
+        )
+    else:
+        detail = (
+            "READY card stuck behind active_pr (>30 min)\n"
+            f"Operator recovery: `{item['clear_verb']}`"
+        )
+    message = (
+        f"🛑 **Kanban dispatcher** · {detail}\n"
+        f"Board: `{board}` · Card: `{item['task_id']}`"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--send", message, "--channel", "discord",
+             "--profile", "default", "--sev", "error"],
+            check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=30,
+        )
+    except Exception:
+        logger.exception("kanban dispatcher: guard-stuck page failed")
+        return False
+    return proc.returncode == 0
+
+
+def _stall_streak_is_bad(ready_pending, any_spawned, results, *, guard_stuck=False) -> bool:
     """Decide whether a dispatcher tick counts toward the "stuck" streak.
 
     A tick is "bad" (stall-suspect) only when there is spawnable work,
@@ -489,6 +569,8 @@ def _stall_streak_is_bad(ready_pending, any_spawned, results) -> bool:
     credentials)" warning that fired for ~2h during a provider 429 window /
     large fan-out, when the dispatcher was healthy but throttled.
     """
+    if guard_stuck:
+        return True
     if not ready_pending or any_spawned:
         return False
     declined_benign = False
@@ -2145,6 +2227,7 @@ class GatewayKanbanWatchersMixin:
         last_stranded_warn_at: dict[str, int] = {}
         last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
         workspace_refusal_notifier = _WorkspaceRefusalOutageNotifier()
+        guard_stuck_notifier = _GuardStuckNotifier()
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -2462,6 +2545,7 @@ class GatewayKanbanWatchersMixin:
                 # workers finish naturally; zombie reaping above still runs.
                 if not _kanban_dispatch_allowed():
                     ready_pending = False
+                    guard_stuck = []
                     bad_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live each tick so a user
@@ -2542,22 +2626,38 @@ class GatewayKanbanWatchersMixin:
                     # throttled, not broken). ``_stall_streak_is_bad`` consults the
                     # DispatchResult buckets so telemetry can tell "busy/throttled"
                     # from "genuinely stuck" instead of guessing.
+                    guard_stuck, observed_boards = await service(_guard_stuck_cards, results)
+                    guard_pages = await service(
+                        guard_stuck_notifier.observe, guard_stuck, _send_guard_stuck_alert,
+                        observed_boards,
+                    )
+                    if guard_pages:
+                        logger.error("kanban dispatcher: %d guarded card(s) STUCK; "
+                                     "#alerts paged with diagnostics", guard_pages)
                     ready_pending = await service(_ready_nonempty)
-                    if _stall_streak_is_bad(ready_pending, any_spawned, results):
+                    if _stall_streak_is_bad(ready_pending, any_spawned, results,
+                                            guard_stuck=bool(guard_stuck)):
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
-                        logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned, with no "
-                            "benign decline (cap/rate-limit/lock) to explain it. "
-                            "Check profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
-                            bad_ticks,
-                        )
+                        if guard_stuck:
+                            logger.warning(
+                                "kanban dispatcher STUCK: %d card(s) continuously "
+                                "guarded. See per-card diagnostics in #alerts.",
+                                len(guard_stuck),
+                            )
+                        else:
+                            logger.warning(
+                                "kanban dispatcher stuck: ready queue non-empty for "
+                                "%d consecutive ticks but 0 workers spawned, with no "
+                                "benign decline (cap/rate-limit/lock) to explain it. "
+                                "Check profile health (venv, PATH, credentials) and "
+                                "`hermes kanban list --status ready`.",
+                                bad_ticks,
+                            )
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")

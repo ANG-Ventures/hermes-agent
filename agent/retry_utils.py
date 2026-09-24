@@ -312,6 +312,83 @@ def resolve_retry_after(
     return wait
 
 
+# ── Pool-capacity (``pool_exhausted``) retry policy ───────────────────────
+#
+# Our claude-apr/-bpr relays answer 503 ``{"error":"no eligible sub ..."}``
+# when every pooled sub is quota-reserved / capped for the requested model.
+# That is a CAPACITY signal about the pool, not an auth or transport fault —
+# and, crucially, leaving the provider on the first hit is not free: a
+# ``fallback_providers`` switch is a HOST MOVE for a bridge-backed
+# conversation, and the receiving box has no CLI session for it, so the bridge
+# replays the entire history (measured 2026-09-24: 168 replays of 64k-830k
+# chars on ONE sub in 10h, 52 of them inside 70 minutes, every one a session
+# that left the pool the moment it saw this 503). Before this policy the loop
+# gave a pool 503 the generic 2s/4s jitter and walked the chain after ~6s.
+#
+# Policy: stay on the SAME provider and wait for a seat, bounded by an
+# attempt count (``agent.capacity_retry_attempts``) and a wall-clock budget
+# (``agent.capacity_retry_max_wait_s``). Honour the relay's ``Retry-After``
+# when it fits the remaining budget; a hint LONGER than the remaining budget
+# means the pool has told us it will not free in time, so leave now instead
+# of sleeping a wait we cannot afford. Without a header, use a slower jitter
+# than the generic path (seats free on the order of tens of seconds, not
+# two) clamped to the remaining budget. ``attempts == 0`` disables the policy
+# (the loop's pre-existing behaviour is untouched).
+CAPACITY_RETRY_DEFAULT_ATTEMPTS = 3
+CAPACITY_RETRY_DEFAULT_MAX_WAIT_S = 90.0
+CAPACITY_RETRY_BASE_DELAY_S = 5.0
+CAPACITY_RETRY_MAX_DELAY_S = 30.0
+
+
+def capacity_retry_wait(
+    *,
+    retry_count: int,
+    max_retries: int,
+    raw_retry_after: Any,
+    waited_s: float,
+    max_wait_s: float,
+    base_delay: float = CAPACITY_RETRY_BASE_DELAY_S,
+    max_delay: float = CAPACITY_RETRY_MAX_DELAY_S,
+) -> Optional[float]:
+    """Seconds to wait before the next SAME-provider attempt on a pool 503.
+
+    Pure function (no I/O). Returns ``None`` when the capacity budget is spent
+    and the caller should fall back NOW:
+
+      * ``retry_count >= max_retries`` — attempt budget exhausted.
+      * ``waited_s >= max_wait_s`` — wall-clock budget exhausted.
+      * a numeric ``Retry-After`` larger than the remaining budget — the relay
+        says the seat frees later than we are willing to wait.
+
+    Otherwise the wait is the relay's numeric ``Retry-After`` (when present and
+    positive) or a jittered backoff, and in both cases never exceeds the
+    remaining budget. ``retry_count`` is the caller's 1-based attempt number
+    (incremented before this runs), matching :func:`resolve_retry_after`.
+    """
+    if retry_count >= max_retries:
+        return None
+    try:
+        remaining = float(max_wait_s) - float(waited_s)
+    except (TypeError, ValueError):
+        return None
+    if remaining <= 0:
+        return None
+    hinted: Optional[float] = None
+    if raw_retry_after not in (None, ""):
+        try:
+            secs = float(raw_retry_after)
+        except (TypeError, ValueError):
+            secs = None
+        if secs is not None and secs > 0:
+            hinted = secs
+    if hinted is not None:
+        if hinted > remaining:
+            return None
+        return hinted
+    wait = jittered_backoff(retry_count, base_delay=base_delay, max_delay=max_delay)
+    return min(wait, remaining)
+
+
 def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS) -> int:
     """Retry-loop ceiling needed for the full Z.AI overload backoff schedule.
 

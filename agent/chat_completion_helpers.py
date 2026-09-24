@@ -175,12 +175,34 @@ def _note_api_call_recording_failure(agent: Any) -> None:
 
 
 
+def _requested_cache_ttl(api_kwargs: dict | None) -> str | None:
+    """Read outbound cache markers, not the potentially clamped config tier."""
+    if not isinstance(api_kwargs, dict):
+        return None
+    found = set()
+    def walk(node):
+        if isinstance(node, dict):
+            marker = node.get("cache_control")
+            if isinstance(marker, dict) and marker.get("type") == "ephemeral":
+                found.add("1h" if marker.get("ttl") == "1h" else "5m")
+            for value in node.values():
+                if isinstance(value, (list, dict)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+    for key in ("system", "messages", "tools"):
+        walk(api_kwargs.get(key))
+    return "1h" if "1h" in found else "5m" if "5m" in found else None
+
+
 def _emit_api_call_record(
     agent: Any,
     *,
     usage: Any,
     headers: Optional[dict[str, str]] = None,
     http_status: Optional[int] = None,
+    api_kwargs: Optional[dict] = None,
 ) -> None:
     """Fail-open bridge from the inference chokepoint to Blackbox.
 
@@ -212,6 +234,7 @@ def _emit_api_call_record(
             http_status=http_status,
             relay_synthetic="x-pool-unreachable" in pool_headers,
             route_id=pool_headers.get("x-pool-route-id"),
+            cache_ttl_requested=_requested_cache_ttl(api_kwargs),
         )
     except Exception:
         _note_api_call_recording_failure(agent)
@@ -219,7 +242,7 @@ def _emit_api_call_record(
 
 
 
-def _record_successful_api_call(agent: Any, response: Any) -> None:
+def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[dict] = None) -> None:
     if response is None or getattr(response, "_api_call_failure_recorded", False):
         return
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
@@ -238,11 +261,12 @@ def _record_successful_api_call(agent: Any, response: Any) -> None:
         usage=getattr(response, "usage", None),
         headers=headers if isinstance(headers, dict) else {},
         http_status=200,
+        api_kwargs=api_kwargs,
     )
 
 
 
-def _record_failed_api_call(agent: Any, error: BaseException) -> None:
+def _record_failed_api_call(agent: Any, error: BaseException, api_kwargs: Optional[dict] = None) -> None:
     response = getattr(error, "response", None)
     status = getattr(error, "status_code", None)
     if status is None:
@@ -252,6 +276,7 @@ def _record_failed_api_call(agent: Any, error: BaseException) -> None:
         usage=None,
         headers=_snapshot_pool_headers(response),
         http_status=int(status) if isinstance(status, int) else None,
+        api_kwargs=api_kwargs,
     )
 
 
@@ -1629,9 +1654,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
         try:
             response = direct_api_call(agent, api_kwargs)
         except Exception as exc:
-            _record_failed_api_call(agent, exc)
+            _record_failed_api_call(agent, exc, api_kwargs)
             raise
-        _record_successful_api_call(agent, response)
+        _record_successful_api_call(agent, response, api_kwargs)
         return response
 
     result = {"response": None, "error": None}
@@ -2219,13 +2244,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _join_worker_for_relay_teardown(t, label="Non-streaming")
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
-        _record_failed_api_call(agent, result["error"])
+        _record_failed_api_call(agent, result["error"], api_kwargs)
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
-        _record_successful_api_call(agent, result["response"])
+        _record_successful_api_call(agent, result["response"], api_kwargs)
     return result["response"]
 
 
@@ -4298,6 +4323,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     api_msg.pop(internal_key, None)
 
         summary_extra_body = {}
+        summary_user = None
         try:
             from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE as _OMIT_TEMP
         except Exception:
@@ -4370,9 +4396,26 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                         base_url=agent.base_url,
                         reasoning_config=agent.reasoning_config,
                     )
+                    # The transport also takes the profile's per-session routing
+                    # identity (the OpenAI ``user`` field) from
+                    # build_api_kwargs_extras. Carry ONLY that onto this direct call:
+                    # without it a session-routed provider (claude-bridge pools)
+                    # gets the summary request keyless. Other top-level extras stay
+                    # transport-only (reasoning is handled above).
+                    _, _summary_top = provider_profile.build_api_kwargs_extras(
+                        reasoning_config=None,
+                        supports_reasoning=False,
+                        model=agent.model,
+                        base_url=agent.base_url,
+                        session_id=getattr(agent, "session_id", None),
+                        bridge_route_suffix=getattr(agent, "_bridge_route_suffix", None),
+                    )
+                    summary_user = (_summary_top or {}).get("user")
             except Exception:
                 pass
 
+            if summary_user:
+                summary_kwargs["user"] = summary_user
             if profile_extra_body:
                 summary_extra_body.update(profile_extra_body)
             if provider_preferences and "provider" not in profile_extra_body and (
@@ -4490,6 +4533,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
+                if summary_user:
+                    summary_kwargs["user"] = summary_user
 
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
@@ -6251,7 +6296,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # The transport made a real attempt. Append its zero-token
                     # row before retry/failover classification; interrupt-forced
                     # closes returned above are deliberately excluded.
-                    _record_failed_api_call(agent, e)
+                    _record_failed_api_call(agent, e, api_kwargs)
                     result["failure_recorded"] = True
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
@@ -6902,7 +6947,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # pending stream-error reason so it can't leak a stale "(connection
         # dropped)" rider onto an unrelated later failover.
         agent._pending_stream_error_reason = None
-        _record_successful_api_call(agent, result["response"])
+        _record_successful_api_call(agent, result["response"], api_kwargs)
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────

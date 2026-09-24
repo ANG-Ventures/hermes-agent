@@ -7,6 +7,8 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
+    # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
+    branches-ignore: [ci-overflow-ledger]
 
 permissions:
   actions: read

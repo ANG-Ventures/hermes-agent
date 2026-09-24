@@ -7560,7 +7560,34 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            # Stop-during-pre-flight gate (2026-09-24 incident, Discord
+            # #claude-bridge): a /stop that lands while this turn is still
+            # in pre-flight (agent not yet built, slot holds the PENDING
+            # sentinel) bumps the run generation but has no agent to
+            # interrupt. Without this check the turn then enters
+            # run_conversation anyway, acquires the durable turn lease and
+            # runs to completion — 87 API calls over an hour — with every
+            # result discarded as stale, while the user's replacement turn
+            # waits the full lease budget and dies with "Another Hermes
+            # process kept this session busy too long". Refuse to start.
+            if not ctx._run_still_current():
+                logger.warning(
+                    "Refusing to start stale turn for %s — generation %s was "
+                    "invalidated during pre-flight (stopped); no lease acquired, "
+                    "no API calls",
+                    ctx.session_key or "?",
+                    ctx.run_generation,
+                )
+                result = {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 0,
+                    "interrupted": True,
+                    "completed": False,
+                    "stale_run_generation": True,
+                }
+            else:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -15782,7 +15809,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event that was parked. An event with a field that cannot be stored
         durably is refused and logged as lost by field name.
         """
-        from gateway.fork_ext.restart_followups import event_fields, spool_followup
+        from gateway.fork_ext.restart_followups import (
+            admission_fields,
+            event_fields,
+            spool_followup,
+        )
 
         fields = None
         if pending_event is not None:
@@ -15840,6 +15871,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     src_dict,
                     reason=self._status_action_label(),
                     event=fields,
+                    # Adapter-granted admission (is_bot / role_authorized /
+                    # relay) that SessionSource.to_dict never serialises;
+                    # MAC-bound so a forged record cannot assert it (t_43e058b7).
+                    admission=admission_fields(src),
                 )
             except Exception:
                 logger.debug("restart follow-up spool failed", exc_info=True)
@@ -15929,7 +15964,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _load_restart_followups(self) -> int:
         """Queue follow-ups spooled by the previous life into startup restore."""
         try:
-            from gateway.fork_ext.restart_followups import event_kwargs, take_followups
+            from gateway.fork_ext.restart_followups import (
+                event_kwargs,
+                restored_admission,
+                take_followups,
+            )
 
             records, stale = await asyncio.to_thread(take_followups)
         except Exception:
@@ -15941,9 +15980,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 carried = record.get("event")
                 kwargs = event_kwargs(carried) if isinstance(carried, dict) else {}
                 kwargs.setdefault("message_type", MessageType.TEXT)
+                source = SessionSource.from_dict(record["source"])
+                for flag, value in restored_admission(record).items():
+                    setattr(source, flag, value)
+                # In-process only: lets the intake report a replay it refuses
+                # as restart_followup_lost (the spool file is already acked).
+                source._restart_followup_session = record.get("session_key")
                 event = MessageEvent(
                     text=record["text"],
-                    source=SessionSource.from_dict(record["source"]),
+                    source=source,
                     **kwargs,
                 )
                 event._hermes_restart_followup_path = record["_spool_path"]
@@ -15962,6 +16007,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 stale,
             )
         return queued
+
+    def _report_refused_restart_followup(self, source: Any, reason: str) -> None:
+        """A replayed restart follow-up refused at intake is LOST, never silent.
+
+        Its spool file was acknowledged when the adapter accepted the replay,
+        so this log line is the only remaining trace (t_43e058b7).
+        """
+        session = getattr(source, "_restart_followup_session", None)
+        if not session:
+            return
+        logger.error(
+            "PHASE=restart_followup_lost session=%s reason=%s platform=%s chat=%s "
+            "user=%s: replayed follow-up refused at intake; it is DROPPED",
+            session,
+            reason,
+            getattr(getattr(source, "platform", None), "value", "unknown"),
+            getattr(source, "chat_id", None),
+            getattr(source, "user_id", None),
+        )
 
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
@@ -22844,6 +22908,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Dropping inbound message because its explicit profile route "
                 "targets an unserved profile"
             )
+            self._report_refused_restart_followup(source, "profile_route_rejected")
             return None
 
         # Internal events (e.g. background-process completion notifications)
@@ -22940,9 +23005,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized_for_source(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                self._report_refused_restart_followup(source, "unauthorized")
                 return None
         elif not self._is_user_authorized_for_source(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            self._report_refused_restart_followup(source, "unauthorized")
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
                 source.chat_type == "dm"
@@ -24294,7 +24361,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
                     # uninstalled skill and give actionable guidance.
-                    _unavail_msg = _check_unavailable_skill(command)
+                    # rglob + read_text over every SKILL.md (900+ on the fleet)
+                    # — measured PHASE=event_loop_blocked 10 s; keep it off-loop.
+                    _unavail_msg = await asyncio.to_thread(_check_unavailable_skill, command)
                     if _unavail_msg:
                         return _unavail_msg
                     # Genuinely unrecognized /command: not a built-in, not a
@@ -25635,7 +25704,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # miss (thread rename, /sethome, redact_pii flip, ...) re-renders
         # once — the only legitimate cache busts.
         context_prompt = self._pinned_session_context_prompt(
-            context, _redact_pii, session_key
+            context, _redact_pii, session_key,
+            internal=bool(getattr(event, "internal", False)),
         )
 
         # Per-turn must-deliver notes.  These used to be appended to
@@ -26244,20 +26314,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     ),
                                     default=False,
                                 )
-                                _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
-                                    model=_hyg_model,
-                                    max_iterations=4,
-                                    quiet_mode=True,
-                                    skip_memory=not _hyg_checkpoint_required,
-                                    enabled_toolsets=["memory"],
-                                    session_id=session_entry.session_id,
-                                    session_db=_hyg_session_db,
-                                )
-                                _seed_hygiene_system_prompt(
-                                    _hyg_agent,
-                                    _hyg_session_row,
-                                )
+                                # OFF the event loop (2026-09-24): AIAgent.__init__
+                                # loads the context engine under the process-global
+                                # _LOAD_LOCK — 20-60 s while worker turns hold it —
+                                # and that was the PHASE=event_loop_blocked site
+                                # that stalled Discord heartbeats past the ~41 s
+                                # ACK window (7 socket drops in 50 min). The
+                                # compression call below was already off-loop;
+                                # construction must be too.
+                                def _build_hyg_agent():
+                                    _a = AIAgent(
+                                        **_hyg_runtime,
+                                        model=_hyg_model,
+                                        max_iterations=4,
+                                        quiet_mode=True,
+                                        skip_memory=not _hyg_checkpoint_required,
+                                        enabled_toolsets=["memory"],
+                                        session_id=session_entry.session_id,
+                                        session_db=_hyg_session_db,
+                                    )
+                                    _seed_hygiene_system_prompt(_a, _hyg_session_row)
+                                    return _a
+
+                                _hyg_agent = await asyncio.to_thread(_build_hyg_agent)
                                 # If compression must rebuild instead of retaining
                                 # the cached prompt, make the persisted result
                                 # deliberately stale for every real gateway surface.
@@ -35559,7 +35638,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return f"[Voice channel now: {vc_now}]"
 
     def _pinned_session_context_prompt(
-        self, context, redact_pii: bool, session_key: Optional[str]
+        self,
+        context,
+        redact_pii: bool,
+        session_key: Optional[str],
+        *,
+        internal: bool = False,
     ) -> str:
         """Return the session-context prompt, pinned per session.
 
@@ -35567,12 +35651,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         composed system prompt against renderer nondeterminism); key miss →
         re-render ``build_session_context_prompt`` and re-pin (a legitimate
         cache bust: rename, topic edit, /sethome, redact_pii flip, ...).
+
+        ``internal`` events (kanban wakes, delegation completions, watch
+        notifications) carry a source rebuilt from the persisted origin, which
+        lacks chat_name/user_name/message_id. Rendering from it produced
+        different bytes than the surrounding human turns, so every internal
+        turn re-keyed the pin and the next human turn re-keyed it back (A→B→A).
+        Each flip rewrote already-sent system bytes and collapsed the prompt
+        cache to the static prefix (t_064c65a9). An internal event is never a
+        real metadata change, so it reuses the existing pin verbatim and never
+        re-pins.
         """
-        _eph_key = self._ephemeral_change_key(context, redact_pii)
         _eph_pin = None
         if session_key:
             _pin_state = self._peek_session_state(session_key)
             _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
+        if internal:
+            if _eph_pin is not None:
+                return _eph_pin[1]
+            return build_session_context_prompt(context, redact_pii=redact_pii)
+        _eph_key = self._ephemeral_change_key(context, redact_pii)
         if _eph_pin is not None and _eph_pin[0] == _eph_key:
             return _eph_pin[1]
         text = build_session_context_prompt(context, redact_pii=redact_pii)

@@ -1,0 +1,31 @@
+# Relay head-SHA commit statuses to the synthetic merge-queue candidate.
+# This workflow deliberately never runs on pull_request: fleet-merge.sh owns
+# the PR-head status; the job below is only the merge-group check-run.
+name: Fleet attribution merge-group relay
+
+on:
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: read
+
+jobs:
+  attribution:
+    name: fleet/attribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # The candidate may contain an unreviewed rewrite of this gate.
+          ref: ${{ github.event.merge_group.base_sha }}
+          sparse-checkout: scripts/ci
+      - name: Check attribution of every group member
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: python3 scripts/ci/attribution_merge_group.py

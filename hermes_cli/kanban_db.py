@@ -78,13 +78,17 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
+import inspect
 import json
 import os
 import re
 import random
 import secrets
+import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -782,7 +786,7 @@ def _pin_divergence_is_a_hazard(target: Path) -> bool:
         return False
     # Spelling-blind: a pin naming the live home in another case/firmlink
     # spelling still reaches production (card t_ee808d83 class sweep).
-    return _same_tree(target, native)
+    return _pin_tree_agrees(target, native)
 
 
 class KanbanPinDivergenceError(RuntimeError):
@@ -848,7 +852,11 @@ def _refuse_if_override_escapes_hermes_home(override: Path) -> None:
         target = override.resolve(strict=False)
     except OSError:
         return
-    if target.is_relative_to(root):
+    # Spelling-blind on the AGREE side too: the hazard predicate below is
+    # spelling-blind, so a pin naming a file inside the root in another
+    # case/firmlink spelling must be recognised here or it would be refused
+    # as an escape (card t_ee808d83, Argus round 2 N1).
+    if _pin_tree_agrees(target, root):
         _CHECKED_OVERRIDE_ESCAPES.add(key)
         return  # override lives inside the HERMES_HOME-derived root: normal.
     if not _pin_divergence_is_a_hazard(target):
@@ -1076,7 +1084,10 @@ def _refuse_if_pin_contradicts_board_arg(board: Optional[str], override: Path) -
         pinned = override.resolve(strict=False)
     except (OSError, ValueError):
         return
-    if requested == pinned:
+    # Spelling-blind equality: the same DB file spelled in another case or
+    # via the Data-volume firmlink is agreement, not a contradiction (card
+    # t_ee808d83, Argus round 2 N1).
+    if _pin_file_agrees(requested, pinned):
         _CHECKED_PIN_BOARD_CONTRADICTIONS.add(key)
         return  # pin agrees with the argument: the normal worker case.
     if not _pin_divergence_is_a_hazard(pinned):
@@ -4793,6 +4804,346 @@ def _resolve_stored_model_pair(
         return model, provider
 
 
+# ---------------------------------------------------------------------------
+# Home-session card ownership (foreign-session mutation guard)
+# ---------------------------------------------------------------------------
+#
+# ``tasks.session_id`` is a card's HOME session: the chat/agent session that
+# created it. A session acting from a chat may freely READ and COMMENT on any
+# card, but a status/ownership mutation of a card born in ANOTHER session is
+# refused unless the caller passes an explicit override reason, which is then
+# recorded as a comment the home session will see.
+#
+# The guard is keyed on an explicit caller context (:func:`mutation_actor`),
+# set once by each chat-facing surface (the ``hermes kanban`` CLI entry and
+# the ``kanban_*`` tool registration). When no actor is bound — the
+# dispatcher, reapers, the PR gate, direct library/test callers — the guard
+# is inert: it polices humans-and-agents acting from a chat, never the
+# execution lane. The body of a guarded mutator runs with the actor cleared,
+# so internal cascades (a completion promoting children, a reassign that
+# reclaims first) are never re-checked against other cards.
+
+
+class ForeignSessionMutationError(ValueError):
+    """A chat-driven status/ownership mutation targeted a card whose home
+    session is a different session. ``ValueError`` so every existing CLI /
+    tool error path already renders it as a clean refusal."""
+
+
+@dataclass(frozen=True)
+class MutationActor:
+    """Who is mutating, as seen by the home-session guard."""
+
+    session_ids: tuple[str, ...]
+    profile: Optional[str]
+    foreign_ok: Optional[str] = None
+    surface: str = "cli"  # "cli" | "tool" -- only shapes the refusal hint
+
+
+_MUTATION_ACTOR: ContextVar[Optional[MutationActor]] = ContextVar(
+    "kanban_mutation_actor", default=None
+)
+_UNSTAMPED_WARNED: list[bool] = [False]
+
+
+@contextlib.contextmanager
+def mutation_actor(
+    *,
+    session_ids: Iterable[Optional[str]] = (),
+    profile: Optional[str] = None,
+    foreign_ok: Optional[str] = None,
+    surface: str = "cli",
+):
+    """Bind the chat-facing caller for the home-session guard."""
+    ids = tuple(dict.fromkeys(
+        str(s).strip() for s in (session_ids or ()) if s and str(s).strip()
+    ))
+    actor = MutationActor(
+        session_ids=ids,
+        profile=(str(profile).strip() or None) if profile else None,
+        foreign_ok=(str(foreign_ok).strip() or None) if foreign_ok else None,
+        surface=surface,
+    )
+    token = _MUTATION_ACTOR.set(actor)
+    try:
+        yield actor
+    finally:
+        _MUTATION_ACTOR.reset(token)
+
+
+def _caller_session_lineage(session_id: str) -> tuple[str, ...]:
+    """Compression lineage of the caller's session (best effort).
+
+    Context compression rotates the physical session id; without this a
+    session would lose ownership of its own cards after its first
+    compaction. Consulted only on the mismatch path, never on the hot path.
+    """
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            lineage = db.get_compression_lineage(session_id)
+        finally:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
+        return tuple(str(x) for x in (lineage or ()) if x)
+    except Exception:
+        return ()
+
+
+HOME_LINEAGE_MAX_DEPTH = 10
+
+
+def home_ids(session_id: Optional[str], *, db_path: Any = None) -> frozenset[str]:
+    """THE definition of a session's kanban "home": the id plus its
+    ``parent_session_id`` ancestors and descendants that share its
+    ``session_key`` (depth <= :data:`HOME_LINEAGE_MAX_DEPTH` each way).
+
+    Gateway chats rotate their session id (resume_pending_expired,
+    session_switch, most ``/new``) while keeping the ``session_key`` and
+    linking the successor via ``parent_session_id``; an exact-id home would
+    make a chat foreign to its own cards after every rotation. Requiring the
+    same non-NULL ``session_key`` keeps another chat's chain (and keyless
+    subagent/CLI children) out.
+
+    Read-only against the gateway ``state.db`` sessions table, short
+    ``busy_timeout``, and FAIL-OPEN: any error (no state.db, no such row,
+    locked, old schema) returns ``{session_id}`` -- exactly the pre-lineage
+    exact-id behaviour. Shared by ``list --home``, ``show``'s home label,
+    the home-session guard and the kanban-home-cards plugin.
+    """
+    sid = (str(session_id).strip() if session_id else "")
+    if not sid:
+        return frozenset()
+    only = frozenset({sid})
+    try:
+        if db_path is None:
+            from hermes_state import _default_db_path
+
+            db_path = _default_db_path()
+        path = Path(db_path)
+        if not path.is_file():
+            return only
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 2000")
+            row = conn.execute(
+                "SELECT session_key, parent_session_id FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+            if row is None or not row[0]:
+                return only
+            key = row[0]
+            ids = {sid}
+            parent = row[1]
+            for _ in range(HOME_LINEAGE_MAX_DEPTH):
+                if not parent or parent in ids:
+                    break
+                prow = conn.execute(
+                    "SELECT parent_session_id FROM sessions "
+                    "WHERE id = ? AND session_key = ?",
+                    (parent, key),
+                ).fetchone()
+                if prow is None:
+                    break
+                ids.add(parent)
+                parent = prow[0]
+            frontier = [sid]
+            for _ in range(HOME_LINEAGE_MAX_DEPTH):
+                if not frontier:
+                    break
+                ph = ",".join("?" * len(frontier))
+                kids = [
+                    r[0] for r in conn.execute(
+                        f"SELECT id FROM sessions WHERE parent_session_id IN ({ph}) "
+                        "AND session_key = ?",
+                        (*frontier, key),
+                    )
+                    if r[0] and r[0] not in ids
+                ]
+                ids.update(kids)
+                frontier = kids
+            return frozenset(ids)
+        finally:
+            conn.close()
+    except Exception:
+        return only
+
+
+def home_guard_mode() -> str:
+    """``kanban.home_guard``: ``refuse`` (default) or ``warn``.
+
+    2026-09-24: default flipped warn -> refuse now that "home" is the
+    session lineage (:func:`home_ids`), so id rotations inside one chat no
+    longer make a session foreign to its own cards. ``warn`` is the
+    operator escape hatch: the foreign mutation proceeds with one stderr line.
+    Any unreadable/unknown value means ``refuse``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get("home_guard", "refuse")
+    except Exception:
+        return "refuse"
+    return "warn" if str(value).strip().lower() == "warn" else "refuse"
+
+
+def check_home_session(
+    conn: sqlite3.Connection, task_id: str, action: str
+) -> Optional[MutationActor]:
+    """Enforce home-session ownership for one mutation of ``task_id``.
+
+    Returns ``None`` when the mutation is allowed outright, the bound
+    :class:`MutationActor` when it is allowed ONLY via the ``foreign_ok``
+    override (the caller must then record the audit comment once the
+    mutation succeeds), and raises :class:`ForeignSessionMutationError` when
+    it is refused.
+    """
+    actor = _MUTATION_ACTOR.get()
+    if actor is None:
+        return None
+    row = conn.execute(
+        "SELECT session_id, assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None  # unknown id: the mutator reports it in its own words
+    home = (row["session_id"] or "").strip()
+    if not home:
+        if actor.surface == "cli" and not _UNSTAMPED_WARNED[0]:
+            _UNSTAMPED_WARNED[0] = True
+            print(
+                f"kanban: warning: {task_id} has no home session (legacy "
+                f"unstamped card) -- {action} allowed",
+                file=sys.stderr,
+            )
+        return None
+    # No chat-session identity (cron opener, wake script, a plain shell):
+    # that is the execution lane, not a chat acting on a foreign card.
+    if not actor.session_ids:
+        return None
+    if home in actor.session_ids:
+        return None
+    # Execution lane: the assignee works its card wherever it was born, and a
+    # dispatched worker always owns the card it was spawned for.
+    if actor.profile and (row["assignee"] or "") == actor.profile:
+        return None
+    if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
+        return None
+    for sid in actor.session_ids:
+        if home in home_ids(sid) or home in _caller_session_lineage(sid):
+            return None
+    if actor.foreign_ok:
+        return actor
+    caller = ", ".join(actor.session_ids) or "none"
+    if home_guard_mode() == "warn":
+        print(
+            f"kanban: warning: {action} on {task_id} from caller session "
+            f"{caller}; its home session is {home} (kanban.home_guard=warn, "
+            f"allowed)",
+            file=sys.stderr,
+        )
+        return None
+    override = (
+        '--foreign-ok "<reason>"' if actor.surface == "cli"
+        else 'foreign_ok="<reason>"'
+    )
+    raise ForeignSessionMutationError(
+        f"refused {action} on {task_id}: its home session is {home} "
+        f"(caller session: {caller}). Status/ownership changes belong to the "
+        f"home session or the assignee -- comment instead: "
+        f"hermes kanban comment {task_id} \"...\" "
+        f"(or override with {override}, which posts an audit comment)."
+    )
+
+
+def _mutation_succeeded(result: Any) -> bool:
+    if result is None:  # ``-> None`` mutators (link_tasks) signal failure by raising
+        return True
+    if isinstance(result, tuple):
+        return bool(result and result[0])
+    return bool(result)
+
+
+def record_foreign_action(
+    conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor
+) -> None:
+    """Append the audit comment for an overridden foreign-session mutation."""
+    sess = ", ".join(actor.session_ids) or "no-session"
+    session_ref = None
+    if actor.session_ids:
+        try:
+            session_ref = derive_session_ref(actor.session_ids[0])
+        except Exception:
+            session_ref = None
+    add_comment(
+        conn,
+        task_id,
+        author=actor.profile or "user",
+        body=(
+            f"foreign-session action by {sess} ({actor.profile or 'unknown'}): "
+            f"{actor.foreign_ok} [{action}]"
+        ),
+        session_ref=session_ref,
+    )
+
+
+def _home_session_guarded(action: str, task_param: str = "task_id"):
+    """Decorate a status/ownership mutator with the home-session guard.
+
+    ``task_param`` names the parameter holding the card being mutated
+    (``child_id`` for :func:`link_tasks`, whose status a link can demote).
+    The contract test enumerates writers of ``tasks.status/assignee/priority/``
+    ``session_id`` plus dispatch-intent events. Each carries this decorator or
+    is an execution-lane internal listed in its ``EXECUTION_LANE`` table.
+    """
+
+    def deco(fn):
+        sig = inspect.signature(fn)
+        if task_param not in sig.parameters:
+            raise TypeError(f"{fn.__name__} has no parameter {task_param!r}")
+
+        @functools.wraps(fn)
+        def wrapper(conn, *args, **kwargs):
+            if _MUTATION_ACTOR.get() is None or kwargs.get("dry_run"):
+                return fn(conn, *args, **kwargs)
+            task_id = sig.bind_partial(conn, *args, **kwargs).arguments.get(task_param)
+            override = check_home_session(conn, str(task_id), action)
+            token = _MUTATION_ACTOR.set(None)
+            try:
+                result = fn(conn, *args, **kwargs)
+            finally:
+                _MUTATION_ACTOR.reset(token)
+            if override is not None and _mutation_succeeded(result):
+                record_foreign_action(conn, str(task_id), action, override)
+            return result
+
+        wrapper.__home_session_action__ = action
+        wrapper.__home_session_task_param__ = task_param
+        return wrapper
+
+    return deco
+
+
+@_home_session_guarded("update --session")
+def set_task_session(
+    conn: sqlite3.Connection, task_id: str, session_id: Optional[str]
+) -> bool:
+    """(Re)stamp a card's home session. ``None`` clears it (unstamped)."""
+    sid = (str(session_id).strip() or None) if session_id else None
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ?", (sid, task_id)
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "session_restamped", {"session_id": sid}
+        )
+    return True
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -5371,6 +5722,7 @@ def list_tasks(
     status: Optional[str] = None,
     tenant: Optional[str] = None,
     session_id: Optional[str] = None,
+    session_ids: Optional[Iterable[str]] = None,
     include_archived: bool = False,
     limit: Optional[int] = None,
     order_by: Optional[str] = None,
@@ -5393,6 +5745,13 @@ def list_tasks(
     if session_id is not None:
         query += " AND session_id = ?"
         params.append(session_id)
+    if session_ids is not None:
+        sids = sorted({str(x) for x in session_ids if x})
+        if not sids:
+            query += " AND 0"
+        else:
+            query += f" AND session_id IN ({','.join('?' * len(sids))})"
+            params.extend(sids)
     if workflow_template_id is not None:
         query += " AND workflow_template_id = ?"
         params.append(workflow_template_id)
@@ -5416,6 +5775,7 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+@_home_session_guarded("assign")
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
@@ -5762,6 +6122,14 @@ def apply_batch_route_writes(
         effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
         prepared.append((write, model, provider, effort))
 
+    # Home-session guard for every card in the batch, before the writer lock:
+    # one foreign card refuses the whole batch with nothing written.
+    overrides: dict[str, MutationActor] = {}
+    for write in writes:
+        ov = check_home_session(conn, write.task_id, "set-model")
+        if ov is not None:
+            overrides[write.task_id] = ov
+
     written: list[str] = []
     fields: dict[str, tuple[str, ...]] = {}
     skipped_now: dict[str, str] = {}
@@ -5797,6 +6165,8 @@ def apply_batch_route_writes(
     # batch never announces a mutation that did not happen.
     for task_id in written:
         notify_task_updated(conn, task_id, fields[task_id])
+        if task_id in overrides:
+            record_foreign_action(conn, task_id, "set-model", overrides[task_id])
     return written
 
 
@@ -5804,6 +6174,7 @@ def apply_batch_route_writes(
 # Links
 # ---------------------------------------------------------------------------
 
+@_home_session_guarded("link", task_param="child_id")
 def link_tasks(
     conn: sqlite3.Connection,
     parent_id: str,
@@ -6521,6 +6892,15 @@ def _append_event(
     and the row carries NULL.
     """
     now = int(time.time())
+    if kind in _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS or (
+        kind == "dependency_wait" and (payload or {}).get("kind") == "dependency"
+    ) or (kind == "reclaimed" and (payload or {}).get("manual") is True):
+        # Snapshot comment causality in the same transaction as operator intent.
+        # Old commented events cannot be correlated with comment rows reliably.
+        payload = dict(payload or {})
+        payload["after_comment_id"] = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
+        ).fetchone()[0]
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
@@ -6914,6 +7294,8 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 
+
+
 def _prior_worker_still_alive(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[dict]:
@@ -6921,15 +7303,21 @@ def _prior_worker_still_alive(
 
     A release outcome is not a death certificate: operator and worker calls
     can write identical outcomes, and a newer synthetic row can mask an older
-    owner. Inspect ended runs at both claim doors, before a second spawn.
-    A claimed-but-never-spawned run has no PID to probe here; its active claim
-    remains protected by the reclaim/reconcile guards.
+    owner. Inspect EVERY prior run at both claim doors, before a second
+    spawn -- ended or still open. An open run on a claimable card is a leaked
+    ``current_run_id`` (claim_task's invariant recovery closes it below); its
+    owner is exactly as able to be alive as an ended run's, so the ended_at
+    filter must not hide it. A claimed-but-never-spawned run has no PID to
+    probe here; its active claim remains protected by the reclaim/reconcile
+    guards.
     """
     # An outcome cannot certify exit: operators can write the same outcomes as
     # worker tools, and a newer synthetic row can hide an older live owner.
     runs = conn.execute(
-        "SELECT id, outcome, ended_at FROM task_runs WHERE task_id = ? "
-        "AND ended_at IS NOT NULL ORDER BY id DESC", (task_id,),
+        "SELECT r.id, r.outcome, r.ended_at, r.started_at, t.max_runtime_seconds "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.task_id = ? ORDER BY r.id DESC",
+        (task_id,),
     ).fetchall()
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     for row in runs:
@@ -6940,7 +7328,7 @@ def _prior_worker_still_alive(
 
 
 def _spawned_owner_alive(conn, task_id, row, host_prefix):
-    """Probe one ended run's spawned owner using its durable event evidence."""
+    """Probe one prior run's spawned owner(s) using durable event evidence."""
 
     # _end_run clears task_runs.worker_pid, so the durable claimed/spawned
     # events are the record. Both claim doors emit ``claimed`` with the lock
@@ -6949,13 +7337,27 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
     # run_id NULL -- measured on t_09180e10, 5 s after the reclaim.
     # Legacy / hand-built rows may lack the claimed event; fall back to any
     # event of that run that recorded the lock (reclaimed.prev_lock, ...).
+    # Explicitly bounded workers cannot still own a run this long after its
+    # release, even when the PID has since been recycled.
+    if (row["max_runtime_seconds"] is not None and row["ended_at"] is not None
+            and time.time() > row["ended_at"] + row["max_runtime_seconds"]
+            + RECLAIM_DEFER_GRACE_SECONDS):
+        return None
     run_events = conn.execute(
-        "SELECT id, kind, payload FROM task_events WHERE task_id = ? "
-        "AND run_id = ? ORDER BY (kind = 'claimed') DESC, id ASC",
+        "SELECT id, kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND run_id = ? "
+        "ORDER BY (kind = 'claimed') DESC, id ASC",
         (task_id, row["id"]),
     ).fetchall()
     if not run_events:
         return None
+    # Lower edge of the run's causal window: a worker cannot exist before its
+    # claim committed. Legacy rows without a ``claimed`` event fall back to
+    # the run's started_at (stamped in the same claim txn).
+    claimed_at = next(
+        (ev["created_at"] for ev in run_events if ev["kind"] == "claimed"),
+        row["started_at"],
+    )
     lock = ""
     for ev in run_events:
         try:
@@ -6977,28 +7379,116 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
         "SELECT MIN(id) FROM task_events WHERE task_id = ? "
         "AND kind = 'claimed' AND id > ?", (task_id, boundary_id),
     ).fetchone()[0]
-    spawned = conn.execute(
-        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'spawned' AND id >= ? "
+    # Probe EVERY spawn in the interval, not just the newest: a run stamped
+    # twice leaves an older PID that a later dead one must not vouch for.
+    # _set_worker_pid is the only worker_pid writer and always appends this
+    # event in the same txn, so an open run's row pid is covered here too.
+    spawns = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'spawned' AND id >= ? "
         "AND (run_id = ? OR (run_id IS NULL AND (? IS NULL OR id < ?))) "
-        "ORDER BY id DESC LIMIT 1",
+        "ORDER BY id DESC",
         (task_id, boundary_id, row["id"], next_claim, next_claim),
-    ).fetchone()
-    if spawned is None:
-        return None
-    try:
-        pid = int(json.loads(spawned["payload"] or "{}")["pid"])
-    except (TypeError, ValueError, KeyError):
-        return None
-    if _pid_alive(pid):
+    ).fetchall()
+    candidates = []
+    for spawned in spawns:
+        try:
+            pid = int(json.loads(spawned["payload"] or "{}")["pid"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        candidates.append((pid, spawned["run_id"] is None,
+                           spawned["created_at"]))
+    for pid, late, spawned_at in candidates:
+        if not _pid_alive(pid):
+            continue
+        # Liveness is not identity: the PID may now belong to an unrelated
+        # process (recycled PID). The owner is the process at this PID only
+        # if it was created inside this run's causal window.
+        identity = _owner_identity(pid, claimed_at, spawned_at)
+        if identity == "recycled":
+            continue
         return {"prev_pid": pid, "prev_lock": lock,
                 "prev_run_id": row["id"],
                 "prev_outcome": row["outcome"],
-                "late_spawn": spawned["run_id"] is None,
+                "prev_run_open": row["ended_at"] is None,
+                "late_spawn": late,
+                "owner_identity": identity,
                 "needs_attention": True}
     return None
 
 
+# Causal-window tolerances for owner identity, in seconds. Event timestamps
+# are integer seconds (floored), so allow 1 s before the claim and 2 s after
+# the spawned event. The window is deliberately ONE-SIDED around the spawn:
+# ``_set_worker_pid`` writes the ``spawned`` event inside write_txn AFTER
+# Popen, so under DB lock contention the event can lag the worker's real
+# creation by up to the busy timeout (measured -7.5 s / -19.6 s on genuine
+# workers). A symmetric +/-N s window around ``spawned_at`` would call those
+# genuine workers dead and let a second worker onto the card.
+_OWNER_CREATE_LEAD_SECONDS = 1.0
+_OWNER_CREATE_LAG_SECONDS = 2.0
+
+
+def _pid_create_time(pid: int) -> Optional[float]:
+    """Wall-clock epoch creation time of ``pid``, or None if unreadable."""
+    try:
+        import psutil
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:  # optional psutil, or process vanished during the probe
+        pass
+    if os.name == "posix":
+        try:
+            from datetime import datetime
+            proc = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(int(pid))],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, timeout=1,
+                env={**os.environ, "LC_ALL": "C"}, check=False,
+            )
+            if proc.returncode == 0:
+                return datetime.strptime(
+                    proc.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def _real_pid_started_in_claim(pid, claimed_at, spawned_at) -> Optional[bool]:
+    """Whether a live ``pid`` was created inside the run's causal window.
+
+    ``True``: created inside ``[claimed_at - 1 s, spawned_at + 2 s]``.
+    ``False``: created outside it -- provably not the recorded worker.
+    ``None``: create time unreadable. A missing bound is simply not applied,
+    so missing evidence never proves a PID recycled.
+    """
+    created = _pid_create_time(pid)
+    if created is None:
+        return None
+    if claimed_at is not None and created < float(claimed_at) - _OWNER_CREATE_LEAD_SECONDS:
+        return False
+    if spawned_at is not None and created > float(spawned_at) + _OWNER_CREATE_LAG_SECONDS:
+        return False
+    return True
+
+
+# Seam: tests with synthetic PIDs substitute a constant verdict here.
+_pid_started_in_claim = _real_pid_started_in_claim
+
+
+def _owner_identity(pid, claimed_at, spawned_at) -> str:
+    """Classify a LIVE pid against the run that recorded it.
+
+    Returns ``"verified"``, ``"recycled"`` (provably not the recorded
+    worker), or ``"unverified"`` (create time unreadable -- fail CLOSED, the
+    caller treats it as the owner).
+    """
+    started = _pid_started_in_claim(pid, claimed_at, spawned_at)
+    if started is None:
+        return "unverified"
+    return "verified" if started else "recycled"
+
+
+@_home_session_guarded("claim")
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7524,6 +8014,7 @@ def release_stale_claims(
     return reclaimed
 
 
+@_home_session_guarded("reclaim")
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7640,6 +8131,7 @@ def reclaim_task(
     return True
 
 
+@_home_session_guarded("reassign")
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7867,6 +8359,7 @@ class EmptySupersedeError(ValueError):
         )
 
 
+@_home_session_guarded("complete")
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8432,11 +8925,17 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                     roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
                 except OSError:
                     continue
+    memo: dict = {}
     for root, board in roots:
-        if p_abs == root:
-            continue
         try:
-            if p_abs.is_relative_to(root):
+            # Spelling-blind (card t_ee808d83 round 3): a DB row can store a
+            # scratch path in another case/firmlink spelling, and a literal
+            # miss refused its reclamation forever. Containment is decided by
+            # kernel names, and STRICT descendancy is kept the same way: the
+            # root itself, in any spelling, is never managed.
+            if _same_path(p_abs, root, memo):
+                continue
+            if _same_tree(p_abs, root, memo):
                 return True, board
         except ValueError:
             continue
@@ -8472,7 +8971,7 @@ def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
         return False
     try:
         want = _board_db_path_ignoring_pin(_normalize_board_slug(board) or board)
-        return Path(actual).resolve(strict=False) == want.resolve(strict=False)
+        return _same_path(Path(actual).resolve(strict=False), want.resolve(strict=False))
     except Exception:
         return False
 
@@ -8483,90 +8982,134 @@ def _conn_is_board(conn: sqlite3.Connection, board: str) -> bool:
 _CWD_SNAPSHOT_SCOPE: ContextVar[Optional[list]] = ContextVar(
     "kanban_cwd_snapshot_scope", default=None,
 )
+_CWD_SCAN_BUDGET_SECONDS = 30
 
 
-#: macOS spells every path on the Data volume twice: ``/Users/...`` and the
-#: firmlinked ``/System/Volumes/Data/Users/...``. Only used to decide whether
-#: two spellings are worth asking the kernel about (:func:`_same_tree`).
-_FIRMLINK_DATA_PREFIX = "/System/Volumes/Data"
+@contextlib.contextmanager
+def _bounded_cwd_probe():
+    """Bound lsof, cwd identity snapshot, and a candidate stat; fail closed.
 
-
-def _kernel_path(p) -> Optional[Path]:
-    """Return the kernel's own spelling of existing path *p*.
-
-    ``Path.resolve()`` follows symlinks only. On case-insensitive APFS it keeps
-    the caller's case, NFC vs NFD, and ``/System/Volumes/Data`` firmlink
-    spellings, while ``lsof`` prints the kernel's canonical name -- so a
-    string compare of the two misses a live cwd (card t_ee808d83, Argus
-    round 1). The kernel answers from an open descriptor: ``F_GETPATH`` on
-    macOS, ``/proc/self/fd`` on Linux, which is the same name source lsof
-    uses. Returns ``None`` on platforms with neither; raises ``OSError`` when
-    the path cannot be opened or named, so callers choose their fail-closed
-    answer.
+    The deadline starts with a probe, never with the GC removal loop: a slow
+    rmtree must not spend the following candidate's probe budget. All lsof
+    cwd ancestors are resolved in the first probe and cached for this run.
+    A stat on a dead mount can block independently of lsof. SIGALRM interrupts
+    it on POSIX; threads/platforms without timers refuse reclamation.
     """
-    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
-        return None
-    fd = os.open(os.fspath(p), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    deadline = time.monotonic() + _CWD_SCAN_BUDGET_SECONDS
+    alarm_signal = getattr(signal, "SIGALRM", None)
+    if (alarm_signal is None or not hasattr(signal, "setitimer") or
+            threading.current_thread() is not threading.main_thread()):
+        raise TimeoutError("cwd probe cannot be bounded in this context")
+    previous = signal.getitimer(signal.ITIMER_REAL)
+    if previous[0] > 0:
+        raise TimeoutError("cwd probe cannot replace an existing alarm")
+    old_handler = signal.getsignal(alarm_signal)
+
+    def expired(_signum, _frame):
+        raise TimeoutError("cwd probe budget exhausted")
+
+    signal.signal(alarm_signal, expired)
     try:
-        if sys.platform == "darwin":
-            import fcntl
-
-            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
-            name = os.fsdecode(raw.split(b"\0", 1)[0])
-        else:
-            name = os.readlink(f"/proc/self/fd/{fd}")
-            if name.endswith(" (deleted)"):
-                raise FileNotFoundError(name)
+        signal.setitimer(signal.ITIMER_REAL, max(deadline - time.monotonic(), 0.000001))
+        yield
     finally:
-        os.close(fd)
-    if not name.startswith("/"):
-        raise OSError(f"kernel returned a non-absolute path for {p}: {name!r}")
-    return Path(name)
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(alarm_signal, old_handler)
 
 
-def _loose_spelling(p: Path) -> Path:
-    """Fold the spelling axes the kernel may canonicalise (case, Unicode
-    normalisation, the Data-volume firmlink). A cheap pre-filter only: it
-    decides when :func:`_same_tree` should pay for a kernel lookup."""
-    import unicodedata
+def _path_identity(path: Path, memo: Optional[dict] = None) -> Optional[tuple[int, int]]:
+    """Filesystem identity of an EXISTING path, without opening a descriptor.
 
-    s = unicodedata.normalize("NFC", str(p)).casefold()
-    prefix = _FIRMLINK_DATA_PREFIX.casefold()
-    if s == prefix or s.startswith(prefix + "/"):
-        s = s[len(prefix):] or "/"
-    return Path(s)
+    The kernel resolves case, Unicode and firmlink aliases. Missing paths have
+    no identity; never borrow a parent mount's identity for a missing child.
+    In particular, opening and closing a DB file would cancel SQLite locks.
+    """
+    key = str(path)
+    if memo is not None and key in memo:
+        return memo[key]
+    try:
+        stat = os.stat(os.path.realpath(os.path.expanduser(key)))
+        result = (stat.st_dev, stat.st_ino)
+    except (OSError, ValueError):
+        result = None
+    if memo is not None:
+        memo[key] = result
+    return result
+
+
+def _existing_ancestor(path: Path) -> Path:
+    """For a missing path, find the nearest ancestor with a filesystem ID."""
+    current = path
+    while _path_identity(current) is None and current.parent != current:
+        current = current.parent
+    return current
 
 
 def _same_tree(child: Path, parent: Path, memo: Optional[dict] = None) -> bool:
-    """True when *child* is *parent* or lies beneath it, however either is spelled.
-
-    Both arguments are ``resolve()``d paths from different sources (the
-    board DB, the environment, a candidate). An exact match answers at once.
-    Otherwise only pairs that agree once case / Unicode / firmlink spelling is
-    folded are re-compared by their kernel names, so unrelated rows (NAS
-    mounts, other projects) are never opened. A path the kernel cannot name
-    keeps its literal spelling: a missing path cannot physically contain or
-    sit inside an existing one under another name.
-    """
-    if child == parent or child.is_relative_to(parent):
-        return True
-    if not _loose_spelling(child).is_relative_to(_loose_spelling(parent)):
+    """Walk the existing child's ancestors; compare filesystem identities."""
+    target = _path_identity(parent, memo)
+    if target is None or _path_identity(child, memo) is None:
         return False
+    current = Path(os.path.realpath(os.path.expanduser(str(child))))
+    while True:
+        if _path_identity(current, memo) == target:
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
 
-    def canon(p: Path) -> Path:
-        key = str(p)
-        if memo is not None and key in memo:
-            return memo[key]
-        try:
-            got = _kernel_path(p) or p
-        except (OSError, ValueError):
-            got = p
-        if memo is not None:
-            memo[key] = got
-        return got
 
-    c, q = canon(child), canon(parent)
-    return c == q or c.is_relative_to(q)
+def _same_path(a: Path, b: Path, memo: Optional[dict] = None) -> bool:
+    """True only for two existing filesystem objects with identical identity."""
+    first, second = _path_identity(a, memo), _path_identity(b, memo)
+    return first is not None and first == second
+
+
+def _pin_missing_parts(path: Path) -> tuple[Optional[tuple[int, int]], tuple[str, ...]]:
+    """Pin-only identity: nearest existing ancestor ID and exact missing tail."""
+    ancestor = _existing_ancestor(path)
+    return _path_identity(ancestor), path.parts[len(ancestor.parts):]
+
+
+def _pin_tree_agrees(child: Path, parent: Path) -> bool:
+    """Pin-only containment: filesystem identity plus exact uncreated tail.
+
+    Never use this for scratch admission or ownership. Missing paths have no
+    identity there; only the pin resolver needs to agree before mkdir.
+    """
+    child_base, child_tail = _pin_missing_parts(child)
+    parent_base, parent_tail = _pin_missing_parts(parent)
+    if child_base is None or parent_base is None:
+        return False
+    if not parent_tail:
+        return _same_tree(_existing_ancestor(child), parent)
+    return child_base == parent_base and child_tail[:len(parent_tail)] == parent_tail
+
+
+def _pin_file_agrees(a: Path, b: Path) -> bool:
+    """Compare an uncreated DB pin by existing ancestor and exact missing tail.
+
+    This is a pin agreement check, never scratch admission or ownership: an
+    uncreated DB file has no filesystem identity until the first connection.
+    """
+    identity_a, tail_a = _pin_missing_parts(a)
+    identity_b, tail_b = _pin_missing_parts(b)
+    return identity_a is not None and identity_a == identity_b and tail_a == tail_b
+
+
+def _unknown_owner_may_claim(candidate: Path, stored: Path) -> bool:
+    """A missing stored path may only add a refusal, never admit deletion."""
+    import unicodedata
+
+    def fold(path: Path) -> str:
+        name = unicodedata.normalize("NFC", str(path)).casefold()
+        prefix = "/system/volumes/data"
+        if name.startswith(prefix + "/"):
+            name = name[len(prefix):]
+        return name.rstrip("/")
+
+    a, b = fold(candidate), fold(stored)
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
 def _scan_process_cwds() -> Optional[frozenset]:
@@ -8580,10 +9123,9 @@ def _scan_process_cwds() -> Optional[frozenset]:
     this process's own cwd, so a non-zero exit or an empty listing is a
     failed scan, never "nothing found"; callers must fail closed on None.
 
-    Names are kept exactly as lsof prints them -- the kernel's canonical
-    spelling -- and are not touched on disk: resolving ~200 cwds here would
-    sit outside the lsof timeout and could hang on a dead network mount.
-    :func:`_process_cwd_within` canonicalises the CANDIDATE instead.
+    Names are kept exactly as lsof prints them. The first candidate's probe
+    resolves every cwd ancestor under a single 30s deadline and caches the
+    result; later candidates get fresh bounded identity checks.
     """
     try:
         result = subprocess.run(
@@ -8619,13 +9161,37 @@ def process_cwd_snapshot_scope():
         _CWD_SNAPSHOT_SCOPE.reset(token)
 
 
-def _process_cwds() -> Optional[frozenset]:
+def _process_cwds() -> Optional[tuple[frozenset, tuple]]:
+    """Cache cwd ancestor identities as well as lsof output under one deadline."""
     slot = _CWD_SNAPSHOT_SCOPE.get()
-    if slot is None:
-        return _scan_process_cwds()
-    if not slot:
-        slot.append(_scan_process_cwds())
-    return slot[0]
+    if slot is not None and slot:
+        return slot[0]
+    try:
+        with _bounded_cwd_probe():
+            cwds = _scan_process_cwds()
+            snapshot = None
+            if cwds is not None:
+                known, unknown = set(), []
+                for cwd in cwds:
+                    if _path_identity(cwd) is None:
+                        unknown.append(cwd)
+                        continue
+                    current = Path(os.path.realpath(os.path.expanduser(str(cwd))))
+                    while True:
+                        identity = _path_identity(current)
+                        if identity is None:
+                            unknown.append(cwd)
+                            break
+                        known.add(identity)
+                        if current == current.parent:
+                            break
+                        current = current.parent
+                snapshot = (frozenset(known), tuple(unknown))
+    except (OSError, RuntimeError, ValueError):
+        snapshot = None
+    if slot is not None:
+        slot.append(snapshot)
+    return snapshot
 
 
 def _process_cwd_within(path: Path) -> bool:
@@ -8636,19 +9202,25 @@ def _process_cwd_within(path: Path) -> bool:
     exempting that broad enclosing path from ownership. A failed or timed-out
     cwd scan answers True (preserve the path).
     """
-    cwds = _process_cwds()
-    if cwds is None:
+    snapshot = _process_cwds()
+    if snapshot is None:
         return True
     try:
-        targets = {Path(path).resolve(strict=False)}
-        # lsof prints kernel spellings; match against the candidate's kernel
-        # spelling too (case / NFC-NFD / firmlink). Unnameable => fail closed.
-        canonical = _kernel_path(path)
+        # Candidate identity is separately bounded; it does not consume or
+        # consult the cached cwd scan's deadline after a slow deletion.
+        with _bounded_cwd_probe():
+            identity = _path_identity(path)
+            if identity is None:
+                return True
+            known, unknown = snapshot
+            if identity in known:
+                return True
+            for cwd in unknown:
+                if _unknown_owner_may_claim(path, cwd):
+                    return True
+            return False
     except (OSError, RuntimeError, ValueError):
         return True
-    if canonical is not None:
-        targets.add(canonical)
-    return any(cwd == t or cwd.is_relative_to(t) for cwd in cwds for t in targets)
 
 
 def _live_owners_of_path(
@@ -8692,17 +9264,11 @@ def _live_owners_of_path(
     except Exception:
         return ["<unresolvable-owner>"] if live_only else []
 
-    candidates: set = set()
     managed_root: Optional[Path] = None
     if is_managed:
-        # A nested checkout belongs to the enclosing card too; testing only
-        # resolved.name would miss <root>/<live-card>/repo.
         for parent in (resolved, *resolved.parents):
-            if _is_managed_scratch_path(parent):
-                if _TASK_DIR_NAME_RE.fullmatch(parent.name):
-                    candidates.add(parent.name)
-            else:
-                managed_root = parent  # the workspaces root itself
+            if not _is_managed_scratch_path(parent):
+                managed_root = parent
                 break
     # Stored rows and the candidate come from different sources and may spell
     # the same directory differently (case, NFC/NFD, firmlink); compare them
@@ -8736,8 +9302,14 @@ def _live_owners_of_path(
                 rows = c.execute(sql).fetchall()
             except Exception:
                 return ["<unreadable-task-table>"] if live_only else []
-            ids = candidates.intersection(row["id"] for row in rows)
+            ids = set()
             for row in rows:
+                # Convention ownership is a filesystem question, not a
+                # comparison of the candidate's spelling with a task id.
+                if (is_managed and managed_root is not None
+                        and _TASK_DIR_NAME_RE.fullmatch(row["id"])
+                        and _same_tree(resolved, managed_root / row["id"], spelling_memo)):
+                    ids.add(row["id"])
                 if not row["workspace_path"]:
                     continue
                 try:
@@ -8746,6 +9318,13 @@ def _live_owners_of_path(
                     ).expanduser().resolve(strict=False)
                 except Exception:
                     return ["<unresolvable-owner-path>"] if live_only else []
+                if _path_identity(stored, spelling_memo) is None:
+                    if (live_only and _task_has_live_run(c, row["id"])
+                            and _unknown_owner_may_claim(resolved, stored)):
+                        # A row may name the candidate despite an unstatable
+                        # path. Unknown identity can only prevent removal.
+                        return ["<unknown-owner-path>"]
+                    continue
                 stored_in = _same_tree(stored, resolved, spelling_memo)
                 path_in = _same_tree(resolved, stored, spelling_memo)
                 if not (stored_in or path_in):
@@ -8886,7 +9465,12 @@ def _durable_audit_log_path(target: Path, board: Optional[str]) -> Path:
         except OSError:
             continue
         try:
-            if _same_tree(resolved, target):
+            # The audit FILE may not exist yet; its existing parent still
+            # determines whether writing it would be inside the target.
+            current = _existing_ancestor(resolved)
+            if (_same_tree(current, target)
+                    or (_path_identity(target) is None
+                        and _unknown_owner_may_claim(resolved, target))):
                 continue  # would be destroyed by the deletion it records
         except (ValueError, OSError):
             pass
@@ -9031,6 +9615,8 @@ def safe_remove_workspace_dir(
         )
         return False
 
+    if not resolved.is_dir():
+        return False
     if not _is_managed_scratch_path(resolved):
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,
@@ -9640,6 +10226,7 @@ def edit_completed_task_result(
     return True
 
 
+@_home_session_guarded("block")
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10169,6 +10756,7 @@ def arm_review_stale_alerts(conn: sqlite3.Connection, entries: list[dict]) -> li
     return fresh
 
 
+@_home_session_guarded("request-review")
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10347,6 +10935,7 @@ def request_review(
     return _ret(True)
 
 
+@_home_session_guarded("request-changes")
 def request_changes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10466,6 +11055,47 @@ def request_changes(
     return True, implementer
 
 
+@_home_session_guarded("requeue")
+def requeue_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> tuple[bool, Optional[str]]:
+    """Record operator intent to run a READY card now (``requeued`` event).
+
+    The operator verb for a card that is already ``ready`` but deferred by the
+    respawn guard (typically ``active_pr``: the open PR is the fix-round
+    target). ``unblock``/``reopen``/``triage-resolve`` all require a non-ready
+    source state, which previously forced a block->unblock round trip just to
+    mint an intent event. Status is unchanged; ``requeued`` is in
+    ``_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS`` so the next dispatch tick spawns.
+
+    Returns ``(True, None)`` on success, ``(False, reason)`` if refused.
+    """
+    if not (reason or "").strip():
+        return False, "a reason is required to requeue a task"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        if row["status"] != "ready":
+            return False, (
+                f"task {task_id} is {row['status']!r}; requeue only applies to "
+                f"'ready' tasks (use unblock/reopen/triage-resolve/promote "
+                f"for other states)"
+            )
+        _append_event(
+            conn, task_id, "requeued", {"actor": actor, "reason": reason},
+        )
+    return True, None
+
+
+
+@_home_session_guarded("reopen")
 def reopen_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10594,6 +11224,7 @@ def reopen_task(
     return True, None
 
 
+@_home_session_guarded("promote")
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10713,6 +11344,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
+@_home_session_guarded("unblock")
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -10774,6 +11406,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+@_home_session_guarded("reopen-review")
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``review`` -> ready (or todo) so the implementer re-runs.
 
@@ -11012,6 +11645,7 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+@_home_session_guarded("specify")
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11114,6 +11748,7 @@ def specify_triage_task(
 TRIAGE_RESOLVE_TARGETS = ("todo", "done", "archived")
 
 
+@_home_session_guarded("triage-resolve")
 def triage_resolve_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11240,6 +11875,7 @@ def triage_resolve_task(
     return True, None
 
 
+@_home_session_guarded("decompose")
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11506,6 +12142,7 @@ def decompose_triage_task(
     return child_ids
 
 
+@_home_session_guarded("archive")
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
@@ -12148,6 +12785,7 @@ def set_workspace_path(
     record_baseline(conn, task_id, path)
 
 
+@_home_session_guarded("set-model")
 def set_task_model(
     conn: sqlite3.Connection, task_id: str, model: Optional[str]
 ) -> int:
@@ -12198,6 +12836,7 @@ def set_branch_name(
 
 
 # ---------------------------------------------------------------------------
+@_home_session_guarded("schedule")
 def schedule_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12309,11 +12948,181 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Escalating hold after CONSECUTIVE rate-limited runs. The flat cooldown above
+# never escalated, so a card re-probed an exhausted pool every 5 minutes for
+# hours (measured 2026-09-22 over 7d: 3,706 rate_limited runs, zero inter-retry
+# gaps below 304s, 1,538 clustered at the floor; worst card retried 128x).
+# Streak N holds for ladder[N-1], capped at the last rung; the configured
+# cooldown stays the floor. Any non-rate_limited run resets the streak.
+RATE_LIMIT_BACKOFF_LADDER: tuple[int, ...] = (300, 900, 2700, 7200)  # 5m 15m 45m 2h
+
+# Board-wide circuit: >= trip rate_limited closes inside the window hold every
+# pool-bound spawn for one further window. The pool is down for everyone, so
+# per-card backoff alone still lets N cards each spend a probe.
+DEFAULT_RATE_LIMIT_TRIP = 5
+RATE_LIMIT_TRIP_WINDOW_SECONDS = 600  # 10 minutes
+_RATE_LIMIT_CIRCUIT_MARKER = ".rate_limit_circuit.json"
+
+
+def _rate_limit_hold_seconds(streak: int, *, base: int) -> int:
+    """Seconds to hold a card after ``streak`` consecutive rate-limited runs."""
+    if base <= 0:
+        return 0  # operator disabled the cooldown entirely
+    if streak <= 1:
+        return base
+    rung = RATE_LIMIT_BACKOFF_LADDER[min(streak, len(RATE_LIMIT_BACKOFF_LADDER)) - 1]
+    return max(base, rung)
+
+
+def consecutive_rate_limited_runs(conn: sqlite3.Connection, task_id: str) -> int:
+    """Trailing count of CLOSED runs whose outcome is ``rate_limited``."""
+    streak = 0
+    for r in conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT ?",
+        (task_id, len(RATE_LIMIT_BACKOFF_LADDER) + 1),
+    ):
+        if r["outcome"] != "rate_limited":
+            break
+        streak += 1
+    return streak
+
+
+def _resolve_rate_limit_trip() -> int:
+    """``kanban.rate_limit_trip`` (0 disables the circuit)."""
+    try:
+        from hermes_cli.config import load_config
+        value = int(load_config().get("kanban", {}).get("rate_limit_trip", DEFAULT_RATE_LIMIT_TRIP))
+        return value if value >= 0 else DEFAULT_RATE_LIMIT_TRIP
+    except Exception:
+        return DEFAULT_RATE_LIMIT_TRIP
+
+
+def rate_limit_circuits(
+    conn: sqlite3.Connection, *, now: int, trip: int,
+    window: int = RATE_LIMIT_TRIP_WINDOW_SECONDS,
+) -> dict[str, int]:
+    """``{pool_key: open_until}`` for every pool whose circuit is open now.
+
+    Only closes whose route is pool-bound count, grouped by the pool that
+    served them (``kanban_provider_health.pool_key``: relay family, or the one
+    sub a pinned lane hits) -- five openai-codex 429s are not claude-pool
+    evidence, and a bpr storm says nothing about apr (Argus r1, PR #953).
+    A close is charged to the pool that SERVED the run: a dispatch-time
+    route change (capped-pool fallback rung, lane override) is recorded as a
+    run-scoped ``dispatch_provider_fallback`` / ``dispatch_lane_route`` event
+    and wins; otherwise the route is re-derived from the card's pin + the
+    run's profile (Argus r2 G1: fallback-rung 429s charged to the primary).
+
+    Derived from ``task_runs`` alone (no in-memory latch), so it survives a
+    gateway restart: a pool trips at the latest close that completes ``trip``
+    of its rate-limited closes within ``window`` and holds for ``window``.
+    """
+    if trip <= 0:
+        return {}
+    from types import SimpleNamespace
+    from hermes_cli.kanban_provider_health import effective_provider, pool_key
+
+    rows = conn.execute(
+        "SELECT r.id, r.ended_at, r.profile, t.assignee, t.model_override, t.provider_override "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.outcome = 'rate_limited' AND r.ended_at IS NOT NULL AND r.ended_at >= ? "
+        "ORDER BY r.ended_at",
+        (now - 2 * window,),
+    ).fetchall()
+    served: dict[int, str] = {}
+    run_ids = [int(r["id"]) for r in rows]
+    for i in range(0, len(run_ids), 500):
+        chunk = run_ids[i:i + 500]
+        for ev in conn.execute(
+            "SELECT run_id, kind, payload FROM task_events WHERE run_id IN ("
+            + ",".join("?" * len(chunk)) + ") AND kind IN "
+            "('dispatch_lane_route', 'dispatch_provider_fallback') ORDER BY id",
+            chunk,
+        ):
+            try:
+                payload = json.loads(ev["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            field = "to_provider" if ev["kind"] == "dispatch_provider_fallback" else "provider"
+            if isinstance(payload, dict) and isinstance(payload.get(field), str):
+                served[int(ev["run_id"])] = payload[field]  # later event wins
+    keys: dict[tuple, Optional[str]] = {}
+    by_pool: dict[str, list[int]] = {}
+    for r in rows:
+        if int(r["id"]) in served:
+            route = (None, "served", served[int(r["id"])])
+        else:
+            route = (r["profile"] or r["assignee"], r["model_override"], r["provider_override"])
+        if route not in keys:
+            keys[route] = pool_key(effective_provider(SimpleNamespace(
+                assignee=route[0], model_override=route[1], provider_override=route[2],
+            )))
+        if keys[route] is not None:
+            by_pool.setdefault(keys[route], []).append(int(r["ended_at"]))
+    open_until: dict[str, int] = {}
+    for key, ends in by_pool.items():
+        tripped_at = None
+        for i in range(trip - 1, len(ends)):
+            if ends[i] - ends[i - trip + 1] <= window:
+                tripped_at = ends[i]
+        if tripped_at is not None and now < tripped_at + window:
+            open_until[key] = tripped_at + window
+    return open_until
+
+
+def _notify_rate_limit_circuit(
+    board: Optional[str], pool: str, until: int, trip: int, *, now: Optional[int] = None,
+) -> None:
+    """Post ONE #logs line per pool circuit EPISODE (marker file = latch).
+
+    Workers already running when a pool trips keep dying at 429 during the
+    hold, and every such close pushes ``until`` forward. That extends the same
+    episode: the latch is "the recorded hold for this pool has not lapsed yet",
+    never the exact ``until`` value (Argus F2: 4 notifies for one episode).
+    """
+    now = int(time.time()) if now is None else int(now)
+    try:
+        from hermes_cli import kanban_budget as _kbudget
+
+        marker = board_dir(board) / _RATE_LIMIT_CIRCUIT_MARKER
+        try:
+            seen = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:
+            seen = {}
+        if not isinstance(seen, dict):
+            seen = {}
+        prior = seen.get(pool)
+        same_episode = isinstance(prior, (int, float)) and now < int(prior)
+        if same_episode and int(prior) >= until:
+            return
+        seen[pool] = max(int(prior), until) if same_episode else until
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(seen), encoding="utf-8")
+        if same_episode:
+            return  # hold extended; already announced
+        script = _kbudget._notify_script_path()
+        if script is None:
+            return
+        import sys as _sys
+        body = (
+            f"🧯 Kanban '{board or 'default'}': rate-limit circuit OPEN for {pool} — "
+            f">= {trip} workers hit 429 within {RATE_LIMIT_TRIP_WINDOW_SECONDS // 60} min. "
+            f"Holding {pool} spawns until "
+            f"{time.strftime('%H:%M:%S', time.localtime(until))}; other pools unaffected."
+        )
+        _kbudget._run_notify([
+            _sys.executable, script, "--channel", "discord",
+            "--target", _kbudget.RECOVERY_TARGET, "--send", body,
+        ])
+    except Exception as exc:
+        _log.warning("kanban rate-limit circuit notify failed (%s: %s)", type(exc).__name__, exc)
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 # Event kinds that mean "an OPERATOR deliberately asked for this task to run
-# again". Any of these at/after the newest PR comment overrides the
-# ``active_pr`` guard: the open PR is the fix-round target, not duplicate work.
+# again". An unused event strictly AFTER the newest PR comment overrides
+# ``active_pr`` for one spawn: the open PR is the fix-round target.
 # This is the TOTAL set of operator requeue verbs -- every CLI verb that moves a
 # task back toward ``ready`` by human intent must appear here, and
 # ``tests/hermes_cli/test_kanban_db.py::test_operator_requeue_verbs_all_override_active_pr``
@@ -12329,6 +13138,10 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
     "review_reopened",
     "triage_resolved",
     "reopened",
+    # ``kanban requeue`` — the operator verb for a READY card (2026-09-23,
+    # t_7d7ff489): unblock/reopen/triage-resolve all need a non-ready source
+    # state, so a guarded ready card had no verb short of block->unblock.
+    "requeued",
 )
 # Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
 # ``rate_limit_cooldown`` rules when they land at/after the failing run ended:
@@ -14203,11 +15016,17 @@ def detect_crashed_workers(
                     f"requeued without counting a failure"
                 )
                 event_kind = "rate_limited"
+                # This run is still open, so the streak it completes is the
+                # closed trailing streak + 1.
+                _rl_hold = _rate_limit_hold_seconds(
+                    consecutive_rate_limited_runs(conn, row["id"]) + 1,
+                    base=_resolve_rate_limit_cooldown_seconds(),
+                )
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
-                    "next_eligible_at": int(time.time()) + _resolve_rate_limit_cooldown_seconds(),
+                    "next_eligible_at": int(time.time()) + _rl_hold,
                 }
                 if exit_class:
                     event_payload["exit_class"] = exit_class
@@ -14955,6 +15774,44 @@ def _respawn_guard_failure_reset_after(
     ).fetchone() is not None
 
 
+def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether the latest PR-bearing comment has an unconsumed resume intent.
+
+    Event ids establish causality even when writes share a timestamp. A spawn
+    consumes the intent; automatic crash reclaim cannot reuse it.
+    """
+    comments = conn.execute(
+        "SELECT id, author, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY id DESC",
+        (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+    ).fetchall()
+    pr_comment = next(
+        (c for c in comments if _RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None,
+    )
+    if pr_comment is None:
+        return False
+    # The intent event snapshots the highest comment id atomically. No guess
+    # about which 'commented' event corresponds to this PR is needed: inline
+    # audit comments and historical trimmed bodies cannot skew the ordering.
+    # Pre-upgrade intent events have no marker; an equal-second tie resumes:
+    # one duplicate worker is recoverable, an indefinite guard is not.
+    kinds = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
+    return conn.execute(
+        "SELECT 1 FROM task_events i WHERE i.task_id = ? "
+        f"AND (i.kind IN ({kinds}) OR "
+        "(i.kind = 'reclaimed' AND json_extract(i.payload, '$.manual') = 1) OR "
+        "(i.kind = 'dependency_wait' AND json_extract(i.payload, '$.kind') = 'dependency' "
+        "AND EXISTS (SELECT 1 FROM task_events p WHERE p.task_id = i.task_id "
+        "AND p.kind = 'promoted' AND p.id > i.id))) "
+        "AND (json_extract(i.payload, '$.after_comment_id') >= ? OR "
+        "(json_type(i.payload, '$.after_comment_id') IS NULL AND i.created_at >= ?)) "
+        "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
+        "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
+        (task_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS,
+         pr_comment["id"], pr_comment["created_at"]),
+    ).fetchone() is not None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection,
     task_id: str,
@@ -15068,6 +15925,14 @@ def check_respawn_guard(
         eligible_at = _respawn_guard_eligible_at(
             row["next_eligible_at"], failed_at, rl_cooldown,
         )
+        streak = 0
+        if latest_outcome == "rate_limited" and failed_at is not None:
+            # Escalate by the consecutive streak (5m/15m/45m/2h). Computed
+            # here, not only at release, so rows stamped before this ladder
+            # existed and any other release path are held too.
+            streak = consecutive_rate_limited_runs(conn, task_id)
+            laddered = failed_at + _rate_limit_hold_seconds(streak, base=rl_cooldown)
+            eligible_at = laddered if eligible_at is None else max(int(eligible_at), laddered)
         if eligible_at is not None and now < int(eligible_at):
             if detail is not None:
                 detail.update(
@@ -15075,6 +15940,8 @@ def check_respawn_guard(
                     recorded_at=failed_at,
                     eligible_at=int(eligible_at),
                 )
+                if streak > 1:
+                    detail["backoff_streak"] = streak
             return "rate_limit_cooldown"
         # Cooldown elapsed (or disabled) — allow the respawn. Return early
         # so the blocker_auth check below doesn't catch the rate-limit text
@@ -15151,37 +16018,19 @@ def check_respawn_guard(
     # 4. Recent GitHub PR comments. Guard while ANY referenced PR is open,
     #    unparseable, unqueryable, or beyond this tick's query budget. The
     #    duplicate-PR risk is gone only when ALL referenced PRs are closed.
-    #    Exception: an explicit requeue at/after the newest PR comment means
-    #    the open PR is the fix-round target, not duplicate work. Honor it
-    #    before querying PR states (2026-09-07, clanker-voice-backlog
-    #    t_800b8189: both unblock and changes_requested stranded PR #315).
-    #    Unlike rule 3, this is not gated behind a completed run, so only
-    #    operator-intent events count (including manual reclaim). Automatic
-    #    reclaim after a worker dies with an open PR is the founding case;
-    #    automatic dependency promotion and generic status events also defer.
+    #    Exception: a fresh, unconsumed operator requeue AFTER the newest PR
+    #    comment means the open PR is the fix-round target, not duplicate
+    #    work. Worker dependency_wait followed by promotion grants the same
+    #    one-shot continuation. Both are consumed by the next spawn.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     pr_urls: list[str] = []
-    newest_pr_at = 0
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ?",
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        body = c["body"] or ""
-        urls = [match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body)]
-        if urls:
-            pr_urls.extend(urls)
-            newest_pr_at = max(newest_pr_at, int(c["created_at"]))
+        pr_urls.extend(match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"] or ""))
     if pr_urls:
-        _kinds_sql = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            f"AND (kind IN ({_kinds_sql}) OR (kind = 'reclaimed' "
-            "AND json_extract(payload, '$.manual') = 1)) LIMIT 1",
-            (task_id, newest_pr_at, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS),
-        ).fetchone()
-        if requeued_after:
+        if _unused_operator_intent_after_pr(conn, task_id):
             return None
         resolver = pr_state_resolver or _PrStateResolver()
         for url in dict.fromkeys(pr_urls):
@@ -15193,6 +16042,138 @@ def check_respawn_guard(
                 return "active_pr"
 
     return None
+
+
+# A READY+assigned card continuously deferred as ``respawn_guarded:active_pr``
+# for this long is STUCK, not cooling down: nothing automatic will clear it.
+RESPAWN_GUARD_STUCK_SECONDS = 30 * 60
+# The newest guard event must be this fresh for the streak to be "current"
+# (the dispatcher still re-evaluates it); a stale streak means the dispatcher
+# itself is down, which other health lanes own.
+_RESPAWN_GUARD_STUCK_FRESH_SECONDS = 10 * 60
+
+
+def render_operator_command(board: str, verb: str, *args: str) -> str:
+    """Render a runnable ``hermes kanban`` command for an operator page.
+
+    The ONLY place an alert/hint may build a ``hermes kanban`` command
+    string. It always pins ``--board <slug>`` (the default board included),
+    so the command acts on the card's board no matter which board is current
+    where the operator pastes it. Arguments are shell-quoted. 2026-09-24,
+    t_7d7ff489 r5: a hand-assembled unscoped verb failed (rc1 "not found")
+    against a secondary-board card.
+    """
+    return shlex.join(["hermes", "kanban", "--board", str(board), verb, *map(str, args)])
+
+
+# Event kinds that can change ``check_respawn_guard``'s ``active_pr`` answer:
+# the intent/requeue kinds the guard itself reads, plus the worker's own
+# dependency block and a spawn (which consumes intent). Only these restart
+# the continuous-guard age in ``respawn_guard_stuck_tasks``; everything else
+# (commented, heartbeat, linked, attached, ...) is data. Any trip away from
+# READY returns through one of the requeue kinds, so status transitions are
+# covered too.
+_RESPAWN_GUARD_STUCK_RESET_KINDS: tuple[str, ...] = (
+    *_RESPAWN_GUARD_FAILURE_RESET_KINDS,
+    "dependency_wait",
+    "spawned",
+)
+
+
+def respawn_guard_stuck_tasks(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    min_seconds: int = RESPAWN_GUARD_STUCK_SECONDS,
+    now: Optional[int] = None,
+) -> list[dict]:
+    """Return unclaimed cards continuously refused by active_pr or prior worker.
+
+    Active-PR guards page for ready cards after 30 minutes; claim rejection by
+    an allegedly live previous worker pages for ready or review cards after
+    15 minutes (the process may have exited or its PID may have been recycled).
+    For active_pr, a card qualifies when it has been guarded with ``active_pr`` since the
+    last event that could have changed the guard's answer
+    (``_RESPAWN_GUARD_STUCK_RESET_KINDS``, or a guard decline for another
+    reason), the first such guard row is at least ``min_seconds`` old, and the
+    newest is recent. Data-only events (a progress comment, heartbeat,
+    attachment) do NOT restart the age. Each entry carries ``clear_verb``,
+    rendered by ``render_operator_command`` for ``board`` (defaults to the
+    current board; callers holding another board's connection must pass it).
+
+    ``respawn_guarded`` is a benign decline for the stall streak, so without
+    this probe a card held by the guard is indistinguishable from a card that
+    is briefly cooling down. 2026-09-23, t_7d7ff489: two cards sat silent for
+    8h and 14h.
+    """
+    now = int(time.time()) if now is None else int(now)
+    board = board or get_current_board()
+    reset_marks = ", ".join("?" for _ in _RESPAWN_GUARD_STUCK_RESET_KINDS)
+    out: list[dict] = []
+    for row in conn.execute(
+        "SELECT id, assignee, status FROM tasks WHERE status IN ('ready', 'review') "
+        "AND assignee IS NOT NULL AND claim_lock IS NULL ORDER BY id"
+    ).fetchall():
+        task_id = row["id"]
+        last_reset = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events WHERE task_id=? "
+            "AND (kind IN ('claimed', 'spawned', 'requeued', 'unblocked', 'status') "
+            "OR (kind='claim_rejected' AND ("
+            "COALESCE(json_extract(payload, '$.reason'), '') != 'prior_worker_still_alive' "
+            "OR COALESCE(json_extract(payload, '$.source_status'), 'ready') != ?)))",
+            (task_id, row["status"]),
+        ).fetchone()["m"]
+        rejected = conn.execute(
+            "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, "
+            "COUNT(*) AS n, MAX(json_extract(payload, '$.prev_pid')) AS pid "
+            "FROM task_events WHERE task_id=? AND id>? AND kind='claim_rejected'",
+            (task_id, last_reset),
+        ).fetchone()
+        if (rejected["n"] and now - rejected["first_at"] > 15 * 60
+                and now - rejected["last_at"] <= _RESPAWN_GUARD_STUCK_FRESH_SECONDS):
+            out.append({
+                "task_id": task_id, "assignee": row["assignee"],
+                "reason": "prior_worker_still_alive",
+                "status": row["status"],
+                "guarded_since": rejected["first_at"],
+                "guarded_seconds": now - rejected["first_at"],
+                "guard_events": rejected["n"],
+                "prev_pid": rejected["pid"],
+                "clear_verb": render_operator_command(board, "show", task_id),
+            })
+        if row["status"] != "ready":
+            continue  # active_pr is a ready-only respawn guard
+        last_other = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
+            f"WHERE task_id = ? AND (kind IN ({reset_marks}) "
+            "OR (kind = 'respawn_guarded' "
+            "AND COALESCE(json_extract(payload, '$.reason'), '') != 'active_pr'))",
+            (task_id, *_RESPAWN_GUARD_STUCK_RESET_KINDS),
+        ).fetchone()["m"]
+        streak = conn.execute(
+            "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, "
+            "COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND id > ? AND kind = 'respawn_guarded'",
+            (task_id, int(last_other)),
+        ).fetchone()
+        if not streak or not streak["n"]:
+            continue
+        first_at = int(streak["first_at"])
+        last_at = int(streak["last_at"])
+        if now - first_at < min_seconds:
+            continue
+        if now - last_at > _RESPAWN_GUARD_STUCK_FRESH_SECONDS:
+            continue
+        out.append({
+            "task_id": task_id,
+            "assignee": row["assignee"],
+            "reason": "active_pr",
+            "guarded_since": first_at,
+            "guarded_seconds": now - first_at,
+            "guard_events": int(streak["n"]),
+            "clear_verb": render_operator_command(board, "requeue", task_id, "<reason>"),
+        })
+    return out
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -16282,14 +17263,65 @@ def _dispatch_once_locked(
     spawned = 0
     from hermes_cli.kanban_provider_health import (
         available_profile_fallback, capped_provider, configured_min_eligible,
-        configured_probes,
+        configured_box_health, configured_pool_health_urls, configured_probes,
+        configured_pool_spawns_per_eligible, effective_provider, pool_budget_eligible,
+        pool_key,
     )
     health_probes = configured_probes()
     min_eligible = configured_min_eligible()
-    health_cache: dict = {}
+    pool_urls = configured_pool_health_urls()
+    box_health = configured_box_health()
+    pool_spawns_per_eligible = configured_pool_spawns_per_eligible()
+    # The relay pools are shared by every board, so the per-tick admission
+    # budget must be too. The gateway tick calls dispatch_once once per board
+    # with ONE ``budget_cache``; keep the admitted-per-pool counter (and the
+    # health probe results it is measured against) in that tick-scoped dict so
+    # board N+1 sees board N's spawns. Callers without cross-board state (CLI,
+    # standalone daemon) pass no cache and get a fresh per-call map.
+    if budget_cache is not None:
+        health_cache: dict = budget_cache.setdefault(("_provider_health_cache",), {})
+        admitted_this_tick: dict[str, int] = budget_cache.setdefault(
+            ("_pool_admitted_this_tick",), {},
+        )
+    else:
+        health_cache = {}
+        admitted_this_tick = {}
+    admitted_routes: dict[str, str | None] = {}
+
+    def pool_budget(provider):
+        pool = pool_key(provider)
+        if pool is None or pool_spawns_per_eligible == 0:
+            return None
+        eligible = pool_budget_eligible(provider, health_probes, health_cache, pool_urls,
+                                        box_health=box_health)
+        if eligible is None:
+            return None  # Unknown probe: fail open.
+        admitted = admitted_this_tick.get(pool, 0)
+        if admitted < eligible * pool_spawns_per_eligible:
+            return None
+        return {"reason": "pool_budget", "provider": provider,
+                "pool": pool, "eligible": eligible, "admitted": admitted}
+
+    def charge_pool(task_id):
+        pool = admitted_routes.pop(task_id, None)
+        if pool is not None:
+            admitted_this_tick[pool] = admitted_this_tick.get(pool, 0) + 1
+
+    circuits: dict[str, int] = {}
+    try:
+        rl_trip = _resolve_rate_limit_trip()
+        circuits = rate_limit_circuits(conn, now=_tick_now, trip=rl_trip)
+        if not dry_run:
+            for _pool, _until in circuits.items():
+                _notify_rate_limit_circuit(board, _pool, _until, rl_trip, now=_tick_now)
+    except Exception as exc:
+        # Fail OPEN: a broken circuit query must never halt spawning.
+        _log.warning("kanban rate-limit circuit check failed (%s: %s)", type(exc).__name__, exc)
+        circuits = {}
 
     def provider_admission(task_id, assignee):
-        if not health_probes:
+        if (not health_probes and not any(pool_urls.values()) and not box_health
+                and not circuits):
             return False, None
         task = get_task(conn, task_id)
         if task is None:
@@ -16299,11 +17331,27 @@ def _dispatch_once_locked(
         # for cards with no pin of their own), so a capped profile default
         # under a healthy lane is admitted, and a capped lane still falls back.
         apply_lane_model_override(task, _lane_override_for(assignee), now=_tick_now)
-        payload = capped_provider(task, health_probes, health_cache, min_eligible=min_eligible)
+        route_provider = effective_provider(task)
+        circuit_pool = pool_key(route_provider)
+        if circuit_pool in circuits:
+            # An open circuit on THIS card's pool is a capacity verdict like
+            # provider_capped: hold unless a rung on another open pool exists.
+            payload = {"reason": "rate_limit_circuit", "provider": route_provider,
+                       "pool": circuit_pool, "until": circuits[circuit_pool]}
+        else:
+            payload = capped_provider(
+                task, health_probes, health_cache, min_eligible=min_eligible,
+                pool_urls=pool_urls, box_health=box_health,
+            )
+            if payload is None:
+                payload = pool_budget(route_provider)
         if payload is None:
+            admitted_routes[task_id] = circuit_pool
             return False, None
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
+            pool_urls=pool_urls, skip_pools=frozenset(circuits), box_health=box_health,
+            budget_available=lambda provider: pool_budget(provider) is None,
         )
         if fallback is not None and fallback_flagship_banned(task_id, fallback[0]):
             # The flagship gate covers the post-fallback route too: a capped
@@ -16318,12 +17366,23 @@ def _dispatch_once_locked(
             )
             fallback = None
         if fallback is not None:
+            admitted_routes[task_id] = pool_key(fallback[1])
             return False, (fallback, payload)
-        result.respawn_guarded.append((task_id, "provider_capped"))
+        result.respawn_guarded.append((task_id, payload["reason"]))
         if not dry_run:
             with write_txn(conn):
                 _append_event(conn, task_id, "deferred", payload)
         return True, None
+
+    def note_lane_route(claimed, source):
+        """Record the lane-override route on the run (in-memory only on the
+        card) so a rate-limited close is charged to the pool that served it."""
+        if source is None or not claimed.provider_override:
+            return
+        with write_txn(conn):
+            _append_event(conn, claimed.id, "dispatch_lane_route", {
+                "provider": claimed.provider_override, "model": claimed.model_override,
+            }, run_id=claimed.current_run_id)
 
     def apply_dispatch_fallback(claimed, selection):
         if selection is None:
@@ -16618,6 +17677,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            charge_pool(row["id"])
             spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
@@ -16643,7 +17703,10 @@ def _dispatch_once_locked(
         # outlive its TTL / the capacity window as a permanent pin.
         route_source = apply_lane_model_override(
             claimed, _lane_override_for(claimed.assignee), now=_tick_now,
-        ) or ("card-override" if claimed.model_override else "profile-default")
+        )
+        note_lane_route(claimed, route_source)
+        route_source = route_source or (
+            "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             route_source = f"dispatch-fallback(capped {route_source})"
@@ -16734,6 +17797,7 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = route_source
+            charge_pool(claimed.id)
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
@@ -16819,6 +17883,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            charge_pool(row["id"])
             spawned += 1
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
@@ -16834,7 +17899,10 @@ def _dispatch_once_locked(
         # precedence as the ready path: lane first, then capped-pool fallback.
         review_route_source = apply_lane_model_override(
             claimed, _lane_override_for(claimed.assignee), now=_tick_now,
-        ) or ("card-override" if claimed.model_override else "profile-default")
+        )
+        note_lane_route(claimed, review_route_source)
+        review_route_source = review_route_source or (
+            "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             review_route_source = f"dispatch-fallback(capped {review_route_source})"
@@ -16921,6 +17989,7 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = review_route_source
+            charge_pool(claimed.id)
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
@@ -17008,7 +18077,44 @@ def worker_cpu_priority_config(
     mode = str(raw or "").strip().lower()
     if mode == "normal":
         return ("normal", 0)
+    if mode == "idle":
+        return ("idle", WORKER_BACKGROUND_NICE)
     return ("background", WORKER_BACKGROUND_NICE)
+
+
+# macOS: nice(2) only reorders threads INSIDE one scheduling class. Darwin's
+# real levers are the task QoS clamp and the darwin-BG flag, which also set
+# the disk I/O tier. Both are inherited across fork/exec. The QoS clamp can
+# only be applied at spawn time (posix_spawnattr_set_qos_clamp_np) — there is
+# no setpriority() form — so it rides as an exec-form ``taskpolicy`` prefix:
+# taskpolicy execs the worker in place (same pid, same argv once running).
+#
+# Measured on the M3 Ultra, 2026-09-24 (16 spinners x 5s, 61% host idle):
+#   unclamped            15.9 cores   iotier 0 (IMPORTANT)
+#   -c utility            3.8 cores   iotier 1 (STANDARD), P+E cores
+#   -b (darwin BG)        0.1 cores   iotier 2, E-cores only
+# "background" = utility clamp: batch work sits strictly below an
+# Interactive gateway without collapsing worker throughput. "idle" = darwin
+# BG for hosts where the gateway must win at any cost to worker speed.
+WORKER_DARWIN_TASKPOLICY = "/usr/sbin/taskpolicy"
+_WORKER_DARWIN_POLICY_ARGS = {
+    "background": ("-c", "utility"),
+    "idle": ("-b",),
+}
+
+
+def worker_darwin_qos_prefix(mode: str) -> "list[str]":
+    """Return the exec-form ``taskpolicy`` argv prefix for *mode*, or ``[]``.
+
+    Empty off macOS, for ``normal``, and when ``taskpolicy`` is missing — a
+    missing wrapper must degrade to nice-only, never refuse the spawn.
+    """
+    args = _WORKER_DARWIN_POLICY_ARGS.get(mode)
+    if not args or sys.platform != "darwin":
+        return []
+    if not os.access(WORKER_DARWIN_TASKPOLICY, os.X_OK):
+        return []
+    return [WORKER_DARWIN_TASKPOLICY, *args]
 
 
 def _build_worker_priority_preexec(nice_value: int):
@@ -17887,16 +18993,22 @@ def _default_spawn(
     # the seam the 2026-09-20 load-538 incident escaped through.
     cpu_priority_mode, cpu_nice = worker_cpu_priority_config()
     priority_preexec = _build_worker_priority_preexec(cpu_nice)
+    # macOS: nice alone leaves the worker in the gateway's own QoS class and
+    # I/O tier, so worker pytest/git storms still starve the resident gateway
+    # (t_14c130aa). Clamp QoS via exec-form taskpolicy; it keeps the pid.
+    darwin_prefix = worker_darwin_qos_prefix(cpu_priority_mode)
+    spawn_cmd = [*darwin_prefix, *cmd]
     _log.info(
-        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s",
+        "PHASE=worker_spawn task=%s profile=%s cpu_priority=%s nice=%s darwin_policy=%s",
         task.id,
         profile_arg,
         cpu_priority_mode,
         cpu_nice,
+        " ".join(darwin_prefix[1:]) or "-",
     )
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
+            spawn_cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,

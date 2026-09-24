@@ -207,7 +207,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
-    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
+    def mock_judge_goal(goal, last_response, **kwargs):
         # Match the real judge_goal contract:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
         return "continue", "missing verification evidence", False, None, False
@@ -230,6 +230,65 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         assert task.status == "running"  # Should still be running, not done
     finally:
         conn2.close()
+
+
+def test_goal_complete_first_call_uses_deliverables_not_completion_receipt(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+    monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
+
+    def judge(**kwargs):
+        assert kwargs["completion_handoff"] is True
+        assert "kanban_complete" not in kwargs["last_response"]
+        return ("done", "deliverable verified", False, None, False)
+
+    monkeypatch.setattr(kt, "judge_goal", judge)
+    result = json.loads(kt._handle_complete({"summary": "CANARY_PHASE1_NEW and CANARY_PHASE2_NEW; both exit 0"}))
+    assert result.get("ok") is True, result
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_goal_complete_judge_500_blocks_worker_transient(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+    monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
+    calls = []
+
+    def failing_judge(**kwargs):
+        calls.append(kwargs)
+        return ("continue", "judge error: InternalServerError", False, None, True)
+
+    monkeypatch.setattr(kt, "judge_goal", failing_judge)
+    out = json.loads(kt._handle_complete({"summary": "Verified output"}))
+    assert len(calls) == 2
+    assert "InternalServerError" in out["error"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "transient"
+
+
+def test_goal_complete_operator_judge_500_fails_open_with_event(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
+    monkeypatch.setattr(kt, "judge_goal", lambda **kw: ("continue", "judge error: InternalServerError", False, None, True))
+    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "Verified output"}))
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+        events = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ?", (tid,)).fetchall()
+        assert any(e["kind"] == "judge_error" and "InternalServerError" in e["payload"] for e in events)
 
 
 def test_block_happy_path(worker_env):
@@ -266,10 +325,12 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             conn, title="goal-mode-block-test", assignee="test-worker",
             body="Must achieve X.", goal_mode=True,
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return goal_task_id
 
 

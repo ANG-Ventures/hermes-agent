@@ -58,6 +58,23 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def _priced_summary_call(response: Any, *, provider: str, model: str,
+                         api_mode: str | None = None,
+                         base_url: str | None = None) -> float | None:
+    """Price observed summarizer usage through the canonical pricing engine."""
+    raw = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+    if raw is None:
+        return None
+    try:
+        from agent.usage_pricing import normalize_usage, estimate_usage_cost
+        usage = normalize_usage(raw, provider=provider, api_mode=api_mode)
+        price = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
+        return float(price.amount_usd) if price.amount_usd is not None else None
+    except Exception:
+        logger.debug("summary call cost unavailable", exc_info=True)
+        return None
+
+
 # ── Pinned summary route ─────────────────────────────────────────────────
 # The summary call normally resolves its provider/model from
 # ``auxiliary.compression``. One caller needs to override that for a single
@@ -5483,6 +5500,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             try:
                 with aux_interrupt_protection():
                     response = call_llm(**call_kwargs)
+                _summary_cost = _priced_summary_call(
+                    response, provider=_aux_route.get("provider") or self.provider or "",
+                    model=_aux_route.get("model") or self.summary_model or self.model or "",
+                    api_mode=_aux_route.get("api_mode") or self.api_mode,
+                    base_url=_aux_route.get("base_url") or self.base_url,
+                )
+                _telemetry = getattr(self, "_active_compression_telemetry", None)
+                if isinstance(_telemetry, dict):
+                    if _summary_cost is None:
+                        _telemetry["aux_cost_usd"] = None
+                        _telemetry["aux_cost_unknown"] = True
+                    elif not _telemetry.get("aux_cost_unknown"):
+                        _telemetry["aux_cost_usd"] = (_telemetry.get("aux_cost_usd") or 0) + _summary_cost
             finally:
                 route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
                 _aux_provider = _aux_route.get("provider") or self.provider or ""

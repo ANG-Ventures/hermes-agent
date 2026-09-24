@@ -1693,6 +1693,26 @@ class TestProfileArg:
             "--external-supervisor",
         ]
 
+    def test_launchd_plist_runs_gateway_as_interactive_process_type(self, tmp_path, monkeypatch):
+        """Without ProcessType launchd clamps the gateway job to utility QoS.
+
+        Measured 2026-09-24 (t_14c130aa): the default-profile gateway, whose
+        plist lacked the key, ran as TASK_APPTYPE_DAEMON_STANDARD with a
+        THREAD_QOS_UTILITY clamp (68% of its CPU time on E-cores) while the
+        batch reviewer gateways ran Interactive — the user-facing agent was
+        the throttled one, in the same class as its own kanban workers.
+        """
+        profile_dir = tmp_path / ".hermes"
+        profile_dir.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert plist["ProcessType"] == "Interactive"
+
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
         profile_dir.mkdir(parents=True)
