@@ -10466,6 +10466,44 @@ def request_changes(
     return True, implementer
 
 
+def requeue_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> tuple[bool, Optional[str]]:
+    """Record operator intent to run a READY card now (``requeued`` event).
+
+    The operator verb for a card that is already ``ready`` but deferred by the
+    respawn guard (typically ``active_pr``: the open PR is the fix-round
+    target). ``unblock``/``reopen``/``triage-resolve`` all require a non-ready
+    source state, which previously forced a block->unblock round trip just to
+    mint an intent event. Status is unchanged; ``requeued`` is in
+    ``_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS`` so the next dispatch tick spawns.
+
+    Returns ``(True, None)`` on success, ``(False, reason)`` if refused.
+    """
+    if not (reason or "").strip():
+        return False, "a reason is required to requeue a task"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        if row["status"] != "ready":
+            return False, (
+                f"task {task_id} is {row['status']!r}; requeue only applies to "
+                f"'ready' tasks (use unblock/reopen/triage-resolve/promote "
+                f"for other states)"
+            )
+        _append_event(
+            conn, task_id, "requeued", {"actor": actor, "reason": reason},
+        )
+    return True, None
+
+
 def reopen_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12329,6 +12367,10 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
     "review_reopened",
     "triage_resolved",
     "reopened",
+    # ``kanban requeue`` — the operator verb for a READY card (2026-09-23,
+    # t_7d7ff489): unblock/reopen/triage-resolve all need a non-ready source
+    # state, so a guarded ready card had no verb short of block->unblock.
+    "requeued",
 )
 # Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
 # ``rate_limit_cooldown`` rules when they land at/after the failing run ended:
@@ -15183,6 +15225,32 @@ def check_respawn_guard(
         ).fetchone()
         if requeued_after:
             return None
+        # A worker's OWN dependency block (``block_task(kind="dependency")``)
+        # recorded after the newest PR comment is intent to resume on that PR
+        # once the parents land. When the automatic ``promoted`` that ends the
+        # wait has not yet been followed by a spawn, the open PR is the
+        # continuation target -- not duplicate work. Any spawn after the
+        # promotion re-arms the guard, so a continuation run that then dies
+        # with the PR open is the founding crash-reclaim case again.
+        # 2026-09-23, t_7d7ff489: t_8e737f2c (PR #938) and t_32f44156 sat
+        # ready 8h/14h behind ``active_pr`` after dependency_wait->promoted.
+        # Event ids (not created_at) order the sequence: second-granularity
+        # timestamps tie inside one tick.
+        dependency_resume = conn.execute(
+            "SELECT 1 FROM task_events p "
+            "WHERE p.task_id = ? AND p.kind = 'promoted' "
+            "AND EXISTS (SELECT 1 FROM task_events d "
+            "    WHERE d.task_id = p.task_id AND d.kind = 'dependency_wait' "
+            "    AND json_extract(d.payload, '$.kind') = 'dependency' "
+            "    AND d.created_at >= ? AND d.id < p.id) "
+            "AND NOT EXISTS (SELECT 1 FROM task_events s "
+            "    WHERE s.task_id = p.task_id AND s.kind = 'spawned' "
+            "    AND s.id > p.id) "
+            "LIMIT 1",
+            (task_id, newest_pr_at),
+        ).fetchone()
+        if dependency_resume:
+            return None
         resolver = pr_state_resolver or _PrStateResolver()
         for url in dict.fromkeys(pr_urls):
             parsed = _parse_github_pr_url(url)
@@ -15193,6 +15261,73 @@ def check_respawn_guard(
                 return "active_pr"
 
     return None
+
+
+# A READY+assigned card continuously deferred as ``respawn_guarded:active_pr``
+# for this long is STUCK, not cooling down: nothing automatic will clear it.
+RESPAWN_GUARD_STUCK_SECONDS = 30 * 60
+# The newest guard event must be this fresh for the streak to be "current"
+# (the dispatcher still re-evaluates it); a stale streak means the dispatcher
+# itself is down, which other health lanes own.
+_RESPAWN_GUARD_STUCK_FRESH_SECONDS = 10 * 60
+
+
+def respawn_guard_stuck_tasks(
+    conn: sqlite3.Connection,
+    *,
+    min_seconds: int = RESPAWN_GUARD_STUCK_SECONDS,
+    now: Optional[int] = None,
+) -> list[dict]:
+    """Return ready+assigned+unclaimed cards stuck behind ``active_pr``.
+
+    A card qualifies when every event since its last non-guard event is a
+    ``respawn_guarded`` row with reason ``active_pr``, the first of those is at
+    least ``min_seconds`` old, and the newest is recent. Any other event (a
+    comment, an operator verb, a spawn) resets the streak. Each entry names
+    the operator verb that clears it.
+
+    ``respawn_guarded`` is a benign decline for the stall streak, so without
+    this probe a card held by the guard is indistinguishable from a card that
+    is briefly cooling down. 2026-09-23, t_7d7ff489: two cards sat silent for
+    8h and 14h.
+    """
+    now = int(time.time()) if now is None else int(now)
+    out: list[dict] = []
+    for row in conn.execute(
+        "SELECT id, assignee FROM tasks WHERE status = 'ready' "
+        "AND assignee IS NOT NULL AND claim_lock IS NULL ORDER BY id"
+    ).fetchall():
+        task_id = row["id"]
+        last_other = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
+            "WHERE task_id = ? AND (kind != 'respawn_guarded' "
+            "OR COALESCE(json_extract(payload, '$.reason'), '') != 'active_pr')",
+            (task_id,),
+        ).fetchone()["m"]
+        streak = conn.execute(
+            "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, "
+            "COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND id > ? AND kind = 'respawn_guarded'",
+            (task_id, int(last_other)),
+        ).fetchone()
+        if not streak or not streak["n"]:
+            continue
+        first_at = int(streak["first_at"])
+        last_at = int(streak["last_at"])
+        if now - first_at < min_seconds:
+            continue
+        if now - last_at > _RESPAWN_GUARD_STUCK_FRESH_SECONDS:
+            continue
+        out.append({
+            "task_id": task_id,
+            "assignee": row["assignee"],
+            "reason": "active_pr",
+            "guarded_since": first_at,
+            "guarded_seconds": now - first_at,
+            "guard_events": int(streak["n"]),
+            "clear_verb": f'kanban requeue {task_id} "<reason>"',
+        })
+    return out
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
