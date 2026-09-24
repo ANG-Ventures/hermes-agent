@@ -3506,6 +3506,408 @@ def test_operator_requeue_verbs_all_override_active_pr(kanban_home, monkeypatch)
         assert kb.check_respawn_guard(conn, task_id) is None
 
 
+def test_dependency_wait_promoted_resumes_open_pr_once(kanban_home, all_assignees_spawnable, monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume then complete", kind="dependency")
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, child).status == "ready"
+        spawned = []
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
+        assert child in spawned
+        assert result.spawned
+        # A second crash/reclaim must not get the same one-shot exemption.
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=?", (child,))
+        conn.commit()
+        assert kb.check_respawn_guard(conn, child) == "active_pr"
+
+
+def test_dependency_wait_ordinary_comment_after_block_resumes_same_pr(kanban_home, all_assignees_spawnable, monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume", kind="dependency")
+        kb.add_comment(conn, child, "alice", "Waiting for parent; no new PR")
+        assert kb.complete_task(conn, parent)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
+        assert child in spawned
+
+
+def test_dependency_wait_before_newer_pr_comment_does_not_resume(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume", kind="dependency")
+        kb.add_comment(conn, child, "alice", "newer https://github.com/o/r/pull/10")
+        assert kb.complete_task(conn, parent)
+        assert kb.check_respawn_guard(conn, child) == "active_pr"
+
+
+def test_requeue_ready_card_overrides_active_pr(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, int(time.time()))
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="resume")[0] is False
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="retry PR") == (True, None)
+        assert kb.list_events(conn, task_id)[-1].kind == "requeued"
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+@pytest.mark.parametrize("later_pr_second", [False, True])
+def test_requeue_intent_preceding_new_pr_is_not_reused(kanban_home, monkeypatch, later_pr_second):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue PR 9") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        if later_pr_second:
+            now += 1
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/10")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+@pytest.mark.parametrize("kind", kb._RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS)
+def test_every_operator_intent_is_ordered_and_consumed(kanban_home, monkeypatch, kind):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        kb._append_event(conn, task_id, kind, {"actor": "operator"})
+        intent = kb.list_events(conn, task_id)[-1]
+        assert intent.payload is not None
+        assert intent.payload["after_comment_id"] == conn.execute(
+            "SELECT MAX(id) FROM task_comments WHERE task_id=?", (task_id,),
+        ).fetchone()[0]
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb._append_event(conn, task_id, "spawned", {"pid": 99999999})
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        # Even an intent newer than PR 9 must not authorize PR 10.
+        kb._append_event(conn, task_id, kind, {"actor": "operator"})
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/10")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_reclaim_intent_only_if_manual_and_not_consumed(kanban_home, monkeypatch, manual):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        kb._append_event(conn, task_id, "reclaimed", {"manual": manual})
+        assert (kb.check_respawn_guard(conn, task_id) is None) is manual
+        kb._append_event(conn, task_id, "spawned", {"pid": 99999999})
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_requeue_intent_consumed_after_dispatch_and_crash(kanban_home, all_assignees_spawnable, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, int(time.time()))
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue PR 9") == (True, None)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 99999999))
+        assert task_id in spawned
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        assert task_id in kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        spawned.clear()
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 99999999))
+        assert task_id not in spawned
+
+
+def test_ready_requeue_after_inline_triage_comment_resumes_pr(kanban_home, all_assignees_spawnable, monkeypatch):
+    """An inline audit comment cannot shift the PR comment's causal event."""
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="triage PR", assignee="alice")
+        assert kb.claim_task(conn, task_id)
+        assert kb.block_task(conn, task_id, reason="ruling one", kind="needs_input")
+        assert kb.unblock_task(conn, task_id)
+        assert kb.claim_task(conn, task_id)
+        assert kb.block_task(conn, task_id, reason="ruling two", kind="needs_input")
+        assert kb.triage_resolve_task(conn, task_id, to="todo", reason="resume", actor="qa") == (True, None)
+        kb.add_comment(conn, task_id, "qa", "https://github.com/o/r/pull/9")
+        assert kb.requeue_task(conn, task_id, actor="qa", reason="continue PR 9") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 99999999))
+        assert task_id in spawned
+
+
+def test_dependency_intent_not_reused_after_second_automatic_promotion(kanban_home, all_assignees_spawnable, monkeypatch):
+    from plugins.kanban.dashboard import plugin_api
+
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="qa", reason="first parent rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume after parent", kind="dependency")
+        assert kb.complete_task(conn, parent)
+        first = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (first.append(task.id) or 99999999))
+        assert child in first
+        assert plugin_api._set_status_direct(conn, parent, "todo")
+        assert kb.recompute_ready(conn) >= 1
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.check_respawn_guard(conn, child) == "active_pr"
+        second = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (second.append(task.id) or 99999999))
+        assert child not in second
+
+
+def test_inline_same_author_and_length_cannot_impersonate_pr_event(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="audit", assignee="alice")
+        pr = "https://github.com/o/r/pull/9"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "alice", "x" * len(pr), now),
+        )
+        conn.commit()
+        kb.add_comment(conn, task_id, "alice", pr)
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="resume") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/8")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_legacy_pr_event_with_inline_comment_still_requeues(kanban_home, monkeypatch):
+    """Existing boards have commented events without a comment_id payload."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy PR", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "audit", "old inline note", now),
+        )
+        conn.commit()
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/9")
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+            "WHERE task_id=? AND kind='commented'", (task_id,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_legacy_equal_length_inline_comment_does_not_block_requeue(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy equal length", assignee="alice")
+        pr = "https://github.com/o/r/pull/9"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "alice", "x" * len(pr), now),
+        )
+        conn.commit()
+        kb.add_comment(conn, task_id, "alice", pr)
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+            "WHERE task_id=? AND kind='commented'", (task_id,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/8")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+@pytest.mark.parametrize("inline_before", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_historical_pr_dependency_wait_resumes_despite_unmappable_comment_event(
+    kanban_home, all_assignees_spawnable, monkeypatch, inline_before, padded,
+):
+    """Old boards did not link commented events; trim/inline writes defeat correlation."""
+    now = int(time.time())
+    clock = {"now": now}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        if inline_before:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (child, "alice", "x" * len("https://github.com/o/r/pull/9"), now),
+            )
+            conn.commit()
+        pr = "https://github.com/o/r/pull/9"
+        kb.add_comment(conn, child, "alice", f" {pr} " if padded else pr)
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+            "WHERE task_id=? AND kind='commented'", (child,),
+        )
+        conn.commit()
+        assert kb.reopen_task(conn, parent, actor="qa", reason="rework") == (True, None)
+        clock["now"] += 2
+        assert kb.block_task(conn, child, reason="resume then complete", kind="dependency")
+        assert kb.complete_task(conn, parent)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
+        assert child in spawned
+
+
+@pytest.mark.parametrize("later_second", [False, True])
+def test_preupgrade_intent_resumes_on_equal_second(kanban_home, monkeypatch, later_second):
+    now = int(time.time())
+    clock = {"now": now}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        if later_second:
+            clock["now"] += 2
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="legacy") == (True, None)
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.after_comment_id', '$.pr_comment_id') "
+            "WHERE task_id=? AND kind='requeued'", (task_id,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_pr_intent_has_one_event_id_ordering_seam():
+    """PR identity comes only from comments; no guessed comment/event join."""
+    import ast
+    import inspect
+    source = inspect.getsource(kb.check_respawn_guard)
+    intent = inspect.getsource(kb._unused_operator_intent_after_pr)
+    tree = ast.parse(source + "\n" + intent)
+    sql_literals = [node.value.lower() for node in ast.walk(tree)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+    assert source.count("_unused_operator_intent_after_pr(conn, task_id)") == 1
+    assert "after_comment_id" in intent and "s.id > i.id" in intent
+    assert "json_type(i.payload, '$.after_comment_id') IS NULL AND i.created_at >= ?" in intent
+    assert not any("kind = 'commented'" in value for value in sql_literals)
+    assert not any("join task_comments" in value or "join task_events" in value
+                   for value in sql_literals)
+
+
+def test_guard_stuck_age_survives_progress_comment_during_real_dispatch(kanban_home, monkeypatch):
+    import hermes_cli.profiles as profmod
+
+    now = int(time.time())
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name == "alice")
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda *args: "OPEN")
+    with kb.connect() as conn:
+        plain = kb.create_task(conn, title="no comment", assignee="alice")
+        noted = kb.create_task(conn, title="progress comment", assignee="alice")
+        for tid in (plain, noted):
+            kb.add_comment(conn, tid, "qa", "https://github.com/o/r/pull/9")
+        spawn = lambda *args, **kw: (_ for _ in ()).throw(AssertionError("guarded card spawned"))
+        first = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert {plain, noted} <= {tid for tid, reason in first.respawn_guarded if reason == "active_pr"}
+        conn.execute("UPDATE task_events SET created_at=? WHERE kind='respawn_guarded'", (now - 1861,))
+        conn.commit()
+        kb.add_comment(conn, noted, "qa", "Progress only; same PR")
+        second = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert {plain, noted} <= {tid for tid, reason in second.respawn_guarded if reason == "active_pr"}
+        stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
+        assert {plain, noted} == {row["task_id"] for row in stuck}
+        assert all(row["guarded_seconds"] >= 1861 for row in stuck)
+        assert kb.requeue_task(conn, noted, actor="operator", reason="resume") == (True, None)
+        assert {row["task_id"] for row in kb.respawn_guard_stuck_tasks(conn, now=now)} == {plain}
+
+
+def test_guard_stuck_recovery_command_runs_on_each_board(kanban_home, monkeypatch):
+    import shlex
+    kb.create_board("secondary")
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    now = int(time.time())
+    for board in ("default", "secondary"):
+        with kb.connect_closing(board=board) as conn:
+            tid = kb.create_task(conn, title="stuck", assignee="alice")
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+            conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1861, tid))
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+            item, = kb.respawn_guard_stuck_tasks(conn, board=board, now=now)
+            command = shlex.split(item["clear_verb"].replace("<reason>", "continue PR"))
+            assert command[:4] == ["hermes", "kanban", "--board", board]
+        result = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", *command[1:]],
+            cwd=Path(__file__).resolve().parents[2], env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        with kb.connect_closing(board=board) as conn:
+            assert kb.list_events(conn, tid)[-1].kind == "requeued"
+            assert kb.respawn_guard_stuck_tasks(conn, board=board, now=now) == []
+
+
+def test_guard_stuck_recovery_command_has_one_renderer():
+    import ast
+    import inspect
+    from gateway import kanban_watchers
+    for module in (kb, kanban_watchers):
+        tree = ast.parse(inspect.getsource(module))
+        builders = [node for node in ast.walk(tree) if isinstance(node, ast.JoinedStr)
+                    and node.values and isinstance(node.values[0], ast.Constant)
+                    and isinstance(node.values[0].value, str)
+                    and node.values[0].value.startswith("hermes kanban ")]
+        assert all(any(isinstance(parent, ast.FunctionDef) and parent.name == "render_operator_command"
+                       and node in ast.walk(parent) for parent in ast.walk(tree)
+                       if isinstance(parent, ast.FunctionDef)) for node in builders)
+
+
+def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stuck", assignee="alice")
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1860, tid))
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        assert kb.respawn_guard_stuck_tasks(conn, now=now - 120) == []
+        stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
+        assert [x["task_id"] for x in stuck] == [tid]
+        assert stuck[0]["clear_verb"] == kb.render_operator_command("default", "requeue", tid, "<reason>")
+        kb._append_event(conn, tid, "requeued", {"actor": "operator", "reason": "retry"})
+        assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
+
+
 def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
     """Every kind in the override set is actually emitted by kanban_db (no dead entries),
     and every operator requeue verb's event kind is in the set (no missing entries)."""
@@ -3520,6 +3922,7 @@ def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
         "reopen_review_task": "review_reopened",
         "triage_resolve_task": "triage_resolved",
         "reopen_task": "reopened",
+        "requeue_task": "requeued",
     }
     for fn, kind in verb_kinds.items():
         assert hasattr(kb, fn), fn

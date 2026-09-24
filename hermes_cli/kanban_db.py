@@ -84,6 +84,7 @@ import os
 import re
 import random
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -6521,6 +6522,15 @@ def _append_event(
     and the row carries NULL.
     """
     now = int(time.time())
+    if kind in _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS or (
+        kind == "dependency_wait" and (payload or {}).get("kind") == "dependency"
+    ) or (kind == "reclaimed" and (payload or {}).get("manual") is True):
+        # Snapshot comment causality in the same transaction as operator intent.
+        # Old commented events cannot be correlated with comment rows reliably.
+        payload = dict(payload or {})
+        payload["after_comment_id"] = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
+        ).fetchone()[0]
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
@@ -10466,6 +10476,44 @@ def request_changes(
     return True, implementer
 
 
+def requeue_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> tuple[bool, Optional[str]]:
+    """Record operator intent to run a READY card now (``requeued`` event).
+
+    The operator verb for a card that is already ``ready`` but deferred by the
+    respawn guard (typically ``active_pr``: the open PR is the fix-round
+    target). ``unblock``/``reopen``/``triage-resolve`` all require a non-ready
+    source state, which previously forced a block->unblock round trip just to
+    mint an intent event. Status is unchanged; ``requeued`` is in
+    ``_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS`` so the next dispatch tick spawns.
+
+    Returns ``(True, None)`` on success, ``(False, reason)`` if refused.
+    """
+    if not (reason or "").strip():
+        return False, "a reason is required to requeue a task"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        if row["status"] != "ready":
+            return False, (
+                f"task {task_id} is {row['status']!r}; requeue only applies to "
+                f"'ready' tasks (use unblock/reopen/triage-resolve/promote "
+                f"for other states)"
+            )
+        _append_event(
+            conn, task_id, "requeued", {"actor": actor, "reason": reason},
+        )
+    return True, None
+
+
 def reopen_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12312,8 +12360,8 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 # Event kinds that mean "an OPERATOR deliberately asked for this task to run
-# again". Any of these at/after the newest PR comment overrides the
-# ``active_pr`` guard: the open PR is the fix-round target, not duplicate work.
+# again". An unused event strictly AFTER the newest PR comment overrides
+# ``active_pr`` for one spawn: the open PR is the fix-round target.
 # This is the TOTAL set of operator requeue verbs -- every CLI verb that moves a
 # task back toward ``ready`` by human intent must appear here, and
 # ``tests/hermes_cli/test_kanban_db.py::test_operator_requeue_verbs_all_override_active_pr``
@@ -12329,6 +12377,10 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
     "review_reopened",
     "triage_resolved",
     "reopened",
+    # ``kanban requeue`` — the operator verb for a READY card (2026-09-23,
+    # t_7d7ff489): unblock/reopen/triage-resolve all need a non-ready source
+    # state, so a guarded ready card had no verb short of block->unblock.
+    "requeued",
 )
 # Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
 # ``rate_limit_cooldown`` rules when they land at/after the failing run ended:
@@ -14955,6 +15007,44 @@ def _respawn_guard_failure_reset_after(
     ).fetchone() is not None
 
 
+def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether the latest PR-bearing comment has an unconsumed resume intent.
+
+    Event ids establish causality even when writes share a timestamp. A spawn
+    consumes the intent; automatic crash reclaim cannot reuse it.
+    """
+    comments = conn.execute(
+        "SELECT id, author, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY id DESC",
+        (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+    ).fetchall()
+    pr_comment = next(
+        (c for c in comments if _RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None,
+    )
+    if pr_comment is None:
+        return False
+    # The intent event snapshots the highest comment id atomically. No guess
+    # about which 'commented' event corresponds to this PR is needed: inline
+    # audit comments and historical trimmed bodies cannot skew the ordering.
+    # Pre-upgrade intent events have no marker; an equal-second tie resumes:
+    # one duplicate worker is recoverable, an indefinite guard is not.
+    kinds = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
+    return conn.execute(
+        "SELECT 1 FROM task_events i WHERE i.task_id = ? "
+        f"AND (i.kind IN ({kinds}) OR "
+        "(i.kind = 'reclaimed' AND json_extract(i.payload, '$.manual') = 1) OR "
+        "(i.kind = 'dependency_wait' AND json_extract(i.payload, '$.kind') = 'dependency' "
+        "AND EXISTS (SELECT 1 FROM task_events p WHERE p.task_id = i.task_id "
+        "AND p.kind = 'promoted' AND p.id > i.id))) "
+        "AND (json_extract(i.payload, '$.after_comment_id') >= ? OR "
+        "(json_type(i.payload, '$.after_comment_id') IS NULL AND i.created_at >= ?)) "
+        "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
+        "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
+        (task_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS,
+         pr_comment["id"], pr_comment["created_at"]),
+    ).fetchone() is not None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection,
     task_id: str,
@@ -15151,37 +15241,19 @@ def check_respawn_guard(
     # 4. Recent GitHub PR comments. Guard while ANY referenced PR is open,
     #    unparseable, unqueryable, or beyond this tick's query budget. The
     #    duplicate-PR risk is gone only when ALL referenced PRs are closed.
-    #    Exception: an explicit requeue at/after the newest PR comment means
-    #    the open PR is the fix-round target, not duplicate work. Honor it
-    #    before querying PR states (2026-09-07, clanker-voice-backlog
-    #    t_800b8189: both unblock and changes_requested stranded PR #315).
-    #    Unlike rule 3, this is not gated behind a completed run, so only
-    #    operator-intent events count (including manual reclaim). Automatic
-    #    reclaim after a worker dies with an open PR is the founding case;
-    #    automatic dependency promotion and generic status events also defer.
+    #    Exception: a fresh, unconsumed operator requeue AFTER the newest PR
+    #    comment means the open PR is the fix-round target, not duplicate
+    #    work. Worker dependency_wait followed by promotion grants the same
+    #    one-shot continuation. Both are consumed by the next spawn.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     pr_urls: list[str] = []
-    newest_pr_at = 0
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ?",
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        body = c["body"] or ""
-        urls = [match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body)]
-        if urls:
-            pr_urls.extend(urls)
-            newest_pr_at = max(newest_pr_at, int(c["created_at"]))
+        pr_urls.extend(match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"] or ""))
     if pr_urls:
-        _kinds_sql = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            f"AND (kind IN ({_kinds_sql}) OR (kind = 'reclaimed' "
-            "AND json_extract(payload, '$.manual') = 1)) LIMIT 1",
-            (task_id, newest_pr_at, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS),
-        ).fetchone()
-        if requeued_after:
+        if _unused_operator_intent_after_pr(conn, task_id):
             return None
         resolver = pr_state_resolver or _PrStateResolver()
         for url in dict.fromkeys(pr_urls):
@@ -15193,6 +15265,107 @@ def check_respawn_guard(
                 return "active_pr"
 
     return None
+
+
+# A READY+assigned card continuously deferred as ``respawn_guarded:active_pr``
+# for this long is STUCK, not cooling down: nothing automatic will clear it.
+RESPAWN_GUARD_STUCK_SECONDS = 30 * 60
+# The newest guard event must be this fresh for the streak to be "current"
+# (the dispatcher still re-evaluates it); a stale streak means the dispatcher
+# itself is down, which other health lanes own.
+_RESPAWN_GUARD_STUCK_FRESH_SECONDS = 10 * 60
+
+
+def render_operator_command(board: str, verb: str, *args: str) -> str:
+    """Render a runnable ``hermes kanban`` command for an operator page.
+
+    The ONLY place an alert/hint may build a ``hermes kanban`` command
+    string. It always pins ``--board <slug>`` (the default board included),
+    so the command acts on the card's board no matter which board is current
+    where the operator pastes it. Arguments are shell-quoted. 2026-09-24,
+    t_7d7ff489 r5: a hand-assembled unscoped verb failed (rc1 "not found")
+    against a secondary-board card.
+    """
+    return shlex.join(["hermes", "kanban", "--board", str(board), verb, *map(str, args)])
+
+
+# Event kinds that can change ``check_respawn_guard``'s ``active_pr`` answer:
+# the intent/requeue kinds the guard itself reads, plus the worker's own
+# dependency block and a spawn (which consumes intent). Only these restart
+# the continuous-guard age in ``respawn_guard_stuck_tasks``; everything else
+# (commented, heartbeat, linked, attached, ...) is data. Any trip away from
+# READY returns through one of the requeue kinds, so status transitions are
+# covered too.
+_RESPAWN_GUARD_STUCK_RESET_KINDS: tuple[str, ...] = (
+    *_RESPAWN_GUARD_FAILURE_RESET_KINDS,
+    "dependency_wait",
+    "spawned",
+)
+
+
+def respawn_guard_stuck_tasks(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    min_seconds: int = RESPAWN_GUARD_STUCK_SECONDS,
+    now: Optional[int] = None,
+) -> list[dict]:
+    """Return ready+assigned+unclaimed cards stuck behind ``active_pr``.
+
+    A card qualifies when it has been guarded with ``active_pr`` since the
+    last event that could have changed the guard's answer
+    (``_RESPAWN_GUARD_STUCK_RESET_KINDS``, or a guard decline for another
+    reason), the first such guard row is at least ``min_seconds`` old, and the
+    newest is recent. Data-only events (a progress comment, heartbeat,
+    attachment) do NOT restart the age. Each entry carries ``clear_verb``,
+    rendered by ``render_operator_command`` for ``board`` (defaults to the
+    current board; callers holding another board's connection must pass it).
+
+    ``respawn_guarded`` is a benign decline for the stall streak, so without
+    this probe a card held by the guard is indistinguishable from a card that
+    is briefly cooling down. 2026-09-23, t_7d7ff489: two cards sat silent for
+    8h and 14h.
+    """
+    now = int(time.time()) if now is None else int(now)
+    board = board or get_current_board()
+    reset_marks = ", ".join("?" for _ in _RESPAWN_GUARD_STUCK_RESET_KINDS)
+    out: list[dict] = []
+    for row in conn.execute(
+        "SELECT id, assignee FROM tasks WHERE status = 'ready' "
+        "AND assignee IS NOT NULL AND claim_lock IS NULL ORDER BY id"
+    ).fetchall():
+        task_id = row["id"]
+        last_other = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
+            f"WHERE task_id = ? AND (kind IN ({reset_marks}) "
+            "OR (kind = 'respawn_guarded' "
+            "AND COALESCE(json_extract(payload, '$.reason'), '') != 'active_pr'))",
+            (task_id, *_RESPAWN_GUARD_STUCK_RESET_KINDS),
+        ).fetchone()["m"]
+        streak = conn.execute(
+            "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, "
+            "COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND id > ? AND kind = 'respawn_guarded'",
+            (task_id, int(last_other)),
+        ).fetchone()
+        if not streak or not streak["n"]:
+            continue
+        first_at = int(streak["first_at"])
+        last_at = int(streak["last_at"])
+        if now - first_at < min_seconds:
+            continue
+        if now - last_at > _RESPAWN_GUARD_STUCK_FRESH_SECONDS:
+            continue
+        out.append({
+            "task_id": task_id,
+            "assignee": row["assignee"],
+            "reason": "active_pr",
+            "guarded_since": first_at,
+            "guarded_seconds": now - first_at,
+            "guard_events": int(streak["n"]),
+            "clear_verb": render_operator_command(board, "requeue", task_id, "<reason>"),
+        })
+    return out
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
