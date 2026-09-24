@@ -520,6 +520,9 @@ def test_create_persists_model_override(worker_env):
 def test_create_tool_stamps_session_and_origin(worker_env, monkeypatch):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
+    # A CHAT session's tool create (not a dispatched worker run): a worker
+    # run's per-run id is never a card's home (t_f59538cf item 1).
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_SESSION_ID", "20260924_000000_toolsess")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "#ops")
