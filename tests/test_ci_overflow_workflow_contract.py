@@ -442,6 +442,19 @@ def _file_set(matrix):
     return sorted((row["index"], row["name"], row["files"]) for row in matrix["slice"])
 
 
+def test_static_merge_group_uses_real_generator_matrix():
+    original = _generate("full")
+    ctx = _ctx("merge_group", copy.deepcopy(PLACEMENT_OUTCOMES["skipped"]),
+               '["self-hosted","hermes-ci"]', enabled=False)
+    ctx["needs"]["generate"]["outputs"]["matrix"] = json.dumps(original)
+    jobs = _tests_yml()["jobs"]
+    assert not _job_runs(jobs["placement"], ctx)
+    assert _job_runs(jobs["test"], ctx) and _job_runs(jobs["e2e"], ctx)
+    status = {"always": True, "cancelled": False, "failure": False, "success": True}
+    assert evaluate(jobs["test"]["strategy"]["matrix"], ctx, status) == original
+    assert evaluate(jobs["e2e"]["runs-on"], ctx, status) == ["self-hosted", "hermes-ci", "X64"]
+
+
 @pytest.mark.parametrize("scope", ["full", "plugin"])
 def test_local_matrix_membership_identical_real_generator(tmp_path, scope):
     if scope == "plugin":
