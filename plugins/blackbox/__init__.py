@@ -372,7 +372,7 @@ def _build_record(
     )
 
     return TurnRecord(
-        turn_id=_turn_id(),
+        turn_id=str(kwargs.get("turn_id") or _turn_id()),
         parent_turn_id=usage.get("parent_turn_id"),
         is_subagent=is_subagent,
         depth=depth,
