@@ -779,6 +779,18 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
             filtered.append(parts[i])
             i += 1
 
+    # Discord's native /model renders its option as ``name:<value>``; pasting
+    # that text into any other surface (Telegram, Slack, CLI, TUI) used to
+    # make ``name:claude-bpx-5/x`` the model id under the CURRENT provider.
+    # Strip a leading option label here, once, for every surface.
+    if filtered:
+        _opt = _re.match(r"(?i)^(?:name|model)[:=](.*)$", filtered[0])
+        if _opt is not None:
+            if _opt.group(1):
+                filtered[0] = _opt.group(1)
+            else:  # "name: <value>" — label token on its own
+                filtered.pop(0)
+
     model_input = " ".join(filtered).strip()
     return ModelFlagParseResult(
         model_input=model_input,
@@ -1799,6 +1811,25 @@ def switch_model(
         if inline_provider is not None:
             target_provider, new_model = inline_provider
 
+    # ``X/model`` off an aggregator where X is neither a provider nor a vendor
+    # namespace: X is most likely a mistyped/unconfigured provider. Remember
+    # it so the switch is refused (below, after validation) instead of
+    # persisting ``<current>/X/model`` — unless the current endpoint lists or
+    # config declares the full slug (HF-style ids on private endpoints).
+    unknown_slash_prefix = ""
+    if not explicit_provider and inline_provider is None:
+        _raw_slug = raw_input.strip()
+        _head = _raw_slug.split("/", 1)[0].strip()
+        if (
+            "/" in _raw_slug
+            and _head
+            and "://" not in _raw_slug
+            and not is_aggregator(current_provider)
+            and not is_known_vendor_namespace(_head)
+            and not _user_provider_lists_model(_raw_slug, current_provider, user_providers)
+        ):
+            unknown_slash_prefix = _head
+
     # =================================================================
     # PATH A: Explicit --provider given OR inline provider qualification
     # =================================================================
@@ -2449,6 +2480,40 @@ def switch_model(
                 is_global=is_global,
                 error_message=msg,
             )
+
+    # Refuse ``unknown-provider/model`` rather than persisting a route whose
+    # model id silently embeds a provider name nothing can resolve. Only when
+    # the id survived resolution untouched AND the endpoint did not recognise
+    # it — a listed/declared slug is a real model id and passes.
+    if (
+        unknown_slash_prefix
+        and target_provider == current_provider
+        and new_model.strip().split("/", 1)[0].strip() == unknown_slash_prefix
+        and not validation.get("recognized")
+        and not validation.get("corrected_model")
+        and not any(
+            isinstance(_cp, dict)
+            and (
+                _cp.get("model") == new_model
+                or new_model in _declared_model_ids(_cp.get("models", {}))
+            )
+            for _cp in (custom_providers if isinstance(custom_providers, list) else [])
+        )
+    ):
+        return ModelSwitchResult(
+            success=False,
+            new_model=new_model,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=(
+                f"Unknown provider '{unknown_slash_prefix}' in "
+                f"'{new_model}'. No model switch was made. Use "
+                f"<provider>/<model> with a configured provider id "
+                f"(see 'hermes model'), or force the full id on the current "
+                f"provider with --provider {current_provider}."
+            ),
+        )
 
     # Apply auto-correction if validation found a closer match
     if validation.get("corrected_model"):
