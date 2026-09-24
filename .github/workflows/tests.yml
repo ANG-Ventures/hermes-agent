@@ -105,10 +105,12 @@ jobs:
         id: overflow
         env:
           EVENT_NAME: ${{ github.event_name }}
-          MANAGED_PLACEMENT: ${{ vars.CI_OVERFLOW_PLACEMENT_ENABLED }}
+          MANAGED_PLACEMENT: ${{ vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' }}
         run: |
           python3 scripts/ci_overflow_request.py --matrix-file ci-overflow/matrix.json --out-dir ci-overflow --event "$EVENT_NAME" --managed "$MANAGED_PLACEMENT"
-          echo "local_matrix=$(cat ci-overflow/local_matrix.json)" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT_NAME" == "merge_group" && "$MANAGED_PLACEMENT" == "true" ]]; then
+            echo "local_matrix=$(cat ci-overflow/local_matrix.json)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload CI overflow request
         id: request
@@ -123,6 +125,7 @@ jobs:
 
       - name: Upload local matrix for placement
         # Placement's input (too large for env). Not the controller's request.
+        if: github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -196,7 +196,7 @@ def _ctx(event, placement, runner_labels, enabled=False):
                                                        "CI_OVERFLOW_PLACEMENT_ENABLED": "true" if enabled else ""},
             "needs": {"generate": {"result": "success",
                                    "outputs": {"matrix": json.dumps(GEN_MATRIX),
-                                               "local_matrix": json.dumps(local_matrix(GEN_MATRIX))}},
+                                               "local_matrix": json.dumps(local_matrix(GEN_MATRIX)) if event == "merge_group" and enabled else ""}},
                       "placement": placement}}
 
 
@@ -289,7 +289,7 @@ def test_static_routing_switch_mutation_fails_integration():
     doc = _tests_yml()
     doc["jobs"]["test"]["strategy"]["matrix"] = doc["jobs"]["test"]["strategy"]["matrix"].replace(
         " || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true'", "")
-    assert any("wrong matrix" in e for e in check_fallback(doc))
+    assert any("missing/empty" in e for e in check_fallback(doc))
     doc = _tests_yml()
     doc["jobs"]["e2e"]["runs-on"] = doc["jobs"]["e2e"]["runs-on"].replace(
         " || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true'", "")
@@ -321,8 +321,27 @@ def test_generate_emits_local_matrix_and_request_artifact():
     assert upload["with"]["name"] == "ci-overflow-request-${{ github.run_id }}-${{ github.run_attempt }}"
     assert upload["with"]["path"] == "ci-overflow/request.json"
     step = next(s for s in gen["steps"] if s.get("id") == "overflow")
-    assert step["env"]["MANAGED_PLACEMENT"] == "${{ vars.CI_OVERFLOW_PLACEMENT_ENABLED }}"
-    assert '--managed "$MANAGED_PLACEMENT"' in step["run"]
+    assert step["env"]["MANAGED_PLACEMENT"] == "${{ vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' }}"
+    assert 'if [[ "$EVENT_NAME" == "merge_group" && "$MANAGED_PLACEMENT" == "true" ]]' in step["run"]
+    local_upload = next(s for s in gen["steps"] if s.get("name") == "Upload local matrix for placement")
+    assert local_upload["if"] == _tests_yml()["jobs"]["placement"]["if"]
+
+
+def test_generate_step_emits_local_output_only_on_managed_merge_group(tmp_path):
+    step = next(s for s in _tests_yml()["jobs"]["generate"]["steps"] if s.get("id") == "overflow")
+    (tmp_path / "ci-overflow").mkdir()
+    (tmp_path / "scripts").symlink_to(ROOT / "scripts", target_is_directory=True)
+    (tmp_path / "ci-overflow" / "matrix.json").write_text(json.dumps(GEN_MATRIX), encoding="utf-8")
+    for event, enabled in (("merge_group", "false"), ("pull_request", "true"), ("merge_group", "true")):
+        output = tmp_path / "output"
+        output.write_text("", encoding="utf-8")
+        env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "EVENT_NAME": event,
+               "MANAGED_PLACEMENT": enabled, "GITHUB_OUTPUT": str(output)}
+        proc = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=tmp_path, env=env,
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        assert proc.returncode == 0, proc.stderr
+        assert output.read_text().startswith("local_matrix=") == (event == "merge_group" and enabled == "true")
+        assert (tmp_path / "ci-overflow" / "request.json").exists()
 
 
 def test_static_merge_group_summary_reports_legacy_policy(tmp_path):

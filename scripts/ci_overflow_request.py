@@ -70,7 +70,7 @@ def main(argv=None) -> int:
     (args.out_dir / "request.json").write_text(json.dumps(request, separators=(",", ":")) + "\n", encoding="utf-8")
     (args.out_dir / "local_matrix.json").write_text(json.dumps(local_matrix(matrix)), encoding="utf-8")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary and (args.event != "merge_group" or args.managed != "true"):
+    if summary and (args.event != "merge_group" or args.managed.lower() != "true"):
         with open(summary, "a", encoding="utf-8") as fh:
             fh.write(f"CI overflow placement: `{LEGACY_NOTE}` (event `{args.event}` uses the original generate matrix).\n")
     return 0
