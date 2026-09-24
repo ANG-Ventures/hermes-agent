@@ -15902,11 +15902,11 @@ def respawn_guard_stuck_tasks(
     min_seconds: int = RESPAWN_GUARD_STUCK_SECONDS,
     now: Optional[int] = None,
 ) -> list[dict]:
-    """Return ready cards continuously refused by active_pr or prior worker.
+    """Return unclaimed cards continuously refused by active_pr or prior worker.
 
-    Active-PR guards page after 30 minutes; claim rejection by an allegedly
-    live previous worker pages after 15 minutes (the process may have exited
-    or its PID may have been recycled). Both use the same one-shot notifier.
+    Active-PR guards page for ready cards after 30 minutes; claim rejection by
+    an allegedly live previous worker pages for ready or review cards after
+    15 minutes (the process may have exited or its PID may have been recycled).
     For active_pr, a card qualifies when it has been guarded with ``active_pr`` since the
     last event that could have changed the guard's answer
     (``_RESPAWN_GUARD_STUCK_RESET_KINDS``, or a guard decline for another
@@ -15926,16 +15926,17 @@ def respawn_guard_stuck_tasks(
     reset_marks = ", ".join("?" for _ in _RESPAWN_GUARD_STUCK_RESET_KINDS)
     out: list[dict] = []
     for row in conn.execute(
-        "SELECT id, assignee FROM tasks WHERE status = 'ready' "
+        "SELECT id, assignee, status FROM tasks WHERE status IN ('ready', 'review') "
         "AND assignee IS NOT NULL AND claim_lock IS NULL ORDER BY id"
     ).fetchall():
         task_id = row["id"]
         last_reset = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events WHERE task_id=? "
             "AND (kind IN ('claimed', 'spawned', 'requeued', 'unblocked', 'status') "
-            "OR (kind='claim_rejected' AND "
-            "COALESCE(json_extract(payload, '$.reason'), '') != 'prior_worker_still_alive'))",
-            (task_id,),
+            "OR (kind='claim_rejected' AND ("
+            "COALESCE(json_extract(payload, '$.reason'), '') != 'prior_worker_still_alive' "
+            "OR COALESCE(json_extract(payload, '$.source_status'), 'ready') != ?)))",
+            (task_id, row["status"]),
         ).fetchone()["m"]
         rejected = conn.execute(
             "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, "
@@ -15954,6 +15955,8 @@ def respawn_guard_stuck_tasks(
                 "prev_pid": rejected["pid"],
                 "clear_verb": render_operator_command(board, "show", task_id),
             })
+        if row["status"] != "ready":
+            continue  # active_pr is a ready-only respawn guard
         last_other = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
             f"WHERE task_id = ? AND (kind IN ({reset_marks}) "

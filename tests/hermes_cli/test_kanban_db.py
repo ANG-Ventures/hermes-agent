@@ -3932,13 +3932,18 @@ def test_guard_stuck_recovery_command_has_one_renderer():
                        if isinstance(parent, ast.FunctionDef)) for node in builders)
 
 
-def test_prior_worker_claim_rejections_page_after_continuous_15_minutes(kanban_home):
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_prior_worker_claim_rejections_page_after_continuous_15_minutes(kanban_home, status):
     now = int(time.time())
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="recycled PID", assignee="alice")
-        kb._append_event(conn, tid, "claim_rejected", {"reason": "prior_worker_still_alive", "prev_pid": 42})
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        refusal = {"reason": "prior_worker_still_alive", "prev_pid": 42}
+        if status == "review":
+            refusal["source_status"] = "review"
+        kb._append_event(conn, tid, "claim_rejected", refusal)
         conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='claim_rejected'", (now - 901, tid))
-        kb._append_event(conn, tid, "claim_rejected", {"reason": "prior_worker_still_alive", "prev_pid": 42})
+        kb._append_event(conn, tid, "claim_rejected", refusal)
         assert not any(x["reason"] == "prior_worker_still_alive"
                        for x in kb.respawn_guard_stuck_tasks(conn, now=now - 2))
         stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
@@ -3946,6 +3951,20 @@ def test_prior_worker_claim_rejections_page_after_continuous_15_minutes(kanban_h
         assert stuck[0]["prev_pid"] == 42
         assert stuck[0]["clear_verb"] == kb.render_operator_command("default", "show", tid)
         kb._append_event(conn, tid, "claimed", {"lock": "new"})
+        assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
+
+
+def test_prior_worker_page_requires_current_claim_door(kanban_home):
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="changed lane", assignee="alice")
+        kb._append_event(conn, tid, "claim_rejected", {"reason": "prior_worker_still_alive"})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='claim_rejected'", (now - 901, tid))
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
+        kb._append_event(conn, tid, "claim_rejected", {
+            "reason": "prior_worker_still_alive", "source_status": "review",
+        })
         assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
 
 
