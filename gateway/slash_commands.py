@@ -7950,7 +7950,8 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.merge.fold_failed", error=exc)
 
         # --- Layer 2: durable .md record (self-purging). ---
-        record_path = self._write_merge_record(
+        record_path = await asyncio.to_thread(
+            self._write_merge_record,
             source_title, source_session_id, target_title, target_id,
             summary, source.platform.value if source.platform else "gateway",
         )
@@ -8688,6 +8689,12 @@ class GatewaySlashCommandsMixin:
             from agent.skill_commands import reload_skills
 
             result = await loop.run_in_executor(None, reload_skills)
+            try:
+                from gateway.run import _invalidate_skill_slug_index
+
+                _invalidate_skill_slug_index()
+            except Exception:
+                logger.debug("skill slug index invalidation failed", exc_info=True)
             added = result.get("added", [])      # [{"name", "description"}, ...]
             removed = result.get("removed", [])  # [{"name", "description"}, ...]
             total = result.get("total", 0)
