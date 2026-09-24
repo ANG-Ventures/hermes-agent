@@ -142,6 +142,15 @@ inter-statement wall time.
    `SELECT DISTINCT session_id` full scans. It uses indexed per-session probes, takes the write
    lock only when there is something to delete, and runs at most once per
    `empty_lifecycle_gc_interval_hours` (default 6 h) per process.
+7. **Config parse: nothing under `_LOAD_LOCK` may re-parse config per knob.** Every
+   config-file knob in `plugins/context_engine/lcm/config.py` reads through
+   `_hermes_config_yaml()`. That function re-reads the file but parses it only when its text
+   changed, using libyaml `CSafeLoader` when it is available. Never call
+   `_load_hermes_config_yaml()` (the raw parser) or `yaml.safe_load` from a knob helper. Before
+   this, each of about 12 helpers parsed the 23 KB `config.yaml` with pure-Python
+   `safe_load`: 2.75 s per `LCMConfig.from_env()` measured, 5–10 s holds live (card
+   t_90850d58). Gate: `tests/context_engine/test_lcm_config_parse_once.py` (≤ 1 parse per
+   engine load, 0 on an unchanged file).
 
 ## An FTS repair is one transaction (freeze #3, third defect)
 
@@ -256,3 +265,6 @@ replay shapes, 0 mismatches, and two planted mutations were both caught.
   restart"), was moved into `ReconcileMixin` by `b497583`, and reached the fork with re-vendor
   `27b617846e`. It was harmless on short sessions because the post-compaction replay shape only
   gets long once the fresh tail is token-budgeted (60K cap on 1M windows).
+- Incident 5: 2026-09-24 06:26–06:45 PDT, after #966: 11× `PHASE=context_engine_load_slow`,
+  held 5.5–10.1 s, lock holder spread across `LCMConfig.from_env` config-file helpers (12
+  parses of `config.yaml` per load). Card t_90850d58.
