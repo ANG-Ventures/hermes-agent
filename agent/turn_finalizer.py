@@ -895,6 +895,9 @@ def finalize_turn(
         # never break the turn, so guard the fold.
         _turn_calls = _turn_calls or []
         _turn_usage = None
+        _blackbox_compaction = getattr(agent, "_blackbox_compaction", None)
+        if not isinstance(_blackbox_compaction, dict):
+            _blackbox_compaction = {}
         try:
             if _turn_calls:
                 # Last-call cache split — the FINAL provider call's own
@@ -963,7 +966,10 @@ def finalize_turn(
                     # Depth tracking (B1): read from the agent attribute set at
                     # construction time (0 for parents, parent+1 for children).
                     "depth": getattr(agent, "_blackbox_depth", None),
+                    **_blackbox_compaction,
                 }
+            elif _blackbox_compaction:
+                _turn_usage = dict(_blackbox_compaction)
         except Exception:
             _turn_usage = None
         _invoke_hook(
