@@ -945,6 +945,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_requeue = sub.add_parser("requeue", help="Explicitly retry a READY card held by the respawn guard")
+    p_requeue.add_argument("task_id")
+    p_requeue.add_argument("reason", nargs="+", help="Required operator reason")
+
     p_reopen = sub.add_parser(
         "reopen",
         help=(
@@ -1530,6 +1534,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "requeue":  _cmd_requeue,
             "reopen":   _cmd_reopen,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
@@ -1607,6 +1612,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "block",
     "schedule",
     "unblock",
+    "requeue",
     "reopen",
     "promote",
     "triage-resolve",
@@ -3940,6 +3946,17 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_requeue(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip()
+    with kb.connect_closing() as conn:
+        ok, err = kb.requeue_task(conn, args.task_id, actor=_profile_author(), reason=reason)
+    if not ok:
+        print(f"cannot requeue {args.task_id}: {err}", file=sys.stderr)
+        return 1
+    print(f"Requeued {args.task_id}: {reason}")
+    return 0
 
 
 def _cmd_reopen(args: argparse.Namespace) -> int:

@@ -203,6 +203,41 @@ def test_workspace_refusal_sender_uses_default_profile_error_route(tmp_path, mon
     assert kwargs["stdin"] is subprocess.DEVNULL
 
 
+def test_guard_stuck_notifier_pages_once_and_rearms():
+    from gateway.kanban_watchers import _GuardStuckNotifier, _stall_streak_is_bad
+    item = {"task_id": "t_test", "clear_verb": 'kanban requeue t_test "<reason>"'}
+    notifier = _GuardStuckNotifier()
+    sent = []
+    def send(board, row):
+        sent.append((board, row))
+        return True
+    assert notifier.observe([("default", item)], send) == 1
+    assert notifier.observe([("default", item)], send) == 0
+    assert sent[0][1]["clear_verb"] == 'kanban requeue t_test "<reason>"'
+    assert _stall_streak_is_bad(True, True, [("default", _FakeResult())], guard_stuck=True)
+    assert notifier.observe([], send) == 0
+    assert notifier.observe([("default", item)], send) == 1
+
+
+def test_guard_stuck_sender_routes_to_alerts(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    from types import SimpleNamespace
+    from gateway.kanban_watchers import _send_guard_stuck_alert
+    script = tmp_path / ".hermes" / "scripts" / "notify.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    calls = []
+    monkeypatch.setattr("gateway.kanban_watchers.subprocess.run", lambda argv, **kw: (calls.append((argv, kw)) or SimpleNamespace(returncode=0)))
+    assert _send_guard_stuck_alert("default", {"task_id": "t_test", "clear_verb": 'kanban requeue t_test "<reason>"'})
+    argv, kwargs = calls[0]
+    assert argv[argv.index("--channel") + 1] == "discord"
+    assert argv[argv.index("--sev") + 1] == "error"
+    assert "kanban requeue t_test" in argv[argv.index("--send") + 1]
+    assert kwargs["stdin"] is subprocess.DEVNULL
+
+
 def test_stall_respawn_guard_is_benign_not_bad():
     res = _FakeResult(respawn_guarded=[("t1", "recent_success")])
     assert _stall_streak_is_bad(True, False, [("b", res)]) is False

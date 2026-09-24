@@ -3506,6 +3506,68 @@ def test_operator_requeue_verbs_all_override_active_pr(kanban_home, monkeypatch)
         assert kb.check_respawn_guard(conn, task_id) is None
 
 
+def test_dependency_wait_promoted_resumes_open_pr_once(kanban_home, all_assignees_spawnable, monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume then complete", kind="dependency")
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, child).status == "ready"
+        spawned = []
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
+        assert child in spawned
+        assert result.spawned
+        # A second crash/reclaim must not get the same one-shot exemption.
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=?", (child,))
+        conn.commit()
+        assert kb.check_respawn_guard(conn, child) == "active_pr"
+
+
+def test_dependency_wait_before_newer_pr_comment_does_not_resume(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume", kind="dependency")
+        kb.add_comment(conn, child, "alice", "newer https://github.com/o/r/pull/10")
+        assert kb.complete_task(conn, parent)
+        assert kb.check_respawn_guard(conn, child) == "active_pr"
+
+
+def test_requeue_ready_card_overrides_active_pr(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, int(time.time()))
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="resume")[0] is False
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="retry PR") == (True, None)
+        assert kb.list_events(conn, task_id)[-1].kind == "requeued"
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stuck", assignee="alice")
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1860, tid))
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        assert kb.respawn_guard_stuck_tasks(conn, now=now - 120) == []
+        assert [x["task_id"] for x in kb.respawn_guard_stuck_tasks(conn, now=now)] == [tid]
+        kb._append_event(conn, tid, "requeued", {"actor": "operator", "reason": "retry"})
+        assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
+
+
 def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
     """Every kind in the override set is actually emitted by kanban_db (no dead entries),
     and every operator requeue verb's event kind is in the set (no missing entries)."""
@@ -3520,6 +3582,7 @@ def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
         "reopen_review_task": "review_reopened",
         "triage_resolve_task": "triage_resolved",
         "reopen_task": "reopened",
+        "requeue_task": "requeued",
     }
     for fn, kind in verb_kinds.items():
         assert hasattr(kb, fn), fn

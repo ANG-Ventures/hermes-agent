@@ -15242,12 +15242,15 @@ def check_respawn_guard(
             "AND EXISTS (SELECT 1 FROM task_events d "
             "    WHERE d.task_id = p.task_id AND d.kind = 'dependency_wait' "
             "    AND json_extract(d.payload, '$.kind') = 'dependency' "
-            "    AND d.created_at >= ? AND d.id < p.id) "
+            "    AND d.created_at >= ? AND d.id < p.id "
+            "    AND NOT EXISTS (SELECT 1 FROM task_events c "
+            "        WHERE c.task_id = d.task_id AND c.kind = 'commented' "
+            "        AND c.created_at >= ? AND c.id > d.id)) "
             "AND NOT EXISTS (SELECT 1 FROM task_events s "
             "    WHERE s.task_id = p.task_id AND s.kind = 'spawned' "
             "    AND s.id > p.id) "
             "LIMIT 1",
-            (task_id, newest_pr_at),
+            (task_id, newest_pr_at, newest_pr_at),
         ).fetchone()
         if dependency_resume:
             return None
