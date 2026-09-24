@@ -48,6 +48,29 @@ def append(turn_id, seq, **overrides):
     store.insert_api_call(turn_id, seq, **args)
 
 
+def test_plugin_end_hook_uses_call_ledger_turn_id(db, monkeypatch):
+    """The real plugin entry points must persist a joinable call and turn."""
+    monkeypatch.setattr(blackbox, '_config', lambda: {
+        'enabled': True, 'alerts_enabled': False, 'record_subagents': True,
+        'retention_days': 3650,
+    })
+    turn_id = 'session:task:12345678'
+    blackbox._on_session_start(session_id='session')
+    blackbox.record_api_call(
+        turn_id=turn_id, seq=0, ts=100., provider='claude-apr', model='test-model',
+        usage=CanonicalUsage(input_tokens=1000, output_tokens=50),
+        api_mode='anthropic_messages', sub_key='sub-vps-7', attribution='wire',
+        http_status=200, relay_synthetic=False, route_id=None,
+    )
+    blackbox._on_session_end(session_id='session', turn_id=turn_id,
+                             provider='claude-apr', model='test-model', platform='cli',
+                             turn_usage={'input_tokens': 1000, 'output_tokens': 50,
+                                         'api_calls': 1})
+    with sqlite3.connect(db) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM turn_api_calls a JOIN turns t USING (turn_id)').fetchone()[0] == 1
+        assert conn.execute('SELECT turn_id FROM turns').fetchone()[0] == turn_id
+
+
 def test_api_call_exact_roundtrip_and_defaults(db):
     append("t", 0)
     append("t", 1, usage=CanonicalUsage(), sub_key=None,
