@@ -209,9 +209,9 @@ def test_wait_times_out_to_defer_without_signalling(store, monkeypatch):
     real_kill = os.kill
 
     def spy(pid, sig):
-        if sig != 0:
-            killed.append((pid, sig))
-        return real_kill(pid, 0)
+        if sig == 0:  # liveness probe (psutil.pid_exists on POSIX), not a signal
+            return real_kill(pid, 0)
+        killed.append((pid, sig))
 
     monkeypatch.setattr(os, "kill", spy)
     g = _gate(store, GW)
@@ -301,7 +301,7 @@ def test_unregistered_work_source_is_unknown(store):
 
 def test_corrupt_consumer_record_is_unknown(store):
     _held_and_acked(store)
-    store.consumer_path(GW).write_text("{not json")
+    store.consumer_path(GW).write_text("{not json", encoding="utf-8")
     assert ca.evaluate(store)["verdict"] == UNKNOWN
 
 
@@ -316,7 +316,7 @@ def test_unexpected_live_consumer_is_unknown(store):
 def test_corrupt_hold_fails_closed_everywhere(store):
     g = _gate(store, GW)
     store.directory.mkdir(parents=True)
-    store.hold_path.write_text("garbage")
+    store.hold_path.write_text("garbage", encoding="utf-8")
     with pytest.raises(AdmissionRefused):
         g.admit("x", internal=True)
     assert g.snapshot()["hold_error"]
@@ -460,7 +460,8 @@ def test_process_gate_reads_config_yaml_through_production_loader(tmp_path):
     cfg.write_text(
         "checkout_admission:\n  enabled: true\n"
         f"  dir: {tmp_path / 'adm'}\n"
-        "  consumers:\n    gateway: gateway:default\n"
+        "  consumers:\n    gateway: gateway:default\n",
+        encoding="utf-8",
     )
     ca._reset_process_gates_for_tests()
     g = ca.process_gate("gateway")

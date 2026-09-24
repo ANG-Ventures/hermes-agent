@@ -135,13 +135,9 @@ def _fsync_dir(directory: Path) -> None:
 def _pid_alive(pid: int) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    import psutil  # core dependency; os.kill(pid, 0) is not a probe on Windows
+
+    return bool(psutil.pid_exists(pid))
 
 
 @dataclass(frozen=True)
