@@ -30,6 +30,8 @@ import os
 from pathlib import Path
 import psutil
 import secrets
+import subprocess
+import sys
 import time
 
 import pytest
@@ -113,7 +115,7 @@ def _row(conn, tid):
 
 
 def test_dead_local_claimer_without_worker_pid_is_reclaimed(conn, monkeypatch):
-    """A gateway that died before stamping a worker cannot still spawn one."""
+    """A dead claimer without any worker evidence can release its claim."""
     dead_pid = 999991
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{dead_pid}"
     tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
@@ -131,6 +133,64 @@ def test_dead_local_claimer_without_worker_pid_is_reclaimed(conn, monkeypatch):
     assert payload["terminated"] is True
     assert payload["claimer_pid_dead"] == dead_pid
     assert not _events(conn, tid, "reclaim_refused")
+
+
+def test_heartbeat_from_previous_run_does_not_hold_dead_claimer(conn, monkeypatch):
+    dead_pid = 999995
+    lock = f"{kb._claimer_id().split(':', 1)[0]}:{dead_pid}"
+    tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "heartbeat", run_id=run_id - 1)
+    def dead(pid):
+        raise psutil.NoSuchProcess(pid)
+    monkeypatch.setattr(psutil, "Process", dead)
+    assert kb.reclaim_task(conn, tid) is True
+
+
+@pytest.mark.parametrize("reclaim_path", ["manual", "ttl", "stale"])
+def test_dead_claimer_with_unstamped_heartbeating_worker_keeps_claim(conn, reclaim_path):
+    """Popen can succeed before the gateway commits _set_worker_pid.
+
+    A detached worker may then outlive the gateway. Its heartbeat belongs to
+    the current run even if the PID was never stamped. Neither operator nor
+    automatic recovery may schedule a second worker beside it.
+    """
+    host = kb._claimer_id().split(":", 1)[0]
+    claimer = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL)
+    claimer.wait(timeout=10)
+    assert not psutil.pid_exists(claimer.pid)
+    lock = f"{host}:{claimer.pid}"
+    tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
+    orphan = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        assert kb.heartbeat_claim(conn, tid, claimer=lock)
+        assert kb.heartbeat_worker(conn, tid, note="unstamped worker alive")
+        assert _row(conn, tid)["worker_pid"] is None
+        if reclaim_path == "ttl":
+            conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, tid))
+            conn.commit()
+            assert kb.release_stale_claims(conn) == 0
+        elif reclaim_path == "stale":
+            old = int(time.time()) - 7200
+            conn.execute("UPDATE task_runs SET started_at=? WHERE id=?", (old, run_id))
+            conn.execute("UPDATE tasks SET last_heartbeat_at=? WHERE id=?", (old, tid))
+            conn.commit()
+            assert kb.detect_stale_running(conn, stale_timeout_seconds=60) == []
+        else:
+            assert kb.reclaim_task(conn, tid, reason="worker sweep: missing pid") is False
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 424242)
+        assert tid not in spawned
+        assert orphan.poll() is None
+        assert _row(conn, tid)["status"] == "running"
+        assert _row(conn, tid)["claim_lock"] == lock
+        assert not _events(conn, tid, "reclaimed")
+    finally:
+        orphan.kill()
+        orphan.wait(timeout=10)
 
 
 def test_expired_dead_claimer_is_not_renewed(conn, monkeypatch):

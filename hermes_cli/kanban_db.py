@@ -7723,6 +7723,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            conn=conn, task_id=row["id"],
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -7845,6 +7846,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        conn=conn, task_id=task_id,
     )
     # Never release a claim while our host-local worker is alive or its
     # liveness is unknown. This also covers NULL pid in the TTL and stale
@@ -13471,6 +13473,8 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    conn: Optional[sqlite3.Connection] = None,
+    task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
     import signal
@@ -13491,10 +13495,23 @@ def _terminate_reclaimed_worker(
     info["host_local"] = True
 
     if not pid or pid <= 0:
-        # The local claimer may still be launching the worker. Only an absent
-        # claimer proves a never-stamped worker cannot be launched later.
-        # An alive, inaccessible or malformed claimer remains unprovable.
+        # Popen precedes _set_worker_pid. A dead claimer can leave a detached,
+        # unstamped worker behind; any heartbeat/spawned event on THIS run is
+        # evidence that a worker existed, even when its heartbeat is stale.
+        # Without a run-bound check, a prior attempt's heartbeat would wedge
+        # a genuinely never-spawned current attempt.
         info["liveness_unprovable"] = True
+        if conn is not None and task_id is not None:
+            run_id = _current_run_id(conn, task_id)
+            if run_id is not None:
+                evidence = conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind IN ('heartbeat', 'spawned') LIMIT 1",
+                    (task_id, run_id),
+                ).fetchone()
+                if evidence is not None:
+                    info["unstamped_worker_evidence"] = evidence["kind"]
+                    return info
         claimer_pid = 0
         try:
             claimer_pid = int(str(claim_lock)[len(host_prefix):])
@@ -13552,10 +13569,9 @@ def _worker_survived_termination(termination: dict) -> bool:
     """True when a host-local worker has NOT been proven gone.
 
     A signalled-but-still-alive worker is positive liveness evidence. A
-    missing worker pid is UNKNOWN liveness unless the host-local claimer is
-    proven dead. Unknown liveness must not release a claim: it could spawn a
-    second worker beside the first. Proven-dead and non-local claims use the
-    normal release path.
+    missing worker pid is UNKNOWN liveness if the claimer may still launch or
+    the current run has evidence of an unstamped worker. Unknown liveness must
+    not release a claim: it could spawn a second worker beside the first.
     """
     if not termination.get("host_local") or termination.get("terminated"):
         return False
@@ -14072,7 +14088,7 @@ def detect_stale_running(
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+            pid, lock, signal_fn=signal_fn, conn=conn, task_id=tid,
         )
 
         # Never release a claim while our own worker is still alive: that would
