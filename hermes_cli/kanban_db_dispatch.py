@@ -1578,7 +1578,7 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', 'requeued') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -1608,6 +1608,36 @@ def check_respawn_guard(
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+            return None
+        # A worker's dependency_wait after this PR comment deliberately pauses
+        # work on the same PR until the parent completes. The promotion grants
+        # one continuation spawn only; a later crash/reclaim stays guarded.
+        # Event ids disambiguate transitions within one timestamp second.
+        resume = conn.execute(
+            "SELECT 1 FROM task_events p WHERE p.task_id = ? AND p.kind = 'promoted' "
+            "AND EXISTS (SELECT 1 FROM task_events d WHERE d.task_id = p.task_id "
+            "AND d.kind = 'dependency_wait' AND json_extract(d.payload, '$.kind') = 'dependency' "
+            "AND d.created_at >= ? AND d.id < p.id "
+            "AND NOT EXISTS (SELECT 1 FROM task_events c WHERE c.task_id = d.task_id "
+            "AND c.kind = 'commented' AND c.created_at >= ? AND c.id > d.id)) "
+            "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = p.task_id "
+            "AND s.kind = 'spawned' AND s.id > p.id) LIMIT 1",
+            (task_id, int(c["created_at"] or 0), int(c["created_at"] or 0)),
+        ).fetchone()
+        if resume:
+            return None
+        # A READY card can also be deliberately retried by an operator without
+        # the block/unblock status round trip.
+        requeued = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'requeued' "
+            "AND created_at >= ? AND NOT EXISTS (SELECT 1 FROM task_events s "
+            "WHERE s.task_id = ? AND s.kind = 'spawned' AND s.id > task_events.id) "
+            "AND NOT EXISTS (SELECT 1 FROM task_events c2 WHERE c2.task_id = ? "
+            "AND c2.kind = 'commented' AND c2.created_at >= ? AND c2.id > task_events.id) "
+            "LIMIT 1", (task_id, int(c["created_at"] or 0), task_id,
+                         task_id, int(c["created_at"] or 0)),
+        ).fetchone()
+        if requeued:
             return None
         return "active_pr"
 

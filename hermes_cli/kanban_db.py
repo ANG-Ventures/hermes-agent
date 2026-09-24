@@ -1576,6 +1576,20 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     return True
 
 
+def requeue_task(conn: sqlite3.Connection, task_id: str, *, actor: str, reason: str) -> tuple[bool, Optional[str]]:
+    """Explicitly retry a READY card, recording operator intent without changing its status."""
+    if not reason.strip():
+        return False, "a reason is required"
+    with write_txn(conn):
+        row = conn.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False, "task not found"
+        if row["status"] != "ready" or row["claim_lock"] is not None:
+            return False, "requeue requires an unclaimed READY task"
+        _append_event(conn, task_id, "requeued", {"actor": actor, "reason": reason.strip()})
+    return True, None
+
+
 def set_model_override(
     conn: sqlite3.Connection, task_id: str, model: Optional[str], provider: Optional[str] = None,
 ) -> bool:
