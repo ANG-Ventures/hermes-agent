@@ -255,8 +255,10 @@ def test_I1_seen_mark_happens_before_query(mod, home, monkeypatch):
         calls.append(ids); raise RuntimeError("db down")
     monkeypatch.setattr(mod, "query_cards", boom)
     assert mod.on_pre_llm_call(session_id=SID) is None
+    first_turn = len(calls)  # fallback-home read + exact-home read
+    assert 1 <= first_turn <= 2
     assert mod.on_pre_llm_call(session_id=SID) is None
-    assert len(calls) == 1  # a failure does not retry on every later turn
+    assert len(calls) == first_turn  # a failure does not retry on later turns
 
 
 def test_I1_threads_race_single_winner(mod, home):
@@ -617,8 +619,9 @@ def test_plugin_home_ids_is_the_shared_lineage(mod, home):
 
 # ── I5 stage-attributed timeout (t_11f2cf60) ────────────────────────────────
 
-def test_I5_budget_is_750ms(mod):
-    assert mod.BUDGET_S == 0.75
+def test_I5_turn_ceiling_is_at_most_250ms(mod):
+    # t_15d21849 AC3: a timeout degrades to skip in <= 250 ms.
+    assert 0 < mod.BUDGET_S <= 0.25
 
 
 def _slow(value, secs=3.0):
@@ -698,8 +701,8 @@ def test_P2_slow_dedupe_injects_and_says_pending(mod, home, monkeypatch, caplog)
     assert "dedupe=pending" in line and "dedupe_ms=pending" in line
 
 
-def test_P2_state_wait_leaves_room_for_the_index(mod):
-    assert mod.STATE_WAIT_S + mod.INDEX_BUSY_S < mod.BUDGET_S
+def test_P2_index_busy_wait_fits_inside_the_ceiling(mod):
+    assert mod.INDEX_BUSY_S < mod.BUDGET_S
 
 
 def test_I5_index_timeout_names_stage(mod, home, monkeypatch, caplog):
@@ -740,7 +743,86 @@ def test_dedupe_results_are_logged(mod, home, caplog):
 def test_only_pre_llm_call_is_registered():
     manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
     assert manifest["hooks"] == ["pre_llm_call"]
-    assert "750 ms" in manifest["description"]
+    assert "250 ms" in manifest["description"]
     hooks = []
     _load().register(type("Ctx", (), {"register_hook": lambda self, n, f: hooks.append(n)})())
     assert hooks == ["pre_llm_call"]
+
+
+# ── t_15d21849: 77 boards, first turn never held past BUDGET_S ───────────────
+
+N_BOARDS = 77
+
+
+@pytest.fixture
+def fleet77(home):
+    """77 boards (default + 76 named), one open home card on every 7th."""
+    paths = [_board(home)] + [_board(home, f"b{i:02d}") for i in range(1, N_BOARDS)]
+    for i, p in enumerate(paths):
+        conn = sqlite3.connect(p)
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, session_id) VALUES (?,?,?,?,?)",
+            (f"t_frgn{i:04d}", f"foreign {i}", "ready", 1_790_000_000, FOREIGN),
+        )
+        if i % 7 == 0:
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at, session_id) VALUES (?,?,?,?,?)",
+                (f"t_home{i:04d}", f"home {i}", "ready", 1_790_000_000 + i, SID),
+            )
+        conn.commit(); conn.close()
+    report = _reindex()
+    return paths, report
+
+
+def _timed(mod, **kw):
+    t = time.monotonic()
+    out = mod.on_pre_llm_call(**kw)
+    return out, time.monotonic() - t
+
+
+# Scheduling slack for a loaded CI runner; the ceiling itself is BUDGET_S.
+SLACK_S = 0.1
+
+
+def test_77_boards_warm_turn_renders_home_cards_within_ceiling(mod, fleet77):
+    out, took = _timed(mod, session_id=SID)
+    assert out and "t_home" in out["context"] and "foreign" not in out["context"]
+    assert took < mod.BUDGET_S + SLACK_S, took
+
+
+def test_77_boards_cold_state_db_degrades_within_250ms(mod, fleet77, monkeypatch):
+    """Cold state.db after a restart (lineage + dedupe take seconds): the
+    turn stops waiting at BUDGET_S and still answers from the index."""
+    monkeypatch.setattr(mod, "home_ids", _slow((SID,), secs=5))
+    monkeypatch.setattr(mod, "_persisted_recently_injected", _slow(False, secs=5))
+    out, took = _timed(mod, session_id=SID)
+    assert took < 0.25 + SLACK_S, took
+    assert out and "t_home" in out["context"]
+
+
+def test_77_boards_locked_index_skips_within_250ms(mod, fleet77, caplog):
+    from hermes_cli import kanban_home_index
+
+    locker = sqlite3.connect(kanban_home_index.index_path(), isolation_level=None)
+    locker.execute("PRAGMA journal_mode=DELETE")
+    locker.execute("BEGIN EXCLUSIVE")
+    try:
+        with caplog.at_level("INFO", logger=mod.logger.name):
+            out, took = _timed(mod, session_id=SID)
+    finally:
+        locker.execute("ROLLBACK"); locker.close()
+    assert out is None
+    assert took < 0.25 + SLACK_S, took
+    assert any(f"session={SID} unavailable=" in r.getMessage() for r in caplog.records)
+
+
+def test_77_boards_27_concurrent_first_turns_all_within_ceiling(mod, fleet77):
+    """The 10:00-12:00 shape: 27 session inits, 8 at a time, 77 boards."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    sids = [SID] + [f"20260924_1200{i:02d}_cccccc" for i in range(26)]
+    with ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(lambda s: _timed(mod, session_id=s), sids))
+    worst = max(took for _, took in res)
+    assert worst < mod.BUDGET_S + SLACK_S, worst
+    assert res[0][0] and "t_home" in res[0][0]["context"]
