@@ -172,13 +172,23 @@ PLACED = copy.deepcopy(GEN_MATRIX)
 PLACED["slice"][0]["runs_on"] = json.dumps(X64, separators=(",", ":"))
 PLACED["slice"][1]["runs_on"] = json.dumps(POOL, separators=(",", ":"))
 
+RUN_ATTEMPT = 2  # executing github.run_attempt in every scenario
+
 PLACEMENT_OUTCOMES = {
     "skipped": {"result": "skipped", "outputs": {}},
-    "valid": {"result": "success", "outputs": {"plan_valid": "true", "matrix": json.dumps(PLACED),
-                                               "e2e_runs_on": json.dumps(X64)}},
+    "valid": {"result": "success", "outputs": {"plan_valid": "true", "plan_attempt": str(RUN_ATTEMPT),
+                                               "matrix": json.dumps(PLACED), "e2e_runs_on": json.dumps(X64)}},
+    # "Re-run failed jobs": placement is NOT re-run; attempt N+1 reuses attempt N's
+    # outputs (measured live, runs 35966312383 / 36056222052). Must fall back local.
+    "reused-prior-attempt": {"result": "success", "outputs": {"plan_valid": "true", "plan_attempt": str(RUN_ATTEMPT - 1),
+                                                              "matrix": json.dumps(PLACED), "e2e_runs_on": json.dumps(X64)}},
+    "valid-without-attempt": {"result": "success", "outputs": {"plan_valid": "true", "matrix": json.dumps(PLACED),
+                                                               "e2e_runs_on": json.dumps(X64)}},
     "invalid": {"result": "success", "outputs": {"plan_valid": "false"}},
     # the explicit flag, not the presence of a matrix, is what authorises it
-    "invalid-with-matrix": {"result": "success", "outputs": {"plan_valid": "false", "matrix": json.dumps(PLACED),
+    # (carries the CURRENT plan_attempt so the plan_valid guard is tested on its own)
+    "invalid-with-matrix": {"result": "success", "outputs": {"plan_valid": "false", "plan_attempt": str(RUN_ATTEMPT),
+                                                             "matrix": json.dumps(PLACED),
                                                              "e2e_runs_on": json.dumps(X64)}},
     "failure": {"result": "failure", "outputs": {}},
     "timeout": {"result": "failure", "outputs": {}},
@@ -186,13 +196,14 @@ PLACEMENT_OUTCOMES = {
     # job-level continue-on-error may surface a failed placement as success
     "failure-continue-on-error": {"result": "success", "outputs": {}},
     # killed after writing plan_valid but job failed: must still fall back
-    "failed-after-output": {"result": "failure", "outputs": {"plan_valid": "true", "matrix": json.dumps(PLACED),
+    "failed-after-output": {"result": "failure", "outputs": {"plan_valid": "true", "plan_attempt": str(RUN_ATTEMPT),
+                                                             "matrix": json.dumps(PLACED),
                                                              "e2e_runs_on": json.dumps(X64)}},
 }
 
 
 def _ctx(event, placement, runner_labels, enabled=False):
-    return {"github": {"event_name": event}, "vars": {"CI_RUNNER_LABELS": runner_labels,
+    return {"github": {"event_name": event, "run_attempt": RUN_ATTEMPT}, "vars": {"CI_RUNNER_LABELS": runner_labels,
                                                        "CI_OVERFLOW_PLACEMENT_ENABLED": "true" if enabled else ""},
             "needs": {"generate": {"result": "success",
                                    "outputs": {"matrix": json.dumps(GEN_MATRIX),
@@ -275,6 +286,24 @@ def test_mutating_plan_valid_guard_out_fails_integration():
     assert check_fallback(doc)
 
 
+@pytest.mark.parametrize("site", ["matrix", "e2e"])
+def test_mutating_attempt_binding_out_fails_integration(site):
+    """AC3 amendment D(3): dropping the plan_attempt == run_attempt clause must go RED."""
+    doc = _tests_yml()
+    clause = " && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt)"
+    if site == "matrix":
+        expr = doc["jobs"]["test"]["strategy"]["matrix"]
+        assert clause in expr
+        doc["jobs"]["test"]["strategy"]["matrix"] = expr.replace(clause, "")
+        want = "reused-prior-attempt/labels=None: wrong matrix"
+    else:
+        expr = doc["jobs"]["e2e"]["runs-on"]
+        assert clause in expr
+        doc["jobs"]["e2e"]["runs-on"] = expr.replace(clause, "")
+        want = "reused-prior-attempt/labels=None: e2e runs-on"
+    assert any(want in e for e in check_fallback(doc)), check_fallback(doc)
+
+
 def test_mutating_managed_fallback_to_legacy_matrix_fails_integration():
     doc = _tests_yml()
     doc["jobs"]["test"]["strategy"]["matrix"] = doc["jobs"]["test"]["strategy"]["matrix"].replace(
@@ -311,7 +340,8 @@ def test_placement_job_shape_and_permissions_exact():
     assert job["timeout-minutes"] == 5
     assert job["permissions"] == {"contents": "read"}
     assert job["continue-on-error"] is True  # a dead placement must not fail required checks
-    assert set(job["outputs"]) == {"matrix", "e2e_runs_on", "plan_valid"}
+    assert set(job["outputs"]) == {"matrix", "e2e_runs_on", "plan_valid", "plan_attempt"}
+    assert job["outputs"]["plan_attempt"] == "${{ steps.plan.outputs.plan_attempt }}"
 
 
 def test_generate_emits_local_matrix_and_request_artifact():
@@ -375,6 +405,7 @@ def test_fromjson_never_fed_a_possibly_missing_output():
     for expr in re.findall(r"fromJSON\(([^()]*(?:\([^()]*\))*[^()]*)\)", text):
         if "needs.placement.outputs" in expr:
             assert "needs.placement.result == 'success'" in expr and "plan_valid == 'true'" in expr
+            assert "needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt)" in expr
             assert expr.rstrip().endswith(("local_matrix", "'[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]'"))
 
 
@@ -617,6 +648,7 @@ def test_outputs_invalid_emits_no_matrix(tmp_path):
     write_outputs(str(out), _validate(_state()))
     lines = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
     assert lines["plan_valid"] == "true" and json.loads(lines["e2e_runs_on"]) == POOL
+    assert lines["plan_attempt"] == str(IDENT["run_attempt"])
 
 
 def test_place_without_digest_falls_back_without_network(tmp_path):
