@@ -2416,25 +2416,133 @@ def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalConten
         column_names = {row[1] for row in columns if len(row) > 1}
         if spec.indexed_column not in column_names:
             return True
-
-        content_count = conn.execute(
-            f"SELECT COUNT(*) FROM {quote_sql_identifier(spec.content_table)}"
-        ).fetchone()[0]
-        # For an external-content FTS5 table, ``COUNT(*) FROM <fts>`` reads
-        # through to the content table (so it can never reveal a lagging index)
-        # and is O(index size). The ``<fts>_docsize`` shadow table holds the
-        # true indexed-document count and is a cheap ordinary-table count. Its
-        # existence is already guaranteed by the shadow-table check above.
-        docsize_table = f"{spec.table_name}_docsize"
-        fts_count = conn.execute(
-            f"SELECT COUNT(*) FROM {quote_sql_identifier(docsize_table)}"
-        ).fetchone()[0]
-        if int(content_count or 0) != int(fts_count or 0):
-            return True
     except sqlite3.DatabaseError:
         return True
 
     return False
+
+
+def _fts_count_parity_mismatch(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    """True when the content table and the FTS index disagree on row count.
+
+    O(rows): ``COUNT(*)`` on the content table is a full traversal (SQLite
+    answers it from the smallest covering index, which is still a scan of every
+    row — 2.5 M rows / 11 s cold on the fleet's largest DB), and the
+    ``<fts>_docsize`` shadow count is a second full table scan. NEVER call this
+    on the engine-load path: until 2026-09-24 it ran inside
+    ``_fts_needs_rebuild_structural`` on every ``MessageStore``/``SummaryDAG``
+    construction, under ``plugins.context_engine._LOAD_LOCK`` — the third
+    Apollo boot-cost freeze (fork PR for card t_d3963974). It belongs to the
+    throttled parity lane (``_should_run_parity_check``, background thread) and
+    to explicit ``/lcm doctor`` paths only.
+    """
+    # Both counts MUST come from one read snapshot. Issued as two autocommit
+    # statements, any ingest committing between them (the FTS insert trigger
+    # runs inside the ingest's own transaction, so the pair is always
+    # consistent at any single instant) made the counts differ — measured
+    # 15/300 calls (5 %) under a concurrent writer — and the caller answered
+    # with a FULL index rebuild: 13 min + 6.5 min on the fleet DB on
+    # 2026-09-24, holding _LOAD_LOCK and the SQLite write lock, up to 12 turns
+    # queued, every ingest failing "database is locked". A restart burst
+    # (many concurrent loads + ingests) made at least one such false rebuild
+    # near-certain. Wrapping the pair in a deferred transaction pins one WAL
+    # snapshot for both reads without taking the write lock.
+    opened_txn = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+            opened_txn = True
+        try:
+            content_count = conn.execute(
+                f"SELECT COUNT(*) FROM {quote_sql_identifier(spec.content_table)}"
+            ).fetchone()[0]
+            # For an external-content FTS5 table, ``COUNT(*) FROM <fts>`` reads
+            # through to the content table (so it can never reveal a lagging
+            # index) and is O(index size). The ``<fts>_docsize`` shadow table
+            # holds the true indexed-document count. Its existence is
+            # guaranteed by the structural check callers run first.
+            docsize_table = f"{spec.table_name}_docsize"
+            fts_count = conn.execute(
+                f"SELECT COUNT(*) FROM {quote_sql_identifier(docsize_table)}"
+            ).fetchone()[0]
+        finally:
+            if opened_txn:
+                conn.execute("COMMIT")
+    except sqlite3.DatabaseError:
+        return True
+    return int(content_count or 0) != int(fts_count or 0)
+
+
+PARITY_CHECK_INTERVAL_ENV = "LCM_FTS_PARITY_CHECK_INTERVAL_HOURS"
+DEFAULT_PARITY_CHECK_INTERVAL_HOURS = 6.0
+
+
+def _parity_check_interval_hours() -> float:
+    """Hours between startup-dispatched FTS row-count parity checks.
+
+    ``0`` checks (in the background) on every startup; negative never checks on
+    startup (parity is still verified by explicit ``/lcm doctor`` paths).
+    """
+    raw = os.environ.get(PARITY_CHECK_INTERVAL_ENV)
+    if raw is None:
+        return DEFAULT_PARITY_CHECK_INTERVAL_HOURS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PARITY_CHECK_INTERVAL_HOURS
+    if not math.isfinite(value):
+        return DEFAULT_PARITY_CHECK_INTERVAL_HOURS
+    return value
+
+
+def _parity_marker_key(spec: ExternalContentFtsSpec) -> str:
+    return f"fts_parity_checked_at:{spec.table_name}"
+
+
+def _load_parity_checked_at(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec
+) -> float | None:
+    ensure_metadata_table(conn)
+    row = conn.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (_parity_marker_key(spec),),
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    try:
+        return float(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_parity_checked(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
+) -> None:
+    ensure_metadata_table(conn)
+    current = time.time() if now is None else now
+    conn.execute(
+        """
+        INSERT INTO metadata(key, value)
+        VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (_parity_marker_key(spec), str(current)),
+    )
+
+
+def _should_run_parity_check(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
+) -> bool:
+    hours = _parity_check_interval_hours()
+    if hours == 0:
+        return True
+    if hours < 0:
+        return False
+    last = _load_parity_checked_at(conn, spec)
+    if last is None:
+        return True
+    current = time.time() if now is None else now
+    return (current - last) >= hours * 3600.0
 
 
 INTEGRITY_CHECK_INTERVAL_ENV = "LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS"
@@ -2649,7 +2757,7 @@ def _clear_scan_started(
 
 
 def _run_background_integrity_scan(
-    db_path: str, spec: ExternalContentFtsSpec, started_at: float
+    db_path: str, spec: ExternalContentFtsSpec, started_at: float, deep: bool = True
 ) -> None:
     """Daemon-thread body: deep-check ``spec`` on a private connection.
 
@@ -2668,7 +2776,22 @@ def _run_background_integrity_scan(
             # detectable cross-process via the staleness window above.
             _record_scan_started(scan_conn, spec, now=started_at)
             scan_conn.commit()
-            result = check_external_content_fts_integrity(scan_conn, spec)
+            # Row-count parity (two O(rows) COUNTs) runs HERE, off the engine-load
+            # path, at most once per LCM_FTS_PARITY_CHECK_INTERVAL_HOURS. A
+            # mismatch is flagged for `/lcm doctor` exactly like a failed deep
+            # check; the deep FTS5 integrity-check itself only runs when ITS
+            # (longer) interval is due.
+            if _fts_needs_rebuild_structural(scan_conn, spec):
+                result = {"status": "fail", "detail": "structural repair needed"}
+            elif _fts_count_parity_mismatch(scan_conn, spec):
+                result = {
+                    "status": "fail",
+                    "detail": "content/index row-count mismatch (parity check)",
+                }
+            elif deep:
+                result = check_external_content_fts_integrity(scan_conn, spec)
+            else:
+                result = {"status": "parity_pass", "detail": ""}
         finally:
             scan_conn.close()
 
@@ -2676,8 +2799,12 @@ def _run_background_integrity_scan(
         try:
             meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             status = result.get("status")
+            if status in ("pass", "parity_pass", "fail"):
+                _record_parity_checked(meta_conn, spec, now=started_at)
             if status == "pass":
                 _record_integrity_checked(meta_conn, spec, now=started_at)
+                _clear_integrity_failed(meta_conn, spec)
+            elif status == "parity_pass":
                 _clear_integrity_failed(meta_conn, spec)
             elif status == "fail":
                 _record_integrity_failed(
@@ -2714,8 +2841,19 @@ def _run_background_integrity_scan(
                 _integrity_scan_threads.pop(key, None)
 
 
+# The cross-process claim stamp below is best-effort. It is written from the
+# engine-load path, so it must never sit behind another writer for the full
+# SQLITE_BUSY_TIMEOUT_MS (30 s): a held write lock (a deep scan in flight, an
+# ingest batch) would turn one dispatch into a 30 s stall under _LOAD_LOCK.
+INTEGRITY_CLAIM_BUSY_TIMEOUT_MS = 1_000
+
+
 def _dispatch_background_integrity_scan(
-    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    now: float | None = None,
+    deep: bool = True,
 ) -> bool:
     """Try to run the deep FTS integrity-check on a daemon thread.
 
@@ -2746,13 +2884,13 @@ def _dispatch_background_integrity_scan(
         # no stamp and dispatch a duplicate deep scan (F6). Writing the stamp here
         # under BEGIN IMMEDIATE closes that window; best-effort (a transient lock
         # just falls back to the thread's own stamp).
-        claim_timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+        claim_timeout = INTEGRITY_CLAIM_BUSY_TIMEOUT_MS / 1000.0
         try:
             claim_conn = sqlite3.connect(
                 db_path, timeout=claim_timeout, check_same_thread=False
             )
             try:
-                claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                claim_conn.execute(f"PRAGMA busy_timeout={INTEGRITY_CLAIM_BUSY_TIMEOUT_MS}")
                 claim_conn.execute("BEGIN IMMEDIATE")
                 _record_scan_started(claim_conn, spec, now=current)
                 claim_conn.commit()
@@ -2763,7 +2901,7 @@ def _dispatch_background_integrity_scan(
 
         thread = threading.Thread(
             target=_run_background_integrity_scan,
-            args=(db_path, spec, current),
+            args=(db_path, spec, current, deep),
             name=f"lcm-fts-integrity-{spec.table_name}",
             daemon=True,
         )
@@ -2792,21 +2930,40 @@ def _fts_needs_rebuild(
 ) -> bool:
     if _fts_needs_rebuild_structural(conn, spec):
         return True
-    # Structurally sound: the FTS5 integrity-check is O(index size) and was the
-    # dominant startup cost on large databases (issue #235). On the startup path
-    # (``throttle=True``) skip it when already checked within the interval.
-    # Explicit repair (e.g. ``/lcm doctor repair apply``) uses ``throttle=False``
-    # so it always runs the deep check and can fix same-row-count drift that the
-    # structural checks cannot see.
-    if throttle and not _should_run_integrity_check(conn, spec, now=now):
+    if not throttle:
+        # Explicit repair (``/lcm doctor repair apply``): full synchronous
+        # verification — row-count parity, then the deep FTS5 integrity-check
+        # that can also see same-row-count drift.
+        if _fts_count_parity_mismatch(conn, spec):
+            _record_parity_checked(conn, spec, now=now)
+            return True
+        _record_parity_checked(conn, spec, now=now)
+        result = check_external_content_fts_integrity(conn, spec)
+        if result["status"] == "pass":
+            _record_integrity_checked(conn, spec, now=now)
+        return result["status"] == "fail"
+
+    # Startup path (every engine load, under plugins.context_engine._LOAD_LOCK).
+    # Nothing here may cost O(rows): the structural check above is the only
+    # synchronous verification. Both O(rows) checks — the row-count parity
+    # (two full COUNTs; this ran on EVERY load until 2026-09-24, freeze #3) and
+    # the O(index) deep integrity-check (issue #235) — are throttled by their own
+    # markers and, when due, handed to a background thread that opens its own
+    # connection (issue #6). Findings are flagged in metadata for `/lcm doctor`.
+    parity_due = _should_run_parity_check(conn, spec, now=now)
+    deep_due = _should_run_integrity_check(conn, spec, now=now)
+    if not parity_due and not deep_due:
         return False
-    # The deep check is due. On the startup path, dispatch it to a background
-    # thread so the bind returns immediately (issue #6); the scan flags any
-    # corruption via metadata rather than rebuilding here. The kill-switch and
-    # non-file DBs fall back to the exact old synchronous behavior below.
-    if throttle and _background_integrity_enabled():
-        if _dispatch_background_integrity_scan(conn, spec, now=now):
+    if _background_integrity_enabled():
+        if _dispatch_background_integrity_scan(conn, spec, now=now, deep=deep_due):
             return False
+    # Kill-switch / non-file DB: synchronous fallback, still marker-throttled.
+    if _fts_count_parity_mismatch(conn, spec):
+        _record_parity_checked(conn, spec, now=now)
+        return True
+    _record_parity_checked(conn, spec, now=now)
+    if not deep_due:
+        return False
     result = check_external_content_fts_integrity(conn, spec)
     if result["status"] == "pass":
         _record_integrity_checked(conn, spec, now=now)
@@ -2844,7 +3001,7 @@ def check_external_content_fts_integrity(
     behind on the shared connection.
     """
 
-    if _fts_needs_rebuild_structural(conn, spec):
+    if _fts_needs_rebuild_structural(conn, spec) or _fts_count_parity_mismatch(conn, spec):
         return {"status": "fail", "detail": "structural repair needed"}
 
     savepoint = f"lcm_fts_integrity_{spec.table_name}"
@@ -2976,8 +3133,13 @@ def _fts_stale_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) 
 
 
 def external_content_fts_needs_repair(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    """Diagnostic (``/lcm doctor``) view: structure, row-count parity, triggers.
+
+    O(rows) because of the parity count — never call from the engine-load path.
+    """
     return (
         _fts_needs_rebuild_structural(conn, spec)
+        or _fts_count_parity_mismatch(conn, spec)
         or _fts_missing_triggers(conn, spec)
         or _fts_stale_triggers(conn, spec)
     )
@@ -3042,7 +3204,15 @@ def repair_external_content_fts(
     # it in the SAME transaction that commits the rebuild so `/lcm doctor` stops
     # reporting issues-found (and the next self-healing scan is not pushed out a
     # full interval). Without this an explicit `repair apply` left the flag stuck.
-    _clear_integrity_failed(conn, spec)
+    # ONLY when something was actually repaired: a no-op pass (every ordinary
+    # engine load) must issue no write — an unconditional DELETE here needed the
+    # SQLite write lock on every load and sat behind any in-flight writer (deep
+    # integrity scan: measured 139 s holding RESERVED on the fleet DB; lifecycle
+    # GC scan under BEGIN IMMEDIATE) for up to busy_timeout — and it silently
+    # erased the background scan's corruption flag before `/lcm doctor` could
+    # ever show it.
+    if rebuilt or triggers_were_missing or triggers_were_stale:
+        _clear_integrity_failed(conn, spec)
     conn.commit()
     return {
         "rebuilt": rebuilt,
@@ -3131,6 +3301,11 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     # and idempotently under a NAMED marker so it can't collide. The columns are
     # additive ALTER TABLE ADD COLUMN, ignored by older readers.
     ensure_messages_dedup_columns(conn)
-    mark_migration_step_complete(conn, "messages_dedup_v1")
+    # Marker-gated: an unconditional upsert here took the write lock on every
+    # MessageStore/SummaryDAG/LifecycleStateStore construction (three per engine
+    # load), each able to stall for busy_timeout behind any concurrent writer.
+    if not is_migration_step_complete(conn, "messages_dedup_v1"):
+        mark_migration_step_complete(conn, "messages_dedup_v1")
 
-    set_schema_version(conn, current_version)
+    if get_schema_version(conn) != current_version:
+        set_schema_version(conn, current_version)
