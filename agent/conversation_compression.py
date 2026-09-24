@@ -79,6 +79,7 @@ from agent.fork_ext.compaction_ext import (
     _inturn_stats_render_eligible,
 )
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
+from agent.confab_notice import is_metadata_only_tool_notice
 from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
@@ -4100,6 +4101,20 @@ def compress_context(
                 )
 
         messages_before_compression = copy.deepcopy(messages)
+        # Presentation-only tool events are not conversation content. In
+        # particular, an event at index 0 must not become the system-prompt
+        # anchor to which a compressor appends its compaction note.
+        tool_events = [(i, copy.deepcopy(msg)) for i, msg in enumerate(messages)
+                       if is_metadata_only_tool_notice(msg)]
+        engine_messages = ([msg for msg in messages if not is_metadata_only_tool_notice(msg)]
+                           if tool_events else messages)
+        from agent.context_compressor import ContextCompressor
+        # The built-in engine copies kept rows through pruning, summary merge,
+        # and media cleanup. Stamp private INPUT indices on those copies, not
+        # content signatures: even a kept row can be rewritten by any pass.
+        stamped_builtin = bool(tool_events and type(agent.context_compressor) is ContextCompressor)
+        if stamped_builtin:
+            engine_messages = [dict(row, _src_idx=i) for i, row in enumerate(engine_messages)]
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
@@ -4161,7 +4176,7 @@ def compress_context(
                     cancel_event=_hard_cancel_event
                 ), aux_cost_sink(_blackbox_cost_sink):
                     try:
-                        compressed = compress_fn(messages, **compress_kwargs)
+                        compressed = compress_fn(engine_messages, **compress_kwargs)
                     except TypeError:
                         # Strict-signature context engine (or a wrapper/mock whose
                         # signature inspection could not predict the rejection) that
@@ -4183,8 +4198,84 @@ def compress_context(
                         if _compression_kwargs_are_signature_proven(compress_fn):
                             raise
                         compressed = compress_fn(
-                            messages, current_tokens=approx_tokens
+                            engine_messages, current_tokens=approx_tokens
                         )
+                    if tool_events:
+                        # Prefer source indices carried by the built-in engine
+                        # (stamped above) and LCM's existing fresh-tail stamp.
+                        # Content matching below is only a fallback for older
+                        # engines and unmarked head rows; it can miss survivors
+                        # whose content was rewritten during compression.
+                        original = [(i, msg) for i, msg in enumerate(messages)
+                                    if not is_metadata_only_tool_notice(msg)]
+
+                        def same_row(source, candidate):
+                            if not isinstance(source, dict) or not isinstance(candidate, dict):
+                                return source is candidate
+                            if source.get("role") != candidate.get("role"):
+                                return False
+                            if source.get("tool_calls"):
+                                return source["tool_calls"] == candidate.get("tool_calls")
+                            if source.get("role") == "tool":
+                                return source.get("tool_call_id") == candidate.get("tool_call_id")
+                            return (not candidate.get("tool_calls")
+                                    and source.get("content") == candidate.get("content"))
+
+                        surviving = {}
+                        marked_outputs = set()
+                        for output_index, row in enumerate(compressed):
+                            source_index = row.get("_src_idx") if isinstance(row, dict) else None
+                            if (type(source_index) is int and 0 <= source_index < len(original)
+                                    and original[source_index][0] not in surviving
+                                    and original[source_index][1].get("role") == row.get("role")):
+                                surviving[original[source_index][0]] = output_index
+                                marked_outputs.add(output_index)
+                            if stamped_builtin and isinstance(row, dict):
+                                # LCM's stamps are consumed by compaction stats;
+                                # ours exist only for this placement and must
+                                # never be persisted or reach the provider.
+                                row.pop("_src_idx", None)
+                        head = 0
+                        while (head < min(len(original), len(compressed))
+                               and same_row(original[head][1], compressed[head])):
+                            if head not in marked_outputs:
+                                surviving.setdefault(original[head][0], head)
+                            head += 1
+                        tail = 0
+                        while (tail < min(len(original) - head, len(compressed) - head)
+                               and same_row(original[-tail - 1][1], compressed[-tail - 1])):
+                            if len(compressed) - tail - 1 not in marked_outputs:
+                                surviving.setdefault(original[-tail - 1][0], len(compressed) - tail - 1)
+                            tail += 1
+                        boundary = max(head, len(compressed) - tail)
+
+                    placements = []
+                    for index, event in tool_events:
+                        successor = next((surviving[i] for i in range(index + 1, len(messages))
+                                          if i in surviving), None)
+                        predecessor = next((surviving[i] for i in range(index - 1, -1, -1)
+                                            if i in surviving), None)
+                        if successor is not None:
+                            landing = successor
+                        elif predecessor is not None:
+                            landing = predecessor + 1
+                        else:
+                            # Neither original neighbour survived: keep the
+                            # event at the summary/tail boundary, not in head.
+                            landing = boundary
+                        if landing < len(compressed) and compressed[landing].get("role") == "tool":
+                            # A replaced assistant can leave tool results as
+                            # the first surviving successors. Keep their run
+                            # contiguous with the assistant that issued it.
+                            while landing > 0 and compressed[landing - 1].get("role") == "tool":
+                                landing -= 1
+                            if landing > 0 and compressed[landing - 1].get("role") == "assistant" and compressed[landing - 1].get("tool_calls"):
+                                landing -= 1
+                        placements.append((landing, event))
+                    # Compute all anchors against the same engine output;
+                    # reverse insertion preserves input order at shared boundaries.
+                    for landing, event in reversed(placements):
+                        compressed.insert(landing, event)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.
@@ -5476,9 +5567,18 @@ def compress_context(
                                 len(_b_idx), len(_cur_idx), _sid, _src,
                             )
 
+                    # LCM's provenance stamp indexes the event-free engine
+                    # input. Use that same index space on BOTH sides of the
+                    # stats partition; presentation-only events count as
+                    # neither anchors nor folded conversation content.
+                    _stats_messages = engine_messages if tool_events else messages
+                    _stats_compressed = (
+                        [row for row in compressed if not is_metadata_only_tool_notice(row)]
+                        if tool_events else compressed
+                    )
                     _cand = build_inturn_stats(
-                        messages=messages,
-                        compressed=compressed,
+                        messages=_stats_messages,
+                        compressed=_stats_compressed,
                         estimator=_est,
                         engine_is_lcm=(_engine_name == "lcm"),
                         sanitize=getattr(_cc, "_sanitize_active_context_messages", None),

@@ -579,28 +579,39 @@ def _auto_truncate_response_history(
     """
     if limit <= 0 or len(conversation_history) <= limit:
         return conversation_history
+    from agent.confab_notice import is_metadata_only_tool_notice
 
+    event_indices = {
+        index for index, message in enumerate(conversation_history)
+        if is_metadata_only_tool_notice(message)
+    }
+    content_indices = [
+        index for index in range(len(conversation_history)) if index not in event_indices
+    ]
+    if len(content_indices) <= limit:
+        return conversation_history
     summary_indices = [
         index
         for index, message in enumerate(conversation_history)
-        if _is_compressed_summary_message(message)
+        if index not in event_indices and _is_compressed_summary_message(message)
     ]
     if not summary_indices:
-        return conversation_history[-limit:]
+        kept_indices = set(content_indices[-limit:]) | event_indices
+        return [conversation_history[index] for index in sorted(kept_indices)]
 
     kept_indices = set(summary_indices[:limit])
     remaining = limit - len(kept_indices)
     if remaining > 0:
         summary_index_set = set(summary_indices)
         for index in range(len(conversation_history) - 1, -1, -1):
-            if index in summary_index_set:
+            if index in summary_index_set or index in event_indices:
                 continue
             kept_indices.add(index)
             remaining -= 1
             if remaining <= 0:
                 break
 
-    return [conversation_history[index] for index in sorted(kept_indices)]
+    return [conversation_history[index] for index in sorted(kept_indices | event_indices)]
 
 
 def _normalize_chat_content(

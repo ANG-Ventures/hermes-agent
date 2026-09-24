@@ -761,7 +761,7 @@ class CLIAgentSetupMixin:
         """
         from cli import CLI_CONFIG, _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
         from tools.ansi_strip import sanitize_display_text as _sanitize_display_text
-        from agent.confab_notice import notice_from_display_row
+        from agent.confab_notice import confab_notice_status, notice_from_display_row
         display_history = getattr(self, "_resume_display_history", self.conversation_history)
         if not display_history:
             return
@@ -804,15 +804,18 @@ class CLIAgentSetupMixin:
                 # real content — surface the catch as an event line AND fall
                 # through so the reply itself is still recapped.
                 #
-                # Gated: display_kind is an open string column, so a reloaded
-                # user/system record (imported or malformed history) carrying
-                # it must NOT be presented as a confirmed catch. Only an
-                # assistant row whose display_metadata re-validates against
-                # the v1 schema earns the claim.
-                if notice_from_display_row(
+                # Gated: a validated assistant scaffold notice or metadata-
+                # only system tool-call event earns a kind-specific label.
+                notice = notice_from_display_row(
                     role, display_kind, msg.get("display_metadata")
-                ):
-                    entries.append(("event", "confabulation caught — scaffold text removed"))
+                )
+                if notice:
+                    label = (
+                        "confabulation caught — scaffold text removed"
+                        if notice["kind"] == "scaffold_confab_removed"
+                        else confab_notice_status(notice["kind"])
+                    )
+                    entries.append(("event", label))
 
             if role == "system":
                 continue

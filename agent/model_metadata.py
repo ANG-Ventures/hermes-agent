@@ -4190,7 +4190,7 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     )
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k in ("_anthropic_content_blocks", "reasoning_details") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+        if k in ("_anthropic_content_blocks", "reasoning_details", "_src_idx") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
             continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it

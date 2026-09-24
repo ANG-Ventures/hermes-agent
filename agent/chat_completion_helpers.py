@@ -40,6 +40,7 @@ from agent.confab_notice import (
     CONFAB_NOTICE_FIELD,
     CONFAB_NOTICE_KEY,
     extract_confab_notice,
+    is_metadata_only_tool_notice,
 )
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, _ceil_chars_to_tokens
@@ -4252,6 +4253,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
         for msg in messages:
+            if is_metadata_only_tool_notice(msg):
+                continue
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason"):
