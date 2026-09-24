@@ -1802,6 +1802,43 @@ def _authoritative_repositories(survivor):
     return keys | _all_sidecar_repositories(survivor)
 
 
+_SHA1 = re.compile(r"[0-9a-f]{40}")
+
+
+def _holds_commit_by_stat(path, sha):
+    """Stat-only proof that the repository at `path` still holds `sha`.
+
+    `_replaced_orphans` runs on every completion AND reclamation pass, and the
+    terminal transition is gated on a fixed git-spawn budget
+    (test_kanban_terminal_transition_ref_cost). The common case -- the same
+    repository, dispatch commit still a loose object or still HEAD's ref --
+    is answerable from the object/ref files without a process.
+
+    Only POSITIVE answers are trusted: a loose object file named `sha` in THIS
+    repository's own `.git` directory, or `HEAD`'s ref file naming it, cannot
+    exist in a re-initialised repository. Anything else (a gitfile worktree,
+    packed objects or refs, an unreadable file) returns False and the caller
+    falls back to `git cat-file -e`, so this never decides "replaced".
+    """
+    if not isinstance(sha, str) or not _SHA1.fullmatch(sha):
+        return False
+    gitdir = path / ".git"
+    try:
+        if not gitdir.is_dir():
+            return False
+        if (gitdir / "objects" / sha[:2] / sha[2:]).is_file():
+            return True
+        head = (gitdir / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            name = head[5:].strip()
+            if ".." in name.split("/"):
+                return False
+            head = (gitdir / name).read_text().strip()
+        return head == sha
+    except (OSError, ValueError):
+        return False
+
+
 def _replaced_orphans(workspace, bases):
     """Recorded repositories re-initialised in place over ignored bytes.
 
@@ -1828,14 +1865,14 @@ def _replaced_orphans(workspace, bases):
         if not sha:
             continue
         path = workspace if key == "." else workspace / key
-        if key != "." and not _is_repo_on_disk(path):
-            continue  # vanished outright: the `missing` arms own that shape
-        top = _git(path, "rev-parse", "--show-toplevel", check=False)
-        if top.returncode:
+        if not _is_repo_on_disk(path):
+            # Vanished outright (the `missing` arms own that shape), or a `.`
+            # base recorded from an ENCLOSING repository -- re-initialising in
+            # place would put a `.git` here. A stat, not a spawn: this runs on
+            # every completion and reclamation pass (ref-cost gate).
             continue
-        if key != "." and Path(top.stdout.decode().strip()).resolve() != path.resolve():
-            continue
-        if _git(path, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0:
+        if _holds_commit_by_stat(path, sha) or \
+                _git(path, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0:
             continue  # same identity (or history still holds the dispatch commit)
         listed = _git(path, "ls-files", "-z", "--others", "--ignored", "--exclude-standard",
                       "--directory", "--", ".", check=False)
