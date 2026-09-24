@@ -34,11 +34,17 @@ CAPTURES = {
                                   "--jq", "del(.files)"],
     # merge_group-triggered CI runs: head_sha is each entry's queue commit, and
     # head_branch carries base_sha (gh-readonly-queue/main/pr-<n>-<base_sha>).
+    # Only the runs the tests join against (945, 947, 955 in the span; 829 whose
+    # queue commit is the span base): unused runs add nothing and one carried a
+    # SHA that gitleaks 8.18.4 misreads as a Square token.
     "merge_group_runs.json": ["gh", "api", f"repos/{AGENT}/actions/runs?event=merge_group&per_page=100",
-                              "--jq", f"[.workflow_runs[] | select(.name == \"CI\") | {RUN_FIELDS}]"],
+                              "--jq", f"[.workflow_runs[] | select(.name == \"CI\" and (.head_branch | test(\"/pr-(829|945|947|955)-\"))) | {RUN_FIELDS}]"],
 }
 
+ONLY = set(sys.argv[2:])  # optional: recapture just these fixture names
 for name, cmd in CAPTURES.items():
+    if ONLY and name not in ONLY:
+        continue
     raw = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
     body = {"capture": {"command": " ".join(cmd),
                         "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},

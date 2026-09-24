@@ -40,6 +40,9 @@ SPAN_BASE = "a7942d7989e45ac26863188e7052e79bfe901893"
 MEMBERS = [(945, "2536b20729c6e8ff20a34f7aa820cb311ebc7ab2", "cfa22067fe4baa9ae861abc10d97a5b358fff80a"),
            (947, "88a1b30c5d05f7e234e88ef4efa1a83a191da072", "f2fffde3acca1bcf68533bf516c851d636cf743e"),
            (955, "a9809aa3709262449095dab7821f54b1628403d3", "4956e38e1885f7d7b14e15e75120fbd9a161bbf1")]
+# Real queue entry OUTSIDE the span: #829's queue commit is SPAN_BASE itself (the
+# recorded pr-829 merge_group run head_sha), head 02e5879a carries no statuses.
+OUTSIDER = (829, "02e5879abc4494baca78862af7db0b3a3769a9d5", SPAN_BASE)
 
 
 def test_recorded_fixtures_are_what_the_relay_assumes():
@@ -51,8 +54,10 @@ def test_recorded_fixtures_are_what_the_relay_assumes():
     assert COMPARE_SPAN["total_commits"] == len(COMPARE_SPAN["commits"])
     # merge_group run head_sha is each entry's queue commit; branch names the PR.
     by_pr = {r["head_branch"].split("/pr-")[1].split("-")[0]: r["head_sha"] for r in RUNS}
-    for number, _, group_sha in MEMBERS:
+    for number, _, group_sha in MEMBERS + [OUTSIDER]:
         assert by_pr[str(number)] == group_sha
+    # The outsider's queue commit is the span base, so compare(base...head) excludes it.
+    assert OUTSIDER[2] not in {c["sha"] for c in COMPARE_SPAN["commits"]}
     node = QUEUE_955["data"]["repository"]["mergeQueue"]["entries"]["nodes"][0]
     assert (node["pullRequest"]["number"], node["pullRequest"]["headRefOid"],
             node["headCommit"]["oid"]) == MEMBERS[2]
@@ -69,6 +74,11 @@ def test_has_success_on_recorded_combined_status():
         s["state"] = "pending"
     assert not relay.has_success(pending)
     assert not relay.has_success(STATUS_NONE)
+    other = copy.deepcopy(STATUS_OK)
+    for s in other["statuses"]:
+        s["context"] = "ci/other"
+    assert other["statuses"] and all(s["state"] == "success" for s in other["statuses"])
+    assert not relay.has_success(other)
 
 
 def queue_of(members, has_next=False):
@@ -95,7 +105,7 @@ def fake_github(queue, compare, attributed_heads, calls):
             return queue
         if "/compare/" in path:
             return compare
-        for _, pr_head, _ in MEMBERS:
+        for _, pr_head, _ in MEMBERS + [OUTSIDER]:
             if path == f"repos/{REPO}/commits/{pr_head}/status?per_page=100":
                 # Association comes from the request: the body is whichever
                 # recorded response this head should receive.
@@ -116,6 +126,16 @@ def test_verify_requires_every_batch_head_status(monkeypatch, missing):
     else:
         with pytest.raises(ValueError, match=f"PR #{MEMBERS[missing][0]} head"):
             relay.verify(REPO, SPAN_BASE, MEMBERS[-1][2], "token")
+
+
+def test_unattributed_queue_entry_outside_group_is_not_a_member(monkeypatch):
+    # Queue also holds an unattributed entry whose commit is outside base...head:
+    # it is not in this batch and must not turn the group red.
+    calls = []
+    monkeypatch.setattr(relay, "api", fake_github(queue_of([OUTSIDER] + MEMBERS), COMPARE_SPAN,
+                                                  {m[1] for m in MEMBERS}, calls))
+    relay.verify(REPO, SPAN_BASE, MEMBERS[-1][2], "token")
+    assert not any(OUTSIDER[1] in p for p in calls)
 
 
 @pytest.mark.parametrize("attributed", [True, False])
