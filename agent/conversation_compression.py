@@ -3203,6 +3203,25 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+def _record_blackbox_compaction(agent: Any, *, trigger: str | None,
+                                before: int | None, after: int | None,
+                                telemetry: dict | None) -> None:
+    """Record only committed work; an incomplete aux price remains unknown."""
+    state = getattr(agent, "_blackbox_compaction", None)
+    if not isinstance(state, dict):
+        return
+    state["idle_compaction_fired"] = state.get("idle_compaction_fired", False) or trigger == "idle_resume"
+    state["compaction_tokens_before"] = before
+    state["compaction_tokens_after"] = after
+    # Chunk digests are additional unpriced calls. Do not report a partial sum.
+    cost = telemetry.get("aux_cost_usd") if isinstance(telemetry, dict) and not telemetry.get("chunking") else None
+    if cost is not None and not state.get("compaction_cost_unknown"):
+        state["compaction_cost_usd"] = round((state.get("compaction_cost_usd") or 0) + cost, 12)
+    else:
+        state["compaction_cost_usd"] = None
+        state["compaction_cost_unknown"] = True
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -5678,6 +5697,12 @@ def compress_context(
             ),
             commit_started_at=_commit_started_at,
         )
+        if _commit_status == "committed":
+            _record_blackbox_compaction(
+                agent, trigger=trigger_reason, before=approx_tokens,
+                after=_compressed_est,
+                telemetry=getattr(agent.context_compressor, "_last_compression_telemetry", None),
+            )
         return compressed, new_system_prompt
     finally:
         # Release the lock on the OLD session_id only AFTER rotation completed

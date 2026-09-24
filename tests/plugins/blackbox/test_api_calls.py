@@ -76,7 +76,10 @@ def test_api_call_exact_roundtrip_and_defaults(db):
     append("t", 1, usage=CanonicalUsage(), sub_key=None,
            http_status=503, relay_synthetic=True, route_id="route-1")
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT * FROM turn_api_calls ORDER BY seq").fetchall() == [
+        assert conn.execute("SELECT turn_id,seq,ts,provider,sub_key,model,input_tokens,"
+                            "output_tokens,cache_read,cache_write,reasoning,attribution,"
+                            "http_status,relay_synthetic,route_id FROM turn_api_calls "
+                            "ORDER BY seq").fetchall() == [
             ("t", 0, 100.5, "claude-apr", "sub-vps-7", "test-model",
              1000, 50, 300, 20, 7, "wire", None, 0, None),
             ("t", 1, 100.5, "claude-apr", None, "test-model",

@@ -963,7 +963,10 @@ def finalize_turn(
                     # Depth tracking (B1): read from the agent attribute set at
                     # construction time (0 for parents, parent+1 for children).
                     "depth": getattr(agent, "_blackbox_depth", None),
+                    **(getattr(agent, "_blackbox_compaction", None) or {}),
                 }
+            elif getattr(agent, "_blackbox_compaction", None):
+                _turn_usage = dict(agent._blackbox_compaction)
         except Exception:
             _turn_usage = None
         _invoke_hook(

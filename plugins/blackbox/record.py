@@ -46,6 +46,10 @@ class TurnRecord:
     usage_unknown: bool = False
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    idle_compaction_fired: Optional[bool] = None
+    compaction_tokens_before: Optional[int] = None
+    compaction_tokens_after: Optional[int] = None
+    compaction_cost_usd: Optional[float] = None
     reasoning_tokens: int = 0
     context_used: int = 0
     context_length: int = 0

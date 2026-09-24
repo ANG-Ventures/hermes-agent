@@ -57,6 +57,17 @@ _lock = Lock()
 _sessions: dict[str, dict[str, Any]] = {}
 
 
+def _cache_creation_tiers(usage: Any) -> tuple[int | None, int | None]:
+    """Keep unreported cache tiers NULL rather than imputing them."""
+    creation = usage.get("cache_creation") if isinstance(usage, dict) else getattr(usage, "cache_creation", None)
+    if creation is None:
+        return None, None
+    def value(key: str) -> int | None:
+        raw = creation.get(key) if isinstance(creation, dict) else getattr(creation, key, None)
+        return int(raw) if raw is not None else None
+    return value("ephemeral_5m_input_tokens"), value("ephemeral_1h_input_tokens")
+
+
 def record_api_call(
     *,
     turn_id: str,
@@ -71,6 +82,7 @@ def record_api_call(
     http_status: int | None,
     relay_synthetic: bool,
     route_id: str | None,
+    cache_ttl_requested: str | None = None,
 ) -> None:
     """Persist one completion attempt when Blackbox is enabled.
 
@@ -90,6 +102,7 @@ def record_api_call(
         if usage is not None
         else CanonicalUsage(request_count=0)
     )
+    tier_5m, tier_1h = _cache_creation_tiers(usage)
     store.insert_api_call(
         turn_id,
         seq,
@@ -102,6 +115,9 @@ def record_api_call(
         http_status=http_status,
         relay_synthetic=relay_synthetic,
         route_id=route_id,
+        cache_write_5m=tier_5m,
+        cache_write_1h=tier_1h,
+        cache_ttl_requested=cache_ttl_requested,
     )
 
 
@@ -395,6 +411,10 @@ def _build_record(
         usage_unknown=bool(usage.get("usage_unknown")),
         cache_read_tokens=_int_value(usage.get("cache_read_tokens")),
         cache_write_tokens=_int_value(usage.get("cache_write_tokens")),
+        idle_compaction_fired=usage.get("idle_compaction_fired"),
+        compaction_tokens_before=_int_or_none_value(usage.get("compaction_tokens_before")),
+        compaction_tokens_after=_int_or_none_value(usage.get("compaction_tokens_after")),
+        compaction_cost_usd=usage.get("compaction_cost_usd"),
         reasoning_tokens=_int_value(usage.get("reasoning_tokens")),
         context_used=_int_value(usage.get("context_used")),
         context_length=_int_value(usage.get("context_length")),

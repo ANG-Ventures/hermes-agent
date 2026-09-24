@@ -77,6 +77,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             output_tokens_unknown INT DEFAULT 0,
             cache_read INT,
             cache_write INT,
+            cache_write_5m INT,
+            cache_write_1h INT,
+            gap_prev_turn_s REAL,
+            first_call_cache_miss INT,
+            idle_compaction_fired INT,
+            compaction_tokens_before INT,
+            compaction_tokens_after INT,
+            compaction_cost_usd REAL,
             reasoning INT,
             context_used INT,
             context_length INT,
@@ -162,6 +170,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             output_tokens INT,
             cache_read INT,
             cache_write INT,
+            cache_write_5m INT,
+            cache_write_1h INT,
+            cache_ttl_requested TEXT,
+            lane_family TEXT,
             reasoning INT,
             attribution TEXT,
             http_status INT,
@@ -192,6 +204,27 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # partially-migrated DB (or a second writer that already added them)
     # never raises "duplicate column name".
     _existing = {row[1] for row in conn.execute("PRAGMA table_info(turns)").fetchall()}
+    for col, kind in (
+        ("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
+        ("gap_prev_turn_s", "REAL"), ("first_call_cache_miss", "INT"),
+        ("idle_compaction_fired", "INT"), ("compaction_tokens_before", "INT"),
+        ("compaction_tokens_after", "INT"), ("compaction_cost_usd", "REAL"),
+    ):
+        if col not in _existing:
+            try:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {kind}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+    _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
+    for col, kind in (("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
+                      ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT")):
+        if col not in _api_existing:
+            try:
+                conn.execute(f"ALTER TABLE turn_api_calls ADD COLUMN {col} {kind}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
     for _col in ("last_cache_read", "last_cache_write", "last_uncached"):
         if _col not in _existing:
             try:
@@ -390,6 +423,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 # be opened at all (t_71ae3a75). A column the table lacks simply gets no index.
 _TURN_INDEXES = (
     ("idx_blackbox_turns_chat_end", ("platform", "chat_id", "ts_end")),
+    ("idx_blackbox_turns_chat_start", ("chat_id", "ts_start")),
     ("idx_blackbox_turns_cost", ("cost_usd",)),
     ("idx_blackbox_turns_ts_start", ("ts_start",)),
     # The skill-stats miner (skills-dashboard launchd, hourly) opens every
@@ -441,6 +475,71 @@ def _cost_float(value: Any) -> float | None:
     return float(value)
 
 
+def lane_family(provider: str) -> str:
+    p = str(provider or "").strip().lower()
+    for prefixes, family in (
+        (("claude-apx", "claude-apr", "claude-api-proxy"), "apx/apr"),
+        (("claude-bpx", "claude-bpr", "claude-bridge"), "bpx/bpr"),
+        (("claude-cpx", "claude-cpr"), "cpx/cpr"),
+        (("xai",), "xai"), (("openrouter",), "openrouter"),
+    ):
+        if p.startswith(prefixes):
+            return family
+    return "codex" if p == "openai-codex" else "other"
+
+
+def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
+    """Reconcile calls even when they arrive after the turn row."""
+    conn.execute("""
+        UPDATE turns SET
+            cache_write_5m = (SELECT SUM(cache_write_5m) FROM turn_api_calls
+                              WHERE turn_id = turns.turn_id),
+            cache_write_1h = (SELECT SUM(cache_write_1h) FROM turn_api_calls
+                              WHERE turn_id = turns.turn_id),
+            first_call_cache_miss = (
+                SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
+                                      OR cache_write IS NULL THEN NULL
+                            WHEN input_tokens + cache_read + cache_write <= 0 THEN NULL
+                            WHEN cache_write * 5 >= 4 *
+                                 (input_tokens + cache_read + cache_write) THEN 1
+                            ELSE 0 END
+                FROM turn_api_calls WHERE turn_id = turns.turn_id
+                ORDER BY seq LIMIT 1)
+        WHERE turn_id = ?
+    """, (turn_id,))
+
+
+def backfill_cache_monitoring() -> None:
+    """Explicit historical fill; never infer cache tiers or compaction cost."""
+    with _connect() as conn:
+        for family, prefixes in (
+            ("apx/apr", ("claude-apx", "claude-apr", "claude-api-proxy")),
+            ("bpx/bpr", ("claude-bpx", "claude-bpr", "claude-bridge")),
+            ("cpx/cpr", ("claude-cpx", "claude-cpr")),
+            ("codex", ("openai-codex",)), ("xai", ("xai",)),
+            ("openrouter", ("openrouter",)),
+        ):
+            for prefix in prefixes:
+                conn.execute("UPDATE turn_api_calls SET lane_family=? "
+                             "WHERE lane_family IS NULL AND lower(provider) LIKE ?",
+                             (family, prefix + "%"))
+        conn.execute("UPDATE turn_api_calls SET lane_family='other' WHERE lane_family IS NULL")
+        conn.execute("""
+            UPDATE turns SET gap_prev_turn_s = ts_start - (
+                SELECT prev.ts_end FROM turns AS prev
+                WHERE prev.chat_id = turns.chat_id AND prev.chat_id != ''
+                  AND (prev.ts_start < turns.ts_start OR
+                       (prev.ts_start = turns.ts_start AND prev.turn_id < turns.turn_id))
+                ORDER BY prev.ts_start DESC, prev.turn_id DESC LIMIT 1)
+            WHERE gap_prev_turn_s IS NULL AND chat_id != ''
+        """)
+        for (turn_id,) in conn.execute(
+            "SELECT DISTINCT turn_id FROM turn_api_calls WHERE turn_id IN "
+            "(SELECT turn_id FROM turns WHERE first_call_cache_miss IS NULL)"
+        ).fetchall():
+            _refresh_cache_monitoring(conn, turn_id)
+
+
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -478,6 +577,8 @@ _INSERT_TURN_COLUMNS = (
     "profile", "provider", "model", "platform", "chat_id", "chat_name",
     "api_calls", "tools", "input_tokens", "output_tokens", "cache_read",
     "cache_write", "reasoning", "context_used", "context_length",
+    "idle_compaction_fired", "compaction_tokens_before",
+    "compaction_tokens_after", "compaction_cost_usd",
     "last_cache_read", "last_cache_write", "last_uncached",
     "last_call_prompt_unknown",
     "comp_sys_tokens", "comp_tool_schema_tokens", "comp_history_tokens",
@@ -536,6 +637,10 @@ def insert_turn(record: TurnRecord) -> None:
                     _int(record.reasoning_tokens),
                     _int(record.context_used),
                     _int(record.context_length),
+                    None if record.idle_compaction_fired is None else _bool_int(record.idle_compaction_fired),
+                    _int_or_none(record.compaction_tokens_before),
+                    _int_or_none(record.compaction_tokens_after),
+                    _cost_float(record.compaction_cost_usd),
                     _int_or_none(record.last_cache_read_tokens),
                     _int_or_none(record.last_cache_write_tokens),
                     _int_or_none(record.last_uncached_tokens),
@@ -593,6 +698,17 @@ def insert_turn(record: TurnRecord) -> None:
                 """,
                 (record.platform or "", record.chat_id or "", record.turn_id),
             )
+            if record.chat_id:
+                conn.execute("""
+                    UPDATE turns SET gap_prev_turn_s = ts_start - (
+                        SELECT prev.ts_end FROM turns AS prev
+                        WHERE prev.chat_id = turns.chat_id
+                          AND (prev.ts_start < turns.ts_start OR
+                               (prev.ts_start = turns.ts_start AND prev.turn_id < turns.turn_id))
+                        ORDER BY prev.ts_start DESC, prev.turn_id DESC LIMIT 1)
+                    WHERE turn_id = ?
+                """, (record.turn_id,))
+            _refresh_cache_monitoring(conn, record.turn_id)
     except Exception:
         logger.warning("blackbox telemetry insert failed", exc_info=True)
 
@@ -602,6 +718,9 @@ def insert_api_call(
     usage: CanonicalUsage, sub_key: str | None, attribution: str,
     http_status: int | None = None, relay_synthetic: bool = False,
     route_id: str | None = None,
+    cache_write_5m: int | None = None,
+    cache_write_1h: int | None = None,
+    cache_ttl_requested: str | None = None,
 ) -> None:
     """Append one call, including zero-usage failures, without changing turn totals.
 
@@ -625,14 +744,17 @@ def insert_api_call(
             INSERT INTO turn_api_calls (
                 turn_id, seq, ts, provider, sub_key, model, input_tokens,
                 output_tokens, cache_read, cache_write, reasoning, attribution,
-                http_status, relay_synthetic, route_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                http_status, relay_synthetic, route_id, cache_write_5m,
+                cache_write_1h, cache_ttl_requested, lane_family
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (turn_id, seq, ts, provider, sub_key, model, usage.input_tokens,
              usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
              usage.reasoning_tokens, attribution, http_status,
-             _bool_int(relay_synthetic), route_id),
+             _bool_int(relay_synthetic), route_id, cache_write_5m,
+             cache_write_1h, cache_ttl_requested, lane_family(provider)),
         )
+        _refresh_cache_monitoring(conn, turn_id)
 
 
 def mark_alerted(turn_id: str) -> bool:
