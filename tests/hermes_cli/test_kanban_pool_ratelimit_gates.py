@@ -420,6 +420,192 @@ def test_fallback_rung_judged_on_its_own_pool(home, apr, bpr):
         assert ev and ev[-1]["to_provider"] == "claude-apr"
 
 
+@pytest.mark.parametrize("reviews", [0, 15, 30])
+def test_single_tick_pool_budget_across_ready_and_review(home, apr, reviews):
+    """Real DB + loopback relay: 30 claims may not all spend one eligible seat."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    with kb.connect_closing() as conn:
+        ids = [kb.create_task(conn, title=f"burst-{i}", assignee="argus") for i in range(30)]
+        if reviews:
+            conn.executemany("UPDATE tasks SET status='review' WHERE id=?",
+                             [(tid,) for tid in ids[-reviews:]])
+            conn.commit()
+        seen = []
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+                               max_in_progress=100)
+        assert len(seen) == 2
+        assert len([tid for tid, reason in res.respawn_guarded if reason == "pool_budget"]) == 28
+        for tid in ids:
+            if tid not in seen:
+                assert _events(conn, tid, "deferred")[-1] == {
+                    "reason": "pool_budget", "provider": "claude-apr",
+                    "pool": "claude-apr", "eligible": 1, "admitted": 2,
+                }
+        assert apr.hits == 1
+
+
+def test_pool_budget_is_per_tick_across_boards_with_shared_tick_cache(home, apr):
+    """Argus r1 F1: the gateway tick calls dispatch_once once PER BOARD with one
+    shared ``budget_cache``. The relay pool is shared by every board, so the
+    admission budget must span the whole tick, not reset per board."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    boards = ["default", "b2", "b3"]
+    for b in boards[1:]:
+        kb.create_board(b)
+    ids: dict = {}
+    for b in boards:
+        with kb.connect_closing(board=b) as conn:
+            ids[b] = [kb.create_task(conn, title=f"{b}-{i}", assignee="argus")
+                      for i in range(10)]
+    tick_cache: dict = {}
+    seen: list = []
+    for b in boards:
+        with kb.connect_closing(board=b) as conn:
+            kb.dispatch_once(conn, board=b, spawn_fn=_spawner(seen), max_spawn=100,
+                             max_in_progress=100, budget_cache=tick_cache)
+    assert len(seen) == 2, seen
+    assert set(seen) <= set(ids["default"])
+    for b in boards[1:]:
+        with kb.connect_closing(board=b) as conn:
+            for tid in ids[b]:
+                assert _events(conn, tid, "deferred")[-1] == {
+                    "reason": "pool_budget", "provider": "claude-apr",
+                    "pool": "claude-apr", "eligible": 1, "admitted": 2,
+                }
+    # One probe per tick, not one per board.
+    assert apr.hits == 1
+
+    # A NEW tick (fresh cache) gets a fresh budget.
+    seen.clear()
+    with kb.connect_closing(board="b2") as conn:
+        kb.dispatch_once(conn, board="b2", spawn_fn=_spawner(seen), max_spawn=100,
+                         max_in_progress=100, budget_cache={})
+    assert len(seen) == 2
+
+
+def test_pool_budget_single_call_without_tick_cache_is_per_call(home, apr):
+    """CLI / standalone daemon pass no cache: each call is its own tick."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    with kb.connect_closing() as conn:
+        for i in range(6):
+            kb.create_task(conn, title=f"c-{i}", assignee="argus")
+        seen: list = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert len(seen) == 2
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert len(seen) == 4
+
+
+def test_gateway_tick_threads_one_budget_cache_through_every_board():
+    """The cross-board budget above only holds if the REAL gateway tick passes
+    one shared cache per tick to every board's dispatch_once. Pin that wiring."""
+    import ast
+    import inspect
+    from gateway import kanban_watchers
+
+    tree = ast.parse(inspect.getsource(kanban_watchers))
+    funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    tick = funcs["_tick_once"]
+    loop_calls = [c for c in ast.walk(tick) if isinstance(c, ast.Call)
+                  and getattr(c.func, "id", None) == "_tick_once_for_board"]
+    assert loop_calls and all(
+        any(isinstance(a, ast.Name) and a.id == "budget_cache" for a in c.args)
+        for c in loop_calls)
+    # Created once per tick, outside the per-board loop.
+    loops = [n for n in ast.walk(tick) if isinstance(n, ast.For)]
+    assigned_in_loop = {t.id for lp in loops for n in ast.walk(lp)
+                        if isinstance(n, (ast.Assign, ast.AnnAssign))
+                        for t in ([n.target] if isinstance(n, ast.AnnAssign) else n.targets)
+                        if isinstance(t, ast.Name)}
+    assert "budget_cache" not in assigned_in_loop
+    per_board = funcs["_tick_once_for_board"]
+    dispatch = [c for c in ast.walk(per_board) if isinstance(c, ast.Call)
+                and getattr(c.func, "attr", None) == "dispatch_once"]
+    assert dispatch and all(
+        any(k.arg == "budget_cache" and isinstance(k.value, ast.Name)
+            and k.value.id == "budget_cache" for k in c.keywords)
+        for c in dispatch)
+
+
+def test_pool_budget_config_default_and_legacy_zero(home):
+    assert ph.configured_pool_spawns_per_eligible() == 2
+    _config(home, pool_spawns_per_eligible=0)
+    assert ph.configured_pool_spawns_per_eligible() == 0
+    _config(home, pool_spawns_per_eligible=-1)
+    assert ph.configured_pool_spawns_per_eligible() == 2
+
+
+def test_fallback_spawns_charge_serving_pool_budget(home, apr, bpr):
+    apr.eligible = bpr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url), pool_spawns_per_eligible=2)
+    p = home / "profiles" / "fb"
+    p.mkdir(parents=True)
+    (p / "config.yaml").write_text(json.dumps({
+        "model": {"provider": "claude-apr", "default": "m"},
+        "fallback_providers": [{"provider": "claude-bpr", "model": "mbpr"}],
+    }))
+    with kb.connect_closing() as conn:
+        ids = [kb.create_task(conn, title=f"fallback-{i}", assignee="fb") for i in range(10)]
+        seen = []
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+                               max_in_progress=100)
+        assert seen == ids[:4]
+        assert all(not _events(conn, tid, "dispatch_provider_fallback") for tid in ids[:2])
+        assert all(_events(conn, tid, "dispatch_provider_fallback")[-1]["to_provider"] == "claude-bpr"
+                   for tid in ids[2:4])
+        assert all((tid, "pool_budget") in res.respawn_guarded for tid in ids[4:])
+        assert apr.hits == bpr.hits == 1
+
+
+def test_pinned_lanes_share_sub_budget_and_zero_disables_it(home, apr):
+    apr.eligible = 5
+    _config(home, pool_health_urls=_urls(apr.url, apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "apx", "claude-apx-16")
+    _profile(home, "bpx", "claude-bpx-16")
+    with kb.connect_closing() as conn:
+        ids = [kb.create_task(conn, title=f"pinned-{i}", assignee="apx" if i % 2 else "bpx")
+               for i in range(6)]
+        seen = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert len(seen) == 2
+        assert _events(conn, ids[2], "deferred")[-1]["pool"] == "sub-vps-16"
+        _config(home, pool_health_urls=_urls(apr.url, apr.url), pool_box_health=False,
+                pool_spawns_per_eligible=0)
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert len(seen) == 6
+
+
+def test_unreachable_probe_fails_open_even_with_pool_budget(home):
+    _config(home, pool_health_urls=_urls(_dead_url()), pool_spawns_per_eligible=2)
+    _profile(home, "a", "claude-apr")
+    with kb.connect_closing() as conn:
+        ids = [kb.create_task(conn, title=f"unreachable-{i}", assignee="a") for i in range(5)]
+        seen = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert seen == ids
+
+
+def test_unreachable_pinned_probe_fails_open_without_box_health(home):
+    _config(home, pool_health_urls=_urls(_dead_url()), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "a", "claude-apx-16")
+    with kb.connect_closing() as conn:
+        ids = [kb.create_task(conn, title=f"pin-unreachable-{i}", assignee="a")
+               for i in range(5)]
+        seen = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert seen == ids
+
+
 # ---------------------------------------------------------------------------
 # Gate 2 -- escalating per-task backoff
 # ---------------------------------------------------------------------------
@@ -976,7 +1162,7 @@ def test_G1_fallback_rung_429s_open_the_rungs_circuit_not_the_primary(home, apr,
     monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: None)
     apr.eligible, bpr.eligible = 4, 0
     _config(home, pool_health_urls=_urls(apr.url, bpr.url), max_spawn=50,
-            max_in_progress_per_profile=50)
+            max_in_progress_per_profile=50, pool_spawns_per_eligible=0)
     _fb_chain_profile(home, [
         {"provider": "claude-bpx-16", "model": "m16"},
         {"provider": "claude-apr", "model": "mapr"},
@@ -1048,7 +1234,7 @@ def test_circuit_lane_then_fallback_charges_the_serving_rung(home, apr, bpr, mon
     monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: None)
     apr.eligible, bpr.eligible = 0, 9          # lane pool (apr) capped
     _config(home, pool_health_urls=_urls(apr.url, bpr.url), max_spawn=50,
-            max_in_progress_per_profile=50)
+            max_in_progress_per_profile=50, pool_spawns_per_eligible=0)
     _fb_chain_profile(home, [{"provider": "claude-bpx-16", "model": "m16"}])
     with kb.connect_closing() as conn:
         kb.set_lane_model_override(conn, provider="claude-apr", model="lm", assignee="fb",
