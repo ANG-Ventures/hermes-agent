@@ -3,12 +3,27 @@ import base64
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import threading
 
 import pytest
 
-from scripts.ci_overflow_plan import JobPlacement, Plan
-from scripts.ci_overflow_ledger import Ledger, Refusal, Reservation
+from scripts.ci_overflow_plan import POOL, JobPlacement, Plan
+from scripts.ci_overflow_ledger import Ledger, Refusal, ReleaseResult, Reservation
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ci_overflow"
+CANONICAL = {"version": 1, "attempts": {}, "daily_totals": {}}
+
+
+def github_base64(raw: bytes) -> str:
+    """GitHub Contents API wire shape: base64 wrapped at 60 columns, newline-terminated."""
+    flat = base64.b64encode(raw).decode()
+    return "".join(flat[i:i + 60] + "\n" for i in range(0, len(flat), 60))
+
+
+def live_response():
+    """The captured live `GET contents/state.json?ref=ci-overflow-ledger` response."""
+    return json.loads((FIXTURES / "contents.json").read_text(encoding="utf-8"))
 
 
 def proposed(*names):
@@ -27,7 +42,7 @@ class Contents:
     def get(self, path, params):
         assert (path, params) == ("state.json", {"ref": "ci-overflow-ledger"})
         with self.lock:
-            return {"sha": self.sha, "encoding": "base64", "content": base64.b64encode(json.dumps(self.state).encode()).decode()}
+            return {"sha": self.sha, "encoding": "base64", "content": github_base64(json.dumps(self.state).encode())}
     def put(self, path, payload):
         assert path == "state.json" and payload["branch"] == "ci-overflow-ledger"
         with self.lock:
@@ -116,6 +131,103 @@ def test_missing_or_corrupt_refuses_cloud(name, state, incident):
     assert api.writes == 0
 
 
+def test_canonical_ledger_control_caps_admission():
+    api = Contents()
+    result = ledger(api, limit=35).reserve(key(), proposed("a", "b"))
+    assert isinstance(result, Reservation)
+    assert [j.reserved_minutes for j in result.plan.jobs] == [35, 0]
+    assert api.writes == 1
+
+
+@pytest.mark.parametrize("name,change", [
+    ("negative-daily-total", lambda s: s["daily_totals"].update({"2026-09-23": -35})),
+    ("fractional-daily-total", lambda s: s["daily_totals"].update({"2026-09-23": 0.5})),
+    ("future-daily-total", lambda s: s["daily_totals"].update({"2026-09-24": 35})),
+    ("negative-old-reservation", lambda s: s["attempts"]["123:9:1"]["jobs"][0].update(reserved_minutes=-35)),
+    ("missing-reservation-field", lambda s: s["attempts"]["123:9:1"]["jobs"][0].pop("reserved_minutes")),
+    ("future-dated-pending", lambda s: s["attempts"]["123:9:1"].update(admitted_on="2026-09-24")),
+    ("bad-terminal-date", lambda s: s["attempts"]["123:9:1"].update(terminal_on="nonsense")),
+    ("terminal-before-admission", lambda s: s["attempts"]["123:9:1"].update(terminal_on="2026-09-21")),
+    ("missing-existing-plan", lambda s: s["attempts"]["123:9:1"].pop("plan")),
+    ("malformed-existing-plan", lambda s: s["attempts"]["123:9:1"]["plan"].update(jobs="broken")),
+    ("plan-job-mismatch", lambda s: s["attempts"]["123:9:1"]["plan"]["jobs"][0].update(reserved_minutes=0)),
+    ("wrong-attempt-key", lambda s: s["attempts"].update({"bad-key": s["attempts"].pop("123:9:1")})),
+    ("released-without-receipt", lambda s: s["attempts"]["123:9:1"]["jobs"][0].update(released_unemitted=True)),
+    # Argus R3: every persisted field is required; an omitted key is corruption, not a default.
+    ("missing-terminal-field", lambda s: s["attempts"]["123:9:1"].pop("terminal_on")),
+    ("missing-admitted-field", lambda s: s["attempts"]["123:9:1"].pop("admitted_on")),
+    ("missing-released-flag", lambda s: s["attempts"]["123:9:1"]["jobs"][0].pop("released_unemitted")),
+    ("missing-plan-incidents", lambda s: s["attempts"]["123:9:1"]["plan"].pop("incidents")),
+    ("unknown-row-field", lambda s: s["attempts"]["123:9:1"].update(refund=35)),
+    ("unknown-job-field", lambda s: s["attempts"]["123:9:1"]["jobs"][0].update(credit=35)),
+    ("unknown-plan-field", lambda s: s["attempts"]["123:9:1"]["plan"].update(extra=[])),
+    ("unknown-top-level-field", lambda s: s.update(carry={"2026-09-23": -35})),
+    ("boolean-version", lambda s: s.update(version=True)),
+    ("float-version", lambda s: s.update(version=1.0)),
+])
+def test_semantically_corrupt_ledger_refuses_without_put(name, change):
+    """Corrupt persisted state => ledger-unavailable on EVERY path: new-key reserve, same-key
+    replay, hosted reconcile and absent-job reconcile. Zero cloud, zero PUT, no exception."""
+    api = Contents()
+    baseline = ledger(api, day="2026-09-22", limit=35).reserve(key(9), proposed("old"))
+    assert isinstance(baseline, Reservation)
+    api.writes = 0
+    change(api.state)
+    denied = ledger(api, limit=35).reserve(key(), proposed("a", "b"))
+    assert isinstance(denied, Refusal) and denied.incident == "ledger-unavailable", name
+    replay = ledger(api, limit=35).reserve(key(9), proposed("old"))
+    assert isinstance(replay, Refusal) and replay.incident == "ledger-unavailable", name
+    hosted = ledger(api).reconcile(key(9), evidence(run=9, jobs=[{
+        "name": "old", "status": "completed", "labels": ["ubuntu-latest"], "runner_name": "GitHub Actions"}]))
+    assert hosted == ReleaseResult(0, "ledger-unavailable"), name
+    release = ledger(api).reconcile(key(9), evidence(run=9, jobs=[]))
+    assert release == ReleaseResult(0, "ledger-unavailable"), name
+    assert api.writes == 0, name
+
+
+class RawContents(Contents):
+    """Serves exact raw JSON bytes (wrapped base64) so wire-level corruption reaches the parser."""
+    def __init__(self, raw):
+        super().__init__()
+        self.raw = raw
+    def get(self, path, params):
+        assert (path, params) == ("state.json", {"ref": "ci-overflow-ledger"})
+        return {"sha": self.sha, "encoding": "base64", "content": github_base64(self.raw.encode())}
+
+
+def test_raw_wire_clean_control_charges_recorded_total():
+    api = RawContents('{"version":1,"attempts":{},"daily_totals":{"2026-09-23":35}}')
+    result = ledger(api, limit=35).reserve(key(), proposed("a"))
+    assert isinstance(result, Reservation) and result.plan.jobs[0].reserved_minutes == 0
+    assert api.writes == 1
+
+
+@pytest.mark.parametrize("name,raw", [
+    ("duplicate-daily-totals", '{"version":1,"attempts":{},"daily_totals":{"2026-09-23":35},"daily_totals":{}}'),
+    ("duplicate-day-inside-totals", '{"version":1,"attempts":{},"daily_totals":{"2026-09-23":35,"2026-09-23":0}}'),
+    ("duplicate-version", '{"version":2,"version":1,"attempts":{},"daily_totals":{}}'),
+    ("duplicate-attempts", '{"version":1,"attempts":{"x":1},"attempts":{},"daily_totals":{}}'),
+    ("boolean-version", '{"version":true,"attempts":{},"daily_totals":{}}'),
+    ("float-version", '{"version":1.0,"attempts":{},"daily_totals":{}}'),
+])
+def test_raw_wire_corrupt_ledger_refuses_without_put(name, raw):
+    api = RawContents(raw)
+    denied = ledger(api, limit=35).reserve(key(), proposed("a"))
+    assert isinstance(denied, Refusal) and denied.incident == "ledger-unavailable", name
+    assert ledger(api).reconcile(key(), evidence(jobs=[])) == ReleaseResult(0, "ledger-unavailable"), name
+    assert api.writes == 0, name
+
+
+def test_corrupt_existing_attempt_never_returns_stored_plan():
+    api = Contents()
+    assert isinstance(ledger(api).reserve(key(), proposed("a")), Reservation)
+    api.state["attempts"]["123:1:1"].pop("plan")
+    api.writes = 0
+    result = ledger(api).reserve(key(), proposed("a"))
+    assert isinstance(result, Refusal) and result.incident == "ledger-unavailable"
+    assert api.writes == 0
+
+
 def test_conflicts_recompute_allowance_and_retry_bounded():
     api = Contents()
     api.conflicts = 2
@@ -199,6 +311,84 @@ def test_underpriced_hosted_placement_cannot_be_committed():
 
 def test_oversized_essential_state_refuses_new_cloud():
     api = Contents()
-    api.state["attempts"]["123:0:1"] = {"admitted_on": "2026-09-22", "jobs": [], "terminal_on": None,
-                                       "pad": "z" * 520000}
+    ledger(api, day="2026-09-22").reserve(key(9), proposed("old"))
+    # Oversize through a schema-valid field (unknown fields are corruption, not padding).
+    row = api.state["attempts"]["123:9:1"]
+    for placement in (row["jobs"][0], row["plan"]["jobs"][0]):
+        placement["reason"] = "z" * 260000
     assert ledger(api).reserve(key(), proposed("a")).incident == "state-capacity"
+
+
+class Static:
+    def __init__(self, response):
+        self.response, self.writes = response, 0
+    def get(self, path, params):
+        assert (path, params) == ("state.json", {"ref": "ci-overflow-ledger"})
+        return self.response
+    def put(self, path, payload):
+        self.writes += 1
+        raise AssertionError("must not write")
+
+
+def test_captured_live_contents_response_decodes():
+    """F1: GitHub's newline-wrapped base64 decodes; the live (pre-canonical) schema is then refused."""
+    response = live_response()
+    assert "\n" in response["content"]  # the real wire shape is wrapped
+    api = Static(response)
+    with pytest.raises(ValueError, match="corrupt ledger"):  # decoded fine, rejected on schema
+        Ledger(api)._read()
+    r = ledger(api).reserve(key(), proposed("a"))
+    assert isinstance(r, Refusal) and r.incident == "ledger-unavailable" and api.writes == 0
+
+
+def test_live_envelope_with_canonical_state_admits():
+    response = dict(live_response(), content=github_base64(json.dumps(CANONICAL, indent=1).encode()))
+    assert response["content"].count("\n") >= 1
+    state, sha = Ledger(Static(response))._read()
+    assert state == CANONICAL and sha == response["sha"]
+
+
+def test_wrapped_base64_admission_round_trip():
+    api = Contents()
+    local = Plan([JobPlacement(f"pad-{i}", POOL, "local-idle", 0) for i in range(5)],
+                 [], {"mode": "self-only"})
+    ledger(api).reserve(key(9), local)
+    assert api.get("state.json", {"ref": "ci-overflow-ledger"})["content"].count("\n") > 3
+    assert ledger(api, limit=35).reserve(key(), proposed("a")).plan.jobs[0].reserved_minutes == 35
+
+
+class CreatesOnMissing:
+    """Real GitHub: GET on a missing path is 404, and PUT without `sha` CREATES the file."""
+    def __init__(self):
+        self.state = None
+        self.writes = 0
+    def get(self, path, params):
+        if self.state is None:
+            raise HTTPError(404)
+        return {"sha": "s1", "encoding": "base64", "content": github_base64(json.dumps(self.state).encode())}
+    def put(self, path, payload):
+        if self.state is None and payload.get("sha") is None:
+            self.state = json.loads(base64.b64decode(payload["content"]))
+            self.writes += 1
+            return {"content": {"sha": "s1"}}
+        raise HTTPError(409 if self.state is not None else 422)
+
+
+def test_missing_ledger_never_created():
+    """C13: a missing ledger refuses cloud and is never auto-created, on reserve or reconcile."""
+    api = CreatesOnMissing()
+    r = ledger(api).reserve(key(), proposed("a"))
+    assert isinstance(r, Refusal) and r.incident == "ledger-unavailable"
+    assert ledger(api).reconcile(key(), evidence(jobs=[])).incident == "ledger-unavailable"
+    assert api.writes == 0 and api.state is None
+
+
+def test_reserve_refuses_more_than_18_jobs():
+    """C29: controller ceiling is 17 slices + 1 e2e; a 19-job plan is refused even at 0 minutes."""
+    api = Contents()
+    at_limit = Plan([JobPlacement(f"j{i}", POOL, "local-queue", 0) for i in range(18)], [], {"mode": "overflow"})
+    assert isinstance(ledger(api).reserve(key(), at_limit), Reservation)
+    over = Plan([JobPlacement(f"j{i}", POOL, "local-queue", 0) for i in range(19)], [], {"mode": "overflow"})
+    r = ledger(api).reserve(key(2), over)
+    assert isinstance(r, Refusal) and r.incident == "invalid-plan"
+    assert api.writes == 1

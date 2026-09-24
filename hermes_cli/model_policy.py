@@ -1,4 +1,10 @@
-"""Shared worker-model policy for Kanban creation and dispatch."""
+"""Shared worker-model policy for Kanban creation and dispatch.
+
+Main's configurable flagship ban (``kanban.banned_worker_model_substrings``)
+is the ONE predicate.  The batch/lane routing helpers further down layer on
+top of it (alias canonicalisation, route classification, audit text) and never
+define a second ban list.
+"""
 
 from __future__ import annotations
 
@@ -81,3 +87,85 @@ def validate_worker_model(
 
 def override_comment(reason: str) -> str:
     return f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} {reason.strip()}"
+
+
+# ---------------------------------------------------------------------------
+# Batch / lane routing helpers (set-model --where, lane-model).  These consume
+# ``flagship_model_match`` above; they add alias resolution so a config alias
+# that expands to a flagship id cannot slip past the substring check.
+# ---------------------------------------------------------------------------
+
+
+def canonical_model_pair(
+    model: Optional[str], provider: Optional[str] = None
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve config aliases before any policy, persistence, or audit decision."""
+
+    if not model:
+        return model, provider
+    try:
+        from hermes_cli.model_switch import resolve_model_pair_for_storage
+
+        return resolve_model_pair_for_storage(model, provider)
+    except Exception:
+        return model, provider
+
+
+def is_firepower_model(
+    model: Optional[str],
+    config: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Return whether *model* (raw or alias-resolved) hits the flagship ban."""
+
+    if not str(model or "").strip():
+        return False
+    if flagship_model_match(model, config):
+        return True
+    canonical_model, _ = canonical_model_pair(model)
+    return bool(flagship_model_match(canonical_model, config))
+
+
+def route_kind(route: Optional[str]) -> str:
+    """Classify a route for dispatcher announcements."""
+
+    return "firepower" if is_firepower_model(route) else "standard"
+
+
+def firepower_guard_error(
+    model: Optional[str],
+    reason: Optional[str],
+    *,
+    reason_field: str = "--firepower",
+    config: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Return an actionable refusal message, or ``None`` when allowed."""
+
+    if not is_firepower_model(model, config):
+        return None
+    if str(reason or "").strip():
+        return None
+    message = flagship_model_error(str(model))
+    if reason_field != "--allow-flagship":
+        message += f" ({reason_field} is accepted as an alias.)"
+    return message
+
+
+def format_firepower_audit(
+    model: str,
+    provider: Optional[str],
+    reason: str,
+) -> str:
+    """Human-readable audit LOG line naming the route (delegate_task, lane-model).
+
+    Kanban card comments use :func:`override_comment` instead, byte-identical
+    to main's create/set-model writers, which is what the dispatcher's
+    ``flagship override:`` gate authorizes on.
+    """
+
+    canonical_model, canonical_provider = canonical_model_pair(model, provider)
+    route = (
+        f"{canonical_provider}/{canonical_model}"
+        if canonical_provider
+        else canonical_model
+    )
+    return override_comment(f"route={route}; reason={reason.strip()}")

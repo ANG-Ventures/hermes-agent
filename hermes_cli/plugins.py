@@ -326,7 +326,8 @@ VALID_HOOKS: Set[str] = {
     #   exit_kind: "clean_exit" | "rate_limited" | "infra_unavailable"
     #              | "nonzero_exit" | "signaled" | "unknown",
     #   exit_code: int | None,
-    #   outcome: "crashed" | "rate_limited" | "infra_unavailable",
+    #   outcome: "crashed" | "rate_limited" | "infra_unavailable"
+    #            | "cohort_death",
     #   retry_status: str  (the phase the task was released back to).
     "on_kanban_worker_exited",
     # on_kanban_worker_stale_claim fires when release_stale_claims reclaims
@@ -7071,11 +7072,23 @@ def _dispatch_pre_tool_call_hooks(
     Callers that also need input transformation should call this
     function and apply ``modified_args`` if not ``None``.
     """
+    import re
+    original_command = args.get("command") if tool_name == "terminal" and isinstance(args, dict) else None
+    raw_diff = isinstance(original_command, str) and re.match(r"^\s*diff(?:\s|$)", original_command)
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
     )
+    if raw_diff and isinstance(args, dict):
+        # RTK can report whitespace-only differences as equality with exit 0.
+        # Preserve both the in-place and returned-directive command paths.
+        args["command"] = original_command
+        if details.modified_args is not None:
+            details = _PreToolCallDirective(
+                action=details.action, message=details.message, rule_key=details.rule_key,
+                modified_args={**details.modified_args, "command": original_command},
+            )
     block_msg = _resolve_block_from_details(
         details, tool_name,
         turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id,

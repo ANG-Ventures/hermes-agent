@@ -1153,6 +1153,27 @@ def _set_status_direct(
     """
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
+    # Moving a card OFF running releases its claim. Prove the worker is gone
+    # FIRST, exactly like kanban_db.reclaim_task: releasing and then trying
+    # to kill (ignoring the result) let the dispatcher claim a second worker
+    # beside a survivor. A failed or unprovable termination refuses the move.
+    held = conn.execute(
+        "SELECT status, worker_pid, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if held is None:
+        return False
+    released_lock = held["claim_lock"]
+    if held["status"] == "running" and new_status != "running":
+        termination = kanban_db._terminate_reclaimed_worker(
+            held["worker_pid"], held["claim_lock"],
+        )
+        if kanban_db._worker_survived_termination(termination):
+            kanban_db._refuse_reclaim_unproven_death(
+                conn, task_id, held["claim_lock"], termination,
+                reason=f"dashboard status move to {new_status}",
+            )
+            return False
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
@@ -1161,6 +1182,12 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if prev["status"] == "running" and (
+            held["status"] != "running" or prev["claim_lock"] != released_lock
+        ):
+            # Claimed/re-claimed between the termination check and here;
+            # that owner was never checked. Refuse rather than release it.
             return False
 
         if prev["status"] == "running" and new_status == "ready":
@@ -1218,7 +1245,7 @@ def _set_status_direct(
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)",
             )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
+            # Worker already proven gone above; nothing left to terminate.
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
@@ -1423,16 +1450,46 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.assignee is not None:
                     try:
                         if payload.reclaim_first:
+                            # Irreversible SIGTERM before the assign — the
+                            # per-id receipt must say whether it fired, or a
+                            # bare "assign refused" hides a killed worker.
+                            reassign_receipt: dict = {}
                             ok = kanban_db.reassign_task(
                                 conn, tid, payload.assignee or None,
                                 reclaim_first=True,
+                                receipt=reassign_receipt,
                             )
+                            if reassign_receipt.get("reclaimed"):
+                                entry["reclaimed"] = True
+                            if not ok:
+                                entry.update(
+                                    ok=False,
+                                    error=(
+                                        f"assign refused for {tid}"
+                                        + (
+                                            f"; reclaim failed: "
+                                            f"{reassign_receipt['reclaim_error']}"
+                                            if reassign_receipt.get("reclaim_error")
+                                            else (
+                                                "; claim WAS reclaimed (prior worker signalled)"
+                                                + (
+                                                    f"; assign failed ({reassign_receipt['assign_error']}); "
+                                                    "assignment outcome may have changed — inspect card"
+                                                    if reassign_receipt.get("assign_error") else
+                                                    "; card may have been claimed again — inspect status"
+                                                )
+                                                if reassign_receipt.get("reclaimed")
+                                                else ""
+                                            )
+                                        )
+                                    ),
+                                )
                         else:
                             ok = kanban_db.assign_task(
                                 conn, tid, payload.assignee or None,
                             )
-                        if not ok:
-                            entry.update(ok=False, error="assign refused")
+                            if not ok:
+                                entry.update(ok=False, error="assign refused")
                     except RuntimeError as e:
                         entry.update(ok=False, error=str(e))
                 if payload.priority is not None:
@@ -1895,13 +1952,42 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        # `reclaim_first` fires an irreversible SIGTERM + claim release BEFORE
+        # the assign. A bare 409 after that tells the operator "still running"
+        # while the worker is already dead — same silent post-effect class as
+        # the set-model batch. The receipt makes the real outcome visible.
+        receipt: dict = {}
         ok = kanban_db.reassign_task(
             conn, task_id,
             payload.profile or None,
             reclaim_first=bool(payload.reclaim_first),
             reason=payload.reason,
+            receipt=receipt,
         )
         if not ok:
+            if receipt.get("reclaim_error"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"cannot reassign {task_id}: reclaim failed "
+                        f"({receipt['reclaim_error']}); task NOT reassigned"
+                    ),
+                )
+            if receipt.get("reclaimed"):
+                detail = (
+                    f"; assign failed ({receipt['assign_error']}); assignment "
+                    "outcome may have changed — inspect the card"
+                    if receipt.get("assign_error") else
+                    "; assign refused (card may have been claimed again) — "
+                    "inspect current status before retrying"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"cannot reassign {task_id}: the claim WAS reclaimed "
+                        f"(prior worker signalled){detail}"
+                    ),
+                )
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1909,7 +1995,12 @@ def reassign_task_endpoint(
                     "running (pass reclaim_first=true to release the claim first)"
                 ),
             )
-        return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "assignee": payload.profile or None,
+            "reclaimed": bool(receipt.get("reclaimed")),
+        }
     finally:
         conn.close()
 

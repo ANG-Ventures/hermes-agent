@@ -83,7 +83,10 @@ class TestReconcileOrphanedRunning:
         to release_stale_claims — reconciliation must catch it."""
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="half-claim", assignee="w")
-        _orphan_running(conn, tid, claim_lock=f"{host}:dead")
+        dead = subprocess.Popen(["true"], stdin=subprocess.DEVNULL)
+        dead.wait()
+        _orphan_running(conn, tid, claim_lock=f"{host}:dead",
+                        worker_pid=dead.pid)
 
         reconciled = kb.reconcile_orphaned_running(conn)
 
@@ -91,6 +94,16 @@ class TestReconcileOrphanedRunning:
         assert conn.execute(
             "SELECT status FROM tasks WHERE id=?", (tid,)
         ).fetchone()["status"] == "ready"
+
+    def test_null_pid_host_local_claim_is_held_for_attention(self, conn):
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="in-flight", assignee="w")
+        _orphan_running(conn, tid, claim_lock=f"{host}:in-flight")
+        assert kb.reconcile_orphaned_running(conn) == []
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)
+        ).fetchone()["status"] == "running"
+        assert any(e.kind == "reconcile_refused" for e in kb.list_events(conn, tid))
 
     def test_reconciled_event_and_note_logged(self, conn):
         tid = kb.create_task(conn, title="zombie", assignee="w")

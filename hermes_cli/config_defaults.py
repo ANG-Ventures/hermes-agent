@@ -3086,6 +3086,14 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Wrapper heartbeats do not prove worker progress. Warn after 15 min
+        # without agent progress (heartbeat ``progress_at``: API call, stream
+        # chunk, tool call) and reclaim after 25 min (0 disables).
+        "stall_minutes": 15,
+        "stall_reclaim_minutes": 25,
+        # For configured provider_health_probes, prefer a healthy fallback
+        # if fewer than this many pool seats can serve the selected model.
+        "provider_health_min_eligible": 1,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create
@@ -3409,7 +3417,8 @@ DEFAULT_CONFIG = {
         # value; raise it alongside a larger max_concurrent_turns. 0 disables
         # the reserve. Clamped to [0, max_concurrent_turns - 1].
         "user_turn_reserve": 2,
-        "startup_resume_concurrency": 3,
+        # None = unbounded boot-resume fan-out; a positive int throttles.
+        "startup_resume_concurrency": None,
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,

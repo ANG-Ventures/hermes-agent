@@ -266,6 +266,38 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    # UNKNOWN != 0. Some providers report an explicit "I could not measure the
+    # output of this turn" (a null count plus a discriminator flag) rather than
+    # a number — e.g. the claude-bpx bridge's parallel-batch path, which emits
+    # ``completion_tokens: null`` + ``output_tokens_unavailable: true`` on ~40%
+    # of parallel-batch turns. ``output_tokens`` stays an int so every arithmetic
+    # consumer keeps working, but this flag is the discriminator every PRICING,
+    # PERSISTENCE and DISPLAY site must branch on so an unmeasured turn is never
+    # recorded or rendered as a measured zero.
+    output_tokens_unknown: bool = False
+    input_tokens_unknown: bool = False
+    cache_read_tokens_unknown: bool = False
+    cache_write_tokens_unknown: bool = False
+    usage_unknown: bool = False
+
+    @classmethod
+    def fully_unknown(cls) -> "CanonicalUsage":
+        """Usage for a call the provider measured in NO bucket.
+
+        Every discriminator is set, not just the aggregate ``usage_unknown``.
+        Consumers read these flags narrowly — ``output_tokens_unknown`` alone
+        gates the output line on the thin ``/usage`` card and the ``out=``
+        API log, ``prompt_tokens_unknown`` ORs only the three input flags — so
+        an aggregate-only UNKNOWN still lets a narrow reader present this
+        object's placeholder 0 as a measurement.
+        """
+        return cls(
+            input_tokens_unknown=True,
+            output_tokens_unknown=True,
+            cache_read_tokens_unknown=True,
+            cache_write_tokens_unknown=True,
+            usage_unknown=True,
+        )
 
     @property
     def prompt_tokens(self) -> int:
@@ -275,12 +307,20 @@ class CanonicalUsage:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.output_tokens
 
+    @property
+    def total_tokens_unknown(self) -> bool:
+        """A total missing any term is not a measurement."""
+        return any(getattr(self, key) for key in USAGE_UNKNOWN_FIELDS)
+
     def __add__(self, other: "CanonicalUsage") -> "CanonicalUsage":
         """Sum two usage buckets (e.g. MoA advisor fan-out + aggregator).
 
         ``raw_usage`` is dropped on the sum — it describes a single API
         response and cannot be meaningfully merged. ``request_count`` adds so
         callers can see how many underlying API calls a combined figure covers.
+
+        Unknown is ABSORBING: a sum that is missing one side's output term is
+        itself unmeasured, and saying so is the whole point of the flag.
         """
         if not isinstance(other, CanonicalUsage):
             return NotImplemented
@@ -292,6 +332,13 @@ class CanonicalUsage:
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
             request_count=self.request_count + other.request_count,
             raw_usage=None,
+            output_tokens_unknown=(
+                self.output_tokens_unknown or other.output_tokens_unknown
+            ),
+            input_tokens_unknown=self.input_tokens_unknown or other.input_tokens_unknown,
+            cache_read_tokens_unknown=self.cache_read_tokens_unknown or other.cache_read_tokens_unknown,
+            cache_write_tokens_unknown=self.cache_write_tokens_unknown or other.cache_write_tokens_unknown,
+            usage_unknown=self.usage_unknown or other.usage_unknown,
         )
 
 
@@ -1574,6 +1621,324 @@ def _usage_count(value: Any) -> int:
     return max(0, _to_int(value))
 
 
+# Discriminator key a provider sets alongside a null output count to say "this
+# turn's output was never measured" rather than "it was measured at 0". This is
+# the claude-bpx bridge's egress spelling (bridge/src/server.js usagePayload,
+# emitted on the unknown path only).
+_OUTPUT_UNKNOWN_FLAGS = ("output_tokens_unavailable",)
+
+# Output counters, in the order the shapes are tried. A provider that sends an
+# EXPLICIT null for the field it actually uses is declaring an unknown; a
+# provider that simply omits the field is not (see ``_output_is_unknown``).
+_OUTPUT_COUNT_KEYS = ("completion_tokens", "output_tokens")
+
+# The one spelling of "we don't know" every usage renderer must use. Single-
+# sourced so usage.ace, the MacBar and the chat cards cannot drift.
+UNKNOWN_TOKENS_LABEL = "unknown"
+USAGE_UNKNOWN_FIELDS = (
+    "input_tokens_unknown", "output_tokens_unknown", "cache_read_tokens_unknown",
+    "cache_write_tokens_unknown", "usage_unknown",
+)
+
+
+def _declared_null(obj: Any, key: str) -> bool:
+    """True when ``key`` is a WIRE null the provider actually wrote.
+
+    An SDK optional whose value is ``None`` only because nobody set it is not a
+    declaration — pydantic records the keys that arrived on the wire in
+    ``model_fields_set``, so honour that when it exists.
+    """
+    if not _usage_has(obj, key):
+        return False
+    fields = getattr(obj, "model_fields_set", None)
+    if fields is not None and key not in fields:
+        return False
+    return _usage_get(obj, key) is None
+
+
+def _bucket_is_unknown(obj: Any, keys: tuple[str, ...], flags: tuple[str, ...] = ()) -> bool:
+    """Did the provider declare this bucket UNMEASURED?
+
+    An explicit ``*_unavailable`` flag always wins. Otherwise a wire null on one
+    of ``keys`` is a declaration — UNLESS a SIBLING alias in the same bucket
+    carries a measured value. ``keys`` lists the aliases for ONE bucket across
+    API dialects (``prompt_tokens``/``input_tokens``), and a unified provider
+    schema routinely serializes the dialect it is not speaking as ``null``. A
+    measured alias is proof the bucket WAS measured, so the inactive dialect's
+    null must not turn a fully-measured call into an unpriceable UNKNOWN.
+    """
+    extra = _usage_get(obj, "model_extra", {}) or {}
+    if any(_usage_get(obj, key, False) or _usage_get(extra, key, False) for key in flags):
+        return True
+    if not any(_declared_null(obj, key) for key in keys):
+        return False
+    # A present, non-null counter in the same bucket establishes measurement.
+    return not any(
+        _usage_has(obj, key) and _usage_get(obj, key) is not None for key in keys
+    )
+
+
+def _cache_bucket_is_unknown(
+    locations: tuple[tuple[Any, tuple[str, ...]], ...],
+    flag_obj: Any,
+    flags: tuple[str, ...],
+    *,
+    container: Any = None,
+    payload_measured: bool = False,
+) -> bool:
+    """Cross-location version of ``_bucket_is_unknown`` for the cache buckets.
+
+    A cache count can arrive in EITHER of two places: inside the details
+    container (``prompt_tokens_details.cached_tokens``) or as a top-level alias
+    (``cache_read_input_tokens``). ``_bucket_is_unknown``'s sibling-alias
+    protection only looks at keys on the SAME object, so OR-ing two independent
+    calls lets a JSON-null on the dialect the provider is not speaking override
+    a measured value in the other location — a unified OpenAI-compatible schema
+    serialized without ``exclude_none`` emits exactly that shape, and the
+    resulting ``cache_read_tokens_unknown`` escalates into
+    ``total_tokens_unknown``, makes the turn unpriceable, and ``reprice_unpriced``
+    never heals it.
+
+    Same rule as ``_bucket_is_unknown``, one bucket spanning both locations:
+    an explicit unavailable flag wins; otherwise a declared wire null means
+    UNKNOWN only when NO location carries a measured value for this bucket.
+
+    One further narrowing (r6 finding 4). A top-level cache alias is an
+    OPTIONAL field: a request that used no caching has no cache bucket to
+    report, and a unified schema serialized without ``exclude_none`` writes
+    that absence as ``null``. ``{"input_tokens": 100, "output_tokens": 50,
+    "cache_read_input_tokens": null}`` — the exact shape this repo's own
+    Anthropic transport reads with ``... or 0`` — is therefore "no caching on
+    this request", not "the cache bucket was not measured", and treating it as
+    UNKNOWN escalated through ``total_tokens_unknown`` into an unpriceable
+    turn whose billable buckets were measured right beside it, which
+    ``reprice_unpriced`` then refused to heal. So when the rest of the payload
+    IS measured and the null sits only on a top-level alias — no present
+    details CONTAINER declaring a null count, no ``*_unavailable`` flag — the
+    bucket is a measured zero. A null inside a present container still means
+    UNKNOWN: there the provider is speaking the cache dialect and declined to
+    fill in the number.
+    """
+    extra = _usage_get(flag_obj, "model_extra", {}) or {}
+    if any(_usage_get(flag_obj, key, False) or _usage_get(extra, key, False) for key in flags):
+        return True
+    if not any(
+        _declared_null(obj, key) for obj, keys in locations for key in keys
+    ):
+        return False
+    if any(
+        _usage_has(obj, key) and _usage_get(obj, key) is not None
+        for obj, keys in locations
+        for key in keys
+    ):
+        return False
+    # r6 F4: the null is only on a top-level OPTIONAL alias, and the rest of
+    # the payload was measured -> "no caching on this request", a measured
+    # zero. A null inside a PRESENT details container keeps its UNKNOWN
+    # meaning (the provider is speaking the cache dialect and declined to
+    # supply the number), and so does any null when the payload itself is not
+    # measured.
+    if not payload_measured:
+        return True
+    container_declares_null = container is not None and any(
+        _declared_null(obj, key)
+        for obj, keys in locations
+        if obj is container
+        for key in keys
+    )
+    return container_declares_null
+
+
+def prompt_tokens_unknown(usage: Any) -> bool:
+    """Shared display rule for an input total derived from three buckets."""
+    return any(bool(_usage_get(usage, key, False)) for key in (
+        "input_tokens_unknown", "cache_read_tokens_unknown",
+        "cache_write_tokens_unknown", "usage_unknown",
+    ))
+
+
+def last_call_prompt_unknown(record: Any) -> bool:
+    """Was the FINAL call's prompt count unmeasured? The one gate, for every renderer.
+
+    ``context_used`` and the ``last_cache_*`` split describe the final call
+    ONLY. The turn-level ``*_unknown`` flags are absorbing (``any()`` over every
+    call of the turn, ``agent/turn_finalizer.py::_rollup_turn_usage``), so they
+    answer a different question and would blank a fully measured final call just
+    because call #2 returned no usage (r6 finding 9).
+
+    Two shapes reach this, and both must agree — ``plugins/blackbox/last_turn.py``
+    renders a raw ``SELECT *`` dict row, ``plugins/blackbox/card.py`` renders a
+    hydrated ``TurnRecord``. Duplicating the rule per renderer is how the two
+    drifted in the first place (r6 round-4 finding 6: ``• Context: 0/200k 🟢``
+    on the same record ``/context`` read as ``unknown``), so it lives here once.
+
+    NULL is not False. ``plugins/blackbox/store.py`` ALTERs this column in
+    without a DEFAULT, so rows written before it existed hold SQL NULL — and
+    ``TurnRecord.last_call_prompt_unknown`` is typed ``bool`` but carries that
+    ``None`` straight through ``_record_from_row``. A bare truth test on
+    ``None`` silently asserts "the final call was measured" about every historic
+    row. Those rows fall back to the turn-level flag, i.e. exactly the behaviour
+    they already had before the column existed.
+    """
+    flag = _usage_get(record, "last_call_prompt_unknown", None)
+    if flag is None:
+        return prompt_tokens_unknown(record)
+    return bool(flag)
+
+
+# Cumulative session counters live on the agent under a ``session_`` prefix
+# (agent/agent_init.py, run_agent.py) and carry ABSORBING unknown provenance:
+# one unmeasured call latches the flag for the whole window.
+_SESSION_FLAG_PREFIX = "session_"
+
+
+def session_usage_unknown_flags(agent: Any) -> dict[str, bool]:
+    """Read an agent's cumulative UNKNOWN provenance as unprefixed flags.
+
+    Returns the same key shape ``CanonicalUsage`` uses, so the SAME display
+    rules (``prompt_tokens_unknown``, ``format_token_count``) apply to a
+    session-wide total as to one turn. Forking a second rule for cumulative
+    figures is how the two drift; this exists so they cannot.
+
+    An agent that predates the flags (or is a stub) reads as fully measured.
+    """
+    return {
+        key: bool(getattr(agent, _SESSION_FLAG_PREFIX + key, False))
+        for key in USAGE_UNKNOWN_FIELDS
+    }
+
+
+def session_total_tokens_unknown(agent: Any) -> bool:
+    """True when a session-wide TOTAL is missing at least one measured term."""
+    return any(session_usage_unknown_flags(agent).values())
+
+
+def _usage_has(obj: Any, name: str) -> bool:
+    """True when a usage object carries ``name`` at all (even as None)."""
+    if isinstance(obj, dict):
+        return name in obj
+    return hasattr(obj, name)
+
+
+def _output_is_unknown(response_usage: Any) -> bool:
+    """Does this usage object declare its output count UNMEASURED?
+
+    Two independent tells, either of which is sufficient:
+
+    1. An explicit discriminator flag (``output_tokens_unavailable`` /
+       ``unavailable``) set truthy. This is the contract the claude-bpx bridge
+       egresses, and it survives the OpenAI client as ``model_extra``.
+    2. A PRESENT output counter whose value is a WIRE ``None`` — and no sibling
+       output alias carrying a measured value. A null the provider deliberately
+       wrote is an unknown even without the flag, but a null on the dialect the
+       provider is NOT speaking (``completion_tokens: null`` beside a measured
+       ``output_tokens``) is just an unused field.
+
+    An ABSENT key is NOT an unknown — providers that never speak this dialect
+    (every pre-existing one) must keep normalizing to integers, and a usage
+    object that simply omits ``completion_tokens`` has always meant 0 here.
+    """
+    if response_usage is None:
+        return False
+    return _bucket_is_unknown(response_usage, _OUTPUT_COUNT_KEYS, _OUTPUT_UNKNOWN_FLAGS)
+
+
+def format_token_count(
+    value: Any,
+    *,
+    unknown: bool = False,
+    formatter: Any = None,
+) -> str:
+    """Render a token count for a human, honouring the UNKNOWN state.
+
+    THE UNKNOWN DISPLAY RULE LIVES HERE, not in each renderer. usage.ace, the
+    MacBar and the chat cards are three renderers over one usage record; an
+    unmeasured turn must read the same in all three. An unknown renders
+    ``UNKNOWN_TOKENS_LABEL`` — never ``0``, which is indistinguishable from a
+    measured dead call.
+
+    ``formatter`` lets a caller keep its own magnitude formatting (renderers
+    differ on k/M suffixes) while still routing the unknown case through here.
+    """
+    if unknown:
+        return UNKNOWN_TOKENS_LABEL
+    if formatter is not None:
+        return formatter(value)
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if abs(n) >= 1_000_000:
+        return f"{n // 1_000_000}M" if n % 1_000_000 == 0 else f"{n / 1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n // 1_000}k" if n % 1_000 == 0 else f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def verbose_token_usage_log_args(
+    canonical_usage: Any, prompt_tokens: Any, completion_tokens: Any, total_tokens: Any
+) -> tuple[str, str, str]:
+    """(prompt, completion, total) as rendered for the verbose token-usage log.
+
+    Extracted from ``agent/conversation_loop.py``'s ``verbose_logging`` block so
+    the UNKNOWN routing is callable — and therefore testable — instead of only
+    reachable by re-parsing an 8k-line module's source. This log's own
+    comma-grouped vocabulary is preserved via ``formatter``; only the unknown
+    case goes through the shared rule.
+    """
+    comma = lambda v: f"{int(v or 0):,}"  # noqa: E731 - this log's existing formatting
+    return (
+        format_token_count(
+            prompt_tokens, unknown=prompt_tokens_unknown(canonical_usage), formatter=comma
+        ),
+        format_token_count(
+            completion_tokens,
+            unknown=bool(canonical_usage.output_tokens_unknown)
+            or bool(canonical_usage.usage_unknown),
+            formatter=comma,
+        ),
+        format_token_count(
+            total_tokens, unknown=canonical_usage.total_tokens_unknown, formatter=comma
+        ),
+    )
+
+
+def cache_stats_line(canonical_usage: Any, prompt_tokens: Any) -> Optional[str]:
+    """The console cache-hit line for a turn, or None when there is nothing to say.
+
+    Extracted from ``agent/conversation_loop.py``'s post-call console block.
+    UNKNOWN wins over the hit-rate render: a hit percentage computed from an
+    unmeasured prompt total is a fabricated measurement, so an unknown input
+    reports ``unknown`` and suppresses both the ``% hit`` and ``written`` terms.
+
+    But UNKNOWN only wins where the line would have SPOKEN. The inline code this
+    replaced printed nothing at all when there was no cache activity, and this
+    runs per API CALL — so an unconditional unknown branch adds one noise line
+    per call for any provider that routinely omits ``usage`` (r6 finding 3).
+    The discriminator is ``usage_unknown`` ALONE: it means the call carried NO
+    usage payload at all, so there is no cache-specific fact to report and the
+    turn card already says the turn is unmeasured. Every narrower unknown is
+    still news and still prints ``unknown`` — a present payload that declares
+    its prompt unmeasured, a null cache bucket inside a present container, or
+    measured cache counts beside an unmeasured prompt total. In those cases the
+    percentage that would otherwise print is the fabrication being refused.
+    """
+    cached = canonical_usage.cache_read_tokens
+    written = canonical_usage.cache_write_tokens
+    if _usage_get(canonical_usage, "usage_unknown", False):
+        return None
+    if prompt_tokens_unknown(canonical_usage):
+        return f"💾 Cache: {format_token_count(None, unknown=True)}"
+    if not (cached or written):
+        return None
+    prompt = int(prompt_tokens or 0)
+    hit_pct = (cached / prompt * 100) if prompt > 0 else 0
+    return (
+        f"💾 Cache: {cached:,}/{prompt:,} tokens "
+        f"({hit_pct:.0f}% hit, {written:,} written)"
+    )
+
+
 
 def resolve_billing_route(
     model_name: str,
@@ -2214,6 +2579,97 @@ def normalize_usage(
 
     provider_name = (provider or "").strip().lower()
     mode = (api_mode or "").strip().lower()
+    # UNKNOWN != 0 (see CanonicalUsage.output_tokens_unknown). Computed once,
+    # before the per-shape branches, because the discriminator is shape-agnostic:
+    # it is a property of the usage object, not of which dialect it speaks.
+    output_unknown = _output_is_unknown(response_usage)
+    input_unknown = _bucket_is_unknown(
+        response_usage, ("prompt_tokens", "input_tokens"),
+        ("prompt_tokens_unavailable", "input_tokens_unavailable"),
+    )
+    details_key = "input_tokens_details" if mode == "codex_responses" else "prompt_tokens_details"
+    details = _usage_get(response_usage, details_key, None)
+    # Hoisted above the cache-bucket calls: a top-level cache alias that
+    # arrived as a wire null is only a "no caching on this request" zero when
+    # the rest of the payload really was measured (r6 F4).
+    input_measured = any(
+        _usage_has(response_usage, key) and _usage_get(response_usage, key) is not None
+        for key in ("prompt_tokens", "input_tokens")
+    )
+    output_measured = any(
+        _usage_has(response_usage, key) and _usage_get(response_usage, key) is not None
+        for key in _OUTPUT_COUNT_KEYS
+    )
+    # The CACHE buckets are input-side. `cache_read`/`cache_write` are
+    # components of the prompt, so whether a top-level cache null means "no
+    # caching on this request" is answered by the INPUT side alone. Requiring a
+    # measured OUTPUT too made a payload with a measured prompt, an explicitly
+    # unmeasured output (`completion_tokens: null` + `output_tokens_unavailable`)
+    # and a unified-schema `cache_read_input_tokens: null` mark the cache
+    # UNKNOWN — which ORs into `prompt_tokens_unknown` and
+    # `last_call_prompt_unknown`, so the compressor skipped a real prompt
+    # occupancy update and Blackbox blanked the window numbers, for a call whose
+    # window WAS measured (r6 round-4 finding 9, the claude-bpx parallel-batch
+    # shape). The turn is already correctly unpriceable via
+    # `output_tokens_unknown`; nothing is gained by also losing the prompt.
+    #
+    # This narrows ONLY the top-level-alias case. Both settled contracts are
+    # untouched: a null details CONTAINER is still no-cache-breakdown → measured
+    # zeros, and a null count INSIDE a present container is still UNKNOWN (the
+    # provider is speaking the cache dialect and declined to fill in the
+    # number) — `_cache_bucket_is_unknown` decides those before consulting this.
+    _prompt_side_measured = input_measured and not input_unknown
+    # A null details CONTAINER is not an unknown COUNT. ``"prompt_tokens_details":
+    # null`` is the ordinary serialization of an OpenAI-compatible server that has
+    # no cache breakdown to report (any encoder without ``exclude_none`` emits it,
+    # and pydantic puts the explicitly-null wire field in ``model_fields_set``), so
+    # reading it as "both cache buckets were unmeasured" escalated into
+    # ``input_tokens_unknown`` and made every such turn permanently unpriceable —
+    # with ``prompt_tokens`` measured right beside it. Absent cache detail means
+    # zero cache, exactly as it did before the UNKNOWN work. Only a null on a
+    # counter the provider actually uses (``cached_tokens: null`` inside a PRESENT
+    # container, a null top-level cache field) or an explicit ``cache_*_unavailable``
+    # discriminator is a declaration that the bucket was not measured.
+    cache_read_unknown = _cache_bucket_is_unknown(
+        (
+            (details, ("cached_tokens",)),
+            (response_usage, ("cache_read_input_tokens", "prompt_cache_hit_tokens", "cached_tokens")),
+        ),
+        response_usage,
+        ("cache_read_tokens_unavailable",),
+        container=details,
+        payload_measured=_prompt_side_measured,
+    )
+    cache_write_unknown = _cache_bucket_is_unknown(
+        (
+            (details, ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens")),
+            (response_usage, ("cache_creation_input_tokens", "cache_write_tokens")),
+        ),
+        response_usage,
+        ("cache_write_tokens_unavailable",),
+        container=details,
+        payload_measured=_prompt_side_measured,
+    )
+    if mode != "anthropic_messages" and provider_name != "anthropic":
+        input_unknown = input_unknown or cache_read_unknown or cache_write_unknown
+    # An aggregate count is derivable when BOTH component buckets carry usable
+    # numbers. A wire ``total_tokens: null`` beside measured prompt+completion
+    # is therefore not an unknown total; it is merely an omitted redundant
+    # field. An explicit unavailable flag still wins.
+    aggregate_unavailable = any(
+        bool(_usage_get(response_usage, key, False))
+        or bool(_usage_get(_usage_get(response_usage, "model_extra", {}) or {}, key, False))
+        for key in ("total_tokens_unavailable", "unavailable")
+    )
+    aggregate_null = _bucket_is_unknown(response_usage, ("total_tokens",))
+    usage_unknown = aggregate_unavailable or (
+        aggregate_null and not (input_measured and output_measured)
+    )
+    # Bucket-level discriminators already preserve the unknown state; keep the
+    # aggregate discriminator for the aggregate-only case.
+    usage_unknown = usage_unknown and not (
+        input_unknown or output_unknown or cache_read_unknown or cache_write_unknown
+    )
 
     if mode == "anthropic_messages" or provider_name == "anthropic":
         input_tokens = _usage_count(_usage_get(response_usage, "input_tokens", 0))
@@ -2289,6 +2745,10 @@ def normalize_usage(
         )
         if not cache_write_tokens:
             cache_write_tokens = _usage_count(
+                _usage_get(details, "cache_creation_tokens", 0) if details else 0
+            )
+        if not cache_write_tokens:
+            cache_write_tokens = _usage_count(
                 _usage_get(details, "cache_creation_input_tokens", 0)
                 if details else 0
             )
@@ -2344,6 +2804,11 @@ def normalize_usage(
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        output_tokens_unknown=output_unknown,
+        input_tokens_unknown=input_unknown,
+        cache_read_tokens_unknown=cache_read_unknown,
+        cache_write_tokens_unknown=cache_write_unknown,
+        usage_unknown=usage_unknown,
     )
 
 
@@ -2357,6 +2822,13 @@ def estimate_usage_cost(
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
+        # A subscription route's marginal cost is $0 BY DEFINITION OF THE ROUTE —
+        # it does not depend on token counts, so an unmeasured usage cannot make
+        # it unpriceable. This branch is deliberately ABOVE the unknown-usage
+        # refusal below: refusing here would persist cost_usd NULL for a turn we
+        # already know was free, and ``store.reprice_unpriced`` filters unknown
+        # rows out forever, so the NULL would never heal. Mirrors the ordering
+        # plugins/observability/langfuse/__init__.py already uses.
         return CostResult(
             amount_usd=_ZERO,
             status="included",
@@ -2365,6 +2837,9 @@ def estimate_usage_cost(
             pricing_version="included-route",
             notes=(_INCLUDED_NOTE,),
         )
+    if usage.total_tokens_unknown:
+        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a",
+                          notes=("usage unavailable from provider; turn is unpriceable",))
 
     entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
     if not entry:
@@ -2393,6 +2868,7 @@ def estimate_usage_cost(
 
     if usage.input_tokens and input_rate is None:
         return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
+
     if usage.output_tokens and output_rate is None:
         return CostResult(amount_usd=None, status="unknown", source=entry.source, label="n/a")
     if usage.cache_read_tokens:
@@ -2484,6 +2960,74 @@ def estimate_usage_cost(
         cost_cache_read_usd=cost_cache_read,
         cost_cache_write_usd=cost_cache_write,
     )
+
+
+def measured_cost_floor(
+    model_name: str,
+    usage: CanonicalUsage,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[Decimal]:
+    """A LOWER BOUND on what this call bills, priced from the MEASURED buckets only.
+
+    ``estimate_usage_cost`` refuses any usage with ``total_tokens_unknown`` and
+    that refusal is correct and settled: a total missing a term is not a total,
+    and a partial number must never be persisted or displayed as the turn's
+    cost. This is deliberately NOT that number. It is a floor, for decisions —
+    "is one attempt already over the ceiling?" — and it is never persisted,
+    never rendered, and never fed back into ``cost_status``.
+
+    Why it has to exist (r6 round-4 finding 3). The deterministic-empty guard
+    correctly stopped classifying a declared-unmeasured output as a measured
+    zero, but the cost-aware guard beside it was ALREADY inert for the same
+    payloads: it asks ``estimate_usage_cost``, gets ``None``, and falls back to
+    the full 3-retry budget. So a bridge that declares only its OUTPUT
+    unmeasured (``completion_tokens: null`` + ``output_tokens_unavailable``,
+    prompt fully measured) lost both protections at once, and every unsignaled
+    empty re-sent the whole prompt three times — the exact "charged ~$2.33 for
+    an empty answer" incident class ``agent/empty_response_guard.py`` exists to
+    prevent, except now at whatever the prompt actually costs.
+
+    The data is right there: the INPUT buckets are measured in that payload,
+    and input is what an empty attempt actually bills. Pricing what is known
+    and omitting what is not gives a number that is wrong only in the safe
+    direction — it can never exceed the real bill, so a ceiling that trips on
+    it cannot trip early.
+
+    Returns ``None`` when nothing can be priced: no measured bucket, no pricing
+    entry, or a rate missing for a measured bucket. A subscription-included
+    route floors at ``0`` — its marginal cost is $0 by definition of the route.
+    """
+    zeroed = CanonicalUsage(
+        input_tokens=0 if usage.input_tokens_unknown or usage.usage_unknown else usage.input_tokens,
+        output_tokens=(
+            0 if usage.output_tokens_unknown or usage.usage_unknown else usage.output_tokens
+        ),
+        cache_read_tokens=(
+            0
+            if usage.cache_read_tokens_unknown or usage.usage_unknown
+            else usage.cache_read_tokens
+        ),
+        cache_write_tokens=(
+            0
+            if usage.cache_write_tokens_unknown or usage.usage_unknown
+            else usage.cache_write_tokens
+        ),
+        reasoning_tokens=usage.reasoning_tokens,
+        request_count=usage.request_count,
+    )
+    if zeroed.total_tokens <= 0:
+        # Nothing measured survived; there is no floor to state. (A genuinely
+        # all-zero MEASURED usage does not reach here — it has no unknown flag,
+        # so estimate_usage_cost prices it directly.)
+        route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+        return _ZERO if route.billing_mode == "subscription_included" else None
+    result = estimate_usage_cost(
+        model_name, zeroed, provider=provider, base_url=base_url, api_key=api_key
+    )
+    return result.amount_usd
 
 
 def has_known_pricing(

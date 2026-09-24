@@ -851,6 +851,15 @@ class AIAgent:
         self.session_cache_write_tokens = 0
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
+        # ABSORBING per-bucket unknown latch over the cumulative counters above
+        # (set beside the increments in agent/conversation_loop.py). It must be
+        # cleared HERE with them: a new/branched/resumed session's totals start
+        # at zero and are fully measured until proven otherwise — carrying the
+        # old session's latch forward would render the fresh totals `unknown`.
+        from agent.usage_pricing import USAGE_UNKNOWN_FIELDS as _USAGE_UNKNOWN_FIELDS
+
+        for _usage_flag in _USAGE_UNKNOWN_FIELDS:
+            setattr(self, f"session_{_usage_flag}", False)
         # Snapshot of the most recent successful provider call, normalized into
         # Hermes' canonical usage shape. Session counters above are cumulative;
         # this per-call record lets status/usage surfaces show the last turn's
@@ -1213,8 +1222,9 @@ class AIAgent:
           description, which the "⏳ Working — N min" heartbeat includes.
 
         Never raises — a wait notice must not break the API-call wait loop.
+        A wait notice is liveness, not progress (``progress=False``).
         """
-        self._touch_activity(text)
+        self._touch_activity(text, progress=False)
         _thinking_cb = getattr(self, "thinking_callback", None)
         if _thinking_cb:
             try:
@@ -4471,8 +4481,14 @@ class AIAgent:
         *,
         provenance: Optional[ActivityProvenance] = None,
         force_persist: bool = False,
+        progress: bool = True,
     ) -> None:
         """Update the last-activity timestamp and description (thread-safe).
+
+        ``progress=False`` marks a pure wait ticker (e.g. "still waiting on
+        the provider"): it refreshes liveness but not ``_last_progress_ts``,
+        which the kanban stall detector reads to tell a live wrapper from a
+        progressing loop (t_7d034e3b).
 
         Also bridges to the kanban board's heartbeat fields when this
         process is a dispatcher-spawned worker (HERMES_KANBAN_TASK set),
@@ -4498,6 +4514,8 @@ class AIAgent:
         )
 
         self._last_activity_ts = time.time()
+        if progress:
+            self._last_progress_ts = self._last_activity_ts
         self._last_activity_desc = bound_activity_description(desc)
         self._last_activity_provenance = normalize_activity_provenance(provenance)
         if os.environ.get("HERMES_KANBAN_TASK"):
@@ -4506,7 +4524,9 @@ class AIAgent:
                     heartbeat_current_worker_from_env,
                     inject_new_comments_from_env,
                 )
-                heartbeat_current_worker_from_env()
+                heartbeat_current_worker_from_env(
+                    progress_at=getattr(self, "_last_progress_ts", None),
+                )
                 # Fold any new operator notes into the running turn (OUT-OF-BAND
                 # steer) so the user can talk to a live task without a restart.
                 inject_new_comments_from_env(self)

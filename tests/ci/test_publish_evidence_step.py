@@ -1374,6 +1374,20 @@ def _extension_gh(tmp_path: Path, *, served_bytes: str | None = None,
              cp {q_payload} "$out"
              exit 0 ;;
           *"extension install"*)
+             # Mirror real gh (measured 2026-09-23, gh 2.87.3): ONLY "." is a
+             # local-directory install; any other argument -- an absolute
+             # path included -- is parsed as [HOST/]OWNER/REPO and rejected.
+             # The previous stub accepted anything, which is how
+             # `gh extension install "$ext_dir"` shipped green and failed
+             # every live publish on a runner without a cached install.
+             if [ "${{3:-}}" != "." ]; then
+               echo "expected the \"[HOST/]OWNER/REPO\" format, got \"${{3:-}}\"" >&2
+               exit 1
+             fi
+             if [ ! -x ./gh-image ]; then
+               echo "extension directory has no executable gh-image" >&2
+               exit 1
+             fi
              touch {q_installed}; exit 0 ;;
         esac
         {textwrap.dedent(rest)}

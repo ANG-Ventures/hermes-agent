@@ -141,3 +141,89 @@ def test_read_text_piped_to_os_system_is_executable(tmp_path):
     body = f"from pathlib import Path\nimport os\nos.system(Path('{data}').read_text())\n"
     heredoc, _ = _forms(tmp_path, body)
     assert guard(heredoc, cwd=str(tmp_path))
+
+
+def test_shell_heredoc_owner_not_following_python(tmp_path):
+    script = tmp_path / "action.sh"
+    script.write_text("hermes gateway " + "restart\n")
+    shell = f"bash <<'EOF'; python3 -V\nsh -c '{script}'\nEOF"
+    document = "cat <<'EOF' > notes.md; python3 -V\nhermes gateway " + "restart\nEOF"
+    assert guard(shell, cwd=str(tmp_path))
+    assert not guard(document, cwd=str(tmp_path))
+
+
+def test_read_only_loop_rebound_parser_must_not_hide_log(tmp_path):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    loop = (
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    try: d=json.loads(line)\n"
+        "    except: continue\n"
+        "    print(d)\n"
+    )
+    ordinary, _ = _forms(tmp_path, "import json\n" + loop)
+    rebound, _ = _forms(tmp_path, "import json\njson.loads = print\n" + loop)
+    assert not guard(ordinary, cwd=str(tmp_path))
+    assert guard(rebound, cwd=str(tmp_path))
+
+
+def test_read_only_loop_parser_variable_name_is_irrelevant(tmp_path):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = (
+        "import json\n"
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    try: rec=json.loads(line)\n"
+        "    except: continue\n"
+        "    if rec.get('type')!='intake': continue\n"
+        "    print(rec['repo'].lower())\n"
+    )
+    heredoc, file_command = _forms(tmp_path, body)
+    assert not guard(file_command, cwd=str(tmp_path))
+    assert not guard(heredoc, cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("prefix,inside", [
+    ("json.loads = print\n", "    print(d)\n"),
+    ("setattr(json, 'loads', print)\n", "    print(d)\n"),
+    ("print = len\n", "    print(line)\n"),
+    ("len = print\n", "    len(line)\n"),
+    ("reversed = print\n", "    print(d)\n"),
+    ("open = print\n", "    print(d)\n"),
+    ("seen = type('Reader', (), {'add': print})()\n", "    seen.add(line)\n"),
+    ("out = type('Reader', (), {'append': print})()\n", "    out.append(line)\n"),
+    ("", "    d = type('Reader', (), {'get': print})()\n    d.get(line)\n"),
+])
+def test_read_only_exemption_refuses_rebound_callables(tmp_path, prefix, inside):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = (
+        "import json\n" + prefix
+        + f"for line in reversed(open('{log}').read().splitlines()):\n"
+        + "    d=json.loads(line)\n" + inside
+    )
+    heredoc, _ = _forms(tmp_path, body)
+    assert guard(heredoc, cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("binding,nested", [
+    ("match J():\n    case json: pass\n", False),
+    ("match [J()]:\n    case [*json]: pass\n", False),
+    ("match {'item': J()}:\n    case {**json}: pass\n", False),
+    ("try: raise J()\nexcept J as json:\n", True),
+    ("async def json(): pass\n", False),
+])
+def test_read_only_exemption_refuses_non_name_trusted_bindings(tmp_path, binding, nested):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    loop = (
+        f"for line in reversed(open('{log}').read().splitlines()):\n"
+        "    d=json.loads(line)\n"
+        "    print(d)\n"
+    )
+    ordinary, _ = _forms(tmp_path, "import json\n" + loop)
+    unsafe = "import json, os\nclass J(Exception):\n    loads=staticmethod(os.system)\n" + binding
+    unsafe += "".join("    " + line for line in loop.splitlines(keepends=True)) if nested else loop
+    rebound, _ = _forms(tmp_path, unsafe)
+    assert not guard(ordinary, cwd=str(tmp_path))
+    assert guard(rebound, cwd=str(tmp_path))

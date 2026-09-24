@@ -54,6 +54,11 @@ def _seed(store, turn_id, provider, model, i=0, o=0, cr=0, cw=0, **cost_cols):
         cost_cache_read_usd=cost_cols.get("cost_cache_read_usd"),
         cost_cache_write_usd=cost_cols.get("cost_cache_write_usd"),
         cost_output_usd=cost_cols.get("cost_output_usd"),
+        output_tokens_unknown=bool(cost_cols.get("output_tokens_unknown")),
+        input_tokens_unknown=bool(cost_cols.get("input_tokens_unknown")),
+        cache_read_tokens_unknown=bool(cost_cols.get("cache_read_tokens_unknown")),
+        cache_write_tokens_unknown=bool(cost_cols.get("cache_write_tokens_unknown")),
+        usage_unknown=bool(cost_cols.get("usage_unknown")),
     )
     store.insert_turn(rec)
 
@@ -82,6 +87,50 @@ def test_genuinely_unknown_real_token_row_stays_null(store, real_pricing_fn):
     res = store.reprice_unpriced(real_pricing_fn, apply=True)
     assert res["still_unknown"] == 1 and res["repriced"] == 0
     assert store.get_turn("u1")["cost_usd"] is None
+
+
+def test_unknown_discriminator_is_scanned_and_reported_unresolved(store, real_pricing_fn):
+    _seed(
+        store,
+        "u-flag",
+        "anthropic",
+        "claude-sonnet-4-5",
+        i=100,
+        output_tokens_unknown=True,
+    )
+    res = store.reprice_unpriced(real_pricing_fn, apply=True)
+    assert res == {"scanned": 1, "repriced": 0, "zeroed": 0, "still_unknown": 1}
+    assert store.get_turn("u-flag")["cost_usd"] is None
+
+
+def test_unknown_discriminator_on_included_route_heals_to_zero(
+    store, real_pricing_fn, monkeypatch
+):
+    from agent.usage_pricing import BillingRoute
+
+    monkeypatch.setattr(
+        store,
+        "resolve_billing_route",
+        lambda *a, **k: BillingRoute(
+            provider="flat-plan",
+            model="included-model",
+            base_url="",
+            billing_mode="subscription_included",
+        ),
+    )
+    _seed(
+        store,
+        "u-included",
+        "flat-plan",
+        "included-model",
+        i=100,
+        output_tokens_unknown=True,
+    )
+    res = store.reprice_unpriced(real_pricing_fn, apply=True)
+    assert res == {"scanned": 1, "repriced": 1, "zeroed": 0, "still_unknown": 0}
+    row = store.get_turn("u-included")
+    assert row["cost_usd"] == 0.0
+    assert row["cost_status"] == "included"
 
 
 def test_live_catalog_route_left_null_route_purity(store, real_pricing_fn):

@@ -11,7 +11,7 @@ from plugins.blackbox.record import TurnRecord, tools_summary, turn_output_split
 _PT = ZoneInfo("America/Los_Angeles")
 
 
-def humanize_tokens(value: int | float | None) -> str:
+def _humanize_magnitude(value: int | float | None) -> str:
     try:
         n = int(value or 0)
     except (TypeError, ValueError):
@@ -19,6 +19,19 @@ def humanize_tokens(value: int | float | None) -> str:
     if abs(n) >= 1_000:
         return f"{n // 1_000}k" if n % 1_000 == 0 else f"{n / 1_000:.1f}k"
     return str(n)
+
+
+def humanize_tokens(value: int | float | None, *, unknown: bool = False) -> str:
+    """Render a token count. Delegates the UNKNOWN rule to the shared lib.
+
+    The unknown spelling lives in agent.usage_pricing.format_token_count so
+    usage.ace, the MacBar and the chat cards — three renderers over one usage
+    record — can never disagree about how an unmeasured turn reads. This
+    renderer's own k-suffix magnitude formatting is unchanged.
+    """
+    from agent.usage_pricing import format_token_count
+
+    return format_token_count(value, unknown=unknown, formatter=_humanize_magnitude)
 
 
 def _money(value: float | None) -> str:
@@ -84,8 +97,21 @@ def _session_line(platform: str, chat_id: str, chat_name: str) -> str:
 
 
 def _context_line(record: TurnRecord) -> str:
+    from agent.usage_pricing import last_call_prompt_unknown
+
     used = int(record.context_used or 0)
     length = int(record.context_length or 0)
+    # `context_used` is the FINAL call's provider prompt count
+    # (agent/turn_finalizer.py:944 reads context_compressor.last_prompt_tokens).
+    # When THAT call returned no usage payload the stored value is a
+    # placeholder, so dividing it by the window fabricates a measurement —
+    # `• Context: 0/200k 🟢 (0% of model max)` for exactly the turns the
+    # provider declined to measure. Same gate `last_turn.py` renders this record
+    # through, via the one shared callable, so the two renderers over one record
+    # cannot disagree (r6 round-4 finding 6).
+    if last_call_prompt_unknown(record):
+        suffix = f"/{humanize_tokens(length)}" if length > 0 else ""
+        return f"{humanize_tokens(0, unknown=True)}{suffix}"
     if length <= 0:
         return humanize_tokens(used)
     pct = used / length * 100
@@ -104,6 +130,11 @@ def _tokens_out_line(record: TurnRecord) -> str:
     per-call split is unknown (old/NULL/blackbox-off blob).
     """
     import json as _json
+    # UNKNOWN != 0: the provider never measured this turn's output. The stored
+    # 0 is absence of data, so neither the total nor a finished/unfinished split
+    # derived from it may be shown as a measurement.
+    if record.output_tokens_unknown or record.usage_unknown:
+        return f"{humanize_tokens(0, unknown=True)} out"
     out = int(record.output_tokens or 0)
     raw = getattr(record, "comp_calls_json", None)
     calls = None
@@ -119,6 +150,11 @@ def _tokens_out_line(record: TurnRecord) -> str:
             f"({humanize_tokens(finished)} finished + {humanize_tokens(unfinished)} unfinished)"
         )
     return f"{humanize_tokens(out)} out"
+
+
+def _tokens_in_label(record: TurnRecord) -> str:
+    from agent.usage_pricing import prompt_tokens_unknown
+    return humanize_tokens(_prompt_total(record), unknown=prompt_tokens_unknown(record))
 
 
 def _prompt_total(record: TurnRecord) -> int:
@@ -138,6 +174,9 @@ def _prompt_total(record: TurnRecord) -> int:
 
 
 def _cache_line(record: TurnRecord) -> str:
+    from agent.usage_pricing import prompt_tokens_unknown
+    if prompt_tokens_unknown(record):
+        return humanize_tokens(0, unknown=True)
     cache_read = int(record.cache_read_tokens or 0)
     # Cache hit rate = fraction of the full prompt served from cache. The
     # denominator is the TOTAL prompt (fresh input + cache read + cache write),
@@ -166,7 +205,7 @@ def render_card(record: TurnRecord, threshold_usd: float) -> str:
             f"• Threshold: {_money(threshold_usd)}",
             f"• API Calls: {record.api_calls}",
             f"• Tool Calls: {len(record.tools)} ({tools_summary(record.tools)})",
-            f"• Tokens: {humanize_tokens(_prompt_total(record))} in + {_tokens_out_line(record)}",
+            f"• Tokens: {_tokens_in_label(record)} in + {_tokens_out_line(record)}",
             f"• Context: {_context_line(record)}",
             f"• Cached: {_cache_line(record)}",
             f"• Agent: {record.profile}",

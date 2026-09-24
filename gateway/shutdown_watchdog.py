@@ -595,7 +595,7 @@ def arm_shutdown_watchdog(
     exit_code: int = 1,
     dump_path: Optional[Path] = None,
     name: str = "gateway-shutdown-watchdog",
-) -> threading.Event:
+) -> Optional[threading.Event]:
     """Arm a daemon-thread hard-exit backstop for a wedged shutdown path.
 
     If ``done_event`` is set before ``delay_s`` elapses, the thread exits
@@ -604,6 +604,25 @@ def arm_shutdown_watchdog(
 
     Never raises. Returns the ``done_event`` (creating one when omitted) so
     the caller can disarm on successful completion.
+
+    🔴 Returns ``None`` when no backstop was armed, i.e. the thread start
+    itself failed. ``threading.Thread.start`` raises ``RuntimeError: can't
+    start new thread`` under thread/FD exhaustion or memory pressure —
+    exactly the wedged-shutdown condition the watchdog exists for — and
+    returning the ``done`` event regardless made that indistinguishable from
+    success. A caller that REPLACES a live watchdog (see
+    ``gateway.run._rearm_shutdown_watchdog``) then retires the running
+    backstop in favour of a thread that does not exist, leaving the shutdown
+    with no hard-exit at all: no dump, no ``mark_exited`` ledger entry, and
+    no ordered PID-file / runtime-lock release before launchd's SIGKILL.
+    Returning ``None`` is the only signal a never-raises API can give, so
+    every replace-style caller MUST check it. Callers that merely ADD a
+    backstop can keep ignoring the return: they already hold the event they
+    passed in, and a ``None`` there means only that the optional backstop is
+    absent, which is the pre-existing behaviour.
+
+    The deliberate ``delay_s <= 0`` disable still returns the event: nothing
+    was armed, but nothing was asked for either, so it is not a failure.
     """
     done = done_event if done_event is not None else threading.Event()
     try:
@@ -677,7 +696,12 @@ def arm_shutdown_watchdog(
     try:
         threading.Thread(target=_watchdog, daemon=True, name=name).start()
     except Exception:
-        logger.debug("Failed to arm shutdown watchdog", exc_info=True)
+        # Signal the failure to the caller. `logger.debug` alone left a
+        # replace-style caller (the stop-path re-arm) unable to distinguish
+        # "armed" from "no thread exists", so it retired the live backstop in
+        # favour of nothing. This API never raises, so None IS the signal.
+        logger.warning("Failed to arm shutdown watchdog", exc_info=True)
+        return None
     return done
 
 

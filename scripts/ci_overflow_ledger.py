@@ -6,14 +6,21 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 import time
 
-from scripts.ci_overflow_plan import ARM, POOL, X64, JobPlacement, Plan
+from scripts.ci_overflow_plan import ARM, POOL, X64, JobPlacement, Plan, _object_pairs
 
 BRANCH = "ci-overflow-ledger"
 PATH = "state.json"
 SOFT_LIMIT = 400 * 1024
 HARD_LIMIT = 500 * 1024
+# Exact persisted shapes: a missing OR extra key is corruption, never a default.
+STATE_FIELDS = {"version", "attempts", "daily_totals"}
+ROW_FIELDS = {"admitted_on", "terminal_on", "jobs", "plan"}
+PLAN_FIELDS = {"jobs", "incidents", "summary"}
+JOB_FIELDS = {"job_id", "labels", "reserved_minutes", "reason", "released_unemitted"}
+RECEIPT = "release_receipt_sha256"
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,66 @@ def _plan(raw):
     return Plan([JobPlacement(**item) for item in raw["jobs"]], raw["incidents"], raw["summary"])
 
 
+def _date(value, today):
+    if type(value) is not str or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("corrupt ledger date")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("corrupt ledger date") from exc
+    if parsed.isoformat() != value or value > today:
+        raise ValueError("corrupt ledger date")
+
+
+def _validate(state, today):
+    for day, total in state["daily_totals"].items():
+        _date(day, today)
+        if type(total) is not int or total < 0:
+            raise ValueError("corrupt ledger total")
+    for ident, row in state["attempts"].items():
+        if (type(ident) is not str or not re.fullmatch(r"[1-9]\d*:[1-9]\d*:[1-9]\d*", ident)
+                or type(row) is not dict):
+            raise ValueError("corrupt admission")
+        if set(row) != ROW_FIELDS:
+            raise ValueError("corrupt admission fields")
+        _date(row["admitted_on"], today)
+        terminal = row["terminal_on"]
+        if terminal is not None:
+            _date(terminal, today)
+            if terminal < row["admitted_on"]:
+                raise ValueError("corrupt admission")
+        jobs = row.get("jobs")
+        raw = row.get("plan")
+        if (type(jobs) is not list or len(jobs) > 18 or type(raw) is not dict or set(raw) != PLAN_FIELDS
+                or type(raw.get("jobs")) is not list or type(raw.get("incidents")) is not list
+                or type(raw.get("summary")) is not dict or len(raw["jobs"]) != len(jobs)):
+            raise ValueError("corrupt admission")
+        seen = set()
+        for job, planned in zip(jobs, raw["jobs"]):
+            if type(job) is not dict or type(planned) is not dict:
+                raise ValueError("corrupt job")
+            if set(job) != JOB_FIELDS | ({RECEIPT} if job.get("released_unemitted") is True else set()):
+                raise ValueError("corrupt job fields")
+            name, labels, charge = job.get("job_id"), job.get("labels"), job.get("reserved_minutes")
+            if (type(name) is not str or not name or name in seen
+                    or set(planned) != {"job_id", "labels", "reserved_minutes", "reason"}
+                    or type(labels) is not list or labels not in (POOL, X64, ARM)
+                    or type(charge) is not int or charge < 0
+                    or charge != (0 if labels == POOL else 20 if name == "e2e" else 35)
+                    or type(job.get("reason")) is not str
+                    or type(job.get("released_unemitted")) is not bool
+                    or any(job.get(field) != planned.get(field) for field in
+                           ("job_id", "labels", "reserved_minutes", "reason"))
+                    or job["released_unemitted"] and
+                    (terminal is None or type(job.get("release_receipt_sha256")) is not str
+                     or not re.fullmatch(r"[0-9a-f]{64}", job["release_receipt_sha256"]))):
+                raise ValueError("corrupt job")
+            seen.add(name)
+        if (any(type(x) is not str for x in raw["incidents"])
+                or type(raw["summary"].get("mode")) is not str):
+            raise ValueError("corrupt plan")
+
+
 class Ledger:
     def __init__(self, api, *, daily_limit=0, clock=None):
         self.api = api
@@ -57,14 +124,18 @@ class Ledger:
         response = self.api.get(PATH, params={"ref": BRANCH})
         if not isinstance(response, dict) or not isinstance(response.get("sha"), str) or response.get("encoding") != "base64":
             raise ValueError("invalid Contents response")
-        data = json.loads(base64.b64decode(response["content"], validate=True))
-        if (type(data) is not dict or data.get("version") != 1 or type(data.get("attempts")) is not dict
+        content = response.get("content")
+        if not isinstance(content, str):
+            raise ValueError("invalid Contents response")
+        # GitHub wraps Contents base64 at 60 columns with "\n"; drop only that whitespace,
+        # then decode strictly so any other non-alphabet byte still fails closed.
+        # Duplicate keys are refused: last-wins parsing could hide a recorded charge.
+        data = json.loads(base64.b64decode("".join(content.split()), validate=True), object_pairs_hook=_object_pairs)
+        if (type(data) is not dict or set(data) != STATE_FIELDS or type(data["version"]) is not int
+                or data["version"] != 1 or type(data.get("attempts")) is not dict
                 or type(data.get("daily_totals")) is not dict):
             raise ValueError("corrupt ledger")
-        for row in data["attempts"].values():
-            if (type(row) is not dict or type(row.get("admitted_on")) is not str or
-                    type(row.get("jobs")) is not list or "terminal_on" not in row):
-                raise ValueError("corrupt admission")
+        _validate(data, self._today())
         return data, response["sha"]
 
     def _write(self, state, sha):
@@ -79,7 +150,7 @@ class Ledger:
 
     @staticmethod
     def _consumed(state, day):
-        consumed = int(state["daily_totals"].get(day, 0))
+        consumed = state["daily_totals"].get(day, 0)
         for record in state["attempts"].values():
             admitted = record["admitted_on"]
             if admitted > day:

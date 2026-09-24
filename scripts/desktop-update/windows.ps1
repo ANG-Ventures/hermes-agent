@@ -1145,7 +1145,17 @@ if ($SelfTestUi) {
     $hold = 6
     if ($env:HERMES_SELFTEST_HOLD_SECONDS) { $hold = [int]$env:HERMES_SELFTEST_HOLD_SECONDS }
     Publish-UiProgress "Testing quiet update"
-    Start-Sleep -Seconds $hold
+    if ($env:HERMES_SELFTEST_RELEASE_FILE) {
+        # Let the integration test decide when its samples are complete;
+        # a fixed hold can expire while a loaded runner is descheduled.
+        $releaseDeadline = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath $env:HERMES_SELFTEST_RELEASE_FILE)) {
+            if ($releaseDeadline.Elapsed.TotalSeconds -ge 120) { throw "self-test release timed out" }
+            Start-Sleep -Milliseconds 100
+        }
+    } else {
+        Start-Sleep -Seconds $hold
+    }
     if ($env:HERMES_SELFTEST_FAIL) {
         Show-ErrorFinale "self-test error state"
     } else {

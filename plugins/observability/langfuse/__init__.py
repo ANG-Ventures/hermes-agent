@@ -760,6 +760,42 @@ def _serialize_assistant_message(message: Any) -> dict[str, Any]:
     }
 
 
+def _unknown_usage_details(canonical: Any) -> dict[str, bool]:
+    """Which Langfuse usage keys are OMITTED because they were never measured.
+
+    UNKNOWN != 0. A provider can declare a token term UNMEASURED (a null count
+    plus a discriminator — see ``CanonicalUsage`` / ``USAGE_UNKNOWN_FIELDS``).
+    ``_canonical_usage_and_cost`` leaves such a term OUT of ``usage_details``
+    rather than exporting the placeholder ``0``, which Langfuse could not tell
+    from a real zero. This is the explicit companion flag: it names each key the
+    export dropped and why, so "we did not measure this" is distinguishable from
+    "this key was never part of the payload". It rides on the observation's
+    METADATA, because ``usage_details`` is an int-valued map on the wire and
+    cannot carry a nested flag.
+
+    Single-sourced so the omission and its declaration cannot drift apart.
+    """
+    try:
+        from agent.usage_pricing import USAGE_UNKNOWN_FIELDS
+
+        flags = {
+            key: bool(getattr(canonical, key, False)) for key in USAGE_UNKNOWN_FIELDS
+        }
+    except Exception:  # pragma: no cover - fail-open to legacy behaviour
+        return {}
+    every = bool(flags.get("usage_unknown"))
+    details: Dict[str, bool] = {}
+    if every or flags.get("input_tokens_unknown"):
+        details["input"] = True
+    if every or flags.get("output_tokens_unknown"):
+        details["output"] = True
+    if every or flags.get("cache_read_tokens_unknown"):
+        details["cache_read_input_tokens"] = True
+    if every or flags.get("cache_write_tokens_unknown"):
+        details["cache_creation_input_tokens"] = True
+    return details
+
+
 def _canonical_usage_and_cost(
     canonical: Any,
     *,
@@ -767,19 +803,37 @@ def _canonical_usage_and_cost(
     model: str,
     base_url: str,
 ) -> tuple[dict[str, int], dict[str, float]]:
-    """Translate canonical Hermes usage into Langfuse usage and cost maps."""
-    usage_details: Dict[str, int] = {
-        "input": canonical.input_tokens,
-        "output": canonical.output_tokens,
-    }
-    if canonical.cache_read_tokens:
+    """Translate canonical Hermes usage into Langfuse usage and cost maps.
+
+    UNKNOWN != 0: a term the provider never measured is OMITTED here (absent,
+    never ``0``) and declared via :func:`_unknown_usage_details`, which the
+    caller attaches to the observation's metadata.
+    """
+    unknown_details = _unknown_usage_details(canonical)
+
+    usage_details: Dict[str, int] = {}
+    if "input" not in unknown_details:
+        usage_details["input"] = canonical.input_tokens
+    if "output" not in unknown_details:
+        usage_details["output"] = canonical.output_tokens
+    if "cache_read_input_tokens" not in unknown_details and canonical.cache_read_tokens:
         usage_details["cache_read_input_tokens"] = canonical.cache_read_tokens
-    if canonical.cache_write_tokens:
+    if (
+        "cache_creation_input_tokens" not in unknown_details
+        and canonical.cache_write_tokens
+    ):
         usage_details["cache_creation_input_tokens"] = canonical.cache_write_tokens
     if canonical.reasoning_tokens:
         usage_details["reasoning_tokens"] = canonical.reasoning_tokens
 
     cost_details: Dict[str, float] = {}
+    if unknown_details:
+        # An unmeasured term makes the request total unpriceable. Emitting a
+        # partial cost map here is worse than emitting none: Langfuse would
+        # treat the subtotal as authoritative. estimate_usage_cost already
+        # refuses these turns; return early so the per-type breakdown below
+        # cannot reintroduce a component price for the measured half.
+        return usage_details, cost_details
     try:
         from agent.usage_pricing import estimate_usage_cost, resolve_billing_route
 
@@ -1446,6 +1500,14 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
             model=model,
             base_url=base_url,
         )
+        try:
+            from agent.usage_pricing import normalize_usage
+
+            unknown_details = _unknown_usage_details(
+                normalize_usage(response.usage, provider=provider, api_mode=api_mode)
+            )
+        except Exception:  # pragma: no cover - fail-open
+            unknown_details = {}
     elif isinstance(usage, dict) and usage:
         # post_api_request passes a pre-built CanonicalUsage summary dict.
         _input = usage.get("input_tokens", 0)
@@ -1454,7 +1516,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         _cache_write = usage.get("cache_write_tokens", 0)
         _reasoning = usage.get("reasoning_tokens", 0)
         try:
-            from agent.usage_pricing import CanonicalUsage
+            from agent.usage_pricing import USAGE_UNKNOWN_FIELDS, CanonicalUsage
 
             _cu = CanonicalUsage(
                 input_tokens=_input,
@@ -1463,6 +1525,13 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                 cache_write_tokens=_cache_write,
                 reasoning_tokens=_reasoning,
                 request_count=usage.get("request_count", 1),
+                # UNKNOWN != 0. Reconstructing from the summary dict with
+                # numeric fields ONLY was a second flag-loss site: the ints are
+                # 0 placeholders and, without these, the export could not tell
+                # them from measured zeros.
+                **{
+                    key: bool(usage.get(key, False)) for key in USAGE_UNKNOWN_FIELDS
+                },
             )
             usage_details, cost_details = _canonical_usage_and_cost(
                 _cu,
@@ -1470,13 +1539,20 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                 model=model,
                 base_url=base_url,
             )
+            unknown_details = _unknown_usage_details(_cu)
         except Exception:
-            usage_details, cost_details = {}, {}
+            usage_details, cost_details, unknown_details = {}, {}, {}
     else:
-        usage_details, cost_details = {}, {}
+        usage_details, cost_details, unknown_details = {}, {}, {}
 
     tool_count = len(output.get("tool_calls", [])) or assistant_tool_call_count
     gen_metadata: Dict[str, Any] = {"tool_call_count": tool_count}
+    if unknown_details:
+        # The explicit flag the omission requires. usage_details is an
+        # int-valued map on the wire, so the discriminator rides here — a
+        # consumer seeing a missing `input` key can look up WHY instead of
+        # inferring "not reported" or, worse, reading an absent term as 0.
+        gen_metadata["usage_unknown"] = dict(unknown_details)
     if api_duration and api_duration > 0:
         gen_metadata["api_duration_s"] = round(api_duration, 3)
     if finish_reason:

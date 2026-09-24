@@ -1099,6 +1099,9 @@ def init_agent(
     # agent was doing when it was killed, and by the "still working"
     # notifications to show progress.
     agent._last_activity_ts: float = time.time()
+    # Last REAL progress (API call, stream chunk, tool call) — wait tickers
+    # refresh _last_activity_ts only. Read by the kanban stall detector.
+    agent._last_progress_ts: float = agent._last_activity_ts
     agent._last_activity_desc: str = "initializing"
     # Default / unmigrated paths and _touch_activity stamp unknown; named
     # provenances are stamped by compression writers (heartbeat / timeout / cooldown).
@@ -3093,6 +3096,17 @@ def init_agent(
     agent.session_cache_read_tokens = 0
     agent.session_cache_write_tokens = 0
     agent.session_reasoning_tokens = 0
+    # ABSORBING per-bucket unknown latch for the five cumulative counters
+    # above. They are plain ints — an unmeasured call adds the canonical 0 and
+    # leaves no trace — so a session-total consumer has no other way to know
+    # the aggregate is missing a measurement. Set (never cleared) beside the
+    # increments in `agent/conversation_loop.py`; reset with the counters in
+    # `AIAgent.reset_session_state`. Per-bucket rather than one boolean
+    # because narrow readers gate on individual buckets.
+    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS as _USAGE_UNKNOWN_FIELDS
+
+    for _usage_flag in _USAGE_UNKNOWN_FIELDS:
+        setattr(agent, f"session_{_usage_flag}", False)
     # Per-call snapshot for the most recent successful provider response.
     # Cumulative session_* counters are still the source of truth for totals.
     agent.last_turn_usage = None

@@ -1501,7 +1501,9 @@ def direct_api_call(agent, api_kwargs: dict):
         # ticker only refreshes the activity clock.
         while not activity_hb_stop.wait(_DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS):
             try:
-                agent._touch_activity("waiting for non-streaming API response")
+                agent._touch_activity(
+                    "waiting for non-streaming API response", progress=False,
+                )
             except Exception:
                 pass
 

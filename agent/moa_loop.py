@@ -20,6 +20,7 @@ from typing import Any
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
 from agent.transports import get_transport
+from agent.usage_pricing import USAGE_UNKNOWN_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -599,7 +600,16 @@ def _run_reference(
             extra_headers=extra_headers,
             **runtime,
         )
-        usage = CanonicalUsage()
+        # UNKNOWN != 0 on the advisor lane too. A successful advisor call that
+        # carried no usage payload (or whose payload failed to normalize) has
+        # every bucket unmeasured — exactly the case
+        # ``conversation_loop._canonical_usage_from_response`` routes through
+        # ``fully_unknown()``. A bare ``CanonicalUsage()`` sets no
+        # discriminator, so moa_loop's pricing-call dict rides out all-False,
+        # ``estimate_usage_cost`` prices the advisor at a confident $0 instead
+        # of refusing, and the advisor's real spend silently vanishes from the
+        # session total (r6 finding 5).
+        usage = CanonicalUsage.fully_unknown()
         raw_usage = getattr(response, "usage", None)
         if raw_usage:
             try:
@@ -609,7 +619,7 @@ def _run_reference(
                     api_mode=runtime.get("api_mode"),
                 )
             except Exception:  # pragma: no cover - defensive
-                usage = CanonicalUsage()
+                usage = CanonicalUsage.fully_unknown()
         # Price this advisor at ITS OWN model/provider rate (with correct
         # cache-read/cache-write split), not the aggregator's. This is why
         # advisor cost is summed as dollars rather than by folding tokens into
@@ -2189,6 +2199,7 @@ class MoAChatCompletions:
                         # (advisors may be cheaper/pricier than the aggregator).
                         if _acct.model:
                             _ref_pricing_calls.append({
+                                **{key: bool(getattr(_acct.usage, key)) for key in USAGE_UNKNOWN_FIELDS},
                                 "model": _acct.model,
                                 "provider": _acct.provider,
                                 "base_url": _acct.base_url,
@@ -2197,6 +2208,19 @@ class MoAChatCompletions:
                                 "cache_read_tokens": _acct.usage.cache_read_tokens,
                                 "cache_write_tokens": _acct.usage.cache_write_tokens,
                                 "reasoning_tokens": _acct.usage.reasoning_tokens,
+                                # This advisor's OWN pricing verdict, from the
+                                # estimate_usage_cost call `_run_reference`
+                                # already made at its own route. Carried so the
+                                # session lane can see a MEASURED-but-unpriceable
+                                # advisor — an uncatalogued route returns
+                                # amount_usd=None with fully measured tokens, so
+                                # no unknown FLAG is set and the advisor's real
+                                # dollars silently never enter the session total
+                                # (r6 round-4 finding 1). Ignored by
+                                # plugins/blackbox/cost.py, which re-prices these
+                                # calls itself.
+                                "cost_usd": _acct.cost_usd,
+                                "cost_status": _acct.cost_status,
                             })
                     if _acct.cost_usd is not None:
                         _ref_cost = (_ref_cost or 0) + _acct.cost_usd

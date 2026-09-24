@@ -74,6 +74,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             tools TEXT,
             input_tokens INT,
             output_tokens INT,
+            output_tokens_unknown INT DEFAULT 0,
             cache_read INT,
             cache_write INT,
             reasoning INT,
@@ -82,6 +83,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             last_cache_read INT,
             last_cache_write INT,
             last_uncached INT,
+            last_call_prompt_unknown INT DEFAULT 0,
             comp_sys_tokens INT,
             comp_tool_schema_tokens INT,
             comp_history_tokens INT,
@@ -196,6 +198,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} INT")
             except sqlite3.OperationalError:
                 pass  # raced with another writer; column now exists
+    # Last-CALL prompt discriminator (r6 finding 9). Deliberately NULLable with
+    # no DEFAULT on the migration path: NULL means "this row predates the
+    # column, so its final-call provenance was never recorded", and the
+    # renderer falls back to the absorbing turn-level flag for those rows —
+    # exactly the behaviour they have today. A DEFAULT 0 here would instead
+    # assert "the final call WAS measured" about every historical row,
+    # including genuinely unmeasured ones, and render their placeholder zeros
+    # as real window numbers. New rows always bind an explicit 0/1.
+    if "last_call_prompt_unknown" not in _existing:
+        try:
+            conn.execute("ALTER TABLE turns ADD COLUMN last_call_prompt_unknown INT")
+        except sqlite3.OperationalError:
+            pass  # raced with another writer; column now exists
     # Request-composition columns (fixed vs non-fixed breakdown of the final
     # call). Same guarded additive pattern. INT for the token buckets, TEXT for
     # the per-call composition JSON blob.
@@ -258,6 +273,110 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    # UNKNOWN != 0 discriminator columns. New rows default measured, but rows
+    # that PRE-DATE this schema can be ambiguous: old Hermes collapsed an
+    # omitted provider usage payload into integer zeroes and had no
+    # discriminator with which to distinguish that from a measured zero.
+    #
+    # The latch is therefore restricted to unpriced rows whose token counts are
+    # ALL ZERO — the only rows that are actually ambiguous. A blanket
+    # "unpriced" latch was wrong on both ends: `usage_unknown` is not a
+    # pricing-private column, it is the shared DISPLAY discriminator
+    # (`agent.usage_pricing.prompt_tokens_unknown`, `plugins/blackbox/
+    # last_turn.py`, `plugins/blackbox/card.py` all branch on it), and a row is
+    # routinely NULL-cost because pricing REFUSED (no catalog entry for the
+    # route) while carrying perfectly good provider-measured counts. Latching
+    # those rewrote real measurements as "unknown" on every user-facing card,
+    # irreversibly. Already-priced history is left untouched either way.
+    unknown_columns = {
+        "output_tokens_unknown",
+        "input_tokens_unknown",
+        "cache_read_tokens_unknown",
+        "cache_write_tokens_unknown",
+        "usage_unknown",
+    }
+    migrating_legacy_unknown_schema = not unknown_columns <= _existing
+    if "output_tokens_unknown" not in _existing:
+        try:
+            conn.execute(
+                "ALTER TABLE turns ADD COLUMN output_tokens_unknown INT DEFAULT 0"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+    for column in ("input_tokens_unknown", "cache_read_tokens_unknown",
+                   "cache_write_tokens_unknown", "usage_unknown"):
+        if column not in _existing:
+            try:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {column} INT DEFAULT 0")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+    if migrating_legacy_unknown_schema:
+        # Narrowed once more (r6 finding 6). "unpriced AND all counts zero" is
+        # still not a purely ambiguous population: a turn interrupted before
+        # any API call fired, a blackbox-off turn, or one whose first call
+        # failed genuinely consumed zero tokens and is a MEASURED zero. Latching
+        # those was irreversible and had two costs: `reprice_unpriced` now
+        # short-circuits on any unknown flag, so they could never again heal to
+        # `priced_zero` and were reported `still_unknown` on every future sweep;
+        # and every consumer that branches on `usage_unknown` rendered them
+        # `unknown in + unknown out` forever.
+        #
+        # `cost_status` is the discriminator the old schema DID carry: a row the
+        # pre-UNKNOWN code already labelled 'unknown' is one where that code
+        # could not account the call, which is exactly the ambiguous population.
+        # A row with any other status (including NULL, i.e. never accounted)
+        # keeps its measured zero. Already-priced history is untouched either
+        # way.
+        #
+        # The all-zero-counts guard may only name token columns this DB actually
+        # has. `turns` is created with them, but a table that already existed
+        # never gains them (CREATE TABLE IF NOT EXISTS is a no-op and no ALTER
+        # adds them), so a sufficiently old DB can reach here without e.g.
+        # `cache_write` — naming it unconditionally aborts the whole migration
+        # with "no such column". When a count column is absent the row cannot
+        # carry a measurement in it, which is exactly the zero the guard tests
+        # for, so omitting it from the sum preserves the condition's meaning.
+        _count_cols = [
+            c for c in ("input_tokens", "output_tokens", "cache_read", "cache_write")
+            if c in _existing
+        ]
+        _all_zero = (
+            " + ".join(f"COALESCE({c}, 0)" for c in _count_cols) + " = 0"
+            if _count_cols
+            else "1 = 1"
+        )
+        _status_guard = (
+            " AND cost_status = 'unknown'" if "cost_status" in _existing else ""
+        )
+        # All five columns, not just the aggregate (r6 round-4 finding 8). A
+        # migrated row IS the shape `CanonicalUsage.fully_unknown()` describes —
+        # the provider measured NO bucket — and that classmethod's docstring
+        # states why the aggregate alone is insufficient: consumers read these
+        # flags NARROWLY. `plugins/blackbox/card.py::_tokens_out_line` and the
+        # thin `/usage` card gate the output line on `output_tokens_unknown`
+        # ALONE, and `prompt_tokens_unknown` ORs only the three input flags.
+        # Setting `usage_unknown` by itself therefore left every migrated row
+        # still rendering `0 out` as a measurement on exactly the surfaces this
+        # latch exists to correct.
+        #
+        # Same `_existing` guard as the counts above: an old DB that never
+        # gained a column cannot be updated on it, and naming it would abort the
+        # whole migration with "no such column". Note `_existing` is the
+        # PRE-ALTER snapshot, so it CANNOT be used here — in the migration case
+        # it is precisely the set that lacks these columns. The ALTERs above run
+        # unconditionally for all five and re-raise anything other than
+        # "duplicate column", so reaching this line means all five exist.
+        _set_clause = ", ".join(f"{c} = 1" for c in sorted(unknown_columns))
+        conn.execute(
+            f"UPDATE turns SET {_set_clause} "
+            "WHERE cost_usd IS NULL "
+            "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
+            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"
+            f"{_status_guard} "
+            f"AND {_all_zero}"
+        )
     _ensure_turn_indexes(conn)
     conn.commit()
 
@@ -273,6 +392,12 @@ _TURN_INDEXES = (
     ("idx_blackbox_turns_chat_end", ("platform", "chat_id", "ts_end")),
     ("idx_blackbox_turns_cost", ("cost_usd",)),
     ("idx_blackbox_turns_ts_start", ("ts_start",)),
+    # The skill-stats miner (skills-dashboard launchd, hourly) opens every
+    # ledger with `SELECT DISTINCT profile FROM turns`. Without an index on
+    # profile that is a full SCAN of the overflow-heavy table: measured 107 s on
+    # the 1.5 GB fleet ledger under I/O load (2026-09-23), past the miner's
+    # 180 s budget, so the Stats tab silently served last-good data.
+    ("idx_blackbox_turns_profile", ("profile",)),
 )
 
 
@@ -354,6 +479,7 @@ _INSERT_TURN_COLUMNS = (
     "api_calls", "tools", "input_tokens", "output_tokens", "cache_read",
     "cache_write", "reasoning", "context_used", "context_length",
     "last_cache_read", "last_cache_write", "last_uncached",
+    "last_call_prompt_unknown",
     "comp_sys_tokens", "comp_tool_schema_tokens", "comp_history_tokens",
     "comp_history_message_count",
     "comp_tool_result_tokens", "comp_tool_arg_tokens", "comp_tool_result_count",
@@ -365,6 +491,9 @@ _INSERT_TURN_COLUMNS = (
     "cost_cache_write_usd", "cost_output_usd",
     "interrupted", "alerted", "user_text",
     "final_text", "cli_invocation_id",
+    "output_tokens_unknown",
+    "input_tokens_unknown", "cache_read_tokens_unknown",
+    "cache_write_tokens_unknown", "usage_unknown",
 )
 
 _INSERT_TURN_SQL = (
@@ -410,6 +539,7 @@ def insert_turn(record: TurnRecord) -> None:
                     _int_or_none(record.last_cache_read_tokens),
                     _int_or_none(record.last_cache_write_tokens),
                     _int_or_none(record.last_uncached_tokens),
+                    _bool_int(record.last_call_prompt_unknown),
                     _int_or_none(record.comp_sys_tokens),
                     _int_or_none(record.comp_tool_schema_tokens),
                     _int_or_none(record.comp_history_tokens),
@@ -432,6 +562,11 @@ def insert_turn(record: TurnRecord) -> None:
                     scrub_and_truncate(record.user_text),
                     scrub_and_truncate(record.final_text),
                     record.cli_invocation_id,
+                    _bool_int(record.output_tokens_unknown),
+                    _bool_int(record.input_tokens_unknown),
+                    _bool_int(record.cache_read_tokens_unknown),
+                    _bool_int(record.cache_write_tokens_unknown),
+                    _bool_int(record.usage_unknown),
                 ),
             )
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
@@ -612,7 +747,12 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
         sel = (
             "SELECT turn_id, model, provider, "
             "COALESCE(input_tokens,0) AS i, COALESCE(output_tokens,0) AS o, "
-            "COALESCE(cache_read,0) AS cr, COALESCE(cache_write,0) AS cw "
+            "COALESCE(cache_read,0) AS cr, COALESCE(cache_write,0) AS cw, "
+            "COALESCE(output_tokens_unknown,0) AS ou, "
+            "COALESCE(input_tokens_unknown,0) AS iu, "
+            "COALESCE(cache_read_tokens_unknown,0) AS cru, "
+            "COALESCE(cache_write_tokens_unknown,0) AS cwu, "
+            "COALESCE(usage_unknown,0) AS uu "
             "FROM turns WHERE cost_usd IS NULL "
             "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
             "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"
@@ -625,13 +765,25 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
         # (turn_id, cost, status, perclass, is_zero)
         candidates: list[tuple[str, float, str, dict, bool]] = []
         for r in rows:
+            route = resolve_billing_route(r["model"], provider=r["provider"])
+            usage_unknown = any(bool(r[key]) for key in ("ou", "iu", "cru", "cwu", "uu"))
+            if usage_unknown:
+                # Missing counts cannot be repriced from their integer-zero
+                # placeholders. The one exception is a route whose marginal
+                # cost is $0 independently of token counts. Either way, keep
+                # the row inside ``scanned`` so unresolved rows contribute to
+                # ``still_unknown`` instead of disappearing from the report.
+                if route.billing_mode == "subscription_included":
+                    candidates.append(
+                        (r["turn_id"], 0.0, "included", dict(_ZERO_PERCLASS), False)
+                    )
+                continue
             total = r["i"] + r["o"] + r["cr"] + r["cw"]
             if total == 0:
-                # Zero-token → costless → priced_zero, route-independent (M3 parity).
+                # Zero-token → costless → priced_zero, regardless of route.
                 candidates.append((r["turn_id"], 0.0, "priced_zero", dict(_ZERO_PERCLASS), True))
                 continue
             # Real-token: route-purity gate (INV-9 / RC-A).
-            route = resolve_billing_route(r["model"], provider=r["provider"])
             entry = get_pricing_entry(r["model"], provider=r["provider"])
             if route.billing_mode not in _PURE_BILLING_MODES:
                 # A notional relay (openai-codex → official_models_api) consults the

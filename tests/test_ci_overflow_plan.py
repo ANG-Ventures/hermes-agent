@@ -1,12 +1,21 @@
 """Contracts for the trusted CI overflow decision and untrusted request boundary."""
 import io
 import json
+from pathlib import Path
+from types import SimpleNamespace
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from scripts.ci_overflow_plan import Policy, Snapshot, parse_request, plan, sample_pool
+import scripts.ci_overflow_plan as planner
+from scripts.ci_overflow_plan import ARM, X64, Policy, Snapshot, parse_request, plan, sample_pool
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ci_overflow"
+
+
+def fixture(name):
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 POOL = ["self-hosted", "Linux", "X64", "hermes-ci"]
 SLICES = [{"job_id": "core-smoke", "core": True, "estimated_duration_s": 10},
@@ -110,7 +119,7 @@ def test_request_accepts_17_and_bounded_reservation():
     assert r.max_reservation == 615
 
 
-def test_archive_traversal_and_symlink_refused():
+def test_archive_traversal_and_multi_entry_refused():
     for filename in ("../request.json", "a/request.json"):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as z:
@@ -153,3 +162,102 @@ class Pages:
 def test_sampler(name, api, status, queued):
     s = sample_pool(api)
     assert (s.status, s.queued_matching_jobs) == (status, queued), name
+
+
+def test_arm_never_placed_on_core_when_core_goes_to_cloud():
+    """C5: ARM is only for NON-core admitted cloud slices, even when core itself is cloud."""
+    p = decide(idle=0, arm=3)
+    labels = {j.job_id: j.labels for j in p.jobs}
+    assert labels["core-smoke"] == X64 and labels["e2e"] == X64
+    assert labels["slice-0"] == labels["slice-1"] == ARM
+
+
+def test_duplicate_json_field_rejected():
+    """C26: a repeated key must not silently last-win."""
+    with pytest.raises(ValueError, match="duplicate JSON field"):
+        parse_request(b'{"slices":[],"slices":[],"e2e":null}')
+
+
+def test_archive_symlink_entry_refused():
+    """C27: a real symlink entry (S_IFLNK mode bits) named request.json is refused."""
+    info = zipfile.ZipInfo("request.json")
+    info.create_system = 3  # unix, so external_attr carries st_mode
+    info.external_attr = (0o120777 << 16)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr(info, request())
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as z:
+        assert (z.infolist()[0].external_attr >> 16) & 0o170000 == 0o120000  # entry really is a symlink
+    with pytest.raises(ValueError, match="unsafe request archive"):
+        parse_request(buf.getvalue())
+    # Control: the same bytes as a regular-file entry are accepted.
+    ok = io.BytesIO()
+    with zipfile.ZipFile(ok, "w") as z:
+        z.writestr("request.json", request())
+    assert parse_request(ok.getvalue()).max_reservation == 2 * 35 + 20 + 35
+
+
+class FixtureAPI:
+    """Serves the committed GitHub response-shape fixtures; overrides are per-endpoint."""
+    def __init__(self, runners=None, runs=None, jobs=None, tick=None):
+        self.runners = runners or fixture("runners.json")
+        self.runs = runs or fixture("runs.json")
+        self.jobs = jobs or fixture("jobs.json")
+        self.tick = tick
+    def get(self, path, params=None):
+        if self.tick:
+            self.tick()
+        if path == "actions/runners":
+            return self.runners
+        if path == "actions/runs":
+            return self.runs
+        assert path.startswith("actions/runs/") and "/attempts/" in path and path.endswith("/jobs")
+        return self.jobs
+
+
+def test_sampler_reads_fixture_shapes():
+    s = sample_pool(FixtureAPI())
+    assert (s.status, s.online, s.idle, s.queued_matching_jobs) == ("ok", 1, 1, 1)
+
+
+def test_sampler_excludes_this_run_attempt():
+    """C16: the controller's own attempt must not count as queued pool demand."""
+    assert sample_pool(FixtureAPI(), exclude_attempt=(11, 2)).queued_matching_jobs == 1
+    assert sample_pool(FixtureAPI(), exclude_attempt=(11, 1)).queued_matching_jobs == 0
+
+
+def test_sampler_dedupes_jobs_by_id():
+    """C18: the same job surfacing under two runs/pages counts once."""
+    runs = {"total_count": 2, "workflow_runs": [{"id": 11, "run_attempt": 1, "status": "in_progress"},
+                                                  {"id": 12, "run_attempt": 1, "status": "queued"}]}
+    assert sample_pool(FixtureAPI(runs=runs)).queued_matching_jobs == 1
+
+
+def test_sampler_busy_runner_is_online_not_idle():
+    """C21: online+busy counts toward online, never toward idle."""
+    runners = fixture("runners.json")
+    runners["runners"][0]["busy"] = True
+    s = sample_pool(FixtureAPI(runners=runners))
+    assert (s.status, s.online, s.idle) == ("ok", 1, 0)
+
+
+def test_sampler_collection_bound_20s_is_unknown(monkeypatch):
+    """C19: a collection that takes >20 s of monotonic time is unknown, not a partial ok."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(planner, "time", SimpleNamespace(monotonic=lambda: clock["t"]))
+    def tick():
+        clock["t"] += 7  # three endpoint calls = 21 s
+    s = sample_pool(FixtureAPI(tick=tick), now=datetime.now(timezone.utc))
+    assert s.status == "unknown"
+    clock["t"] = 1000.0
+    def slow_but_in_bound():
+        clock["t"] += 6  # 18 s total: still inside the bound
+    assert sample_pool(FixtureAPI(tick=slow_but_in_bound), now=datetime.now(timezone.utc)).status == "ok"
+
+
+def test_sampler_snapshot_older_than_60s_is_unknown():
+    """C20: a snapshot whose collection started >60 s ago is unknown."""
+    stale = datetime.now(timezone.utc) - timedelta(seconds=61)
+    assert sample_pool(FixtureAPI(), now=stale).status == "unknown"
+    fresh = datetime.now(timezone.utc) - timedelta(seconds=30)
+    assert sample_pool(FixtureAPI(), now=fresh).status == "ok"
