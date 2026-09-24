@@ -4893,6 +4893,103 @@ def _caller_session_lineage(session_id: str) -> tuple[str, ...]:
         return ()
 
 
+HOME_LINEAGE_MAX_DEPTH = 10
+
+
+def home_ids(session_id: Optional[str], *, db_path: Any = None) -> frozenset[str]:
+    """THE definition of a session's kanban "home": the id plus its
+    ``parent_session_id`` ancestors and descendants that share its
+    ``session_key`` (depth <= :data:`HOME_LINEAGE_MAX_DEPTH` each way).
+
+    Gateway chats rotate their session id (resume_pending_expired,
+    session_switch, most ``/new``) while keeping the ``session_key`` and
+    linking the successor via ``parent_session_id``; an exact-id home would
+    make a chat foreign to its own cards after every rotation. Requiring the
+    same non-NULL ``session_key`` keeps another chat's chain (and keyless
+    subagent/CLI children) out.
+
+    Read-only against the gateway ``state.db`` sessions table, short
+    ``busy_timeout``, and FAIL-OPEN: any error (no state.db, no such row,
+    locked, old schema) returns ``{session_id}`` -- exactly the pre-lineage
+    exact-id behaviour. Shared by ``list --home``, ``show``'s home label,
+    the home-session guard and the kanban-home-cards plugin.
+    """
+    sid = (str(session_id).strip() if session_id else "")
+    if not sid:
+        return frozenset()
+    only = frozenset({sid})
+    try:
+        if db_path is None:
+            from hermes_state import _default_db_path
+
+            db_path = _default_db_path()
+        path = Path(db_path)
+        if not path.is_file():
+            return only
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 2000")
+            row = conn.execute(
+                "SELECT session_key, parent_session_id FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+            if row is None or not row[0]:
+                return only
+            key = row[0]
+            ids = {sid}
+            parent = row[1]
+            for _ in range(HOME_LINEAGE_MAX_DEPTH):
+                if not parent or parent in ids:
+                    break
+                prow = conn.execute(
+                    "SELECT parent_session_id FROM sessions "
+                    "WHERE id = ? AND session_key = ?",
+                    (parent, key),
+                ).fetchone()
+                if prow is None:
+                    break
+                ids.add(parent)
+                parent = prow[0]
+            frontier = [sid]
+            for _ in range(HOME_LINEAGE_MAX_DEPTH):
+                if not frontier:
+                    break
+                ph = ",".join("?" * len(frontier))
+                kids = [
+                    r[0] for r in conn.execute(
+                        f"SELECT id FROM sessions WHERE parent_session_id IN ({ph}) "
+                        "AND session_key = ?",
+                        (*frontier, key),
+                    )
+                    if r[0] and r[0] not in ids
+                ]
+                ids.update(kids)
+                frontier = kids
+            return frozenset(ids)
+        finally:
+            conn.close()
+    except Exception:
+        return only
+
+
+def home_guard_mode() -> str:
+    """``kanban.home_guard``: ``refuse`` (default) or ``warn``.
+
+    2026-09-24: default flipped warn -> refuse now that "home" is the
+    session lineage (:func:`home_ids`), so id rotations inside one chat no
+    longer make a session foreign to its own cards. ``warn`` is the
+    operator escape hatch: the foreign mutation proceeds with one stderr line.
+    Any unreadable/unknown value means ``refuse``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get("home_guard", "refuse")
+    except Exception:
+        return "refuse"
+    return "warn" if str(value).strip().lower() == "warn" else "refuse"
+
+
 def check_home_session(
     conn: sqlite3.Connection, task_id: str, action: str
 ) -> Optional[MutationActor]:
@@ -4935,11 +5032,19 @@ def check_home_session(
     if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
         return None
     for sid in actor.session_ids:
-        if home in _caller_session_lineage(sid):
+        if home in home_ids(sid) or home in _caller_session_lineage(sid):
             return None
     if actor.foreign_ok:
         return actor
     caller = ", ".join(actor.session_ids) or "none"
+    if home_guard_mode() == "warn":
+        print(
+            f"kanban: warning: {action} on {task_id} from caller session "
+            f"{caller}; its home session is {home} (kanban.home_guard=warn, "
+            f"allowed)",
+            file=sys.stderr,
+        )
+        return None
     override = (
         '--foreign-ok "<reason>"' if actor.surface == "cli"
         else 'foreign_ok="<reason>"'
@@ -5617,6 +5722,7 @@ def list_tasks(
     status: Optional[str] = None,
     tenant: Optional[str] = None,
     session_id: Optional[str] = None,
+    session_ids: Optional[Iterable[str]] = None,
     include_archived: bool = False,
     limit: Optional[int] = None,
     order_by: Optional[str] = None,
@@ -5639,6 +5745,13 @@ def list_tasks(
     if session_id is not None:
         query += " AND session_id = ?"
         params.append(session_id)
+    if session_ids is not None:
+        sids = sorted({str(x) for x in session_ids if x})
+        if not sids:
+            query += " AND 0"
+        else:
+            query += f" AND session_id IN ({','.join('?' * len(sids))})"
+            params.extend(sids)
     if workflow_template_id is not None:
         query += " AND workflow_template_id = ?"
         params.append(workflow_template_id)
