@@ -95,6 +95,7 @@ import sys
 import threading
 import logging
 import time
+import psutil
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -456,6 +457,14 @@ DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 # stops the duplication; once no duplicate is spawned the pressure eases, the
 # signal lands, and the following tick reclaims cleanly.
 RECLAIM_DEFER_GRACE_SECONDS = 120
+
+# A pid-less claim whose local CLAIMER (dispatching gateway) is dead may still
+# have a detached worker: Popen precedes the pid stamp. With no heartbeat on
+# the current run yet, hold the claim this long after it was taken before
+# treating the spawn as never-happened. Measured 2026-09-24 over 12,732 live
+# runs: claim-to-first-heartbeat p50 6 s, p90 21 s, p99 69 s, max 708 s.
+# The claim TTL (900 s) sits above that max. See _dead_claimer_release_at.
+DEAD_CLAIMER_LAUNCH_BOUND_SECONDS = DEFAULT_CLAIM_TTL_SECONDS
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -7944,6 +7953,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            conn=conn, task_id=row["id"],
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -8031,7 +8041,8 @@ def reclaim_task(
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
     If the worker was signalled but survived, or if this host holds the
-    claim but its worker pid cannot be resolved, reclamation FAILS CLOSED.
+    claim without a worker pid and its claimer may still be alive,
+    reclamation FAILS CLOSED.
     The card retains its owner and emits a ``reclaim_refused`` event marked
     ``needs_attention``. A human must resolve the worker outside this path;
     an operator request alone does not prove the worker is gone.
@@ -8065,6 +8076,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        conn=conn, task_id=task_id,
     )
     # Never release a claim while our host-local worker is alive or its
     # liveness is unknown. This also covers NULL pid in the TTL and stale
@@ -13856,11 +13868,63 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _dead_claimer_release_at(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[Optional[int], str, Optional[str]]:
+    """Earliest time a pid-less claim with a DEAD claimer may be released.
+
+    A dead claimer is not proof that no worker exists: ``_default_spawn``
+    calls ``Popen(start_new_session=True)`` before ``_set_worker_pid``
+    commits, so a gateway killed in that window leaves a live orphan with no
+    stamped pid. The row cannot tell such an orphan from a spawn that never
+    happened, so release is time-bounded on the CURRENT run only:
+
+    * no worker evidence yet (no ``heartbeat``/``spawned`` event on this run):
+      release after ``DEAD_CLAIMER_LAUNCH_BOUND_SECONDS`` from the claim. An
+      orphan that has not heartbeated by then is outside every observed launch
+      (live ledger 2026-09-24, 12,732 runs: first heartbeat p99 69 s, max 708 s).
+    * worker evidence exists: release after the newest evidence is older than
+      ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` — the same staleness rule
+      ``release_stale_claims`` applies to a worker whose pid IS alive. Without
+      this bound an orphan that heartbeated once and then died held the card
+      forever (the stuck-running shape this path exists to end).
+
+    Returns ``(release_at, basis, evidence_kind)``; ``release_at`` is None when
+    there is no current run to anchor the bound (held).
+    """
+    run = conn.execute(
+        "SELECT r.id, r.started_at FROM tasks t "
+        "JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
+        (task_id,),
+    ).fetchone()
+    if run is None or run["started_at"] is None:
+        return None, "no_current_run", None
+    evidence = conn.execute(
+        "SELECT kind, created_at FROM task_events WHERE task_id = ? "
+        "AND run_id = ? AND kind IN ('heartbeat', 'spawned') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, int(run["id"])),
+    ).fetchone()
+    if evidence is None:
+        return (
+            int(run["started_at"]) + DEAD_CLAIMER_LAUNCH_BOUND_SECONDS,
+            "launch_bound",
+            None,
+        )
+    return (
+        int(evidence["created_at"]) + DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS,
+        "evidence_stale_bound",
+        evidence["kind"],
+    )
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    conn: Optional[sqlite3.Connection] = None,
+    task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
     import signal
@@ -13881,16 +13945,43 @@ def _terminate_reclaimed_worker(
     info["host_local"] = True
 
     if not pid or pid <= 0:
-        # OUR host holds this claim but no worker pid was ever stamped, so
-        # there is nothing to signal — and, critically, no evidence of death
-        # either. Flag that explicitly instead of returning a payload that
-        # looks identical to a clean "nothing to do".
-        #
-        # The pre-fix code returned here BEFORE setting host_local, so the
-        # event claimed the worker was some other host's problem. Measured on
-        # t_09180e10 (2026-09-22): `prev_pid: null, host_local: false` on a
-        # card whose lock was `mac-studio-m3u:71817` — our own host.
+        # OUR host holds this claim but no worker pid was ever stamped. That
+        # is UNKNOWN liveness unless we can prove otherwise (t_09180e10).
         info["liveness_unprovable"] = True
+        if conn is None or task_id is None:
+            # Fail closed on omission: without the run row we cannot rule out
+            # a detached worker whose pid was never stamped, so a caller that
+            # forgets conn/task_id must hold the claim, never release it.
+            info["unstamped_worker_check"] = "skipped_no_run_context"
+            return info
+        claimer_pid = 0
+        try:
+            claimer_pid = int(str(claim_lock)[len(host_prefix):])
+            if claimer_pid <= 0:
+                return info
+            # Equivalent to kill(pid, 0), without Windows' destructive
+            # CTRL_C_EVENT behavior for signal 0.
+            psutil.Process(claimer_pid)
+            # Claimer alive: its spawn may still be in flight (launch grace).
+            return info
+        except psutil.NoSuchProcess:
+            pass
+        except (ValueError, OSError, psutil.AccessDenied):
+            return info
+        # The claimer is dead, but that alone does not prove no worker exists:
+        # Popen(start_new_session=True) precedes _set_worker_pid, so a claimer
+        # killed in between leaves a live, unstamped orphan. Release only once
+        # no worker can still be alive for THIS run (see _dead_claimer_release_at).
+        info["claimer_pid_dead"] = claimer_pid
+        release_at, basis, evidence_kind = _dead_claimer_release_at(conn, task_id)
+        info["dead_claimer_release_basis"] = basis
+        if evidence_kind:
+            info["unstamped_worker_evidence"] = evidence_kind
+        if release_at is None or int(time.time()) < release_at:
+            info["dead_claimer_hold_until"] = release_at
+            return info
+        info["liveness_unprovable"] = False
+        info["terminated"] = True
         return info
 
     kill = signal_fn if signal_fn is not None else (
@@ -13935,10 +14026,9 @@ def _worker_survived_termination(termination: dict) -> bool:
     """True when a host-local worker has NOT been proven gone.
 
     A signalled-but-still-alive worker is positive liveness evidence. A
-    missing pid is UNKNOWN liveness — not death evidence. Neither may release
-    the claim, because that would let the dispatcher spawn a second worker
-    beside the first. A proven-dead worker (including ProcessLookupError on
-    SIGTERM) and non-local claims use the normal release path.
+    missing worker pid is UNKNOWN liveness if the claimer may still launch or
+    the current run has evidence of an unstamped worker. Unknown liveness must
+    not release a claim: it could spawn a second worker beside the first.
     """
     if not termination.get("host_local") or termination.get("terminated"):
         return False
@@ -14360,7 +14450,9 @@ def detect_progress_stalls(
                 _append_event(conn, row["id"], "stalled", evidence, run_id=rid)
         if age < reclaim_seconds:
             continue
-        termination = _terminate_reclaimed_worker(pid, lock)
+        termination = _terminate_reclaimed_worker(
+            pid, lock, conn=conn, task_id=row["id"],
+        )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, row["id"], lock, now, termination, reason="progress_stalled_worker_alive",
@@ -14455,7 +14547,7 @@ def detect_stale_running(
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+            pid, lock, signal_fn=signal_fn, conn=conn, task_id=tid,
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -15707,7 +15799,9 @@ def _abort_lost_claim_spawn(
         "run_id": task.current_run_id,
     }
     if pid:
-        termination = _terminate_reclaimed_worker(int(pid), task.claim_lock)
+        termination = _terminate_reclaimed_worker(
+            int(pid), task.claim_lock, conn=conn, task_id=task.id,
+        )
         payload.update(termination)
         if not termination.get("terminated"):
             payload["needs_attention"] = True
