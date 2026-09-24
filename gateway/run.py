@@ -26233,30 +26233,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 from hermes_cli.config import load_config as _load_cfg
                                 from utils import is_truthy_value as _is_truthy
 
-                                _hyg_checkpoint_required = _is_truthy(
-                                    ((_load_cfg() or {}).get("compression") or {}).get(
-                                        "checkpoint_required"
-                                    ),
-                                    default=False,
-                                )
-                                _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
-                                    model=_hyg_model,
-                                    max_iterations=4,
-                                    quiet_mode=True,
-                                    skip_memory=not _hyg_checkpoint_required,
-                                    enabled_toolsets=["memory"],
-                                    session_id=session_entry.session_id,
-                                    session_db=_hyg_session_db,
-                                )
-                                _seed_hygiene_system_prompt(
-                                    _hyg_agent,
-                                    _hyg_session_row,
-                                )
-                                # If compression must rebuild instead of retaining
-                                # the cached prompt, make the persisted result
-                                # deliberately stale for every real gateway surface.
-                                _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
+                                def _build_hygiene_agent():
+                                    # Config loading and engine construction may take
+                                    # filesystem/SQLite locks; neither belongs on the loop.
+                                    checkpoint_required = _is_truthy(
+                                        ((_load_cfg() or {}).get("compression") or {}).get(
+                                            "checkpoint_required"
+                                        ),
+                                        default=False,
+                                    )
+                                    agent = AIAgent(
+                                        **_hyg_runtime,
+                                        model=_hyg_model,
+                                        max_iterations=4,
+                                        quiet_mode=True,
+                                        skip_memory=not checkpoint_required,
+                                        enabled_toolsets=["memory"],
+                                        session_id=session_entry.session_id,
+                                        session_db=_hyg_session_db,
+                                    )
+                                    _seed_hygiene_system_prompt(agent, _hyg_session_row)
+                                    # Force a prompt rebuild if the persisted result
+                                    # cannot retain the cached system prompt.
+                                    agent.platform = _GATEWAY_HYGIENE_PLATFORM
+                                    agent.compression_in_place = True
+                                    bind_state = getattr(
+                                        getattr(agent, "context_compressor", None),
+                                        "bind_session_state", None,
+                                    )
+                                    if callable(bind_state):
+                                        bind_state(_hyg_session_db, session_entry.session_id)
+                                    agent._end_session_on_close = False
+                                    agent._print_fn = lambda *a, **kw: None
+                                    return agent
+
+                                _hyg_agent = await asyncio.to_thread(_build_hygiene_agent)
                                 _hyg_cleanup_deferred = False
                                 try:
                                     # Gateway hygiene runs before the user turn
@@ -26268,22 +26279,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # bindings.  If no SessionDB is available,
                                     # compress_context leaves this flag false and
                                     # the guard below preserves the transcript.
-                                    _hyg_agent.compression_in_place = True
-                                    _bind_hyg_state = getattr(
-                                        getattr(_hyg_agent, "context_compressor", None),
-                                        "bind_session_state",
-                                        None,
-                                    )
-                                    if callable(_bind_hyg_state):
-                                        _bind_hyg_state(
-                                            _hyg_session_db,
-                                            session_entry.session_id,
-                                        )
-                                    # It must never finalize on close() — close()
-                                    # would end the live gateway session row.
-                                    _hyg_agent._end_session_on_close = False
-                                    _hyg_agent._print_fn = lambda *a, **kw: None
-
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
                                     _hyg_future = loop.run_in_executor(

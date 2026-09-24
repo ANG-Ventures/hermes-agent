@@ -117,3 +117,34 @@ def test_load_lock_exists_and_is_a_lock():
     # RLock/Lock expose acquire/release; assert it behaves as a context manager.
     with lock:
         pass
+
+
+def test_connection_independent_counter_setup_reused_but_engines_are_fresh(tmp_path, monkeypatch):
+    """Module-level setup is cached without sharing per-session engine state."""
+    plugin_dir = tmp_path / "setupplug"
+    plugin_dir.mkdir()
+    (plugin_dir / "__init__.py").write_text("", encoding="utf-8")
+    (plugin_dir / "tokens.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(ce, "_CONTEXT_ENGINE_PLUGINS_DIR", tmp_path)
+    name = "plugins.context_engine.setupplug"
+    module = types.ModuleType(name)
+    module.register = lambda collector: collector.register_context_engine(object())
+    tokens = types.ModuleType(f"{name}.tokens")
+    installed = []
+    tokens.set_messages_token_counter = installed.append
+    tokens.count_messages_tokens_builtin = lambda messages: 1
+    tokens.media_part_token_cost = lambda part: 0
+    monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(sys.modules, tokens.__name__, tokens)
+
+    first = ce.load_context_engine("setupplug")
+    second = ce.load_context_engine("setupplug")
+    assert first is not second
+    assert len(installed) == 1
+
+    # Explicit module replacement is a reload, so the host callback is renewed.
+    replacement = types.ModuleType(name)
+    replacement.register = module.register
+    monkeypatch.setitem(sys.modules, name, replacement)
+    ce.load_context_engine("setupplug")
+    assert len(installed) == 2

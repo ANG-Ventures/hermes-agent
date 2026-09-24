@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 # back to the built-in compressor — a silent, intermittent partial-import race.
 # RLock (not Lock) guards against any reentrant load during module exec.
 _LOAD_LOCK = threading.RLock()
+# Only module-level setup is reusable. Engine instances own sessions and stores;
+# reusing one would share mutable state across agents and profiles.
+_COUNTER_SETUP: dict[Path, tuple[object, object]] = {}
 # Engine construction slower than this is logged as PHASE=context_engine_load_slow.
 # Healthy init on the fleet's largest DB (10.9 GB) measures 0.14 s; 5 s is 35x that.
 ENGINE_LOAD_SLOW_S = float(os.environ.get("HERMES_ENGINE_LOAD_SLOW_S", "5"))
@@ -148,31 +151,36 @@ def _register_host_token_counter(engine_dir: "Path", name: str) -> None:
         tokens_mod = importlib.import_module(
             f"plugins.context_engine.{name}.tokens"
         )
-        setter = getattr(tokens_mod, "set_messages_token_counter", None)
-        if not callable(setter):
-            return
-        builtin = getattr(tokens_mod, "count_messages_tokens_builtin", None)
-        media_cost = getattr(tokens_mod, "media_part_token_cost", None)
-        if not callable(builtin) or not callable(media_cost):
-            return
-        from agent.model_metadata import estimate_messages_tokens_rough
+        module = sys.modules.get(f"plugins.context_engine.{name}")
+        with _LOAD_LOCK:
+            if _COUNTER_SETUP.get(engine_dir) == (module, tokens_mod):
+                return
+            setter = getattr(tokens_mod, "set_messages_token_counter", None)
+            if not callable(setter):
+                return
+            builtin = getattr(tokens_mod, "count_messages_tokens_builtin", None)
+            media_cost = getattr(tokens_mod, "media_part_token_cost", None)
+            if not callable(builtin) or not callable(media_cost):
+                return
+            from agent.model_metadata import estimate_messages_tokens_rough
 
-        def _counter(messages):
-            """Host estimate for multimodal lists; engine's own for pure text."""
-            for msg in messages or ():
-                if not isinstance(msg, dict):
-                    continue
-                content = msg.get("content")
-                parts = content if isinstance(content, list) else None
-                if parts is None and isinstance(content, dict) and content.get("_multimodal"):
-                    parts = content.get("content")
-                if isinstance(parts, list) and any(media_cost(p) for p in parts):
-                    return estimate_messages_tokens_rough(messages)
-                if isinstance(msg.get("_anthropic_content_blocks"), list):
-                    return estimate_messages_tokens_rough(messages)
-            return builtin(messages)
+            def _counter(messages):
+                """Host estimate for multimodal lists; engine's own for pure text."""
+                for msg in messages or ():
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get("content")
+                    parts = content if isinstance(content, list) else None
+                    if parts is None and isinstance(content, dict) and content.get("_multimodal"):
+                        parts = content.get("content")
+                    if isinstance(parts, list) and any(media_cost(p) for p in parts):
+                        return estimate_messages_tokens_rough(messages)
+                    if isinstance(msg.get("_anthropic_content_blocks"), list):
+                        return estimate_messages_tokens_rough(messages)
+                return builtin(messages)
 
-        setter(_counter)
+            setter(_counter)
+            _COUNTER_SETUP[engine_dir] = (module, tokens_mod)
         logger.debug("Registered host token counter with context engine '%s'", name)
     except Exception:
         logger.debug(

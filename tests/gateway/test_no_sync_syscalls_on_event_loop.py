@@ -22,6 +22,8 @@ COVERED call shapes (the ones that block the calling thread):
   * ``time.sleep(...)``
   * ``os.system(...)``
   * ``os.popen(...)``
+  * ``AIAgent(...)`` directly in ``gateway/run.py`` coroutines: its context
+    engine may open a multi-GB SQLite store while holding the loader lock.
 
 PER-MESSAGE shapes (added 2026-09-20 after the second measured episode).  These
 are individually cheap -- microseconds to a couple of milliseconds -- so they do
@@ -361,16 +363,46 @@ def find_sync_calls_in_async_defs(root: Path) -> tuple[list[str], int]:
                 continue
             async_defs += 1
             for call in _iter_loop_calls(node):
-                label = _offender_label(call)
+                label = (
+                    "agent-init:AIAgent"
+                    if py.name == "run.py" and isinstance(call.func, ast.Name)
+                    and call.func.id == "AIAgent"
+                    else _offender_label(call)
+                )
                 if label is None:
                     continue
                 line = lines[call.lineno - 1] if 0 < call.lineno <= len(lines) else ""
-                if _noqa_exempt(line):
+                if label != "agent-init:AIAgent" and _noqa_exempt(line):
                     continue
                 offenders.append(
                     f"{py.relative_to(root).as_posix()}:{call.lineno} {node.name} -> {label}"
                 )
     return sorted(offenders), async_defs
+
+
+def test_gateway_agent_construction_lint_catches_direct_call(tmp_path):
+    """A direct AIAgent init freezes slash acks; a thread-bound init does not."""
+    py = tmp_path / "run.py"
+    py.write_text(
+        "import asyncio\n"
+        "async def handle():\n"
+        "    agent = AIAgent()\n"
+        "    return await asyncio.to_thread(AIAgent)\n",
+        encoding="utf-8",
+    )
+    offenders, _ = find_sync_calls_in_async_defs(tmp_path)
+    assert offenders == ["run.py:3 handle -> agent-init:AIAgent"]
+
+    py.write_text(
+        "import asyncio\n"
+        "async def handle():\n"
+        "    def build():\n"
+        "        return AIAgent()\n"
+        "    return await asyncio.to_thread(build)\n",
+        encoding="utf-8",
+    )
+    offenders, _ = find_sync_calls_in_async_defs(tmp_path)
+    assert offenders == []
 
 
 # ---------------------------------------------------------------------------

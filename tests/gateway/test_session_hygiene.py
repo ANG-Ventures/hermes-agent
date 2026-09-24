@@ -1163,6 +1163,9 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         "</memory_provider_context>"
     )
     fake_db = MagicMock()
+    loop = asyncio.get_running_loop()
+    slash_ack = loop.create_future()
+    construction_started = []
     fake_db.get_compression_failure_cooldown.return_value = None
     async_session_db = SimpleNamespace(
         _db=fake_db,
@@ -1177,6 +1180,10 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         last_instance = None
 
         def __init__(self, **kwargs):
+            construction_started.append(time.monotonic())
+            # Simulate a slow LCM store open while a slash interaction arrives.
+            loop.call_soon_threadsafe(lambda: slash_ack.set_result(time.monotonic()))
+            time.sleep(2)
             self.model = kwargs.get("model")
             self.platform = kwargs.get("platform")
             self.session_id = kwargs.get("session_id", "fake-session")
@@ -1278,7 +1285,10 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
         lambda gw, key: (reset_calls.append(key), _real_reset(gw, key))[1],
     )
 
-    result = await runner._handle_message(event)
+    turn = asyncio.create_task(runner._handle_message(event))
+    ack_at = await asyncio.wait_for(slash_ack, timeout=3)
+    assert ack_at - construction_started[0] < 0.1, "hygiene blocked the slash ack"
+    result = await turn
 
     assert result == "ok"
     agent = FakeInPlaceCompressAgent.last_instance

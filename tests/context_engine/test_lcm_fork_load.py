@@ -38,6 +38,23 @@ def test_load_context_engine_lcm_returns_context_engine(tmp_path, monkeypatch):
             _close_engine(engine)
 
 
+def test_repeated_lcm_loads_keep_profile_stores_isolated(tmp_path, monkeypatch):
+    homes = [tmp_path / "a", tmp_path / "b", tmp_path / "a"]
+    engines = []
+    try:
+        for home in homes:
+            home.mkdir(exist_ok=True)
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            engine = load_context_engine("lcm")
+            assert engine is not None
+            engines.append(engine)
+            assert Path(engine._store.db_path).parent == home
+        assert len({id(engine) for engine in engines}) == len(engines)
+    finally:
+        for engine in engines:
+            _close_engine(engine)
+
+
 def test_lcm_tool_schemas_expose_recall_and_status_tools(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
