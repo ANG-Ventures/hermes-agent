@@ -1387,6 +1387,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--dry-run", action="store_true",
                       help="List the workspaces gc would try to remove; delete nothing")
 
+    # --- clone ---
+    p_clone = sub.add_parser(
+        "clone",
+        help="git clone that borrows objects from a shared fleet mirror",
+        description=(
+            "Clone a repo into a kanban workspace. For ANG-Ventures/* and "
+            "Kyzcreig/* GitHub URLs the clone uses --reference-if-able "
+            "against a bare mirror under <hermes root>/mirrors/, created "
+            "lazily, so the checkout stores only objects the mirror lacks. "
+            "Other URLs are cloned normally. Common git-clone options "
+            "(-q, -b, --depth, --filter, --no-checkout, --single-branch, "
+            "--no-tags, --origin, ...) are forwarded."
+        ),
+    )
+    from hermes_cli.kanban_clone import add_arguments as _add_clone_arguments
+
+    _add_clone_arguments(p_clone)
+
     # --- repair ---
     p_repair = sub.add_parser(
         "repair",
@@ -1497,6 +1515,12 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        # `clone` is a git operation with no board state; it must not depend
+        # on (or initialize) kanban.db.
+        if action == "clone":
+            from hermes_cli.kanban_clone import clone
+
+            return clone(args.url, args.dest, args.git_opts)
         try:
             kb.init_db()
         except Exception as exc:

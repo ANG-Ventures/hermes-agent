@@ -179,7 +179,14 @@ def test_workspace_deletion_has_one_choke_point():
                 if name == "rmtree" or {"worktree", "remove"} <= strings or any("rm -rf" in s for s in strings):
                     removals.append((path.name, node.name))
     assert removals
-    assert set(removals) == {("kanban_survivor.py", "remove_workspace_dir")}
+    assert set(removals) == {
+        ("kanban_survivor.py", "remove_workspace_dir"),
+        # Reviewed exception (t_dad1edd7 QA r2 R1): discards dead mirror
+        # staging repos -- <mirrors>/<owner>/.<repo>.git.build-* only, under
+        # the mirror flock, never a workspace. Resuming them in place instead
+        # promoted a killed fetch's tmp_pack residue into the precious mirror.
+        ("kanban_clone.py", "_discard_dead_builds"),
+    }
 
 
 @pytest.mark.parametrize("target", [None, "missing"])
