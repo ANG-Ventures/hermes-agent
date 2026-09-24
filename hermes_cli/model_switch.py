@@ -1735,6 +1735,10 @@ def _resolve_named_custom_model_id(
 # Core model-switching pipeline
 # ---------------------------------------------------------------------------
 
+class _SkipCatalogProbe(Exception):
+    """Internal sentinel: ``switch_model(probe_catalog=False)`` skips validation."""
+
+
 def switch_model(
     raw_input: str,
     current_provider: str,
@@ -1745,8 +1749,19 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    *,
+    probe_catalog: bool = True,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
+
+    ``probe_catalog=False`` skips every NETWORK step (the live ``GET
+    /v1/models`` validation probe and the models.dev fetches) and returns the
+    credential/route resolution only.  Callers that merely RE-RESOLVE an
+    already-accepted route -- the gateway's persisted-override rehydrate and
+    persistability check -- must use it: the probe is a synchronous urllib GET
+    with a 5 s timeout, and those callers run on the gateway event loop
+    (2026-09-24: 33 Discord /model "application did not respond" + 10 s
+    PHASE=event_loop_blocked at ``open_credentialed_url``).
 
     Resolution chain:
 
@@ -2400,6 +2415,9 @@ def switch_model(
 
     # --- Validate ---
     try:
+        if not probe_catalog:
+            # Re-resolution of an already-accepted route: no live probe.
+            raise _SkipCatalogProbe
         validation = validate_requested_model(
             new_model,
             target_provider,
@@ -2423,6 +2441,13 @@ def switch_model(
                 )
             ),
         )
+    except _SkipCatalogProbe:
+        validation = {
+            "accepted": True,
+            "persist": True,
+            "recognized": False,
+            "message": None,
+        }
     except Exception as e:
         validation = {
             "accepted": False,
@@ -2560,10 +2585,12 @@ def switch_model(
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
     # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model, allow_network=True)
+    capabilities = get_model_capabilities(
+        target_provider, new_model, allow_network=probe_catalog
+    )
 
     # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model, allow_network=True)
+    model_info = get_model_info(target_provider, new_model, allow_network=probe_catalog)
 
     # --- Collect warnings ---
     warnings: list[str] = []

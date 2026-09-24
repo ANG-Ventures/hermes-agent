@@ -11645,6 +11645,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 explicit_provider=provider,
                 user_providers=user_provs,
                 custom_providers=custom_provs,
+                # Credential re-resolution only: NO live /v1/models probe.
+                # This runs on the event loop (every /model persist and every
+                # lazy rehydrate); the probe is a sync urllib GET with a 5 s
+                # timeout that blocked Discord for 10 s on 2026-09-24.
+                probe_catalog=False,
             )
         except Exception:
             return None
@@ -29082,8 +29087,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Slash-command loops dispatch through the command
                         # path and never hit the post-turn completion hook —
                         # complete the tick immediately (caps + scheduling).
+                        # complete_tick runs the sync --until aux-LLM judge
+                        # (network) — keep it off the event loop, same as the
+                        # post-turn completion hook.
                         if wakeup.lstrip().startswith("/"):
-                            mgr.complete_tick("")
+                            await asyncio.to_thread(mgr.complete_tick, "")
                     except Exception as exc:
                         logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
                         try:
