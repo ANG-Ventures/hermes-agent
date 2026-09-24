@@ -261,9 +261,15 @@ def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home, mo
         monkeypatch.setattr(psutil, "Process", dead_claimer)
         for expected in (1, 2):
             kb.claim_task(conn, t, claimer=f"{host}:999991")
-            # No _set_worker_pid: the claimer never spawned a worker.
+            # No _set_worker_pid: the claimer never spawned a worker. Age the
+            # claim past the dead-claimer launch bound as well as its TTL.
             conn.execute(
                 "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                (int(time.time()) - 3600, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                 (int(time.time()) - 3600, t),
             )
             assert kb.release_stale_claims(
