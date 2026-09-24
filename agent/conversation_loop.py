@@ -551,6 +551,157 @@ def _canonical_usage_from_response(
     return normalize_usage(response_usage, provider=provider, api_mode=api_mode)
 
 
+def _bump_counter(agent: Any, name: str, delta: Any) -> None:
+    setattr(agent, name, int(getattr(agent, name, 0) or 0) + int(delta or 0))
+
+
+def _account_unaccepted_billed_call(
+    agent: Any,
+    entry: dict[str, Any],
+    turn_calls: Optional[list[dict[str, Any]]],
+    turn_id: Optional[str],
+) -> None:
+    """Fold ONE billed-but-unaccepted response into the session + turn totals.
+
+    Mirrors the accept-site commit (session_* counters, absorbing UNKNOWN
+    latches, cost, state.db delta, Blackbox ``_turn_calls``) but prices the
+    call at the route that actually served it (captured at the transport
+    chokepoint), not at the fallback the agent has since switched to. The
+    ``last_turn_usage`` snapshot and the context compressor are deliberately
+    NOT touched: a rejected response is spend, not the conversation's window.
+    """
+    provider = entry.get("provider") or None
+    model = entry.get("model") or ""
+    base_url = entry.get("base_url") or None
+    usage = _canonical_usage_from_response(
+        entry.get("response"), provider=provider, api_mode=entry.get("api_mode") or None
+    )
+    usage_flags = {key: bool(getattr(usage, key)) for key in USAGE_UNKNOWN_FIELDS}
+    prior_api_calls = int(getattr(agent, "session_api_calls", 0) or 0)
+    _bump_counter(agent, "session_prompt_tokens", usage.prompt_tokens)
+    _bump_counter(agent, "session_completion_tokens", usage.output_tokens)
+    _bump_counter(agent, "session_total_tokens", usage.total_tokens)
+    _bump_counter(agent, "session_api_calls", 1)
+    _bump_counter(agent, "session_input_tokens", usage.input_tokens)
+    _bump_counter(agent, "session_output_tokens", usage.output_tokens)
+    _bump_counter(agent, "session_cache_read_tokens", usage.cache_read_tokens)
+    _bump_counter(agent, "session_cache_write_tokens", usage.cache_write_tokens)
+    _bump_counter(agent, "session_reasoning_tokens", usage.reasoning_tokens)
+    for flag, is_set in usage_flags.items():
+        if is_set:
+            setattr(agent, f"session_{flag}", True)
+    if turn_calls is not None and entry.get("turn_id", "") == (turn_id or ""):
+        turn_calls.append({
+            **usage_flags,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_read_tokens": usage.cache_read_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+            "output_tokens_unknown": bool(usage.output_tokens_unknown),
+            "latency_s": 0.0,
+            "composition": None,
+            # Price at the serving route (Blackbox cost.py reads these).
+            "provider": provider or "",
+            "model": model,
+            "base_url": base_url or "",
+            "accepted": False,
+        })
+    cost_result = estimate_usage_cost(
+        model, usage, provider=provider, base_url=base_url
+    )
+    cost_status = _session_cost_status_with_known_spend(
+        _moa_session_cost_status(cost_result, [], None),
+        session_cost_usd=getattr(agent, "session_estimated_cost_usd", 0.0),
+    )
+    if cost_result.amount_usd is not None:
+        agent.session_estimated_cost_usd = float(
+            getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0
+        ) + float(cost_result.amount_usd)
+    agent.session_cost_status = merge_session_cost_status(
+        getattr(agent, "session_cost_status", None),
+        cost_status,
+        prior_api_calls=prior_api_calls,
+    )
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db and session_id:
+        try:
+            if not getattr(agent, "_session_db_created", True):
+                agent._ensure_db_session()
+            session_db.queue_token_counts(
+                session_id,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
+                estimated_cost_usd=(
+                    float(cost_result.amount_usd)
+                    if cost_result.amount_usd is not None
+                    else None
+                ),
+                cost_status=cost_status,
+                cost_source=cost_result.source,
+                billing_provider=provider,
+                billing_base_url=base_url,
+                billing_mode="subscription_included"
+                if cost_result.status == "included" else None,
+                model=model,
+                api_call_count=1,
+                **usage_flags,
+            )
+        except Exception as exc:
+            logger.debug("Unaccepted billed-call persistence failed: %s", exc)
+
+
+def _settle_unaccepted_billed_responses(
+    agent: Any,
+    turn_calls: Optional[list[dict[str, Any]]],
+    turn_id: Optional[str],
+    *,
+    committing: bool = False,
+) -> int:
+    """Account every billed response the loop did not accept; return the count.
+
+    ``agent._billed_unaccounted`` is filled by the transport chokepoint
+    (``chat_completion_helpers._note_billed_response``) once per billed
+    HTTP-200 — the same event that writes the per-call ledger row. Settling
+    it here keeps ``session_api_calls`` / the turn rollup equal to the ledger:
+
+    * ``committing=True`` (the accept site): the LATEST entry is the response
+      being committed and is accounted by the normal path, so it is dropped;
+      anything older was billed and rejected within this attempt.
+    * ``committing=False`` (start of a model attempt, turn start, turn end):
+      no response is being accepted, so every parked entry was rejected.
+
+    Telemetry must never break the conversation loop.
+    """
+    pending = getattr(agent, "_billed_unaccounted", None)
+    if not isinstance(pending, list) or not pending:
+        return 0
+    entries = list(pending)
+    del pending[:]
+    if committing:
+        entries = entries[:-1]
+    settled = 0
+    for entry in entries:
+        try:
+            _account_unaccepted_billed_call(agent, entry, turn_calls, turn_id)
+            settled += 1
+        except Exception:
+            logger.warning("Unaccepted billed-call accounting failed", exc_info=True)
+    if settled:
+        logger.info(
+            "Accounted %d billed provider response(s) the loop rejected "
+            "(turn=%s)", settled, turn_id or "",
+        )
+    return settled
+
+
 def _capture_measured_usage_anchor(usage: Any, messages: list[dict[str, Any]]) -> Any:
     """Build an exact context anchor only from fully measured usage."""
     if bool(getattr(usage, "total_tokens_unknown", False)):
@@ -2360,6 +2511,11 @@ def run_conversation(
     # successful provider call appends a dict at the usage-commit site below;
     # folded into the on_session_end `turn_usage` kwarg at the end of the turn.
     _turn_calls: List[Dict[str, Any]] = []
+    # A previous turn that ended through an early ``return`` (not via
+    # finalize_turn) can leave billed-but-unaccepted responses parked. Their
+    # tokens were spent: count them in the session totals now (they carry the
+    # old turn id, so they are NOT added to this turn's rollup).
+    _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
     final_response = None
     interrupted = False
     failed = False
@@ -3937,6 +4093,11 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                # Any billed response still parked here belongs to an EARLIER
+                # attempt the loop rejected (failover, retry, redirect) — the
+                # accept site would have consumed it. Settle before the next
+                # call so the per-turn totals match the per-call ledger.
+                _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -5091,6 +5252,12 @@ def run_conversation(
                 # in that case (see `_canonical_usage_from_response`), so every
                 # consumer below refuses to present its zeros as measurements.
                 if response is not None:
+                    # Consume this response's billed-response entry (it is
+                    # accounted right below) and settle any OLDER entry from
+                    # this attempt that the loop did not accept.
+                    _settle_unaccepted_billed_responses(
+                        agent, _turn_calls, turn_id, committing=True
+                    )
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
                     # from the error message), not guessed probe tiers.
@@ -9919,6 +10086,9 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
+    # Turn end: a response billed after the last accepted one (e.g. rejected
+    # and then the loop broke out) is spent inside THIS turn.
+    _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
     return finalize_turn(
         agent,
         final_response=final_response,
