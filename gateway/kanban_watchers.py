@@ -486,7 +486,10 @@ def _guard_stuck_cards(results) -> tuple[list[tuple[str, dict]], set[str]]:
             continue
         try:
             with kb.connect_closing(board=board) as conn:
-                cards.extend((board, item) for item in kb.respawn_guard_stuck_tasks(conn))
+                cards.extend(
+                    (board, item)
+                    for item in kb.respawn_guard_stuck_tasks(conn, board=board)
+                )
             observed_boards.add(board)
         except Exception:
             logger.exception("kanban dispatcher: guard-stuck probe failed on %s", board)

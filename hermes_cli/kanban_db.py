@@ -84,6 +84,7 @@ import os
 import re
 import random
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -15275,19 +15276,50 @@ RESPAWN_GUARD_STUCK_SECONDS = 30 * 60
 _RESPAWN_GUARD_STUCK_FRESH_SECONDS = 10 * 60
 
 
+def render_operator_command(board: str, verb: str, *args: str) -> str:
+    """Render a runnable ``hermes kanban`` command for an operator page.
+
+    The ONLY place an alert/hint may build a ``hermes kanban`` command
+    string. It always pins ``--board <slug>`` (the default board included),
+    so the command acts on the card's board no matter which board is current
+    where the operator pastes it. Arguments are shell-quoted. 2026-09-24,
+    t_7d7ff489 r5: a hand-assembled unscoped verb failed (rc1 "not found")
+    against a secondary-board card.
+    """
+    return shlex.join(["hermes", "kanban", "--board", str(board), verb, *map(str, args)])
+
+
+# Event kinds that can change ``check_respawn_guard``'s ``active_pr`` answer:
+# the intent/requeue kinds the guard itself reads, plus the worker's own
+# dependency block and a spawn (which consumes intent). Only these restart
+# the continuous-guard age in ``respawn_guard_stuck_tasks``; everything else
+# (commented, heartbeat, linked, attached, ...) is data. Any trip away from
+# READY returns through one of the requeue kinds, so status transitions are
+# covered too.
+_RESPAWN_GUARD_STUCK_RESET_KINDS: tuple[str, ...] = (
+    *_RESPAWN_GUARD_FAILURE_RESET_KINDS,
+    "dependency_wait",
+    "spawned",
+)
+
+
 def respawn_guard_stuck_tasks(
     conn: sqlite3.Connection,
     *,
+    board: Optional[str] = None,
     min_seconds: int = RESPAWN_GUARD_STUCK_SECONDS,
     now: Optional[int] = None,
 ) -> list[dict]:
     """Return ready+assigned+unclaimed cards stuck behind ``active_pr``.
 
-    A card qualifies when every event since its last non-guard event is a
-    ``respawn_guarded`` row with reason ``active_pr``, the first of those is at
-    least ``min_seconds`` old, and the newest is recent. Any other event (a
-    comment, an operator verb, a spawn) resets the streak. Each entry names
-    the operator verb that clears it.
+    A card qualifies when it has been guarded with ``active_pr`` since the
+    last event that could have changed the guard's answer
+    (``_RESPAWN_GUARD_STUCK_RESET_KINDS``, or a guard decline for another
+    reason), the first such guard row is at least ``min_seconds`` old, and the
+    newest is recent. Data-only events (a progress comment, heartbeat,
+    attachment) do NOT restart the age. Each entry carries ``clear_verb``,
+    rendered by ``render_operator_command`` for ``board`` (defaults to the
+    current board; callers holding another board's connection must pass it).
 
     ``respawn_guarded`` is a benign decline for the stall streak, so without
     this probe a card held by the guard is indistinguishable from a card that
@@ -15295,6 +15327,8 @@ def respawn_guard_stuck_tasks(
     8h and 14h.
     """
     now = int(time.time()) if now is None else int(now)
+    board = board or get_current_board()
+    reset_marks = ", ".join("?" for _ in _RESPAWN_GUARD_STUCK_RESET_KINDS)
     out: list[dict] = []
     for row in conn.execute(
         "SELECT id, assignee FROM tasks WHERE status = 'ready' "
@@ -15303,9 +15337,10 @@ def respawn_guard_stuck_tasks(
         task_id = row["id"]
         last_other = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
-            "WHERE task_id = ? AND (kind != 'respawn_guarded' "
-            "OR COALESCE(json_extract(payload, '$.reason'), '') != 'active_pr')",
-            (task_id,),
+            f"WHERE task_id = ? AND (kind IN ({reset_marks}) "
+            "OR (kind = 'respawn_guarded' "
+            "AND COALESCE(json_extract(payload, '$.reason'), '') != 'active_pr'))",
+            (task_id, *_RESPAWN_GUARD_STUCK_RESET_KINDS),
         ).fetchone()["m"]
         streak = conn.execute(
             "SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, "
@@ -15328,7 +15363,7 @@ def respawn_guard_stuck_tasks(
             "guarded_since": first_at,
             "guarded_seconds": now - first_at,
             "guard_events": int(streak["n"]),
-            "clear_verb": f'hermes kanban requeue {task_id} "<reason>"',
+            "clear_verb": render_operator_command(board, "requeue", task_id, "<reason>"),
         })
     return out
 

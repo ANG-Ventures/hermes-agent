@@ -3826,6 +3826,73 @@ def test_pr_intent_has_one_event_id_ordering_seam():
                    for value in sql_literals)
 
 
+def test_guard_stuck_age_survives_progress_comment_during_real_dispatch(kanban_home, monkeypatch):
+    import hermes_cli.profiles as profmod
+
+    now = int(time.time())
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name == "alice")
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda *args: "OPEN")
+    with kb.connect() as conn:
+        plain = kb.create_task(conn, title="no comment", assignee="alice")
+        noted = kb.create_task(conn, title="progress comment", assignee="alice")
+        for tid in (plain, noted):
+            kb.add_comment(conn, tid, "qa", "https://github.com/o/r/pull/9")
+        spawn = lambda *args, **kw: (_ for _ in ()).throw(AssertionError("guarded card spawned"))
+        first = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert {plain, noted} <= {tid for tid, reason in first.respawn_guarded if reason == "active_pr"}
+        conn.execute("UPDATE task_events SET created_at=? WHERE kind='respawn_guarded'", (now - 1861,))
+        conn.commit()
+        kb.add_comment(conn, noted, "qa", "Progress only; same PR")
+        second = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert {plain, noted} <= {tid for tid, reason in second.respawn_guarded if reason == "active_pr"}
+        stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
+        assert {plain, noted} == {row["task_id"] for row in stuck}
+        assert all(row["guarded_seconds"] >= 1861 for row in stuck)
+        assert kb.requeue_task(conn, noted, actor="operator", reason="resume") == (True, None)
+        assert {row["task_id"] for row in kb.respawn_guard_stuck_tasks(conn, now=now)} == {plain}
+
+
+def test_guard_stuck_recovery_command_runs_on_each_board(kanban_home, monkeypatch):
+    import shlex
+    kb.create_board("secondary")
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    now = int(time.time())
+    for board in ("default", "secondary"):
+        with kb.connect_closing(board=board) as conn:
+            tid = kb.create_task(conn, title="stuck", assignee="alice")
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+            conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1861, tid))
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+            item, = kb.respawn_guard_stuck_tasks(conn, board=board, now=now)
+            command = shlex.split(item["clear_verb"].replace("<reason>", "continue PR"))
+            assert command[:4] == ["hermes", "kanban", "--board", board]
+        result = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", *command[1:]],
+            cwd=Path(__file__).resolve().parents[2], env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        with kb.connect_closing(board=board) as conn:
+            assert kb.list_events(conn, tid)[-1].kind == "requeued"
+            assert kb.respawn_guard_stuck_tasks(conn, board=board, now=now) == []
+
+
+def test_guard_stuck_recovery_command_has_one_renderer():
+    import ast
+    import inspect
+    from gateway import kanban_watchers
+    for module in (kb, kanban_watchers):
+        tree = ast.parse(inspect.getsource(module))
+        builders = [node for node in ast.walk(tree) if isinstance(node, ast.JoinedStr)
+                    and node.values and isinstance(node.values[0], ast.Constant)
+                    and isinstance(node.values[0].value, str)
+                    and node.values[0].value.startswith("hermes kanban ")]
+        assert all(any(isinstance(parent, ast.FunctionDef) and parent.name == "render_operator_command"
+                       and node in ast.walk(parent) for parent in ast.walk(tree)
+                       if isinstance(parent, ast.FunctionDef)) for node in builders)
+
+
 def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
     now = int(time.time())
     with kb.connect() as conn:
@@ -3836,7 +3903,7 @@ def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
         assert kb.respawn_guard_stuck_tasks(conn, now=now - 120) == []
         stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
         assert [x["task_id"] for x in stuck] == [tid]
-        assert stuck[0]["clear_verb"] == f'hermes kanban requeue {tid} "<reason>"'
+        assert stuck[0]["clear_verb"] == kb.render_operator_command("default", "requeue", tid, "<reason>")
         kb._append_event(conn, tid, "requeued", {"actor": "operator", "reason": "retry"})
         assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
 

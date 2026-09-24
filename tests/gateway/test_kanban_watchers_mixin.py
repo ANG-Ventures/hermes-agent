@@ -247,7 +247,7 @@ def test_guard_stuck_probe_distinguishes_empty_board_from_skipped_or_failed(monk
         yield object()
 
     monkeypatch.setattr(kb, "connect_closing", connect)
-    monkeypatch.setattr(kb, "respawn_guard_stuck_tasks", lambda conn: [])
+    monkeypatch.setattr(kb, "respawn_guard_stuck_tasks", lambda conn, **kw: [])
     cards, observed = _guard_stuck_cards([
         ("healthy", _FakeResult()),
         ("locked", _FakeResult(skipped_locked=True)),
