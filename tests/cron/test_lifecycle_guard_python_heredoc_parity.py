@@ -157,3 +157,53 @@ def test_open_loop_non_name_binding_does_not_hide_log(tmp_path, binding, nested)
     unsafe = "import json, os\nclass J(Exception):\n    loads=staticmethod(os.system)\n" + binding
     unsafe += "".join("    " + line for line in loop.splitlines(keepends=True)) if nested else loop
     assert guard(f"python3 - <<'PY'\n{unsafe}PY", cwd=str(tmp_path))
+
+
+_OPEN_LOOP = (
+    "for line in reversed(open('{log}').read().splitlines()):\n"
+    "    d=json.loads(line)\n"
+    "    print(d)\n"
+)
+
+
+@pytest.mark.parametrize("prefix", [
+    # Changing a trusted object in place binds no name. The mask must be
+    # granted by a whole-body allowlist, not by a list of binding shapes.
+    "import json\njson.__dict__.update(loads=print)\n",
+    "import json\nobject.__setattr__(json, 'loads', print)\n",
+    "import sys, types\nsys.modules.update(json=types.SimpleNamespace(loads=print))\nimport json\n",
+    "import json, builtins\nbuiltins.__dict__.update(print=len)\n",
+    "import json\nfrom io import *\n",
+    "import json\nimport importlib\n",
+    "import json\njson.decoder.scanstring.__class__\n",
+    "import json\nvars(json).update(loads=print)\n",
+    "import json\ngetattr(json, 'loads')\n",
+    "import json\ntype(json)\n",
+    "import json\ndef hook(value):\n    return value\n",
+    "import json\nhook = lambda value: value\n",
+    "import json\nwith open('/dev/null') as handle: pass\n",
+    "import json\nimport json as j\n",
+    "import json\nfrom pathlib import Path as P\n",
+    "import json\njson.JSONDecoder.decode = print\n",
+])
+def test_open_loop_mask_requires_whole_body_allowlist(tmp_path, prefix):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    ordinary = "import json\n" + _OPEN_LOOP.format(log=log)
+    unsafe = prefix + _OPEN_LOOP.format(log=log)
+    assert not guard(f"echo ok; python3 - <<'PY'\n{ordinary}PY", cwd=str(tmp_path))
+    assert guard(f"echo ok; python3 - <<'PY'\n{unsafe}PY", cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("call", [
+    "subprocess.run(['sqlite3', 'x'], shell=True)",
+    "subprocess.run(cmd)",
+    "subprocess.Popen(['sqlite3', 'x'])",
+    "subprocess.run(['sqlite3', 'x'], env=dict())",
+    "json.load(open('/dev/null'))",
+])
+def test_open_loop_mask_refuses_non_allowlisted_calls(tmp_path, call):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body = "import json, subprocess\ncmd = ['sqlite3']\n" + call + "\n" + _OPEN_LOOP.format(log=log)
+    assert guard(f"echo ok; python3 - <<'PY'\n{body}PY", cwd=str(tmp_path))
