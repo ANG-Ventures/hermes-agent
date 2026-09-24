@@ -4317,7 +4317,29 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # here, diverging the summary request's prefix at the EARLIEST
             # sidecar-carrying message and re-prefilling the whole transcript
             # at exactly the moment the context is largest.
-            substitute_api_content(api_msg)
+            _api_content = substitute_api_content(api_msg)
+            # Display-only timeline metadata (#764 confab notice, model-switch
+            # / typed event rows, hidden redirect placeholders). Never a
+            # provider field — mirror the main loop's api_msg builder, which
+            # pops both from every outgoing copy. Without this a DB-reloaded
+            # confab row sends display_kind + display_metadata (bridge
+            # request_id, detector grammar label) on the summary request, and
+            # strict Chat Completions gateways reject the unknown keys.
+            _display_kind = api_msg.pop("display_kind", None)
+            api_msg.pop("display_metadata", None)
+            # Same legacy hidden-placeholder heal as the main loop (#88955):
+            # once display_kind is stripped, an empty hidden assistant row
+            # with no sidecar would otherwise go out as empty assistant text.
+            if (
+                _display_kind == "hidden"
+                and api_msg.get("role") == "assistant"
+                and not _api_content
+                and not (api_msg.get("content") or "").strip()
+                and not api_msg.get("tool_calls")
+            ):
+                from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+
+                api_msg["content"] = _INTERRUPTED_PLACEHOLDER
             if _needs_sanitize:
                 # In MoA mode, agent.model is the virtual preset name,
                 # not the actual aggregator model.  Resolve the real
