@@ -114,11 +114,62 @@ def _row(conn, tid):
     ).fetchone()
 
 
+def _age_claim(conn, tid, run_id, seconds):
+    """Backdate the claim (task + current run) by ``seconds``."""
+    old = int(time.time()) - seconds
+    conn.execute("UPDATE tasks SET started_at=? WHERE id=?", (old, tid))
+    conn.execute("UPDATE task_runs SET started_at=? WHERE id=?", (old, run_id))
+    conn.commit()
+
+
+_PAST_LAUNCH_BOUND = kb.DEAD_CLAIMER_LAUNCH_BOUND_SECONDS + 5
+
+
+def _dead_pid() -> int:
+    """A real pid that has exited (not a guessed number)."""
+    c = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL)
+    c.wait(timeout=10)
+    assert not psutil.pid_exists(c.pid)
+    return c.pid
+
+
+def _load_dashboard_api():
+    import importlib.util
+    path = Path(__file__).resolve().parents[2] / "plugins/kanban/dashboard/plugin_api.py"
+    spec = importlib.util.spec_from_file_location("t9d7_plugin_api", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _release(conn, tid, run_id, path):
+    """Drive one release entry point; return True when it released the claim."""
+    if path == "manual":
+        return kb.reclaim_task(conn, tid, reason="worker sweep: missing pid")
+    if path == "ttl":
+        conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, tid))
+        conn.commit()
+        return kb.release_stale_claims(conn) == 1
+    if path == "stale":
+        # Keep the claim age the caller set; only make the heartbeat column
+        # stale so detect_stale_running considers the row at all.
+        old = int(time.time()) - 7200
+        conn.execute("UPDATE tasks SET last_heartbeat_at=? WHERE id=?", (old, tid))
+        conn.commit()
+        return kb.detect_stale_running(conn, stale_timeout_seconds=30) == [tid]
+    if path == "dashboard":
+        return _load_dashboard_api()._set_status_direct(conn, tid, "ready")
+    raise AssertionError(path)
+
+
 def test_dead_local_claimer_without_worker_pid_is_reclaimed(conn, monkeypatch):
     """A dead claimer without any worker evidence can release its claim."""
     dead_pid = 999991
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{dead_pid}"
     tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
+    _age_claim(conn, tid, run_id, _PAST_LAUNCH_BOUND)
 
     def dead_claimer(pid):
         assert pid == dead_pid
@@ -132,6 +183,7 @@ def test_dead_local_claimer_without_worker_pid_is_reclaimed(conn, monkeypatch):
     payload = _events(conn, tid, "reclaimed")[-1]
     assert payload["terminated"] is True
     assert payload["claimer_pid_dead"] == dead_pid
+    assert payload["dead_claimer_release_basis"] == "launch_bound"
     assert not _events(conn, tid, "reclaim_refused")
 
 
@@ -139,12 +191,130 @@ def test_heartbeat_from_previous_run_does_not_hold_dead_claimer(conn, monkeypatc
     dead_pid = 999995
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{dead_pid}"
     tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
+    _age_claim(conn, tid, run_id, _PAST_LAUNCH_BOUND)
     with kb.write_txn(conn):
         kb._append_event(conn, tid, "heartbeat", run_id=run_id - 1)
     def dead(pid):
         raise psutil.NoSuchProcess(pid)
     monkeypatch.setattr(psutil, "Process", dead)
     assert kb.reclaim_task(conn, tid) is True
+
+
+@pytest.mark.parametrize("reclaim_path", ["manual", "ttl", "stale", "dashboard"])
+def test_dead_claimer_with_unstamped_orphan_before_first_heartbeat_keeps_claim(
+    conn, reclaim_path,
+):
+    """Argus r2 B3: an orphan that has not heartbeated YET is still a worker.
+
+    Real processes: the claimer has exited, a detached orphan is alive, no
+    heartbeat or pid landed, and the claim is 60 s old (past the sweep's 45 s
+    launch grace; live p99 first heartbeat is 69 s, max 708 s). No release
+    path may free the claim or let a second worker spawn.
+    """
+    lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
+    tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
+    _age_claim(conn, tid, run_id, 60)
+    orphan = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        assert _release(conn, tid, run_id, reclaim_path) is False
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 424242)
+        assert tid not in spawned
+        assert orphan.poll() is None
+        assert _row(conn, tid)["status"] == "running"
+        assert _row(conn, tid)["claim_lock"] == lock
+        assert not _events(conn, tid, "reclaimed")
+    finally:
+        orphan.kill()
+        orphan.wait(timeout=10)
+
+
+@pytest.mark.parametrize("reclaim_path", ["manual", "ttl", "stale", "dashboard"])
+def test_dead_claimer_orphan_that_heartbeated_then_died_is_released_once_stale(
+    conn, reclaim_path,
+):
+    """Argus r2 B5: heartbeat-then-die must not hold the card forever.
+
+    Once the newest current-run worker evidence is older than
+    DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS (the bound release_stale_claims
+    already applies to a live-pid worker), the claim is released.
+    """
+    lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
+    tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
+    orphan = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    assert kb.heartbeat_worker(conn, tid, note="orphan alive once")
+    orphan.kill()
+    orphan.wait(timeout=10)
+    aged = int(time.time()) - kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS - 5
+    conn.execute(
+        "UPDATE task_events SET created_at=? WHERE task_id=? AND run_id=? AND kind='heartbeat'",
+        (aged, tid, run_id),
+    )
+    conn.commit()
+    _age_claim(conn, tid, run_id, kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS + 10)
+    assert _release(conn, tid, run_id, reclaim_path) is True
+    assert _row(conn, tid)["claim_lock"] is None
+    assert _row(conn, tid)["status"] != "running"
+
+
+def test_dead_claimer_fresh_heartbeat_holds_even_if_orphan_is_gone(conn):
+    """The bound, not a guess about the orphan, decides: fresh evidence holds."""
+    lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
+    tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
+    _age_claim(conn, tid, run_id, _PAST_LAUNCH_BOUND)
+    assert kb.heartbeat_worker(conn, tid, note="recent")
+    assert kb.reclaim_task(conn, tid) is False
+    refused = _events(conn, tid, "reclaim_refused")[-1]
+    assert refused["dead_claimer_release_basis"] == "evidence_stale_bound"
+    assert refused["unstamped_worker_evidence"] == "heartbeat"
+
+
+def test_dead_claimer_inside_launch_bound_is_held(conn):
+    lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
+    tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
+    _age_claim(conn, tid, run_id, kb.DEAD_CLAIMER_LAUNCH_BOUND_SECONDS - 60)
+    assert kb.reclaim_task(conn, tid) is False
+    assert _row(conn, tid)["claim_lock"] == lock
+
+
+def test_missing_run_context_fails_closed_for_dead_claimer(conn):
+    """Omitting conn/task_id can never turn a dead claimer into a release."""
+    lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
+    info = kb._terminate_reclaimed_worker(None, lock)
+    assert kb._worker_survived_termination(info) is True
+    assert info["unstamped_worker_check"] == "skipped_no_run_context"
+
+
+def test_every_gated_termination_call_site_passes_run_context():
+    """Argus r2 B2 class guard: a release gate must hand the run to the probe.
+
+    Any call whose result is bound to a name (i.e. used to decide a release)
+    must pass ``conn=`` and ``task_id=``. Bare post-commit kill calls are
+    fire-and-forget and do not gate a release.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[2]
+    offenders = []
+    for rel in ("hermes_cli/kanban_db.py", "plugins/kanban/dashboard/plugin_api.py"):
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            fn = node.value.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+            if name != "_terminate_reclaimed_worker":
+                continue
+            kws = {k.arg for k in node.value.keywords}
+            if not {"conn", "task_id"} <= kws:
+                offenders.append(f"{rel}:{node.lineno}")
+    assert not offenders, f"gated call sites missing conn/task_id: {offenders}"
 
 
 @pytest.mark.parametrize("reclaim_path", ["manual", "ttl", "stale"])
@@ -197,6 +367,7 @@ def test_expired_dead_claimer_is_not_renewed(conn, monkeypatch):
     dead_pid = 999992
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{dead_pid}"
     tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
+    _age_claim(conn, tid, run_id, _PAST_LAUNCH_BOUND)
     conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, tid))
     conn.commit()
 

@@ -458,6 +458,14 @@ DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 # signal lands, and the following tick reclaims cleanly.
 RECLAIM_DEFER_GRACE_SECONDS = 120
 
+# A pid-less claim whose local CLAIMER (dispatching gateway) is dead may still
+# have a detached worker: Popen precedes the pid stamp. With no heartbeat on
+# the current run yet, hold the claim this long after it was taken before
+# treating the spawn as never-happened. Measured 2026-09-24 over 12,732 live
+# runs: claim-to-first-heartbeat p50 6 s, p90 21 s, p99 69 s, max 708 s.
+# The claim TTL (900 s) sits above that max. See _dead_claimer_release_at.
+DEAD_CLAIMER_LAUNCH_BOUND_SECONDS = DEFAULT_CLAIM_TTL_SECONDS
+
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     """Return the effective claim TTL, honoring the kanban env override.
@@ -13468,6 +13476,56 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _dead_claimer_release_at(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[Optional[int], str, Optional[str]]:
+    """Earliest time a pid-less claim with a DEAD claimer may be released.
+
+    A dead claimer is not proof that no worker exists: ``_default_spawn``
+    calls ``Popen(start_new_session=True)`` before ``_set_worker_pid``
+    commits, so a gateway killed in that window leaves a live orphan with no
+    stamped pid. The row cannot tell such an orphan from a spawn that never
+    happened, so release is time-bounded on the CURRENT run only:
+
+    * no worker evidence yet (no ``heartbeat``/``spawned`` event on this run):
+      release after ``DEAD_CLAIMER_LAUNCH_BOUND_SECONDS`` from the claim. An
+      orphan that has not heartbeated by then is outside every observed launch
+      (live ledger 2026-09-24, 12,732 runs: first heartbeat p99 69 s, max 708 s).
+    * worker evidence exists: release after the newest evidence is older than
+      ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` — the same staleness rule
+      ``release_stale_claims`` applies to a worker whose pid IS alive. Without
+      this bound an orphan that heartbeated once and then died held the card
+      forever (the stuck-running shape this path exists to end).
+
+    Returns ``(release_at, basis, evidence_kind)``; ``release_at`` is None when
+    there is no current run to anchor the bound (held).
+    """
+    run = conn.execute(
+        "SELECT r.id, r.started_at FROM tasks t "
+        "JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
+        (task_id,),
+    ).fetchone()
+    if run is None or run["started_at"] is None:
+        return None, "no_current_run", None
+    evidence = conn.execute(
+        "SELECT kind, created_at FROM task_events WHERE task_id = ? "
+        "AND run_id = ? AND kind IN ('heartbeat', 'spawned') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, int(run["id"])),
+    ).fetchone()
+    if evidence is None:
+        return (
+            int(run["started_at"]) + DEAD_CLAIMER_LAUNCH_BOUND_SECONDS,
+            "launch_bound",
+            None,
+        )
+    return (
+        int(evidence["created_at"]) + DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS,
+        "evidence_stale_bound",
+        evidence["kind"],
+    )
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -13495,36 +13553,43 @@ def _terminate_reclaimed_worker(
     info["host_local"] = True
 
     if not pid or pid <= 0:
-        # Popen precedes _set_worker_pid. A dead claimer can leave a detached,
-        # unstamped worker behind; any heartbeat/spawned event on THIS run is
-        # evidence that a worker existed, even when its heartbeat is stale.
-        # Without a run-bound check, a prior attempt's heartbeat would wedge
-        # a genuinely never-spawned current attempt.
+        # OUR host holds this claim but no worker pid was ever stamped. That
+        # is UNKNOWN liveness unless we can prove otherwise (t_09180e10).
         info["liveness_unprovable"] = True
-        if conn is not None and task_id is not None:
-            run_id = _current_run_id(conn, task_id)
-            if run_id is not None:
-                evidence = conn.execute(
-                    "SELECT kind FROM task_events WHERE task_id=? AND run_id=? "
-                    "AND kind IN ('heartbeat', 'spawned') LIMIT 1",
-                    (task_id, run_id),
-                ).fetchone()
-                if evidence is not None:
-                    info["unstamped_worker_evidence"] = evidence["kind"]
-                    return info
+        if conn is None or task_id is None:
+            # Fail closed on omission: without the run row we cannot rule out
+            # a detached worker whose pid was never stamped, so a caller that
+            # forgets conn/task_id must hold the claim, never release it.
+            info["unstamped_worker_check"] = "skipped_no_run_context"
+            return info
         claimer_pid = 0
         try:
             claimer_pid = int(str(claim_lock)[len(host_prefix):])
-            if claimer_pid > 0:
-                # Equivalent to kill(pid, 0), without Windows' destructive
-                # CTRL_C_EVENT behavior for signal 0.
-                psutil.Process(claimer_pid)
+            if claimer_pid <= 0:
+                return info
+            # Equivalent to kill(pid, 0), without Windows' destructive
+            # CTRL_C_EVENT behavior for signal 0.
+            psutil.Process(claimer_pid)
+            # Claimer alive: its spawn may still be in flight (launch grace).
+            return info
         except psutil.NoSuchProcess:
-            info["liveness_unprovable"] = False
-            info["terminated"] = True
-            info["claimer_pid_dead"] = claimer_pid
-        except (ValueError, OSError, psutil.AccessDenied):
             pass
+        except (ValueError, OSError, psutil.AccessDenied):
+            return info
+        # The claimer is dead, but that alone does not prove no worker exists:
+        # Popen(start_new_session=True) precedes _set_worker_pid, so a claimer
+        # killed in between leaves a live, unstamped orphan. Release only once
+        # no worker can still be alive for THIS run (see _dead_claimer_release_at).
+        info["claimer_pid_dead"] = claimer_pid
+        release_at, basis, evidence_kind = _dead_claimer_release_at(conn, task_id)
+        info["dead_claimer_release_basis"] = basis
+        if evidence_kind:
+            info["unstamped_worker_evidence"] = evidence_kind
+        if release_at is None or int(time.time()) < release_at:
+            info["dead_claimer_hold_until"] = release_at
+            return info
+        info["liveness_unprovable"] = False
+        info["terminated"] = True
         return info
 
     kill = signal_fn if signal_fn is not None else (
@@ -13993,7 +14058,9 @@ def detect_progress_stalls(
                 _append_event(conn, row["id"], "stalled", evidence, run_id=rid)
         if age < reclaim_seconds:
             continue
-        termination = _terminate_reclaimed_worker(pid, lock)
+        termination = _terminate_reclaimed_worker(
+            pid, lock, conn=conn, task_id=row["id"],
+        )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, row["id"], lock, now, termination, reason="progress_stalled_worker_alive",
@@ -15334,7 +15401,9 @@ def _abort_lost_claim_spawn(
         "run_id": task.current_run_id,
     }
     if pid:
-        termination = _terminate_reclaimed_worker(int(pid), task.claim_lock)
+        termination = _terminate_reclaimed_worker(
+            int(pid), task.claim_lock, conn=conn, task_id=task.id,
+        )
         payload.update(termination)
         if not termination.get("terminated"):
             payload["needs_attention"] = True
