@@ -592,6 +592,8 @@ def _carry_prior_exit_forward(claim: Dict[str, Any], home: Optional[Path]) -> No
         if not previous or previous.get("phase") != "exited":
             return
         claim["prior_phase"] = "exited"
+        if previous.get("pid") is not None:
+            claim["prior_pid"] = previous.get("pid")
         if previous.get("exit_code") is not None:
             claim["prior_exit_code"] = previous.get("exit_code")
         if previous.get("exit_reason"):
@@ -620,6 +622,17 @@ def _claim_sentinel(evidence: Optional[Dict[str, Any]], home: Optional[Path]) ->
         # boot rewrites the sentinel and the flags age out with it.
         if evidence is not None:
             claim["prior_unclean_exit"] = True
+            # Identity + last liveness of the dead life. The boot restart notice
+            # joins the safe-restart ledger on pid_before == prior_pid, and a
+            # SIGKILLed life has no exited_at, so its last heartbeat is the
+            # closest record of WHEN it died (2026-09-24 12:12 incident).
+            for _src, _dst in (
+                ("prior_pid", "prior_pid"),
+                ("prior_started_at", "prior_started_at"),
+                ("last_heartbeat_at", "prior_last_heartbeat_at"),
+            ):
+                if evidence.get(_src) is not None:
+                    claim[_dst] = evidence[_src]
             if evidence.get("suspected_oom"):
                 claim["prior_suspected_oom"] = True
             # Who killed it — so a later `hermes gateway status`/doctor can
