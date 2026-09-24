@@ -8194,108 +8194,73 @@ _CWD_SNAPSHOT_SCOPE: ContextVar[Optional[list]] = ContextVar(
 )
 
 
-#: macOS spells every path on the Data volume twice: ``/Users/...`` and the
-#: firmlinked ``/System/Volumes/Data/Users/...``. Only used to decide whether
-#: two spellings are worth asking the kernel about (:func:`_same_tree`).
+#: macOS's Data-volume firmlink is not a symlink and survives realpath().
 _FIRMLINK_DATA_PREFIX = "/System/Volumes/Data"
 
 
-def _kernel_path(p) -> Optional[Path]:
-    """Return the kernel's own spelling of existing path *p*.
+def _path_identity(path: Path, memo: Optional[dict] = None) -> Path:
+    """One descriptor-free identity for DB, environment, and lsof paths.
 
-    ``Path.resolve()`` follows symlinks only. On case-insensitive APFS it keeps
-    the caller's case, NFC vs NFD, and ``/System/Volumes/Data`` firmlink
-    spellings, while ``lsof`` prints the kernel's canonical name -- so a
-    string compare of the two misses a live cwd (card t_ee808d83, Argus
-    round 1). The kernel answers from an open descriptor: ``F_GETPATH`` on
-    macOS, ``/proc/self/fd`` on Linux, which is the same name source lsof
-    uses. Returns ``None`` on platforms with neither; raises ``OSError`` when
-    the path cannot be opened or named, so callers choose their fail-closed
-    answer.
+    Fold case and Unicode only on case-insensitive volumes. A case-sensitive
+    volume can contain distinct directories differing only in case; treating
+    them as one would allow GC to delete an unmanaged directory. Never open a
+    descriptor here: closing a kanban.db fd cancels SQLite's POSIX locks.
     """
-    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
-        return None
-    fd = os.open(os.fspath(p), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-    try:
-        if sys.platform == "darwin":
-            import fcntl
-
-            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
-            name = os.fsdecode(raw.split(b"\0", 1)[0])
-        else:
-            name = os.readlink(f"/proc/self/fd/{fd}")
-            if name.endswith(" (deleted)"):
-                raise FileNotFoundError(name)
-    finally:
-        os.close(fd)
-    if not name.startswith("/"):
-        raise OSError(f"kernel returned a non-absolute path for {p}: {name!r}")
-    return Path(name)
-
-
-def _loose_spelling(p: Path) -> Path:
-    """Fold the spelling axes the kernel may canonicalise (case, Unicode
-    normalisation, the Data-volume firmlink). A cheap pre-filter only: it
-    decides when :func:`_same_tree` should pay for a kernel lookup."""
     import unicodedata
 
-    s = unicodedata.normalize("NFC", str(p)).casefold()
-    prefix = _FIRMLINK_DATA_PREFIX.casefold()
-    if s == prefix or s.startswith(prefix + "/"):
-        s = s[len(prefix):] or "/"
-    return Path(s)
+    key = str(path)
+    if memo is not None and key in memo:
+        return memo[key]
+    name = os.path.realpath(os.path.expanduser(key))
+    if sys.platform == "darwin":
+        prefix = _FIRMLINK_DATA_PREFIX
+        if name == prefix or name.startswith(prefix + "/"):
+            stripped = name[len(prefix):] or "/"
+            # Only strip an actual firmlink, not an unrelated mount.
+            current = Path(name)
+            while not current.exists() and current.parent != current:
+                current = current.parent
+            counterpart = Path(str(current)[len(prefix):] or "/")
+            if current.exists() and counterpart.exists() and current.samefile(counterpart):
+                name = stripped
+        # Python's macOS os.pathconf_names does not expose PC_CASE_SENSITIVE.
+        # Probe an existing component with opposite case using stat (not open).
+        current = Path(name)
+        while not current.exists() and current.parent != current:
+            current = current.parent
+        insensitive = False
+        probe = current
+        while probe.parent != probe:
+            spelling = probe.name
+            idx = next((i for i, c in enumerate(spelling) if c.isascii() and c.isalpha()), None)
+            if idx is not None:
+                alt = spelling[:idx] + spelling[idx].swapcase() + spelling[idx + 1:]
+                try:
+                    a, b = probe.stat(), (probe.parent / alt).stat()
+                    insensitive = (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+                except FileNotFoundError:
+                    pass
+                else:
+                    break
+            probe = probe.parent
+        if insensitive:
+            name = unicodedata.normalize("NFC", name).casefold()
+    result = Path(name)
+    if memo is not None:
+        memo[key] = result
+    return result
 
 
 def _same_tree(child: Path, parent: Path, memo: Optional[dict] = None) -> bool:
-    """True when *child* is *parent* or lies beneath it, however either is spelled.
-
-    Both arguments are ``resolve()``d paths from different sources (the
-    board DB, the environment, a candidate). An exact match answers at once.
-    Otherwise only pairs that agree once case / Unicode / firmlink spelling is
-    folded are re-compared by their kernel names, so unrelated rows (NAS
-    mounts, other projects) are never opened. A path that does not exist is
-    named by its nearest existing ancestor plus the literal missing tail.
-    """
-    if child == parent or child.is_relative_to(parent):
-        return True
-    if not _loose_spelling(child).is_relative_to(_loose_spelling(parent)):
-        return False
-
-    def canon(p: Path) -> Path:
-        key = str(p)
-        if memo is not None and key in memo:
-            return memo[key]
-        # Name the nearest EXISTING ancestor through the kernel and re-attach
-        # the missing tail literally: a pin whose kanban.db is not created yet
-        # still sits in (or outside) its home by the home's kernel name.
-        got = p
-        tail: list[str] = []
-        cur = p
-        while True:
-            try:
-                named = _kernel_path(cur)
-            except (OSError, ValueError):
-                named = None
-                if cur.parent != cur:
-                    tail.append(cur.name)
-                    cur = cur.parent
-                    continue
-            if named is not None:
-                got = named.joinpath(*reversed(tail))
-            break
-        if memo is not None:
-            memo[key] = got
-        return got
-
-    c, q = canon(child), canon(parent)
-    return c == q or c.is_relative_to(q)
+    """True when child names parent or a descendant under the same identity."""
+    c = _path_identity(child, memo)
+    p = _path_identity(parent, memo)
+    return c == p or c.is_relative_to(p)
 
 
 def _same_path(a: Path, b: Path, memo: Optional[dict] = None) -> bool:
-    """True when *a* and *b* name the same file, however either is spelled."""
-    if memo is None:
-        memo = {}
-    return _same_tree(a, b, memo) and _same_tree(b, a, memo)
+    """True when both paths name the same file under the same identity."""
+    return _path_identity(a, memo) == _path_identity(b, memo)
 
 
 def _scan_process_cwds() -> Optional[frozenset]:
@@ -8309,10 +8274,9 @@ def _scan_process_cwds() -> Optional[frozenset]:
     this process's own cwd, so a non-zero exit or an empty listing is a
     failed scan, never "nothing found"; callers must fail closed on None.
 
-    Names are kept exactly as lsof prints them -- the kernel's canonical
-    spelling -- and are not touched on disk: resolving ~200 cwds here would
-    sit outside the lsof timeout and could hang on a dead network mount.
-    :func:`_process_cwd_within` canonicalises the CANDIDATE instead.
+    Names are kept exactly as lsof prints them; resolving every machine cwd
+    could block on a dead network mount outside the lsof timeout. The candidate
+    and only plausible matching cwds use the shared path identity.
     """
     try:
         result = subprocess.run(
@@ -8369,15 +8333,25 @@ def _process_cwd_within(path: Path) -> bool:
     if cwds is None:
         return True
     try:
-        targets = {Path(path).resolve(strict=False)}
-        # lsof prints kernel spellings; match against the candidate's kernel
-        # spelling too (case / NFC-NFD / firmlink). Unnameable => fail closed.
-        canonical = _kernel_path(path)
+        target = _path_identity(path)
+        # Fast lexical pre-filter avoids stat/realpath on unrelated process
+        # cwds (including unresponsive network mounts). Identity decides the
+        # match; the pre-filter never authorises a deletion by itself.
+        import unicodedata
+
+        def maybe_within(cwd: Path) -> bool:
+            name = unicodedata.normalize("NFC", str(cwd)).casefold()
+            prefix = _FIRMLINK_DATA_PREFIX.casefold()
+            if name.startswith(prefix + "/"):
+                name = name[len(prefix):]
+            candidate = unicodedata.normalize("NFC", str(target)).casefold()
+            if not (name == candidate or name.startswith(candidate.rstrip("/") + "/")):
+                return False
+            return _same_tree(cwd, path)
+
+        return any(maybe_within(cwd) for cwd in cwds)
     except (OSError, RuntimeError, ValueError):
         return True
-    if canonical is not None:
-        targets.add(canonical)
-    return any(cwd == t or cwd.is_relative_to(t) for cwd in cwds for t in targets)
 
 
 def _live_owners_of_path(
@@ -8428,8 +8402,9 @@ def _live_owners_of_path(
         # resolved.name would miss <root>/<live-card>/repo.
         for parent in (resolved, *resolved.parents):
             if _is_managed_scratch_path(parent):
-                if _TASK_DIR_NAME_RE.fullmatch(parent.name):
-                    candidates.add(parent.name)
+                owner_id = _path_identity(parent).name
+                if _TASK_DIR_NAME_RE.fullmatch(owner_id):
+                    candidates.add(owner_id)
             else:
                 managed_root = parent  # the workspaces root itself
                 break

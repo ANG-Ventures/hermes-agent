@@ -280,7 +280,7 @@ def test_nested_cwd_in_candidate_retains_it(kanban_home, monkeypatch):
     nested = old / "repo" / "src" / "pkg"
     nested.mkdir(parents=True)
     # Real lsof prints the kernel's spelling of a cwd; mirror that.
-    reported = kb._kernel_path(nested) or nested
+    reported = kb._path_identity(nested)
     _fake_lsof(monkeypatch, _listing("/", str(reported)))
 
     assert kb._live_owners_of_path(old) == [home_card]
@@ -378,7 +378,7 @@ def test_cwd_probe_fails_closed_when_candidate_cannot_be_named(monkeypatch, tmp_
         raise PermissionError(p)
 
     _fake_lsof(monkeypatch, _listing("/"))
-    monkeypatch.setattr(kb, "_kernel_path", boom)
+    monkeypatch.setattr(kb, "_path_identity", boom)
     assert kb._process_cwd_within(tmp_path) is True
 
 
@@ -461,6 +461,47 @@ def test_nested_live_dir_card_stored_in_other_case_retains_candidate(kanban_home
          claim_expires=int(time.time()) + 3600)
     assert _gc(done_retention_days=3) == 0
     assert (nested / "live_work.txt").exists(), "gc deleted a live card's workspace"
+
+
+@pytest.mark.parametrize("axis", ["root-case", "firmlink", "leaf-case", "stored-path"])
+def test_gc_convention_owner_in_other_spelling_retains_live_work(kanban_home, axis):
+    """A live scratch card without a stored path still owns its named directory."""
+    live = _mktask("live card without stored path")
+    root = kb.workspaces_root()
+    directory = root / live
+    directory.mkdir(parents=True)
+    work = directory / "work.txt"
+    work.write_text("live work", encoding="utf-8")
+    _set(live, status="running", workspace_kind="scratch", workspace_path=None,
+         claim_expires=int(time.time()) + 3600)
+    done = _mktask("old row pointing at the live directory")
+    if axis == "root-case":
+        spelled = _variant(root, "case") / live.upper()
+    elif axis == "firmlink":
+        spelled = _variant(root, "firmlink") / live.upper()
+    else:
+        spelled = root / live.upper()
+    if not spelled.is_dir():
+        pytest.skip("filesystem does not alias this spelling")
+    _set(done, status="done", workspace_kind="scratch",
+         workspace_path=str(directory if axis == "stored-path" else spelled),
+         completed_at=int(time.time() - 10 * 86400))
+    assert _gc(done_retention_days=3) == 0
+    assert work.read_text(encoding="utf-8") == "live work"
+    assert "owner-has-live-run" in kb.workspace_deletion_log_path().read_text(encoding="utf-8")
+
+
+def test_case_sensitive_distinct_root_is_not_managed(kanban_home):
+    root = kb.workspaces_root()
+    root.mkdir(parents=True)
+    other = root.parent / root.name.upper()
+    if other.exists():
+        pytest.skip("case-insensitive filesystem")
+    other.mkdir()
+    candidate = other / "t_deadbeef"
+    candidate.mkdir()
+    assert not kb._is_managed_scratch_path(candidate)
+    assert not kb._same_tree(candidate, root)
 
 
 def test_scratch_row_stored_in_other_case_is_reaped(kanban_home):
@@ -555,6 +596,47 @@ def test_conn_on_board_file_in_other_spelling_is_that_board(kanban_home, axis):
         assert kb._conn_is_board(other, "default") is False, "negative control"
     finally:
         other.close()
+
+
+def test_noncanonical_pin_identity_preserves_sqlite_shared_lock(tmp_path, monkeypatch):
+    """Identity must not open/close the DB file: POSIX close cancels SQLite locks."""
+    import sqlite3
+
+    home = tmp_path.resolve() / ".hermes"
+    home.mkdir()
+    real = home / "kanban.db"
+    pin = _variant(home, "case") / "kanban.db"
+    _pin_env(monkeypatch, tmp_path, home=home, pin=pin)
+    kb.init_db()
+    conn = sqlite3.connect(str(pin), isolation_level=None)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    # A separate process attempts an EXCLUSIVE writer lock. Opening and closing
+    # a descriptor in *this* process cancels its own SQLite POSIX read lock.
+    check = (
+        "import sqlite3, sys; c=sqlite3.connect(sys.argv[1], timeout=0); "
+        "\ntry: c.execute('BEGIN EXCLUSIVE'); print('acquired')"
+        "\nexcept sqlite3.OperationalError: print('locked')"
+        "\nfinally: c.rollback(); c.close()"
+    )
+
+    def lock_type():
+        return subprocess.check_output([sys.executable, "-c", check, str(real)],
+                                       stdin=subprocess.DEVNULL, text=True).strip()
+
+    try:
+        conn.execute("BEGIN")
+        conn.execute("SELECT name FROM sqlite_master").fetchall()
+        assert lock_type() == "locked", "lock probe did not acquire SHARED"
+        kb._conn_is_board(conn, "default")
+        assert lock_type() == "locked"
+        kb._refuse_if_override_escapes_hermes_home(pin)
+        assert lock_type() == "locked"
+        kb._refuse_if_pin_contradicts_board_arg("default", pin)
+        assert lock_type() == "locked"
+        kb._pin_divergence_is_a_hazard(pin)
+        assert lock_type() == "locked"
+    finally:
+        conn.close()
 
 
 def test_sandbox_with_native_pin_in_other_case_still_refuses(tmp_path, monkeypatch):
