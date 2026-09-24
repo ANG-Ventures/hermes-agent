@@ -10901,6 +10901,107 @@ def configured_review_assignee() -> Optional[str]:
     return value.strip()
 
 
+DEFAULT_MAX_REVIEW_ROUNDS = 3
+MILESTONE_MARKER = "[milestone]"
+REVIEW_POLICIES = ("all", "milestone_only")
+
+
+def configured_max_review_rounds() -> int:
+    """``kanban.max_review_rounds`` — reviewer↔implementer round cap (0 = off).
+
+    A "round" is one ``changes_requested`` verdict. Once a card has collected
+    this many, the NEXT ``request_review`` does not re-spawn the reviewer: the
+    card is BLOCKED (``needs_input``) for the orchestrator to take over. Measured
+    2026-09-24 (Mac Studio): 458 reviewed cards / 7d averaged 10.8 rounds, max
+    123, 107 cards at 13+ — the tail that produced 498 reviewer sessions a day.
+    Default :data:`DEFAULT_MAX_REVIEW_ROUNDS`.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get(
+            "max_review_rounds", DEFAULT_MAX_REVIEW_ROUNDS
+        )
+        rounds = int(value)
+    except Exception:
+        return DEFAULT_MAX_REVIEW_ROUNDS
+    return rounds if rounds >= 0 else DEFAULT_MAX_REVIEW_ROUNDS
+
+
+def configured_review_policy() -> str:
+    """``kanban.review_policy`` — ``all`` (default) or ``milestone_only``.
+
+    ``milestone_only``: only *milestone* cards (see :func:`is_milestone_card`)
+    are routed to ``kanban.review_assignee``; every other card that asks for
+    review is COMPLETED instead, with a ``review_skipped`` event — CI is the
+    gate for slice work, the reviewer profile is functional QA at milestones.
+    An explicit ``reviewer=`` on the request still wins.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get("review_policy", "all")
+    except Exception:
+        return "all"
+    value = str(value or "all").strip().lower()
+    return value if value in REVIEW_POLICIES else "all"
+
+
+def is_milestone_card(conn: sqlite3.Connection, task_id: str) -> bool:
+    """A card is a milestone when its title/body carries ``[milestone]`` (any
+    case) or it is a PARENT in ``task_links`` (an umbrella closing over its
+    children). Slice cards — leaves without the marker — are not."""
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    text = f"{row['title'] or ''}\n{row['body'] or ''}".lower()
+    if MILESTONE_MARKER in text:
+        return True
+    child = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
+    ).fetchone()
+    return child is not None
+
+
+def count_review_rounds(conn: sqlite3.Connection, task_id: str) -> int:
+    """Number of ``changes_requested`` verdicts recorded for ``task_id``."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'changes_requested'",
+        (task_id,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def resolve_per_profile_cap(
+    spec: Union[int, Mapping[str, Any], None], assignee: Optional[str]
+) -> Optional[int]:
+    """Per-profile in-flight cap for ``assignee`` from ``spec``.
+
+    ``kanban.max_in_progress_per_profile`` is either a single positive int
+    (every profile gets the same cap — the original #21582 shape) or a
+    mapping ``{default: N, <profile>: M, ...}`` so one hungry profile (a
+    reviewer that re-runs CI locally, a browser-pool profile) can be held
+    tighter than the coders without starving them. ``None`` / invalid = no cap.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, Mapping):
+        key = _canonical_assignee(assignee) if assignee else None
+        raw = spec.get(key) if key is not None else None
+        if raw is None:
+            raw = spec.get("default")
+    else:
+        raw = spec
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
+
+
 def review_stale_minutes() -> int:
     """Minutes an unclaimed review card may sit before it is reported stale."""
     try:
@@ -11135,6 +11236,62 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+
+    # ── Review-round cap (kanban.max_review_rounds) ────────────────────────
+    # Evaluated BEFORE the transaction because block_task opens its own.
+    # Round N+1 on a card that already collected N changes_requested verdicts
+    # does not re-spawn the reviewer: the ping-pong has stopped converging and
+    # the orchestrator takes the card over. The block is typed needs_input so
+    # the notifier wakes the orchestrator and the recurrence accounting is
+    # honest (this is a real "needs a human/orchestrator decision" block).
+    cap = configured_max_review_rounds()
+    if cap > 0 and not force:
+        rounds = count_review_rounds(conn, task_id)
+        if rounds >= cap:
+            reason = (
+                f"review round cap reached: {rounds} changes_requested round(s) "
+                f"on this card (kanban.max_review_rounds={cap}). Not re-spawning "
+                "the reviewer — card BLOCKED (needs_input) for orchestrator "
+                "take-over. Re-request with force=True (--force) to override."
+            )
+            blocked = block_task(
+                conn, task_id, reason=reason, kind="needs_input",
+                expected_run_id=expected_run_id,
+            )
+            if blocked:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "review_round_cap",
+                        {"rounds": rounds, "cap": cap, "summary": (summary or "")[:400] or None},
+                    )
+            return _ret(False, reason)
+
+    # ── Review policy (kanban.review_policy=milestone_only) ────────────────
+    # Slice cards do not get a reviewer session; CI is their gate. They are
+    # COMPLETED here with a review_skipped event so the orchestrator's merge
+    # pass sees them as done-with-PR. An explicit reviewer= still routes.
+    if reviewer is None and configured_review_policy() == "milestone_only":
+        if not is_milestone_card(conn, task_id):
+            skip_meta = dict(metadata or {})
+            skip_meta["review_skipped"] = "non_milestone"
+            done = complete_task(
+                conn, task_id, summary=summary, metadata=skip_meta,
+                expected_run_id=expected_run_id,
+            )
+            if not done:
+                return _ret(
+                    False,
+                    "review_policy=milestone_only: card is not a milestone and "
+                    "could not be completed in place (not running/ready, or "
+                    "expected_run_id mismatch)",
+                )
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "review_skipped",
+                    {"policy": "milestone_only", "summary": (summary or "")[:400] or None},
+                )
+            return _ret(True, "review skipped (non-milestone card, kanban.review_policy=milestone_only) — card completed; CI is the gate")
+
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -13851,6 +14008,11 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    spawn_paused: Optional[str] = None
+    """Non-None when this tick RECLAIMED but deliberately spawned nothing —
+    the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
+    over its run-queue bar. The string is the human reason (load1/ncpu). NOT
+    an operator-actionable failure; spawning resumes when the host cools."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -17258,7 +17420,8 @@ def dispatch_once(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
-    max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile: Union[int, Mapping[str, Any], None] = None,
+    spawn_paused: Optional[str] = None,
     reconcile_orphans: bool = True,
     budget_cache: Optional[dict] = None,
 ) -> DispatchResult:
@@ -17296,6 +17459,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            spawn_paused=spawn_paused,
             reconcile_orphans=reconcile_orphans,
             pr_gate_prefetch=pr_gate_prefetch,
             budget_cache=budget_cache,
@@ -17321,6 +17485,7 @@ def dispatch_once(
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
+                spawn_paused=spawn_paused,
                 reconcile_orphans=reconcile_orphans,
                 pr_gate_prefetch=pr_gate_prefetch,
                 budget_cache=budget_cache,
@@ -17390,7 +17555,8 @@ def _dispatch_once_locked(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
-    max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile: Union[int, Mapping[str, Any], None] = None,
+    spawn_paused: Optional[str] = None,
     reconcile_orphans: bool = True,
     pr_gate_prefetch=None,
     budget_cache: Optional[dict] = None,
@@ -17593,6 +17759,14 @@ def _dispatch_once_locked(
     # board, since "running" tasks aren't reclaimed by completion alone —
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
+    # Load gate (kanban.dispatch_load_gate): reclaim/stale/orphan bookkeeping
+    # above already ran, so a paused tick keeps the board honest but adds
+    # NO new workers to an overloaded host. Measured 2026-09-24: load1 80-110
+    # on 32 cores while the dispatcher kept spawning 9-14 workers a tick.
+    if spawn_paused:
+        result.spawn_paused = str(spawn_paused)
+        return result
+
     running_count = 0
     spawn_budget: Optional[int] = None
     if max_spawn is not None or max_in_progress is not None:
@@ -17934,10 +18108,19 @@ def _dispatch_once_locked(
     # Tasks blocked this way go to skipped_per_profile_capped (not
     # skipped_unassigned — the operator-actionable signal is different:
     # "this profile is busy, try again later" not "this needs routing").
-    _per_profile_cap = max_in_progress_per_profile if (
-        isinstance(max_in_progress_per_profile, int)
-        and max_in_progress_per_profile > 0
+    # ``max_in_progress_per_profile`` is an int (one cap for all) or a mapping
+    # ``{default: N, <profile>: M}`` (see resolve_per_profile_cap). ``_per_profile_cap``
+    # stays as the "is any cap configured" sentinel; the per-assignee value is
+    # looked up through ``_cap_for``.
+    _per_profile_spec = max_in_progress_per_profile if (
+        isinstance(max_in_progress_per_profile, Mapping)
+        or (isinstance(max_in_progress_per_profile, int) and max_in_progress_per_profile > 0)
     ) else None
+    _per_profile_cap = _per_profile_spec
+
+    def _cap_for(assignee: Optional[str]) -> Optional[int]:
+        return resolve_per_profile_cap(_per_profile_spec, assignee)
+
     _per_profile_running: dict[str, int] = {}
     if _per_profile_cap is not None:
         for prow in conn.execute(
@@ -18040,9 +18223,10 @@ def _dispatch_once_locked(
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
-        if _per_profile_cap is not None:
+        _row_cap = _cap_for(row_assignee) if _per_profile_cap is not None else None
+        if _row_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
+            if current >= _row_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
@@ -18286,9 +18470,10 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        if _per_profile_cap is not None:
+        _review_cap = _cap_for(row["assignee"]) if _per_profile_cap is not None else None
+        if _review_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
+            if current >= _review_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
                 )
