@@ -10499,8 +10499,17 @@ def requeue_task(
                 f"'ready' tasks (use unblock/reopen/triage-resolve/promote "
                 f"for other states)"
             )
+        # Snapshot the PR the operator intends to continue. Historical
+        # commented events may lack comment_id, so same-second inline audit
+        # comments cannot always be mapped back to their event unambiguously.
+        pr_comment_id = next((c["id"] for c in conn.execute(
+            "SELECT id, body FROM task_comments WHERE task_id = ? "
+            "AND created_at >= ? ORDER BY id DESC",
+            (task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW),
+        ) if _RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")), None)
         _append_event(
-            conn, task_id, "requeued", {"actor": actor, "reason": reason},
+            conn, task_id, "requeued",
+            {"actor": actor, "reason": reason, "pr_comment_id": pr_comment_id},
         )
     return True, None
 
@@ -15014,6 +15023,17 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
     )
     if pr_comment is None:
         return False
+    # A READY requeue records the exact latest PR comment in its own txn.
+    # This works even on pre-upgrade boards whose 'commented' event cannot
+    # be mapped uniquely after an inline audit comment in the same second.
+    if conn.execute(
+        "SELECT 1 FROM task_events i WHERE i.task_id = ? AND i.kind = 'requeued' "
+        "AND json_extract(i.payload, '$.pr_comment_id') = ? "
+        "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
+        "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
+        (task_id, pr_comment["id"]),
+    ).fetchone():
+        return True
     # New writes carry the exact comment id. Historical events lack it; match
     # their author/length within the timestamp rather than counting unrelated
     # inline audit comments (which do not emit 'commented' events).

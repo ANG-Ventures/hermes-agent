@@ -3722,6 +3722,31 @@ def test_legacy_pr_event_with_inline_comment_still_requeues(kanban_home, monkeyp
         assert kb.check_respawn_guard(conn, task_id) is None
 
 
+def test_legacy_equal_length_inline_comment_does_not_block_requeue(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy equal length", assignee="alice")
+        pr = "https://github.com/o/r/pull/9"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "alice", "x" * len(pr), now),
+        )
+        conn.commit()
+        kb.add_comment(conn, task_id, "alice", pr)
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+            "WHERE task_id=? AND kind='commented'", (task_id,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/8")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
 def test_pr_intent_has_one_event_id_ordering_seam():
     """PR override must not regress to second-resolution timestamp ordering."""
     import inspect
