@@ -1593,7 +1593,7 @@ def check_respawn_guard(
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT id, body, created_at FROM task_comments "
+        "SELECT id, author, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
@@ -1613,29 +1613,39 @@ def check_respawn_guard(
         # work on the same PR until the parent completes. The promotion grants
         # one continuation spawn only; a later crash/reclaim stays guarded.
         # Event ids disambiguate transitions within one timestamp second.
-        # Match this PR-bearing comment to its corresponding commented event.
-        # Ordering by event id (rather than second-resolution timestamps or
-        # every subsequent comment) distinguishes a newer PR from ordinary
-        # status updates after the worker's dependency block.
-        comment_offset = conn.execute(
-            "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
-            "AND created_at = ? AND id < ?",
-            (task_id, int(c["created_at"] or 0), c["id"]),
-        ).fetchone()[0]
+        # New comments identify their event directly. For older comments,
+        # correlate author/length within this second so unrelated inline audit
+        # comments do not shift the event ordinal.
         pr_event = conn.execute(
             "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
-            "AND created_at = ? ORDER BY id LIMIT 1 OFFSET ?",
-            (task_id, int(c["created_at"] or 0), comment_offset),
+            "AND json_extract(payload, '$.comment_id') = ? LIMIT 1",
+            (task_id, c["id"]),
         ).fetchone()
+        if pr_event is None:
+            comment_offset = conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ? "
+                "AND created_at = ? AND author = ? AND length(body) = ? AND id < ? "
+                "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = task_comments.task_id "
+                "AND e.kind = 'commented' AND json_extract(e.payload, '$.comment_id') = task_comments.id)",
+                (task_id, int(c["created_at"] or 0), c["author"], len(body), c["id"]),
+            ).fetchone()[0]
+            pr_event = conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
+                "AND created_at = ? AND json_extract(payload, '$.author') = ? "
+                "AND json_extract(payload, '$.len') = ? "
+                "AND json_extract(payload, '$.comment_id') IS NULL "
+                "ORDER BY id LIMIT 1 OFFSET ?",
+                (task_id, int(c["created_at"] or 0), c["author"], len(body), comment_offset),
+            ).fetchone()
         # Imported comments without a matching event cannot grant a resume.
         pr_event_id = int(pr_event["id"]) if pr_event else 0
         resume = conn.execute(
             "SELECT 1 FROM task_events p WHERE p.task_id = ? AND p.kind = 'promoted' "
             "AND EXISTS (SELECT 1 FROM task_events d WHERE d.task_id = p.task_id "
             "AND d.kind = 'dependency_wait' AND json_extract(d.payload, '$.kind') = 'dependency' "
-            "AND d.id > ? AND d.id < p.id) "
-            "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = p.task_id "
-            "AND s.kind = 'spawned' AND s.id > p.id) LIMIT 1",
+            "AND d.id > ? AND d.id < p.id "
+            "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = d.task_id "
+            "AND s.kind = 'spawned' AND s.id > d.id)) LIMIT 1",
             (task_id, pr_event_id),
         ).fetchone() if pr_event_id else None
         if resume:

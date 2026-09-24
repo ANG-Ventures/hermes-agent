@@ -79,6 +79,42 @@ def test_ordinary_comment_after_wait_does_not_cancel_pr_resume(board):
         assert kbd.check_respawn_guard(conn, child) is None
 
 
+def test_inline_audit_comment_does_not_shift_ready_requeue(board, monkeypatch):
+    import time
+    from hermes_cli import kanban_db as kb
+
+    now = int(time.time())
+    monkeypatch.setattr(kbd.time, "time", lambda: now)
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="inline audit", assignee="worker")
+        with kb.write_txn(conn):
+            kb._insert_comment(conn, task_id, "operator", "audit note", now)
+        kb.add_comment(conn, task_id, "worker", "https://github.com/o/r/pull/9")
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue PR") == (True, None)
+        assert kbd.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(conn, task_id, "worker", "https://github.com/o/r/pull/10")
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_dependency_intent_cannot_attach_to_second_promotion(board):
+    with kbc.connect() as conn:
+        child = kb.create_task(conn, title="implement", assignee="worker")
+        claim = kb.claim_task(conn, child)
+        assert claim is not None
+        kb.add_comment(conn, child, "worker", "https://github.com/o/r/pull/9")
+        parent = kb.create_task(conn, title="prerequisite", assignee="worker")
+        kb.link_tasks(conn, parent, child, expected_child_run_id=claim.current_run_id)
+        assert kb.block_task(conn, child, kind="dependency", reason="resume")
+        assert kb.complete_task(conn, parent, summary="done")
+        kb.recompute_ready(conn)
+        assert kbd.check_respawn_guard(conn, child) is None
+        with kb.write_txn(conn):
+            kb._append_event(conn, child, "spawned", {"pid": 42})
+            kb._append_event(conn, child, "promoted", {"status": "ready"})
+        assert kbd.check_respawn_guard(conn, child) == "active_pr"
+
+
 def test_new_pr_comment_after_wait_does_not_resume(board):
     with kbc.connect() as conn:
         child = kb.create_task(conn, title="implement", assignee="worker")
