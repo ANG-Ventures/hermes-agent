@@ -77,12 +77,13 @@ class RemoteUnavailable(Exception):
 
 
 def _query(args):
+    target = " ".join(args[:2]) + " " + redact(args[-1])
     try:
         result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RemoteUnavailable(f"{args[0]} did not answer") from exc
+        raise RemoteUnavailable(f"{target} did not answer ({type(exc).__name__}: {redact(str(exc))})") from exc
     if result.returncode != 0:
-        raise RemoteUnavailable(f"{args[0]} exited {result.returncode}")
+        raise RemoteUnavailable(f"{target} exited {result.returncode}: {redact(result.stderr.decode(errors='replace')[:200])}")
     try:
         return result.stdout.decode()
     except UnicodeError as exc:
@@ -126,6 +127,10 @@ def verify_ref(claim, *, mined_for=None):
     if not sep or not re.fullmatch(_SHA, sha) or not _safe_url(url):
         return None
     output = _query(["git", "ls-remote", "--heads", "--tags", "--", url])
+    # ls-remote advertises tips, not ancestors: a squash/merge commit on
+    # default may cease to be a tip at the next push. GitHub's compare API
+    # proves ancestry without downloading an entire potentially huge tree.
+
     matches = {}
     for line in output.splitlines():
         oid, _, ref = line.partition("\t")
@@ -141,7 +146,23 @@ def verify_ref(claim, *, mined_for=None):
             # order. Keep every tip and decide over all of them.
             matches.setdefault(oid, []).append(ref)
     if len(matches) != 1:
-        return None  # unknown or ambiguous abbreviation
+        if matches or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return None  # unknown or ambiguous abbreviation
+        symref = _query(["git", "ls-remote", "--symref", "--", url, "HEAD"])
+        default = next((line.split("\t")[0].removeprefix("ref: ") for line in symref.splitlines()
+                        if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD")), None)
+        if not default:
+            return None
+        slug = re.fullmatch(rf"https://github\.com/({_SLUG})\.git", url)
+        if slug:
+            branch = default.removeprefix("refs/heads/")
+            comparison = json.loads(_query(["gh", "api", f"repos/{slug[1]}/compare/{sha}...{branch}"]))
+            if comparison.get("status") in {"ahead", "identical"}:
+                matches = {sha: [default]}
+            else:
+                return None
+        else:
+            return None
     oid, tips = next(iter(matches.items()))
     tips = sorted(tips)
     if mined_for:

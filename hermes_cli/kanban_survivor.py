@@ -1914,15 +1914,34 @@ def _hold(conn, task_id, reason):
 
 
 def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
-             survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=()):
+             survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
+             survivor_none=False, survivor_reason=None):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
     bases, held, previous = _state(conn, task_id)
     if cleanup and held:
         raise SurvivorUnavailable(held)
+    if cleanup and previous and previous.get("kind") == "none":
+        # A no-ref close records a deployment assertion, not a durable copy of
+        # workspace bytes. The automatic completion cleanup has no authority to
+        # discard them, even when there was no changed_files claim.
+        raise SurvivorUnavailable("survivor_unavailable: survivor-none cannot authorize workspace deletion")
+    stage = "task lookup"
     try:
         task = kb.get_task(conn, task_id)
         if task is None:
             raise SurvivorUnavailable("survivor_unavailable: task missing")
+        if survivor_none:
+            if cleanup:
+                raise SurvivorUnavailable("survivor_unavailable: survivor-none is not reusable for workspace deletion")
+            if survivor_ref or survivor_pr or survivor_unbound:
+                raise SurvivorUnavailable("survivor_unavailable: survivor-none cannot be mixed with remote claims")
+            reason = (survivor_reason or "").strip()
+            followups = re.findall(r"\bt_[0-9a-f]{8}\b", reason)
+            if not reason or len(followups) != 1 or not kb.get_task(conn, followups[0]):
+                raise SurvivorUnavailable("survivor_unavailable: survivor-none needs a reason naming one existing follow-up card")
+            return _record(conn, task_id, {"kind": "none", "reason": reason,
+                                            "follow_up_card": followups[0]}, previous)
+        stage = "remote survivor verification"
         explicit = _verified_explicit(task_id, survivor_ref, survivor_pr,
                                       unbound=survivor_unbound)
         claimed = bool((metadata or {}).get("changed_files"))
@@ -1996,12 +2015,14 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         # Only a positive short-circuits: the absence of a registered nested
         # repo proves nothing (a hand-made clone is in neither registry), so
         # that case falls through to the bounded walk exactly as before.
+        stage = "registered nested repository scan"
         registered = _registered_nested(workspace)
         if registered:
             raise SurvivorUnavailable(
                 "survivor_unavailable: nested repository requires separate recovery "
                 f"({str(registered[0].relative_to(workspace))})"
             )
+        stage = "_repos workspace scan"
         repos = _repos(workspace)
         if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
             # A patch cannot add a gitlink and files below the same path.
@@ -2134,6 +2155,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         patches, refs, bundles, repositories = [], list(carried), list(carried_bundles), []
         for repo in repos:
             key = str(repo.relative_to(workspace))
+            stage = f"capture repository {key}"
             try:
                 ref, base, data = _capture(repo, key, workspace)
             except SurvivorUnavailable:
@@ -2209,9 +2231,12 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # became JSON `null` while `held_reason` was cleared. The invariant
             # is not "reclamation may not shrink the index" but "nothing may".
             survivor = previous
+        stage = "record survivor"
         return _record(conn, task_id, survivor, previous)
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as exc:
-        reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: capture failed"
+        reason = (str(exc) if isinstance(exc, SurvivorUnavailable) else
+                  f"survivor_unavailable: capture failed at {stage}: "
+                  f"{type(exc).__name__}: {_ext.redact(str(exc))}")
         # `reason` is what gets PERSISTED (held_reason + a workspace_held event
         # kanban_show replays to workers), so it must stay hint-free. The hint
         # rides the re-raised exception instead, for the CLI to render.

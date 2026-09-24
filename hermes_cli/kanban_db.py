@@ -8301,6 +8301,8 @@ def complete_task(
     survivor_ref: Optional[Union[str, Sequence[str]]] = None,
     survivor_pr: Optional[Union[str, Sequence[str]]] = None,
     survivor_unbound: Union[bool, str, Sequence[Union[bool, str]], None] = None,
+    survivor_none: bool = False,
+    survivor_reason: Optional[str] = None,
     superseded_by: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -8407,6 +8409,7 @@ def complete_task(
         conn, task_id, metadata,
         survivor_ref=survivor_ref, survivor_pr=survivor_pr,
         survivor_unbound=survivor_unbound,
+        survivor_none=survivor_none, survivor_reason=survivor_reason,
         evidence=[t for t in (summary, result) if t],
     )
     if survivor:
@@ -8422,6 +8425,8 @@ def complete_task(
                 f"{entry['repository']}@{entry['sha']} ({entry['matched_by']})"
                 for entry in survivor["landed"]
             )
+        elif survivor['kind'] == 'none':
+            survivor_note = f"survivor=none follow-up={survivor['follow_up_card']}"
         else:
             survivor_note = "survivor=ref " + " ".join(
                 f"{ref.get('repository_path') or ref['remote']}/{ref['branch']}@{ref['sha']}"
