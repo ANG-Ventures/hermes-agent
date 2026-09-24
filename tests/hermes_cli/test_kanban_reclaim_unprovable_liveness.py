@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import psutil
 import secrets
 import time
 
@@ -117,11 +118,11 @@ def test_dead_local_claimer_without_worker_pid_is_reclaimed(conn, monkeypatch):
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{dead_pid}"
     tid, _, run_id = _running_card(conn, worker_pid=None, lock=lock)
 
-    def dead_claimer(pid, sig):
-        assert (pid, sig) == (dead_pid, 0)
-        raise ProcessLookupError(pid)
+    def dead_claimer(pid):
+        assert pid == dead_pid
+        raise psutil.NoSuchProcess(pid)
 
-    monkeypatch.setattr(kb.os, "kill", dead_claimer)
+    monkeypatch.setattr(psutil, "Process", dead_claimer)
     assert kb.reclaim_task(conn, tid, reason="worker sweep: missing pid") is True
     assert _row(conn, tid)["status"] == "ready"
     assert _row(conn, tid)["claim_lock"] is None
@@ -139,11 +140,11 @@ def test_expired_dead_claimer_is_not_renewed(conn, monkeypatch):
     conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, tid))
     conn.commit()
 
-    def dead_claimer(pid, sig):
-        assert (pid, sig) == (dead_pid, 0)
-        raise ProcessLookupError(pid)
+    def dead_claimer(pid):
+        assert pid == dead_pid
+        raise psutil.NoSuchProcess(pid)
 
-    monkeypatch.setattr(kb.os, "kill", dead_claimer)
+    monkeypatch.setattr(psutil, "Process", dead_claimer)
     assert kb.release_stale_claims(conn) == 1
     assert _row(conn, tid)["status"] == "ready"
     assert conn.execute("SELECT outcome FROM task_runs WHERE id=?", (run_id,)).fetchone()[0] == "reclaimed"
@@ -155,15 +156,15 @@ def test_live_local_claimer_without_worker_pid_still_holds_claim(conn, monkeypat
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{os.getpid()}"
     tid, _, _ = _running_card(conn, worker_pid=None, lock=lock)
     seen = []
-    original_kill = os.kill
+    original_process = psutil.Process
 
-    def live_claimer(pid, sig):
-        seen.append((pid, sig))
-        return original_kill(pid, sig)
+    def live_claimer(pid):
+        seen.append(pid)
+        return original_process(pid)
 
-    monkeypatch.setattr(kb.os, "kill", live_claimer)
+    monkeypatch.setattr(psutil, "Process", live_claimer)
     assert kb.reclaim_task(conn, tid) is False
-    assert seen == [(os.getpid(), 0)]
+    assert seen == [os.getpid()]
     assert _row(conn, tid)["claim_lock"] == lock
     assert _events(conn, tid, "reclaim_refused")[-1]["reason"] == "liveness_unprovable"
 
@@ -176,12 +177,11 @@ def test_unprovable_claimer_stays_held(conn, monkeypatch, suffix, error):
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{suffix}"
     tid, _, _ = _running_card(conn, worker_pid=None, lock=lock)
 
-    def inaccessible(pid, sig):
-        assert sig == 0
-        raise error(pid)
+    def inaccessible(pid):
+        raise psutil.AccessDenied(pid)
 
     if error:
-        monkeypatch.setattr(kb.os, "kill", inaccessible)
+        monkeypatch.setattr(psutil, "Process", inaccessible)
     assert kb.reclaim_task(conn, tid) is False
     assert _row(conn, tid)["claim_lock"] == lock
     assert not _events(conn, tid, "reclaimed")
@@ -189,7 +189,7 @@ def test_unprovable_claimer_stays_held(conn, monkeypatch, suffix, error):
 
 def test_foreign_claimer_without_worker_pid_is_not_probed(conn, monkeypatch):
     tid, _, _ = _running_card(conn, worker_pid=None, lock="other-host:999993")
-    monkeypatch.setattr(kb.os, "kill", lambda *_: pytest.fail("foreign PID was probed"))
+    monkeypatch.setattr(psutil, "Process", lambda *_: pytest.fail("foreign PID was probed"))
     # The existing operator reclaim policy releases a foreign claim; do not
     # assert local death for a process on a host we cannot inspect.
     assert kb.reclaim_task(conn, tid) is True
