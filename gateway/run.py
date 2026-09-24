@@ -27240,17 +27240,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            # Same rule as the context-prompt pin: an internal event reuses
+            # the last human turn's channel_prompt / parent_chat_id, which
+            # its rebuilt source lacks, so combined_ephemeral cannot toggle.
+            _turn_channel_prompt, _turn_source = self._pinned_channel_inputs(
+                session_key, event, source,
+            )
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
                 history=history,
-                source=source,
+                source=_turn_source,
                 session_id=_run_start_session_id,
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
+                channel_prompt=_turn_channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -35676,6 +35682,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return text
 
+    def _pinned_channel_inputs(self, session_key, event, source):
+        """Return ``(channel_prompt, source)`` for this turn's agent run.
+
+        ``run_sync`` appends ``channel_prompt`` and the ``channel_overrides``
+        prompt (looked up by chat/thread/``parent_chat_id``) to the pinned
+        session context.  Internal events carry ``channel_prompt=None`` and a
+        source without ``parent_chat_id``, so without this they drop both
+        components and toggle the system prompt A->B->A exactly like the
+        context-prompt pin did (t_4bcd60ba C2).  Human turns record their
+        inputs; internal turns reuse them.
+        """
+        channel_prompt = getattr(event, "channel_prompt", None)
+        if not session_key:
+            return channel_prompt, source
+        if not getattr(event, "internal", False):
+            self._session_state(session_key).conversation.channel_pin = (
+                channel_prompt,
+                getattr(source, "parent_chat_id", None),
+            )
+            return channel_prompt, source
+        state = self._peek_session_state(session_key)
+        pin = state.conversation.channel_pin if state else None
+        if pin is None:
+            return channel_prompt, source
+        pinned_prompt, pinned_parent = pin
+        if pinned_parent and not getattr(source, "parent_chat_id", None):
+            source = dataclasses.replace(source, parent_chat_id=pinned_parent)
+        return pinned_prompt, source
+
     @staticmethod
     def _ephemeral_change_key(context, redact_pii: bool) -> str:
         """Hash the exact inputs ``build_session_context_prompt`` renders.
@@ -38583,7 +38618,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if next_message is None:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
-                    next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_channel_prompt, next_source = self._pinned_channel_inputs(
+                        next_session_key, pending_event, next_source,
+                    )
                     next_message_type = getattr(pending_event, "message_type", None)
 
                 # Clear the completed streaming marker from the prior logical
