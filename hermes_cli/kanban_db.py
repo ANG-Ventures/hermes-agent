@@ -5144,6 +5144,58 @@ def set_task_session(
     return True
 
 
+def _origin_line(body: Optional[str]) -> Optional[str]:
+    """The card's ``origin: ...`` provenance line (its first non-empty line)."""
+    for line in (body or "").splitlines():
+        line = line.strip()
+        if line:
+            return line if line.lower().startswith("origin:") else None
+    return None
+
+
+def resolve_inherited_home(
+    conn: sqlite3.Connection,
+    parents: Iterable[str] = (),
+    worker_task_id: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Home session + origin line a new card inherits: the first STAMPED of
+    its parents, then the card the creating worker run was dispatched for.
+    ``(None, None)`` when none of them has a home."""
+    for tid in (*parents, *((worker_task_id,) if worker_task_id else ())):
+        row = conn.execute(
+            "SELECT session_id, body FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        home = ((row["session_id"] if row else None) or "").strip()
+        if home:
+            return home, _origin_line(row["body"])
+    return None, None
+
+
+def _apply_inherited_home(
+    conn: sqlite3.Connection,
+    parents: Iterable[str],
+    session_id: Optional[str],
+    body: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """A card created under a parent, or from inside a kanban worker/reviewer
+    run (``$HERMES_KANBAN_TASK``), belongs to the HUMAN home of that lineage --
+    never to the worker run's own per-run session id, which nobody reads.
+    Inside a worker run with no stamped ancestor the card stays unstamped.
+    The parent's ``origin:`` line is copied onto a body that has none."""
+    worker_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip() or None
+    parents = tuple(parents or ())
+    if not parents and not worker_tid:
+        return session_id, body
+    home, origin = resolve_inherited_home(conn, parents, worker_tid)
+    if home:
+        session_id = home
+    elif worker_tid:
+        session_id = None
+    if origin and not _origin_line(body):
+        body = f"{origin}\n\n{body}" if (body or "").strip() else origin
+    return session_id, body
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -5358,6 +5410,7 @@ def create_task(
     # Raise on a bad kind before any row is written, and resolve NULL to
     # ``blocks`` so the status decision below reads one value.
     parents_kind = normalize_link_kind(parents_kind)
+    session_id, body = _apply_inherited_home(conn, parents, session_id, body)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -11898,8 +11951,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "session_id, body FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
@@ -11907,6 +11960,8 @@ def decompose_triage_task(
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        root_home = (root_row["session_id"] or "").strip() or None
+        root_origin = _origin_line(root_row["body"])
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -11965,21 +12020,30 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # Decomposed children belong to the root's HOME session, and
+            # carry its origin line, exactly like any other parented card.
+            child_body = body if isinstance(body, str) else None
+            if root_origin and not _origin_line(child_body):
+                child_body = (
+                    f"{root_origin}\n\n{child_body}"
+                    if (child_body or "").strip() else root_origin
+                )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, session_id) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
-                    body if isinstance(body, str) else None,
+                    child_body,
                     assignee,
                     child_ws_kind,
                     child_ws_path,
                     tenant,
                     now,
                     (author or "decomposer"),
+                    root_home,
                 ),
             )
             _append_event(
