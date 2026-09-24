@@ -537,6 +537,108 @@ class TestConfabNoticeEndToEnd:
             else:
                 assert index > summary, "event from the dropped middle entered protected head"
 
+    @pytest.mark.parametrize("engine", ["builtin", "lcm"])
+    @pytest.mark.parametrize("layout", ["bigargs", "twins", "image", "merge"])
+    @pytest.mark.parametrize("event_position", range(1, 32, 2))
+    def test_rewritten_kept_rows_preserve_notice_timeline(
+        self, notice_env, stream, engine, layout, event_position, tmp_path
+    ):
+        make_agent, handler, db, sid, _ = notice_env
+        handler.response_queue[:] = [
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
+        ]
+        make_agent(stream=stream).run_conversation("first", conversation_history=[], task_id="writer")
+        event = next(m for m in db.get_messages_as_conversation(sid)
+                     if is_metadata_only_tool_notice(m))
+        big = " ".join(f"w{j}" for j in range(700))
+        history = []
+        for i in range(8):
+            call_id = f"call_{layout}_{i}"
+            user_content = f"u{i} {big}"
+            if layout == "image" and i in (5, 7):
+                user_content = [{"type": "text", "text": user_content},
+                                {"type": "image_url", "image_url": {
+                                    "url": "data:image/png;base64," + "iVBORw0KGgo" * 40}}]
+            arguments = {"path": f"/tmp/{call_id}"}
+            if layout == "bigargs":
+                arguments["content"] = "x" * 2400
+            history.extend([
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": call_id, "type": "function", "function": {
+                        "name": "write_file" if layout == "bigargs" else "read_file",
+                        "arguments": json.dumps(arguments)}}]},
+                {"role": "tool", "tool_call_id": call_id, "content": f"result {call_id} {big}"},
+                {"role": "assistant", "content": "Done." if layout == "twins" else f"a{i} {big}"},
+            ])
+        if layout == "merge":
+            history[:0] = [{"role": "user", "content": "leading question"},
+                           {"role": "assistant", "content": "leading answer"}]
+            event_position += 2
+        for index, row in enumerate(history):
+            row["_qa_id"] = index  # independent of the compressor's placement mechanism
+        history.insert(event_position, dict(event))
+        agent = make_agent(stream=stream)
+        agent.session_id = f"rewrite-{layout}-{engine}-{event_position}-{stream}"
+        agent.compression_enabled = True
+        if engine == "lcm":
+            from plugins.context_engine.lcm.config import LCMConfig
+            from plugins.context_engine.lcm.engine import LCMEngine
+            cc = LCMEngine(config=LCMConfig(
+                database_path=str(tmp_path / "lcm.db"), fresh_tail_count=8,
+                leaf_chunk_tokens=1, context_threshold=0.01), hermes_home=str(tmp_path))
+            cc.update_model("test-model", 200_000, provider="unit-test")
+            cc.on_session_start(agent.session_id, hermes_home=str(tmp_path), model="test-model",
+                                provider="unit-test", context_length=200_000, platform="pytest")
+            agent.context_compressor = cc
+        else:
+            agent.context_compressor.threshold_tokens = 2000
+            agent.context_compressor._generate_summary = lambda *a, **kw: "compacted summary"
+        compress = agent.context_compressor.compress
+        def one_compaction(*args, **kwargs):
+            result = compress(*args, **kwargs)
+            agent.context_compressor.threshold_tokens = 1_000_000
+            return result
+        agent.context_compressor.compress = one_compaction
+        handler.captured_requests = []
+        handler.response_queue[:] = [("Done.", None)]
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "compacted summary"
+        response.usage = None
+        with patch("agent.auxiliary_client.call_llm", return_value=response):
+            result = agent.run_conversation("next", conversation_history=history, task_id="compact")
+        assert agent.context_compressor.compression_count > 0
+        rows = result["messages"]
+        event_index = next(i for i, row in enumerate(rows)
+                           if is_metadata_only_tool_notice(row))
+        assert sum(isinstance(row.get("_qa_id"), int) for row in rows) > 5
+        if 0 < event_index < len(rows) - 1 and rows[event_index + 1].get("role") == "tool":
+            assert not (rows[event_index - 1].get("role") == "tool" or
+                        rows[event_index - 1].get("tool_calls")), "event split a tool group"
+        if engine == "builtin":
+            assert all("_src_idx" not in row for row in rows)
+            assert all("_src_idx" not in row for row in db.get_messages_as_conversation(
+                agent.session_id))
+            assert all("_src_idx" not in row for request in _chat_requests(handler)
+                       for row in request["messages"])
+        for i, row in enumerate(rows):
+            source_index = row.get("_qa_id")
+            if isinstance(source_index, int):
+                assert (source_index < event_position) == (i < event_index), (
+                    engine, event_position, source_index, i, event_index)
+        assert sum(is_metadata_only_tool_notice(row)
+                   for row in db.get_messages_as_conversation(agent.session_id)) == 1
+        handler.captured_requests = []
+        handler.response_queue[:] = [("Second.", None)]
+        resumed = make_agent(stream=stream)
+        resumed.session_id = agent.session_id
+        resumed.compression_enabled = False
+        resumed.run_conversation("follow up", conversation_history=db.get_messages_as_conversation(
+            agent.session_id), task_id="resume")
+        assert all(not is_metadata_only_tool_notice(m)
+                   for m in _chat_requests(handler)[-1]["messages"])
+
     def test_contentful_tagged_system_is_not_stripped_before_compression(self, notice_env, stream):
         make_agent, handler, db, sid, _ = notice_env
         tagged = {"role": "system", "content": "CONTENTFUL-COMPRESS-ANCHOR",
@@ -559,6 +661,68 @@ class TestConfabNoticeEndToEnd:
         handler.response_queue.append(("Done.", None))
         agent.run_conversation("next", conversation_history=rows, task_id="contentful-compress")
         assert seen and any(tagged in attempt for attempt in seen)
+
+    def test_compaction_notice_backs_off_from_surviving_parallel_tool_run(self, notice_env, stream):
+        make_agent, handler, db, sid, _ = notice_env
+        handler.response_queue[:] = [
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
+        ]
+        make_agent(stream=stream).run_conversation("first", conversation_history=[], task_id="writer")
+        event = next(m for m in db.get_messages_as_conversation(sid)
+                     if is_metadata_only_tool_notice(m))
+        calls = [{"id": f"call_{i}", "type": "function",
+                  "function": {"name": "read_file", "arguments": "{}"}} for i in range(2)]
+        user = {"role": "user", "content": "old question"}
+        assistant = {"role": "assistant", "content": "", "tool_calls": calls}
+        results = [{"role": "tool", "tool_call_id": call["id"], "content": "result"}
+                   for call in calls]
+        history = [user, event, {"role": "user", "content": "dropped"},
+                   {"role": "assistant", "content": "dropped"},
+                   assistant, *results, {"role": "assistant", "content": "answered"}]
+        agent = make_agent(stream=stream)
+        # Simulate a plugin that rewrites the kept assistant's arguments but
+        # preserves the two results. The assistant is not content-matchable;
+        # its first result becomes the nearest mapped successor.
+        def rewritten_engine(input_rows, **kwargs):
+            modified = {**assistant, "tool_calls": [
+                {**call, "function": {**call["function"], "arguments": '{"changed":true}'}}
+                for call in calls]}
+            return [user, {"role": "user", "content": "summary"}, modified,
+                    *results, {"role": "assistant", "content": "answered"}]
+        agent.context_compressor.compress = rewritten_engine
+        compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
+        event_at = next(i for i, row in enumerate(compressed)
+                        if is_metadata_only_tool_notice(row))
+        assert compressed[event_at + 1].get("tool_calls"), "notice split a parallel tool run"
+        assert [row["tool_call_id"] for row in compressed if row.get("role") == "tool"] == [
+            call["id"] for call in calls]
+
+    @pytest.mark.parametrize("survives", ["predecessor", "neither"])
+    @pytest.mark.parametrize("retains_stamp", [False, True])
+    def test_compaction_notice_without_successor_uses_original_boundary(
+        self, notice_env, stream, survives, retains_stamp
+    ):
+        make_agent, handler, db, sid, _ = notice_env
+        handler.response_queue[:] = [
+            ("", {**VALID_NOTICE, "kind": "tool_call_as_text"}), ("First.", None)
+        ]
+        make_agent(stream=stream).run_conversation("first", conversation_history=[], task_id="writer")
+        event = next(m for m in db.get_messages_as_conversation(sid)
+                     if is_metadata_only_tool_notice(m))
+        user = {"role": "user", "content": "preserved head"}
+        history = [user, event, {"role": "assistant", "content": "dropped"},
+                   {"role": "user", "content": "dropped too"},
+                   {"role": "assistant", "content": "also dropped"}]
+        agent = make_agent(stream=stream)
+        def engine(input_rows, **kwargs):
+            predecessor = input_rows[0] if retains_stamp else user
+            return ([predecessor] if survives == "predecessor" else []) + [
+                {"role": "assistant", "content": "summary"}]
+        agent.context_compressor.compress = engine
+        compressed, _ = agent._compress_context(history, "system", approx_tokens=120_000)
+        event_at = next(i for i, row in enumerate(compressed)
+                        if is_metadata_only_tool_notice(row))
+        assert event_at == (1 if survives == "predecessor" else len(compressed) - 1)
 
     def test_same_request_id_retry_has_one_durable_event(self, notice_env, stream):
         make_agent, handler, db, sid, statuses = notice_env

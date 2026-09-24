@@ -95,6 +95,12 @@ class TestEstimateMessagesTokensRough:
             estimate_messages_tokens_rough([msg])
         )
 
+    def test_compaction_source_index_does_not_change_estimate(self):
+        """A transient restore stamp cannot move the compaction tail boundary."""
+        rows = [{"role": "user", "content": f"turn {i}"} for i in range(40)]
+        stamped = [dict(row, _src_idx=i) for i, row in enumerate(rows)]
+        assert estimate_messages_tokens_rough(stamped) == estimate_messages_tokens_rough(rows)
+
     def test_message_with_list_content(self):
         """Vision messages with multimodal content arrays.
 

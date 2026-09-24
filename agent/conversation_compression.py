@@ -4070,6 +4070,13 @@ def compress_context(
                        if is_metadata_only_tool_notice(msg)]
         engine_messages = ([msg for msg in messages if not is_metadata_only_tool_notice(msg)]
                            if tool_events else messages)
+        from agent.context_compressor import ContextCompressor
+        # The built-in engine copies kept rows through pruning, summary merge,
+        # and media cleanup. Stamp private INPUT indices on those copies, not
+        # content signatures: even a kept row can be rewritten by any pass.
+        stamped_builtin = bool(tool_events and type(agent.context_compressor) is ContextCompressor)
+        if stamped_builtin:
+            engine_messages = [dict(row, _src_idx=i) for i, row in enumerate(engine_messages)]
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
@@ -4155,10 +4162,11 @@ def compress_context(
                             engine_messages, current_tokens=approx_tokens
                         )
                     if tool_events:
-                        # Engines preserve a leading head and a trailing tail,
-                        # replacing the middle with a summary. Match only those
-                        # contiguous regions by position: a content-equal twin
-                        # in the head is not a survivor from the dropped middle.
+                        # Prefer source indices carried by the built-in engine
+                        # (stamped above) and LCM's existing fresh-tail stamp.
+                        # Content matching below is only a fallback for older
+                        # engines and unmarked head rows; it can miss survivors
+                        # whose content was rewritten during compression.
                         original = [(i, msg) for i, msg in enumerate(messages)
                                     if not is_metadata_only_tool_notice(msg)]
 
@@ -4175,15 +4183,30 @@ def compress_context(
                                     and source.get("content") == candidate.get("content"))
 
                         surviving = {}
+                        marked_outputs = set()
+                        for output_index, row in enumerate(compressed):
+                            source_index = row.get("_src_idx") if isinstance(row, dict) else None
+                            if (type(source_index) is int and 0 <= source_index < len(original)
+                                    and original[source_index][0] not in surviving
+                                    and original[source_index][1].get("role") == row.get("role")):
+                                surviving[original[source_index][0]] = output_index
+                                marked_outputs.add(output_index)
+                            if stamped_builtin and isinstance(row, dict):
+                                # LCM's stamps are consumed by compaction stats;
+                                # ours exist only for this placement and must
+                                # never be persisted or reach the provider.
+                                row.pop("_src_idx", None)
                         head = 0
                         while (head < min(len(original), len(compressed))
                                and same_row(original[head][1], compressed[head])):
-                            surviving[original[head][0]] = head
+                            if head not in marked_outputs:
+                                surviving.setdefault(original[head][0], head)
                             head += 1
                         tail = 0
                         while (tail < min(len(original) - head, len(compressed) - head)
                                and same_row(original[-tail - 1][1], compressed[-tail - 1])):
-                            surviving[original[-tail - 1][0]] = len(compressed) - tail - 1
+                            if len(compressed) - tail - 1 not in marked_outputs:
+                                surviving.setdefault(original[-tail - 1][0], len(compressed) - tail - 1)
                             tail += 1
                         boundary = max(head, len(compressed) - tail)
 
