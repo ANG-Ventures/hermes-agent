@@ -74,6 +74,18 @@ def _card(path: Path, tid: str, *, session_id, status="ready", title="t",
         )
     conn.commit()
     conn.close()
+    _reindex()
+
+
+def _reindex():
+    """Backfill/resync the cross-board home index (what install + the daily
+    cron do).  Raw INSERTs above write no event rows, so the write path
+    would not see them; the resync reads every board."""
+    from hermes_cli import kanban_home_index
+
+    report = kanban_home_index.resync()
+    assert not report["errors"], report
+    return report
 
 
 def _cards(n, **kw):
@@ -187,9 +199,8 @@ def test_I2_only_home_cards_foreign_null_worker_absent(mod, home):
     _card(d, "t_null0001", session_id=None, title="NULLHOME")
     _card(d, "t_wrkr0001", session_id="t_deadbeef", title="WORKERRUN")
     _card(d, "t_done0001", session_id=SID, title="CLOSED", status="done")
-    cards, stats = mod.query_cards(mod.home_ids(SID), budget_s=10)
+    cards = mod.query_cards(mod.home_ids(SID))
     assert {c["id"] for c in cards} == {"t_home0001", "t_home0002"}
-    assert stats["boards"] == 2
     out = mod.render(cards)
     for bad in ("FOREIGN", "NULLHOME", "WORKERRUN", "CLOSED"):
         assert bad not in out
@@ -197,10 +208,13 @@ def test_I2_only_home_cards_foreign_null_worker_absent(mod, home):
 
 
 def test_I2_grep_gate_single_query_filters_on_session_id(mod):
+    # The plugin never queries a board; the one card query is the index's.
     src = (PLUGIN_DIR / "__init__.py").read_text()
-    selects = re.findall(r"FROM tasks\b[^;]*?WHERE[^\n]*", src)
-    assert selects and all("session_id IN" in s for s in selects)
-    assert src.count("FROM tasks") == 1
+    assert "FROM tasks" not in src and "kanban.db" not in src
+    idx = (REPO / "hermes_cli" / "kanban_home_index.py").read_text()
+    body = idx[idx.index("def open_cards"):]
+    selects = re.findall(r"FROM cards WHERE[^\n]*", body)
+    assert len(selects) == 1 and "session_id IN" in selects[0]
 
 
 def test_I8_read_only_uri_never_immutable(mod, home):
@@ -209,7 +223,7 @@ def test_I8_read_only_uri_never_immutable(mod, home):
     d = _board(home)
     _card(d, "t_home0001", session_id=SID)
     before = d.stat().st_mtime_ns, d.read_bytes()
-    mod.query_cards(mod.home_ids(SID), budget_s=10)
+    mod.query_cards(mod.home_ids(SID))
     assert (d.stat().st_mtime_ns, d.read_bytes()) == before
 
 
@@ -220,7 +234,8 @@ def test_last_comment_and_activity_come_from_newest_comment(mod, home):
     conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) "
                  "VALUES ('t_home0001','x','newest',1790000500)")
     conn.commit(); conn.close()
-    (card,), _ = mod.query_cards([SID], budget_s=10)
+    _reindex()  # raw INSERT writes no event row; real add_comment does
+    (card,) = mod.query_cards([SID])
     assert card["last_comment"] == "newest" and card["last_activity"] == 1_790_000_500
 
 
@@ -487,48 +502,61 @@ def test_missing_session_id_is_noop(mod, stamped):
 
 # ── I5 fail-open, bounded latency ───────────────────────────────────────────
 
-def test_I5_locked_board_skipped_turn_proceeds(mod, home):
-    d = _board(home)
-    o = _board(home, "locked-board")
-    _card(d, "t_home0001", session_id=SID)
-    _card(o, "t_home0002", session_id=SID)
-    locker = sqlite3.connect(o, isolation_level=None)
+def test_I5_locked_index_fails_open_within_budget(mod, home, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    from hermes_cli import kanban_home_index
+
+    locker = sqlite3.connect(kanban_home_index.index_path(), isolation_level=None)
     locker.execute("PRAGMA journal_mode=DELETE")
     locker.execute("BEGIN EXCLUSIVE")
     try:
-        t = time.monotonic()
-        out = mod.on_pre_llm_call(session_id=SID)
-        assert time.monotonic() - t < mod.BUDGET_S + 0.5
+        with caplog.at_level("INFO", logger=mod.logger.name):
+            t = time.monotonic()
+            out = mod.on_pre_llm_call(session_id=SID)
+            assert time.monotonic() - t < mod.BUDGET_S + 0.5
     finally:
         locker.execute("ROLLBACK"); locker.close()
-    assert out and "t_home0001" in out["context"]
+    assert out is None
+    assert any(f"session={SID} unavailable=" in r.getMessage() for r in caplog.records)
 
 
-def test_I5_slow_board_hits_budget_and_fails_open(mod, home, monkeypatch):
+def test_I5_missing_index_renders_nothing_and_never_scans(mod, home, monkeypatch, caplog):
     d = _board(home)
     _card(d, "t_home0001", session_id=SID)
-    _board(home, "slow-board")
-    real = mod._query_board
-    def slow(slug, *a):
-        if slug == "slow-board":
-            time.sleep(3)
-        return real(slug, *a)
-    monkeypatch.setattr(mod, "_query_board", slow)
-    t = time.monotonic()
-    out = mod.on_pre_llm_call(session_id=SID)
-    elapsed = time.monotonic() - t
-    assert elapsed < mod.BUDGET_S + 0.5, elapsed
-    # the home is known non-empty (default board answered) → pointer line
-    assert out["context"].startswith("[Your open cards: unavailable (timeout)")
-    assert len(out["context"]) <= mod.MAX_UNAVAILABLE
+    from hermes_cli import kanban_home_index
+
+    kanban_home_index.index_path().unlink()
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        assert mod.on_pre_llm_call(session_id=SID) is None
+    assert any("unavailable=no-index" in r.getMessage() for r in caplog.records)
 
 
-def test_I5_timeout_with_empty_home_is_zero_tokens(mod, home, monkeypatch):
+def test_I5_not_backfilled_index_renders_nothing(mod, home, caplog):
+    from hermes_cli import kanban_home_index
+
     _board(home)
-    monkeypatch.setattr(mod, "_query_board", lambda *a: time.sleep(3) or [])
-    t = time.monotonic()
-    assert mod.on_pre_llm_call(session_id=SID) is None
-    assert time.monotonic() - t < mod.BUDGET_S + 0.5
+    conn = kanban_home_index._open_rw(kanban_home_index.index_path())  # schema only
+    conn.close()
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        assert mod.on_pre_llm_call(session_id=SID) is None
+    assert any("unavailable=not-backfilled" in r.getMessage() for r in caplog.records)
+
+
+def test_P1_turn_path_never_opens_a_board_db(mod, home, monkeypatch):
+    """Argus r1 B1 / Apollo ruling 1: the first turn reads ONE index."""
+    for slug in ("default", "b1", "b2", "b3"):
+        _card(_board(home, slug), f"t_{slug[:2]}000001".ljust(10, "0"), session_id=SID)
+    opened = []
+    real = sqlite3.connect
+
+    def spy(database, *a, **kw):
+        opened.append(str(database))
+        return real(database, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    out = mod.on_pre_llm_call(session_id=SID)
+    assert out and out["context"].count("\n- t_") == 4
+    assert opened and not [u for u in opened if "kanban.db" in u], opened
 
 
 def test_I5_never_raises(mod, home, monkeypatch):
@@ -569,71 +597,7 @@ def test_real_loader_not_enabled_by_default(home):
     assert not [r for r in mgr.invoke_hook("pre_llm_call", session_id=SID, platform="cli") if r]
 
 
-# ── P2 board mtime filter (t_11f2cf60) ──────────────────────────────────────
-
-def _age(path: Path, seconds_ago: float) -> None:
-    import os
-
-    t = time.time() - seconds_ago
-    os.utime(path, (t, t))
-
-
-def test_P2_board_not_written_since_home_start_is_not_opened(mod, home):
-    d = _board(home)
-    old = _board(home, "old-board")
-    new = _board(home, "new-board")
-    _card(old, "t_old00001", session_id=SID)  # cannot exist in reality; proves no open
-    _card(new, "t_new00001", session_id=SID)
-    _age(d, 86_400)
-    _age(old, 86_400)
-    since = time.time() - 3_600
-    dbs, skipped = mod._board_dbs(since)
-    assert [s for s, _ in dbs] == ["default", "new-board"]  # root kept even if old
-    assert skipped == 1
-    cards, stats = mod.query_cards([SID], budget_s=10, since=since)
-    assert {c["id"] for c in cards} == {"t_new00001"}
-    assert stats["mtime_skipped"] == 1 and stats["boards"] == 2
-
-
-def test_P2_mtime_slack_keeps_board_written_just_before_start(mod, home):
-    _board(home)
-    b = _board(home, "edge")
-    _age(b, 3_600 + mod.MTIME_SLACK_S - 60)  # inside the slack window
-    dbs, skipped = mod._board_dbs(time.time() - 3_600)
-    assert "edge" in [s for s, _ in dbs] and skipped == 0
-
-
-def test_P2_nonempty_wal_keeps_old_board(mod, home):
-    _board(home)
-    b = _board(home, "wal-board")
-    _age(b, 86_400)
-    Path(str(b) + "-wal").write_bytes(b"x" * 64)
-    dbs, skipped = mod._board_dbs(time.time() - 3_600)
-    assert "wal-board" in [s for s, _ in dbs] and skipped == 0
-
-
-def test_P2_unknown_start_disables_filter(mod, home):
-    _board(home)
-    b = _board(home, "ancient")
-    _age(b, 10 * 86_400)
-    dbs, skipped = mod._board_dbs(None)
-    assert "ancient" in [s for s, _ in dbs] and skipped == 0
-
-
-def test_P2_hook_uses_home_start_from_lineage(mod, home):
-    from hermes_state import SessionDB
-
-    db = SessionDB()
-    db.create_session(SID, "discord", session_key="agent:main:discord:group:1")
-    db.close()
-    d = _board(home)
-    old = _board(home, "old-board")
-    _card(d, "t_home0001", session_id=SID)
-    _card(old, "t_old00001", session_id=SID)
-    _age(old, 86_400)  # session started "now"; this board predates it
-    out = mod.on_pre_llm_call(session_id=SID, platform="discord")
-    assert "t_home0001" in out["context"] and "t_old00001" not in out["context"]
-
+# ── shared lineage ──────────────────────────────────────────────────────────
 
 def test_plugin_home_ids_is_the_shared_lineage(mod, home):
     from hermes_state import SessionDB
@@ -653,8 +617,8 @@ def test_plugin_home_ids_is_the_shared_lineage(mod, home):
 
 # ── I5 stage-attributed timeout (t_11f2cf60) ────────────────────────────────
 
-def test_I5_budget_is_1500ms(mod):
-    assert mod.BUDGET_S == 1.5
+def test_I5_budget_is_750ms(mod):
+    assert mod.BUDGET_S == 0.75
 
 
 def test_I5_lineage_timeout_names_stage(mod, home, monkeypatch, caplog):
@@ -666,7 +630,7 @@ def test_I5_lineage_timeout_names_stage(mod, home, monkeypatch, caplog):
         assert mod.on_pre_llm_call(session_id=SID) is None
         assert time.monotonic() - t < 0.2 + 0.5
     line = next(r.getMessage() for r in caplog.records if "unavailable=timeout" in r.getMessage())
-    assert "stage=lineage" in line and "partial_cards=0" in line and "ms=" in line
+    assert "stage=lineage" in line and "ms=" in line
 
 
 def test_I5_dedupe_timeout_names_stage(mod, home, monkeypatch, caplog):
@@ -679,21 +643,14 @@ def test_I5_dedupe_timeout_names_stage(mod, home, monkeypatch, caplog):
     assert any("stage=dedupe" in r.getMessage() for r in caplog.records)
 
 
-def test_I5_boards_timeout_names_stage_and_partial(mod, home, monkeypatch, caplog):
-    d = _board(home)
-    _card(d, "t_home0001", session_id=SID)
-    _board(home, "slow-board")
-    real = mod._query_board
-    def slow(slug, *a):
-        if slug == "slow-board":
-            time.sleep(3)
-        return real(slug, *a)
-    monkeypatch.setattr(mod, "_query_board", slow)
+def test_I5_index_timeout_names_stage(mod, home, monkeypatch, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    monkeypatch.setattr(mod, "BUDGET_S", 0.2)
+    monkeypatch.setattr(mod, "query_cards", lambda ids: time.sleep(1) or [])
     with caplog.at_level("INFO", logger=mod.logger.name):
-        out = mod.on_pre_llm_call(session_id=SID)
-    assert out["context"].startswith("[Your open cards: unavailable (timeout)")
+        assert mod.on_pre_llm_call(session_id=SID) is None
     line = next(r.getMessage() for r in caplog.records if "unavailable=timeout" in r.getMessage())
-    assert "stage=boards" in line and "partial_cards=1" in line
+    assert "stage=index" in line and "lineage_ms=" in line and "dedupe_ms=" in line
 
 
 def test_success_log_carries_stage_timings(mod, home, caplog):
@@ -701,77 +658,28 @@ def test_success_log_carries_stage_timings(mod, home, caplog):
     with caplog.at_level("INFO", logger=mod.logger.name):
         assert mod.on_pre_llm_call(session_id=SID)
     line = next(r.getMessage() for r in caplog.records if "cards=1" in r.getMessage())
-    for f in ("ms=", "lineage_ms=", "dedupe_ms=", "boards_ms=", "mtime_skipped=",
-              "prewarmed=False"):
+    for f in ("ms=", "lineage_ms=", "dedupe_ms=", "index_ms="):
         assert f in line, (f, line)
 
 
-# ── P1 gateway prewarm (t_11f2cf60) ─────────────────────────────────────────
+# ── one log line per first turn (Argus r1 non-blocking b) ───────────────────
 
-class _Store:
-    def __init__(self, sid):
-        self.sid = sid
-
-    def _generate_session_key(self, source):
-        return "k"
-
-    def peek_session_id(self, key):
-        return self.sid if key == "k" else None
-
-
-class _Ev:
-    class source:  # noqa: N801 - attribute bag
-        platform = "discord"
-
-
-def test_P1_prewarm_probe_is_consumed_by_first_turn(mod, home, monkeypatch, caplog):
+def test_dedupe_results_are_logged(mod, home, caplog):
     _card(_board(home), "t_home0001", session_id=SID)
-    calls = []
-    real = mod.home_ids
-    monkeypatch.setattr(mod, "home_ids", lambda s: calls.append(s) or real(s))
-    assert mod.on_pre_gateway_dispatch(event=_Ev(), gateway=None,
-                                       session_store=_Store(SID)) is None
     with caplog.at_level("INFO", logger=mod.logger.name):
-        out = mod.on_pre_llm_call(session_id=SID, platform="discord")
-    assert out and "t_home0001" in out["context"]
-    assert calls == [SID]  # one probe, started by dispatch, reused by the turn
-    assert any("prewarmed=True" in r.getMessage() for r in caplog.records)
-    assert mod.on_pre_llm_call(session_id=SID, platform="discord") is None  # I1
+        assert mod.on_pre_llm_call(session_id=SID, conversation_history=_hist(1, header_at=0)) is None
+    assert any(f"session={SID} dedupe=history" in r.getMessage() for r in caplog.records)
+    fresh = _load()
+    _state_db(fresh, FOREIGN, 2, header_at=0)
+    with caplog.at_level("INFO", logger=fresh.logger.name):
+        assert fresh.on_pre_llm_call(session_id=FOREIGN, conversation_history=[]) is None
+    assert any(f"session={FOREIGN} dedupe=state.db" in r.getMessage() for r in caplog.records)
 
 
-def test_P1_prewarm_never_affects_dispatch_and_fails_quiet(mod, home):
-    class Boom:
-        def _generate_session_key(self, source):
-            raise RuntimeError("x")
-    assert mod.on_pre_gateway_dispatch(event=_Ev(), session_store=Boom()) is None
-    assert mod.on_pre_gateway_dispatch(event=None, session_store=None) is None
-    assert mod._PROBES == {}
-
-
-def test_P1_no_prewarm_for_already_served_session(mod, home):
-    _card(_board(home), "t_home0001", session_id=SID)
-    assert mod.on_pre_llm_call(session_id=SID)
-    mod.on_pre_gateway_dispatch(event=_Ev(), session_store=_Store(SID))
-    assert SID not in mod._PROBES
-
-
-def test_P1_stale_prewarm_is_not_trusted(mod, home, monkeypatch):
-    _card(_board(home), "t_home0001", session_id=SID)
-    mod.on_pre_gateway_dispatch(event=_Ev(), session_store=_Store(SID))
-    probe = mod._PROBES[SID]
-    probe.done.wait(10)
-    probe.created -= mod.PROBE_FRESH_S + 1
-    assert mod._take_probe(SID) is not probe
-
-
-def test_P1_real_loader_registers_dispatch_hook(home):
-    (home / "config.yaml").write_text(
-        yaml.safe_dump({"plugins": {"enabled": ["kanban-home-cards"]}}), encoding="utf-8"
-    )
-    from hermes_cli.plugins import PluginManager
-
-    mgr = PluginManager()
-    mgr.discover_and_load()
-    res = mgr.invoke_hook("pre_gateway_dispatch", event=_Ev(), gateway=None,
-                          session_store=_Store(None))
-    assert all(r is None for r in res)  # never skips/rewrites a message
+def test_only_pre_llm_call_is_registered():
+    manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
+    assert manifest["hooks"] == ["pre_llm_call"]
+    assert "750 ms" in manifest["description"]
+    hooks = []
+    _load().register(type("Ctx", (), {"register_hook": lambda self, n, f: hooks.append(n)})())
+    assert hooks == ["pre_llm_call"]
