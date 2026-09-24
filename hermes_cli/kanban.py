@@ -1317,14 +1317,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Kyzcreig/* GitHub URLs the clone uses --reference-if-able "
             "against a bare mirror under <hermes root>/mirrors/, created "
             "lazily, so the checkout stores only objects the mirror lacks. "
-            "Other URLs are cloned normally."
+            "Other URLs are cloned normally. Common git-clone options "
+            "(-q, -b, --depth, --filter, --no-checkout, --single-branch, "
+            "--no-tags, --origin, ...) are forwarded."
         ),
     )
-    p_clone.add_argument("url", help="Repository URL")
-    p_clone.add_argument("dest", nargs="?", default=None,
-                         help="Destination directory (default: repo name)")
-    p_clone.add_argument("-b", "--branch", default=None,
-                         help="Branch to check out")
+    from hermes_cli.kanban_clone import add_arguments as _add_clone_arguments
+
+    _add_clone_arguments(p_clone)
 
     # --- repair ---
     p_repair = sub.add_parser(
@@ -1441,7 +1441,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         if action == "clone":
             from hermes_cli.kanban_clone import clone
 
-            return clone(args.url, args.dest, args.branch)
+            return clone(args.url, args.dest, args.git_opts)
         try:
             kb.init_db()
         except Exception as exc:

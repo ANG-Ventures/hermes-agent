@@ -79,9 +79,22 @@ def test_fleet_clone_borrows_objects_from_lazy_mirror(fleet):
     assert (fleet / "a" / "big.txt").read_text().startswith("payload")
 
     # The never-prune invariant is written into the mirror at creation.
-    for key, value in kc.MIRROR_CONFIG:
-        got = _git("--git-dir", str(mirror), "config", "--get-all", key).splitlines()
-        assert value in got, key
+    # Literal values, NOT a loop over kc.MIRROR_CONFIG: a table the test
+    # re-reads from the implementation cannot catch a key dropped from it.
+    expected = {
+        "core.repositoryformatversion": "1",
+        "extensions.preciousobjects": "true",
+        "gc.auto": "0",
+        "gc.pruneexpire": "never",
+        "gc.reflogexpire": "never",
+        "gc.reflogexpireunreachable": "never",
+        "maintenance.auto": "false",
+        "fetch.prune": "false",
+    }
+    for key, value in expected.items():
+        assert _git("--git-dir", str(mirror), "config", "--get", key) == value, key
+    # A fully built mirror leaves no staging repo behind.
+    assert not list((fleet / "mirrors" / "Kyzcreig").glob(".*.partial"))
 
 
 def test_second_clone_reuses_mirror(fleet):
@@ -122,6 +135,122 @@ def test_cli_dispatch_skips_kanban_db(fleet, monkeypatch):
     monkeypatch.setattr(kanban.kb, "init_db", _boom)
     parser = argparse.ArgumentParser()
     kanban.build_parser(parser.add_subparsers(dest="cmd"))
-    args = parser.parse_args(["kanban", "clone", "https://github.com/Kyzcreig/demo.git", "c", "-b", "main"])
+    args = parser.parse_args(["kanban", "clone", "-b", "main", "https://github.com/Kyzcreig/demo.git", "c"])
     assert kanban.kanban_command(args) == 0
     assert (fleet / "c" / ".git" / "objects" / "info" / "alternates").exists()
+
+
+def _run_cli(argv):
+    import argparse
+
+    from hermes_cli import kanban
+
+    parser = argparse.ArgumentParser()
+    kanban.build_parser(parser.add_subparsers(dest="cmd"))
+    return kanban.kanban_command(parser.parse_args(["kanban", "clone", *argv]))
+
+
+def test_cli_forwards_the_git_clone_options_workers_use(fleet):
+    """QA r1 B5b: -q/--depth/--filter/--no-checkout/... were rc=2 before."""
+    rc = _run_cli([
+        "-q", "--depth", "1", "--filter=blob:none", "--no-checkout",
+        "--single-branch", "--no-tags", "--origin", "up", "-b", "main",
+        "https://github.com/Kyzcreig/demo.git", "d",
+    ])
+    assert rc == 0
+    dest = fleet / "d"
+    assert (dest / ".git" / "objects" / "info" / "alternates").exists()
+    assert (dest / ".git" / "shallow").exists(), "--depth not forwarded"
+    assert not (dest / "big.txt").exists(), "--no-checkout not forwarded"
+    assert _git("remote", cwd=dest) == "up", "--origin not forwarded"
+    assert _git("config", "--get", "remote.up.partialclonefilter", cwd=dest) == "blob:none"
+    assert _git("config", "--get", "remote.up.fetch", cwd=dest) == "+refs/heads/main:refs/remotes/up/main"
+    assert _git("config", "--get", "remote.up.tagopt", cwd=dest) == "--no-tags"
+
+
+def test_cli_accepts_double_dash_before_url(fleet):
+    assert _run_cli(["-q", "--", "https://github.com/Kyzcreig/demo.git", "e"]) == 0
+    assert (fleet / "e" / "big.txt").exists()
+
+
+def test_mirror_root_is_fleet_root_under_a_profile_home(tmp_path, monkeypatch):
+    """QA r1 A5: workers run with HERMES_HOME=<root>/profiles/<name>."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "daedalus").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "daedalus"))
+    monkeypatch.delenv(kc.MIRRORS_ENV, raising=False)
+    assert kc.mirrors_root() == root / "mirrors"
+    assert kc.mirror_path("Kyzcreig", "demo") == root / "mirrors" / "Kyzcreig" / "demo.git"
+
+
+def test_userinfo_is_not_persisted_in_the_shared_mirror(fleet, monkeypatch):
+    """QA r1 C1: a token-bearing URL must not land in the mirror's config."""
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+    monkeypatch.setenv("GIT_CONFIG_KEY_1", f"url.file://{fleet / 'src'}/.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_1", "https://someone:s3cret@github.com/")
+    assert kc.clone("https://someone:s3cret@github.com/Kyzcreig/demo.git", "a") == 0
+    mirror = fleet / "mirrors" / "Kyzcreig" / "demo.git"
+    assert _git("--git-dir", str(mirror), "config", "--get", "remote.origin.url") == (
+        "https://github.com/Kyzcreig/demo.git")
+    assert "s3cret" not in (mirror / "config").read_text()
+
+
+def test_failed_mirror_build_leaves_no_mirror_and_resumes(fleet, monkeypatch):
+    """A half-built mirror is never visible; the next call finishes the build."""
+    real = kc._git
+    calls = {"n": 0}
+
+    def flaky(*args):
+        if "fetch" in args and calls["n"] == 0:
+            calls["n"] += 1
+            return subprocess.CompletedProcess(args, 1, "", "network down")
+        return real(*args)
+
+    monkeypatch.setattr(kc, "_git", flaky)
+    with pytest.raises(RuntimeError, match="network down"):
+        kc.ensure_mirror("https://github.com/Kyzcreig/demo.git", "Kyzcreig", "demo")
+    mirror = fleet / "mirrors" / "Kyzcreig" / "demo.git"
+    assert not mirror.exists()
+    assert kc.ensure_mirror("https://github.com/Kyzcreig/demo.git", "Kyzcreig", "demo") == mirror
+    assert (mirror / "objects").is_dir()
+    assert not (fleet / "mirrors" / "Kyzcreig" / ".demo.git.partial").exists()
+
+
+@pytest.mark.parametrize("precious", [True, False])
+def test_explicit_prune_on_mirror_cannot_corrupt_a_dependent(fleet, precious):
+    """QA r1 B3(c): `git gc --prune=now` overrides gc.pruneExpire=never.
+
+    extensions.preciousObjects is what stops it. The precious=False arm is the
+    control: with the extension removed the same operation DOES corrupt the
+    dependent, so the True arm is measuring the guard, not a no-op.
+    """
+    assert kc.clone("https://github.com/Kyzcreig/demo.git", "a") == 0
+    mirror = fleet / "mirrors" / "Kyzcreig" / "demo.git"
+    dep = fleet / "a"
+    assert "size-pack: 0" in _git("count-objects", "-v", cwd=dep)  # objects live in the mirror
+
+    # Upstream force-pushes an unrelated history; a refresh makes the
+    # dependent's commit unreachable inside the mirror.
+    work = fleet / "src" / "work" / "Kyzcreig" / "demo"
+    _git("checkout", "-q", "--orphan", "rewrite", cwd=work)
+    (work / "big.txt").write_text("rewritten\n")
+    _git("add", ".", cwd=work)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "rewrite", cwd=work)
+    _git("push", "-q", "--force", str(fleet / "src" / "Kyzcreig" / "demo.git"), "HEAD:main", cwd=work)
+    _git("--git-dir", str(mirror), "fetch", "-q", "origin")
+
+    if not precious:
+        _git("--git-dir", str(mirror), "config", "--unset", "extensions.preciousObjects")
+    subprocess.run(["git", "--git-dir", str(mirror), "gc", "-q", "--prune=now"],
+                   capture_output=True, text=True, check=False)
+
+    fsck = subprocess.run(["git", "fsck", "--connectivity-only"], cwd=dep,
+                          capture_output=True, text=True, check=False)
+    head = subprocess.run(["git", "cat-file", "-e", "HEAD^{tree}"], cwd=dep,
+                          capture_output=True, text=True, check=False)
+    if precious:
+        assert fsck.returncode == 0, fsck.stderr
+        assert head.returncode == 0
+    else:
+        assert fsck.returncode != 0 or head.returncode != 0, "control arm did not corrupt"
