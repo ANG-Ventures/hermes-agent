@@ -3935,6 +3935,14 @@ DEFAULT_CONFIG = {
         # to disable idle reaping and keep servers for process lifetime.
         "idle_timeout": 600.0,
 
+        # Running language servers allowed per OS user across EVERY agent
+        # process on the box (each worker otherwise runs its own pyright,
+        # 200-950 MB apiece).  Past the cap a process runs without LSP
+        # (shell linter only), logs one line, and retries on a later edit
+        # once a slot frees.  Slots are flock'd files, released by the
+        # kernel when a holder dies.  0 = unlimited.
+        "max_servers_per_host": 3,
+
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
         # ``rust-analyzer``, etc.) and accepts:
