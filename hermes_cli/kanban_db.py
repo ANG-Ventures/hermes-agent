@@ -8416,8 +8416,13 @@ def complete_task(
         metadata = dict(metadata or {}, survivor=survivor)
         if survivor['kind'] == 'patch':
             survivor_note = (
-                f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} NOT PUSHED"
+                f"survivor=patch {survivor['path']} {survivor['sha256']} {survivor['bytes']} "
+                f"{survivor.get('notice') or 'NOT PUSHED'}"
             )
+            if survivor.get("claims"):
+                survivor_note += " claims=" + " ".join(
+                    f"{ref.get('pr') or ref['remote']}@{ref['sha']}" for ref in survivor["claims"]
+                )
         elif survivor['kind'] == 'bundle':
             survivor_note = f"survivor=bundle {survivor['sidecar']} NOT PUSHED"
         elif survivor['kind'] == 'landed':

@@ -39,15 +39,45 @@ class SurvivorUnavailable(ValueError):
 
 log = logging.getLogger(__name__)
 
-def _git(repo, *args, env=None, check=True, input=None, timeout=30):
-    # Local replace refs can substitute another tree for the only raw commit.
-    # Every Git authority read must inspect raw objects before deleting work.
-    git_env = dict(os.environ if env is None else env, GIT_NO_REPLACE_OBJECTS="1")
+def _git_env(env=None, *, lazy_fetch=False):
+    """The environment every survivor git call runs with.
+
+    * ``GIT_NO_REPLACE_OBJECTS``: local replace refs can substitute another
+      tree for the only raw commit; authority reads inspect raw objects.
+    * ``GIT_NO_LAZY_FETCH`` (git >= 2.44; older git ignores it and is merely
+      slow): a "does THIS repository hold X" probe must never go to the
+      network. In a ``blob:none``/promisor clone ``cat-file`` on an advertised
+      head the store lacks triggers an on-demand fetch per SHA -- measured 36 s
+      for 32 missing heads on t_fc150853's workspace, past the 30 s ``_git``
+      timeout, which surfaced as the bare "capture failed" (Argus r1 F2).
+      Only content materialisation (``_snapshot``) may opt back in.
+    * Discovery overrides (``GIT_DIR``/``GIT_WORK_TREE``/...) INHERITED from
+      the caller are dropped: they re-point ``git -C <repo>`` at another tree.
+      Values a caller sets on purpose (``_snapshot``'s ``GIT_INDEX_FILE``)
+      differ from ``os.environ`` and are kept.
+    """
+    base = dict(os.environ if env is None else env)
+    for key in _ext._DISCOVERY_ENV:
+        if key in base and base[key] == os.environ.get(key):
+            base.pop(key)
+    base["GIT_NO_REPLACE_OBJECTS"] = "1"
+    if lazy_fetch:
+        base.pop("GIT_NO_LAZY_FETCH", None)
+    else:
+        base["GIT_NO_LAZY_FETCH"] = "1"
+    return base
+
+
+def _git(repo, *args, env=None, check=True, input=None, timeout=30, lazy_fetch=False):
+    # ``-C`` names the repository; ``cwd`` is pinned to a neutral directory so
+    # nothing about the CALLER's cwd (a scratch workspace under the tripwire
+    # gitfile, Argus r1 F1) can influence discovery. The path is made absolute
+    # against the process cwd first, so a relative ``repo`` keeps its meaning.
     result = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", "-C", os.path.abspath(str(repo)), *args],
         stdin=subprocess.DEVNULL if input is None else None,
-        input=input,
-        capture_output=True, timeout=timeout, env=git_env,
+        input=input, cwd=_ext.neutral_cwd(),
+        capture_output=True, timeout=timeout, env=_git_env(env, lazy_fetch=lazy_fetch),
     )
     if check and result.returncode:
         # Git stderr can contain credential-bearing remote URLs, so it is never
@@ -837,9 +867,9 @@ def _patch_id(repo, sha, env=None):
     if diff.returncode or not diff.stdout:
         return None
     result = subprocess.run(
-        ["git", "-C", str(repo), "patch-id", "--stable"],
+        ["git", "-C", os.path.abspath(str(repo)), "patch-id", "--stable"],
         input=diff.stdout, capture_output=True, timeout=30,
-        env=dict(os.environ if env is None else env, GIT_NO_REPLACE_OBJECTS="1"),
+        cwd=_ext.neutral_cwd(), env=_git_env(env),
     )
     if result.returncode or not result.stdout.strip():
         return None
@@ -1095,7 +1125,23 @@ def _base(repo, published):
     return min(candidates)[1]
 
 
-def _snapshot(repo, base, prefix):
+def _snapshot(repo, base, prefix, *, irreversible_delete=False):
+    """A bundle when ``base`` is None, else a binary patch against ``base``.
+
+    ``irreversible_delete`` (used by ``_capture`` only when the full binary
+    patch exceeds the attachment limit) re-cuts it with
+    ``--irreversible-delete``. That only
+    omits the PREIMAGE of wholly deleted files, and a patch against ``base``
+    only ever deletes files that exist in ``base`` -- a published commit, so
+    every omitted byte is derivable from it (``--full-index`` keeps the exact
+    blob ids that name them). Added and modified content is untouched, so any
+    new byte is still captured in full, and an over-limit result still
+    refuses in ``_store``. t_3684ae00's truncated checkout is the measured
+    case: 12,318 deletions, 0 added lines, 164.8 MB full vs 2.7 MB cut
+    (Argus r1 F3). The cut patch does not ``git apply`` as-is (git refuses a
+    removal without contents); recovery is ``git rm`` of the listed paths,
+    so the full form stays the default whenever it fits.
+    """
     with tempfile.TemporaryDirectory(prefix="kanban-index-") as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
         index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip())
@@ -1104,7 +1150,7 @@ def _snapshot(repo, base, prefix):
             shutil.copy2(index, env["GIT_INDEX_FILE"])
         else:
             _git(repo, "read-tree", "--empty", env=env)
-        _git(repo, "add", "-A", "--", ".", env=env)
+        _git(repo, "add", "-A", "--", ".", env=env, lazy_fetch=True)
         if base is None:
             tree = _git(repo, "write-tree", env=env).stdout.decode().strip()
             head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
@@ -1120,13 +1166,19 @@ def _snapshot(repo, base, prefix):
             _git(recovery, "update-ref", "refs/heads/implementation", commit, env=bundle_env)
             _git(recovery, "symbolic-ref", "HEAD", "refs/heads/implementation", env=bundle_env)
             bundle = Path(tmp) / "implementation.bundle"
-            _git(recovery, "bundle", "create", str(bundle), "--all", env=bundle_env)
+            _git(recovery, "bundle", "create", str(bundle), "--all", env=bundle_env, lazy_fetch=True)
             return bundle.read_bytes()
         return _git(
             repo, "diff", "--cached", "--relative", "--binary", "--full-index", "--no-ext-diff",
-            "--no-textconv", "--no-renames", f"--src-prefix=a/{prefix}",
-            f"--dst-prefix=b/{prefix}", base, "--", ".", env=env,
+            "--no-textconv", "--no-renames", *(["--irreversible-delete"] if irreversible_delete else []),
+            f"--src-prefix=a/{prefix}", f"--dst-prefix=b/{prefix}", base, "--", ".", env=env,
+            lazy_fetch=True, timeout=_SNAPSHOT_TIMEOUT,
         ).stdout
+
+
+#: A full binary diff of a large truncated checkout is legitimately slow (the
+#: 164.8 MB t_3684ae00 case); 30 s is the probe budget, not the content one.
+_SNAPSHOT_TIMEOUT = 300
 
 
 def _capture(repo, key, workspace):
@@ -1394,6 +1446,12 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
                     f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
                     f"against the remote"
                 )
+        except _ext.Unverified as exc:
+            # The remote answered and said why the claim fails (e.g. the SHA
+            # is not reachable from the default branch). Say it.
+            raise SurvivorUnavailable(
+                f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)}: {exc}"
+            ) from exc
         except _ext.AmbiguousRef as exc:
             # A THIRD outcome, and reporting it as either of the other two lies.
             # The remote answered, and it answered with several refs that all
@@ -2168,6 +2226,16 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             stage = f"capture repository {key}"
             try:
                 ref, base, data = _capture(repo, key, workspace)
+                irreversible = False
+                if base is not None and data and len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
+                    # Only deleted-file preimages are dropped, and those are
+                    # derivable from the published ``base`` (see ``_snapshot``).
+                    # Still over the limit means real new bytes: ``_store``
+                    # refuses below, fail-closed.
+                    stage = f"irreversible-delete recut of repository {key}"
+                    data = _snapshot(repo, base, "" if key == "." else key + "/",
+                                     irreversible_delete=True)
+                    irreversible = True
             except SurvivorUnavailable:
                 # Every object-reading step above (`status`, `diff`, and
                 # `_snapshot`'s `git bundle` inside pack-objects) raises the
@@ -2184,9 +2252,15 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 bundle = _store(conn, task_id, name, data, "application/x-git-bundle")
                 bundles.append(dict(bundle, repository=key))
             elif data:
-                header = f"# kanban repository={json.dumps(key)} base={base}\n".encode()
+                header = (f"# kanban repository={json.dumps(key)} base={base}"
+                          f"{' irreversible-delete=1' if irreversible else ''}\n").encode()
                 patches.append(header + data)
-            repositories.append({"repository": key, "base_sha": base})
+            entry = {"repository": key, "base_sha": base}
+            if irreversible:
+                # Recorded so a recoverer knows deleted-file preimages were
+                # omitted as derivable from `base_sha`, not lost.
+                entry["irreversible_delete"] = True
+            repositories.append(entry)
         if repos and not bundles and len(refs) == len(repos) + len(carried):
             survivor = {"kind": "ref", "refs": refs}
             if any(ref.get("matched_by") == "canonical" for ref in refs):
@@ -2198,6 +2272,16 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             data = b"".join(patches)
             survivor = {"kind": "bundle" if bundles else "patch", "notice": "NOT PUSHED",
                         "bundles": bundles, "refs": refs}
+            if explicit:
+                # A verified explicit claim (e.g. a squash-merged PR) is the
+                # implementation's provenance; the captured bytes are only the
+                # workspace's residual delta. Persist the claim instead of
+                # dropping it, and do not label landed work "NOT PUSHED"
+                # (Argus r1 F5: t_fc150853 closed as refs:[] + NOT PUSHED
+                # although #195 had verified as merged deb2603).
+                survivor["claims"] = [dict(ref, repository=key or ".")
+                                      for key, ref in sorted(explicit.items(), key=lambda i: i[0] or "")]
+                survivor["notice"] = "WORKSPACE DELTA CAPTURED; implementation landed per verified claim"
             if patches:
                 survivor.update(_store(conn, task_id, "implementation.patch", data, "text/x-patch"))
             manifest = dict(survivor, repositories=repositories)

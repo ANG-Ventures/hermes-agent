@@ -1,6 +1,8 @@
 """Closeout regressions from real merged PRs whose merge commits are no longer tips."""
 import argparse
+import ast
 import contextlib
+import os
 import subprocess
 from pathlib import Path
 
@@ -178,3 +180,199 @@ def test_explicit_pr_closes_shared_dir_without_claiming_foreign_worktree(board, 
     assert (foreign / "unpublished.py").read_text() == "foreign work\n"
     assert survivor.remove_workspace_dir(board, tid, shared) is False
     assert (foreign / "unpublished.py").exists(), "a closeout claim is not deletion authority"
+
+
+HOME_PR_HEAD = "23672b199402bc2afafb8ea2df43e75b7aae7daf"  # squash-merged: NOT on main
+
+
+@pytest.fixture
+def tripwire_cwd(tmp_path, monkeypatch):
+    """The worker's real cwd shape: a dir under a gitfile pointing at /nonexistent."""
+    root = tmp_path / "workspaces"
+    (root / "t_cwdprobe").mkdir(parents=True)
+    (root / ".git").write_text("gitdir: /nonexistent/kanban-scratch-workspace-is-not-a-repo\n")
+    monkeypatch.chdir(root / "t_cwdprobe")
+    probe = subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True,
+                           stdin=subprocess.DEVNULL)
+    assert probe.returncode == 128, "fixture must reproduce the tripwire"
+    return root / "t_cwdprobe"
+
+
+def test_ref_verifies_from_tripwire_cwd(tripwire_cwd):
+    """Argus r1 F1: ls-remote from an inherited scratch cwd exited 128."""
+    result = ext.verify_ref(f"{HOMELAB}#{HOMELAB_MERGE}")
+    assert result["sha"] == HOMELAB_MERGE
+
+
+def test_merged_sha_ancestry_verifies_from_tripwire_cwd(tripwire_cwd):
+    result = ext.verify_ref(f"{HOME}#{HOME_MERGE}")
+    assert result["branch"] == "refs/heads/main"
+
+
+def test_landed_tree_binds_from_tripwire_cwd(tripwire_cwd):
+    result = survivor._verified_explicit("t_3684ae00", None, "ANG-Ventures/hermes-home#457")
+    assert result[None]["corroborated_by"] == "landed-tree"
+
+
+def test_inherited_git_dir_does_not_redirect_remote_probe(monkeypatch, tmp_path):
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "not-a-repo"))
+    assert ext.verify_ref(f"{HOMELAB}#{HOMELAB_MERGE}")["sha"] == HOMELAB_MERGE
+
+
+def test_unreachable_sha_names_default_branch_and_compare_status():
+    """Argus r1 F4: the squashed PR head is known to GitHub but not on main."""
+    with pytest.raises(survivor.SurvivorUnavailable) as exc:
+        survivor._verified_explicit("t_3684ae00", f"{HOME}#{HOME_PR_HEAD}", None, unbound=True)
+    message = str(exc.value)
+    assert "refs/heads/main" in message
+    assert "status=diverged" in message
+
+
+_SURVIVOR_MODULES = ("hermes_cli/kanban_survivor.py", "hermes_cli/kanban_external_survivor.py")
+
+
+def _subprocess_calls_without_cwd(source):
+    missing = []
+    for node in ast.walk(ast.parse(source)):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess"
+                and node.func.attr in {"run", "Popen", "call", "check_call", "check_output"}
+                and not any(k.arg == "cwd" for k in node.keywords)):
+            missing.append(node.lineno)
+    return missing
+
+
+def test_survivor_path_subprocesses_never_inherit_process_cwd():
+    """Contract: no git/gh subprocess on the survivor path runs in the caller's cwd."""
+    root = Path(__file__).resolve().parents[2]
+    offenders = {mod: _subprocess_calls_without_cwd((root / mod).read_text())
+                 for mod in _SURVIVOR_MODULES}
+    assert not any(offenders.values()), offenders
+
+
+def test_cwd_contract_detects_a_dropped_cwd():
+    """Mutant arm: stripping ``cwd=`` from the real module must turn the contract RED."""
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "hermes_cli/kanban_external_survivor.py").read_text()
+    mutant = source.replace("cwd=neutral_cwd(), env=scrubbed_env())", "env=scrubbed_env())", 1)
+    assert mutant != source
+    assert _subprocess_calls_without_cwd(mutant)
+
+
+def _dirty_repo(ws, files):
+    repo = ws / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, stdin=subprocess.DEVNULL)
+    for name, body in files.items():
+        (repo / name).write_bytes(body)
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, stdin=subprocess.DEVNULL)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True,
+                   stdin=subprocess.DEVNULL, env=env)
+    # A bare "published" remote that carries HEAD, so HEAD is a published base.
+    remote = ws.parent / f"{ws.name}-published.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True,
+                   stdin=subprocess.DEVNULL)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", f"file://{remote}"],
+                   check=True, stdin=subprocess.DEVNULL)
+    return repo
+
+
+def _scratch(board, title):
+    tid = kb.create_task(board, title=title)
+    ws = kb.resolve_workspace(kb.get_task(board, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kb.set_workspace_path(board, tid, ws)
+    return tid, ws
+
+
+@pytest.fixture
+def published_ok(monkeypatch):
+    # file:// remotes under tmp are (correctly) not durable; this fixture is
+    # about the capture shape, not the durability rule, so accept them here.
+    monkeypatch.setattr(survivor, "_durable_remote", lambda *a, **kw: True)
+
+
+def test_pure_deletion_over_limit_captures_irreversible_patch(board, monkeypatch, published_ok):
+    """Argus r1 F3 (t_3684ae00 shape): deletion-only dirt against a published HEAD."""
+    tid, ws = _scratch(board, "truncated checkout")
+    repo = _dirty_repo(ws, {f"big{i}.bin": os.urandom(4000) for i in range(5)} | {"keep.txt": b"k\n"})
+    for i in range(5):
+        (repo / f"big{i}.bin").unlink()
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4000)
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["x"]})
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert saved["kind"] == "patch"
+    patch = Path(saved["path"]).read_bytes()
+    assert b"irreversible-delete=1" in patch
+    for i in range(5):
+        assert f"diff --git a/repo/big{i}.bin b/repo/big{i}.bin".encode() in patch
+    assert len(patch) <= 4000
+
+
+def test_added_bytes_are_never_cut_and_still_refuse_over_limit(board, monkeypatch, published_ok):
+    """Sibling: new content cannot be derived from any commit, so it is never cut."""
+    tid, ws = _scratch(board, "real new work")
+    repo = _dirty_repo(ws, {f"big{i}.bin": os.urandom(4000) for i in range(5)})
+    for i in range(5):
+        (repo / f"big{i}.bin").unlink()
+    (repo / "new.py").write_bytes(os.urandom(6000))
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4000)
+    with pytest.raises(survivor.SurvivorUnavailable, match="attachment limit"):
+        kb.complete_task(board, tid, metadata={"changed_files": ["new.py"]})
+    assert (repo / "new.py").exists()
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_added_line_beside_deletions_is_captured_in_full(board, monkeypatch, published_ok):
+    tid, ws = _scratch(board, "deletions plus one line")
+    repo = _dirty_repo(ws, {f"big{i}.bin": os.urandom(4000) for i in range(5)} | {"keep.txt": b"k\n"})
+    for i in range(5):
+        (repo / f"big{i}.bin").unlink()
+    (repo / "keep.txt").write_bytes(b"k\nUNPUBLISHED-LINE\n")
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4000)
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["keep.txt"]})
+    patch = Path(kb.latest_run(board, tid).metadata["survivor"]["path"]).read_bytes()
+    assert b"+UNPUBLISHED-LINE" in patch
+
+
+def test_under_limit_patch_keeps_full_reversible_form(board, published_ok):
+    tid, ws = _scratch(board, "small deletion")
+    repo = _dirty_repo(ws, {"a.txt": b"alpha\n", "b.txt": b"beta\n"})
+    (repo / "a.txt").unlink()
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["a.txt"]})
+    patch = Path(kb.latest_run(board, tid).metadata["survivor"]["path"]).read_bytes()
+    assert b"irreversible-delete" not in patch and b"-alpha" in patch
+
+
+def test_presence_probe_never_lazy_fetches(tmp_path, monkeypatch):
+    """Argus r1 F2: every local-presence probe runs with GIT_NO_LAZY_FETCH=1."""
+    seen = []
+    real = subprocess.run
+
+    def spy(args, **kwargs):
+        seen.append((args, kwargs.get("env") or {}, kwargs.get("cwd")))
+        return real(args, **kwargs)
+
+    subprocess.run(["git", "init", "-q", str(tmp_path / "r")], check=True, stdin=subprocess.DEVNULL)
+    monkeypatch.setattr(subprocess, "run", spy)
+    survivor._present_commits(tmp_path / "r", ["0" * 40])
+    args, env, cwd = seen[-1]
+    assert "cat-file" in args and env.get("GIT_NO_LAZY_FETCH") == "1"
+    assert cwd == ext.neutral_cwd()
+
+
+def test_explicit_claim_persists_beside_captured_delta(board, monkeypatch, published_ok):
+    """Argus r1 F5: squash-landed work closed as refs:[] + NOT PUSHED."""
+    tid, ws = _scratch(board, "squash landed with residual dirt")
+    repo = _dirty_repo(ws, {"a.txt": b"alpha\n"})
+    (repo / "a.txt").write_bytes(b"alpha\nresidual\n")
+    monkeypatch.setattr(ext, "verify_pr", lambda *a, **kw: {
+        "remote": HOMELAB, "branch": "refs/pull/195/head", "sha": HOMELAB_MERGE,
+        "pr": "Kyzcreig/ace-media-homelab#195", "state": "MERGED", "external": True})
+    assert kb.complete_task(board, tid, survivor_pr="Kyzcreig/ace-media-homelab#195",
+                            survivor_unbound=True, metadata={"changed_files": ["a.txt"]})
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert saved["claims"][0]["sha"] == HOMELAB_MERGE
+    assert saved["notice"] != "NOT PUSHED"
+    assert Path(saved["path"]).is_file()
