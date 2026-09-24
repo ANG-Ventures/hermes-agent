@@ -63,8 +63,7 @@ def test_three_lenses_refused_and_four_accepted_with_persistence(review):
     ({'findings': 0, 'items': []}, 'findings'),
     ({'lenses': {'contract': 'done', 'execution': 'done', 'cross-vendor': 'n/a:   ', 'mutation': 'done'}}, 'cross-vendor'),
     ({'lenses': {'contract': 'done', 'execution': 'done', 'cross-vendor': 'n/a: could not reach vendor', 'mutation': 'done'}}, 'capability'),
-    ({'review_minutes': -1}, 'review_minutes'), ({'battery': ''}, 'battery'),
-    ({'batch_id': ''}, 'batch_id'),
+    ({'review_minutes': -1}, 'review_minutes'),     ({'batch_id': ''}, 'batch_id'),
     ({'lenses': {'contract': 'done', 'execution': 'done', 'cross-vendor': 'n/a:', 'mutation': 'done'}}, 'cross-vendor'),
     ({'lenses': {'contract': 'done', 'execution': 'done', 'cross-vendor': 'blocked', 'mutation': 'done'}}, 'cross-vendor'),
 ])
@@ -83,19 +82,45 @@ def test_old_round_comment_cannot_authorize_new_review(review):
         assert not ok and 'review_coverage' in detail
 
 
-def test_second_round_cannot_reuse_first_round_battery_sentinel(review):
+def test_battery_is_optional(review):
+    """Per-card batteries are being retired (CI owns suites): omitting it passes."""
+    payload = json.loads(coverage().split('review_coverage: ', 1)[1])
+    del payload['battery']
     with kb.connect() as conn:
-        current = kb.get_task(conn, review).current_run_id
-        kb.add_comment(conn, review, 'argus', coverage(), run_id=current)
-        assert kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard')[0]
-        candidate = kb.claim_task(conn, review)
-        assert candidate
-        assert kb.request_review(conn, review, summary='v2', expected_run_id=candidate.current_run_id)
-        second = kb.claim_review_task(conn, review)
-        assert second
-        kb.add_comment(conn, review, 'argus', coverage(), run_id=second.current_run_id)
-        ok, detail = kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard again')
+        kb.add_comment(conn, review, 'argus', 'review_coverage: ' + json.dumps(payload),
+                       run_id=kb.get_task(conn, review).current_run_id)
+        assert kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard') == (True, 'builder')
+
+
+@pytest.mark.parametrize('battery', ['', '   ', 7, True])
+def test_battery_when_given_must_be_nonempty_string(review, battery):
+    with kb.connect() as conn:
+        kb.add_comment(conn, review, 'argus', coverage(battery=battery),
+                       run_id=kb.get_task(conn, review).current_run_id)
+        ok, detail = kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard')
         assert not ok and 'battery' in detail
+
+
+def test_gate_lens_list_is_data_driven_from_schema(review, monkeypatch):
+    """The required-lens list comes from ONE schema constant, not hardcoded names."""
+    monkeypatch.setattr(kb, '_REVIEW_LENSES', ('contract', 'boundary'))
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, review).current_run_id
+        kb.add_comment(conn, review, 'argus', coverage(), run_id=run_id)
+        ok, detail = kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard')
+        assert not ok and 'boundary' in detail
+        kb.add_comment(conn, review, 'argus', coverage(lenses={'contract': 'done', 'boundary': 'done'}), run_id=run_id)
+        assert kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard') == (True, 'builder')
+
+
+def test_schema_constant_feeds_gate_tool_and_prompt():
+    from hermes_cli import kanban_review_schema as schema
+    from tools import kanban_tools as tools
+    from agent import prompt_builder
+    assert kb._REVIEW_LENSES is schema.REQUIRED_REVIEW_LENSES
+    description = tools.KANBAN_REQUEST_CHANGES_SCHEMA['description']
+    assert schema.lens_list_text() in description
+    assert schema.lens_list_text() in prompt_builder.KANBAN_GUIDANCE
 
 
 def test_tool_and_cli_share_gate(review, monkeypatch):
@@ -186,3 +211,78 @@ def test_human_only_board_can_claim_review_and_return_full_verdict(review):
         assert kb.get_task(conn, parked).status == 'ready'
         assert any(c.run_id == claimed.current_run_id and 'batch-123' in c.body
                    for c in kb.list_comments(conn, parked))
+
+
+def _lenses_with(cross_vendor):
+    return {'contract': 'done', 'execution': 'done', 'cross-vendor': cross_vendor, 'mutation': 'done'}
+
+
+@pytest.mark.parametrize('override,missing', [
+    # type(x) is int, not isinstance: a JSON bool is not a count.
+    ({'findings': True, 'items': ['one real finding']}, 'findings'),
+    ({'review_minutes': True}, 'review_minutes'),
+    # items must be nonempty strings, not whitespace.
+    ({'items': ['   ']}, 'items'),
+    # the n/a form requires the ': ' separator and a reason.
+    ({'lenses': _lenses_with('n/aXYZ')}, 'cross-vendor'),
+])
+def test_parser_type_and_shape_mutants_refused(review, override, missing):
+    with kb.connect() as conn:
+        kb.add_comment(conn, review, 'argus', coverage(**override), run_id=kb.get_task(conn, review).current_run_id)
+        ok, detail = kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard')
+        assert not ok and missing in detail
+        assert kb.get_task(conn, review).status == 'running'
+
+
+@pytest.mark.parametrize('reason', [
+    'n/a: no provider code touched, so vendors cannot differ',
+    'n/a: the failed-state code path is not changed',
+    'n/a: error handling is unchanged; docs-only diff',
+])
+def test_na_applicability_reason_accepted_despite_vocabulary(review, reason):
+    """An n/a certifies the lens does not APPLY; ordinary words are not graded."""
+    with kb.connect() as conn:
+        kb.add_comment(conn, review, 'argus', coverage(lenses=_lenses_with(reason)),
+                       run_id=kb.get_task(conn, review).current_run_id)
+        assert kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard') == (True, 'builder')
+        assert kb.get_task(conn, review).status == 'ready'
+
+
+@pytest.mark.parametrize('reason', [
+    'n/a: skipped', 'n/a: Skipped for time', 'n/a: ran out of time', 'n/a: did not run',
+    'n/a: could not reach vendor', 'n/a: cannot run the suite', 'n/a: unable to build',
+    'n/a: failed to start', 'n/a: timed out', 'n/a: deferred to next round',
+])
+def test_na_inability_opener_refused_and_routed_to_capability_block(review, reason):
+    with kb.connect() as conn:
+        kb.add_comment(conn, review, 'argus', coverage(lenses=_lenses_with(reason)),
+                       run_id=kb.get_task(conn, review).current_run_id)
+        ok, detail = kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard')
+        assert not ok and 'cross-vendor' in detail and 'kind=capability' in detail
+        assert kb.get_task(conn, review).status == 'running'
+
+
+def _skill_example_line():
+    skill = Path(__file__).resolve().parents[2] / 'skills' / 'devops' / 'sdlc-review' / 'SKILL.md'
+    lines = [line for line in skill.read_text(encoding='utf-8').splitlines()
+             if 'review_coverage:' in line and '{' in line]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def test_documented_skill_example_accepted_verbatim(review):
+    """The reviewer copies the SKILL.md example (inline-code backticks and all)."""
+    example = _skill_example_line()
+    assert example.startswith('`review_coverage: ') and example.endswith('`')
+    with kb.connect() as conn:
+        kb.add_comment(conn, review, 'argus', 'Round 1 verdict.\n' + example,
+                       run_id=kb.get_task(conn, review).current_run_id)
+        assert kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard') == (True, 'builder')
+
+
+def test_double_backtick_wrapper_is_not_unwrapped(review):
+    with kb.connect() as conn:
+        kb.add_comment(conn, review, 'argus', '``' + coverage() + '``',
+                       run_id=kb.get_task(conn, review).current_run_id)
+        ok, detail = kb.request_changes(conn, review, reason='BEHAVIOUR: fix guard')
+        assert not ok and 'JSON line' in detail

@@ -23,6 +23,7 @@ from hermes_constants import (
 from typing import List, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
+from hermes_cli import kanban_review_schema as _review_schema
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
@@ -340,11 +341,11 @@ KANBAN_GUIDANCE = (
     "`kanban_request_changes`, or uses `kanban_block` only for a genuine "
     "external escalation. Review is not a block, so repeated review cycles do "
     "not trip unblock-loop detection.\n"
-    "Reviewers: launch contract, execution, cross-vendor and mutation lenses in "
+    f"Reviewers: launch {_review_schema.lens_list_text()} lenses in "
     "ONE delegate_task batch, report ALL findings in ONE round. Before "
     "`kanban_request_changes`, post a current-run comment with a "
-    "`review_coverage: {...}` JSON line (lenses, findings, items, "
-    "review_minutes, battery, batch_id). If a lens cannot run, use "
+    "`review_coverage: {...}` JSON line "
+    f"({_review_schema.coverage_fields_text()}). If a lens cannot run, use "
     "`kanban_block(kind=capability)` instead of a partial changes request.\n"
     "6. **If follow-up work appears, create it; don't do it.** Use "
     "`kanban_create(title=..., assignee=<right-profile>, parents=[your-task-id])` "

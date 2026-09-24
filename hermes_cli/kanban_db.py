@@ -11542,7 +11542,50 @@ def request_review(
     return _ret(True)
 
 
-_REVIEW_LENSES = ("contract", "execution", "cross-vendor", "mutation")
+from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LENSES  # noqa: E402
+# An ``n/a: <reason>`` lens value certifies the lens does not APPLY to the
+# deliverable. A reason that OPENS with an inability report ("skipped",
+# "could not run", "ran out of time") is not an applicability claim: that
+# reviewer must use kanban_block(kind=capability). Only the opening of the
+# reason is graded -- ordinary words later in a legitimate reason ("vendors
+# cannot differ", "the failed-state path is unchanged") are not. Semantic
+# grading of arbitrary prose is out of scope for a parser; the skill and the
+# capability block carry that contract.
+_REVIEW_NA_INABILITY_OPENER = re.compile(
+    r"^(?:i\s+|we\s+|lens\s+|it\s+)?(?:"
+    r"skip(?:ped|ping)?|"
+    r"(?:could|can)\s*(?:not|n't)|cannot|unable|"
+    r"(?:did|was|were)\s*(?:not|n't)\s+(?:run|ran|execute|executed|attempt|attempted|try|tried|finish|finished|complete|completed|get|reach)|"
+    r"not\s+(?:run|ran|executed|attempted|tried|finished|completed|reached)|"
+    r"ran\s+out|out\s+of\s+time|no\s+time\b|timed\s+out|"
+    r"fail(?:ed|s)?\s+to\b|errored|crashed|blocked\s+(?:by|on)\b|"
+    r"unavailable|inaccessible|no\s+access|lacked?\s+access|"
+    r"deferred|postponed|todo\b|tbd\b|n/?a\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _review_coverage_payload(line: str) -> Optional[str]:
+    """Return the JSON text of a ``review_coverage:`` line, or None.
+
+    Accepts the bare form and the inline-code form the skill documents
+    (one surrounding backtick pair), so a reviewer who copies the example
+    verbatim is not refused.
+    """
+    text = line.strip()
+    if len(text) >= 2 and text.startswith("`") and text.endswith("`"):
+        text = text[1:-1].strip()
+    if not text.startswith("review_coverage:"):
+        return None
+    return text.split("review_coverage:", 1)[1].strip()
+
+
+def _review_na_reason_ok(state: Any) -> bool:
+    if not isinstance(state, str) or not state.startswith("n/a: "):
+        return False
+    reason = state[5:].strip()
+    return bool(reason) and not _REVIEW_NA_INABILITY_OPENER.match(reason)
 
 
 def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[str]:
@@ -11558,9 +11601,8 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     ).fetchall()
     if not rows:
         return "missing review_coverage comment on this review run (use kanban_block(kind=capability) if a lens cannot run)"
-    line = next((line.strip().split("review_coverage:", 1)[1].strip()
-                 for line in rows[0]["body"].splitlines()
-                 if line.strip().startswith("review_coverage:")), None)
+    line = next((payload for payload in map(_review_coverage_payload, rows[0]["body"].splitlines())
+                 if payload is not None), None)
     if not line:
         return "missing review_coverage JSON line"
     try:
@@ -11576,9 +11618,7 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
         state = lenses.get(lens)
         if state == "done":
             continue
-        if (isinstance(state, str) and state.startswith("n/a: ")
-                and state[5:].strip()
-                and not any(word in state.lower() for word in ("cannot", "could not", "unavailable", "failed"))):
+        if _review_na_reason_ok(state):
             continue
         return f"missing/invalid lens {lens}: use 'done' or 'n/a: <applicability reason>'; inability to run requires kanban_block(kind=capability)"
     count = coverage.get("findings")
@@ -11591,15 +11631,11 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     minutes = coverage.get("review_minutes")
     if type(minutes) is not int or minutes < 0:
         return "review_minutes must be a nonnegative integer"
+    # Optional (per-card batteries are being retired; CI owns suites). When
+    # given it must still be a real value, not an empty placeholder.
     battery = coverage.get("battery")
-    if not isinstance(battery, str) or not battery.strip() or battery == "none":
-        return "battery must name an attachment or be 'seeded'/'none-first-round'"
-    previous_rounds = conn.execute(
-        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
-        (task_id,),
-    ).fetchone()[0]
-    if previous_rounds and battery in ("seeded", "none-first-round"):
-        return "battery must name the persistent attachment on re-review"
+    if battery is not None and (not isinstance(battery, str) or not battery.strip()):
+        return "battery, when given, must be a nonempty string (attachment name, 'seeded' or 'n/a: <reason>')"
     batch = coverage.get("batch_id")
     if not isinstance(batch, str) or not batch.strip():
         return "batch_id must identify the single delegate_task batch in this comment"

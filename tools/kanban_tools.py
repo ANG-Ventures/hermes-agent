@@ -37,6 +37,7 @@ from agent.redact import redact_sensitive_json, redact_sensitive_text
 from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.goals import judge_goal
 from hermes_cli.kanban_identity import safe_comment_provenance
+from hermes_cli import kanban_review_schema as _review_schema
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -2332,9 +2333,10 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
         "run, reapplies parent dependency gating, and requeues the task without "
         "using block-loop accounting. Only use from a task claimed from the "
         "review column. First post a current-run review_coverage JSON comment "
-        "with lenses (contract, execution, cross-vendor, mutation), findings, "
-        "items, review_minutes, battery and batch_id. If a lens cannot run, "
-        "use kanban_block(kind=capability), not partial review."
+        f"with lenses ({_review_schema.lens_list_text()}) and "
+        f"{_review_schema.coverage_fields_text().split(', ', 1)[1]}. "
+        "If a lens cannot run, use kanban_block(kind=capability), not "
+        "partial review."
     ),
     "parameters": {
         "type": "object",

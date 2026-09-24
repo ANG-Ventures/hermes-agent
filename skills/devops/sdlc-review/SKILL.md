@@ -70,8 +70,9 @@ a single JSON line:
 
 Each lens is `done` or `n/a: <applicability reason>`; inability to run a lens
 requires `kanban_block(kind=capability)`, not n/a. `findings` must equal the
-number of nonempty items and be at least one. Battery may be `seeded` or
-`none-first-round` on an initial review. Approval is unaffected by this gate.
+number of nonempty items and be at least one. `battery` is optional (CI owns
+suites); when given it must be a nonempty string. The required lens list lives
+in `hermes_cli/kanban_review_schema.py`. Approval is unaffected by this gate.
 
 ### Lens variation for ad-hoc review fan-outs
 
