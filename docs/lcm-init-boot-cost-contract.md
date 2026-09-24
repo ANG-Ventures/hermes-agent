@@ -159,6 +159,38 @@ def _ensure_<col>(self):
 Then run `tests/context_engine/test_lcm_backfill_cost.py` and
 `test_lcm_init_cost_regression.py`. If either is red, the backfill is on the boot path.
 
+## Turn-start reconcile: linear in rows, never per cursor (t_49c1f7d7)
+
+Load cost isn't the only per-turn cost. Every turn re-binds the engine to its session, and
+`_schedule_ingest_cursor_reconciliation` marks the next `_ingest_messages` to reconcile the
+in-memory cursor against the durable store (`reconcile.py::_reconcile_ingest_cursor_from_store`
+→ `_find_reconciled_cursor_for_store_tail`). That runs inside `should_compress_preflight`, so
+it happens before the model sees the turn.
+
+The scan tries each candidate cursor from `len(messages)` down to 0. After a compaction the
+active context is `[scaffold] + [summary] + [already-stored fresh tail]`. That never matches a
+stored suffix at the top, so the scan goes all the way down. The old body rebuilt every filtered
+list and recomputed every replay identity for `messages[:cursor]` at **each** cursor. Identities
+mean JSON canonicalisation plus externalized-payload reads, and this made the scan O(n²).
+Measured on a synthetic 5k-row session, 800 replayed rows took **972,426 identity computations
+and 47 s**. It now takes 7,221. 400 rows went from 246k to 3.6k.
+
+**Contract:**
+
+- Every per-message predicate and identity in the scan is computed **once per message**. Each
+  candidate cursor is answered from prefix counts and slices of those precomputed lists.
+- `_matches_store_tail_suffix` compares from the newest row, so a mismatch costs O(1).
+- `_ingest_messages` wraps the reconcile and the cached-prefix check in
+  `_replay_identity_memo_scope()`. The same row is identified once per pass, not ~6×. The memo
+  is keyed by object identity and closes before any new row is persisted.
+
+**Enforcement:** `tests/context_engine/test_lcm_reconcile_turn_start_cost.py`. It counts identity
+computations AND per-message predicate evaluations, because the memo alone makes identity counts
+look linear while the old per-cursor rescans remain. It also pins the ingest outcome. Negative
+control: with the old loop restored (memo kept), 4 of 7 tests fail.
+Semantic equivalence was proved differentially against the old function: 4,000 randomized
+replay shapes, 0 mismatches, and two planted mutations were both caught.
+
 ## How to recognise the class live
 
 - `sudo py-spy dump --pid <gateway>` shows N threads in `load_context_engine → _load_engine_from_dir`
@@ -179,3 +211,10 @@ Then run `tests/context_engine/test_lcm_backfill_cost.py` and
   inline rebuilds (held 779.8 s). The count was introduced by the original vendor import
   `8b869633a4` (2026-06-16, `_fts_needs_rebuild_structural`). It was carried unchanged through
   re-vendor `27b617846e` and was not touched by #887/#902/#903. The DB grew until the count mattered.
+- Incident 4: 2026-09-24 08:23–08:27 PDT, dead air between `turn_slot_acquire` and
+  `conversation turn:` on Apollo, with 8–14 concurrent turns at 250–650k tokens (card t_49c1f7d7).
+  Samples sat in `_find_reconciled_cursor_for_store_tail`. The per-cursor rescan came from
+  upstream hermes-lcm `79629c2` (#111, 2026-05-06, "reconcile ingest cursor after session
+  restart"), was moved into `ReconcileMixin` by `b497583`, and reached the fork with re-vendor
+  `27b617846e`. It was harmless on short sessions because the post-compaction replay shape only
+  gets long once the fresh tail is token-budgeted (60K cap on 1M windows).
