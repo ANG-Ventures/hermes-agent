@@ -2493,6 +2493,7 @@ security:
 ```
 
 - `redact_secrets` — when `true`, automatically detects and redacts patterns that look like API keys, tokens, and passwords in tool output before it enters the conversation context and logs. **On by default**. Set to `false` explicitly only when you need raw credential-like strings for debugging or redactor development.
+  - **Masked test counters.** A bare `PASS` key is also a common password variable, so `PASS=<n>` is normally masked. Only one shape passes through: an unquoted all-digit `PASS=<n>` with a numeric `FAIL=`/`FAILED=`/`FAILURES=`/`ERRORS=` counter on the same line (for example `test-x.sh: PASS=174 FAIL=0`). A lone `PASS=174`, or a counter split across lines, still egresses as `PASS=***`. That means the value was hidden, not that the result was faked. To report a count without disabling redaction, print both counters on one line or use a non-secret key (`passed=174 failed=0`, `174 passed, 0 failed`). Never set `redact_secrets: false` just to read a counter.
 - `tirith_enabled` — when `true`, terminal commands are scanned by [Tirith](https://github.com/sheeki03/tirith) before execution to detect potentially dangerous operations.
 - `tirith_path` — path to the tirith binary. Set this if tirith is installed in a non-standard location.
 - `tirith_timeout` — maximum seconds to wait for a tirith scan. Commands proceed if the scan times out.
