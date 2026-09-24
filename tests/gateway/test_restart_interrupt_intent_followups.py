@@ -255,6 +255,32 @@ def test_draining_site_preserves_instead_of_discarding():
     assert "await self._preserve_followup_across_restart(" in src[start:end]
 
 
+def test_draining_site_spools_the_parked_event_itself():
+    """Event identity at the post-turn draining site (Argus r8 MF, t_43e058b7):
+    the spool must receive ``pending_event`` (the parked MessageEvent: type,
+    media, internal, metadata, source admission), not ``None`` + the derived
+    ``pending`` string. Mutating the argument to ``None`` survived 40/40."""
+    import ast
+
+    src = RUN_PY.read_text(encoding="utf-8")
+    head = "if self._draining and (pending_event or pending):"
+    start = src.find(head)
+    assert start != -1, "draining follow-up branch not found"
+    end = src.find("if pending_event or pending:", start + len(head))
+    line_start = src.rfind("\n", 0, start) + 1
+    branch = ast.parse(__import__("textwrap").dedent(src[line_start:end]).rstrip() + "\n")
+    calls = [
+        n for n in ast.walk(branch)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_preserve_followup_across_restart"
+    ]
+    assert len(calls) == 1
+    args = calls[0].args
+    assert [type(a).__name__ for a in args[:3]] == ["Name", "Name", "Name"], ast.dump(calls[0])
+    assert [a.id for a in args[:3]] == ["session_key", "pending_event", "pending"]
+
+
 # -- ASK 4 / requester logging: in-band restart is attributable -------------
 
 
