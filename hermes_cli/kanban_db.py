@@ -14172,7 +14172,13 @@ def enforce_max_runtime(
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
-def _worker_cpu_active(pid: int) -> bool:
+# How long the stall veto watches a worker's CPU clock. A worker doing any
+# real work (streaming, tool I/O, parsing) accrues CPU inside half a second;
+# a worker blocked on an unanswered provider socket accrues none.
+_CPU_SAMPLE_WINDOW_SECONDS = 0.5
+
+
+def _worker_cpu_active(pid: int, *, window: float = _CPU_SAMPLE_WINDOW_SECONDS) -> bool:
     """Veto only: a worker burning CPU right now is evidence against a stall.
 
     This probe can never *authorize* a reclaim on its own -- a worker blocked
@@ -14182,26 +14188,32 @@ def _worker_cpu_active(pid: int) -> bool:
     processes are deliberately NOT a veto: workers hold persistent idle
     children (execute_code kernels, LSP servers) for their whole life, and a
     healthy long tool call already advances ``progress_at`` through the tool
-    keepalive tickers. Unknown process state (``ps`` missing/failing/
-    unparseable) returns True so it never authorizes a kill.
+    keepalive tickers.
+
+    "Right now" is measured, not inferred: two reads of the process's own
+    cumulative user+system CPU time, ``window`` seconds apart. ``ps -o pcpu``
+    is NOT a recent-CPU reading on Linux -- procps reports cputime/elapsed
+    over the whole process life, so a worker that burned CPU an hour ago
+    vetoes forever, and a freshly started idle process reads busy for ~10 s
+    per 10 ms of startup CPU (measured on Linux: 1/2/3 startup ticks -> first
+    0.0 at 10/20/30 s). Unknown process state (psutil missing, access denied,
+    any probe error) returns True so it never authorizes a kill; a process
+    that no longer exists is not active.
     """
-    import subprocess
     try:
-        ps = subprocess.run(
-            ["ps", "-A", "-o", "pid=,ppid=,pcpu="],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
-            check=True,
-        )
-        for line in ps.stdout.splitlines():
-            fields = line.split()
-            if len(fields) != 3:
-                continue
-            proc, cpu = int(fields[0]), float(fields[2])
-            if proc == pid and cpu > 0:
-                return True
-    except (OSError, ValueError, subprocess.SubprocessError):
+        import psutil
+    except ImportError:
         return True  # Unknown process state must not authorize a kill.
-    return False
+    try:
+        proc = psutil.Process(pid)
+        before = proc.cpu_times()
+        time.sleep(window)
+        after = proc.cpu_times()
+    except psutil.NoSuchProcess:
+        return False
+    except Exception:
+        return True  # Unknown process state must not authorize a kill.
+    return (after.user + after.system) > (before.user + before.system)
 
 
 def _run_progress_at(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[int]:

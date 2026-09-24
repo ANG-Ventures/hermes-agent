@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 
+import psutil
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -40,14 +41,17 @@ def _reap_in_background(proc):
     return proc
 
 
-def _wait_idle(pid, timeout=30.0):
-    """Wait until the REAL probe reads idle on 6 consecutive samples."""
+def _wait_idle(pid, timeout=90.0):
+    """Wait until the REAL probe's own predicate reads idle on 3 consecutive windows.
+
+    Each probe call already spans a real CPU-sampling window, so this polls the
+    exact predicate the detector uses; the ceiling only bounds a broken run.
+    """
     deadline, streak = time.monotonic() + timeout, 0
     while time.monotonic() < deadline:
         streak = 0 if kb._worker_cpu_active(pid) else streak + 1
-        if streak >= 6:
+        if streak >= 3:
             return
-        time.sleep(0.25)
     pytest.fail(f"pid {pid} never read idle to the real probe")
 
 
@@ -217,23 +221,54 @@ def test_cpu_active_worker_vetoes_stale_progress(board, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", [
-    OSError("ps missing"),
-    subprocess.CalledProcessError(1, ["ps"]),
-    subprocess.TimeoutExpired(["ps"], 2),
+    psutil.AccessDenied(1),
+    OSError("proc unreadable"),
+    RuntimeError("probe broke"),
+    "psutil-missing",
 ])
 def test_process_probe_failure_never_authorizes_reclaim(board, monkeypatch, silent_server, failure):
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
     proc = _in_flight_worker(silent_server)
     try:
-        def broken(*_a, **_kw):
-            raise failure
-        monkeypatch.setattr(subprocess, "run", broken)
+        if failure == "psutil-missing":
+            monkeypatch.setitem(sys.modules, "psutil", None)
+        else:
+            def broken(*_a, **_kw):
+                raise failure
+            monkeypatch.setattr(psutil.Process, "cpu_times", broken)
         assert kb._worker_cpu_active(proc.pid) is True
         tid = _running(board, now, proc.pid, progress_at=now - 1600)
         assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == []
         assert kb.get_task(board, tid).status == "running"
         assert proc.poll() is None
+    finally:
+        proc.kill()
+
+
+def test_probe_reads_recent_cpu_not_lifetime_average(silent_server):
+    """A worker that burned CPU earlier and is now blocked reads idle at once.
+
+    ``ps -o pcpu`` on Linux is cputime/elapsed over the whole process life:
+    this child (~1 s of CPU, then blocked) would read busy for ~1000 s, so a
+    stalled worker with any CPU history could never be reclaimed.
+    """
+    code = (
+        "import socket,sys,time;t=time.process_time()\n"
+        "while time.process_time()-t<1.0: pass\n"
+        "s=socket.create_connection(('127.0.0.1',int(sys.argv[1])))\n"
+        "s.sendall(b'POST /v1/messages HTTP/1.1\\r\\n\\r\\n');s.recv(1)"
+    )
+    port = silent_server.getsockname()[1]
+    proc = _reap_in_background(subprocess.Popen([sys.executable, "-c", code, str(port)]))
+    try:
+        silent_server.settimeout(90)
+        conn, _ = silent_server.accept()  # the burn is over; the child is blocking
+        conn.recv(64)
+        _in_flight_worker.conns.append(conn)
+        assert sum(psutil.Process(proc.pid).cpu_times()[:2]) >= 0.9  # real CPU history
+        reads = [kb._worker_cpu_active(proc.pid) for _ in range(4)]
+        assert reads[1:] == [False, False, False], reads  # first window may catch the send
     finally:
         proc.kill()
 
