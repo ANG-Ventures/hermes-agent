@@ -288,46 +288,20 @@ _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 
 def _goal_judge_available() -> bool:
-    """True when an auxiliary client is configured for the goal judge.
-
-    ``judge_goal`` is fail-open at the source: when no auxiliary model can
-    be reached it returns a ``"continue"`` verdict that is indistinguishable
-    from a real "not done yet" judgment. The completion gate must not treat
-    that as a rejection, or an unconfigured/degraded auxiliary model would
-    wedge every ``goal_mode`` worker (it could never close its own task).
-
-    So we probe availability first and only enforce the gate when a judge is
-    actually reachable. This mirrors the same client lookup ``judge_goal``
-    performs internally.
-    """
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return False
-    return client is not None and bool(model)
+    """Tool-surface judge availability probe; see ``goals.goal_judge_available``."""
+    from hermes_cli.goals import goal_judge_available
+    return goal_judge_available()
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
-    if not task or not task.goal_mode or not _goal_judge_available():
-        return None
-    verdict = "done"
-    reason = ""
-    try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-            last_response=evidence.strip(),
-        )
-    except Exception as judge_exc:
-        # Keep the existing fail-open semantics: an unavailable/broken
-        # auxiliary judge must not permanently wedge goal-mode work.
-        logger.warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
-            judge_exc,
-            exc_info=True,
-        )
-    return reason if verdict != "done" else None
+def _goal_mode_handoff_rejection(task, evidence: str, *, conn=None, task_id=None) -> Optional[str]:
+    """Tool-surface wiring of the shared goal-mode handoff gate."""
+    from hermes_cli.goals import kanban_handoff_rejection
+    return kanban_handoff_rejection(
+        task, evidence, conn=conn, task_id=task_id,
+        worker_run_id_for=_worker_run_id,
+        judge_available=_goal_judge_available,
+        judge=judge_goal,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +859,7 @@ def _handle_complete(args: dict, **kw) -> str:
             rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
+                conn=conn, task_id=tid,
             )
             if rejection is not None:
                 return tool_error(
@@ -1077,7 +1052,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            rejection = _goal_mode_handoff_rejection(task, summary, conn=conn, task_id=tid)
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "

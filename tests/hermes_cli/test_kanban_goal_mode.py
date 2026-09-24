@@ -288,6 +288,205 @@ def test_cli_goal_loop_stops_when_task_ownership_moves(monkeypatch):
 # CLI judge gate tests (hermes kanban complete bypass fix)
 # ---------------------------------------------------------------------------
 
+def test_completion_handoff_judge_does_not_require_prior_completion(monkeypatch):
+    from types import SimpleNamespace
+    from agent import auxiliary_client
+
+    prompts = []
+
+    def fake_call_llm(**kwargs):
+        system = kwargs["messages"][0]["content"]
+        prompts.append(system)
+        # A rubric that omits the lifecycle exception reproduces the circular
+        # rejection: evidence exists, but no completion receipt can exist yet.
+        done = "Do not require a prior kanban_complete call" in system
+        content = '{"verdict":"done","reason":"deliverables verified"}' if done else '{"verdict":"continue","reason":"kanban_complete not called"}'
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+    verdict, reason, *_ = goals.judge_goal(
+        goal="Print two canary phases and then call kanban_complete",
+        last_response="CANARY_PHASE1_NEW exit 0; CANARY_PHASE2_NEW exit 0",
+        completion_handoff=True,
+    )
+    assert verdict == "done", reason
+    assert len(prompts) == 1
+
+
+def test_cli_operator_completion_survives_judge_500(kanban_home, monkeypatch):
+    import argparse
+    from hermes_cli import kanban as cli
+    from agent import auxiliary_client
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Verified artifact", assignee="builder", goal_mode=True)
+        assert kb.claim_task(conn, tid)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda name: (object(), "judge"))
+    monkeypatch.setattr(goals, "judge_goal", lambda **kw: ("continue", "judge error: InternalServerError", False, None, True))
+    args = argparse.Namespace(task_ids=[tid], summary="artifact and test passed", result=None, metadata=None)
+    assert cli._cmd_complete(args) == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+        events = conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,)).fetchall()
+        assert any(e["kind"] == "judge_error" for e in events)
+
+
+def _cli_goal_card(conn, title="Print two canary phases and then call kanban_complete"):
+    tid = kb.create_task(conn, title=title, assignee="builder", goal_mode=True)
+    claimed = kb.claim_task(conn, tid)
+    assert claimed
+    return tid, claimed.current_run_id
+
+
+def _kanban_argv(argv):
+    """Drive the real ``hermes kanban ...`` argv path: build_parser -> parse_args
+    -> kanban_command, exactly as the top-level CLI dispatches it."""
+    import argparse
+    from hermes_cli import kanban as cli
+
+    wrap = argparse.ArgumentParser(prog="wrap", add_help=False)
+    parser = cli.build_parser(wrap.add_subparsers(dest="_top"))
+    return cli.kanban_command(parser.parse_args(argv))
+
+
+def test_cli_complete_first_call_passes_completion_handoff_and_closes(kanban_home, monkeypatch):
+    """(a') ``kanban complete`` argv path: the judge must be asked to grade the
+    deliverables (completion_handoff=True) and the card closes on the first call."""
+    from agent import auxiliary_client
+
+    with kb.connect() as conn:
+        tid, _ = _cli_goal_card(conn)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda name: (object(), "judge"))
+    calls = []
+
+    def judge(**kwargs):
+        calls.append(kwargs)
+        ok = kwargs.get("completion_handoff") is True
+        return ("done" if ok else "continue", "deliverables verified" if ok else "kanban_complete not called", False, None, False)
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    rc = _kanban_argv(["complete", tid, "--summary", "CANARY_PHASE1_NEW exit 0; CANARY_PHASE2_NEW exit 0"])
+    assert rc == 0
+    assert len(calls) == 1 and calls[0]["completion_handoff"] is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_cli_complete_real_judge_rubric_accepts_first_completion(kanban_home, monkeypatch):
+    """(a')+(c) end to end on the argv path with the REAL judge_goal prompt.
+    A rubric that demands a prior kanban_complete receipt makes this RED."""
+    from types import SimpleNamespace
+    from agent import auxiliary_client
+
+    with kb.connect() as conn:
+        tid, _ = _cli_goal_card(conn)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda name: (object(), "judge"))
+
+    def fake_call_llm(**kwargs):
+        system = kwargs["messages"][0]["content"]
+        done = "Do not require a prior kanban_complete call" in system
+        content = '{"verdict":"done","reason":"deliverables verified"}' if done else '{"verdict":"continue","reason":"kanban_complete not called"}'
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+    assert _kanban_argv(["complete", tid, "--summary", "CANARY_PHASE1_NEW exit 0; CANARY_PHASE2_NEW exit 0"]) == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_cli_owned_worker_judge_500_retries_then_blocks_transient(kanban_home, monkeypatch, capsys):
+    """(b') ``kanban complete`` argv path, owning worker: a judge error is retried
+    once, then the card blocks transient with the error named; never completes."""
+    from hermes_cli import kanban as cli
+    from agent import auxiliary_client
+
+    with kb.connect() as conn:
+        tid, run_id = _cli_goal_card(conn, title="Verified artifact")
+    monkeypatch.delenv("HERMES_KANBAN_OWNER_PID", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    assert cli._worker_run_id_for(tid) == run_id
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda name: (object(), "judge"))
+    calls = []
+
+    def failing_judge(**kwargs):
+        calls.append(kwargs)
+        return ("continue", "judge error: InternalServerError", False, None, True)
+
+    monkeypatch.setattr(goals, "judge_goal", failing_judge)
+    rc = _kanban_argv(["complete", tid, "--summary", "artifact and test passed"])
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert len(calls) == 2
+    assert "InternalServerError" in err
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "transient"
+        events = conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,)).fetchall()
+        assert any(e["kind"] == "judge_error" for e in events)
+
+
+def test_cli_request_review_uses_shared_gate(kanban_home, monkeypatch):
+    """``kanban request-review`` argv path reaches the same gate: a real
+    ``continue`` verdict blocks the handoff and the judge saw completion_handoff."""
+    from agent import auxiliary_client
+
+    with kb.connect() as conn:
+        tid, _ = _cli_goal_card(conn)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda name: (object(), "judge"))
+    calls = []
+
+    def judge(**kwargs):
+        calls.append(kwargs)
+        return ("continue", "phase 2 output missing", False, None, False)
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    assert _kanban_argv(["request-review", tid, "--summary", "phase 1 only"]) != 0
+    assert len(calls) == 1 and calls[0]["completion_handoff"] is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_goal_handoff_predicate_is_defined_exactly_once():
+    """AST contract (Issue #38367 class): the goal-mode handoff rejection
+    predicate — the one function that asks the judge with
+    ``completion_handoff`` — exists exactly once in the tree, and every
+    surface wrapper delegates to it instead of re-implementing it."""
+    import ast
+
+    root = Path(goals.__file__).resolve().parents[1]
+    definers = []
+    delegating = {}
+    for pkg in ("hermes_cli", "tools", "gateway", "agent", "plugins"):
+        base = root / pkg
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*.py"):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+                if any(k.arg == "completion_handoff" for c in calls for k in c.keywords):
+                    definers.append((path.relative_to(root).as_posix(), fn.name))
+                if fn.name == "_goal_mode_handoff_rejection":
+                    names = {
+                        getattr(c.func, "attr", None) or getattr(c.func, "id", None)
+                        for c in calls
+                    }
+                    delegating[path.relative_to(root).as_posix()] = "kanban_handoff_rejection" in names
+    assert definers == [("hermes_cli/goals.py", "kanban_handoff_rejection")], definers
+    assert delegating == {"tools/kanban_tools.py": True, "hermes_cli/kanban.py": True}, delegating
+
+
 class TestCLIJudgeGate:
     """hermes kanban complete must apply the same goal_mode judge gate as the
     kanban_complete tool (Issue #38367 sibling gap).

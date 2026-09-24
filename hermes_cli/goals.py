@@ -40,7 +40,7 @@ import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -1174,6 +1174,7 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    completion_handoff: bool = False,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1274,10 +1275,21 @@ def judge_goal(
         # Route through call_llm so auxiliary.goal_judge.* config
         # (provider/model/base_url, extra_body, reasoning_effort, retries)
         # all apply — the direct-create path dropped extra_body (#35566).
+        system_prompt = JUDGE_SYSTEM_PROMPT
+        if completion_handoff:
+            system_prompt += (
+                "\nKANBAN COMPLETION HANDOFF: This is the first attempt to complete "
+                "the task. Judge only the deliverables and verification evidence "
+                "in the proposed summary against the task criteria. Do not require "
+                "a prior kanban_complete call, a completed board state, or a "
+                "completion receipt; those cannot exist until after your verdict. "
+                "Ignore lifecycle-call requirements in the goal text when deciding "
+                "whether the substantive work is done.\n"
+            )
         resp = call_llm(
             task="goal_judge",
             messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
@@ -1300,6 +1312,81 @@ def judge_goal(
         f" wait={wait_directive}" if wait_directive else "",
     )
     return verdict, reason, parse_failed, wait_directive, False
+
+
+def goal_judge_available() -> bool:
+    """True when an auxiliary client is configured for the goal judge.
+
+    ``judge_goal`` is fail-open at the source: with no reachable auxiliary
+    model it returns a ``"continue"`` verdict indistinguishable from a real
+    "not done yet". Kanban handoff gates probe this first so an unconfigured
+    judge never wedges a ``goal_mode`` worker out of closing its own task.
+    """
+    try:
+        from agent.auxiliary_client import get_text_auxiliary_client
+        client, model = get_text_auxiliary_client("goal_judge")
+    except Exception:
+        return False
+    return client is not None and bool(model)
+
+
+def kanban_handoff_rejection(
+    task: Any,
+    evidence: str,
+    *,
+    conn: Any = None,
+    task_id: Optional[str] = None,
+    worker_run_id_for: Callable[[str], Optional[int]],
+    judge_available: Callable[[], bool],
+    judge: Optional[Callable[..., Tuple[Any, ...]]] = None,
+) -> Optional[str]:
+    """The ONE goal-mode gate for kanban complete / request-review handoffs.
+
+    Shared by ``tools.kanban_tools`` and ``hermes_cli.kanban`` (the CLI) so the two
+    surfaces cannot drift (Issue #38367 was two copies of one gate). Each
+    surface injects only its own seams: its run-ownership resolver, its judge
+    availability probe, and optionally the judge callable it exposes for tests.
+
+    Contract:
+      * The judge grades the proposed deliverables with
+        ``completion_handoff=True`` — it must never demand a prior
+        kanban_complete receipt (that receipt cannot exist before this call).
+      * A real verdict gates: ``done`` -> None, anything else -> the reason.
+      * A judge ERROR (transport failure / exception / unparseable reply):
+          - the owning worker (resolver returns a run id) retries once, then
+            the card is blocked ``transient`` with the error named;
+          - an operator (no owned run) fails open, with a ``judge_error``
+            event recorded on the caller's ``conn`` for audit.
+    Uses the caller's ``conn``; never opens its own.
+    """
+    if not task or not getattr(task, "goal_mode", False) or not judge_available():
+        return None
+    from hermes_cli import kanban_db as kb
+
+    if judge is None:
+        judge = judge_goal
+    worker_run_id = worker_run_id_for(task_id) if task_id else None
+    reason = "judge unavailable"
+    for _ in range(2 if worker_run_id is not None else 1):
+        try:
+            verdict, reason, parse_failed, _, transport_failed = judge(
+                goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                last_response=(evidence or "").strip(),
+                completion_handoff=True,
+            )
+        except Exception as exc:
+            verdict, reason, parse_failed, transport_failed = (
+                "continue", f"judge error: {type(exc).__name__}", False, True,
+            )
+        if not (parse_failed or transport_failed):
+            return reason if verdict != "done" else None
+    if conn is not None and task_id:
+        kb._append_event(conn, task_id, "judge_error", {"reason": reason}, run_id=worker_run_id)
+        conn.commit()
+        if worker_run_id is not None:
+            blocked = kb.block_task(conn, task_id, reason=reason, kind="transient", expected_run_id=worker_run_id)
+            return f"{reason}; task {'blocked transient after judge retry' if blocked else 'not blocked (run ownership changed)'}"
+    return None
 
 
 def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:

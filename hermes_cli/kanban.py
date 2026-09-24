@@ -3685,37 +3685,16 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
-    if task is None or not task.goal_mode:
-        return None
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, conn=None, task_id=None) -> Optional[str]:
+    """CLI-surface wiring of the shared goal-mode handoff gate (complete + review)."""
+    from hermes_cli import goals
 
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return None
-    if client is None or not model:
-        return None
-
-    from hermes_cli.goals import judge_goal
-
-    verdict = "done"
-    reason = ""
-    try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-            last_response=evidence.strip(),
-        )
-    except Exception as judge_exc:
-        import logging as _logging
-
-        _logging.getLogger(__name__).warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
-            judge_exc,
-            exc_info=True,
-        )
-    return reason if verdict != "done" else None
+    return goals.kanban_handoff_rejection(
+        task, evidence, conn=conn, task_id=task_id,
+        worker_run_id_for=_worker_run_id_for,
+        judge_available=goals.goal_judge_available,
+        judge=goals.judge_goal,
+    )
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -3772,6 +3751,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
+                conn=conn, task_id=tid,
             )
             if rejection is not None:
                 print(
@@ -4022,6 +4002,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         rejection = _goal_mode_handoff_rejection(
             kb.get_task(conn, tid),
             summary or "",
+            conn=conn, task_id=tid,
         )
         if rejection is not None:
             print(
