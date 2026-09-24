@@ -447,6 +447,8 @@ def _terminate_reclaimed_worker(
     *,
     signal_fn=None,
     started_at=None,
+    conn: Optional[sqlite3.Connection] = None,
+    task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
     fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
@@ -468,9 +470,21 @@ def _terminate_reclaimed_worker(
     info["host_local"] = True
 
     if not pid or pid <= 0:
-        # The gateway may still be launching a worker before stamping its PID.
-        # Only a dead local claimer proves that this launch cannot finish.
+        # Popen precedes the PID stamp. A dead gateway can leave a detached,
+        # unstamped worker; current-run heartbeat/spawn evidence must hold its
+        # claim even after that evidence becomes stale. Ignore prior runs.
         info["liveness_unprovable"] = True
+        if conn is not None and task_id is not None:
+            run_id = _kb._current_run_id(conn, task_id)
+            if run_id is not None:
+                evidence = conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind IN ('heartbeat', 'spawned') LIMIT 1",
+                    (task_id, run_id),
+                ).fetchone()
+                if evidence is not None:
+                    info["unstamped_worker_evidence"] = evidence["kind"]
+                    return info
         claimer_pid = 0
         try:
             claimer_pid = int(str(claim_lock)[len(_kb._host_prefix()):])
@@ -813,7 +827,8 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         termination = _kb._terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
+            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"),
+            conn=conn, task_id=tid)
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.

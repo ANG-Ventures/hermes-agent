@@ -2,6 +2,8 @@
 
 import os
 import psutil
+import subprocess
+import sys
 import time
 
 import pytest
@@ -80,3 +82,60 @@ def test_foreign_pidless_claimer_is_not_probed(board, monkeypatch):
     monkeypatch.setattr(psutil, "Process", lambda *_: pytest.fail("foreign PID was probed"))
     assert kb.reclaim_task(board, tid) is True  # preserve foreign-host release policy
     assert kb.get_task(board, tid).status == "ready"
+
+
+@pytest.mark.parametrize("path", ["manual", "ttl", "stale"])
+def test_unstamped_orphan_heartbeat_prevents_second_worker(board, monkeypatch, path):
+    """Popen succeeds, gateway dies before PID stamp, detached worker heartbeats."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    claimer = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL)
+    claimer.wait(timeout=10)
+    assert not psutil.pid_exists(claimer.pid)
+    lock = f"{kb._host_prefix()}{claimer.pid}"
+    tid = _claim(board, lock, expired=False)
+    run_id = kb._current_run_id(board, tid)
+    orphan = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        assert kb.heartbeat_claim(board, tid, claimer=lock)
+        assert kbd.heartbeat_worker(board, tid, note="unstamped worker alive")
+        assert kb.get_task(board, tid).worker_pid is None
+        if path == "ttl":
+            with kb.write_txn(board):
+                board.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, tid))
+            assert kb.release_stale_claims(board) == 0
+        elif path == "stale":
+            old = int(time.time()) - 7200
+            with kb.write_txn(board):
+                board.execute("UPDATE task_runs SET started_at=? WHERE id=?", (old, run_id))
+                board.execute("UPDATE tasks SET last_heartbeat_at=? WHERE id=?", (old, tid))
+            assert kbd.detect_stale_running(board, stale_timeout_seconds=60) == []
+        else:
+            assert kb.reclaim_task(board, tid) is False
+        spawned = []
+        kbd.dispatch_once(board, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id) or 424242)
+        assert tid not in spawned
+        assert orphan.poll() is None
+        assert kb.get_task(board, tid).status == "running"
+        assert kb.get_task(board, tid).claim_lock == lock
+        assert not [e for e in kb.list_events(board, tid) if e.kind == "reclaimed"]
+    finally:
+        orphan.kill()
+        orphan.wait(timeout=10)
+
+
+def test_previous_run_heartbeat_does_not_hold_dead_claimer(board, monkeypatch):
+    dead_pid = 999995
+    tid = _claim(board, f"{kb._host_prefix()}{dead_pid}")
+    run_id = kb._current_run_id(board, tid)
+    assert run_id is not None
+    with kb.write_txn(board):
+        kb._append_event(board, tid, "heartbeat", run_id=run_id - 1)
+    def dead(pid):
+        raise psutil.NoSuchProcess(pid)
+    monkeypatch.setattr(psutil, "Process", dead)
+    assert kb.reclaim_task(board, tid) is True
