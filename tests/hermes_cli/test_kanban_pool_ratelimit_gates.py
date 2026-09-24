@@ -478,7 +478,7 @@ def test_fallback_spawns_charge_serving_pool_budget(home, apr, bpr):
 
 def test_pinned_lanes_share_sub_budget_and_zero_disables_it(home, apr):
     apr.eligible = 5
-    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+    _config(home, pool_health_urls=_urls(apr.url, apr.url), pool_box_health=False,
             pool_spawns_per_eligible=2)
     _profile(home, "apx", "claude-apx-16")
     _profile(home, "bpx", "claude-bpx-16")
@@ -489,7 +489,7 @@ def test_pinned_lanes_share_sub_budget_and_zero_disables_it(home, apr):
         kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert len(seen) == 2
         assert _events(conn, ids[2], "deferred")[-1]["pool"] == "sub-vps-16"
-        _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+        _config(home, pool_health_urls=_urls(apr.url, apr.url), pool_box_health=False,
                 pool_spawns_per_eligible=0)
         kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert len(seen) == 6
@@ -500,6 +500,18 @@ def test_unreachable_probe_fails_open_even_with_pool_budget(home):
     _profile(home, "a", "claude-apr")
     with kb.connect_closing() as conn:
         ids = [kb.create_task(conn, title=f"unreachable-{i}", assignee="a") for i in range(5)]
+        seen = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert seen == ids
+
+
+def test_unreachable_pinned_probe_fails_open_without_box_health(home):
+    _config(home, pool_health_urls=_urls(_dead_url()), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "a", "claude-apx-16")
+    with kb.connect_closing() as conn:
+        ids = [kb.create_task(conn, title=f"pin-unreachable-{i}", assignee="a")
+               for i in range(5)]
         seen = []
         kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert seen == ids

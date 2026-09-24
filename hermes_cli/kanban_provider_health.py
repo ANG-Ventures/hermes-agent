@@ -227,7 +227,8 @@ def configured_pool_spawns_per_eligible() -> int:
     return 2
 
 
-def pool_budget_eligible(provider, probes: dict, cache: dict, pool_urls: dict):
+def pool_budget_eligible(provider, probes: dict, cache: dict, pool_urls: dict,
+                         *, box_health: bool = True):
     """Known capacity of the serving pool; None means unknown (fail open).
 
     Pinned routes spend one subscription, not the relay's aggregate count.
@@ -238,7 +239,15 @@ def pool_budget_eligible(provider, probes: dict, cache: dict, pool_urls: dict):
     if route is None:
         return None
     if route[1] is not None:
-        return 1
+        relay_url = (pool_urls or {}).get(route[0])
+        relay = _fetch(relay_url, cache, provider) if _valid_url(relay_url) else None
+        if relay is not None:
+            return 1
+        if box_health:
+            box_url = box_health_url(route[1])
+            if box_url is not None and _fetch(box_url, cache, provider) is not None:
+                return 1
+        return None  # Neither health signal was reachable: fail open.
     url = (probes or {}).get(provider)
     if url is None:
         url = (pool_urls or {}).get(route[0])

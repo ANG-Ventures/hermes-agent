@@ -17208,7 +17208,8 @@ def _dispatch_once_locked(
         pool = pool_key(provider)
         if pool is None or pool_spawns_per_eligible == 0:
             return None
-        eligible = pool_budget_eligible(provider, health_probes, health_cache, pool_urls)
+        eligible = pool_budget_eligible(provider, health_probes, health_cache, pool_urls,
+                                        box_health=box_health)
         if eligible is None:
             return None  # Unknown probe: fail open.
         admitted = admitted_this_tick.get(pool, 0)
