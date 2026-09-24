@@ -257,3 +257,118 @@ def test_admission_roundtrip_covers_every_field_to_dict_drops(home):
     assert record["_admission_verified"] is True
     assert rf.restored_admission(record) == {name: True for name in rf.ADMISSION_FIELDS}
     assert path is not None
+
+
+def _write_forged(mac_key, chat_id="704", user_id="forger-1"):
+    import hashlib
+    import hmac
+    import time
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id=chat_id, chat_type="group",
+                        guild_id="g1", user_id=user_id)
+    record = {
+        "version": 2, "session_key": f"agent:main:discord:group:{chat_id}:{user_id}",
+        "text": "forged follow-up", "source": src.to_dict(), "reason": "restart",
+        "ts": time.time(), "pid": 1,
+        "admission": {"is_bot": True, "role_authorized": True,
+                      "delivered_via_upstream_relay": True, "profile_route_rejected": False},
+    }
+    body = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    record["mac"] = hmac.new(mac_key, body, hashlib.sha256).hexdigest()
+    rf.spool_dir().mkdir(parents=True, exist_ok=True)
+    (rf.spool_dir() / "00000000000000000001-forged00.json").write_text(json.dumps(record))
+
+
+# Argus r1 F1: a present-but-invalid key (torn 0-byte create, short, non-hex)
+# must NOT be used as an HMAC key; a record forged under it gains nothing.
+INVALID_KEYS = {
+    "empty": ("", b""),
+    "short": ("ab" * 8, bytes.fromhex("ab" * 8)),
+    "non-hex": ("zz-not-hex", b"zz-not-hex"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", sorted(INVALID_KEYS))
+async def test_record_forged_under_invalid_key_gains_no_trust(home, kind):
+    text, mac_key = INVALID_KEYS[kind]
+    keyp = rf.spool_dir().parent / rf.SPOOL_KEY_NAME
+    keyp.parent.mkdir(parents=True, exist_ok=True)
+    keyp.write_text(text)
+    _write_forged(mac_key)
+
+    reached, lines, _left = await _boot(home, (Platform.DISCORD,))
+
+    assert reached == []
+    assert [ln for ln in lines if UNTRUSTED in ln]
+    lost = [ln for ln in lines if LOST in ln]
+    assert len(lost) == 1 and "reason=unauthorized" in lost[0] and "forger-1" in lost[0], lost
+
+
+def test_invalid_key_is_replaced_atomically_on_next_spool(home):
+    keyp = rf.spool_dir().parent / rf.SPOOL_KEY_NAME
+    keyp.parent.mkdir(parents=True, exist_ok=True)
+    keyp.write_text("")
+    assert rf._spool_key(create=False) is None  # boot load: fail closed, no repair
+    assert keyp.read_text() == ""
+    src = {"platform": "discord", "chat_id": "701", "user_id": "bot-777"}
+    rf.spool_followup("k", "t", src, admission={"is_bot": True})
+    assert len(bytes.fromhex(keyp.read_text())) >= rf.SPOOL_KEY_MIN_BYTES
+    assert keyp.stat().st_mode & 0o777 == 0o600
+    (record,), _ = rf.take_followups()
+    assert record["_admission_verified"] is True
+    assert not list(keyp.parent.glob(".*.tmp"))
+
+
+# Argus r1 F2: the MAC must cover the admission block itself.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["is_bot", "role_authorized"])
+async def test_admission_flag_flipped_on_legit_record_is_rejected(home, flag):
+    spooled = await _park_and_stop(home, _event("stranger-3", "705"), (Platform.DISCORD,))
+    assert len(spooled) == 1
+    record = json.loads(spooled[0].read_text())
+    assert isinstance(record.get("mac"), str) and record["admission"][flag] is False
+    record["admission"][flag] = True
+    spooled[0].write_text(json.dumps(record))
+
+    reached, lines, _left = await _boot(home, (Platform.DISCORD,))
+
+    assert reached == []
+    assert [ln for ln in lines if UNTRUSTED in ln]
+    lost = [ln for ln in lines if LOST in ln]
+    assert len(lost) == 1 and "reason=unauthorized" in lost[0] and "stranger-3" in lost[0], lost
+
+
+# Argus r1 F3: every intake refusal site reports the loss.
+@pytest.mark.asyncio
+async def test_no_user_id_followup_refused_on_replay_is_reported_lost(home, monkeypatch):
+    # The operator closes the allow-all gate between parking and replay.
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    spooled = await _park_and_stop(home, _event(None, "706"), (Platform.DISCORD,))
+    assert len(spooled) == 1
+
+    reached, lines, left = await _boot(
+        home, (Platform.DISCORD,), before_boot=lambda: monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS"),
+    )
+
+    assert reached == []
+    lost = [ln for ln in lines if LOST in ln]
+    assert len(lost) == 1 and "reason=unauthorized" in lost[0] and "chat=706" in lost[0], lines
+    assert left == []
+
+
+@pytest.mark.asyncio
+async def test_profile_route_rejected_followup_is_reported_lost(home):
+    spooled = await _park_and_stop(
+        home, _event("human-1", "707", profile_route_rejected=True), (Platform.DISCORD,),
+    )
+    assert len(spooled) == 1
+    record = json.loads(spooled[0].read_text())
+    assert record["admission"]["profile_route_rejected"] is True and isinstance(record.get("mac"), str)
+
+    reached, lines, left = await _boot(home, (Platform.DISCORD,))
+
+    assert reached == []
+    lost = [ln for ln in lines if LOST in ln]
+    assert len(lost) == 1 and "reason=profile_route_rejected" in lost[0], lines
+    assert left == []

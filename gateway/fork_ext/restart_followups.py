@@ -98,29 +98,73 @@ def admission_fields(source: Any) -> Dict[str, bool]:
     return {name: getattr(source, name, False) is True for name in ADMISSION_FIELDS}
 
 
-def _spool_key(home: Optional[Path] = None, *, create: bool) -> Optional[bytes]:
-    path = spool_dir(home).parent / SPOOL_KEY_NAME
+SPOOL_KEY_MIN_BYTES = 32
+
+
+def _read_spool_key(path: Path) -> Tuple[Optional[bytes], bool]:
+    """``(key, present)``. A present key that is empty, torn, non-hex or
+    shorter than ``SPOOL_KEY_MIN_BYTES`` is INVALID and returns ``(None,
+    True)``: an empty key would let anyone forge ``HMAC(b"", body)``."""
     try:
-        return bytes.fromhex(path.read_text(encoding="ascii").strip())
+        raw = path.read_text(encoding="ascii").strip()
     except FileNotFoundError:
-        if not create:
-            return None
+        return None, False
     except Exception:
         logger.warning("restart follow-up spool key unreadable: %s", path, exc_info=True)
-        return None
+        return None, True
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError:
+        key = b""
+    if len(key) < SPOOL_KEY_MIN_BYTES:
+        logger.error(
+            "PHASE=restart_followup_key_invalid path=%s: spool key is empty/short/"
+            "not hex; no spooled admission flag will be trusted until it is replaced",
+            path,
+        )
+        return None, True
+    return key, True
+
+
+def _spool_key(home: Optional[Path] = None, *, create: bool) -> Optional[bytes]:
+    """The per-home spool MAC key, or None (fail closed: nothing is trusted).
+
+    Creation is atomic: the key is written + fsynced to a private temp file and
+    ``os.link``-ed into place, so a reader never sees a partial key. With
+    ``create=True`` a present-but-INVALID key (torn by a pre-fix build, edited)
+    is replaced atomically by a fresh one; records MAC'd under it were never
+    trusted anyway. With ``create=False`` (boot load) an invalid key is only
+    reported and everything fails closed.
+    """
+    path = spool_dir(home).parent / SPOOL_KEY_NAME
+    key, present = _read_spool_key(path)
+    if key is not None or not create:
+        return key
+    tmp = path.with_name(f".{SPOOL_KEY_NAME}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="ascii") as fh:
-            fh.write(secrets.token_hex(32))
+            fh.write(secrets.token_hex(SPOOL_KEY_MIN_BYTES))
             fh.flush()
             os.fsync(fh.fileno())
-    except FileExistsError:
-        pass  # a concurrent writer created it first; read theirs
+        if present:
+            os.replace(tmp, path)  # heal an invalid key
+            logger.warning("PHASE=restart_followup_key_replaced path=%s", path)
+        else:
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                pass  # a concurrent writer won; use theirs
     except Exception:
         logger.warning("restart follow-up spool key could not be created: %s", path, exc_info=True)
         return None
-    return _spool_key(home, create=False)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return _read_spool_key(path)[0]
 
 
 def _record_mac(key: bytes, record: Dict[str, Any]) -> str:
