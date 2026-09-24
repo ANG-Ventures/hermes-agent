@@ -4298,6 +4298,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     api_msg.pop(internal_key, None)
 
         summary_extra_body = {}
+        summary_user = None
         try:
             from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE as _OMIT_TEMP
         except Exception:
@@ -4370,9 +4371,26 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                         base_url=agent.base_url,
                         reasoning_config=agent.reasoning_config,
                     )
+                    # The transport also takes the profile's per-session routing
+                    # identity (the OpenAI ``user`` field) from
+                    # build_api_kwargs_extras. Carry ONLY that onto this direct call:
+                    # without it a session-routed provider (claude-bridge pools)
+                    # gets the summary request keyless. Other top-level extras stay
+                    # transport-only (reasoning is handled above).
+                    _, _summary_top = provider_profile.build_api_kwargs_extras(
+                        reasoning_config=None,
+                        supports_reasoning=False,
+                        model=agent.model,
+                        base_url=agent.base_url,
+                        session_id=getattr(agent, "session_id", None),
+                        bridge_route_suffix=getattr(agent, "_bridge_route_suffix", None),
+                    )
+                    summary_user = (_summary_top or {}).get("user")
             except Exception:
                 pass
 
+            if summary_user:
+                summary_kwargs["user"] = summary_user
             if profile_extra_body:
                 summary_extra_body.update(profile_extra_body)
             if provider_preferences and "provider" not in profile_extra_body and (
@@ -4490,6 +4508,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
+                if summary_user:
+                    summary_kwargs["user"] = summary_user
 
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
