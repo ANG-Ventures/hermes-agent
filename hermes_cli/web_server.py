@@ -476,9 +476,30 @@ async def _lifespan(app: "FastAPI"):
     # sweeping stale sessions on schedule, independent of list requests.
     auto_archive_task = asyncio.create_task(_auto_archive_ticker_loop())
 
+    # Shared-checkout admission hold (gateway/checkout_admission.py). Only
+    # when config.yaml enables it for kind "serve": install the RPC gate and
+    # publish acknowledgments from THIS loop, so a fresh record also proves
+    # the HTTP/WebSocket loop is serving.
+    checkout_publisher_task = None
+    try:
+        from gateway.checkout_admission import process_gate as _checkout_process_gate
+
+        if _checkout_process_gate("serve") is not None:
+            from tui_gateway.server import enable_checkout_admission
+
+            _checkout_gate = enable_checkout_admission("serve")
+            if _checkout_gate is not None:
+                checkout_publisher_task = asyncio.create_task(
+                    _checkout_gate.publish_forever()
+                )
+    except Exception:
+        _log.exception("checkout admission setup failed; consumer will read UNKNOWN")
+
     try:
         yield
     finally:
+        if checkout_publisher_task is not None:
+            checkout_publisher_task.cancel()
         if cron_stop is not None:
             cron_stop.set()
         pty_reaper_task.cancel()

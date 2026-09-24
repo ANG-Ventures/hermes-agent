@@ -1698,8 +1698,38 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    @staticmethod
+    def _checkout_hold_refusal() -> Optional[str]:
+        """Shared-checkout admission hold check (gateway/checkout_admission.py).
+
+        Runs on the event loop in the same non-awaiting block as the caller's
+        pending-work reservation, and the gateway's acknowledgment snapshot
+        also runs on that loop, so a request that passes here is always
+        counted (via ``active_agent_work_count``) by the next snapshot.
+        """
+        try:
+            from gateway.checkout_admission import process_gate
+
+            gate = process_gate("gateway")
+        except Exception:
+            return None
+        if gate is None:
+            return None
+        refusal = gate.check(internal=False)
+        return refusal.reason if refusal is not None else None
+
     def _draining_response(self) -> Optional["web.Response"]:
         """Return a retryable response while the gateway drains existing work."""
+        held = self._checkout_hold_refusal()
+        if held is not None:
+            return web.json_response(
+                _openai_error(
+                    "Gateway is paused for a maintenance update; retry shortly.",
+                    code="checkout_held",
+                ),
+                status=503,
+                headers={"Retry-After": "5"},
+            )
         if not self._gateway_is_draining():
             return None
         return web.json_response(

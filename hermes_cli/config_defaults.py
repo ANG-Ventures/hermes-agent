@@ -2857,6 +2857,22 @@ DEFAULT_CONFIG = {
         "allow_lazy_installs": True,
     },
 
+    # Shared-checkout admission hold (gateway/checkout_admission.py). Off by
+    # default. When several long-lived processes import ONE git checkout
+    # (e.g. two gateways + a serve backend), enabling this lets an operator
+    # hold new work, verify every process acknowledged and drained, and only
+    # then fetch/merge -- without idle-poll races or forced interrupts.
+    # Operator CLI: python -m gateway.checkout_admission --help.
+    "checkout_admission": {
+        "enabled": False,
+        # Shared directory; empty = <git-common-dir>/checkout-admission of the
+        # checkout this code runs from (the same for every consumer of it).
+        "dir": "",
+        # Consumer name per process kind in THIS profile, e.g.
+        # {"gateway": "gateway:default", "serve": "serve:clanker"}.
+        "consumers": {"gateway": "", "serve": ""},
+    },
+
     "cron": {
         # Allow cron-spawned agents to use the cronjob toolset (create/edit/
         # remove scheduled jobs from within a cron run — the "cron-librarian"
