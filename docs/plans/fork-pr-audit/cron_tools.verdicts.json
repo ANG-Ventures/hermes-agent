@@ -1616,8 +1616,8 @@
   "problem": "Per-execution identity markers (delegated-child / worker markers) captured into the shared shell snapshot and re-sourced by later commands.",
   "evidence": {
    "original": "PR #543 body: orchestrator session's shell reported the delegated-child marker =1 hours after its child exited.",
-   "upstream_state": "GREEN (read-only): ../up tools/environments/base_session_env.py:29-31 exclusion list includes the delegated/worker execution markers (the same var names #543 adds). own tests (data/runtests_clean.py: row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP 1 error (collection), FM 7 passed.",
-   "upstream_fix": "f2e32ceead (2026-07-23) + later upstream widenings of _SNAPSHOT_EXCLUDED_ENV_REGEX (issue #71296)",
+   "upstream_state": "GREEN (read-only): ../up tools/environments/base_session_env.py:66-80 _export_dump_excluding_session_vars unsets the delegate_task-child / cron-run scope markers (the same per-execution vars #543 excludes) before export -p; comment cites #90782 'fence the PARENT session's kanban CLI' = #543's exact symptom. Own tests: UP 1 error (collection), FM 7 passed.",
+   "upstream_fix": "c44b423e52 fix(tools): stop the terminal snapshot from persisting ... (#90782, 2026-08-20)",
    "fires": "no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
    "cost": {
     "loc": 122,
