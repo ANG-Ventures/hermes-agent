@@ -499,6 +499,58 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def _pin_kanban_cfg(monkeypatch, kanban_cfg):
+    from hermes_cli import kanban_worker_policy as kwp
+    monkeypatch.setattr(kwp, "_load_config", lambda: {"kanban": kanban_cfg})
+
+
+def test_create_worker_default_assignee_remapped_to_knob(worker_env, monkeypatch):
+    """A worker's literal assignee='default' goes to kanban.default_assignee (t_4424c05d)."""
+    _pin_kanban_cfg(monkeypatch, {"default_assignee": "daedalus"})
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "derived", "assignee": "default"}))
+    assert d["ok"] is True
+    assert d["assignee_remapped"]["from"] == "default"
+    assert d["assignee_remapped"]["to"] == "daedalus"
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, d["task_id"]).assignee == "daedalus"
+        kinds = [
+            r[0] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (d["task_id"],)
+            )
+        ]
+        assert "assignee_remapped" in kinds
+    finally:
+        conn.close()
+
+
+def test_create_worker_default_assignee_refused_without_knob(worker_env, monkeypatch):
+    _pin_kanban_cfg(monkeypatch, {"default_assignee": ""})
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "derived", "assignee": "default"}))
+    assert "error" in d
+    assert "kanban.default_assignee" in d["error"]
+
+
+def test_create_operator_default_assignee_untouched(worker_env, monkeypatch):
+    """Operator/CLI creates (no worker marker) may still assign 'default'."""
+    from hermes_cli import kanban_worker_policy as kwp
+    _pin_kanban_cfg(monkeypatch, {"default_assignee": "daedalus"})
+    monkeypatch.delenv(kwp.WORKER_ENV_MARKER, raising=False)
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "mine", "assignee": "default"}))
+    assert d["ok"] is True
+    assert "assignee_remapped" not in d
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, d["task_id"]).assignee == "default"
+    finally:
+        conn.close()
+
+
 def test_create_persists_model_override(worker_env):
     """kanban_create accepts model_override and persists it (the read side
     at 327/372 already surfaces it)."""

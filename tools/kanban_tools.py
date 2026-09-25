@@ -1566,6 +1566,12 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    from hermes_cli import kanban_worker_policy as _worker_policy
+    assignee, assignee_remap, assignee_err = _worker_policy.resolve_worker_assignee(
+        assignee
+    )
+    if assignee_err:
+        return tool_error(f"kanban_create: {assignee_err}")
     body = args.get("body")
     parents = args.get("parents") or []
     parents_kind = args.get("parents_kind")
@@ -1689,6 +1695,11 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
+            if assignee_remap is not None:
+                with kb.write_txn(conn):
+                    kb._append_event(
+                        conn, new_tid, "assignee_remapped", assignee_remap,
+                    )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
@@ -1699,6 +1710,7 @@ def _handle_create(args: dict, **kw) -> str:
                 project_id=new_task.project_id if new_task else None,
                 reasoning_effort=(new_task.reasoning_effort if new_task else None),
                 subscribed=subscribed,
+                **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
             )
         finally:
             conn.close()

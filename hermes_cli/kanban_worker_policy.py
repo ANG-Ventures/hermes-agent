@@ -107,3 +107,56 @@ def park_event_payload(status: str) -> dict:
         ),
         "worker_task_id": (os.environ.get(WORKER_ENV_MARKER) or "").strip() or None,
     }
+
+
+# ``default`` is the operator's own profile (Apollo). A dispatched worker that
+# passes ``assignee="default"`` is almost always a model filling the required
+# field with a placeholder, not a real routing decision: six such cards landed
+# in 24h on 2026-09-24 (t_4424c05d). Operator/CLI creates are untouched.
+RESERVED_WORKER_ASSIGNEES = frozenset({"default"})
+
+
+def configured_default_assignee() -> str:
+    """Resolve ``kanban.default_assignee``; empty string when unset/unreadable."""
+    try:
+        cfg = _load_config()
+        value = (cfg.get("kanban", {}) or {}).get("default_assignee")
+    except Exception:
+        return ""
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def resolve_worker_assignee(assignee: str) -> tuple[str, Optional[dict], Optional[str]]:
+    """Rewrite a worker's placeholder assignee to ``kanban.default_assignee``.
+
+    Returns ``(assignee, remap_payload, error)``:
+
+    - not a dispatched worker, or a normal assignee: ``(assignee, None, None)``
+    - worker passed ``default`` and the knob names another profile:
+      ``(configured, payload, None)`` where ``payload`` is the audit record
+    - worker passed ``default`` and the knob is unset (or is ``default``):
+      ``(assignee, None, error)``, and the caller refuses the create.
+    """
+    requested = str(assignee).strip()
+    if not is_dispatched_worker() or requested.lower() not in RESERVED_WORKER_ASSIGNEES:
+        return str(assignee), None, None
+    configured = configured_default_assignee()
+    if not configured or configured.lower() in RESERVED_WORKER_ASSIGNEES:
+        return str(assignee), None, (
+            f"assignee={requested!r} is reserved for the operator profile and "
+            "cannot be used by a dispatched worker, and kanban.default_assignee "
+            "is not set to another profile. Name the specialist profile that "
+            "should run this card."
+        )
+    return configured, {
+        "from": requested,
+        "to": configured,
+        "knob": "kanban.default_assignee",
+        "reason": (
+            f"worker-created card asked for assignee={requested!r}; remapped to "
+            f"kanban.default_assignee={configured!r}"
+        ),
+        "worker_task_id": (os.environ.get(WORKER_ENV_MARKER) or "").strip() or None,
+    }, None
