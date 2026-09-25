@@ -3011,35 +3011,6 @@ def _collect_authed_provider_slugs(
     return slugs
 
 
-def provider_row_is_excluded(row: dict, excluded: set | frozenset) -> bool:
-    """True when ``row`` names a provider in ``excluded`` (normalized lowercase).
-
-    THE single definition of "is this provider row excluded". Both exclusion
-    choke points call it — the one at the end of
-    :func:`list_authenticated_providers` (covers every emitter section) and the
-    one at the end of ``inventory.build_models_payload`` (covers the rows
-    injected *after* that call: the virtual ``moa`` row and the unconfigured
-    canonical skeletons). Two independently-written predicates would drift, and
-    the drift is invisible because each site has its own tests.
-
-    Matched against the row's ``slug``, its ``provider_id`` and its display
-    ``name``, plus the bare tail of a ``custom:<name>`` slug, so a single config
-    entry hides the endpoint regardless of which key the user spelled it under.
-    """
-    if not excluded:
-        return False
-    slug = str(row.get("slug", "")).strip().lower()
-    candidates = {
-        slug,
-        str(row.get("provider_id", "")).strip().lower(),
-        str(row.get("name", "")).strip().lower(),
-    }
-    if slug.startswith("custom:"):
-        candidates.add(slug[len("custom:"):])
-    candidates.discard("")
-    return bool(candidates & set(excluded))
-
-
 def list_authenticated_providers(
     current_provider: str = "",
     current_base_url: str = "",
@@ -4341,25 +4312,6 @@ def list_authenticated_providers(
             seen_slugs.add(slug.lower())
             _section4_emitted_slugs.add(slug.lower())
 
-    # Apply final ``model_catalog.excluded_providers`` post-filter.
-    #
-    # The per-section gates above only cover the built-in rows (sections 1, 2
-    # and 2b). Sections 3 (``providers:``), 3b (the bare ``provider: custom`` +
-    # ``base_url`` form) and 4 (``custom_providers:``) had no exclusion gate at
-    # all, so an excluded user endpoint still reached every consumer of this
-    # function — web_server /api/models, the kanban dashboard, the ACP adapter,
-    # tui_gateway and moa_cmd — while ``hermes model`` (main.py) hid it. This
-    # runs as a post-pass over ``results`` rather than as a fourth per-section
-    # gate so a section added later cannot reintroduce the omission.
-    #
-    # ``inventory.build_models_payload`` applies the SAME predicate again after
-    # it injects its own rows (the virtual ``moa`` row and the unconfigured
-    # canonical skeletons), which this function never sees.
-    if _excluded:
-        results = [
-            r for r in results if not provider_row_is_excluded(r, _excluded)
-        ]
-
     # Apply final ``providers.<name>.enabled: false`` post-filter — covers
     # built-in PROVIDER_REGISTRY rows (sections 1-2) which would otherwise
     # bypass the per-section gate. Indexed by lowercase slug AND by
@@ -4482,19 +4434,6 @@ def list_picker_providers(
     )
     if include_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
-        # ``list_authenticated_providers`` filtered ``excluded_providers`` over
-        # its OWN rows; the virtual moa row is injected afterwards and would
-        # otherwise reappear in the gateway/Telegram/Discord picker despite
-        # being excluded. Same shared predicate as the two other choke points
-        # (list_authenticated_providers, inventory.build_models_payload).
-        _excl_norm = {
-            str(p).strip().lower() for p in (excluded_providers or []) if p
-        }
-        if _excl_norm:
-            providers = [
-                p for p in providers
-                if not provider_row_is_excluded(p, _excl_norm)
-            ]
 
     filtered: List[dict] = []
     _cur = str(current_provider or "").strip().lower()
