@@ -1162,7 +1162,9 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 expected_run_id=_worker_run_id(tid),
                 # A non-worker reviewer (human-lane orchestrator) on a parked
                 # review card opens the review run as itself, atomically.
-                claimer=os.environ.get("HERMES_PROFILE") or "worker",
+                # Gateway sessions carry no worker marker: fall back to the
+                # active profile, never a literal that misattributes the verdict.
+                claimer=_caller_profile() or "reviewer",
                 coverage=coverage,
             )
             if not ok:

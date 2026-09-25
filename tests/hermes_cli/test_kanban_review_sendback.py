@@ -260,6 +260,27 @@ def test_tool_request_changes_sends_back_parked_review(board: Path) -> None:
         _assert_sent_back(conn, tid, "apollo")
 
 
+def test_tool_send_back_from_gateway_session_attributes_active_profile(
+    board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An orchestrator in a gateway session has no HERMES_PROFILE (only dispatched
+    workers do): the review claim and coverage comment name the active profile."""
+    from hermes_cli import profiles
+    from tools import kanban_tools as tools
+
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+    out = json.loads(tools._handle_request_changes({
+        "task_id": tid, "reason": "add the boundary test",
+        "coverage": json.loads(COVERAGE),
+    }))
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        _assert_sent_back(conn, tid, "default")
+
+
 def test_tool_send_back_without_coverage_is_refused(board: Path) -> None:
     from tools import kanban_tools as tools
 
