@@ -4273,6 +4273,12 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        if ok and reason:
+            # Success with a diagnostic = the review was resolved WITHOUT a
+            # reviewer session (kanban.review_policy=milestone_only). Say so;
+            # "Requested review" would be a lie the worker then reasons from.
+            print(f"{tid}: {reason}")
+            return 0
         persisted_run = kb.latest_run(conn, tid)
         display_summary = persisted_run.summary if persisted_run else None
         print(
@@ -4489,9 +4495,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 return None
             return ival if ival >= 1 else None
 
-        max_in_progress_per_profile = _coerce_positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile")
-        )
+        _raw_per_profile = _kanban_cfg.get("max_in_progress_per_profile")
+        if isinstance(_raw_per_profile, dict):
+            # {default: N, <profile>: M} — resolved per assignee in the
+            # dispatcher (kanban_db.resolve_per_profile_cap).
+            max_in_progress_per_profile = _raw_per_profile
+        else:
+            max_in_progress_per_profile = _coerce_positive_int(_raw_per_profile)
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # Memory-derived default when unset (OOF-30/OOF-77) — same
         # fallback the gateway-embedded dispatcher applies, so behaviour

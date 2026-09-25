@@ -3099,6 +3099,25 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Pause dispatcher SPAWNS (reclaims still run) while the host's
+        # 1-minute load average is over `pause_above` (default: CPU count);
+        # resume once it drops below `resume_below` (default: 0.75 × CPU
+        # count). Hysteresis so a load that hovers at the bar doesn't flap
+        # spawns every tick. Set enabled: false to disable.
+        "dispatch_load_gate": {"enabled": True, "pause_above": None, "resume_below": None},
+        # Reviewer↔implementer round cap. A "round" is one changes_requested
+        # verdict; once a card has collected this many, the next request for
+        # review does NOT re-spawn the reviewer — the card is blocked
+        # (needs_input) for the orchestrator/human to take over. 0 disables.
+        "max_review_rounds": 3,
+        # "all" (default): every request_review routes to review_assignee.
+        # "milestone_only": only cards whose title/body carry "[milestone]"
+        # or that are parents in task_links get a reviewer session; every
+        # other card that asks for review is completed in place with a
+        # review_skipped event (CI is the gate for slice work) — even when
+        # the worker names a reviewer profile; only reviewer=human or
+        # --force bypasses it.
+        "review_policy": "all",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
