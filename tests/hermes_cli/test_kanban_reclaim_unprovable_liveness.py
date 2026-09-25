@@ -289,7 +289,7 @@ def test_dead_claimer_inside_launch_bound_is_held(conn):
 def test_missing_run_context_fails_closed_for_dead_claimer(conn):
     """Omitting conn/task_id can never turn a dead claimer into a release."""
     lock = f"{kb._claimer_id().split(':', 1)[0]}:{_dead_pid()}"
-    info = kb._terminate_reclaimed_worker(None, lock)
+    info = kb._terminate_reclaimed_worker(None, lock, owner_window=(None, None, None))
     assert kb._worker_survived_termination(info) is True
     assert info["unstamped_worker_check"] == "skipped_no_run_context"
 
