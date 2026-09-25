@@ -106,6 +106,9 @@ class TurnRecord:
     # Enables deduplication: ccusage records with this invocation_id are already
     # counted in turns.db and should not be double-counted in the ccusage panel.
     cli_invocation_id: Optional[str] = None
+    # Terminal-error marker: the turn_exit_reason of a turn that ended FAILED
+    # (fallback chain exhausted, raised); None for a turn that ended normally.
+    terminal_error: Optional[str] = None
     # Not persisted on the main row — written to the side table:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # {name,args_preview,result_preview}
 

@@ -9528,6 +9528,12 @@ class AIAgent:
                     # Interrupt clear is deferred to after thread join in the
                     # outer finally: a refresher firing between stop and join
                     # would otherwise set an interrupt that survives the clear.
+            # Early returns inside run_conversation bypass finalize_turn and
+            # with it the once-per-turn on_session_end hook; emit it here so
+            # every turn (and its Blackbox turn_api_calls) gets a turns row.
+            from agent.turn_finalizer import emit_unfinalized_session_end
+
+            emit_unfinalized_session_end(self, relay_turn_id, result=result)
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
@@ -9544,6 +9550,12 @@ class AIAgent:
                 finish_task_run(**task_context, result=result)
             return result
         except BaseException as exc:
+            try:
+                from agent.turn_finalizer import emit_unfinalized_session_end
+
+                emit_unfinalized_session_end(self, relay_turn_id, exc=exc)
+            except Exception:
+                pass
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
                 type(exc).__name__ == "CancelledError"
             ):

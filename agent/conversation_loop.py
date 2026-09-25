@@ -2512,6 +2512,11 @@ def run_conversation(
     # successful provider call appends a dict at the usage-commit site below;
     # folded into the on_session_end `turn_usage` kwarg at the end of the turn.
     _turn_calls: List[Dict[str, Any]] = []
+    # Published (same list object) for the run_agent forwarder's backstop
+    # (turn_finalizer.emit_unfinalized_session_end): early returns and raises
+    # below never reach finalize_turn but must still record their turn.
+    agent._blackbox_turn_calls = (turn_id, _turn_calls)
+    agent._turn_original_user_message = (turn_id, original_user_message)
     # A previous turn that ended through an early ``return`` (not via
     # finalize_turn) can leave billed-but-unaccepted responses parked. Their
     # tokens were spent: count them in the session totals now (they carry the

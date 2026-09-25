@@ -456,6 +456,11 @@ def _build_record(
         final_text=str(final_response or "") if store_text else "",
         tool_calls=tool_calls if store_text else [],
         cli_invocation_id=kwargs.get("cli_invocation_id"),
+        terminal_error=(
+            str(kwargs.get("turn_exit_reason") or "failed")
+            if kwargs.get("failed")
+            else None
+        ),
     )
 
 
