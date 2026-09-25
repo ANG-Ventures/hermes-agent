@@ -449,7 +449,10 @@ def test_switch_model_rejects_known_tailscale_route_while_client_is_stopped(
     )
 
     assert result.success is False
-    assert result.error_message == "Tailscale down"
+    assert result.error_message == (
+        "Tailscale is down on the gateway host; `claude-apr/claude-fable-5` "
+        "is unavailable. Reconnect Tailscale or use a non-tailnet provider."
+    )
     validation.assert_not_called()
 
 

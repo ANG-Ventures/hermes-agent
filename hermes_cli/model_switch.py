@@ -2416,7 +2416,11 @@ def switch_model(
                     target_provider=target_provider,
                     provider_label=provider_label,
                     is_global=is_global,
-                    error_message="Tailscale down",
+                    error_message=(
+                        "Tailscale is down on the gateway host; "
+                        f"`{target_provider}/{new_model}` is unavailable. "
+                        "Reconnect Tailscale or use a non-tailnet provider."
+                    ),
                 )
     except Exception:
         logger.debug("Model-switch Tailscale preflight failed open", exc_info=True)

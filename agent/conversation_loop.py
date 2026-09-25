@@ -3654,7 +3654,10 @@ def run_conversation(
                     # the same Tailscale diagnosis twice; route count/session
                     # detail remains in the WARNING diagnostic.
                     agent._clear_status_buffer()
-                    _transport_error = "Tailscale down"
+                    _transport_error = (
+                        "Tailscale is down on the gateway host. Reconnect "
+                        "Tailscale or use a non-tailnet provider."
+                    )
                     agent._persist_session(messages, conversation_history)
                     return {
                         "final_response": _transport_error,
