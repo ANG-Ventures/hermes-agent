@@ -7037,6 +7037,15 @@ def run_job(
                 resolve_exc,
             )
             fb_list = get_fallback_chain(_cfg)
+            # A job that declares its OWN ``fallback`` chain must get that chain
+            # here too, not only mid-run. Otherwise a primary that fails at
+            # resolve time (e.g. "Codex credential is in cooldown") walks the
+            # GLOBAL chain and the job's declared, pool-diverse net is never
+            # consulted (debug-log-analysis / weekly-pr-sweep: codex cooldown ->
+            # global claude-bpr rung -> HTTP 503 "no eligible sub", 2026-09-21).
+            # Jobs without their own chain keep the global chain unchanged.
+            if job.get("fallback"):
+                fb_list = _resolve_job_fallback_chain(job, fb_list, job_id) or []
             runtime = None
             for entry in fb_list:
                 if not isinstance(entry, dict):
