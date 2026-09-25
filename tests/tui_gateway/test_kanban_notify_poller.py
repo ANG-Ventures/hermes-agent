@@ -197,11 +197,9 @@ class TestCollectKanbanNotifications:
         assert len(texts) == 1
         assert tid in texts[0]
         assert "cross-profile delivery" in texts[0]
-        # Completion is reversible, so the shared-board subscription remains
-        # owned by this exact Desktop session until the task is archived.
-        rows = _sub_rows(tid)
-        assert len(rows) == 1
-        assert rows[0]["chat_id"] == SESSION_KEY
+        # The done event was delivered, so the subscription is dropped
+        # (t_6d6e9467: no subs survive on terminal cards).
+        assert _sub_rows(tid) == []
 
 
 class TestFormatKanbanEventText:
