@@ -4440,7 +4440,7 @@ class SessionStore:
         session_key: str,
         entry: "SessionEntry",
         revision: Optional[int],
-        publish: Callable[["SessionEntry"], None],
+        apply_transition: Callable[["SessionEntry"], None],
     ) -> None:
         """Apply a durably-written candidate to the live entry, under ``_lock``.
 
@@ -4455,7 +4455,9 @@ class SessionStore:
             current = self._entries.get(session_key)
             if current is not entry:
                 return
-            publish(current)
+            # Not named ``publish``: the loop-reachability gate resolves bare
+            # calls by name and would alias AdmissionPublisher.publish.
+            apply_transition(current)
             if (
                 revision is not None
                 and getattr(self, "_last_full_snapshot_generation", 0) > revision
