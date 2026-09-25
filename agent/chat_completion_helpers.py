@@ -220,6 +220,14 @@ def _emit_api_call_record(
         pool_headers = dict(headers or {})
         sub_key, attribution = _api_call_identity(agent, pool_headers)
         seq = _next_api_call_seq(agent, turn_id)
+        # Prefix-stability guard inputs (card t_c07124ab): the session the
+        # request belongs to, and the one-shot marker the compressor leaves
+        # when it rewrote history on purpose. Consumed here so it tags exactly
+        # the first request after the compaction.
+        session_key = str(getattr(agent, "session_id", "") or "")
+        prefix_reset = getattr(agent, "_blackbox_prefix_reset", None)
+        if prefix_reset is not None:
+            agent._blackbox_prefix_reset = None
         from plugins.blackbox import record_api_call
 
         record_api_call(
@@ -236,6 +244,9 @@ def _emit_api_call_record(
             relay_synthetic="x-pool-unreachable" in pool_headers,
             route_id=pool_headers.get("x-pool-route-id"),
             cache_ttl_requested=_requested_cache_ttl(api_kwargs),
+            api_kwargs=api_kwargs if isinstance(api_kwargs, dict) else None,
+            session_key=session_key or None,
+            prefix_reset=str(prefix_reset) if prefix_reset else None,
         )
     except Exception:
         _note_api_call_recording_failure(agent)
