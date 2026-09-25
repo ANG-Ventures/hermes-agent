@@ -254,6 +254,49 @@ def _emit_api_call_record(
 
 
 
+def _emit_aux_api_call_record(
+    agent: Any,
+    turn_id: str,
+    *,
+    task: str,
+    provider: str,
+    model: str,
+    usage: Any,
+    api_mode: str,
+) -> None:
+    """Ledger one auxiliary-model call under the turn that made it.
+
+    Same row shape as the main-lane record, sharing the turn's sequence
+    allocator so ``(turn_id, seq)`` never collides. ``attribution='aux:<task>'``
+    makes the store tag ``lane_family='aux'``: the row is measurable per aux
+    lane but excluded from the turn's main-lane cache statistics. No sub
+    identity is known on the aux path, so ``sub_key`` stays NULL. Fail-open.
+    """
+    try:
+        if not turn_id:
+            return
+        seq = _next_api_call_seq(agent, turn_id)
+        from plugins.blackbox import record_api_call
+
+        record_api_call(
+            turn_id=turn_id,
+            seq=seq,
+            ts=time.time(),
+            provider=provider,
+            model=model,
+            usage=usage,
+            api_mode=api_mode,
+            sub_key=None,
+            attribution=f"aux:{task}",
+            http_status=200,
+            relay_synthetic=False,
+            route_id=None,
+        )
+    except Exception:
+        _note_api_call_recording_failure(agent)
+        logger.warning("blackbox aux API-call insert failed", exc_info=True)
+
+
 def _note_billed_response(agent: Any, response: Any) -> None:
     """Register a transport-accepted (billed) response for loop accounting.
 
