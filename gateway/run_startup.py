@@ -81,13 +81,58 @@ class GatewayStartupMixin:
         if queue is None:
             queue = self._startup_restore_queue = []
         queue.append(event)
+        source = getattr(event, "source", None)
         with suppress(Exception):
-            source = event.source
             logger.info(
                 "Queued inbound message during gateway startup restore: platform=%s chat=%s",
                 source.platform.value if source and source.platform else "unknown",
                 source.chat_id if source else "unknown",
             )
+        # One ack per chat so a queued message does not look dead until the gate releases. Queueing is
+        # the load-bearing half; the ack must never break it.
+        try:
+            self._maybe_ack_startup_restore_queue(source)
+        except Exception as e:
+            logger.debug("startup-restore ack scheduling failed: %s", e)
+
+    def _maybe_ack_startup_restore_queue(self, source: Optional[SessionSource]) -> None:
+        chat_id = getattr(source, "chat_id", None)
+        platform = getattr(source, "platform", None)
+        if source is None or platform is None or chat_id is None:
+            return
+        acked = getattr(self, "_startup_restore_acked_chats", None)
+        if acked is None:
+            acked = self._startup_restore_acked_chats = set()
+        key = (getattr(platform, "value", platform), str(chat_id))
+        if key in acked:
+            return
+        adapter = self._intake_adapter_for(source)
+        if adapter is None:
+            return  # don't burn the key: a later message may arrive once the adapter is up
+        acked.add(key)
+        try:
+            task = asyncio.create_task(self._send_startup_restore_ack(adapter, source))
+        except RuntimeError:
+            acked.discard(key)  # no running loop: let a later message ack this chat
+            return
+        background_tasks = getattr(self, "_background_tasks", None)
+        if background_tasks is None:
+            background_tasks = self._background_tasks = set()
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+    async def _send_startup_restore_ack(self, adapter: Any, source: SessionSource) -> None:
+        # Fire-and-forget: if the gate released before this ran, the real reply may already be out.
+        if not getattr(self, "_startup_restore_in_progress", False):
+            return
+        try:
+            await adapter.send(
+                source.chat_id,
+                "⏳ Still starting up — your message is queued and I'll get to it in a moment.",
+                metadata={**(self._thread_metadata_for_source(source) or {}), "_interim_send": True},
+            )
+        except Exception as e:
+            logger.debug("startup-restore ack send failed: %s", e)
 
     async def _drain_startup_restore_queue(self) -> int:
         """Replay inbound messages queued while startup auto-resume ran."""
@@ -1564,6 +1609,7 @@ class GatewayStartupMixin:
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        self._startup_restore_acked_chats = set()  # per-restore-cycle ack dedupe
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()
