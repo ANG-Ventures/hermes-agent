@@ -3595,6 +3595,20 @@ def try_activate_fallback(
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)  # skip invalid, try next
 
+    # A card-pinned kanban worker never leaves its pinned provider mid-turn
+    # (t_ed0289e3): a card pinned to openai-codex to escape a bridge fault must
+    # not run on the bridge after the first codex error. Skip cross-provider
+    # entries (same-provider ones stay usable); an exhausted chain returns
+    # False and the run ends retry-preserving via apply_pin_refusal_to_result.
+    from hermes_cli.kanban_worker_route import refuse_runtime_failover
+
+    if refuse_runtime_failover(agent, fb_provider, fb_model, reason):
+        logger.warning(
+            "Fallback skip: %s/%s refused — kanban card pins this worker's provider",
+            fb_provider, fb_model,
+        )
+        return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)
+
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
         unavailable.add(fb_key)
@@ -4190,6 +4204,16 @@ def try_activate_fallback(
             _append_route_change(
                 "failover", old_provider, old_model, fb_provider, fb_model,
                 old_effort=_old_eff, new_effort=_new_eff,
+            )
+            # Kanban worker: put the swap on the card's run (t_4fe0700a) so
+            # a pinned route that ended up elsewhere is visible on the board.
+            from hermes_cli.kanban_worker_route import (
+                record_worker_route_substitution,
+            )
+            record_worker_route_substitution(
+                stage="runtime", from_provider=old_provider, from_model=old_model,
+                to_provider=fb_provider, to_model=fb_model,
+                reason=getattr(reason, "value", reason),
             )
             # Chat announce — gated on model.announce_route_change (default on).
             _announce_on = True

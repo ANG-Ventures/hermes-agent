@@ -49,8 +49,34 @@ class CLIAgentSetupMixin:
         except Exception as exc:
             _primary_exc = exc
 
+        # A kanban worker spawned with ``--provider`` is pinned by the
+        # dispatcher (card set-model / lane override / fallback rung). Never
+        # substitute another provider for it at startup: that is how a card
+        # pinned to openai-codex to escape a bridge fault ran on claude-bpr
+        # (t_4fe0700a). Refuse loudly instead; a cooldown exits rate-limited.
+        from hermes_cli.kanban_worker_route import (
+            pinned_worker_provider,
+            record_worker_route_pin_refused,
+            record_worker_route_substitution,
+        )
+        _pinned = pinned_worker_provider(getattr(self, "_explicit_provider", None))
+        if runtime is None and _primary_exc is not None and _pinned:
+            from hermes_cli.auth import is_rate_limited_auth_error
+
+            _rate_limited = is_rate_limited_auth_error(_primary_exc)
+            record_worker_route_pin_refused(
+                provider=_pinned, model=self.model, reason=str(_primary_exc),
+                rate_limited=_rate_limited,
+            )
+            _cprint(
+                f"⚠️  Pinned provider {_pinned} unavailable ({_primary_exc}) — "
+                "refusing fallback for this kanban worker"
+            )
+            if _rate_limited:
+                self._kanban_pin_rate_limited = str(_primary_exc)
+
         # Primary provider auth failed — try fallback providers before giving up.
-        if runtime is None and _primary_exc is not None:
+        if runtime is None and _primary_exc is not None and not _pinned:
             from hermes_cli.auth import AuthError
             if isinstance(_primary_exc, AuthError):
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
@@ -74,6 +100,11 @@ class CLIAgentSetupMixin:
                             _primary_exc, _fb_provider, _fb_model,
                         )
                         _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
+                        record_worker_route_substitution(
+                            stage="auth", from_provider=self.requested_provider,
+                            from_model=self.model, to_provider=_fb_provider,
+                            to_model=_fb_model, reason=str(_primary_exc),
+                        )
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
                         _primary_exc = None

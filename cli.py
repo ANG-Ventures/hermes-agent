@@ -5295,6 +5295,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         self._explicit_api_key = api_key
         self._explicit_base_url = base_url
+        # Raw ``--provider`` flag. A kanban worker treats it as the
+        # dispatcher's pin and refuses auth-time substitution (t_4fe0700a).
+        self._explicit_provider = provider
+        self._kanban_pin_rate_limited: Optional[str] = None
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
@@ -22516,7 +22520,20 @@ def main(
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
                         from hermes_cli.kanban_worker_exit import WorkerExit
-                        raise WorkerExit(result)
+                        from hermes_cli.kanban_worker_route import (
+                            apply_pin_refusal_to_result,
+                        )
+                        raise WorkerExit(apply_pin_refusal_to_result(cli.agent, result))
+
+                # A pinned kanban worker whose provider is in cooldown exits
+                # rate-limited (retry-preserving) instead of running elsewhere.
+                if getattr(cli, "_kanban_pin_rate_limited", None):
+                    from hermes_cli.kanban_worker_exit import WorkerExit
+                    raise WorkerExit({
+                        "failed": True,
+                        "failure_reason": "rate_limit",
+                        "error": cli._kanban_pin_rate_limited,
+                    })
 
                 # Exit with error code if credentials or agent init fails
                 sys.exit(1)
