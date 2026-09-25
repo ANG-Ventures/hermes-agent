@@ -973,13 +973,27 @@ def build_turn_context(
     # history up front so the rest of the conversation does not keep re-reading
     # a large stale context on every turn. This fires on elapsed wall-clock time
     # rather than size, so it complements (does not replace) the token-threshold
-    # preflight below. ``_last_activity_ts`` is the last time this turn loop did
-    # work; nothing has touched it yet this turn, so it measures the gap since
-    # the previous turn finished. The cheap gap pre-check gates the (more
-    # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
+    # preflight below. The gap is measured from ``_idle_gap_anchor_ts`` when a
+    # driver stamped one for this turn, else from ``_last_activity_ts``. The
+    # gateway MUST stamp the anchor: it resets ``_last_activity_ts`` to "now"
+    # before the turn (watchdog, #9051) and rebuilds evicted agents with a
+    # construction-time clock, so ``_last_activity_ts`` alone reads a ~0s gap
+    # there and the trigger could never fire. The anchor is one-shot per turn.
+    # The cheap gap pre-check gates the (more expensive) token estimate,
+    # mirroring ``_should_run_preflight_estimate``.
+    _idle_anchor = getattr(agent, "_idle_gap_anchor_ts", None)
+    agent._idle_gap_anchor_ts = None
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if agent.compression_enabled and _idle_after > 0 and messages:
-        _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
+        if (
+            isinstance(_idle_anchor, (int, float))
+            and not isinstance(_idle_anchor, bool)
+            and _idle_anchor > 0
+        ):
+            _idle_since = float(_idle_anchor)
+        else:
+            _idle_since = getattr(agent, "_last_activity_ts", time.time())
+        _idle_gap = time.time() - _idle_since
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
             _idle_tokens = estimate_request_tokens_rough(
