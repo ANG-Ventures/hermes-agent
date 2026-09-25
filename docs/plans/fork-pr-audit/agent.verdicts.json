@@ -3341,14 +3341,14 @@
     ],
     "loc": 1015
    },
-   "fires": "see #942",
+   "fires": "2 'confab notice emitted out-of-band' + 0 'tool-call notice emitted out-of-band' across 20 per-sub bridges (journalctl -u claude-bpx-N --since '7 days ago' on sub-vps-1..22; per-host journal window starts 09-18..09-23, i.e. 2-7 days): sub-vps-10 2026-09-21T07:58:40Z and sub-vps-20 2026-09-21T08:09:27Z, both scope=visible; the other 18 bridges 0/0. sub-vps-18,21,23,24,25 run no bpx unit.",
    "original": "PR #764 (a2a1a5cbdb).",
    "upstream_fix": "none",
    "upstream_state": "RED (see #942)"
   },
-  "notes": "Rides with #942; same measurement gap (relay emission is logged only on the per-sub VPS bridges).",
+  "notes": "Settled 2026-09-25 by t_dffd32d3 run 10593 with the row's pre-registered rule ('0 across the fleet => DROP; >0 => KEEP'). Measured >0, so KEEP. The rate is low (2 events in 2-7 days, fleet-wide), and only the confab half fired; the tool-call-notice half had 0. The extension is emitted by our own claude-bridge, and upstream has no such producer, so this is fork-specific and not UPSTREAM. Re-measure at the next sync: if the confab lane stays at ~0 over 30 days, re-open as DROP (2,402 loc on 3/3-sync files). Prior note: Rides with #942; same measurement gap (relay emission is logged only on the per-sub VPS bridges).",
   "problem": "Consume the out-of-band hermes_confab_notice response extension.",
-  "verdict": "UNRESOLVED"
+  "verdict": "KEEP"
  },
  "#768": {
   "branch": null,
@@ -3610,14 +3610,14 @@
     ],
     "loc": 1387
    },
-   "fires": "relay-side rate NOT measurable from this host: the field is emitted by the per-sub claude-bridge (deploy/claude-bpx-0/bridge/src/server.js:5630 logs 'confab notice emitted out-of-band (scope=\u2026 grammar=\u2026)', :5867 'tool-call notice emitted out-of-band'), and 99.8% of routes go to VPS subs (claude-bpr.log 2026-09-17..09-25: 'chosen' sub-vps-* \u224871K vs local 143) whose bridge logs are remote. The pool router (claude_pool_relay.py, 370,599 log lines) does not log the field at all (0 'confab'). Local bridge claude-bpx.log (4.1 MB, to 09-25 09:01): 0 OOB emissions, 0 'gate armed but no capability signal', 10 in-band 'confab marker appended' \u2014 i.e. the OOB lane was not armed on the local sub during that window. Agent side surfaces the notice as a chat status (conversation_loop.py:8321 _emit_status), not a log line; 1 incidental 'confab notice out-of-band' line in gateway/agent logs.",
+   "fires": "2 'confab notice emitted out-of-band' + 0 'tool-call notice emitted out-of-band' across 20 per-sub bridges (journalctl -u claude-bpx-N --since '7 days ago' on sub-vps-1..22; per-host journal window starts 09-18..09-23, i.e. 2-7 days): sub-vps-10 2026-09-21T07:58:40Z and sub-vps-20 2026-09-21T08:09:27Z, both scope=visible; the other 18 bridges 0/0. sub-vps-18,21,23,24,25 run no bpx unit.",
    "original": "PR #942 (f1ba8e40cf).",
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): 'confab_notice' / 'hermes_confab_notice' 0 hits in ../up/agent"
   },
-  "notes": "Sharper question for the lead: run `grep -c 'confab notice emitted out-of-band' <bridge log>` and `grep -c 'tool-call notice emitted out-of-band'` on each sub-vps host (bridge = deploy/claude-bpx-*/bridge) over one week. 0 across the fleet \u21d2 the OOB lane is not armed and #764+#942 (2,402 loc on 3/3-sync files) are dead \u2192 DROP; >0 \u21d2 KEEP (the agent must strip the extension before empty-response handling or the turn is misclassified). Not settled read-only from this host.",
+  "notes": "Settled 2026-09-25 by t_dffd32d3 run 10593 with the row's pre-registered rule ('0 across the fleet => DROP; >0 => KEEP'). Measured >0, so KEEP. The rate is low (2 events in 2-7 days, fleet-wide), and only the confab half fired; the tool-call-notice half had 0. The extension is emitted by our own claude-bridge, and upstream has no such producer, so this is fork-specific and not UPSTREAM. Re-measure at the next sync: if the confab lane stays at ~0 over 30 days, re-open as DROP (2,402 loc on 3/3-sync files). Prior note: Sharper question for the lead: run `grep -c 'confab notice emitted out-of-band' <bridge log>` and `grep -c 'tool-call notice emitted out-of-band'` on each sub-vps host (bridge = deploy/claude-bpx-*/bridge) over one week. 0 across the fleet \u21d2 the OOB lane is not armed and #764+#942 (2,402 loc on 3/3-sync files) are dead \u2192 DROP; >0 \u21d2 KEEP (the agent must strip the extension before empty-response handling or the turn is misclassified). Not settled read-only from this host.",
   "problem": "Recover tool-call notices (confab notice) before empty-response handling.",
-  "verdict": "UNRESOLVED"
+  "verdict": "KEEP"
  },
  "#95": {
   "branch": null,
