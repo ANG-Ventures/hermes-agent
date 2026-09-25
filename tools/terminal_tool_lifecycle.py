@@ -39,7 +39,7 @@ def _scratch_paths():
 
 def _check_disk_usage_warning():
     """True when hermes scratch dirs exceed the warning threshold (cached, advisory)."""
-    from tools.terminal_tool import DISK_USAGE_WARNING_THRESHOLD_GB
+    from tools.terminal_tool import _disk_warning_gb
     if time.monotonic() - _disk_usage_cache["timestamp"] < _DISK_USAGE_CACHE_TTL:
         return _disk_usage_cache["result"]
     try:
@@ -50,10 +50,11 @@ def _check_disk_usage_warning():
                     with _quiet("Could not stat file %s", f, exc=OSError):
                         total_bytes += f.stat().st_size
         total_gb = total_bytes / (1024 ** 3)
-        exceeded = total_gb > DISK_USAGE_WARNING_THRESHOLD_GB
+        threshold = _disk_warning_gb()
+        exceeded = total_gb > threshold
         if exceeded:
             logger.warning("Disk usage (%.1fGB) exceeds threshold (%.0fGB). Consider running cleanup_all_environments().",
-                           total_gb, DISK_USAGE_WARNING_THRESHOLD_GB)
+                           total_gb, threshold)
         _disk_usage_cache["timestamp"] = time.monotonic()
         _disk_usage_cache["result"] = exceeded
         return exceeded

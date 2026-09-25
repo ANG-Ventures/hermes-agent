@@ -365,6 +365,11 @@ DEFAULT_CONFIG = {
         # Keep a long-lived bash shell across execute() calls so cwd/env/shell variables survive.
         # Applies to non-local backends (SSH); local is opt-in via TERMINAL_LOCAL_PERSISTENT env.
         "persistent_shell": True,
+        # Foreground cap on a terminal call's `timeout`; a longer request runs as a tracked
+        # background process instead. Bridged to TERMINAL_MAX_FOREGROUND_TIMEOUT.
+        "max_foreground_timeout": 600,
+        # Scratch-dir size (GB) above which terminal warns. Bridged to TERMINAL_DISK_WARNING_GB.
+        "disk_warning_gb": 500.0,
     },
 
     "web": {

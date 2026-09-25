@@ -71,11 +71,24 @@ def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
         return default
 
 
-# Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
+# Foreground timeout cap and scratch-disk warning threshold: ``terminal.max_foreground_timeout`` /
+# ``terminal.disk_warning_gb`` in config.yaml, bridged to TERMINAL_MAX_FOREGROUND_TIMEOUT /
+# TERMINAL_DISK_WARNING_GB. These module values are IMPORT-time snapshots, but the config->env
+# bridge (_ensure_terminal_env_bridged) runs on first tool use, after import -- so read the
+# current values through _foreground_max_timeout() / _disk_warning_gb(), never the constants,
+# or a config-set value is silently ignored.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer")
-
-# Disk usage warning threshold (in GB)
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env("TERMINAL_DISK_WARNING_GB", 500.0, float, "number")
+
+
+def _foreground_max_timeout() -> int:
+    """Current foreground cap, re-read after the config->env bridge has run."""
+    return _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", FOREGROUND_MAX_TIMEOUT, int, "integer")
+
+
+def _disk_warning_gb() -> float:
+    """Current scratch-disk warning threshold, re-read after the config->env bridge has run."""
+    return _safe_parse_import_env("TERMINAL_DISK_WARNING_GB", DISK_USAGE_WARNING_THRESHOLD_GB, float, "number")
 
 
 # Approval / sudo-prompt UI callbacks (CLI registers prompt_toolkit-aware
@@ -1039,7 +1052,7 @@ def _plan_execution(
         guidance = _foreground_background_guidance(command)
         if guidance:
             raise _Rejected(_error_json(guidance, status="error"))
-        if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+        if timeout and timeout > _foreground_max_timeout():
             promoted = timeout
 
     return _ExecPlan(
@@ -1067,7 +1080,7 @@ def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
     if not isinstance(data, dict) or data.get("error"):
         return result_json
     template = _PROMOTED_NOTE if data.get("notify_on_complete") else _PROMOTED_NOTE_POLL_ONLY
-    data["promoted_from_foreground"] = template.format(requested=requested_timeout, cap=FOREGROUND_MAX_TIMEOUT)
+    data["promoted_from_foreground"] = template.format(requested=requested_timeout, cap=_foreground_max_timeout())
     return json.dumps(data, ensure_ascii=False)
 
 
@@ -1380,6 +1393,15 @@ def check_terminal_requirements() -> bool:
 
 from tools.registry import registry
 
+def _timeout_param_description(cap: int) -> str:
+    """The ``timeout`` parameter text quoting the foreground cap (one builder for the static
+    schema and the per-request refresh, so the two cannot drift)."""
+    return (f"Max seconds to wait (default: 180, foreground max: {cap}). Returns INSTANTLY when command "
+            "finishes — set high for long tasks, you won't wait unnecessarily. A foreground timeout "
+            f"above {cap}s runs the command as a tracked background process with notify_on_complete=true "
+            "instead (the result says so; do not re-run it).")
+
+
 TERMINAL_SCHEMA = {
     "name": "terminal",
     "description": TERMINAL_TOOL_DESCRIPTION,
@@ -1397,7 +1419,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. A foreground timeout above {FOREGROUND_MAX_TIMEOUT}s runs the command as a tracked background process with notify_on_complete=true instead (the result says so; do not re-run it).",
+                "description": _timeout_param_description(FOREGROUND_MAX_TIMEOUT),
                 "minimum": 1
             },
             "workdir": {
@@ -1506,6 +1528,22 @@ def _handle_terminal(args, **kw):
     )
 
 
+def _terminal_schema_overrides() -> dict:
+    """Quote the CURRENT foreground cap in the schema. TERMINAL_SCHEMA is built at import, before
+    the config->env bridge runs, so a config-set cap would otherwise be enforced while the model
+    is still told the import-time number. Bridging here first keeps the rendered schema the same
+    from the first request on (no mid-conversation schema change)."""
+    _ensure_terminal_env_bridged()
+    cap = _foreground_max_timeout()
+    if cap == FOREGROUND_MAX_TIMEOUT:
+        return {}
+    params = dict(TERMINAL_SCHEMA["parameters"])
+    props = dict(params["properties"])
+    props["timeout"] = {**props["timeout"], "description": _timeout_param_description(cap)}
+    params["properties"] = props
+    return {"parameters": params}
+
+
 registry.register(
     name="terminal",
     toolset="terminal",
@@ -1514,6 +1552,7 @@ registry.register(
     check_fn=check_terminal_requirements,
     emoji="💻",
     max_result_size_chars=100_000,
+    dynamic_schema_overrides=_terminal_schema_overrides,
 )
 
 
