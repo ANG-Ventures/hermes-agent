@@ -369,9 +369,10 @@
     "conflict_syncs": 3,
     "conflict_files": 2,
     "dependents": []
-   }
+   },
+   "report_test": "tests/cron/test_cron_delivery_target_hint.py: 3 passed in 4.32s (local test-gate); red control (hint call removed): run_job case 1 failed; tests/cron/test_scheduler.py -k 'run_job or origin or delivery': 45 passed, 1 failed identically on unmodified upstream (TestResolveDeliveryTarget::test_unresolved_target_still_delivered_as_written, home-io guard env artifact)"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-278 @ d259a5fed7",
   "notes": "Generic misroute class; small (_bind_cron_delivery_target_hint). Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/scheduler.py, tests/cron/test_scheduler.py — needs a hand re-port (follow-up card)."
  },
  "#199": {
@@ -642,9 +643,10 @@
     "dependents": [
      "#594"
     ]
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_data_arguments.py: 21 passed in 5.43s (local test-gate); red control on unmodified cron/lifecycle_guard.py: 7 failed, 14 passed (every data case blocked, every execution case still blocked); existing guard suites test_gateway_restart_loop.py + test_lifecycle_guard_heredoc_walk.py + test_lifecycle_guard_budget.py: 333 passed. Port note: re-derived on upstream's _mask_data_sink_arguments (token-based) instead of the fork's regex quote scan; #319(a) skill-path half already green upstream; backticks are blocked (stricter than fork)."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-319 @ 71269aeb97",
   "notes": "Trim to the quoted-data half (_match_is_quoted_data/_open_quote_at) and offer upstream together with #594 (same class: text consumers). Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tests/hermes_cli/test_gateway_restart_loop.py — needs a hand re-port (follow-up card)."
  },
  "#594": {
@@ -662,9 +664,10 @@
     "dependents": [
      "#319"
     ]
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_data_arguments.py: 21 passed in 5.43s (local test-gate); red control on unmodified cron/lifecycle_guard.py: 7 failed, 14 passed (every data case blocked, every execution case still blocked); existing guard suites test_gateway_restart_loop.py + test_lifecycle_guard_heredoc_walk.py + test_lifecycle_guard_budget.py: 333 passed. Port note: re-derived on upstream's _mask_data_sink_arguments (token-based) instead of the fork's regex quote scan; #319(a) skill-path half already green upstream; backticks are blocked (stricter than fork)."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-319 @ 71269aeb97",
   "notes": "Generic false positive; bundle with #319(b) as one upstream PR. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tests/hermes_cli/test_gateway_restart_loop.py (bundle #319) — needs a hand re-port (follow-up card)."
  },
  "nopr:116493ff97": {
@@ -683,9 +686,10 @@
      "nopr:c559189dd2",
      "nopr:10a1424335"
     ]
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_ssh_remote.py: 23 passed (local test-gate); red control on unmodified cron/lifecycle_guard.py: 6 failed (every remote case blocked), all 17 loopback/local-exec/bypass cases blocked on both; existing guard suites: 333 passed. Port note: token-based on upstream's _mask_data_sink_arguments; covers the two hardening commits (IPv4-mapped/bracketed IPv6 loopback, env-assigned ssh path) plus ProxyCommand/LocalCommand local-exec options."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-ssh-116493ff97 @ 5a9b641116",
   "notes": "Generic (remote host cannot SIGTERM the local gateway). Ship with its two Greptile hardenings nopr:c559189dd2 + nopr:10a1424335 as one upstream PR. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py — needs a hand re-port (follow-up card)."
  },
  "nopr:c559189dd2": {
@@ -703,9 +707,10 @@
     "dependents": [
      "nopr:116493ff97"
     ]
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_ssh_remote.py: 23 passed (local test-gate); red control on unmodified cron/lifecycle_guard.py: 6 failed (every remote case blocked), all 17 loopback/local-exec/bypass cases blocked on both; existing guard suites: 333 passed. Port note: token-based on upstream's _mask_data_sink_arguments; covers the two hardening commits (IPv4-mapped/bracketed IPv6 loopback, env-assigned ssh path) plus ProxyCommand/LocalCommand local-exec options."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-ssh-116493ff97 @ 5a9b641116",
   "notes": "Hardening of 116493ff97; lives or dies with it. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py (bundle nopr:116493ff97) — needs a hand re-port (follow-up card)."
  },
  "nopr:10a1424335": {
@@ -723,9 +728,10 @@
     "dependents": [
      "nopr:116493ff97"
     ]
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_ssh_remote.py: 23 passed (local test-gate); red control on unmodified cron/lifecycle_guard.py: 6 failed (every remote case blocked), all 17 loopback/local-exec/bypass cases blocked on both; existing guard suites: 333 passed. Port note: token-based on upstream's _mask_data_sink_arguments; covers the two hardening commits (IPv4-mapped/bracketed IPv6 loopback, env-assigned ssh path) plus ProxyCommand/LocalCommand local-exec options."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-ssh-116493ff97 @ 5a9b641116",
   "notes": "4 loc; follows 116493ff97. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py (bundle nopr:116493ff97) — needs a hand re-port (follow-up card)."
  },
  "#740": {
@@ -741,9 +747,10 @@
     "conflict_syncs": 2,
     "conflict_files": 1,
     "dependents": []
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_sibling_gateways.py: 13 passed (local test-gate); red control on unmodified cron/lifecycle_guard.py: 5 failed, 8 passed (sibling kickstart/bootout/systemctl blocked); existing guard/heredoc suites: 501 passed. Port note: first attempt trusted the HERMES_HOME-derived label and broke 29 existing tests (temp home -> hash label made the real default label look like a sibling); identity now supervisor-only (XPC_SERVICE_NAME / systemd cgroup unit), labels compared by profile key. Implemented as a label mask in contains_gateway_lifecycle_command rather than the fork's three-pass wiring."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-740 @ ea742cfa42",
   "notes": "Needed by the fleet's recovery design (Aegis) and generic to any multi-profile install (upstream names profile gateways ai.hermes.gateway-<profile>). 788 loc — biggest guard row. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/terminal_tool.py — needs a hand re-port (follow-up card)."
  },
  "#767": {
@@ -759,9 +766,10 @@
     "conflict_syncs": 2,
     "conflict_files": 1,
     "dependents": []
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_bootstrap_existing_plist.py: 13 passed (local test-gate); red control on unmodified cron/lifecycle_guard.py: 1 failed, 12 passed (existing non-gateway plist bootstrap blocked); existing guard/heredoc suites: 501 passed. SCOPE: only half (1) re-ported. Half (2) -- execute_code sandbox stub raising on a terminal() guard refusal -- NOT ported (verdict: 'not probed' upstream; needs the RPC stub generator in tools/code_execution_tool.py); open follow-up if wanted."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-767 @ abae372957",
   "notes": "Generic. 966 loc incl. tests. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/code_execution_tool.py, tools/terminal_tool.py — needs a hand re-port (follow-up card)."
  },
  "#920": {
@@ -780,9 +788,10 @@
      "#933",
      "#1017"
     ]
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_interpreter_heredoc.py: 15 passed (local test-gate); red control on unmodified lifecycle_guard.py + shell_heredoc.py: 10 failed, 5 passed (python subprocess/os.system/exec/osascript heredocs allowed); existing guard/heredoc suites: 368 passed + test_self_repo_guard.py 133 passed. Port note: re-derived on upstream's inert-heredoc masking (9aa0721b23) -- keeps its 'bodies are data' default and blocks only bodies with a process-spawning primitive + lifecycle match, so benign read-only literals stay allowed (fork #1017's whole-body allowlist and #933 ownership rework not needed on upstream's owner-aware parser). Obfuscated command text (string concatenation) is not covered."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-920 @ 530419fb15",
   "notes": "Real bypass on upstream: a python heredoc can restart/kill the gateway from inside it. Offer #920+#933+#1017 as one security PR upstream. Fork cost: 3 rows, ~750 loc, 5+ review rounds; the fork is now stricter than #614 intended (it re-blocks benign literals). Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/shell_heredoc.py — needs a hand re-port (follow-up card)."
  },
  "#933": {
@@ -800,9 +809,10 @@
     "dependents": [
      "#920"
     ]
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_interpreter_heredoc.py: 15 passed (local test-gate); red control on unmodified lifecycle_guard.py + shell_heredoc.py: 10 failed, 5 passed (python subprocess/os.system/exec/osascript heredocs allowed); existing guard/heredoc suites: 368 passed + test_self_repo_guard.py 133 passed. Port note: re-derived on upstream's inert-heredoc masking (9aa0721b23) -- keeps its 'bodies are data' default and blocks only bodies with a process-spawning primitive + lifecycle match, so benign read-only literals stay allowed (fork #1017's whole-body allowlist and #933 ownership rework not needed on upstream's owner-aware parser). Obfuscated command text (string concatenation) is not covered."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-920 @ 530419fb15",
   "notes": "Follows #920. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/shell_heredoc.py (bundle #920) — needs a hand re-port (follow-up card)."
  },
  "#1017": {
@@ -820,9 +830,10 @@
     "dependents": [
      "#920"
     ]
-   }
+   },
+   "report_test": "tests/cron/test_lifecycle_guard_interpreter_heredoc.py: 15 passed (local test-gate); red control on unmodified lifecycle_guard.py + shell_heredoc.py: 10 failed, 5 passed (python subprocess/os.system/exec/osascript heredocs allowed); existing guard/heredoc suites: 368 passed + test_self_repo_guard.py 133 passed. Port note: re-derived on upstream's inert-heredoc masking (9aa0721b23) -- keeps its 'bodies are data' default and blocks only bodies with a process-spawning primitive + lifecycle match, so benign read-only literals stay allowed (fork #1017's whole-body allowlist and #933 ownership rework not needed on upstream's owner-aware parser). Obfuscated command text (string concatenation) is not covered."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-920 @ 530419fb15",
   "notes": "Follows #920. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/shell_heredoc.py (bundle #920) — needs a hand re-port (follow-up card)."
  },
  "#348": {
