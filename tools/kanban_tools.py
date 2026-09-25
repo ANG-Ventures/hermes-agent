@@ -1277,8 +1277,25 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
+def _read_attach_source_path(raw: str, max_bytes: int) -> bytes:
+    """Read a ``kanban_attach`` source file from the host filesystem.
+
+    Requires an absolute path (after ``~`` expansion) to a regular file, so
+    the result never depends on the process cwd. Reads at most
+    ``max_bytes + 1`` bytes: an oversize file is then rejected by
+    ``store_attachment_bytes``'s own cap without being buffered whole.
+    """
+    expanded = os.path.expanduser(raw.strip())
+    if not os.path.isabs(expanded):
+        raise ValueError(f"path must be absolute: {raw!r}")
+    if not os.path.isfile(expanded):
+        raise ValueError(f"not a regular file: {expanded}")
+    with open(expanded, "rb") as fh:
+        return fh.read(max_bytes + 1)
+
+
 def _handle_attach(args: dict, **kw) -> str:
-    """Attach an inline (base64) file to a task.
+    """Attach a file to a task, read from ``path`` or decoded from base64.
 
     Mirrors the dashboard's upload endpoint for the agent surface: decode
     the payload, enforce the shared size cap, write it under the per-task
@@ -1298,25 +1315,53 @@ def _handle_attach(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
-    filename = args.get("filename")
+    source_path = args.get("path")
+    content_b64 = args.get("content_base64")
+    has_path = isinstance(source_path, str) and bool(source_path.strip())
+    has_b64 = content_b64 is not None and bool(str(content_b64).strip())
+    if has_path == has_b64:
+        return tool_error(
+            "pass exactly one of path (preferred: the file is read server-side, "
+            "byte-exact) or content_base64"
+        )
+    import hashlib
+    expected = args.get("expected_sha256")
+    if expected is not None and (not isinstance(expected, str) or not expected.strip()):
+        expected = None
+    if has_path:
+        # The bytes never pass through the model. A model that has to
+        # re-emit a file as base64 transcribes it token by token and drops
+        # or invents characters on larger payloads (t_31148bf8); reading the
+        # file here is the only byte-exact route.
+        try:
+            data = _read_attach_source_path(
+                source_path, kb.KANBAN_ATTACHMENT_MAX_BYTES
+            )
+        except (OSError, ValueError) as e:
+            return tool_error(f"kanban_attach: cannot read path: {e}")
+        filename = args.get("filename") or os.path.basename(
+            os.path.expanduser(source_path.strip())
+        )
+    else:
+        filename = args.get("filename")
+        import base64
+        import binascii
+        try:
+            data = base64.b64decode(str(content_b64), validate=True)
+        except (binascii.Error, ValueError) as e:
+            return tool_error(f"content_base64 is not valid base64: {e}")
+        if expected is None:
+            return tool_error(
+                "expected_sha256 is required with content_base64 (or pass path "
+                "instead, which reads the file byte-exact)"
+            )
     if not filename or not str(filename).strip():
         return tool_error("filename is required")
-    content_b64 = args.get("content_base64")
-    if not content_b64 or not str(content_b64).strip():
-        return tool_error("content_base64 is required")
-    import base64
-    import binascii
-    try:
-        data = base64.b64decode(str(content_b64), validate=True)
-    except (binascii.Error, ValueError) as e:
-        return tool_error(f"content_base64 is not valid base64: {e}")
-    import hashlib
     digest = hashlib.sha256(data).hexdigest()
-    expected = args.get("expected_sha256")
-    if not isinstance(expected, str) or not expected.strip():
-        return tool_error("expected_sha256 is required")
-    if expected.lower() != digest:
-        return tool_error("expected_sha256 does not match decoded attachment bytes")
+    if expected is not None and expected.strip().lower() != digest:
+        return tool_error(
+            "expected_sha256 does not match the attachment bytes; nothing stored"
+        )
     content_type = args.get("content_type")
     board = args.get("board")
     try:
@@ -2361,13 +2406,14 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_ATTACH_SCHEMA = {
     "name": "kanban_attach",
     "description": (
-        "Attach a file to a task by passing its bytes inline (base64). "
-        "Use for genuine file artifacts the next worker or a human should "
-        "be able to download — generated reports, images, exports. The "
-        "file is stored as a real attachment (not a comment link) under "
-        "the task's attachments dir, capped at 25 MB. Prefer "
-        "kanban_attach_url when you only have a URL. Returns the verified "
-        "stored SHA-256; expected_sha256 is required to reject upstream payload changes."
+        "Attach a file to a task. PREFER path: the file is read server-side, "
+        "byte-exact. content_base64 makes you re-type the bytes, and long "
+        "payloads come back altered, so use it only for content that exists "
+        "nowhere on disk (write it to a file first when you can). Use for "
+        "genuine artifacts the next worker or a human should download — "
+        "reports, images, exports. Stored under the task's attachments dir, "
+        "capped at 25 MB. Prefer kanban_attach_url when you only have a URL. "
+        "Returns the stored SHA-256."
     ),
     "parameters": {
         "type": "object",
@@ -2383,15 +2429,26 @@ KANBAN_ATTACH_SCHEMA = {
                     "Directory components are stripped; only the leaf is kept."
                 ),
             },
+            "path": {
+                "type": "string",
+                "description": (
+                    "Absolute path of the file to attach, on the machine "
+                    "running the agent. Read byte-exact; no encoding needed. "
+                    "Pass this OR content_base64, not both."
+                ),
+            },
             "content_base64": {
                 "type": "string",
-                "description": "The file contents, base64-encoded. Max 25 MB decoded.",
+                "description": (
+                    "The file contents, base64-encoded (max 25 MB decoded). "
+                    "Fallback for content with no file; requires expected_sha256."
+                ),
             },
             "expected_sha256": {
                 "type": "string",
                 "description": (
-                    "SHA-256 hex digest of the original file bytes, computed before encoding. "
-                    "Rejects a payload altered before it reaches storage."
+                    "SHA-256 hex digest of the original bytes. Required with "
+                    "content_base64; optional with path. A mismatch stores nothing."
                 ),
             },
             "content_type": {
@@ -2400,7 +2457,7 @@ KANBAN_ATTACH_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["filename", "content_base64", "expected_sha256"],
+        "required": [],
     },
 }
 

@@ -1438,6 +1438,105 @@ def test_attach_rejects_corrupt_disk_write_without_row(worker_env, monkeypatch):
         conn.close()
 
 
+# kanban_attach(path=...) — the bytes never pass through the model. A model
+# re-emitting a file as base64 transcribes it and alters long payloads
+# (t_31148bf8: 7,408 B in, 7,407 B stored, a digest inside gained a char).
+
+
+@pytest.mark.parametrize("payload", [
+    pytest.param(b"column     aligned       value\n" * 350, id="spaces"),
+    pytest.param(bytes(range(256)) * 32, id="binary"),
+    pytest.param(("5440c9aeaad7  \u2014 caf\u00e9\n" * 600).encode("utf-8"), id="utf8-hex"),
+])
+def test_attach_path_is_byte_exact_without_client_digest(worker_env, tmp_path, payload):
+    import hashlib
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    src = tmp_path / "evidence.bin"
+    src.write_bytes(payload)
+    result = json.loads(kt._handle_attach({"task_id": worker_env, "path": str(src)}))
+    assert result.get("ok") is True, result
+    assert result["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert result["size"] == len(payload)
+    conn = kb.connect()
+    try:
+        attachment = kb.get_attachment(conn, result["attachment_id"])
+        assert attachment.filename == "evidence.bin"
+        assert Path(attachment.stored_path).read_bytes() == payload
+    finally:
+        conn.close()
+
+
+def test_attach_path_checks_optional_digest_and_stores_nothing_on_mismatch(worker_env, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    src = tmp_path / "a.txt"
+    src.write_bytes(b"abc")
+    out = json.loads(kt._handle_attach({
+        "task_id": worker_env, "path": str(src), "expected_sha256": "0" * 64,
+    }))
+    assert "expected_sha256" in out["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("args", [
+    pytest.param({}, id="neither"),
+    pytest.param({"content_base64": "YWJj", "expected_sha256": "x"}, id="both"),
+])
+def test_attach_requires_exactly_one_source(worker_env, tmp_path, args):
+    from tools import kanban_tools as kt
+
+    src = tmp_path / "a.txt"
+    src.write_bytes(b"abc")
+    if args:
+        args = dict(args, path=str(src))
+    out = json.loads(kt._handle_attach(dict(args, task_id=worker_env, filename="a.txt")))
+    assert "exactly one of path" in out["error"]
+
+
+@pytest.mark.parametrize("make", [
+    pytest.param(lambda d: "relative/a.txt", id="relative"),
+    pytest.param(lambda d: str(d), id="directory"),
+    pytest.param(lambda d: str(d / "missing.txt"), id="missing"),
+])
+def test_attach_path_rejects_unreadable_sources(worker_env, tmp_path, make):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_attach({"task_id": worker_env, "path": make(tmp_path)}))
+    assert "cannot read path" in out["error"]
+
+
+def test_attach_path_enforces_size_cap_without_storing(worker_env, tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 16)
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 17)
+    out = json.loads(kt._handle_attach({"task_id": worker_env, "path": str(src)}))
+    assert "limit" in out["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_schema_offers_path_and_requires_no_inline_bytes():
+    from tools import kanban_tools as kt
+
+    params = kt.KANBAN_ATTACH_SCHEMA["parameters"]
+    assert "path" in params["properties"]
+    assert "content_base64" not in params["required"]
+
+
 @pytest.fixture
 def allow_private_urls(monkeypatch):
     """Opt the SSRF guard into private/loopback targets for local fixtures.
