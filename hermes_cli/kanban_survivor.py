@@ -1444,7 +1444,7 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
     pending = [
         (flag, verify, extra, claim)
         for claims, flag, verify, extra in (
-            (survivor_ref, "--survivor-ref", _ext.verify_ref, {}),
+            (survivor_ref, "--survivor-ref", _ext.verify_ref, {"ancestry": True}),
             (survivor_pr, "--survivor-pr", _ext.verify_pr,
              {"corroborate": ("headRefName", "title", "body")}),
         )
@@ -1479,19 +1479,31 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
         # replays -- as the false statement "is live but does not name <card>",
         # whose offered remedy is to drop the very binding this path adds
         # (kanban card t_de2e348e, Argus round 3).
+        if flag == "--survivor-ref" and "#" not in value:
+            # A bare SHA names no remote to verify against. Say what shape is
+            # accepted instead of "could not verify against the remote", which
+            # read as a network fault (t_a887cce3, 2026-09-24).
+            raise SurvivorUnavailable(
+                f"survivor_unavailable: {flag} {_ext.redact(claim)} names no remote; {_ext.HINT}"
+            )
         try:
             ref = verify(value, mined_for=None if claim_unbound else task_id, **extra)
             if ref is None:
                 # The claim is unverified and may carry a token: echo it redacted only.
                 if not claim_unbound and _live(verify, value, extra):
+                    accepted = (
+                        "; a --survivor-ref must be a branch/tag tip naming it, or a commit "
+                        "reachable from the default branch whose subject names it"
+                        if flag == "--survivor-ref" else ""
+                    )
                     raise _refusal(
                         f"survivor_unavailable: {flag} {_ext.redact(claim)} is live but does not "
-                        f"name {task_id}, so it is not evidence of THIS card's work",
+                        f"name {task_id}, so it is not evidence of THIS card's work{accepted}",
                         hint=True,
                     )
                 raise SurvivorUnavailable(
                     f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
-                    f"against the remote"
+                    f"against the remote; {_ext.HINT}"
                 )
         except _ext.Unverified as exc:
             # The remote answered and said why the claim fails (e.g. the SHA
@@ -1516,7 +1528,7 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
         except _ext.RemoteUnavailable as exc:
             raise SurvivorUnavailable(
                 f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
-                f"against the remote ({_ext.redact(str(exc))})"
+                f"against the remote ({_ext.redact(str(exc))}); {_ext.HINT}"
             ) from exc
         if not claim_unbound and ref.get("corroborated_by") in _WEAK_CORROBORATION:
             # Same refusal as an unrelated live claim, because it is the same

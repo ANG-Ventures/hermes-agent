@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 from hermes_cli import kanban_db as kb
@@ -13,7 +14,9 @@ _SLUG = r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
 _PR = re.compile(rf"(?<![\w/])({_SLUG})#([1-9][0-9]*)\b")
 _PR_URL = re.compile(rf"https://github\.com/({_SLUG})/pull/([1-9][0-9]*)\b")
 _REPO_URL = re.compile(r"(?:https?|ssh|git)://[^\s\"'<>]+|git@github\.com:[^\s\"'<>]+")
-HINT = "use --survivor-pr <owner/repo#N> or --survivor-ref <repo-url>#<sha>; remote verification is required"
+HINT = ("use --survivor-pr <owner/repo#N> or --survivor-ref <repo-url>#<sha>, where <sha> is a "
+        "branch/tag tip naming the card OR a commit reachable from the default branch whose "
+        "subject names the card; remote verification is required")
 
 
 def redact(claim):
@@ -115,23 +118,105 @@ class RemoteUnavailable(Exception):
     reason must say "could not verify" instead.
     """
 
+    def __init__(self, message, *, transient=False):
+        super().__init__(message)
+        self.transient = transient
 
-def _query(args):
+
+#: A remote that did not ANSWER is retried before any caller turns it into a
+#: hold: an ordinary rate limit or network blip (``git ls-remote`` exit 128)
+#: blocked t_4f944382 and t_a887cce3 on 2026-09-24 when a second try would have
+#: answered (t_47199870). Bounded, so a remote that is really down still holds
+#: in seconds: 3 attempts, backing off 0.5 s then 1 s.
+_QUERY_ATTEMPTS = 3
+_QUERY_BACKOFF = 0.5
+
+
+def _query_once(args):
     target = " ".join(args[:2]) + " " + redact(args[-1])
     try:
         result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=15,
                                 cwd=neutral_cwd(), env=scrubbed_env())
+    except subprocess.TimeoutExpired as exc:
+        raise RemoteUnavailable(f"{target} did not answer ({type(exc).__name__}: {redact(str(exc))})",
+                                transient=True) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RemoteUnavailable(f"{target} did not answer ({type(exc).__name__}: {redact(str(exc))})") from exc
     if result.returncode != 0:
-        raise RemoteUnavailable(f"{target} exited {result.returncode}: {redact(result.stderr.decode(errors='replace')[:200])}")
+        raise RemoteUnavailable(
+            f"{target} exited {result.returncode}: {redact(result.stderr.decode(errors='replace')[:200])}",
+            transient=True)
     try:
         return result.stdout.decode()
     except UnicodeError as exc:
         raise RemoteUnavailable(f"{args[0]} returned undecodable output") from exc
 
 
-def verify_ref(claim, *, mined_for=None):
+def _query(args):
+    """``_query_once`` with a bounded retry for a TRANSIENT non-answer.
+
+    Only a non-zero exit or a timeout is retried; a missing binary or
+    undecodable output will not improve on a second try. The final
+    ``RemoteUnavailable`` says how many attempts were made, so a hold reason
+    distinguishes "down" from "blipped once".
+    """
+    for attempt in range(1, _QUERY_ATTEMPTS + 1):
+        try:
+            return _query_once(args)
+        except RemoteUnavailable as exc:
+            if not exc.transient or attempt == _QUERY_ATTEMPTS:
+                if exc.transient and _QUERY_ATTEMPTS > 1:
+                    raise RemoteUnavailable(f"{exc} (after {attempt} attempts)", transient=True) from exc
+                raise
+            time.sleep(_QUERY_BACKOFF * 2 ** (attempt - 1))
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _default_branch(url):
+    symref = _query(["git", "ls-remote", "--symref", "--", url, "HEAD"])
+    default = next((line.split("\t")[0].removeprefix("ref: ") for line in symref.splitlines()
+                    if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD")), None)
+    if not default:
+        raise Unverified(f"{redact(url)} advertises no default branch (ls-remote --symref HEAD)")
+    return default
+
+
+def _on_default(url, sha):
+    """Prove ``sha`` is reachable from ``url``'s default branch; tip not required.
+
+    The remote-side equivalent of ``git merge-base --is-ancestor <sha>
+    origin/<default>``: GitHub's compare API answers it without cloning the
+    tree. Also resolves an abbreviated SHA and returns the commit message,
+    which is what can bind a non-tip commit to a card (see ``verify_ref``).
+    Raises :class:`Unverified` with the reason when the remote answered no.
+    """
+    default = _default_branch(url)
+    slug = re.fullmatch(rf"https://github\.com/({_SLUG})(?:\.git)?", url)
+    if not slug:
+        raise Unverified(f"{sha} is not a branch/tag tip of {redact(url)} and ancestry from "
+                         f"{default} can only be proven for github.com remotes")
+    slug = slug[1].removesuffix(".git")
+    branch = default.removeprefix("refs/heads/")
+    try:
+        commit = json.loads(_query(["gh", "api", f"repos/{slug}/commits/{sha}"]))
+        oid = commit.get("sha") or ""
+        message = str((commit.get("commit") or {}).get("message") or "")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise Unverified(f"{sha} did not resolve to a commit on {redact(url)}") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", oid) or not oid.startswith(sha):
+        raise Unverified(f"{sha} did not resolve to a commit on {redact(url)}")
+    comparison = json.loads(_query(["gh", "api", f"repos/{slug}/compare/{oid}...{branch}"]))
+    status = comparison.get("status")
+    if status not in {"ahead", "identical"}:
+        raise Unverified(
+            f"{sha} is not reachable from default branch {default} of {redact(url)} "
+            f"(compare {oid[:12]}...{branch}: status={status}, "
+            f"ahead_by={comparison.get('ahead_by')}, behind_by={comparison.get('behind_by')})"
+        )
+    return {"sha": oid, "default": default, "message": message}
+
+
+def verify_ref(claim, *, mined_for=None, ancestry=False):
     """Resolve a ``<url>#<sha>`` claim against the remote's branch and tag tips.
 
     An operator flag is authority for the *identity* of the claim, never for
@@ -163,6 +248,17 @@ def verify_ref(claim, *, mined_for=None):
     claim is accepted and the ambiguity is RECORDED rather than hidden --
     ``tips`` carries all of them and ``branch`` takes the lexicographically
     first, which is deterministic rather than drawn from emission order.
+
+    ``ancestry=True`` (the explicit ``--survivor-ref`` path) additionally
+    accepts a commit that is NOT a tip naming the card, provided it is
+    reachable from the remote's default branch (tip not required, abbreviated
+    SHA allowed) AND its commit SUBJECT names the card -- the shape of
+    work landed on ``main`` by a squash, an autocommit or a reconcile that
+    left no card-named ref behind (t_47199870). The binding is kept rather
+    than dropped: an unrelated commit on ``main`` is exactly as live as an
+    unrelated PR, and a verified explicit survivor authorises deleting a
+    workspace (t_de2e348e). The mined path does not get this: text mining
+    cross-products every SHA with every URL and has a six-lookup budget.
     """
     url, sep, sha = claim.rpartition("#")
     if not sep or not re.fullmatch(_SHA, sha) or not _safe_url(url):
@@ -186,35 +282,42 @@ def verify_ref(claim, *, mined_for=None):
             # the `branch` recorded as its provenance, depended on emission
             # order. Keep every tip and decide over all of them.
             matches.setdefault(oid, []).append(ref)
+    landed = None
     if len(matches) != 1:
-        if matches or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        if matches or not (ancestry or re.fullmatch(r"[0-9a-f]{40}", sha)):
             return None  # unknown or ambiguous abbreviation
-        symref = _query(["git", "ls-remote", "--symref", "--", url, "HEAD"])
-        default = next((line.split("\t")[0].removeprefix("ref: ") for line in symref.splitlines()
-                        if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD")), None)
-        if not default:
-            raise Unverified(f"{redact(url)} advertises no default branch (ls-remote --symref HEAD)")
-        slug = re.fullmatch(rf"https://github\.com/({_SLUG})(?:\.git)?", url)
-        if not slug:
-            raise Unverified(f"{sha} is not a branch/tag tip of {redact(url)} and ancestry from "
-                             f"{default} can only be proven for github.com remotes")
-        branch = default.removeprefix("refs/heads/")
-        comparison = json.loads(_query(["gh", "api", f"repos/{slug[1].removesuffix('.git')}/compare/{sha}...{branch}"]))
-        status = comparison.get("status")
-        if status not in {"ahead", "identical"}:
-            raise Unverified(
-                f"{sha} is not reachable from default branch {default} of {redact(url)} "
-                f"(compare {sha[:12]}...{branch}: status={status}, "
-                f"ahead_by={comparison.get('ahead_by')}, behind_by={comparison.get('behind_by')})"
-            )
-        matches = {sha: [default]}
+        # Not a tip: prove ancestry from the default branch instead.
+        landed = _on_default(url, sha)
+        matches = {landed["sha"]: [landed["default"]]}
     oid, tips = next(iter(matches.items()))
     tips = sorted(tips)
     if mined_for:
         # The binding is the question being asked, so ask it of every tip, not
         # of one drawn by emission order. A commit does not stop naming the
         # card because it is also reachable as `main` or as a tag.
-        tips = [ref for ref in tips if mined_for in ref]
+        bound = [ref for ref in tips if mined_for in ref]
+        if not bound and ancestry:
+            # No ref names the card. A commit on the default branch may still
+            # name it in its own message (t_47199870). A tip that is on some
+            # OTHER branch keeps the old verdict -- "live, does not name" --
+            # rather than trading it for an ancestry diagnostic.
+            if landed is None:
+                try:
+                    landed = _on_default(url, oid)
+                except Unverified:
+                    return None
+            # SUBJECT line only, mirroring verify_pr: a PR title naming the
+            # card is upgraded only once the PR is proven landed, and a body
+            # routinely cites other cards ("follow-up to t_..."). Here the
+            # commit is proven on the default branch, so a subject naming the
+            # card is the same strength; a mention further down is not.
+            subject = (landed["message"].splitlines() or [""])[0]
+            if mined_for not in subject:
+                return None
+            return {"remote": url, "branch": landed["default"], "sha": landed["sha"],
+                    "external": True, "reachable_from": landed["default"],
+                    "corroborated_by": "commit-subject"}
+        tips = bound
         if not tips:
             return None
         if len(tips) != 1:
@@ -231,6 +334,8 @@ def verify_ref(claim, *, mined_for=None):
         return None
     ref = tips[0]
     verified = {"remote": url, "branch": ref, "sha": oid, "external": True}
+    if landed is not None:
+        verified["reachable_from"] = landed["default"]
     if len(tips) > 1:
         verified["tips"] = tips
     return dict(verified, corroborated_by="branch") if mined_for else verified
