@@ -1630,5 +1630,154 @@
   },
   "branch": null,
   "notes": "Upstream exclusion set covers these markers. Drop ours."
+ },
+ "#603": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "lazy_deps.ensure() judged an SDK 'missing' from distribution metadata vs the pin, so an importable-but-off-pin modal/daytona SDK raised FeatureUnavailable when lazy installs were refused.",
+  "evidence": {
+   "original": "PR #603 body: both tests in tests/tools/test_modal_snapshot_isolation.py failed deterministically on pristine main (FeatureUnavailable 'terminal.modal' ... allow_lazy_installs=false) with modal importable.",
+   "upstream_state": "GREEN (read-only): ../up replaced lazy_deps with pm/: pm/extras.py:93 available() = all(_importable(anchor)) (import-based, not metadata), pm/extras.py:188 ensure_import() no-ops when available(); backends call remote_common.ensure_lazy_dep@tools/environments/remote_common.py:91. tools/lazy_deps.py on up is a 703-byte relaunch shim. Own test on up: 1 failed, 9 errors (tools.lazy_deps.ensure_importable gone) — not evidence of the bug, evidence of the rewrite; FM 10 passed.",
+   "upstream_fix": "3d12e86ef1 feat(pm): unified package manager — pm store foundation (2026-08-29); backends rewired in 3bbec90f23 (2026-09-02); lazy_deps demoted to shim 6a5a6a05d2 (2026-09-18)",
+   "fires": "no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 231,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Upstream's pm.extras decides availability by importability, which is exactly #603's fix in a richer form. When the parity sync takes pm/, drop ensure_importable + the three backend probes; the fork test moves with it or dies."
+ },
+ "#575": {
+  "verdict": "UPSTREAM",
+  "problem": "terminal.max_foreground_timeout / terminal.disk_warning_gb were env-var-only (TERMINAL_MAX_FOREGROUND_TIMEOUT, TERMINAL_DISK_WARNING_GB) against AGENTS.md's 'behavioral settings go in config.yaml' rule; FOREGROUND_MAX_TIMEOUT is frozen at import so the bridge alone is inert.",
+  "evidence": {
+   "original": "PR #575 body: measured cap 600 enforced after config set 3600 until enforcement was routed through _foreground_max_timeout(). Fleet sets terminal.max_foreground_timeout: 3600 in ~/.hermes/config.yaml + 8 profile config.yamls (read-only grep).",
+   "upstream_state": "RED: own test (7 tests) on ../up: 7 failed; FM 7 passed. Read-only: ../up tools/terminal_tool.py:75 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env('TERMINAL_MAX_FOREGROUND_TIMEOUT', 600, ...) still env-only + import-frozen; no max_foreground_timeout key in hermes_cli/config_defaults.py.",
+   "upstream_fix": "none (git log -S'max_foreground_timeout' upstream/main: 0 hits; last cap change 55d61f16ba 2026-09-05 promotes over-cap foreground to background but keeps the env-only cap)",
+   "fires": "config key live in 9 fleet config.yamls (3600); TERMINAL_MAX_FOREGROUND_TIMEOUT 3 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 173,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "#577"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Generic (upstream's own AGENTS.md rule), small, measured (every fleet profile sets it). Offer #575+#577 as one upstream PR; note upstream 55d61f16ba changed over-cap semantics (promote to background) so the port must re-derive the enforcement seam."
+ },
+ "#577": {
+  "verdict": "UPSTREAM",
+  "problem": "TERMINAL_SCHEMA's quoted foreground cap is baked at import; after #575 bridged the config key the model was still told 600 while 3600 was enforced (schema/enforcement drift).",
+  "evidence": {
+   "original": "PR #577 body: measured 'schema AFTER bridge: 600, enforced AFTER bridge: 3600'.",
+   "upstream_state": "RED: own tests (6) on ../up: 6 failed; FM 6 passed. Read-only: ../up tools/terminal_tool.py:1393 description f-string interpolates the import-time FOREGROUND_MAX_TIMEOUT; no _refresh_terminal_schema_limits.",
+   "upstream_fix": "none (predicated on #575's config key, which upstream lacks)",
+   "fires": "no log line; rides on #575 (config key live in 9 fleet config.yamls)",
+   "cost": {
+    "loc": 229,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #575; ship together."
+ },
+ "#345": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Full local suite unreliable on macOS: $BASHPID-derived snapshot temp names collide under bash 3.2 (torn snapshots), parallel per-file pytest subprocesses deleted each other's tmp_path, and 16 tests assumed a Linux/systemd/live-model host.",
+  "evidence": {
+   "original": "PR #345 body: first complete local run at f98ca2fdc had 19 failures, 16 deterministic host-assumption, 3 temp-dir races; /bin/bash -c 'echo $BASHPID' empty on macOS.",
+   "upstream_state": "GREEN for the production half (read-only): ../up tools/environments/base_session_env.py:88-97 mktemp+mv atomic snapshot publish, comment cites bash 3.2/$BASHPID. RED for the runner half: own tests on ../up: test_each_file_gets_private_basetemp_and_runner_cleans_it FAILED (1 failed), base_environment mktemp tests 2 failed (symbol/layout drift after upstream's base.py split); FM 1 passed / 2 failed (stale after fork's own refactor).",
+   "upstream_fix": "911d380296 fix(tools): allocate snapshot temp paths with mktemp instead of $BASHPID (2026-08-03, 'extracted from #54314' = the fork's upstream offer of this PR); runner scratch relocated 0746903679 (2026-09-19)",
+   "fires": "no log line (test infra); 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 221,
+    "conflict_syncs": 3,
+    "conflict_files": 5,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "The only production code (base.py mktemp) is absorbed upstream. What remains is fork test-premise hygiene + a private --basetemp in scripts/run_tests_parallel.py; keep those as test infra, they are not a runtime burden, but stop carrying the base.py delta at the next sync. 5 conflict files (3 syncs) are all tests/runner."
+ },
+ "#211": {
+  "verdict": "DROP",
+  "problem": "yt-dlp's own fetches/redirects (page, player JS, manifests, segments) bypassed the pre-flight is_safe_url SSRF check; an in-process filtering forward proxy (default OFF, auxiliary.vision.ytdlp_ssrf_proxy) validates every connection.",
+  "evidence": {
+   "original": "PR #211 body: closes #209's documented redirect-time SSRF limitation; design-driven, no incident cited.",
+   "upstream_state": "RED for the primitive: own tests on ../up: url_safety ip_is_blocked 6 failed, video wiring 7 failed, ssrf_proxy module 1 collection error (no tools/ssrf_proxy.py upstream); FM 12+6+7 passed. Read-only: ../up has no yt-dlp ingestion at all (rg ytdlp tools/ = 0), so the hole it closes does not exist upstream.",
+   "upstream_fix": "none",
+   "fires": "never enabled: auxiliary.vision.ytdlp_ssrf_proxy absent from ~/.hermes/config.yaml and all profile config.yamls; 'SSRF proxy listening on' 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 1123,
+    "conflict_syncs": 1,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1,123 loc of default-OFF code that no fleet config turns on and no log line ever shows. Dead on this fleet. Revert branch pending (see branch field). If upstream merges #58144 (#209's yt-dlp ingestion) this becomes the natural security companion — re-offer it there, not here."
+ },
+ "#209": {
+  "verdict": "UPSTREAM",
+  "problem": "video_analyze routed video through the generic vision router (Claude first → 400 on video_url) and could not ingest page URLs (YouTube/X/Vimeo); adds video-capable provider resolution + yt-dlp page ingestion.",
+  "evidence": {
+   "original": "PR #209 body: fork-deploy cherry-pick of upstream PR NousResearch/hermes-agent#58144 (E2E: testsrc mp4 + real YouTube URL).",
+   "upstream_state": "RED (read-only): ../up tools/vision_tools.py has no _resolve_video_provider_model / _download_video_via_ytdlp; rg 'ytdlp' tools/ on up = 0 hits. Upstream PR #58144 still OPEN (gh api: state open, merged_at null).",
+   "upstream_fix": "none (upstream PR #58144 open, unmerged)",
+   "fires": "'yt-dlp could not fetch a compact video from this URL.' 3 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (failure-path line; success path has no log line)",
+   "cost": {
+    "loc": 263,
+    "conflict_syncs": 1,
+    "conflict_files": 1,
+    "dependents": [
+     "#211",
+     "#314"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Already proposed upstream as #58144 (open); no new branch — the lead tracks the PR. Fork copy stays until it merges, then SUPERSEDED. Low fire evidence (3 failure-path lines); dependents: #211 (proxy), #314 (aliases share the file)."
+ },
+ "#314": {
+  "verdict": "UPSTREAM",
+  "problem": "vision_analyze schema requires image_url but models naturally pass path/image_path/file_path for local screenshots and got 'image_url is required' → retry loop.",
+  "evidence": {
+   "original": "PR #314 body: papercut from the fleet friction ledger; proven against the real handler pre/post rebase.",
+   "upstream_state": "RED: own test on ../up: test_path_aliases_resolve_like_image_url FAILED (1 failed, 1 passed); FM 2 passed.",
+   "upstream_fix": "none (git log -S'image_path' upstream/main -- tools/vision_tools.py: 0)",
+   "fires": "no log line; the retry class it kills leaves no marker. 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 59,
+    "conflict_syncs": 1,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic 2-line handler alias + schema note; trivially upstreamable. Unmeasured on the fleet (no marker), so not a KEEP on its own."
+ },
+ "#470": {
+  "verdict": "KEEP",
+  "problem": "An agent-session `hermes kanban create` did not subscribe the origin chat, so finishes were silent; `kanban dispatch` gave no warning for spawned cards with zero notify subscriptions.",
+  "evidence": {
+   "original": "PR #470 body: hand-port of upstream PR #80564 (Ace 2026-08-06) adapted to the fork layout; 12/12 tests RED-proven.",
+   "upstream_state": "RED: own tests on ../up: 4 failed, 8 passed (knob_on_with_session_env_subscribes_origin_chat, dispatch_warns_on_spawned_cards_with_zero_subs, ...); FM 12 passed. Read-only: ../up tools/kanban_tools.py:1119 _maybe_auto_subscribe covers only the kanban_create TOOL path (f8d8f045fa 2026-06-15); no CLI auto-subscribe, no unwatched warning in hermes_cli/kanban.py.",
+   "upstream_fix": "none — upstream PR #80564 CLOSED unmerged (gh api: state closed, merged_at null)",
+   "fires": "'Subscribed the calling session for finish notifications' 1 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25); dispatch 'finishes will be silent' warning is CLI stdout (no log line) — 170 captures in session transcripts, not counted as fires",
+   "cost": {
+    "loc": 813,
+    "conflict_syncs": 3,
+    "conflict_files": 5,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Upstream rejected the PR, so UPSTREAM is not available; the fleet's dispatch flow (Apollo creating cards from a CLI turn) depends on it. KEEP, but the cost is real: 813 loc, 5 conflict files (3 syncs). Candidate for trimming to the CLI subscribe + warning core at the next sync."
  }
 }
