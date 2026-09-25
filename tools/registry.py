@@ -195,6 +195,13 @@ class ToolEntry:
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
+    # True: dispatch() REJECTS model-supplied args the schema does not declare (default: only
+    # log). Opt-in per tool: right for handlers that read args by name and would silently drop
+    # an intent; wrong for tools that inspect stray keys to give a better error.
+    strict_args: bool = False
+    # Keys the handler accepts beyond the model-facing schema (legacy shapes kept off it on
+    # purpose); counted as known so strict mode never rejects a valid call.
+    extra_accepted_args: frozenset = frozenset()
 
 
 class _PluginOverridePolicy:
@@ -668,7 +675,8 @@ class ToolRegistry:
         check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None, override: bool = False,
-        scope: Optional[str] = None):
+        scope: Optional[str] = None, strict_args: bool = False,
+        extra_accepted_args: Optional[list] = None):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected."""
@@ -733,7 +741,8 @@ class ToolRegistry:
                 requires_env=requires_env or [], is_async=is_async,
                 description=description or schema.get("description", ""), emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
-                dynamic_schema_overrides=dynamic_schema_overrides)
+                dynamic_schema_overrides=dynamic_schema_overrides, strict_args=strict_args,
+                extra_accepted_args=frozenset(extra_accepted_args or ()))
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
             # longer gates a toolset; it still feeds get_toolset_requirements ->
             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
@@ -890,6 +899,38 @@ class ToolRegistry:
             f"Tool handler returned unsupported result type: {result_type}",
             error_type="tool_result_contract", tool=name, result_type=result_type)
 
+
+    @staticmethod
+    def _check_unknown_args(entry: "ToolEntry", name: str, args: object) -> Optional[str]:
+        """Surface model-supplied args the schema does not declare.
+
+        Handlers that read ``args.get(...)`` by name silently drop an undeclared key, so the call
+        "succeeds" while doing something other than what the model asked (e.g. an imaginary
+        per-call ``model=`` on delegate_task). Always log a WARNING naming the unknown keys and
+        the accepted set; for ``strict_args`` tools return a tool error instead of dispatching.
+        A schema with ``additionalProperties: true`` opts out. Introspection never blocks
+        dispatch."""
+        try:
+            params = (entry.schema or {}).get("parameters") or {}
+            props = params.get("properties")
+            if not (isinstance(args, dict) and isinstance(props, dict) and props) \
+                    or params.get("additionalProperties") is True:
+                return None
+            accepted = set(props) | set(entry.extra_accepted_args)
+            unknown = sorted(k for k in args if k not in accepted)
+            if not unknown:
+                return None
+            logger.warning(
+                "Tool %s called with argument(s) %s not in its schema (accepted: %s); the handler "
+                "ignores them unless it checks explicitly", name, unknown, sorted(accepted))
+        except Exception:  # noqa: BLE001 - schema introspection must never block dispatch
+            return None
+        if not entry.strict_args:
+            return None
+        return tool_error(
+            f"{name}: unknown argument(s) {unknown} - not in the tool schema, so they would be "
+            f"silently ignored. Accepted: {sorted(accepted)}")
+
     def dispatch(
         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
@@ -897,6 +938,8 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        if (rejection := self._check_unknown_args(entry, name, args)) is not None:
+            return rejection
         try:
             # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
             # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``

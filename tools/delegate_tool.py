@@ -738,6 +738,11 @@ registry.register(
     name="delegate_task",
     toolset="delegation",
     schema=DELEGATE_TASK_SCHEMA,
+    # The handler reads args by name, so an undeclared key (e.g. an imaginary per-call
+    # `model=`) would be silently dropped and the children would run on the config default.
+    strict_args=True,
+    # Legacy single-goal shape: accepted by the handler, deliberately kept off the schema.
+    extra_accepted_args=["goal", "context", "role", "max_iterations", "background", "output_schema", "images"],
     handler=lambda args, **kw: delegate_task(
         goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"), role=args.get("role"),
