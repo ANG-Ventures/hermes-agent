@@ -3482,6 +3482,35 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+_CHECKOUT_GATE_UNSET = object()
+
+
+class _CronDispatchGate:
+    """In-process cron dispatch gate for the gateway.
+
+    ``__call__`` keeps the historical boolean contract (drain/shutdown).
+    ``admit()`` is the shared-checkout admission hook ``cron.scheduler.tick``
+    uses: it returns a release callable spanning the tick's dispatch window,
+    or None when the admission hold refuses new scheduled work.
+    """
+
+    def __init__(self, runner):
+        self._runner = runner
+
+    def __call__(self) -> bool:
+        runner = self._runner
+        return not (runner._draining or runner._external_drain_active)
+
+    def admit(self):
+        gate = self._runner._checkout_admission_gate()
+        if gate is None:
+            return lambda: None
+        from gateway.checkout_admission import AdmissionRefused
+
+        try:
+            return gate.admit("cron:tick", internal=False).release
+        except AdmissionRefused:
+            return None
 
 # Conversation-scoped per-session state registry (legacy contract).
 # The state itself now lives in ``SessionState.conversation`` (see
@@ -10217,6 +10246,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
+
+    def _checkout_admission_gate(self):
+        """This gateway's shared-checkout admission gate, or None if disabled.
+
+        Configured by ``checkout_admission`` in config.yaml (see
+        gateway/checkout_admission.py). The gate's authoritative work count is
+        ``_active_work_count()`` plus its own tickets; its serving signal is
+        published from the event loop by ``publish_forever``.
+        """
+        cached = getattr(self, "_checkout_gate_cache", _CHECKOUT_GATE_UNSET)
+        if cached is not _CHECKOUT_GATE_UNSET:
+            return cached
+        gate = None
+        try:
+            from gateway.checkout_admission import process_gate
+
+            gate = process_gate("gateway")
+            if gate is not None:
+                gate.set_active_work(lambda: {
+                    "agents": self._running_agent_count(),
+                    "cron": self._active_cron_job_count(),
+                    "api": self._active_api_run_count(),
+                    "compaction": self._active_compaction_count(),
+                })
+                gate.set_serving(lambda: {
+                    "ok": bool(getattr(self, "_running", False)),
+                    "draining": bool(getattr(self, "_draining", False)),
+                    "external_drain": bool(getattr(self, "_external_drain_active", False)),
+                    "adapters": len(getattr(self, "adapters", {}) or {}),
+                })
+        except Exception:
+            logger.error("checkout admission gate setup failed", exc_info=True)
+            gate = None
+        self._checkout_gate_cache = gate
+        return gate
 
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
@@ -18658,6 +18722,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
+        # Shared-checkout admission acknowledgments (t_e8017c37): published
+        # from THIS loop so a fresh record also proves the loop is serving.
+        _checkout_gate = self._checkout_admission_gate()
+        if _checkout_gate is not None:
+            self._spawn_supervised(
+                _checkout_gate.publish_forever, "checkout_admission_publisher"
+            )
+
         logger.info("Press Ctrl+C to stop")
 
         return True
@@ -24423,6 +24495,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
+        # ── Shared-checkout admission hold (t_e8017c37) ───────────────
+        # Unlike the marker-polled external drain above, this re-reads the
+        # durable operator hold on EVERY admission, so a turn arriving right
+        # after an operator's last idle poll is refused (or, if it won the
+        # race, is counted by the next acknowledgment snapshot). Internal
+        # continuations are admitted+counted under ``drain`` and refused only
+        # under ``freeze``. The ticket spans the whole turn (finally below).
+        _checkout_ticket = None
+        _checkout_gate = self._checkout_admission_gate()
+        if _checkout_gate is not None:
+            from gateway.checkout_admission import AdmissionRefused
+
+            try:
+                _checkout_ticket = _checkout_gate.admit(
+                    f"message:{_quick_key}", internal=bool(is_internal)
+                )
+            except AdmissionRefused as exc:
+                logger.info(
+                    "Refusing turn for session %s — %s", _quick_key, exc.reason
+                )
+                return (
+                    "⏳ This agent is paused for a maintenance update and isn't "
+                    "accepting new turns right now. Please resend shortly."
+                )
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -24439,6 +24536,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Rejecting new active session %s: max_concurrent_sessions reached",
                 _quick_key,
             )
+            if _checkout_ticket is not None:
+                _checkout_ticket.release()
             return _limit_message
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -24517,6 +24616,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            if _checkout_ticket is not None:
+                _checkout_ticket.release()
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -40308,9 +40409,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # in-process ticker polls local due jobs, so only it receives the local
     # external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active
-        )
+        cron_start_kwargs["can_dispatch"] = _CronDispatchGate(runner)
     cron_thread = threading.Thread(
         target=cron_provider.start,
         args=(cron_stop,),

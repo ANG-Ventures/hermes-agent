@@ -3069,6 +3069,81 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     return rid, method, params
 
 
+# ── Shared-checkout admission hold (gateway/checkout_admission.py) ──────
+# Every RPC -- stdio, and every existing or new WebSocket connection -- goes
+# through handle_request, so gating here covers persistent connections too.
+# Methods that start agent work take an admission ticket BEFORE the handler
+# persists anything; the ticket is released when the handler returns (by then
+# ``session["running"]`` counts the turn) or handed to the worker thread via
+# ``_start_counted_thread`` for fire-and-forget work (background / btw).
+_CHECKOUT_GATED_METHODS = frozenset({"prompt.submit", "prompt.background", "prompt.btw"})
+_checkout_gate_ref = None
+_checkout_rpc_ticket: contextvars.ContextVar = contextvars.ContextVar(
+    "checkout_rpc_ticket", default=None
+)
+
+
+def _serve_active_work() -> dict:
+    """Authoritative serve-process work: running sessions + side work."""
+    running = sum(1 for s in list(_sessions.values()) if s.get("running"))
+    counts = {"sessions_running": running}
+    try:
+        from agent.conversation_compression import compactions_in_flight
+
+        counts["compaction"] = int(compactions_in_flight())
+    except ImportError:
+        pass
+    try:
+        from cron.scheduler import get_running_job_ids
+
+        counts["cron"] = len(get_running_job_ids())
+    except ImportError:
+        pass
+    return counts
+
+
+def enable_checkout_admission(kind: str = "serve"):
+    """Install this process's admission gate (called by the serve lifespan).
+
+    Returns the gate (caller runs ``gate.publish_forever()`` on its serving
+    loop) or None when ``checkout_admission`` is disabled for this kind.
+    """
+    global _checkout_gate_ref
+    from gateway.checkout_admission import process_gate
+
+    gate = process_gate(kind)
+    if gate is not None:
+        gate.set_active_work(_serve_active_work)
+        gate.set_serving(lambda: {"ok": True, "sessions": len(_sessions)})
+    _checkout_gate_ref = gate
+    return gate
+
+
+def _start_counted_thread(target, *, name: str | None = None) -> threading.Thread:
+    """Start fire-and-forget agent work, keeping the RPC's admission ticket
+    (if any) held until the work finishes instead of until the RPC returns."""
+    box = _checkout_rpc_ticket.get()
+    ticket = None
+    if box is not None:
+        ticket, box["ticket"] = box.get("ticket"), None
+
+    def _run():
+        try:
+            target()
+        finally:
+            if ticket is not None:
+                ticket.release()
+
+    th = threading.Thread(target=_run, daemon=True, name=name)
+    try:
+        th.start()
+    except BaseException:
+        if ticket is not None:
+            ticket.release()
+        raise
+    return th
+
+
 def handle_request(req: dict) -> dict | None:
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
@@ -3078,11 +3153,30 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
+    box = None
+    gate = _checkout_gate_ref
+    if gate is not None and method in _CHECKOUT_GATED_METHODS:
+        from gateway.checkout_admission import AdmissionRefused
+
+        try:
+            box = {"ticket": gate.admit(f"rpc:{method}")}
+        except AdmissionRefused as exc:
+            logger.info("refusing %s: %s", method, exc.reason)
+            return _err(
+                rid,
+                5075,
+                "paused for a maintenance update; not accepting new turns — retry shortly",
+            )
     token = _current_rpc_method.set(method)
+    box_token = _checkout_rpc_ticket.set(box) if box is not None else None
     try:
         return fn(rid, params)
     finally:
+        if box_token is not None:
+            _checkout_rpc_ticket.reset(box_token)
         _current_rpc_method.reset(token)
+        if box is not None and box.get("ticket") is not None:
+            box["ticket"].release()
 
 
 def handle_request_bound(req: dict, transport: Optional[Transport] = None) -> dict | None:
@@ -13561,6 +13655,23 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> bool:
+    # Every caller has already set session["running"] (so the turn is counted
+    # by _serve_active_work). Under a ``freeze`` hold even continuations are
+    # refused here -- before the turn thread starts -- and reported, never
+    # interrupted mid-run. ``drain`` admits them (they are counted).
+    _gate = _checkout_gate_ref
+    if _gate is not None:
+        _refusal = _gate.check(internal=True)
+        if _refusal is not None:
+            with session["history_lock"]:
+                session["running"] = False
+            logger.info("deferring turn for %s: %s", sid, _refusal.reason)
+            _emit(
+                "error",
+                sid,
+                {"message": "Paused for a maintenance update; this turn was not started — resend shortly."},
+            )
+            return False
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False

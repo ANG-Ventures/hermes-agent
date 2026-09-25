@@ -8723,6 +8723,7 @@ def tick(
     # exhaustion — must NOT be swallowed as "another instance holds the
     # lock": that previously made the scheduler appear healthy (tick returned
     # 0, heartbeat recorded success) while no job ever ran again (#87644).
+    _dispatch_release = None
     lock_fd = None
     try:
         lock_fd = open(lock_file, "w", encoding="utf-8")
@@ -8775,6 +8776,16 @@ def tick(
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
+        # Shared-checkout admission hold (gateway/checkout_admission.py): a
+        # gate exposing ``admit()`` returns a release callable that must span
+        # the whole dispatch window, so a hold engaged mid-tick still sees
+        # every job this tick registers (get_running_job_ids) or refuses it.
+        _dispatch_admit = getattr(can_dispatch, "admit", None)
+        if callable(_dispatch_admit):
+            _dispatch_release = _dispatch_admit()
+            if _dispatch_release is None:
+                logger.debug("Cron dispatch refused by shared-checkout admission hold")
+                return 0
 
         # Dead-owner claim reclaim (#86721): execution rows carry their owner
         # pid + process start time, but recovery previously ran only at
@@ -9121,6 +9132,11 @@ def tick(
 
         return sum(_results)
     finally:
+        if _dispatch_release is not None:
+            try:
+                _dispatch_release()
+            except Exception:
+                logger.debug("cron dispatch admission release failed", exc_info=True)
         if fcntl:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
