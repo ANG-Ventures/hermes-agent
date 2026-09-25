@@ -1,6 +1,8 @@
 """LCM configuration with defaults and env var overrides."""
+import copy
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,15 @@ try:
     import yaml
 except Exception:  # pragma: no cover - optional fallback for minimal installs
     yaml = None
+
+# libyaml's C loader parses the ~23 KB config.yaml ~10x faster than the
+# pure-Python SafeLoader; same safe constructor set. Fall back when PyYAML was
+# built without libyaml.
+_YAML_SAFE_LOADER = (
+    getattr(yaml, "CSafeLoader", None) or getattr(yaml, "SafeLoader", None)
+    if yaml is not None
+    else None
+)
 
 
 logger = logging.getLogger(__name__)
@@ -154,15 +165,55 @@ def _hermes_config_path() -> Path:
     return home / "config.yaml"
 
 
-def _load_hermes_config_yaml() -> dict[str, Any]:
+# Parsed config.yaml, keyed on (path, exact file text). Card t_90850d58:
+# LCMConfig.from_env resolves ~12 config-file knobs, each through its own
+# helper; when every helper re-parsed the file, one engine load under
+# plugins/context_engine/__init__.py::_LOAD_LOCK cost 12 pure-Python parses
+# (2.75 s measured, 5-10 s under host load). Every helper now reads through
+# _hermes_config_yaml(), which re-reads the (small) file but parses only when
+# its text changed -- so a config edit is still seen on the next read, with no
+# mtime-granularity staleness. Contract: docs/lcm-init-boot-cost-contract.md.
+_CONFIG_YAML_CACHE_LOCK = threading.Lock()
+_config_yaml_cache: tuple[str, str, dict[str, Any]] | None = None
+
+
+def _reset_config_yaml_cache() -> None:
+    global _config_yaml_cache
+    with _CONFIG_YAML_CACHE_LOCK:
+        _config_yaml_cache = None
+
+
+def _hermes_config_yaml() -> dict[str, Any]:
+    """Return the parsed config.yaml (a private copy); parse only on change."""
+    global _config_yaml_cache
     cfg_path = _hermes_config_path()
     try:
         text = cfg_path.read_text(encoding="utf-8")
     except Exception:
         return {}
+    key_path = str(cfg_path)
+    with _CONFIG_YAML_CACHE_LOCK:
+        cached = _config_yaml_cache
+    if cached is None or cached[0] != key_path or cached[1] != text:
+        parsed = _load_hermes_config_yaml(text)
+        with _CONFIG_YAML_CACHE_LOCK:
+            _config_yaml_cache = (key_path, text, parsed)
+        cached = (key_path, text, parsed)
+    # Callers only read today; the copy keeps one caller's mutation from
+    # leaking into every later engine load.
+    return copy.deepcopy(cached[2])
+
+
+def _load_hermes_config_yaml(text: str | None = None) -> dict[str, Any]:
+    """Parse config.yaml. Uncached -- call _hermes_config_yaml() instead."""
+    if text is None:
+        try:
+            text = _hermes_config_path().read_text(encoding="utf-8")
+        except Exception:
+            return {}
     if yaml is not None:
         try:
-            loaded = yaml.safe_load(text) or {}
+            loaded = yaml.load(text, Loader=_YAML_SAFE_LOADER) or {}
             return loaded if isinstance(loaded, dict) else {}
         except Exception:
             return {}
@@ -203,7 +254,7 @@ _SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
-    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    cfg = cfg if cfg is not None else _hermes_config_yaml()
     lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
     if not isinstance(lcm_section, dict):
         return []
@@ -231,7 +282,7 @@ def _hermes_compression_threshold(default: float) -> float:
 
 
 def _hermes_compression_threshold_with_source(default: float) -> tuple[float, str]:
-    cfg = _load_hermes_config_yaml()
+    cfg = _hermes_config_yaml()
     try:
         lcm_section = cfg.get("lcm") or {}
         if isinstance(lcm_section, dict):
@@ -260,13 +311,13 @@ def _hermes_compression_float(key: str, default: float) -> float:
     (which would let one agent's config silently change another's calibration —
     Greptile PR #111). Returns ``default`` on any read/parse failure or absence.
     """
-    # fork-parity: go through this module's own _load_hermes_config_yaml()
+    # fork-parity: go through this module's own _hermes_config_yaml()
     # helper instead of a second raw yaml.safe_load. It already handles the
     # missing-file, unparseable, and no-yaml-installed cases (LCM is vendored
     # and cannot assume PyYAML), and it keeps this module's config reads on ONE
     # path — which is what upstream's test_config_read_guard is enforcing.
     try:
-        cfg = _load_hermes_config_yaml()
+        cfg = _hermes_config_yaml()
         compression = cfg.get("compression") or {}
         val = compression.get(key)
         if val is None:
@@ -281,7 +332,7 @@ def _hermes_lcm_value(key: str):
     """Read ``lcm.<key>`` from ~/.hermes/config.yaml; None on absence/failure."""
     # fork-parity: same single-read-path rule as above.
     try:
-        cfg = _load_hermes_config_yaml()
+        cfg = _hermes_config_yaml()
         return (cfg.get("lcm") or {}).get(key)
     except Exception:
         return None
@@ -345,7 +396,7 @@ def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
 
 
 def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[int, str]:
-    cfg = _load_hermes_config_yaml()
+    cfg = _hermes_config_yaml()
     try:
         auxiliary = cfg.get("auxiliary") or {}
         if not isinstance(auxiliary, dict):
@@ -362,7 +413,7 @@ def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[
 
 
 def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]:
-    cfg = _load_hermes_config_yaml()
+    cfg = _hermes_config_yaml()
     try:
         compression = cfg.get("compression") or {}
         if not isinstance(compression, dict):
