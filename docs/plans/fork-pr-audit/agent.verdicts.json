@@ -38,6 +38,25 @@
   "problem": "Hygiene stats conflated two 'kept' populations; announce silently degraded on real hygiene compactions.",
   "verdict": "KEEP"
  },
+ "#1010": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#913"
+    ],
+    "loc": 471
+   },
+   "fires": "not separately counted (rejected-but-billed rows fold into turn totals)",
+   "original": "PR #1010.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #978)"
+  },
+  "notes": "Rides with #913.",
+  "problem": "Billed HTTP-200s the loop rejects were missing from turn totals (I4 class 2).",
+  "verdict": "KEEP"
+ },
  "#103": {
   "branch": null,
   "evidence": {
@@ -93,6 +112,23 @@
   "problem": "Residual A-floor exhaustive partition for the in-turn announce after #106.",
   "verdict": "DROP"
  },
+ "#11": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 66
+   },
+   "fires": "'task=' 6,147 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #11.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): ../up/agent/turn_finalizer.py:330-341 'Turn ended:' carries origin= but no task="
+  },
+  "notes": "66 loc, generic \u2014 UPSTREAM-able as a one-line addition to the origin= rider.",
+  "problem": "Turn-ended diag line lacked the cron task id.",
+  "verdict": "KEEP"
+ },
  "#110": {
   "branch": null,
   "evidence": {
@@ -139,6 +175,62 @@
   "problem": "In-turn compaction trigger fired off the rough char/3.5 estimate that over-counts schema-heavy requests ~21%; compacted ~130K tokens early.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#12": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#127",
+     "#504"
+    ],
+    "loc": 64
+   },
+   "fires": "background review runs on every gateway turn (not separately logged)",
+   "original": "PR #12.",
+   "upstream_fix": "upstream background_review inheritance (see :844-855)",
+   "upstream_state": "GREEN-partial (read-only): ../up/agent/background_review.py:5 'The fork inherits the parent's live runtime (provider, model, credentials, cached system prompt)' and :749 platform inheritance"
+  },
+  "notes": "Fork's background_review.py diverged early; the plugins-tranche mem0 KEEPs depend on this file. Recommend the lead treat #12/#127/#504 as one 'background_review fork' decision.",
+  "problem": "background_review fork did not inherit the parent's chat context (cache parity).",
+  "verdict": "KEEP"
+ },
+ "#127": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#12"
+    ],
+    "loc": 164
+   },
+   "fires": "mem0 memories written by bg-review (plugins tranche measured)",
+   "original": "PR #127.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'mem0' 0 hits in ../up/agent/background_review.py"
+  },
+  "notes": "Rides with #12.",
+  "problem": "Background review never called mem0_remember (contradictory prompt).",
+  "verdict": "KEEP"
+ },
+ "#133": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 23
+   },
+   "fires": "30d: claude-sonnet-5 21 turns",
+   "original": "PR #133.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN (read-only): usage_pricing.py:191; model_metadata.py:293"
+  },
+  "notes": "Model-catalog row. Upstream carries the same model in its own tables (cited); fork copy is a sync-conflict source with zero residual value.",
+  "problem": "claude-sonnet-5 in known-model lists + pricing.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#161": {
   "branch": null,
   "evidence": {
@@ -175,6 +267,27 @@
   },
   "notes": "Reverting a refactor of fork-only code has no value; rides with the family.",
   "problem": "Refactor: consolidate compaction row subtraction into one _signature_partition helper.",
+  "verdict": "KEEP"
+ },
+ "#165": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7",
+     "#447",
+     "#647"
+    ],
+    "loc": 41
+   },
+   "fires": "30d: claude-fable-5 639 + claude-fable-5-1 4,750 turns, all on notional relays (~/.hermes/blackbox/turns.db 2026-06-11..2026-09-25 (47,189 turns; 30d window used unless stated))",
+   "original": "PR #165.",
+   "upstream_fix": "none (upstream prices direct anthropic via models.dev)",
+   "upstream_state": "RED (read-only): 'fable' 0 hits in ../up/agent/usage_pricing.py (739 lines vs fork 3,105) (metadata has claude-fable 1M at model_metadata.py:293; picker has anthropic/claude-fable-5 in models_catalog_static.py:32)"
+  },
+  "notes": "The snapshot row is what the notional stack prices fable against; rides with #7.",
+  "problem": "claude-fable-5 pricing row (premium tier).",
   "verdict": "KEEP"
  },
  "#172": {
@@ -274,6 +387,94 @@
   "problem": "Provenance stamp gated to single-pass; multi-pass sessions degraded.",
   "verdict": "KEEP"
  },
+ "#2": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:e57e66e59f",
+     "#787"
+    ],
+    "loc": 313
+   },
+   "fires": "'/usage' 1,295 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02); hermes_state.py:9600-10167 last_turn_* columns written every turn",
+   "original": "PR #2.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream _handle_usage_command@../up/gateway/slash_commands_status.py:563 reads the live/cached agent or the persisted BILLING ROUTE only \u2014 no last_turn_* columns in ../up/hermes_state_schema.py (grep 0)"
+  },
+  "notes": "hermes_state.py (3/3 syncs) carries the columns \u2014 cost is real. Generic enough to UPSTREAM if the lead wants a branch.",
+  "problem": "/usage lost the last-turn token snapshot when the agent was evicted; persist it on the session row.",
+  "verdict": "KEEP"
+ },
+ "#207": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7",
+     "#208",
+     "#312"
+    ],
+    "loc": 194
+   },
+   "fires": "30d: 0 gemini-bridge turns in blackbox (provider configured in ~/.hermes/config.yaml:235,256 but no turns in window)",
+   "original": "PR #207.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): no gemini-bridge route upstream; upstream prices google direct via _snap tables only"
+  },
+  "notes": "Rides with #7. NOT measured in 30d \u2014 if the bridge stays idle the lead can fold #207/#208/#312 (\u2248290 loc) into the consolidated-module cleanup as dead lane.",
+  "problem": "gemini-bridge (Google AI Ultra sub) turns unpriced.",
+  "verdict": "KEEP"
+ },
+ "#208": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#207"
+    ],
+    "loc": 66
+   },
+   "fires": "0 in 30d (see #207)",
+   "original": "PR #208.",
+   "upstream_fix": "none",
+   "upstream_state": "see #207"
+  },
+  "notes": "Rides with #207; same idle-lane caveat.",
+  "problem": "gemini-bridge unsupported models leaked to vendor rates.",
+  "verdict": "KEEP"
+ },
+ "#21": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#29",
+     "#32",
+     "#23",
+     "#24",
+     "#26",
+     "#43",
+     "#45",
+     "#46",
+     "#501",
+     "#512"
+    ],
+    "loc": 539
+   },
+   "fires": "7d: comp_sys_tokens>0 on 4,859/5,038 blackbox turns; '/context' 1,278 + '/usage' 1,295 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #21.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): compose_request_breakdown 0 hits in ../up; upstream /usage is _usage_agent_stats_lines@../up/gateway/slash_commands_status.py:195 (session totals, no composition)"
+  },
+  "notes": "Composition-snapshot family (#21 root; #29,#32,#23,#24,#26,#43,#45,#46 ride on it): fork-only per-request composition for /context /usage /compress that feeds the blackbox comp_* columns. Upstream has no compose_request_breakdown (grep 0) and no comp_* sink. Measured live. The six divisor-tuning rows are one constant edited six times \u2014 not separable; the lead should count them as one. Flag: HERMES_COMPOSITION_CHARS_PER_TOKEN{,_FIXED} are HERMES_* env vars for non-secret config (upstream AGENTS.md rejects) \u2014 if this family is ever upstreamed it must move to config.yaml.",
+  "problem": "/context /usage /compress showed guesses; real per-request composition snapshot.",
+  "verdict": "KEEP"
+ },
  "#213": {
   "branch": null,
   "evidence": {
@@ -355,6 +556,82 @@
   "problem": "Re-land of the session.list denorm behind dashboard.session_list_denorm (default off), with the backfill VERSION bumped past a poisoned marker on the live DB.",
   "verdict": "UPSTREAM"
  },
+ "#226": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 50
+   },
+   "fires": "30d: 0 yunwu turns in blackbox (provider in config.yaml:16 fallback list only)",
+   "original": "PR #226.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream has NO notional-pricing concept \u2014 subscription routes are priced $0 with _INCLUDED_NOTE 'subscription-included; no provider invoice for usage' (../up/agent/usage_pricing.py (739 lines vs fork 3,105):36,137-141); no claude-apr/bpr/apx/bpx, xai-oauth, gemini-bridge, yunwu or openai-codex notional route anywhere in ../up/agent (grep 0). D3 fails: upstream would report $0 for every fleet relay turn"
+  },
+  "notes": "Rides with #7; 50 loc, one set member \u2014 idle in window.",
+  "problem": "Yunwu claude-* turns priced at the Anthropic snapshot.",
+  "verdict": "KEEP"
+ },
+ "#23": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21"
+    ],
+    "loc": 94
+   },
+   "fires": "every composition estimate",
+   "original": "PR #23.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream CHARS_PER_TOKEN = 4 fixed (../up/agent/model_metadata.py:2292), not tunable"
+  },
+  "notes": "Rides with #21 \u2014 introduces HERMES_COMPOSITION_CHARS_PER_TOKEN env var (see family note).",
+  "problem": "Tunable chars-per-token divisor (default 3.5) for the composition estimate.",
+  "verdict": "KEEP"
+ },
+ "#24": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21"
+    ],
+    "loc": 65
+   },
+   "fires": "every rough estimate; since c0aaa238f6 the compaction trigger is usage-anchored so the rough path only serves anchor-invalid preflights",
+   "original": "PR #24.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream estimators use CHARS_PER_TOKEN=4 (:2315, :2558)"
+  },
+  "notes": "Rides with #21. Adversary: with the anchor live, is a 3.5-vs-4 divisor still observable anywhere except /context display?",
+  "problem": "Unify all rough token estimators on the 3.5 divisor.",
+  "verdict": "KEEP"
+ },
+ "#242": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 126
+   },
+   "fires": "7d: claude-apr 348+478+46 turns priced",
+   "original": "PR #242 (pools unpriced after rename).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream has NO notional-pricing concept \u2014 subscription routes are priced $0 with _INCLUDED_NOTE 'subscription-included; no provider invoice for usage' (../up/agent/usage_pricing.py (739 lines vs fork 3,105):36,137-141); no claude-apr/bpr/apx/bpx, xai-oauth, gemini-bridge, yunwu or openai-codex notional route anywhere in ../up/agent (grep 0). D3 fails: upstream would report $0 for every fleet relay turn"
+  },
+  "notes": "Rides with #7.",
+  "problem": "claude-app\u2192claude-apr rename left the LIVE pools unpriced.",
+  "verdict": "KEEP"
+ },
  "#25": {
   "branch": null,
   "evidence": {
@@ -373,6 +650,251 @@
   "notes": "Small generic config knob; upstream-able as-is. No branch produced this run (time).",
   "problem": "Per-model compression threshold as a config knob (compression.per_model_threshold).",
   "verdict": "UPSTREAM"
+ },
+ "#26": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#24"
+    ],
+    "loc": 18
+   },
+   "fires": "'413' 3,293 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #26 (18 loc).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #24)"
+  },
+  "notes": "Rides with #21.",
+  "problem": "413/stale-call estimator through the shared divisor.",
+  "verdict": "KEEP"
+ },
+ "#260": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 216
+   },
+   "fires": "0 local providers in blackbox 30d",
+   "original": "PR #260.",
+   "upstream_fix": "upstream endpoint waterfall",
+   "upstream_state": "GREEN (read-only): ../up/agent/model_metadata.py:721 'A hosted provider never runs Ollama/LM Studio' short-circuit + :740-746 most-specific-first waterfall with body checks"
+  },
+  "notes": "",
+  "problem": "OpenAI-compat proxy misdetected as LM Studio.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#262": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7",
+     "#587",
+     "#878"
+    ],
+    "loc": 197
+   },
+   "fires": "30d: xai-oauth 188 turns $311 notional; grok-4.6 176 + x-ai/grok-4.6 34 turns (~/.hermes/blackbox/turns.db 2026-06-11..2026-09-25 (47,189 turns; 30d window used unless stated))",
+   "original": "PR #262.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): no xai-oauth route in ../up/agent/usage_pricing.py (739 lines vs fork 3,105); grok pricing absent (grep 'grok' 0 in usage_pricing)"
+  },
+  "notes": "Rides with #7 (single-vendor notional lane).",
+  "problem": "xAI Grok turns (xai-oauth notional + metered xai) unpriced.",
+  "verdict": "KEEP"
+ },
+ "#263": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 79
+   },
+   "fires": "0 local providers in 30d",
+   "original": "PR #263.",
+   "upstream_fix": "upstream _context_from_model_object",
+   "upstream_state": "GREEN (read-only): ../up/agent/model_metadata.py:810-822 'max_tokens is NOT a window key \u2026 window keys first, max_tokens last'"
+  },
+  "notes": "",
+  "problem": "Local ctx probe read max_tokens as the context window.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#29": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21"
+    ],
+    "loc": 166
+   },
+   "fires": "7d: comp_skills_tokens>0 4,763 / comp_framing_tokens>0 4,859 turns",
+   "original": "PR #29.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #21)"
+  },
+  "notes": "Rides with #21.",
+  "problem": "Split system prompt into identity+skills; per-message framing tokens.",
+  "verdict": "KEEP"
+ },
+ "#31": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#29"
+    ],
+    "loc": 120
+   },
+   "fires": "every gateway session restore (not separately logged)",
+   "original": "PR #31.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #21; upstream has no skills split)"
+  },
+  "notes": "Rides with #21.",
+  "problem": "Skills-index split not recomputed on the gateway restore path.",
+  "verdict": "KEEP"
+ },
+ "#310": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#327"
+    ],
+    "loc": 270
+   },
+   "fires": "30d: openrouter turns 0 in blackbox (x-ai/grok-4.6 34 turns are the only aggregator-shaped ids)",
+   "original": "PR #310.",
+   "upstream_fix": "upstream models_dev provider-aware resolution (88643a1ba9 lineage)",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/models_dev.py get_model_info@961 resolves via _models_dev_id + _iter_model_entries with provider-aware fallback; _openrouter_catalog_lookup_base@523"
+  },
+  "notes": "Adversary: confirm get_model_info(openrouter, 'x-ai/grok-4.6') returns 500K on ../up.",
+  "problem": "Aggregator providers (openrouter) resolved the wrong context window; cross-provider models.dev lookup.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#311": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 384
+   },
+   "fires": "config.yaml has no pricing_source key \u2192 the fork runs the default order anyway",
+   "original": "PR #311.",
+   "upstream_fix": "88643a1ba9 feat: overhaul context length detection with models.dev (+ _models_dev_pricing_entry)",
+   "upstream_state": "GREEN-equivalent (read-only): upstream _models_dev_pricing_entry@../up/agent/usage_pricing.py:500 + models_dev.py (48K, since 88643a1ba9 2026-03-20) price direct first-party routes from models.dev; no 'pricing_source' knob (grep 0) \u2014 one source, not pluggable"
+  },
+  "notes": "The pluggability is unused (no operator ever set pricing_source); upstream's fixed models.dev path serves identically. The fork's _external_pricing_entry is still the fallback the notional stack calls \u2014 remove the knob, keep one call.",
+  "problem": "Pluggable external pricing source, default models.dev with OpenRouter fallback.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#312": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#207"
+    ],
+    "loc": 23
+   },
+   "fires": "0 in 30d (see #207)",
+   "original": "PR #312.",
+   "upstream_fix": "none",
+   "upstream_state": "see #207"
+  },
+  "notes": "Rides with #207; same idle-lane caveat.",
+  "problem": "Drop stale claude/gpt-oss aliases from the Gemini-only bridge.",
+  "verdict": "KEEP"
+ },
+ "#32": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21"
+    ],
+    "loc": 51
+   },
+   "fires": "7d: comp_skills_count>0 on 4,660 turns",
+   "original": "PR #32.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #21)"
+  },
+  "notes": "Rides with #21.",
+  "problem": "Skill count on the /context Skill index line.",
+  "verdict": "KEEP"
+ },
+ "#327": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#310"
+    ],
+    "loc": 118
+   },
+   "fires": "0 openrouter turns in 30d",
+   "original": "PR #327.",
+   "upstream_fix": "upstream cache reconciliation",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/model_metadata.py:665-667 'invalidating stale cache'/'Reconciling stale local cache entry' + :934 TTL-based staleness"
+  },
+  "notes": "Rides with #310.",
+  "problem": "Self-heal stale aggregator cache entries.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#342": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#913"
+    ],
+    "loc": 300
+   },
+   "fires": "30d: 0 MoA turns in blackbox (provider like '%moa%' \u2192 0)",
+   "original": "PR #342.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): fork-only blackbox cost.py; upstream has no MoA cost split"
+  },
+  "notes": "MoA is not used by the fleet in the window; 300 loc on conversation_loop.py/moa_loop.py (3/3 syncs). Revert branch attempted at end of run.",
+  "problem": "Price MoA turns by physical model routes.",
+  "verdict": "DROP"
+ },
+ "#38": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#54"
+    ],
+    "loc": 22
+   },
+   "fires": "superseded inside the fork by #54's regex; kept only as history",
+   "original": "PR #38.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream has NO notional-pricing concept \u2014 subscription routes are priced $0 with _INCLUDED_NOTE 'subscription-included; no provider invoice for usage' (../up/agent/usage_pricing.py (739 lines vs fork 3,105):36,137-141); no claude-apr/bpr/apx/bpx, xai-oauth, gemini-bridge, yunwu or openai-codex notional route anywhere in ../up/agent (grep 0). D3 fails: upstream would report $0 for every fleet relay turn"
+  },
+  "notes": "Rides with #7; its literal alias list was replaced by #54's pattern \u2014 no standalone code survives.",
+  "problem": "claude-*-f2 failover aliases missing from notional Anthropic providers.",
+  "verdict": "KEEP"
  },
  "#392": {
   "branch": null,
@@ -431,6 +953,23 @@
   "problem": "Un-anchored summary-marker regex classified tool results quoting past summaries as summary rows \u2192 TAG_MISSING false-fire \u2192 watcher page.",
   "verdict": "KEEP"
  },
+ "#416": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [],
+    "loc": 49
+   },
+   "fires": "no marker",
+   "original": "PR #416.",
+   "upstream_fix": "upstream image_routing supports_vision",
+   "upstream_state": "GREEN (read-only): ../up/agent/image_routing.py:8,93,121 supports_vision override chain"
+  },
+  "notes": "49 loc.",
+  "problem": "Vision routing ignored provider-profile supports_vision when models.dev misses.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#418": {
   "branch": null,
   "evidence": {
@@ -449,6 +988,42 @@
   "notes": "Fold into the consolidated port.",
   "problem": "Denorm maintenance across parent_session_id rewrites.",
   "verdict": "UPSTREAM"
+ },
+ "#419": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 48
+   },
+   "fires": "see #464",
+   "original": "PR #419.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN (read-only): usage_pricing.py:195,310; models_catalog_static.py:33"
+  },
+  "notes": "Model-catalog row. Upstream carries the same model in its own tables (cited); fork copy is a sync-conflict source with zero residual value.",
+  "problem": "claude-opus-5 pricing + provider catalogs.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#43": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21"
+    ],
+    "loc": 183
+   },
+   "fires": "every composition estimate",
+   "original": "PR #43.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #23)"
+  },
+  "notes": "Rides with #21; superseded inside the fork by #45\u2192#46 (constant now 4.5).",
+  "problem": "Two-tier char\u2192token divisor (fixed 4.0 / non-fixed 3.5).",
+  "verdict": "KEEP"
  },
  "#443": {
   "branch": null,
@@ -485,6 +1060,138 @@
   "notes": "Needs 20 min of reading ../up/gateway/run.py hygiene path; out of this run's budget.",
   "problem": "Pre-agent hygiene compression wrapped in a hardcoded 30s wait_for while the summariser is budgeted 300s.",
   "verdict": "UNRESOLVED"
+ },
+ "#447": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#165"
+    ],
+    "loc": 12
+   },
+   "fires": "see #165",
+   "original": "PR #447 (docs comment, 12 loc).",
+   "upstream_fix": "none",
+   "upstream_state": "see #165"
+  },
+  "notes": "Rides with #165.",
+  "problem": "Cite Anthropic's official page for the Fable 5 rates.",
+  "verdict": "KEEP"
+ },
+ "#45": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#43"
+    ],
+    "loc": 81
+   },
+   "fires": "see #43",
+   "original": "PR #45.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #23)"
+  },
+  "notes": "Rides with #21; superseded by #46 in the fork.",
+  "problem": "Fixed divisor 4.0\u21924.2 (post-deploy gate).",
+  "verdict": "KEEP"
+ },
+ "#459": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 281
+   },
+   "fires": "7d: 141 subagent turns in blackbox (attribution column empty on all \u2014 the lane stamp lands in provider, not attribution)",
+   "original": "PR #459 body (Week-30 audit gap).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): _resolve_notional_custom_lane fork-only (agent/usage_pricing.py:225); upstream tools/delegate_tool.py records no billing lane"
+  },
+  "notes": "Rides with #7.",
+  "problem": "Delegated subagent turns at a custom:<name> lane fronting a notional relay priced as unknown (Week-30 audit: 14 Opus turns $166.70 unpriced).",
+  "verdict": "KEEP"
+ },
+ "#46": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#43"
+    ],
+    "loc": 29
+   },
+   "fires": "see #43",
+   "original": "PR #46.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #23)"
+  },
+  "notes": "Rides with #21; the surviving constant.",
+  "problem": "Fixed divisor 4.2\u21924.5 (Ace 2026-06-15: one global number).",
+  "verdict": "KEEP"
+ },
+ "#464": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 62
+   },
+   "fires": "30d: claude-opus-5 2,532 turns",
+   "original": "PR #464.",
+   "upstream_fix": "upstream DEFAULT_CONTEXT_LENGTHS",
+   "upstream_state": "GREEN (read-only): ../up/agent/model_metadata.py:293 'claude-opus-5': 1000000"
+  },
+  "notes": "Model-catalog row. Upstream carries the same model in its own tables (cited); fork copy is a sync-conflict source with zero residual value.",
+  "problem": "claude-opus-5 resolved at 200K instead of 1M.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#48": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 92
+   },
+   "fires": "7d: cost_cache_write_usd>0 on 3,013/5,038 turns",
+   "original": "PR #48.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream PricingEntry.cache_write_cost_per_million defaults None (../up/agent/usage_pricing.py (739 lines vs fork 3,105):108) with no input-rate fallback at the cost site"
+  },
+  "notes": "Generic; could ride an UPSTREAM branch, but for the fleet it only matters through the notional stack.",
+  "problem": "Cache-write billed $0 when no cache-write rate published; bill at input rate.",
+  "verdict": "KEEP"
+ },
+ "#501": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21",
+     "#512"
+    ],
+    "loc": 604
+   },
+   "fires": "imported by agent/model_metadata.py:4009 and agent/content_class.py:37 on every composition estimate; document/audio parts not counted separately in blackbox",
+   "original": "PR #501.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): agent/media_tokens.py fork-only (no ../up/agent/media_tokens.py); upstream _count_image_tokens@model_metadata.py:2421 charges images flat, no document/audio rates"
+  },
+  "notes": "Display-only estimator accuracy (composition family). Not upstreamable without the composition feature.",
+  "problem": "Documents priced flat instead of per page; audio per second.",
+  "verdict": "KEEP"
  },
  "#502": {
   "branch": null,
@@ -524,6 +1231,25 @@
   "problem": "Banner and footer used different token counters; show both when they disagree.",
   "verdict": "KEEP"
  },
+ "#504": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#12"
+    ],
+    "loc": 141
+   },
+   "fires": "not separately logged",
+   "original": "PR #504.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): ../up/agent/background_review.py:150 _REVIEW_MAX_ITERATIONS = 16"
+  },
+  "notes": "Rides with #12; unmeasured on its own.",
+  "problem": "Background-review iteration ceiling 16\u219230 + loud exhaustion.",
+  "verdict": "KEEP"
+ },
  "#506": {
   "branch": null,
   "evidence": {
@@ -560,6 +1286,25 @@
   },
   "notes": "Fork-only file; 0 sync conflicts.",
   "problem": "A pass that compacted nothing (214\u2192214) claimed 'Context compacted'.",
+  "verdict": "KEEP"
+ },
+ "#512": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21"
+    ],
+    "loc": 238
+   },
+   "fires": "see #21 (every turn)",
+   "original": "PR #512.",
+   "upstream_fix": "none",
+   "upstream_state": "RED: compose_request_breakdown is fork-only (grep 0 in ../up)"
+  },
+  "notes": "Rides with #21.",
+  "problem": "compose_request_breakdown double-billed document+audio base64.",
   "verdict": "KEEP"
  },
  "#528": {
@@ -620,6 +1365,25 @@
   "problem": "Learned skew died with the session; key by (provider, model).",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#54": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 132
+   },
+   "fires": "7d: claude-bpx-0..22 / claude-apx-0..16 lanes = 2,398 apx/apr + 16,913 bpx/bpr api calls priced via _NOTIONAL_ANTHROPIC_FN_RE (turn_api_calls.lane_family)",
+   "original": "PR #54.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream has NO notional-pricing concept \u2014 subscription routes are priced $0 with _INCLUDED_NOTE 'subscription-included; no provider invoice for usage' (../up/agent/usage_pricing.py (739 lines vs fork 3,105):36,137-141); no claude-apr/bpr/apx/bpx, xai-oauth, gemini-bridge, yunwu or openai-codex notional route anywhere in ../up/agent (grep 0). D3 fails: upstream would report $0 for every fleet relay turn"
+  },
+  "notes": "Rides with #7.",
+  "problem": "claude-*-fN failover lanes + claude-pool were not matched as notional Anthropic.",
+  "verdict": "KEEP"
+ },
  "#541": {
   "branch": null,
   "evidence": {
@@ -638,6 +1402,25 @@
   "notes": "Rides with #111 removal. agent/content_class.py is fork-only.",
   "problem": "Single global skew ratio wrong for text-heavy and tool-heavy turns; per-content-class ratios.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#55": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 74
+   },
+   "fires": "30d: 0 dated ids in blackbox (model glob '*-20??*' \u2192 0 rows)",
+   "original": "PR #55 (audit 2026-06-17 dated-Haiku gap).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream lists explicit dated ids in its _snap tables (../up/agent/usage_pricing.py (739 lines vs fork 3,105):175-178) but has no generic _strip_anthropic_release_date (grep 0)"
+  },
+  "notes": "Generic and small (74 loc) \u2014 UPSTREAM-able as a resolver fallback, but 0 fires in 30d; leave with #7.",
+  "problem": "Dated Anthropic ids (claude-haiku-4-5-20251001) fell out of the snapshot \u2192 unpriced.",
+  "verdict": "KEEP"
  },
  "#554": {
   "branch": null,
@@ -711,6 +1494,25 @@
   "problem": "Restart drain could not see an in-flight compaction; SIGTERM killed a 4-minute /compress.",
   "verdict": "KEEP"
  },
+ "#587": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#262"
+    ],
+    "loc": 36
+   },
+   "fires": "30d: grok-4.6 176 turns",
+   "original": "PR #587.",
+   "upstream_fix": "upstream model_metadata grok-4.6 rows",
+   "upstream_state": "GREEN for catalog/metadata (../up/agent/model_metadata.py:341 500000, :368 effort prefixes, hermes_cli/models_catalog_static.py); pricing tuple absent upstream (served by the fork's notional-xAI snapshot, #262)"
+  },
+  "notes": "Model-catalog row. Upstream carries the same model in its own tables (cited); fork copy is a sync-conflict source with zero residual value. Its 3-line pricing tuple must survive inside #262's snapshot when the catalog duplicates go.",
+  "problem": "grok-4.6 catalog, pricing, 500K context, effort dial.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#61": {
   "branch": null,
   "evidence": {
@@ -766,6 +1568,61 @@
   },
   "notes": "Small (160 loc); rides with #502.",
   "problem": "Trigger-attribution coverage on the remaining surfaces (acp, cli, tui).",
+  "verdict": "KEEP"
+ },
+ "#647": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#165"
+    ],
+    "loc": 33
+   },
+   "fires": "30d: claude-fable-5-1 4,750 turns (the fleet default model)",
+   "original": "PR #647.",
+   "upstream_fix": "upstream models_catalog_static.py / model_metadata.py prefix (no single sha)",
+   "upstream_state": "RED for pricing (0 hits); metadata GREEN by prefix ('claude-fable': 1000000 at ../up/agent/model_metadata.py:293) and picker GREEN (anthropic/claude-fable-5.1 in models_catalog_static.py:32)"
+  },
+  "notes": "Only the pricing tuple has residual value; the hermes_cli/models.py + model_metadata entries are duplicates of upstream's and should go on the next sync.",
+  "problem": "claude-fable-5-1 rollout: model lists, 1M context, $10/$50 pricing.",
+  "verdict": "KEEP"
+ },
+ "#649": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 101
+   },
+   "fires": "30d: gpt-6-astra-900k 1,376 + gpt-6-astra 50 turns",
+   "original": "PR #649.",
+   "upstream_fix": "upstream 'openai-gpt-6-astra-2026-09' snapshot",
+   "upstream_state": "GREEN (read-only): ../up/agent/usage_pricing.py:263-266 gpt-6-astra snapshot; model_metadata.py:300,1690; reasoning_effort.py has it"
+  },
+  "notes": "Model-catalog row. Upstream carries the same model in its own tables (cited); fork copy is a sync-conflict source with zero residual value.",
+  "problem": "gpt-6-astra in catalogs, metadata, pricing.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#650": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 40
+   },
+   "fires": "30d: openai-codex 1,883 turns priced from the curated snapshot",
+   "original": "PR #650.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): no openai-codex notional route upstream (openai-codex \u2192 included $0 at ../up/agent/usage_pricing.py (739 lines vs fork 3,105):391)"
+  },
+  "notes": "Rides with #7.",
+  "problem": "Codex notional route consulted external catalogs before the curated snapshot.",
   "verdict": "KEEP"
  },
  "#679": {
@@ -862,6 +1719,57 @@
   "problem": "tests/test_hermes_state.py (10,900 lines, 537 tests) took 600s on CI and was SIGKILLed by the 300s per-file cap; split into 4 files.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#7": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#54",
+     "#242",
+     "#38",
+     "nopr:af1cca05d5",
+     "#262",
+     "#207",
+     "#226",
+     "#208",
+     "#312",
+     "#650",
+     "#459",
+     "#55",
+     "#48",
+     "#165",
+     "#447",
+     "#647"
+    ],
+    "loc": 228
+   },
+   "fires": "30d: cost_status estimated 10,693 turns; openai-codex 1,883 turns $5,875 notional; claude-bpr/apr/bpx/apx thousands (~/.hermes/blackbox/turns.db 2026-06-11..2026-09-25 (47,189 turns; 30d window used unless stated))",
+   "original": "PR #7 body (notional pricing for subscription routes).",
+   "upstream_fix": "none (upstream policy is included/$0)",
+   "upstream_state": "RED (read-only): upstream has NO notional-pricing concept \u2014 subscription routes are priced $0 with _INCLUDED_NOTE 'subscription-included; no provider invoice for usage' (../up/agent/usage_pricing.py (739 lines vs fork 3,105):36,137-141); no claude-apr/bpr/apx/bpx, xai-oauth, gemini-bridge, yunwu or openai-codex notional route anywhere in ../up/agent (grep 0). D3 fails: upstream would report $0 for every fleet relay turn"
+  },
+  "notes": "Notional-pricing family (#7 root; #54,#242,#38,nopr:af1cca05d5,#262,#207,#226,#208,#312,#650,#459,#55,#48 ride on it). This is fleet cost-visibility POLICY (price subscription relays at vendor list rates, label 'estimated'), not a bug fix; upstream deliberately reports subscription routes as included/$0. Measured: 30d blackbox cost_status estimated=10,693 / included=254 \u2014 every fleet turn is priced through this stack. Not upstreamable as policy; the lead may want ONE consolidated 'notional pricing' module instead of 14 rows on usage_pricing.py (3/3 syncs).",
+  "problem": "Subscription proxies/bridges (claude-api-proxy/apr/bpr, openai-codex) reported $0; price them at vendor list rates as 'estimated' for fleet cost visibility.",
+  "verdict": "KEEP"
+ },
+ "#722": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [],
+    "loc": 73
+   },
+   "fires": "7d: cache_write>0 on 3,013 turns (all via native anthropic transport on relays; bridge path not separable)",
+   "original": "PR #722.",
+   "upstream_fix": "upstream extract_cache_stats",
+   "upstream_state": "GREEN (read-only): ../up/agent/transports/chat_completions.py:677 reads prompt_tokens_details.cache_write_tokens \u2192 creation_tokens"
+  },
+  "notes": "Adversary: the bridge emits cache_creation_tokens (Anthropic name), upstream reads cache_write_tokens \u2014 verify the key alias on ../up before dropping.",
+  "problem": "Anthropic-backed OpenAI bridges report cache_creation_tokens; transport ignored it.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#76": {
   "branch": null,
   "evidence": {
@@ -948,6 +1856,80 @@
   "problem": "Multi-minute compactions unattributable when a context-engine plugin calls call_llm directly.",
   "verdict": "KEEP"
  },
+ "#878": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#262"
+    ],
+    "loc": 81
+   },
+   "fires": "30d: grok-4.7 12 turns",
+   "original": "PR #878; seen_unpriced grok-4.7@xai-oauth first_seen 2026-09-22 (the gap it closed).",
+   "upstream_fix": "none yet",
+   "upstream_state": "RED (read-only): 'grok-4.7' 0 hits in ../up/agent, ../up/hermes_cli (upstream main 2026-09-24 predates its own add)"
+  },
+  "notes": "Generic catalog add; upstream will want it. No branch produced this run (time) \u2014 a 3-file port (model_metadata, reasoning_timeouts, models_catalog_static) minus the notional pricing tuple.",
+  "problem": "grok-4.7 (GA 2026-09-21) as xAI flagship: catalog, pricing, 500K window.",
+  "verdict": "UPSTREAM"
+ },
+ "#898": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 513
+   },
+   "fires": "7d: openai-codex gpt-6-sol-900k 129 turns",
+   "original": "PR #898 body: Codex catalog measured, official docs pricing.",
+   "upstream_fix": "upstream gpt-6 tiers (usage_pricing.py 'openai-gpt-6-tiers-2026-09')",
+   "upstream_state": "GREEN (read-only): ../up/agent/usage_pricing.py:278-279 gpt-6-sol/luna rates; model_metadata.py:301 1,050,000 + :1690 codex 272K with the 900K family bump (:1696-1700); reasoning_effort + codex_models carry both slugs"
+  },
+  "notes": "Model-catalog row. Upstream carries the same model in its own tables (cited); fork copy is a sync-conflict source with zero residual value. hermes_cli/models.py picker entries live in upstream models_catalog_static.py now.",
+  "problem": "gpt-6-sol / gpt-6-luna baseline (900K eligible, pricing, picker).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#910": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 167
+   },
+   "fires": "30d: claude-opus-5-5 537 turns; seen_unpriced still lists claude-opus-5-5@claude-apr/claude-apx-14 first_seen 2026-09-23 (alert fired before this row landed)",
+   "original": "PR #910.",
+   "upstream_fix": "upstream (no single sha; three tables)",
+   "upstream_state": "GREEN (read-only): usage_pricing.py:196,311; model_metadata.py:401 _ANTHROPIC_FAST_MODE_MODELS; models_catalog_static.py:32 anthropic/claude-opus-5.5"
+  },
+  "notes": "Model-catalog row. Upstream carries the same model in its own tables (cited); fork copy is a sync-conflict source with zero residual value.",
+  "problem": "claude-opus-5-5 baseline (metadata, pricing, picker).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#913": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#978",
+     "#1010",
+     "#342"
+    ],
+    "loc": 942
+   },
+   "fires": "7d: 20,443 turn_api_calls rows",
+   "original": "PR #913.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #978)"
+  },
+  "notes": "Same seam note as #978.",
+  "problem": "C2 accumulator: every upstream call appends a turn_api_calls row with wire attribution.",
+  "verdict": "KEEP"
+ },
  "#95": {
   "branch": null,
   "evidence": {
@@ -965,6 +1947,42 @@
   },
   "notes": "",
   "problem": "Granular block only rendered on hygiene; the dominant in-turn threshold path degraded to one line on every real session.",
+  "verdict": "KEEP"
+ },
+ "#959": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 57
+   },
+   "fires": "30d: 0 gpt-5.5 turns in blackbox (fleet moved to gpt-5.6/gpt-6 tiers)",
+   "original": "PR #959.",
+   "upstream_fix": "upstream model_metadata gpt-5.5 rows",
+   "upstream_state": "GREEN for context (../up/agent/model_metadata.py:302 1,050,000; :1694 codex 272K+bump); pricing row absent upstream (upstream prices openai direct via models.dev)"
+  },
+  "notes": "Never fires; models.dev fallback would price it anyway. Revert branch attempted at end of run (see branch field).",
+  "problem": "Pin GPT-5.5 official list rate and context tier.",
+  "verdict": "DROP"
+ },
+ "#978": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#913"
+    ],
+    "loc": 951
+   },
+   "fires": "7d: cache_write_5m/1h populated on 444 claude-bpr fable + 191 opus-5-5 turns; idle_compaction_fired column present",
+   "original": "PR #978.",
+   "upstream_fix": "none (upstream langfuse plugin does not model cache tiers)",
+   "upstream_state": "RED (read-only): blackbox is fork-only (../up/plugins has observability/langfuse only); no cache_ttl_requested / cache_write_5m seam in ../up/agent/chat_completion_helpers.py (grep 0)"
+  },
+  "notes": "Agent-side seam for the plugins-tranche blackbox KEEPs. 951 loc on 3/3-sync files \u2014 the lead should ask whether the seam can be a hook instead of inline edits.",
+  "problem": "Persist per-call cache tier (5m/1h) and per-turn cache/compaction signals.",
   "verdict": "KEEP"
  },
  "#99": {
@@ -1185,6 +2203,25 @@
   "problem": "update_model re-derived the trigger from the old model's threshold_percent after a fallback.",
   "verdict": "UPSTREAM"
  },
+ "nopr:af1cca05d5": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 2
+   },
+   "fires": "see #242",
+   "original": "commit af1cca05d5 (2 loc).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream has NO notional-pricing concept \u2014 subscription routes are priced $0 with _INCLUDED_NOTE 'subscription-included; no provider invoice for usage' (../up/agent/usage_pricing.py (739 lines vs fork 3,105):36,137-141); no claude-apr/bpr/apx/bpx, xai-oauth, gemini-bridge, yunwu or openai-codex notional route anywhere in ../up/agent (grep 0). D3 fails: upstream would report $0 for every fleet relay turn"
+  },
+  "notes": "Rides with #7.",
+  "problem": "claude-app (pool rename) priced as notional Anthropic.",
+  "verdict": "KEEP"
+ },
  "nopr:b56024aa7a": {
   "branch": null,
   "evidence": {
@@ -1258,6 +2295,25 @@
   },
   "notes": "",
   "problem": "Link a compaction to a same-turn preceding fallback ('after model fallback' rider).",
+  "verdict": "KEEP"
+ },
+ "nopr:e57e66e59f": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#2"
+    ],
+    "loc": 43
+   },
+   "fires": "see #2",
+   "original": "commit e57e66e59f (43 loc).",
+   "upstream_fix": "upstream turn_usage.record_response_usage (partial)",
+   "upstream_state": "GREEN-partial (read-only): upstream agent._last_turn_usage is set at ../up/agent/turn_usage.py:157 (in-memory only; not persisted)"
+  },
+  "notes": "In-memory half is upstream; the persisted half is #2.",
+  "problem": "Retain the last provider-call token snapshot on the agent.",
   "verdict": "KEEP"
  },
  "nopr:f20f0cc2cc": {
