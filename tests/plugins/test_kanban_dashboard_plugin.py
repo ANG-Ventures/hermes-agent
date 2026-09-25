@@ -285,6 +285,55 @@ def test_patch_review_lifecycle_preserves_handoff_and_refuses_shortcut(client):
         )
 
 
+@pytest.mark.parametrize("bulk", [False, True])
+def test_review_card_cannot_leave_review_via_any_direct_status(client, bulk):
+    """review -> triage -> todo (and scheduled/ready) is refused on single AND
+    bulk routes; the card stays in review with no rework event (t_164f0178 F1)."""
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "walk", "assignee": "builder"},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "review", "assignee": "reviewer"},
+    ).status_code == 200
+    for status in ("triage", "todo", "scheduled", "ready"):
+        if bulk:
+            response = client.post(
+                "/api/plugins/kanban/tasks/bulk",
+                json={"ids": [task["id"]], "status": status},
+            )
+            assert response.status_code == 200, response.text
+            result = response.json()["results"][0]
+            assert result["ok"] is False and "full coverage" in result["error"], result
+        else:
+            response = client.patch(
+                f"/api/plugins/kanban/tasks/{task['id']}", json={"status": status},
+            )
+            assert response.status_code == 409, (status, response.text)
+            assert "full coverage" in response.json()["detail"]
+        with kb.connect() as conn:
+            assert kb.get_task(conn, task["id"]).status == "review", status
+    with kb.connect() as conn:
+        kinds = {event.kind for event in kb.list_events(conn, task["id"])}
+    assert "changes_requested" not in kinds and "review_reopened" not in kinds
+
+
+def test_set_status_direct_owns_the_review_exit_guard(client):
+    """The guard lives in _set_status_direct itself, not only in the routes."""
+    from plugins.kanban.dashboard import plugin_api
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "direct", "assignee": "builder"},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "review", "assignee": "reviewer"},
+    ).status_code == 200
+    with kb.connect() as conn:
+        for status in ("triage", "todo", "ready"):
+            assert plugin_api._set_status_direct(conn, task["id"], status) is False
+            assert kb.get_task(conn, task["id"]).status == "review"
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 

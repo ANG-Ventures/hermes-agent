@@ -85,7 +85,9 @@ def test_verdicts_route_through_distinct_terminal_actions(skill_text: str) -> No
 def test_review_runs_all_four_lenses_every_round(skill_text: str) -> None:
     """Every round grades the whole deliverable: four lenses, one batch, one record."""
     lenses = skill_text.split("## Review Lenses", 1)[1].split("## Procedure", 1)[0]
-    for lens in ("contract", "execution", "cross-vendor", "mutation"):
+    from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES
+
+    for lens in REQUIRED_REVIEW_LENSES:
         assert lens in lenses
     # All lenses launch together as one delegate batch whose id is recorded.
     assert "`delegate_task" in lenses
@@ -95,7 +97,7 @@ def test_review_runs_all_four_lenses_every_round(skill_text: str) -> None:
         line for line in lenses.splitlines() if "review_coverage:" in line and "{" in line
     )
     payload = json.loads(example.strip().strip("`").split("review_coverage:", 1)[1])
-    assert set(payload["lenses"]) == {"contract", "execution", "cross-vendor", "mutation"}
+    assert tuple(payload["lenses"]) == REQUIRED_REVIEW_LENSES
     for key in ("findings", "items", "review_minutes", "battery", "batch_id"):
         assert key in payload
     assert payload["findings"] == len(payload["items"]) >= 1

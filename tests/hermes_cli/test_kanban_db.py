@@ -4010,7 +4010,6 @@ def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
     verb_kinds = {
         "unblock_task": "unblocked",
         "request_changes": "changes_requested",
-        "reopen_review_task": "review_reopened",
         "triage_resolve_task": "triage_resolved",
         "reopen_task": "reopened",
         "requeue_task": "requeued",

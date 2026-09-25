@@ -4387,30 +4387,16 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
 
 
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
+    """Retired verb: a review returns to its implementer only via request-changes."""
     ids = list(args.task_ids or [])
     if not ids:
         print("at least one task_id is required", file=sys.stderr)
         return 1
-    reason = getattr(args, "reason", None)
-    if reason is not None:
-        reason = str(kb.redact_review_value(reason.strip())).strip() or None
-    author = _profile_author() if reason else None
-    failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.reopen_review_task(conn, tid):
-                failed.append(tid)
-                print(f"cannot reopen {tid}: legacy bypass retired; claim review and use request-changes with full coverage", file=sys.stderr)
-            else:
-                if reason:
-                    kb.add_comment(
-                        conn,
-                        tid,
-                        author or "operator",
-                        f"CHANGES REQUESTED: {reason}",
-                    )
-                print(f"Reopened {tid}" + (f": {reason}" if reason else ""))
-    return 0 if not failed else 1
+            kb.reopen_review_task(conn, tid)
+            print(f"cannot reopen {tid}: legacy bypass retired; claim review and use request-changes with full coverage", file=sys.stderr)
+    return 1
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
