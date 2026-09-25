@@ -212,6 +212,148 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 
+# ─── Coalescing off-loop JSON persistence ────────────────────────────────────
+
+
+class CoalescingJsonWriter:
+    """Persist a JSON snapshot at most once per ``min_interval_s``, off the loop.
+
+    WHY: ``atomic_json_write`` ends in mkstemp + fsync + ``os.replace``, whose
+    duration is unbounded under filesystem contention.  On 2026-09-24 the
+    Discord adapter paid that rename inline on every outbound ``send`` (via
+    ``_DiscordRestartRecoveryState.mark_channel_active``) and the kanban
+    notifier's sends blocked the gateway event loop 46 times in 40 minutes
+    (``PHASE=event_loop_blocked site=utils.py:230 atomic_replace``, up to 20 s).
+
+    Contract:
+
+    * ``schedule()`` is cheap and never touches the disk: it marks the state
+      dirty and wakes a single daemon writer thread.  Safe to call from a
+      coroutine.
+    * The writer thread coalesces: any number of ``schedule()`` calls inside
+      one interval produce ONE write of the *latest* snapshot (leading edge if
+      the last write is older than the interval, trailing edge otherwise).
+    * ``snapshot`` is called on the writer thread at write time, so it must
+      take whatever lock guards the owner's state and return a JSON-able copy.
+    * ``flush()`` writes synchronously now (graceful shutdown / tests).  It is
+      a blocking call: coroutines use ``flush_async``.
+    * Snapshot + write happen under one lock, so a slower background write can
+      never land AFTER a newer flush and clobber it with older state.
+    """
+
+    def __init__(
+        self,
+        path_fn,
+        snapshot,
+        *,
+        min_interval_s: float,
+        name: str = "json-writer",
+        **dump_kwargs,
+    ):
+        self._path_fn = path_fn
+        self._snapshot = snapshot
+        self._interval = max(0.0, float(min_interval_s))
+        self._name = name
+        self._dump_kwargs = dump_kwargs
+        self._cv = threading.Condition()
+        self._dirty = False
+        self._stop = False
+        self._thread: threading.Thread | None = None
+        self._write_lock = threading.Lock()
+        self._busy = False  # writer thread has claimed a snapshot, not yet written
+        self._last_write_mono: float | None = None
+        self.writes = 0  # observable for tests / diagnostics
+
+    # -- producer side (loop-safe) -----------------------------------------
+
+    def schedule(self) -> None:
+        """Mark dirty and wake the writer. Never blocks on I/O."""
+        with self._cv:
+            self._dirty = True
+            if self._thread is None or not self._thread.is_alive():
+                self._stop = False
+                self._thread = threading.Thread(
+                    target=self._run, name=self._name, daemon=True
+                )
+                self._thread.start()
+            self._cv.notify_all()
+
+    # -- writer thread -----------------------------------------------------
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._dirty and not self._stop:
+                    self._cv.wait()
+                if self._stop and not self._dirty:
+                    return
+                # Honour the per-file rate limit; wakeups from further
+                # schedule() calls just re-check the deadline.
+                while self._dirty and not self._stop:
+                    last = self._last_write_mono
+                    if last is None:
+                        break
+                    remaining = last + self._interval - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._cv.wait(remaining)
+                if not self._dirty:
+                    continue  # a flush() already wrote it
+                self._dirty = False
+                self._busy = True
+            try:
+                self._write_now()
+            except Exception:
+                logger.debug("[%s] background persist failed", self._name, exc_info=True)
+            finally:
+                with self._cv:
+                    self._busy = False
+                    self._cv.notify_all()
+
+    def _write_now(self) -> None:
+        with self._write_lock:
+            payload = self._snapshot()
+            atomic_json_write(self._path_fn(), payload, **self._dump_kwargs)
+            self._last_write_mono = time.monotonic()
+            self.writes += 1
+
+    # -- synchronous / shutdown side ---------------------------------------
+
+    def flush(self) -> None:
+        """Write the current snapshot now, regardless of the interval.
+
+        Blocking (disk I/O).  Coroutines must use :meth:`flush_async`.
+        """
+        with self._cv:
+            self._dirty = False
+        self._write_now()
+
+    async def flush_async(self) -> None:
+        await asyncio.to_thread(self.flush)
+
+    def close(self, *, flush: bool = True) -> None:
+        """Stop the writer thread (optionally after a final flush). Blocking."""
+        if flush:
+            self.flush()
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5.0)
+
+    def wait_idle(self, timeout: float = 5.0) -> bool:
+        """Block until no write is pending or in flight (tests / diagnostics)."""
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            while self._dirty or self._busy:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(remaining)
+            return True
+
+
 # ─── Thread Participation Tracking ───────────────────────────────────────────
 
 
