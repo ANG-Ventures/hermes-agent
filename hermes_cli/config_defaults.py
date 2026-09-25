@@ -3141,11 +3141,15 @@ DEFAULT_CONFIG = {
         "max_review_rounds": 3,
         # "all" (default): every request_review routes to review_assignee.
         # "milestone_only": only cards whose title/body carry "[milestone]"
-        # or that are parents in task_links get a reviewer session; every
+        # or "qa:required" get a reviewer session (being a task_links parent
+        # does NOT count — fan-in QA makes every slice a parent); every
         # other card that asks for review is completed in place with a
         # review_skipped event (CI is the gate for slice work) — even when
         # the worker names a reviewer profile; only reviewer=human or
         # --force bypasses it.
+        # "none": no card gets a reviewer session (same bypasses).
+        # A present-but-unknown/empty value fails to "none" (never "all")
+        # and logs review_policy_invalid.
         "review_policy": "all",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,

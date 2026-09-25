@@ -10999,6 +10999,7 @@ def configured_review_assignee() -> Optional[str]:
 
 DEFAULT_MAX_REVIEW_ROUNDS = 3
 MILESTONE_MARKER = "[milestone]"
+QA_REQUIRED_MARKER = "qa:required"
 REVIEW_POLICIES = ("all", "milestone_only", "none")
 
 
@@ -11008,8 +11009,10 @@ def configured_max_review_rounds() -> int:
     A "round" is one ``changes_requested`` verdict. Once a card has collected
     this many, the NEXT ``request_review`` does not re-spawn the reviewer: the
     card is BLOCKED (``needs_input``) for the orchestrator to take over. Measured
-    2026-09-24 (Mac Studio): 458 reviewed cards / 7d averaged 10.8 rounds, max
-    123, 107 cards at 13+ — the tail that produced 498 reviewer sessions a day.
+    2026-09-24 (Mac Studio): 458 reviewed cards / 7d averaged 10.8 reviewer
+    SESSIONS per card (incl. rate-limited respawns — not changes_requested
+    rounds), max 123, 107 cards at 13+ — the tail that produced 498 reviewer
+    sessions a day.
     Default :data:`DEFAULT_MAX_REVIEW_ROUNDS`.
     """
     try:
@@ -11037,33 +11040,41 @@ def configured_review_policy() -> str:
     gate for slice work, the reviewer profile is functional QA at milestones.
     Applies even when a reviewer PROFILE is named explicitly; only the
     ``human`` sentinel or ``force=True`` bypasses it.
+
+    A MISSING key keeps the documented default ``all``. A PRESENT-but-invalid
+    value (unknown, empty) or an unreadable config fails to ``none`` — never
+    to ``all`` — and logs a ``review_policy_invalid`` WARNING (spec §0.1 F0:
+    a typo must not silently re-enable a reviewer on every card).
     """
     try:
         from hermes_cli.config import load_config
 
-        value = (load_config() or {}).get("kanban", {}).get("review_policy", "all")
-    except Exception:
-        return "all"
-    value = str(value or "all").strip().lower()
-    return value if value in REVIEW_POLICIES else "all"
+        kanban_cfg = (load_config() or {}).get("kanban", {}) or {}
+        if "review_policy" not in kanban_cfg:
+            return "all"
+        raw = kanban_cfg.get("review_policy")
+    except Exception as exc:
+        _log.warning("review_policy_invalid: config unreadable (%s); using 'none'", exc)
+        return "none"
+    value = str(raw if raw is not None else "").strip().lower()
+    if value in REVIEW_POLICIES:
+        return value
+    _log.warning("review_policy_invalid: %r is not one of %s; using 'none'", raw, REVIEW_POLICIES)
+    return "none"
 
 
 def is_milestone_card(conn: sqlite3.Connection, task_id: str) -> bool:
-    """A card is a milestone when its title/body carries ``[milestone]`` (any
-    case) or it is a PARENT in ``task_links`` (an umbrella closing over its
-    children). Slice cards — leaves without the marker — are not."""
+    """A card is a milestone when its title/body carries ``[milestone]`` or
+    ``qa:required`` (any case). Nothing else: being a PARENT in ``task_links``
+    does NOT qualify — under fan-in QA every slice is the parent of its QA
+    card (spec §5.2), so a parent clause routed every slice to a reviewer."""
     row = conn.execute(
         "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False
     text = f"{row['title'] or ''}\n{row['body'] or ''}".lower()
-    if MILESTONE_MARKER in text:
-        return True
-    child = conn.execute(
-        "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
-    ).fetchone()
-    return child is not None
+    return MILESTONE_MARKER in text or QA_REQUIRED_MARKER in text
 
 
 def count_review_rounds(conn: sqlite3.Connection, task_id: str) -> int:
@@ -11367,7 +11378,7 @@ def request_review(
                     )
             return _ret(False, reason)
 
-    # ── Review policy (kanban.review_policy=milestone_only) ────────────────
+    # ── Review policy (kanban.review_policy=milestone_only|none) ────────────────
     # Slice cards do not get a reviewer session; CI is their gate. They are
     # COMPLETED here with a review_skipped event so the orchestrator's merge
     # pass sees them as done-with-PR. The policy applies even when the worker
@@ -11390,16 +11401,17 @@ def request_review(
             if not done:
                 return _ret(
                     False,
-                    "review_policy=milestone_only: card is not a milestone and "
+                    f"review_policy={_policy}: card needs no review session and "
                     "could not be completed in place (not running/ready, or "
                     "expected_run_id mismatch)",
                 )
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "review_skipped",
-                    {"policy": "milestone_only", "summary": (summary or "")[:400] or None},
+                    {"policy": _policy, "summary": (summary or "")[:400] or None},
                 )
-            return _ret(True, "review skipped (non-milestone card, kanban.review_policy=milestone_only) — card completed; CI is the gate")
+            _why = "review_policy=none" if _policy == "none" else "non-milestone card"
+            return _ret(True, f"review skipped ({_why}, kanban.review_policy={_policy}) — card completed; CI is the gate")
 
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
