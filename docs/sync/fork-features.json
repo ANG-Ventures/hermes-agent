@@ -330,26 +330,6 @@
     "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py::test_branch_keeps_the_fork_alias"
   },
   {
-    "feature": "slash command /merge (fold a branch summary into its parent session)",
-    "tests": [
-      "tests/gateway/test_discord_branch_thread_merge.py::TestMergeCommand"
-    ],
-    "paths": [
-      "hermes_cli/commands.py",
-      "gateway/run.py",
-      "plugins/platforms/discord/adapter.py"
-    ],
-    "why": "Idempotent, owner-guarded fold-back of a branched session into its parent; writes ~/.hermes/merges/*.md. gateway_only=True is a load-bearing CONTRACT, not decoration: /merge has no branch/parent thread to fold into on the CLI surface. A merge that drops the flag makes it appear in the CLI where it cannot work. The canary asserts the flag AND the asymmetry against /branch (which must stay CLI-available).",
-    "lifecycle": "fork-permanent",
-    "upstream_ref": null,
-    "absorbed_date": null,
-    "surfaces": [
-      "gateway",
-      "discord"
-    ],
-    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py::test_merge_is_gateway_only_and_branch_is_not"
-  },
-  {
     "feature": "slash command /fast (OpenAI Priority Processing / Anthropic Fast Mode toggle)",
     "tests": [
       "tests/gateway/test_fast_command.py"

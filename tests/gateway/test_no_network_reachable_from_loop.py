@@ -123,7 +123,6 @@ REACHABLE_BASELINE = frozenset({
     "gateway/slash_commands.py _handle_compress_command_inner -> urlopen",
     "gateway/slash_commands.py _handle_context_command -> requests.get",
     "gateway/slash_commands.py _handle_debug_command -> urlopen",
-    "gateway/slash_commands.py _handle_merge_command -> httpx.get",
     "gateway/slash_commands.py _handle_refine_command -> httpx.get",
     "gateway/slash_commands.py _handle_review_command -> urlopen",
     "plugins/platforms/matrix/adapter.py send_model_picker -> requests.get",
