@@ -1355,5 +1355,280 @@
   },
   "branch": null,
   "notes": "Follows gateway/routing_identity (gateway tranche #682). Measured by the absence of drift rows since 09-12. UPSTREAM candidate only together with routing_identity; alone it is fork glue."
+ },
+ "#71": {
+  "verdict": "UPSTREAM",
+  "problem": "Bare-target send_message/react inside a live messaging turn defaulted to the platform HOME channel, leaking mid-turn updates to a different channel (sometimes another platform).",
+  "evidence": {
+   "original": "PR #71 body: 2026-06-21 incident, Discord #instacart turn's progress checkpoint landed in #hermes; agent.log two-step signature 'Both target and message are required' then 'send_message completed (200 chars)'.",
+   "upstream_state": "RED (read-only; own test file importorskip('telegram') -> 1 skipped on both trees, not runnable in repo venv): ../up _handle_react@tools/send_message_tool.py:173 chat_id = get_home_channel(platform); _handle_send@tools/send_message_tool.py:236-238 used_home_channel -> _home_chat_id; no origin resolver (0 hits _resolve_send_target/_has_messaging_origin in ../up)",
+   "upstream_fix": "none (git log upstream/main -S'get_home_channel' -- tools/send_message_tool.py: only refactors 08ff1c1aa8/156f4fba92, still homes)",
+   "fires": "0 runtime log lines ('send_message routed to current-turn origin' 0, 'Sent to current channel' 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)); state.db tool-role send_message results (all 12 profile DBs, read-only 2026-09-25; send_message tool rows only exist 06-02→06-23): 'Sent to current channel' 3 (all 2026-06-22), home-channel success 3 (06-22) + aegis 1 (06-09). Low usage: fleet agents almost always pass explicit targets.",
+   "cost": {
+    "loc": 497,
+    "conflict_syncs": 1,
+    "conflict_files": 1,
+    "dependents": [
+     "#83",
+     "#88",
+     "nopr:f578c82019"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Real misroute class still present upstream and generic (any gateway user with a home channel). Rarely fires on this fleet (3 in 06-02→09-25) so the fork cost (497 loc) is not justified as a fork patch — propose upstream, then drop ours. Same patch-id as nopr:f578c82019 (duplicate row). Upstream branch not built this run (see handoff)."
+ },
+ "nopr:f578c82019": {
+  "verdict": "DROP",
+  "problem": "Duplicate of #71: identical patch (git patch-id 9e049eb0ce for both 78d2c65fc3 and f578c82019), both ancestors of origin/main via two history lines on 2026-06-21.",
+  "evidence": {
+   "original": "commit f578c82019 body == #71 body; parent 7cb39d1319 vs #71 parent d06f6b327a.",
+   "upstream_state": "n/a — see #71 (RED read-only: ../up tools/send_message_tool.py:173,236)",
+   "upstream_fix": "none (see #71)",
+   "fires": "n/a — no separate code on main; the content fires as #71 (3 in 06-02→09-25)",
+   "cost": {
+    "loc": 497,
+    "conflict_syncs": 1,
+    "conflict_files": 1,
+    "dependents": [
+     "#71"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Row-level DROP only: this is a census duplicate, there is nothing separate to revert (reverting it would revert #71). Verdict for the code follows #71 (UPSTREAM)."
+ },
+ "#83": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Subagent bare send_message leaked to home because delegate children ran in a bare ThreadPoolExecutor with an EMPTY contextvars.Context (no HERMES_SESSION_* origin); adds dedicated _SEND_ORIGIN_* contextvars bound around the child run.",
+  "evidence": {
+   "original": "PR #83 body: after #71 deployed, a #tdd progress update still landed in #hermes; root cause = no copy_context in _run_single_child worker.",
+   "upstream_state": "GREEN on the root cause (read-only): ../up tools/delegate_tool_child_run.py:862 executor.submit(contextvars.copy_context().run, _run_with_thread_capture) and tools/delegate_tool_dispatch.py:150 (batch) — children inherit the parent's session contextvars. Upstream still homes bare targets, but that is #71's bug, not this one. Own test file importorskip('telegram') -> 1 skipped both trees.",
+   "upstream_fix": "8e9628e9cf / 52419bda5d / 64957b7e02 (git log upstream/main -G'copy_context().run' -- tools/delegate_tool*.py)",
+   "fires": "0: 'send_message home-fallback despite session_key present' 0, 'send-origin bind skipped' 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25); state.db mentions only in transcripts",
+   "cost": {
+    "loc": 814,
+    "conflict_syncs": 3,
+    "conflict_files": 3,
+    "dependents": [
+     "#71"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Only meaningful on top of #71's resolver. If #71 goes upstream, the child path works via upstream's copy_context (the resolver reads HERMES_SESSION_* from the copied context); the dedicated _SEND_ORIGIN_* vars + tripwire are fork-only duplication. 814 loc / 3 ledger files for a path that never logged. Drop together with #71 once #71 lands upstream (not independently revertable today — #71 on fork reads get_send_origin())."
+ },
+ "#88": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "In-process cron tick set os.environ HERMES_CRON_SESSION=1 process-globally and never cleared it, so every later interactive turn read as cron (send_message homed; approval gate auto-approved cron children).",
+  "evidence": {
+   "original": "PR #88 body: caught live on gateway PID 95240 — terminal subprocess showed HERMES_CRON_SESSION=1 in the gateway env; bare send_message returned 'Sent to discord home channel' while the user was in #fix-issues.",
+   "upstream_state": "GREEN (read-only): ../up cron/scheduler.py:2305-2312 _cron_session_var = _VAR_MAP['HERMES_CRON_SESSION'], enter() sets via ContextVar token and exit() resets; ../up tools/approval_context.py:128 reads via _session_env. Own tests on ../up: 11 failed/1 passed + 5 failed — they import fork-only names (set_cron_session/is_cron_session/_bind_child_cron_session), so RED here is API shape, not the bug.",
+   "upstream_fix": "fb6446fc9e fix(cron): scope cron approval context per session (2026-08-03)",
+   "fires": "0: 'cron-session bind skipped' 0, 'is_cron_session import failed' 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 768,
+    "conflict_syncs": 3,
+    "conflict_files": 7,
+    "dependents": [
+     "#71"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Upstream fixed the latch with the same ContextVar design (cron store rework era). Drop ours, take theirs; delegate-child cron rebinding covered upstream by copy_context in delegate_tool_child_run.py:862. High conflict cost (7 files x3 syncs)."
+ },
+ "#583": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Explicit child-toolset requests skipped _strip_blocked_tools (inherited/fallback paths stripped); defense-in-depth.",
+  "evidence": {
+   "original": "PR #583 body: self-described 'defense-in-depth, not a known live escalation' — leaf children already get child_disabled_toolsets.",
+   "upstream_state": "GREEN (read-only): ../up tools/delegate_tool_toolsets.py:110 child_toolsets = _strip_blocked_tools(child_toolsets) runs after ALL three branches (explicit/inherited/fallback) and :117-119 re-adds delegation for orchestrators. own tests (data/runtests_clean.py: row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP 1 error (collection: fork test module imports fork-only helpers) FM 3 passed.",
+   "upstream_fix": "3e96c87f37 (2026-04-22) strip after all branches; d77505c007 (2026-09-02) extracted to delegate_tool_toolsets.py",
+   "fires": "n/a — no log line; 0 relevant hits in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 153,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "nopr:30a8a063e9"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "The gap only existed on the fork because nopr:30a8a063e9 removed stripping from the explicit path; upstream never had it. Drop both together and take upstream's resolver (conflicts 2 files x3 syncs)."
+ },
+ "nopr:30a8a063e9": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "(1) code_execution was on the subagent block list though children already get terminal; (2) stop stripping blocked tools from explicit toolsets.",
+  "evidence": {
+   "original": "commit 30a8a063e9 body (no PR/card): 'compute SHA256 + sum of primes' child silently had no execute_code.",
+   "upstream_state": "GREEN (read-only): ../up tools/delegate_tool_toolsets.py:14-21 DELEGATE_BLOCKED_TOOLS = delegate_task/clarify/memory/send_message/cronjob_manage — execute_code not blocked; part (2) was reversed on the fork itself by #583. own tests (data/runtests_clean.py: row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP 1 error (collection), FM 1 passed.",
+   "upstream_fix": "upstream DELEGATE_BLOCKED_TOOLS no longer lists execute_code (../up tools/delegate_tool_toolsets.py:14)",
+   "fires": "n/a — no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 29,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "#583"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Part 1 is upstream behavior; part 2 was undone by #583. Nothing fork-specific left of value."
+ },
+ "#662": {
+  "verdict": "UPSTREAM",
+  "problem": "Model-supplied args the schema does not declare were silently dropped by name-reading handlers; adds log-by-default + opt-in strict_args rejection (delegate_task strict).",
+  "evidence": {
+   "original": "PR #662 body: 2026-09-09 delegate_task called with model={provider,model} (no such param); override vanished, children ran on capped default and 429'd in 20 s; two fan-outs burned.",
+   "upstream_state": "RED: own tests (data/runtests_clean.py: row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP 6 failed (no strict_args/unknown-arg handling in ../up tools/registry.py — 0 hits 'additionalProperties'/'unknown' in dispatch) FM 1 failed, 5 passed (test_delegate_task_legacy_single_goal_shape_is_not_rejected — later fork drift of delegate_task schema, not a regression of this patch).",
+   "upstream_fix": "none (0 hits in ../up tools/registry*.py)",
+   "fires": "'the handler will ignore them unless it checks explicitly' 5507 log lines (fork warning, log-only mode) in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) — models pass undeclared args constantly",
+   "cost": {
+    "loc": 128,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic registry-level contract; measured heavily. Propose upstream (registry option + delegate_task opt-in). Fix the stale FM test before proposing. Upstream branch not built this run."
+ },
+ "#204": {
+  "verdict": "KEEP",
+  "problem": "/boomerang inherit_context folded parent transcript from conversation_history (CLI-only attr); gateway AIAgent keeps it in _session_messages, so gateway children inherited nothing.",
+  "evidence": {
+   "original": "PR #204 body: live gateway E2E returned 'INHERITED: no' after #203 shipped.",
+   "upstream_state": "read-only: upstream has no inherit_context/boomerang (0 hits 'inherit_context' in ../up tools/delegate_tool*.py) — fork-only feature. own tests (data/runtests_clean.py: row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP 1 error (import), FM 2 passed.",
+   "upstream_fix": "n/a — fork-only feature (#203)",
+   "fires": "no log line; follows #203 usage (see #203 row). 0 direct hits in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 87,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#203"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Bugfix to fork-only /boomerang (#203). Verdict follows #203: if #203 is dropped, drop this with it."
+ },
+ "#553": {
+  "verdict": "UPSTREAM",
+  "problem": "Terminal output drain used select(); for stdout fd >= FD_SETSIZE (1024) select raises ValueError, the drain returns silently, every command returns output '' exit 0 (and write_file readback fails).",
+  "evidence": {
+   "original": "PR #553 body: 3 incidents (2026-08-07, 08-09 x2), each cleared only by gateway restart.",
+   "upstream_state": "RED (live repro, $HOME/tmp-audit553.py against ../up with repo venv): Popen('echo hello-from-child') stdout dup2'd to fd 1500, ../up tools/environments/base_output.py _drain_fd_select → captured: '' (fork uses select.poll(), fm/tools/environments/base.py:1259). Same select() pattern in ../up tools/process_registry.py:1409 (_reader_loop).",
+   "upstream_fix": "none (../up base_output.py:406 still select.select([fd])) ",
+   "fires": "no log line (the failure is silent by nature); 3 incidents cited; 0 fires countable in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 304,
+    "conflict_syncs": 1,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic, silent-data-loss class, live-reproduced on upstream. Strong UPSTREAM (upstream split the drain into base_output.py — patch must be re-ported there + process_registry _reader_loop). Upstream branch not built this run."
+ },
+ "#415": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "_reconcile_local_exit's orphaned-pipe drain did read-to-EOF with O_NONBLOCK; a continuously-writing descendant pinned the poll() worker thread forever.",
+  "evidence": {
+   "original": "PR #415 body: 2026-07-23 'codex login 2>&1 &' pinned two gateway worker threads ~2h each (py-spy).",
+   "upstream_state": "GREEN by restructure (read-only): ../up tools/process_registry.py:1938-1952 — when the reader is selectable and alive, reconcile sets session._reader_finish_requested and lets the bounded select loop (:1405-1425, idle_after_exit) publish; the unbounded stdout.read() fallback (:1966-1970) only runs for non-selectable readers. own tests (data/runtests_clean.py: row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP 1 error (collection), FM 3 passed.",
+   "upstream_fix": "fcce28b5a4 (2026-09-22) reader-owned completion (_reader_finish_requested); 1bfbeff4e5 (2026-09-14)",
+   "fires": "'Reconciled session' 4 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (reconcile path itself rare)",
+   "cost": {
+    "loc": 218,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Upstream reworked the reader/reconcile ownership so the busy drain is off the common path. Residual risk: non-selectable reader fallback still reads to EOF — low (fd-less streams). 218 loc, 0 conflict files — cheap either way; drop ours on the next sync."
+ },
+ "#788": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Reader loss (stdout EOF/read failure) marked a still-running child exited with exit_code=None.",
+  "evidence": {
+   "original": "PR #788 body (no incident id); guard log 'Refusing unknown exit status for' is the fork's.",
+   "upstream_state": "GREEN (read-only): ../up tools/process_registry.py _finish_reader (:1433-1454): after EOF it wait()s for the real exit; if wait fails and exit_code() is None it logs and 'leaving process tracked' instead of publishing a completion. own tests (data/runtests_clean.py: row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP 5 failed (fork-only names stdout_closed/'handle-lost'), FM 5 passed.",
+   "upstream_fix": "1bfbeff4e5 fix(process): reap children after early stdout EOF (2026-09-14)",
+   "fires": "'Refusing unknown exit status for … process handle lost' 60 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (clustered at gateway SIGTERM shutdowns, e.g. daedalus gateway.error.log 2026-09-21 11:31:36) — the condition is real; upstream handles it the same way",
+   "cost": {
+    "loc": 149,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Same fix upstream a month later. Drop ours (149 loc, 0 conflict files) on the next sync."
+ },
+ "nopr:4d626ac813": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Shared env snapshot (export -p re-sourced by every command) carried session-identity vars across sessions on the shared 'default' LocalEnvironment (cross-session misbinding).",
+  "evidence": {
+   "original": "commit 4d626ac813 body: 2026-07-10 cross-session misbinding, second live occurrence (a hermetic test's HERMES_HOME surfaced in another session's shell).",
+   "upstream_state": "GREEN (read-only): ../up tools/environments/base_session_env.py:29-31 _SNAPSHOT_EXCLUDED_ENV_REGEX excludes HERMES_SESSION*/cron/delegation markers from the snapshot. own tests (data/runtests_clean.py: row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP 1 error, FM 1 error (test module collection error on BOTH trees — stale test, not evidence either way).",
+   "upstream_fix": "f2e32ceead fix(terminal): stop shared bash snapshot leaking HERMES_SESSION_* across sessions (2026-07-23)",
+   "fires": "no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 159,
+    "conflict_syncs": 1,
+    "conflict_files": 2,
+    "dependents": [
+     "nopr:124a8c0706",
+     "#543"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Upstream took the same exclusion approach 13 days later. Drop ours."
+ },
+ "nopr:124a8c0706": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Follow-up to 4d626ac813: pin snapshot temp name in the parent shell, widen exclusion regex to digits, review fixes.",
+  "evidence": {
+   "original": "commit 124a8c0706 body (Greptile P2 review fixes).",
+   "upstream_state": "GREEN (read-only): ../up tools/environments/base_session_env.py:36-37 _SNAP_TMP = \"$__hermes_snap_tmp\" allocated via mktemp; exclusion is by name/prefix unset (issue #71296), not grep. No own tests added to run.",
+   "upstream_fix": "911d380296 fix(tools): allocate snapshot temp paths with mktemp instead of $BASHPID (2026-08-03)",
+   "fires": "no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 95,
+    "conflict_syncs": 1,
+    "conflict_files": 2,
+    "dependents": [
+     "nopr:4d626ac813"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows 4d626ac813."
+ },
+ "#543": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Per-execution identity markers (delegated-child / worker markers) captured into the shared shell snapshot and re-sourced by later commands.",
+  "evidence": {
+   "original": "PR #543 body: orchestrator session's shell reported the delegated-child marker =1 hours after its child exited.",
+   "upstream_state": "GREEN (read-only): ../up tools/environments/base_session_env.py:29-31 exclusion list includes the delegated/worker execution markers (the same var names #543 adds). own tests (data/runtests_clean.py: row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP 1 error (collection), FM 7 passed.",
+   "upstream_fix": "f2e32ceead (2026-07-23) + later upstream widenings of _SNAPSHOT_EXCLUDED_ENV_REGEX (issue #71296)",
+   "fires": "no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 122,
+    "conflict_syncs": 1,
+    "conflict_files": 1,
+    "dependents": [
+     "nopr:4d626ac813"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Upstream exclusion set covers these markers. Drop ours."
  }
 }
