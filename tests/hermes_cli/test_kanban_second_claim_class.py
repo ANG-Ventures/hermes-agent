@@ -234,6 +234,7 @@ def test_live_unrelated_pid_from_prior_claim_can_be_reclaimed(conn, monkeypatch)
     # after this run. Keep both event stamps consistently old.
     conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? "
                  "AND kind IN ('claimed', 'spawned')", (time.time() - 120, tid))
+    _shift_spawn_token(conn, tid, -120)
     monkeypatch.setattr(kb, "_pid_started_in_claim", kb._real_pid_started_in_claim)
     assert kb.claim_task(conn, tid) is not None
 
@@ -603,9 +604,10 @@ def test_ttl_expiry_requeues_host_local_claim_whose_worker_is_proven_dead(
 
 
 # ---------------------------------------------------------------------------
-# Owner identity: a live PID counts as the prior owner only if its process was
-# created inside the recording run's causal window
-# [claimed_at - 1 s, spawned_at + 2 s]. Liveness alone is not identity: a
+# Owner identity: a live PID counts as the prior owner only if its start token
+# matches the one ``_set_worker_pid`` recorded (t_21dfa673: immune to wall-clock
+# steps), or -- legacy rows without a token -- if its process was created inside
+# the recording run's causal window [claimed_at - 1 s, spawned_at + 2 s]. Liveness alone is not identity: a
 # recycled PID must not strand the card, and a genuine worker whose
 # ``spawned`` event was delayed by DB lock contention must still be refused.
 # ---------------------------------------------------------------------------
@@ -639,6 +641,32 @@ def _backdate_run(conn, run_id, seconds=7200):
         conn.execute(
             "UPDATE task_runs SET started_at = started_at - ? WHERE id = ?",
             (seconds, run_id))
+        conn.execute(
+            "UPDATE task_events SET payload = json_set(payload, '$.start_token', "
+            "json_extract(payload, '$.start_token') - ?) WHERE run_id = ? "
+            "AND kind = 'spawned' "
+            "AND json_extract(payload, '$.start_token') IS NOT NULL",
+            (seconds, run_id))
+
+
+def _shift_spawn_token(conn, tid, delta):
+    """Move the recorded start token: the run recorded a DIFFERENT process."""
+    with kb.write_txn(conn):
+        n = conn.execute(
+            "UPDATE task_events SET payload = json_set(payload, '$.start_token', "
+            "json_extract(payload, '$.start_token') + ?) WHERE task_id = ? "
+            "AND kind = 'spawned' "
+            "AND json_extract(payload, '$.start_token') IS NOT NULL",
+            (delta, tid)).rowcount
+    assert n, "no recorded start_token to shift (arm would be vacuous)"
+
+
+def _strip_spawn_token(conn, tid):
+    """Turn the run's spawns into LEGACY rows (pre-t_21dfa673, no token)."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_events SET payload = json_remove(payload, '$.start_token') "
+            "WHERE task_id = ? AND kind = 'spawned'", (tid,))
 
 
 def _released_with_real_holder(conn, title):
@@ -770,6 +798,7 @@ def test_unreadable_create_time_fails_closed(conn, real_identity, monkeypatch):
     try:
         _backdate_run(conn, first.current_run_id)
         monkeypatch.setattr(kb, "_pid_create_time", lambda pid: None)
+        monkeypatch.setattr(kb, "_pid_start_token", lambda pid: None)
         spawned, _ = _dispatch(conn)
         assert tid not in spawned
         rej = _events(conn, tid, "claim_rejected")[-1]
@@ -779,12 +808,190 @@ def test_unreadable_create_time_fails_closed(conn, real_identity, monkeypatch):
         _stop(proc)
 
 
-def test_boot_time_holder_is_not_the_owner(conn, real_identity, monkeypatch):
+@pytest.mark.parametrize("legacy", [False, True], ids=["token", "legacy-window"])
+def test_boot_time_holder_is_not_the_owner(conn, real_identity, monkeypatch, legacy):
     """PID 1 (and Linux's kthreadd, PID 2) was created before any claim, so it
     can never be the worker a run recorded."""
     tid, first = _live_claim(conn, "boot-time holder", pid=1)
+    if legacy:
+        _strip_spawn_token(conn, tid)
+    else:
+        # The recorded worker started with this run; PID 1 started at boot.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = json_set(payload, "
+                "'$.start_token', ?) WHERE task_id = ? AND kind = 'spawned'",
+                (kb._pid_start_token(os.getpid()), tid))
     assert kb.block_task(conn, tid, reason="operator")
     assert kb.unblock_task(conn, tid)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == 1)
     spawned, _ = _dispatch(conn)
     assert tid in spawned
+
+
+# --- t_21dfa673: clock-step immunity + pinned contract edges ----------------
+
+
+def _real_create_time(pid):
+    import psutil
+    return float(psutil.Process(pid).create_time())
+
+
+def _clock_stepped(monkeypatch, pid, step):
+    """Simulate a wall-clock step of ``step`` s since the worker spawned: the
+    epoch create time psutil reports moves with the clock, the event stamps
+    already written do not, and the kernel start token does not either."""
+    real = _real_create_time(pid)
+    monkeypatch.setattr(
+        kb, "_pid_create_time",
+        lambda p: real + step if int(p) == pid else None)
+
+
+def test_spawn_records_start_token_of_the_worker(conn):
+    proc = _sleeper()
+    try:
+        tid, _ = _live_claim(conn, "token recorded", pid=proc.pid)
+        payload = _events(conn, tid, "spawned")[-1]
+        assert payload["pid"] == proc.pid
+        assert payload["start_token"] == kb._pid_start_token(proc.pid)
+    finally:
+        _stop(proc)
+
+
+@pytest.mark.parametrize("step", [10.0, -10.0], ids=["clock+10s", "clock-10s"])
+def test_clock_step_keeps_genuine_owner_verified(conn, real_identity,
+                                                 monkeypatch, step):
+    """The acceptance arm: the genuine live owner is still refused after a
+    +/-10 s clock step, because the recorded start token -- not the epoch
+    create time -- decides identity."""
+    tid, _, proc = _released_with_real_holder(conn, f"clock step {step}")
+    try:
+        _clock_stepped(monkeypatch, proc.pid, step)
+        spawned, _ = _dispatch(conn)
+        assert proc.poll() is None
+        assert tid not in spawned
+        rej = _events(conn, tid, "claim_rejected")[-1]
+        assert rej["prev_pid"] == proc.pid
+        assert rej["owner_identity"] == "verified"
+    finally:
+        _stop(proc)
+
+
+@pytest.mark.parametrize("step", [10.0, -10.0], ids=["clock+10s", "clock-10s"])
+def test_clock_step_on_legacy_row_documents_window_limit(conn, real_identity,
+                                                         monkeypatch, step):
+    """Legacy rows (no start token) still use the wall-clock window, so the
+    same step misclassifies the genuine owner as recycled. This is the known
+    residual for pre-t_21dfa673 rows; it pins that tokens are what fix it."""
+    tid, _, proc = _released_with_real_holder(conn, f"legacy clock step {step}")
+    try:
+        _strip_spawn_token(conn, tid)
+        _clock_stepped(monkeypatch, proc.pid, step)
+        spawned, _ = _dispatch(conn)
+        assert tid in spawned
+    finally:
+        _stop(proc)
+
+
+@pytest.mark.parametrize("delta", [0.5, -1.0, 7200.0],
+                         ids=["token+0.5s", "token-1s", "token-2h"])
+def test_start_token_mismatch_is_recycled(conn, real_identity, delta):
+    """A live PID whose start token differs from the recorded one is another
+    process. Pins the match tolerance: a sub-second miss is still a miss."""
+    tid, _, proc = _released_with_real_holder(conn, f"token miss {delta}")
+    try:
+        _shift_spawn_token(conn, tid, delta)
+        spawned, _ = _dispatch(conn)
+        assert proc.poll() is None
+        assert tid in spawned
+        assert not _events(conn, tid, "claim_rejected")
+    finally:
+        _stop(proc)
+
+
+def test_start_token_match_ignores_stale_event_stamps(conn, real_identity):
+    """Token match wins over the window: event stamps two hours off (lock
+    lag, clock step) cannot demote a PID whose token matches."""
+    tid, first, proc = _released_with_real_holder(conn, "token beats stamps")
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at = created_at - 7200 "
+                "WHERE run_id = ? AND kind IN ('claimed', 'spawned')",
+                (first.current_run_id,))
+        spawned, _ = _dispatch(conn)
+        assert tid not in spawned
+        assert _events(conn, tid, "claim_rejected")[-1]["owner_identity"] == "verified"
+    finally:
+        _stop(proc)
+
+
+def _restamp_run(conn, run_id, *, claimed_at=None, spawned_at=None,
+                 started_at=None, drop_claimed=False):
+    with kb.write_txn(conn):
+        if claimed_at is not None:
+            conn.execute("UPDATE task_events SET created_at = ? WHERE run_id = ? "
+                         "AND kind = 'claimed'", (claimed_at, run_id))
+        if spawned_at is not None:
+            conn.execute("UPDATE task_events SET created_at = ? WHERE run_id = ? "
+                         "AND kind = 'spawned'", (spawned_at, run_id))
+        if started_at is not None:
+            conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?",
+                         (started_at, run_id))
+        if drop_claimed:
+            # Legacy shape: no ``claimed`` event (the lock survives in another
+            # event's payload, as reclaimed.prev_lock does on old rows).
+            conn.execute("UPDATE task_events SET kind = 'claim_legacy' "
+                         "WHERE run_id = ? AND kind = 'claimed'", (run_id,))
+
+
+@pytest.mark.parametrize("edge", ["lead", "lag"])
+def test_legacy_window_edges_are_pinned(conn, real_identity, edge):
+    """A legacy-row holder created ~5 s outside either window edge is
+    recycled. Widening LEAD or LAG (to 60 s, say) flips this RED."""
+    tid, first, proc = _released_with_real_holder(conn, f"legacy edge {edge}")
+    try:
+        _strip_spawn_token(conn, tid)
+        c = _real_create_time(proc.pid)
+        # Literal contract values (LEAD 1 s, LAG 2 s): reading the constants
+        # here would let a widened mutant move the arm along with it.
+        if edge == "lead":   # holder 5 s before claimed_at - 1 s
+            at = c + 1 + 5
+        else:                # holder 5 s after spawned_at + 2 s
+            at = c - 2 - 5
+        _restamp_run(conn, first.current_run_id, claimed_at=at, spawned_at=at)
+        spawned, _ = _dispatch(conn)
+        assert tid in spawned
+    finally:
+        _stop(proc)
+
+
+@pytest.mark.parametrize("offset,owner", [(6.0, False), (0.0, True)],
+                         ids=["holder-before-started_at", "holder-at-started_at"])
+def test_legacy_row_without_claimed_event_uses_started_at(conn, real_identity,
+                                                          offset, owner):
+    """Rows with no ``claimed`` event take the lower window edge from
+    ``task_runs.started_at``. Dropping that fallback leaves the lower edge
+    unbounded and turns the 'before' arm RED."""
+    tid, first, proc = _released_with_real_holder(conn, f"started_at {offset}")
+    try:
+        _strip_spawn_token(conn, tid)
+        c = _real_create_time(proc.pid)
+        _restamp_run(conn, first.current_run_id, started_at=c + offset,
+                     spawned_at=c + offset, drop_claimed=True)
+        spawned, _ = _dispatch(conn)
+        assert (tid not in spawned) is owner
+    finally:
+        _stop(proc)
+
+
+def test_real_start_token_is_stable_and_distinct():
+    a, b = _sleeper(), _sleeper()
+    try:
+        ta = kb._pid_start_token(a.pid)
+        assert ta is not None and ta == kb._pid_start_token(a.pid)
+        assert kb._pid_start_token(b.pid) is not None
+        assert kb._pid_start_token(99999999) is None
+    finally:
+        _stop(a)
+        _stop(b)
