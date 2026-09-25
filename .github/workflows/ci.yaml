@@ -150,7 +150,13 @@ jobs:
       # hit a slice that had already run 412-784 s; the passing distribution is
       # 4-6 min. Shorter slices keep each job out of that window. Three PRs
       # (#651 x2, #660) were blocked by it with no test actually failing.
-      slice_count: 16
+      #
+      # 2026-09-24 (t_41004cb2): merge_group runs 8, pull_request keeps 16.
+      # The queue run is the only gate (the ruleset has no PR status checks),
+      # and all CI jobs share the 60-concurrent hosted cap: 13 in-flight
+      # runs at ~20 jobs held the queue at 0 merges in 40 min. Halving the
+      # gate's matrix halves its share of that cap.
+      slice_count: ${{ github.event_name == 'merge_group' && 8 || 16 }}
       test_scope: ${{ needs.detect.outputs.test_scope }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and

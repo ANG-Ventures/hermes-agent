@@ -1,0 +1,45 @@
+name: Cancel superseded PR CI
+
+# When a PR enters the merge queue, its in-flight pull_request CI run gates
+# nothing: the ruleset's only gate is the merge_group run on the queue ref.
+# Leaving it running spends ~20 jobs of the shared 60-concurrent hosted cap
+# that the queue's own run needs (measured 2026-09-24, t_41004cb2: 13 CI runs
+# in flight, 0 merges in 40 min with 20 queued).
+#
+# pull_request_target: runs this file from the base branch with a token that
+# can cancel runs, and never checks out or executes PR code.
+on:
+  pull_request_target:
+    types: [enqueued]
+
+permissions:
+  actions: write
+
+concurrency:
+  group: cancel-superseded-pr-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  cancel:
+    name: Cancel in-flight PR CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Best effort: a failure here only means the PR run finishes normally.
+    continue-on-error: true
+    steps:
+      - name: Cancel pull_request CI runs for the enqueued head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          for status in queued in_progress waiting pending requested; do
+            gh api "repos/$REPO/actions/workflows/ci.yaml/runs?event=pull_request&head_sha=$HEAD_SHA&status=$status&per_page=100" \
+              --jq '.workflow_runs[].id'
+          done | sort -u | while read -r run_id; do
+            [ -n "$run_id" ] || continue
+            echo "PR #$PR enqueued: cancelling pull_request CI run $run_id ($HEAD_SHA)"
+            gh api -X POST "repos/$REPO/actions/runs/$run_id/cancel" || echo "cancel $run_id failed (already finished?)"
+          done
