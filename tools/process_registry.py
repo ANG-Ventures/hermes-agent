@@ -1409,11 +1409,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
             if fd is not None:
                 import select as _select
                 session._reader_selectable = True
+                # poll(), not select(): select(2) cannot represent an fd >= FD_SETSIZE (1024), so a
+                # long-lived process's high-numbered pipe would break this loop at once and silently
+                # capture nothing from a healthy background process.
+                _poller = _select.poll()
+                _poller.register(fd, _select.POLLIN | _select.POLLHUP | _select.POLLERR)
             idle_after_exit = 0
             while True:
                 if fd is not None:
                     try:
-                        ready, _, _ = _select.select([fd], [], [], 0.2)
+                        ready = _poller.poll(200)  # milliseconds
+                    except InterruptedError:
+                        continue
                     except (ValueError, OSError):
                         break  # fd already closed
                     if not ready:

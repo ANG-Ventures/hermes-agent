@@ -6,6 +6,7 @@ stdout drain thread used by ``BaseEnvironment._wait_for_process``.
 """
 
 import codecs
+import logging
 import os
 import select
 import subprocess
@@ -18,6 +19,8 @@ from typing import IO, Callable, Protocol
 from hermes_constants import get_hermes_home
 from tools.tool_output_truncate import head_tail_split, truncation_notice
 from hermes_cli._subprocess_compat import windows_hide_flags
+
+logger = logging.getLogger(__name__)
 
 # Sentinel capacity for full-fidelity capture: large enough that the collector
 # never evicts, so bounded and unbounded modes share one code path.
@@ -196,9 +199,27 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
     return _BoundedOutputCollector(capture_limit, spill_path=spill_path)
 
 
-def _finalize_wait_result(collector: _BoundedOutputCollector, rendered: str, returncode: int | None) -> dict:
-    """Assemble a wait result, attaching spill metadata when overflow occurred."""
+def _finalize_wait_result(collector: _BoundedOutputCollector, rendered: str, returncode: int | None,
+                          drain_error: "list[str] | None" = None) -> dict:
+    """Assemble a wait result, attaching spill metadata when overflow occurred.
+
+    ``drain_error`` (default: the one the drain thread recorded on *collector*) is the reason the
+    drain aborted abnormally. Then the result FAILS LOUD: a marker is prepended to the output and
+    ``drain_error`` is set, so a capture we failed to read never looks like a command that printed
+    nothing."""
+    if drain_error is None:
+        drain_error = getattr(collector, "drain_error", None)
+    if drain_error:
+        reason = drain_error[0]
+        rendered = (
+            "[hermes] OUTPUT CAPTURE FAILED — the drain thread aborted "
+            f"({reason}). Any output below is INCOMPLETE and the exit code may not reflect the "
+            "command's real result. Re-run the command; if it repeats, use execute_code.\n"
+        ) + rendered
+        logger.error("terminal drain aborted abnormally (%s); returning a capture-failure marker", reason)
     result = {"output": rendered, "returncode": returncode}
+    if drain_error:
+        result["drain_error"] = drain_error[0]
     spill = collector.close_spill()
     if spill:
         result["output_total_chars"] = collector.total_chars
@@ -343,7 +364,7 @@ def _drain_stdout(proc: ProcessHandle, output: _BoundedOutputCollector, stop: "t
     """Drain ``proc.stdout`` into *output* until EOF or shortly after exit.
     ``for line in proc.stdout`` would block on ``readline()`` until EOF, and a backgrounded
     grandchild (``cmd &``, ``setsid cmd & disown``) inherits the pipe's write end — so the
-    tool would hang for the grandchild's lifetime. Instead we ``select()`` with a short poll
+    tool would hang for the grandchild's lifetime. Instead we ``poll()`` with a short timeout
     and stop ~300ms after bash exits even if the pipe has not EOF'd. Raw 4096-byte ``os.read``
     chunks can split a multibyte UTF-8 sequence, so an incremental decoder with
     ``errors="replace"`` buffers partial sequences across chunks. Streams without a real
@@ -394,17 +415,42 @@ def _drain_stdout(proc: ProcessHandle, output: _BoundedOutputCollector, stop: "t
             pass
 
 
+def _record_drain_error(output: _BoundedOutputCollector, exc: BaseException) -> None:
+    """Remember an abnormal drain abort on the collector (see ``_finalize_wait_result``)."""
+    try:
+        output.drain_error = [f"{type(exc).__name__}: {exc}"]
+    except Exception:
+        pass
+
+
 def _drain_fd_select(proc, fd: int, output: _BoundedOutputCollector, decoder, stop=None) -> None:
-    """POSIX drain: select() poll, stopping ~300ms after bash exits with the pipe idle, or
-    when *stop* is set (the pipe is being handed to another reader — yield-to-background)."""
+    """POSIX drain: poll(), stopping ~300ms after bash exits with the pipe idle, or when *stop*
+    is set (the pipe is being handed to another reader — yield-to-background).
+
+    ``poll()`` NOT ``select()``: select(2) cannot represent an fd at or above FD_SETSIZE (1024)
+    and raises ``ValueError: filedescriptor out of range in select()``. A long-lived process that
+    has accumulated fds then drained NOTHING from every command, returning an empty capture with
+    the real exit code — indistinguishable from a command that printed nothing (and making
+    write_file's read-back verification fail). poll() has no such ceiling."""
+    poller = select.poll()
+    try:
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    except (ValueError, OSError) as exc:
+        _record_drain_error(output, exc)
+        return
     idle_after_exit = 0
     while True:
         if stop is not None and stop.is_set():
             return
         try:
-            ready, _, _ = select.select([fd], [], [], 0.1)
-        except (ValueError, OSError):
-            return  # fd already closed
+            ready = poller.poll(100)  # milliseconds
+        except InterruptedError:
+            continue
+        except (ValueError, OSError) as exc:
+            # fd closed underneath us: benign once the process has exited, a real fault before.
+            if proc.poll() is None:
+                _record_drain_error(output, exc)
+            return
         if ready:
             try:
                 chunk = os.read(fd, 4096)
