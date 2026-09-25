@@ -21239,6 +21239,22 @@ def remove_notify_sub(
     return cur.rowcount > 0
 
 
+# Task statuses at which a notify subscription has served its purpose. The
+# notifier consumers (gateway ``_kanban_notifier_watcher`` and the TUI poller)
+# delete a subscription once it has DELIVERED the events it claimed while the
+# task sits in one of these statuses — so the terminal line still arrives, and
+# nothing is left behind to wake a big-context origin session on later noise.
+# A controller that reopens a ``done`` card re-subscribes explicitly
+# (``hermes kanban notify-subscribe``).
+# Policy: t_6d6e9467 (1,238 of Apollo's 1,295 wake subs sat on done/archived).
+NOTIFY_SUB_FINAL_STATUSES = frozenset({"done", "archived"})
+
+
+def notify_sub_is_final(task: Any) -> bool:
+    """True when ``task`` is in a status that ends notify-sub ownership."""
+    return bool(task) and (getattr(task, "status", "") or "") in NOTIFY_SUB_FINAL_STATUSES
+
+
 def purge_stale_done_notify_subs(
     conn: sqlite3.Connection,
     *,

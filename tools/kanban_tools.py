@@ -1701,7 +1701,9 @@ def _handle_create(args: dict, **kw) -> str:
                         conn, new_tid, "assignee_remapped", assignee_remap,
                     )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(
+                conn, new_tid, wake=args.get("wake") is True,
+            )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1721,7 +1723,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: bool = False) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
     Returns True if a subscription row was written, False otherwise (no
@@ -1768,11 +1770,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         # user-friendly behaviour that mirrors the pre-gate implementation.
         pass
 
-    return subscribe_calling_session(conn, task_id)
+    return subscribe_calling_session(conn, task_id, wake=wake)
 
 
 def subscribe_calling_session(
-    conn: Any, task_id: str, *, require_platform_identity: bool = False
+    conn: Any,
+    task_id: str,
+    *,
+    require_platform_identity: bool = False,
+    wake: bool = False,
 ) -> bool:
     """Resolve the calling session's delivery identity and write a notify sub.
 
@@ -1788,6 +1794,11 @@ def subscribe_calling_session(
     gateway identity (platform + chat id) and skips the TUI
     ``HERMES_SESSION_KEY`` fallback below: a bare CLI/cron/script create
     has no delivery channel and must stay silent (#19718).
+
+    Delivery mode defaults to ``'notify'`` (passive completion line, no
+    agent turn). ``wake=True`` is the only way to get ``'notify+wake'`` for
+    a gateway session: every wake is a full big-context turn that queues
+    the human's messages, so it must be an explicit opt-in (t_6d6e9467).
 
     Returns True if a subscription row was written; any exception is
     logged at WARNING and swallowed (returns False).
@@ -1843,7 +1854,9 @@ def subscribe_calling_session(
                 chat_type = canonical_chat_type(platform, chat_type)
             except Exception:  # pragma: no cover - never block a subscription
                 pass
-        delivery_mode = "notify+wake" if is_gateway_session else None
+        # None → add_notify_sub's platform default: 'notify' everywhere except
+        # api_server, whose only delivery mechanism is the wake self-post.
+        delivery_mode = "notify+wake" if (wake and is_gateway_session) else None
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         # build_session_key derives the participant segment from
@@ -2674,6 +2687,16 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "wake": {
+                "type": "boolean",
+                "description": (
+                    "Only with a gateway auto-subscription: also WAKE this "
+                    "chat's agent (a full turn) on terminal events instead "
+                    "of just posting the passive notification line. "
+                    "Defaults to false — wakes queue the human's messages, "
+                    "so opt in only when this session must act on the result."
                 ),
             },
             "goal_mode": {

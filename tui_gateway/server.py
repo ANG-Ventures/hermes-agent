@@ -12996,11 +12996,11 @@ def _collect_kanban_notifications(session: dict) -> list:
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
                         texts.append(text)
-                # Unsubscribe only on archive. ``done`` is reversible in
-                # review/controller flows, so retaining the subscription lets
-                # a later reopen notify the same originating TUI/Desktop
-                # session. The claimed cursor prevents historical replay.
-                if task and getattr(task, "status", "") == "archived":
+                # Unsubscribe once the task is done/archived — the events
+                # claimed above are already queued for delivery, so the
+                # terminal line still arrives (t_6d6e9467). A reopened
+                # ``done`` card is re-subscribed explicitly by its controller.
+                if _kb.notify_sub_is_final(task):
                     try:
                         _kb.remove_notify_sub(
                             conn,
