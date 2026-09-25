@@ -191,7 +191,8 @@ def test_operator_terminal_outcome_does_not_certify_worker_exit(conn, monkeypatc
         assert review is not None
         kb._set_worker_pid(conn, tid, 525252)
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 525252)
-        assert kb.request_changes(conn, tid, reason="operator")
+        from tests.kanban_review_helpers import covered_request_changes
+        assert covered_request_changes(conn, tid, reason="operator")
     spawned, _ = _dispatch(conn)
     assert tid not in spawned
     assert _events(conn, tid, "claim_rejected")[-1]["reason"] == "prior_worker_still_alive"

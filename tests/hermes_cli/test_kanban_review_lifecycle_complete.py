@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.kanban_review_helpers import covered_request_changes
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_diagnostics as kd
@@ -99,7 +100,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
 
     review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
     assert review is not None
-    assert kb.request_changes(
+    assert covered_request_changes(
         conn,
         task_id,
         reason="Add a regression for the fallback branch.",
@@ -155,7 +156,7 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
     bad_payload: str | None,
 ) -> None:
     task_id, review = _claimed_review(conn, "Malformed reviewer provenance")
-    assert kb.request_changes(
+    assert covered_request_changes(
         conn,
         task_id,
         reason="Correct the implementation.",
@@ -229,7 +230,7 @@ def test_review_changes_reapply_parent_gate(conn):
     conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
     conn.commit()
 
-    assert kb.request_changes(
+    assert covered_request_changes(
         conn,
         task_id,
         reason="Parent contract changed; rework after it lands.",
@@ -520,7 +521,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
         conn, task_id, implementation.current_run_id
     ) == "review"
 
-    assert kb.request_changes(
+    assert covered_request_changes(
         conn,
         task_id,
         reason="fix it",
@@ -676,7 +677,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
 
     review = kb.claim_review_task(conn, task_id)
     assert review is not None
-    assert kb.request_changes(
+    assert covered_request_changes(
         conn, task_id, reason="needs fixes",
         expected_run_id=review.current_run_id,
     ) == (True, "builder")
@@ -690,8 +691,10 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     )
     assert _failures(conn, task_id) == 1  # full re-review cycle: still 1
 
-    # reopen_review_task (manual changes-requested) also preserves it.
-    assert kb.reopen_review_task(conn, task_id)
+    # A full reviewer verdict preserves it; the parked-review bypass is retired.
+    assert kb.reopen_review_task(conn, task_id) is False
+    assert kb.claim_review_task(conn, task_id) is not None
+    assert covered_request_changes(conn, task_id, reason="Fix v2")
     assert _failures(conn, task_id) == 1
 
     # A crash now increments 1 -> 2 and trips a failure_limit=2 breaker —

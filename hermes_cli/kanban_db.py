@@ -7604,7 +7604,9 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+        "'unblocked', 'changes_requested', 'status', 'reclaimed', "
+        # 'review_reopened' is historical (verb retired); legacy rows still count.
+        "'review_reopened', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
         "'infra_unavailable'"
         ") ORDER BY id DESC LIMIT 1",
@@ -11757,6 +11759,166 @@ def request_review(
     return _ret(True)
 
 
+import unicodedata  # noqa: E402
+
+from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LENSES  # noqa: E402
+# An ``n/a: <reason>`` lens value certifies the lens does not APPLY to the
+# deliverable. A reason that reports an INABILITY anywhere in it ("skipped",
+# "the reviewer could not run it", "mutmut missing on host", "budget
+# exhausted") is not an applicability claim: that reviewer must use
+# kanban_block(kind=capability). The reason is NFKC-normalized and stripped of
+# zero-width/control characters first, so invisible characters cannot split a
+# phrase. Matching is deliberately conservative: an applicability reason that
+# happens to use one of these words ("vendors cannot differ") is refused and
+# must be rephrased ("vendors do not differ") -- a false refusal costs one
+# rewrite, a false accept hides an unrun lens.
+_REVIEW_NA_INABILITY = re.compile(
+    r"\b(?:"
+    r"skip(?:ped|ping|s)?|"
+    r"(?:could|can)\s*(?:not|n't)|cannot|unable|"
+    r"(?:did|was|were|does|do)\s*(?:not|n't)\s+(?:run|ran|execute|executed|attempt|attempted|try|tried|finish|finished|complete|completed|get|reach)|"
+    r"not\s+(?:run|ran|executed|attempted|tried|finished|completed|reached)|"
+    r"ran\s+out|out\s+of\s+time|no\s+time\b|timed?\s*out|"
+    r"fail(?:ed|s)?\s+to\b|errored|crashed|blocked\s+(?:by|on)\b|"
+    r"missing|not\s+(?:available|installed|accessible)|unavailable|inaccessible|"
+    r"no\s+(?:\S+\s+){0,3}?(?:tool|tools|tooling|access|budget|runner|harness)\b|lacked?\s+access|"
+    r"exhausted|deferred|postponed|todo\b|tbd\b"
+    r")",
+    re.IGNORECASE,
+)
+# Items must name a finding, not a placeholder: at least this many visible
+# characters, one of them alphanumeric.
+_REVIEW_ITEM_MIN_CHARS = 3
+# A single review round longer than a day is not a real measurement.
+_REVIEW_MINUTES_MAX = 24 * 60
+
+
+def _review_normalize(text: str) -> str:
+    """NFKC-normalize and drop zero-width/format/control characters."""
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(
+        ch if unicodedata.category(ch) not in {"Cf", "Cc"} else (" " if ch in "\t\n\r" else "")
+        for ch in text
+    )
+    return " ".join(text.split())
+
+
+def _review_coverage_payload(line: str) -> Optional[str]:
+    """Return the JSON text of a ``review_coverage:`` line, or None.
+
+    Accepts the bare form and the inline-code form the skill documents
+    (one surrounding backtick pair), so a reviewer who copies the example
+    verbatim is not refused.
+    """
+    text = line.strip()
+    if len(text) >= 2 and text.startswith("`") and text.endswith("`"):
+        text = text[1:-1].strip()
+    if not text.startswith("review_coverage:"):
+        return None
+    return text.split("review_coverage:", 1)[1].strip()
+
+
+def _review_lens_state(state: Any) -> Optional[str]:
+    """Casefold a lens state: ``done``, ``n/a: <reason>`` or None."""
+    if not isinstance(state, str):
+        return None
+    return _review_normalize(state).casefold()
+
+
+def _review_na_reason_ok(state: Any) -> bool:
+    norm = _review_lens_state(state)
+    if norm is None or not norm.startswith("n/a:"):
+        return False
+    reason = norm[4:].strip()
+    return bool(reason) and not _REVIEW_NA_INABILITY.search(reason)
+
+
+def _review_item_ok(item: Any) -> bool:
+    if not isinstance(item, str):
+        return False
+    text = _review_normalize(item)
+    return len(text) >= _REVIEW_ITEM_MIN_CHARS and any(ch.isalnum() for ch in text)
+
+
+def _latest_review_coverage(rows: list) -> tuple[Optional[dict], Optional[str]]:
+    """Newest comment line (newest comment first) that parses to a JSON object.
+
+    A later prose comment that merely mentions ``review_coverage:`` must not
+    hide a valid earlier record. When nothing parses, report why the NEWEST
+    candidate failed.
+    """
+    first_error: Optional[str] = None
+    for row in rows:
+        payloads = [p for p in map(_review_coverage_payload, row["body"].splitlines()) if p is not None]
+        if not payloads:
+            first_error = first_error or "missing review_coverage JSON line"
+            continue
+        for payload in reversed(payloads):
+            try:
+                coverage = json.loads(payload)
+            except (ValueError, TypeError):
+                first_error = first_error or "invalid review_coverage JSON"
+                continue
+            if isinstance(coverage, dict):
+                return coverage, None
+            first_error = first_error or "review_coverage must be a JSON object"
+    return None, first_error or "missing review_coverage JSON line"
+
+
+def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[str]:
+    """Require a current-run, parseable review record before returning work.
+
+    A prior round's comment cannot certify the current head.  The batch id is
+    recorded in the comment, not inferred from a model's unsupported claim.
+    """
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND run_id = ? "
+        "AND body LIKE '%review_coverage:%' ORDER BY id DESC",
+        (task_id, run_id),
+    ).fetchall()
+    if not rows:
+        return "missing review_coverage comment on this review run (use kanban_block(kind=capability) if a lens cannot run)"
+    coverage, error = _latest_review_coverage(rows)
+    if coverage is None:
+        return error
+    lenses = coverage.get("lenses")
+    if not isinstance(lenses, dict):
+        return "missing lenses object"
+    lenses = {
+        _review_normalize(key).casefold(): value
+        for key, value in lenses.items() if isinstance(key, str)
+    }
+    for lens in _REVIEW_LENSES:
+        state = lenses.get(lens.casefold())
+        if _review_lens_state(state) == "done":
+            continue
+        if _review_na_reason_ok(state):
+            continue
+        return f"missing/invalid lens {lens}: use 'done' or 'n/a: <applicability reason>'; inability to run requires kanban_block(kind=capability)"
+    count = coverage.get("findings")
+    if type(count) is not int or count < 1:
+        return "findings must be an integer >= 1"
+    items = coverage.get("items")
+    if (not isinstance(items, list) or len(items) != count
+            or not all(_review_item_ok(item) for item in items)):
+        return (
+            "items must list exactly findings findings, each at least "
+            f"{_REVIEW_ITEM_MIN_CHARS} visible characters with a letter or digit"
+        )
+    minutes = coverage.get("review_minutes")
+    if type(minutes) is not int or minutes < 0 or minutes > _REVIEW_MINUTES_MAX:
+        return f"review_minutes must be an integer from 0 to {_REVIEW_MINUTES_MAX}"
+    # Optional (per-card batteries are being retired; CI owns suites). When
+    # given it must still be a real value, not an empty placeholder.
+    battery = coverage.get("battery")
+    if battery is not None and (not isinstance(battery, str) or not battery.strip()):
+        return "battery, when given, must be a nonempty string (attachment name, 'seeded' or 'n/a: <reason>')"
+    batch = coverage.get("batch_id")
+    if not isinstance(batch, str) or not batch.strip():
+        return "batch_id must identify the single delegate_task batch in this comment"
+    return None
+
+
 @_home_session_guarded("request-changes")
 def request_changes(
     conn: sqlite3.Connection,
@@ -11830,6 +11992,9 @@ def request_changes(
         implementer = requested_payload.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             return False, "review handoff has no valid implementer provenance"
+        coverage_error = _validate_review_coverage(conn, task_id, int(current_run_id))
+        if coverage_error:
+            return False, coverage_error
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
             reviewer = _canonical_assignee(reviewer)
@@ -12228,73 +12393,17 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
-@_home_session_guarded("reopen-review")
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``review`` -> ready (or todo) so the implementer re-runs.
+    """Legacy verdict bypass retired: claim the review and request changes.
 
-    The "changes requested" counterpart of :func:`request_review`: sends the
-    task back out of the review lane so the dispatcher re-runs the implementer
-    on the new comments. Mirrors :func:`unblock_task` (parent re-gating,
-    defensive stale-run close, ``consecutive_failures`` preserved) and emits a
-    ``review_reopened`` event.
-
-    Deliberately does NOT touch ``block_recurrences``/``block_kind``: review is
-    not a block, so there is no loop counter to reset. (A stale counter from a
-    genuine block *before* review is left intact — only :func:`complete_task`
-    clears it.) Returns False when the task is missing or not in ``review``.
+    A parked review has no reviewer-run evidence. Moving it directly to its
+    implementer evades the full-review coverage gate on request_changes.
+    Kept as a refusal for existing CLI callers; no state is changed, so it
+    carries no home-session guard (a guard would print "reopen-review
+    allowed" before the refusal). The ``review_reopened`` event it used to
+    emit is historical: old rows are still read by the resume-status query.
     """
-    now = int(time.time())
-    with write_txn(conn):
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("review",), now=now,
-            note="invariant recovery on review reopen",
-        )
-        new_status = _landing_status_after_parents(conn, task_id)
-        review_event = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'review_requested' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        try:
-            handoff = (
-                json.loads(review_event["payload"])
-                if review_event and review_event["payload"]
-                else {}
-            )
-        except (json.JSONDecodeError, TypeError):
-            handoff = {}
-        implementer = handoff.get("implementer")
-        if not isinstance(implementer, str) or not implementer.strip():
-            implementer = None
-        assignee_sql = ", assignee = ?" if implementer else ""
-        params: tuple[Any, ...] = (
-            (new_status, implementer, task_id)
-            if implementer
-            else (new_status, task_id)
-        )
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            # consecutive_failures deliberately PRESERVED: review reopen is
-            # not a success signal; only complete_task resets the breaker
-            # counter (mirrors unblock_task, #35072).
-            + assignee_sql
-            + " WHERE id = ? AND status = 'review'",
-            params,
-        )
-        if cur.rowcount != 1:
-            return False
-        payload: dict[str, Any] = {"status": new_status}
-        if implementer:
-            payload["implementer"] = implementer
-        _append_event(
-            conn,
-            task_id,
-            "review_reopened",
-            payload if payload != {"status": "ready"} else None,
-        )
-        return True
+    return False
 
 
 def invalidate_descendants_for_parent_reopen(
@@ -14220,6 +14329,8 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
     "changes_requested",
     "unblocked",
+    # Historical: the reopen-review verb is retired and no longer emits it,
+    # but legacy rows still mark an operator requeue.
     "review_reopened",
     "triage_resolved",
     "reopened",

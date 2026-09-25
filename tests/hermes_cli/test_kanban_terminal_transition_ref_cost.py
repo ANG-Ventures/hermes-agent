@@ -17,6 +17,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.kanban_review_helpers import covered_request_changes
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_survivor as survivor
@@ -134,7 +135,7 @@ def test_other_terminal_transitions_never_reach_the_ref_scan(
         "request_review": lambda: kb.request_review(
             board, tid, summary="please review", reviewer="argus",
         ),
-        "request_changes": lambda: kb.request_changes(
+        "request_changes": lambda: covered_request_changes(
             board, tid, reason="please fix",
         ),
     }

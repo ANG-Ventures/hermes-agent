@@ -1909,7 +1909,8 @@ def test_respawn_guard_allows_open_pr_after_changes_requested(
         assert review is not None
 
         now += requeue_delay
-        assert kb.request_changes(
+        from tests.kanban_review_helpers import covered_request_changes
+        assert covered_request_changes(
             conn, task_id, reason="Fix the edge case",
             expected_run_id=review.current_run_id,
         ) == (True, "alice")
@@ -4009,7 +4010,6 @@ def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
     verb_kinds = {
         "unblock_task": "unblocked",
         "request_changes": "changes_requested",
-        "reopen_review_task": "review_reopened",
         "triage_resolve_task": "triage_resolved",
         "reopen_task": "reopened",
         "requeue_task": "requeued",
