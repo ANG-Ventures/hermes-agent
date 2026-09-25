@@ -1439,10 +1439,15 @@ def reevaluate_pr_gates(
 
         # A ref already merged when the card blocked (or already resolved by
         # this gate for this card) is context, not the gate. See t_20b94ef5.
+        # A deploy-premised ref is never history: a card that blocked on
+        # "#N live in <tree>" after #N merged is waiting on the DEPLOY, which
+        # the merge time says nothing about (t_289e8020).
         spent = _previously_resolved_refs(conn, task_id)
+        deploy_keys = {(r.repo.lower(), r.number) for r, _ in deploy_checks}
         gating = [
             (r, e) for r, e in resolved
-            if not _is_history(r, e, blocked_at=blocked_at, spent=spent)
+            if (r.repo.lower(), r.number) in deploy_keys
+            or not _is_history(r, e, blocked_at=blocked_at, spent=spent)
         ]
         if not gating:
             outcomes.append(GateOutcome(
