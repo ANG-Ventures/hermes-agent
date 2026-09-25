@@ -85,6 +85,10 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
 _DISCORD_RESTART_RECOVERY_STATE_FILENAME = "discord_restart_recovery.json"
+_DISCORD_DEAD_CHANNELS_STATE_FILENAME = "discord_dead_channels.json"
+# Discord JSON error code for a deleted (or never-existing) channel/thread.
+# Snowflakes are never reused, so a 10003 target is permanently dead.
+_DISCORD_UNKNOWN_CHANNEL_CODE = 10003
 # Anchor margin (s) subtracted from the persisted graceful-shutdown timestamp
 # when computing how far back the reconnect backfill scans channel.history.
 # shutdown_ts is stamped at drain-END, but the lost messages arrived DURING the
@@ -590,6 +594,94 @@ class _DiscordNonConversationalMessageTracker:
     def __contains__(self, message_id: str) -> bool:
         with self._lock:
             return str(message_id or "") in self._ids
+
+
+def _is_unknown_channel_error(exc: BaseException) -> bool:
+    """True when *exc* is Discord's 404 ``Unknown Channel`` (code 10003)."""
+    if getattr(exc, "code", None) == _DISCORD_UNKNOWN_CHANNEL_CODE:
+        return True
+    return f"error code: {_DISCORD_UNKNOWN_CHANNEL_CODE})" in str(exc)
+
+
+class _DiscordDeadChannelTracker:
+    """Persistent bounded negative cache of channel/thread ids that 404'd 10003.
+
+    A deleted thread stays referenced by session origins, kanban notify
+    subscriptions and cron deliver targets.  Without this cache every boot's
+    session-key migration re-fetched it (``get_chat_info``) and every notifier
+    retry re-fetched it (``send``), each logging an ERROR + traceback
+    (t_ff4197d3: 448 hits in a day for one deleted thread).  Snowflakes are
+    never reused, so a 10003 id is dead for good; the file survives restarts.
+    """
+
+    _MAX_TRACKED = 2000
+    _PERSIST_INTERVAL_S = 2.0
+
+    def __init__(
+        self,
+        max_tracked: int = _MAX_TRACKED,
+        persist_interval_s: float = _PERSIST_INTERVAL_S,
+    ):
+        self._max_tracked = max_tracked
+        self._lock = threading.Lock()
+        self._ids: dict[str, None] = dict.fromkeys(self._load())
+        self._writer = CoalescingJsonWriter(
+            self._state_path,
+            self._snapshot,
+            min_interval_s=persist_interval_s,
+            name="discord-dead-channels-writer",
+            indent=None,
+        )
+
+    def _state_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+
+        return (
+            get_hermes_home()
+            / _DISCORD_COMMAND_SYNC_STATE_SUBDIR
+            / _DISCORD_DEAD_CHANNELS_STATE_FILENAME
+        )
+
+    def _load(self) -> list[str]:
+        path = self._state_path()
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [str(cid) for cid in data if str(cid).strip()]
+        except Exception:
+            logger.debug("[Discord] Failed to load dead-channel ids", exc_info=True)
+        return []
+
+    def _snapshot(self) -> list[str]:
+        with self._lock:
+            return list(self._ids)
+
+    def flush(self) -> None:
+        """Synchronous durable write. Blocking: coroutines use ``asyncio.to_thread``."""
+        try:
+            self._writer.flush()
+        except Exception:
+            logger.debug("[Discord] Failed to save dead-channel ids", exc_info=True)
+
+    def mark(self, channel_id: Any) -> bool:
+        """Record *channel_id* as dead. Loop-safe; ``True`` if newly added."""
+        key = str(channel_id or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            if key in self._ids:
+                return False
+            self._ids[key] = None
+            if len(self._ids) > self._max_tracked:
+                self._ids = dict.fromkeys(list(self._ids)[-self._max_tracked:])
+        self._writer.schedule()
+        return True
+
+    def __contains__(self, channel_id: Any) -> bool:
+        with self._lock:
+            return str(channel_id or "").strip() in self._ids
 
 
 class _DiscordRestartRecoveryState:
@@ -1540,6 +1632,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # so a reconnect after a self-restart can backfill messages the gateway
         # dropped mid-drain. Constructed lazily-safe (loads from disk on init).
         self._restart_recovery = _DiscordRestartRecoveryState()
+        # Negative cache of deleted channels/threads (404 code 10003), so dead
+        # targets are not re-fetched on every send / boot migration lookup.
+        self._dead_channels = _DiscordDeadChannelTracker()
         # Single-flight guard so overlapping reconnect flaps can't run the
         # backfill sweep concurrently (INV-6).
         self._restart_backfill_lock = asyncio.Lock()
@@ -2622,6 +2717,12 @@ class DiscordAdapter(BasePlatformAdapter):
             await asyncio.to_thread(self._nonconversational_messages.flush)
         except Exception:
             logger.debug("[%s] non-conversational ids shutdown flush failed", self.name, exc_info=True)
+        try:
+            _dead = getattr(self, "_dead_channels", None)
+            if _dead is not None:
+                await asyncio.to_thread(_dead.flush)
+        except Exception:
+            logger.debug("[%s] dead-channel ids shutdown flush failed", self.name, exc_info=True)
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
@@ -4260,6 +4361,22 @@ class DiscordAdapter(BasePlatformAdapter):
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
 
+            _target = thread_id or chat_id
+            if self._is_dead_channel(_target):
+                result = SendResult(
+                    success=False,
+                    error=f"Unknown Channel {_target} (deleted; cached 404 10003)",
+                    error_kind="not_found",
+                )
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=reply_to,
+                    result=result,
+                    content=content,
+                    final=final_delivery,
+                )
+                return result
+
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
                 channel = self._client.get_channel(int(thread_id))
@@ -4373,8 +4490,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return result
 
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            result = SendResult(success=False, error=str(e))
+            if _is_unknown_channel_error(e):
+                await self._mark_channel_dead(
+                    (metadata or {}).get("thread_id") or chat_id, e
+                )
+                result = SendResult(success=False, error=str(e), error_kind="not_found")
+            else:
+                logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
+                result = SendResult(success=False, error=str(e))
             await asyncio.to_thread(
                 self._record_discord_response,
                 reply_to=reply_to,
@@ -6616,10 +6739,35 @@ class DiscordAdapter(BasePlatformAdapter):
         self.canonicalize_session_source(event.source)
         await super().handle_message(event)
 
+    def _is_dead_channel(self, channel_id: Any) -> bool:
+        dead = getattr(self, "_dead_channels", None)
+        return dead is not None and channel_id in dead
+
+    async def _mark_channel_dead(self, channel_id: Any, exc: BaseException) -> None:
+        """Negative-cache a 10003 target and drop it from thread participation."""
+        key = str(channel_id or "").strip()
+        if not key:
+            return
+        dead = getattr(self, "_dead_channels", None)
+        if dead is not None and dead.mark(key):
+            logger.warning(
+                "[%s] Channel %s is gone (%s); negative-cached, further sends "
+                "and lookups short-circuit without an API call",
+                self.name, key, exc,
+            )
+        threads = getattr(self, "_threads", None)
+        if threads is not None:
+            try:
+                await threads.discard_async(key)
+            except Exception:
+                logger.debug("[%s] thread-tracker discard failed for %s", self.name, key, exc_info=True)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Discord channel."""
         if not self._client:
             return {"name": "Unknown", "error": "Discord client unavailable"}
+        if self._is_dead_channel(chat_id):
+            return {"name": str(chat_id), "error": "Unknown Channel (deleted; cached 404 10003)"}
 
         try:
             channel = self._client.get_channel(int(chat_id))
@@ -6648,6 +6796,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 "guild_name": channel.guild.name if hasattr(channel, "guild") and channel.guild else None,
             }
         except Exception as e:  # pragma: no cover - defensive logging
+            if _is_unknown_channel_error(e):
+                await self._mark_channel_dead(chat_id, e)
+                return {"name": str(chat_id), "error": str(e)}
             logger.error("[%s] Failed to get chat info for %s: %s", self.name, chat_id, e, exc_info=True)
             return {"name": str(chat_id), "error": str(e)}
 

@@ -763,3 +763,46 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+class _GoneTargetAdapter:
+    """Reports the target chat as deleted (``error_kind='not_found'``)."""
+
+    def __init__(self, error_kind):
+        self.attempts = 0
+        self.error_kind = error_kind
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        from gateway.platforms.base import SendResult
+        return SendResult(
+            success=False,
+            error="404 Not Found (error code: 10003): Unknown Channel",
+            error_kind=self.error_kind,
+        )
+
+
+def test_notifier_drops_subscription_at_once_when_target_is_gone(tmp_path, monkeypatch):
+    """A deleted chat never comes back: one not_found drops the sub; any other
+    failure still gets the MAX_SEND_FAILURES grace (t_ff4197d3)."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "gone.db"))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    runner = _make_runner(_GoneTargetAdapter(error_kind=None))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+
+    adapter = _GoneTargetAdapter(error_kind="not_found")
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.attempts == 1
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
