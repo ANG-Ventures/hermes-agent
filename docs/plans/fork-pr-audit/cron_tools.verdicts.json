@@ -315,7 +315,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic, small (_coerce_job_model). Upstream still RED."
+  "notes": "Generic, small (_coerce_job_model). Upstream still RED. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/scheduler.py — needs a hand re-port (follow-up card)."
  },
  "#473": {
   "verdict": "KEEP",
@@ -371,7 +371,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic misroute class; small (_bind_cron_delivery_target_hint). Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict."
+  "notes": "Generic misroute class; small (_bind_cron_delivery_target_hint). Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/scheduler.py, tests/cron/test_scheduler.py — needs a hand re-port (follow-up card)."
  },
  "#199": {
   "verdict": "UPSTREAM",
@@ -389,7 +389,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic. Fork logic now lives partly in gateway/response_filters.py (5/15 original lines remain in scheduler)."
+  "notes": "Generic. Fork logic now lives partly in gateway/response_filters.py (5/15 original lines remain in scheduler). Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/scheduler.py, tests/cron/test_scheduler.py — needs a hand re-port (follow-up card)."
  },
  "#139": {
   "verdict": "KEEP",
@@ -643,7 +643,7 @@
    }
   },
   "branch": null,
-  "notes": "Trim to the quoted-data half (_match_is_quoted_data/_open_quote_at) and offer upstream together with #594 (same class: text consumers). Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "Trim to the quoted-data half (_match_is_quoted_data/_open_quote_at) and offer upstream together with #594 (same class: text consumers). Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tests/hermes_cli/test_gateway_restart_loop.py — needs a hand re-port (follow-up card)."
  },
  "#594": {
   "verdict": "UPSTREAM",
@@ -663,7 +663,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic false positive; bundle with #319(b) as one upstream PR. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "Generic false positive; bundle with #319(b) as one upstream PR. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tests/hermes_cli/test_gateway_restart_loop.py (bundle #319) — needs a hand re-port (follow-up card)."
  },
  "nopr:116493ff97": {
   "verdict": "UPSTREAM",
@@ -684,7 +684,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic (remote host cannot SIGTERM the local gateway). Ship with its two Greptile hardenings nopr:c559189dd2 + nopr:10a1424335 as one upstream PR. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "Generic (remote host cannot SIGTERM the local gateway). Ship with its two Greptile hardenings nopr:c559189dd2 + nopr:10a1424335 as one upstream PR. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py — needs a hand re-port (follow-up card)."
  },
  "nopr:c559189dd2": {
   "verdict": "UPSTREAM",
@@ -704,7 +704,7 @@
    }
   },
   "branch": null,
-  "notes": "Hardening of 116493ff97; lives or dies with it."
+  "notes": "Hardening of 116493ff97; lives or dies with it. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py (bundle nopr:116493ff97) — needs a hand re-port (follow-up card)."
  },
  "nopr:10a1424335": {
   "verdict": "UPSTREAM",
@@ -724,7 +724,7 @@
    }
   },
   "branch": null,
-  "notes": "4 loc; follows 116493ff97."
+  "notes": "4 loc; follows 116493ff97. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py (bundle nopr:116493ff97) — needs a hand re-port (follow-up card)."
  },
  "#740": {
   "verdict": "UPSTREAM",
@@ -742,7 +742,7 @@
    }
   },
   "branch": null,
-  "notes": "Needed by the fleet's recovery design (Aegis) and generic to any multi-profile install (upstream names profile gateways ai.hermes.gateway-<profile>). 788 loc — biggest guard row. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "Needed by the fleet's recovery design (Aegis) and generic to any multi-profile install (upstream names profile gateways ai.hermes.gateway-<profile>). 788 loc — biggest guard row. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/terminal_tool.py — needs a hand re-port (follow-up card)."
  },
  "#767": {
   "verdict": "UPSTREAM",
@@ -760,7 +760,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic. 966 loc incl. tests. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "Generic. 966 loc incl. tests. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/code_execution_tool.py, tools/terminal_tool.py — needs a hand re-port (follow-up card)."
  },
  "#920": {
   "verdict": "UPSTREAM",
@@ -781,7 +781,7 @@
    }
   },
   "branch": null,
-  "notes": "Real bypass on upstream: a python heredoc can restart/kill the gateway from inside it. Offer #920+#933+#1017 as one security PR upstream. Fork cost: 3 rows, ~750 loc, 5+ review rounds; the fork is now stricter than #614 intended (it re-blocks benign literals). Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "Real bypass on upstream: a python heredoc can restart/kill the gateway from inside it. Offer #920+#933+#1017 as one security PR upstream. Fork cost: 3 rows, ~750 loc, 5+ review rounds; the fork is now stricter than #614 intended (it re-blocks benign literals). Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/shell_heredoc.py — needs a hand re-port (follow-up card)."
  },
  "#933": {
   "verdict": "UPSTREAM",
@@ -801,7 +801,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows #920."
+  "notes": "Follows #920. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/shell_heredoc.py (bundle #920) — needs a hand re-port (follow-up card)."
  },
  "#1017": {
   "verdict": "UPSTREAM",
@@ -821,7 +821,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows #920."
+  "notes": "Follows #920. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/lifecycle_guard.py, tools/shell_heredoc.py (bundle #920) — needs a hand re-port (follow-up card)."
  },
  "#348": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -875,7 +875,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic, 145 loc."
+  "notes": "Generic, 145 loc. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/jobs.py — needs a hand re-port (follow-up card)."
  },
  "#632": {
   "verdict": "UPSTREAM",
@@ -893,7 +893,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic UX, stdlib-only humanizer."
+  "notes": "Generic UX, stdlib-only humanizer. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/jobs.py — needs a hand re-port (follow-up card)."
  },
  "#791": {
   "verdict": "KEEP",
@@ -953,7 +953,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic, small."
+  "notes": "Generic, small. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/jobs.py, cron/scheduler_provider.py, hermes_cli/cron.py — needs a hand re-port (follow-up card)."
  },
  "#521": {
   "verdict": "UPSTREAM",
@@ -972,8 +972,8 @@
     ]
    }
   },
-  "branch": null,
-  "notes": "Measured, generic."
+  "branch": "audit/cron_tools/upstream-521 @ e1183c8e6b",
+  "notes": "Measured, generic. Upstream branch: clean cherry-pick of 6cdf89a4d9 onto upstream/main 59004a6235, commit body scrubbed of fleet names; `pytest tests/cron/test_stale_ledger_after_restart.py` on the branch via test-gate → 3 passed in 4.61s."
  },
  "#462": {
   "verdict": "KEEP",
@@ -1029,7 +1029,7 @@
    }
   },
   "branch": null,
-  "notes": "Measured, generic. Lives in fork-only cron/fork_ext/scheduler_ext.py."
+  "notes": "Measured, generic. Lives in fork-only cron/fork_ext/scheduler_ext.py. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/fork_ext/scheduler_ext.py, cron/scheduler.py — needs a hand re-port (follow-up card)."
  },
  "nopr:e77a87d63a": {
   "verdict": "KEEP",
@@ -1145,7 +1145,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic create-time validation; vendor map needs to be upstream's provider catalog, not the fleet's."
+  "notes": "Generic create-time validation; vendor map needs to be upstream's provider catalog, not the fleet's. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/cronjob_tools.py — needs a hand re-port (follow-up card)."
  },
  "#484": {
   "verdict": "KEEP",
@@ -1253,7 +1253,7 @@
    }
   },
   "branch": null,
-  "notes": "2-line generic fix. Strong UPSTREAM."
+  "notes": "2-line generic fix. Strong UPSTREAM. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/cronjob_tools.py, tools/threat_patterns.py — needs a hand re-port (follow-up card)."
  },
  "#1024": {
   "verdict": "UPSTREAM",
@@ -1376,7 +1376,7 @@
    }
   },
   "branch": null,
-  "notes": "Real misroute class still present upstream and generic (any gateway user with a home channel). Rarely fires on this fleet (3 in 06-02→09-25) so the fork cost (497 loc) is not justified as a fork patch — propose upstream, then drop ours. Same patch-id as nopr:f578c82019 (duplicate row). Upstream branch not built this run (see handoff)."
+  "notes": "Real misroute class still present upstream and generic (any gateway user with a home channel). Rarely fires on this fleet (3 in 06-02→09-25) so the fork cost (497 loc) is not justified as a fork patch — propose upstream, then drop ours. Same patch-id as nopr:f578c82019 (duplicate row). Upstream branch not built this run (see handoff). Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/send_message_tool.py — needs a hand re-port (follow-up card)."
  },
  "nopr:f578c82019": {
   "verdict": "DROP",
@@ -1494,7 +1494,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic registry-level contract; measured heavily. Propose upstream (registry option + delegate_task opt-in). Fix the stale FM test before proposing. Upstream branch not built this run."
+  "notes": "Generic registry-level contract; measured heavily. Propose upstream (registry option + delegate_task opt-in). Fix the stale FM test before proposing. Upstream branch not built this run. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/registry.py — needs a hand re-port (follow-up card)."
  },
  "#204": {
   "verdict": "KEEP",
@@ -1532,7 +1532,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic, silent-data-loss class, live-reproduced on upstream. Strong UPSTREAM (upstream split the drain into base_output.py — patch must be re-ported there + process_registry _reader_loop). Upstream branch not built this run."
+  "notes": "Generic, silent-data-loss class, live-reproduced on upstream. Strong UPSTREAM (upstream split the drain into base_output.py — patch must be re-ported there + process_registry _reader_loop). Upstream branch not built this run. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/environments/base.py, tools/process_registry.py — needs a hand re-port (follow-up card)."
  },
  "#415": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1667,7 +1667,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic (upstream's own AGENTS.md rule), small, measured (every fleet profile sets it). Offer #575+#577 as one upstream PR; note upstream 55d61f16ba changed over-cap semantics (promote to background) so the port must re-derive the enforcement seam."
+  "notes": "Generic (upstream's own AGENTS.md rule), small, measured (every fleet profile sets it). Offer #575+#577 as one upstream PR; note upstream 55d61f16ba changed over-cap semantics (promote to background) so the port must re-derive the enforcement seam. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in hermes_cli/config.py, hermes_cli/config_defaults.py, tools/terminal_tool.py — needs a hand re-port (follow-up card)."
  },
  "#577": {
   "verdict": "UPSTREAM",
@@ -1685,7 +1685,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows #575; ship together."
+  "notes": "Follows #575; ship together. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in hermes_cli/config.py, hermes_cli/config_defaults.py, tools/terminal_tool.py (bundle #575) — needs a hand re-port (follow-up card)."
  },
  "#345": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1741,7 +1741,7 @@
     ]
    }
   },
-  "branch": null,
+  "branch": "upstream PR NousResearch/hermes-agent#58144 (open)",
   "notes": "Already proposed upstream as #58144 (open); no new branch — the lead tracks the PR. Fork copy stays until it merges, then SUPERSEDED. Low fire evidence (3 failure-path lines); dependents: #211 (proxy), #314 (aliases share the file)."
  },
  "#314": {
@@ -1760,7 +1760,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic 2-line handler alias + schema note; trivially upstreamable. Unmeasured on the fleet (no marker), so not a KEEP on its own."
+  "notes": "Generic 2-line handler alias + schema note; trivially upstreamable. Unmeasured on the fleet (no marker), so not a KEEP on its own. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/vision_tools.py — needs a hand re-port (follow-up card)."
  },
  "#470": {
   "verdict": "KEEP",
@@ -1857,7 +1857,7 @@
    }
   },
   "branch": null,
-  "notes": "The delegate_task primitive is generic and was used 45×; the /boomerang command wrapper (cli.py, gateway/run.py, commands.py — 3 of the 5 conflict files) was never used. Offer inherit_context upstream (delegate_tool.py + its test only) and drop the command surface at the next sync; usage is declining (1 in 30d) so this is not a KEEP."
+  "notes": "The delegate_task primitive is generic and was used 45×; the /boomerang command wrapper (cli.py, gateway/run.py, commands.py — 3 of the 5 conflict files) was never used. Offer inherit_context upstream (delegate_tool.py + its test only) and drop the command surface at the next sync; usage is declining (1 in 30d) so this is not a KEEP. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cli.py, gateway/run.py, hermes_cli/commands.py, run_agent.py, tests/hermes_cli/test_boomerang_command.py, tools/delegate_tool.py — needs a hand re-port (follow-up card)."
  },
  "#556": {
   "verdict": "KEEP",
@@ -2044,7 +2044,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic tool robustness, 182 loc, 0 conflict files. Not measurable as a KEEP (silent success path); offer upstream."
+  "notes": "Generic tool robustness, 182 loc, 0 conflict files. Not measurable as a KEEP (silent success path); offer upstream. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/file_operations.py — needs a hand re-port (follow-up card)."
  },
  "nopr:9a1db22e58": {
   "verdict": "UPSTREAM",
@@ -2062,7 +2062,7 @@
    }
   },
   "branch": null,
-  "notes": "Heavily measured, generic, 70 loc, 0 conflict files. Strong UPSTREAM; keep on the fork until it lands."
+  "notes": "Heavily measured, generic, 70 loc, 0 conflict files. Strong UPSTREAM; keep on the fork until it lands. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tests/tools/test_file_tools_live.py, tools/file_operations.py — needs a hand re-port (follow-up card)."
  },
  "#360": {
   "verdict": "KEEP",
@@ -2098,7 +2098,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic normalizer-drift fix in a path upstream still has unnormalized; 92 loc, 0 conflict files. Offer upstream with a wrapped-schema fixture (their memory providers can return wrapped form too)."
+  "notes": "Generic normalizer-drift fix in a path upstream still has unnormalized; 92 loc, 0 conflict files. Offer upstream with a wrapped-schema fixture (their memory providers can return wrapped form too). Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tests/tools/test_refresh_agent_mcp_tools.py, tools/mcp_tool.py — needs a hand re-port (follow-up card)."
  },
  "#98": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
