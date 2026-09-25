@@ -38,6 +38,23 @@
   "problem": "Hygiene stats conflated two 'kept' populations; announce silently degraded on real hygiene compactions.",
   "verdict": "KEEP"
  },
+ "#103": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 381
+   },
+   "fires": "'made no progress for' 5 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02 \u2014 stalls are now bounded",
+   "original": "PR #103 live wedge 2026-06-24 #voice-assistant.",
+   "upstream_fix": "upstream auxiliary_client compression timeout floor (see git log upstream/main --grep='compression' -- agent/auxiliary_client.py)",
+   "upstream_state": "GREEN-equivalent (read-only): upstream auxiliary_client.py:6123-6127/6258 applies a bounded compression timeout floor and explicit-timeout precedence"
+  },
+  "notes": "_scope_client_for_task is fork-only; the behaviour (bounded compaction call) is served upstream.",
+  "problem": "Compaction summarizer hung 30 min on a saturated relay: timeout not threaded, retries not scoped.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#106": {
   "branch": null,
   "evidence": {
@@ -95,6 +112,32 @@
   "notes": "Touches vendored LCM engine (stamp emitter).",
   "problem": "Exact folded/kept split via provenance-stamped rows instead of positional index.",
   "verdict": "KEEP"
+ },
+ "#111": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#392",
+     "#529",
+     "#539",
+     "#541",
+     "#554",
+     "nopr:1921a02047",
+     "nopr:a7c5c51156",
+     "#506"
+    ],
+    "loc": 558
+   },
+   "fires": "COMPACTION_SKEW 677 (recording), 'skew' 83 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02; consultation only on anchor-invalid preflights (not instrumented)",
+   "original": "PR #111 body: 2026-06-26 real session estimate 776,594 \u2265 750,000 vs provider prompt_tokens 644,027.",
+   "upstream_fix": "c0aaa238f6 feat(compression): usage anchor survives DB reloads and process restarts",
+   "upstream_state": "GREEN-equivalent (read-only): upstream c0aaa238f6 usage_anchor.py anchors the trigger on the provider's real prompt_tokens; the fork already carries it \u2014 agent/turn_context.py:99-109 'Usage-anchored fast path \u2026 return anchored' bypasses skew calibration whenever the anchor is valid, so the learned-skew stack now only serves the pre-anchor residual (first preflight after restart/compaction/splice)"
+  },
+  "notes": "Skew-calibration stack (#111,#392,#529,#539,#541,#554,nopr:1921a02047,nopr:a7c5c51156): ~3.3k loc on context_engine.py/context_compressor.py/turn_context.py (3/3 syncs) + a skew_history table in hermes_state.py. D3 converge: upstream's anchor is the stronger fix and is already live on the fork. COMPACTION_SKEW telemetry still fires (677) because recording is unconditional, not because the ratio is consulted. Adversary check: count anchor-invalid preflights in a day; if the residual is not measurable, the stack is dead weight. Revert = one consolidated removal, not eight reverts (no per-row revert branch).",
+  "problem": "In-turn compaction trigger fired off the rough char/3.5 estimate that over-counts schema-heavy requests ~21%; compacted ~130K tokens early.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#161": {
   "branch": null,
@@ -312,6 +355,44 @@
   "problem": "Re-land of the session.list denorm behind dashboard.session_list_denorm (default off), with the backfill VERSION bumped past a poisoned marker on the live DB.",
   "verdict": "UPSTREAM"
  },
+ "#25": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "nopr:a8e443aad1"
+    ],
+    "loc": 159
+   },
+   "fires": "in use: ~/.hermes/config.yaml:211 per_model_threshold: (live)",
+   "original": "PR #25.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'per_model_threshold' 0 hits in ../up/agent (fork agent_init.py has 8)"
+  },
+  "notes": "Small generic config knob; upstream-able as-is. No branch produced this run (time).",
+  "problem": "Per-model compression threshold as a config knob (compression.per_model_threshold).",
+  "verdict": "UPSTREAM"
+ },
+ "#392": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#111"
+    ],
+    "loc": 283
+   },
+   "fires": "not separable",
+   "original": "PR #392: p10=0.67 over 5,268 samples in ~/.hermes/state/skew-samples.log.",
+   "upstream_fix": "c0aaa238f6",
+   "upstream_state": "GREEN-equivalent (read-only): upstream c0aaa238f6 usage_anchor.py anchors the trigger on the provider's real prompt_tokens; the fork already carries it \u2014 agent/turn_context.py:99-109 'Usage-anchored fast path \u2026 return anchored' bypasses skew calibration whenever the anchor is valid, so the learned-skew stack now only serves the pre-anchor residual (first preflight after restart/compaction/splice)"
+  },
+  "notes": "Rides with #111 removal.",
+  "problem": "Empty skew history \u2192 raw rough on first preflight \u2192 false-fire; cold-start prior.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#402": {
   "branch": null,
   "evidence": {
@@ -388,6 +469,23 @@
   "problem": "Denorm maintenance gap: effective_last_active not maintained across session import and message-flush paths (stale ordering).",
   "verdict": "UPSTREAM"
  },
+ "#445": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 629
+   },
+   "fires": "'hygiene' 233 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02; repeated-failure alert lines not sampled",
+   "original": "PR #445.",
+   "upstream_fix": "none",
+   "upstream_state": "could not settle read-only: upstream still runs pre-agent hygiene (_is_hygiene_preagent_only_cooldown@../up/agent/context_compressor.py:131) but 'hygiene_timeout' has 0 hits in ../up/gateway/run.py; whether a tighter guard exists needs a code read of the hygiene call path"
+  },
+  "notes": "Needs 20 min of reading ../up/gateway/run.py hygiene path; out of this run's budget.",
+  "problem": "Pre-agent hygiene compression wrapped in a hardcoded 30s wait_for while the summariser is budgeted 300s.",
+  "verdict": "UNRESOLVED"
+ },
  "#502": {
   "branch": null,
   "evidence": {
@@ -426,6 +524,25 @@
   "problem": "Banner and footer used different token counters; show both when they disagree.",
   "verdict": "KEEP"
  },
+ "#506": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#511"
+    ],
+    "loc": 383
+   },
+   "fires": "'maintenance compaction' 1 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02 (the below-threshold class is gone)",
+   "original": "PR #506: Ace 'did you just compact randomly?' with the 3-row table.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): _maintenance_pressure_met is in the vendored LCM plugin (plugins/context_engine/lcm/compaction.py, fork-only path); upstream agent/context_engine.py has no maintenance-pressure gate (grep 0)"
+  },
+  "notes": "The (B) scale-up clamp half rides with the #111 removal; the (A) pressure gate is the live value. LCM plugin half is the plugins tranche's D1a call.",
+  "problem": "Three compactions in eight minutes at 21-32% of threshold: maintenance pressure gate and scale-up clamp.",
+  "verdict": "KEEP"
+ },
  "#511": {
   "branch": null,
   "evidence": {
@@ -444,6 +561,174 @@
   "notes": "Fork-only file; 0 sync conflicts.",
   "problem": "A pass that compacted nothing (214\u2192214) claimed 'Context compacted'.",
   "verdict": "KEEP"
+ },
+ "#528": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#563",
+     "#681"
+    ],
+    "loc": 717
+   },
+   "fires": "'made no progress for' 5 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #528: 126s /compress replied 'No changes'.",
+   "upstream_fix": "upstream stall watchdog (git log upstream/main --grep='no progress' -- agent/conversation_compression.py)",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/conversation_compression.py:786 clamps the idle window to the effective aux timeout and :1282 reports 'made no progress \u2026 ceiling \u2026 continuing without compression'"
+  },
+  "notes": "agent/compression_timeout_floor.py is fork-only; drop with the family on sync.",
+  "problem": "/compress aborts reported dishonestly; outer guard killed the fallback; summariser followed config route not live route.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#529": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#111"
+    ],
+    "loc": 215
+   },
+   "fires": "not separable",
+   "original": "PR #529.",
+   "upstream_fix": "c0aaa238f6",
+   "upstream_state": "GREEN-equivalent (read-only): upstream c0aaa238f6 usage_anchor.py anchors the trigger on the provider's real prompt_tokens; the fork already carries it \u2014 agent/turn_context.py:99-109 'Usage-anchored fast path \u2026 return anchored' bypasses skew calibration whenever the anchor is valid, so the learned-skew stack now only serves the pre-anchor residual (first preflight after restart/compaction/splice)"
+  },
+  "notes": "Rides with #111 removal.",
+  "problem": "seed_skew_calibration clamped scale-up ratios on restart.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#539": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#111"
+    ],
+    "loc": 765
+   },
+   "fires": "record_model_skew_history 12 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #539 body.",
+   "upstream_fix": "c0aaa238f6",
+   "upstream_state": "GREEN-equivalent (read-only): upstream c0aaa238f6 usage_anchor.py anchors the trigger on the provider's real prompt_tokens; the fork already carries it \u2014 agent/turn_context.py:99-109 'Usage-anchored fast path \u2026 return anchored' bypasses skew calibration whenever the anchor is valid, so the learned-skew stack now only serves the pre-anchor residual (first preflight after restart/compaction/splice); upstream persists the anchor on the session row instead"
+  },
+  "notes": "Rides with #111 removal (includes the hermes_state.py model_skew_history table \u2014 a sync-conflict file).",
+  "problem": "Learned skew died with the session; key by (provider, model).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#541": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#111"
+    ],
+    "loc": 1118
+   },
+   "fires": "COMPACTION_SKEW \u2026 class= rows in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02 (677)",
+   "original": "PR #541: 30 real sessions replayed, Welch t=14.89, Cohen d=2.26.",
+   "upstream_fix": "c0aaa238f6",
+   "upstream_state": "GREEN-equivalent (read-only): upstream c0aaa238f6 usage_anchor.py anchors the trigger on the provider's real prompt_tokens; the fork already carries it \u2014 agent/turn_context.py:99-109 'Usage-anchored fast path \u2026 return anchored' bypasses skew calibration whenever the anchor is valid, so the learned-skew stack now only serves the pre-anchor residual (first preflight after restart/compaction/splice)"
+  },
+  "notes": "Rides with #111 removal. agent/content_class.py is fork-only.",
+  "problem": "Single global skew ratio wrong for text-heavy and tool-heavy turns; per-content-class ratios.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#554": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#111"
+    ],
+    "loc": 243
+   },
+   "fires": "not separable",
+   "original": "PR #554: measured live 2026-08-09.",
+   "upstream_fix": "c0aaa238f6",
+   "upstream_state": "GREEN-equivalent (read-only): upstream c0aaa238f6 usage_anchor.py anchors the trigger on the provider's real prompt_tokens; the fork already carries it \u2014 agent/turn_context.py:99-109 'Usage-anchored fast path \u2026 return anchored' bypasses skew calibration whenever the anchor is valid, so the learned-skew stack now only serves the pre-anchor residual (first preflight after restart/compaction/splice)"
+  },
+  "notes": "Rides with #111 removal.",
+  "problem": "Plugin engines never received the session store \u2192 skew persistence inert.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#56": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 120
+   },
+   "fires": "every aux call",
+   "original": "PR #56.",
+   "upstream_fix": "upstream auxiliary_client _resolve_auto (git log -S'main_prov' upstream/main -- agent/auxiliary_client.py)",
+   "upstream_state": "GREEN (read-only): ../up/agent/auxiliary_client.py:560-575 resolves main_prov/main_model together from runtime then config"
+  },
+  "notes": "",
+  "problem": "_resolve_auto resolved provider and model with independent fallbacks \u2192 mismatched pair.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#563": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#528"
+    ],
+    "loc": 344
+   },
+   "fires": "see #528",
+   "original": "PR #563 measured 2026-08-10.",
+   "upstream_fix": "see #528",
+   "upstream_state": "see #528"
+  },
+  "notes": "agent/config_provenance.py is fork-only.",
+  "problem": "#528's floor was inert because a shipped default was treated as an operator value.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#576": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 231
+   },
+   "fires": "drain path exercised on every gateway restart (gateway-restart-ledger.jsonl 34.8K); compaction-in-flight case not separately logged",
+   "original": "PR #576 measured 2026-08-10 timeline.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): compactions_in_flight/_active_compaction 0 hits in ../up/gateway/run.py and ../up/agent/conversation_compression.py"
+  },
+  "notes": "Generic; UPSTREAM candidate if the lead wants a branch.",
+  "problem": "Restart drain could not see an in-flight compaction; SIGTERM killed a 4-minute /compress.",
+  "verdict": "KEEP"
+ },
+ "#61": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#56"
+    ],
+    "loc": 73
+   },
+   "fires": "every aux call",
+   "original": "PR #61.",
+   "upstream_fix": "see #56",
+   "upstream_state": "GREEN (read-only): same resolver block as #56 (:560-575 uses the runtime pair)"
+  },
+  "notes": "",
+  "problem": "provider=auto kept stale main model when crossed onto a fallback client.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#629": {
   "branch": null,
@@ -482,6 +767,61 @@
   "notes": "Small (160 loc); rides with #502.",
   "problem": "Trigger-attribution coverage on the remaining surfaces (acp, cli, tui).",
   "verdict": "KEEP"
+ },
+ "#679": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 226
+   },
+   "fires": "'stalled' 66 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #679.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): _select_main_fallback_entry absent upstream (grep 0 in ../up/agent); upstream context_compressor.py:744 falls back to main only on permanent-looking errors, not watchdog aborts"
+  },
+  "notes": "226 loc.",
+  "problem": "Auto compression without a task fallback route did not inherit the main fallback policy after a watchdog abort.",
+  "verdict": "KEEP"
+ },
+ "#680": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:a662e9f1e2"
+    ],
+    "loc": 235
+   },
+   "fires": "'refusal' 71 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #680.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'stop_details' 0 hits in ../up/agent/context_compressor.py; upstream _is_summary_refusal is text-heuristic only"
+  },
+  "notes": "",
+  "problem": "Anthropic stop_details refusals dropped through streaming aggregation; compression reported the configured route not the selected one.",
+  "verdict": "KEEP"
+ },
+ "#681": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#528"
+    ],
+    "loc": 221
+   },
+   "fires": "see #528",
+   "original": "PR #681 measured 2026-09-12.",
+   "upstream_fix": "see #528",
+   "upstream_state": "see #528 (upstream reports a ceiling at :1282; whether it derives it the same way is a read the adversary can do)"
+  },
+  "notes": "",
+  "problem": "Total ceiling too tight for a stall-fallback to finish; completed summary discarded.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#686": {
   "branch": null,
@@ -591,6 +931,23 @@
   "problem": "Announce degraded to two-line form on the session-hygiene path and printed the live count where the configured limit belongs.",
   "verdict": "KEEP"
  },
+ "#876": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 419
+   },
+   "fires": "'duration' 152, 'compression started' 134 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #876.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): no per-call duration line in ../up/agent/auxiliary_client.py (grep 'duration' \u2192 cooldown comment only)"
+  },
+  "notes": "agent/compression_duration_log.py fork-only; small.",
+  "problem": "Multi-minute compactions unattributable when a context-engine plugin calls call_llm directly.",
+  "verdict": "KEEP"
+ },
  "#95": {
   "branch": null,
   "evidence": {
@@ -646,6 +1003,42 @@
   "problem": "Announce formatter/emitter core (snippet extractor, engine-aware formatter, deduped emitter).",
   "verdict": "KEEP"
  },
+ "nopr:1921a02047": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#111"
+    ],
+    "loc": 383
+   },
+   "fires": "record_compression_skew_history 12 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02",
+   "original": "commit 1921a02047, live incident 2026-07-10.",
+   "upstream_fix": "c0aaa238f6",
+   "upstream_state": "GREEN-equivalent (read-only): upstream c0aaa238f6 usage_anchor.py anchors the trigger on the provider's real prompt_tokens; the fork already carries it \u2014 agent/turn_context.py:99-109 'Usage-anchored fast path \u2026 return anchored' bypasses skew calibration whenever the anchor is valid, so the learned-skew stack now only serves the pre-anchor residual (first preflight after restart/compaction/splice) (the anchor is persisted on the session row and restored after restart \u2014 the exact restart case)"
+  },
+  "notes": "Rides with #111 removal.",
+  "problem": "Restart wiped in-memory skew history \u2192 first preflight false-fired at ~48% real usage.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "nopr:1a633f7cdd": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 13
+   },
+   "fires": "unknown",
+   "original": "commit 1a633f7cdd (2026-05-12).",
+   "upstream_fix": "none",
+   "upstream_state": "not checked (13 loc; needs a read of ../up/agent/auxiliary_client.py _get_cached_client)"
+  },
+  "notes": "13 loc; lead may fold into the aux-resolver SUPERSEDED group if the read confirms.",
+  "problem": "_get_cached_client returned the raw caller model, bypassing normalize_resolved_model.",
+  "verdict": "UNRESOLVED"
+ },
  "nopr:2870fd4994": {
   "branch": null,
   "evidence": {
@@ -665,6 +1058,133 @@
   "problem": "Wire the announce at the engine-agnostic compress_context done-site.",
   "verdict": "KEEP"
  },
+ "nopr:5c0ecedb4b": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:4972c37aa9"
+    ],
+    "loc": 227
+   },
+   "fires": "1,897 model fallbacks in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02",
+   "original": "commit 5c0ecedb4b (2026-06-16).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): ../up/agent/auxiliary_client.py:560-575 reads _read_main_provider()/_read_main_model() with no failover re-sync site in chat_completion_helpers (grep 'set_runtime_main' in fallback path: fork yes, upstream no)"
+  },
+  "notes": "227 loc; generic \u2014 UPSTREAM candidate.",
+  "problem": "Auxiliary routing runtime globals stayed on the primary after failover \u2192 aux tasks on stale model.",
+  "verdict": "KEEP"
+ },
+ "nopr:78ce24d1db": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 65
+   },
+   "fires": "every aux call",
+   "original": "commit 78ce24d1db (re-apply of c1d5f9e9f).",
+   "upstream_fix": "upstream auxiliary_client api_mode plumbing",
+   "upstream_state": "GREEN (read-only): ../up/agent/auxiliary_client.py:122 imports _canonical_api_mode and :1895-1914 mirrors runtime_provider api_mode detection"
+  },
+  "notes": "",
+  "problem": "Resolver ignored ProviderProfile.api_mode for explicit providers.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "nopr:9c52daad05": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 10
+   },
+   "fires": "config-dependent",
+   "original": "commit 9c52daad05 (2026-05-12).",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN (read-only): ../up/agent/auxiliary_client.py:560 normalises 'auto' as a sentinel"
+  },
+  "notes": "10 loc",
+  "problem": "auxiliary.<task>.model: auto sent literally to the wire.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "nopr:a557064b09": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:a8e443aad1"
+    ],
+    "loc": 134
+   },
+   "fires": "'refusal' 71 / model fallbacks 1,897 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02 \u2014 every fallback exercises update_model",
+   "original": "commit a557064b09 (A4 axis B).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): ../up/agent/context_compressor.py update_model@2546 has no _summary_model_is_config_pinned (grep 0); no vendor-family guard in auxiliary_client"
+  },
+  "notes": "134 loc; fleet fallbacks cross vendor families constantly (claude\u2192codex).",
+  "problem": "Stale runtime-carried summary_model after model swap; incompatible pinned compression model on a swapped provider.",
+  "verdict": "KEEP"
+ },
+ "nopr:a662e9f1e2": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 33
+   },
+   "fires": "0 (no marker)",
+   "original": "commit a662e9f1e2 (2026-05-12).",
+   "upstream_fix": "upstream _is_summary_refusal (git log -S'_is_summary_refusal' upstream/main -- agent/context_compressor.py)",
+   "upstream_state": "GREEN (read-only): _is_summary_refusal@../up/agent/context_compressor.py:180 rejects refusal/error bodies"
+  },
+  "notes": "33 loc; drop with the next sync.",
+  "problem": "200-OK control-plane error strings accepted as the summary.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "nopr:a7c5c51156": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "nopr:1921a02047"
+    ],
+    "loc": 33
+   },
+   "fires": "not separable",
+   "original": "commit a7c5c51156.",
+   "upstream_fix": "c0aaa238f6",
+   "upstream_state": "GREEN-equivalent (read-only): upstream c0aaa238f6 usage_anchor.py anchors the trigger on the provider's real prompt_tokens; the fork already carries it \u2014 agent/turn_context.py:99-109 'Usage-anchored fast path \u2026 return anchored' bypasses skew calibration whenever the anchor is valid, so the learned-skew stack now only serves the pre-anchor residual (first preflight after restart/compaction/splice)"
+  },
+  "notes": "Rides with #111 removal.",
+  "problem": "Persisted skew row cleared by shutdown's on_session_end.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "nopr:a8e443aad1": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#25"
+    ],
+    "loc": 197
+   },
+   "fires": "every fallback re-resolves (1,897 fallbacks in window)",
+   "original": "commit a8e443aad1 (Phase B).",
+   "upstream_fix": "none",
+   "upstream_state": "RED by inheritance of #25 (knob absent upstream)"
+  },
+  "notes": "Rides with #25.",
+  "problem": "update_model re-derived the trigger from the old model's threshold_percent after a fallback.",
+  "verdict": "UPSTREAM"
+ },
  "nopr:b56024aa7a": {
   "branch": null,
   "evidence": {
@@ -683,6 +1203,23 @@
   "notes": "",
   "problem": "Silent delivery holes: in-turn callback raise / no callback \u2192 loud markers.",
   "verdict": "KEEP"
+ },
+ "nopr:b62cb039ed": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 177
+   },
+   "fires": "record_compaction_effectiveness 0 loud markers in window",
+   "original": "commit b62cb039ed, 2026-06-19 thrash incident.",
+   "upstream_fix": "see context_compressor.py cooldown rows (multiple upstream commits)",
+   "upstream_state": "GREEN-equivalent (read-only): upstream converged on durable summary-failure cooldown rows (../up/agent/context_compressor.py:131-160, :706-751) and the anchored pre/post basis"
+  },
+  "notes": "Adversary: confirm no caller still branches on the effectiveness counter before removal.",
+  "problem": "Anti-thrash verdict compared a request-level pre value against a messages-only post estimate.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "nopr:bf30e92673": {
   "branch": null,
