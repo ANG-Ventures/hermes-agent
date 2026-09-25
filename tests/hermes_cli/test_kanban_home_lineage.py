@@ -273,3 +273,21 @@ def test_home_lineage_started_at_is_earliest_member(lineage):
 
 def test_home_lineage_start_unknown_on_fail_open(home):
     assert kb.home_lineage(A) == (frozenset({A}), None)
+
+
+def test_home_lineage_without_started_at_column(tmp_path):
+    """A sessions table lacking started_at (older schema; the dashboard facet
+    fixture from #1014) still yields the lineage, with the start unknown."""
+    import sqlite3
+
+    kb.clear_home_ids_cache()
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE sessions (id TEXT, session_key TEXT, "
+                   "parent_session_id TEXT)")
+        db.executemany("INSERT INTO sessions VALUES (?, ?, ?)", [
+            ("old", "chat-a", None), ("new", "chat-a", "old"),
+            ("kid", "chat-a", "new"), ("other", "chat-b", "old"),
+        ])
+    assert kb.home_lineage("new", db_path=path) == (
+        frozenset({"old", "new", "kid"}), None)

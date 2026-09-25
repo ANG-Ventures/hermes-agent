@@ -5257,8 +5257,12 @@ def _home_lineage_query(
     conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
     try:
         conn.execute("PRAGMA busy_timeout = 2000")
+        # started_at is optional: a sessions table without it (older schema,
+        # the dashboard facet fixture) still yields the lineage, start unknown.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        st = "started_at" if "started_at" in cols else "NULL"
         row = conn.execute(
-            "SELECT session_key, parent_session_id, started_at FROM sessions WHERE id = ?",
+            f"SELECT session_key, parent_session_id, {st} FROM sessions WHERE id = ?",
             (sid,),
         ).fetchone()
         if row is None or not row[0]:
@@ -5271,7 +5275,7 @@ def _home_lineage_query(
             if not parent or parent in ids:
                 break
             prow = conn.execute(
-                "SELECT parent_session_id, started_at FROM sessions "
+                f"SELECT parent_session_id, {st} FROM sessions "
                 "WHERE id = ? AND session_key = ?",
                 (parent, key),
             ).fetchone()
@@ -5287,7 +5291,7 @@ def _home_lineage_query(
             ph = ",".join("?" * len(frontier))
             kids = []
             for r in conn.execute(
-                f"SELECT id, started_at FROM sessions WHERE parent_session_id IN ({ph}) "
+                f"SELECT id, {st} FROM sessions WHERE parent_session_id IN ({ph}) "
                 "AND session_key = ?",
                 (*frontier, key),
             ):
