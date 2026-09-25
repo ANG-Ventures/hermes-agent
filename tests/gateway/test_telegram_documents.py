@@ -322,6 +322,21 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.await_args.args[0]
         assert event.media_urls == []
 
+    @pytest.mark.asyncio
+    async def test_media_download_uses_generous_per_request_timeouts(self, adapter):
+        file_obj = _make_file_obj(b"OggS voice bytes")
+        msg = _make_message()
+        msg.voice = MagicMock(file_size=100)
+        msg.voice.get_file = AsyncMock(return_value=file_obj)
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        expected = {"read_timeout": 30.0, "connect_timeout": 10.0, "pool_timeout": 10.0}
+        assert msg.voice.get_file.await_args.kwargs == expected
+        assert file_obj.download_as_bytearray.await_args.kwargs == expected
+        event = adapter.handle_message.await_args.args[0]
+        assert event.media_types == ["audio/ogg"]
+
 class TestVideoDownloadBlock:
     @pytest.mark.asyncio
     async def test_native_video_is_cached(self, adapter):

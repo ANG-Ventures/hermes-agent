@@ -6202,6 +6202,12 @@ class TelegramAdapter(BasePlatformAdapter):
     _CACHED_KIND_TO_MESSAGE_TYPE = {"image": MessageType.PHOTO, "video": MessageType.VIDEO, "audio": MessageType.AUDIO}
 
     _MEDIA_DOWNLOAD_ATTEMPTS = 3
+    # Downloads are CDN payload transfers, not JSON API calls: the bot-default read timeout is routinely
+    # too short for a voice note on a slow file-CDN edge, so every retry hits the same wall. Give the
+    # download path its own per-request budget; retries then only have to cover genuine flakes.
+    _MEDIA_READ_TIMEOUT_S = 30.0
+    _MEDIA_CONNECT_TIMEOUT_S = 10.0
+    _MEDIA_POOL_TIMEOUT_S = 10.0
 
     async def _download_media_with_retry(self, source: Any, kind: str):
         """Fetch Telegram media (``get_file`` + ``download_as_bytearray``) with bounded retries.
@@ -6212,10 +6218,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         from gateway.run import _is_transient_network_error
         attempts = self._MEDIA_DOWNLOAD_ATTEMPTS
+        timeouts = {"read_timeout": self._MEDIA_READ_TIMEOUT_S, "connect_timeout": self._MEDIA_CONNECT_TIMEOUT_S,
+                    "pool_timeout": self._MEDIA_POOL_TIMEOUT_S}
         for attempt in range(1, attempts + 1):
             try:
-                file_obj = await source.get_file()
-                payload = await file_obj.download_as_bytearray()
+                file_obj = await source.get_file(**timeouts)
+                payload = await file_obj.download_as_bytearray(**timeouts)
             except Exception as exc:
                 if attempt == attempts or not _is_transient_network_error(exc):
                     raise
