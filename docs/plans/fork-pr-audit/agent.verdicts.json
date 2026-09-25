@@ -19,6 +19,23 @@
   "problem": "Summary-row detection by regex over flattened content was fragile; LCM engine now tags its summary row (_lcm_summary) + degrade observability.",
   "verdict": "KEEP"
  },
+ "#1000": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 784
+   },
+   "fires": "'shell hook self-heal' / 'missing shell hook' / 'infrastructure failure' 0 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #1000.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): ../up/agent/shell_hooks.py (645 lines) maps FileNotFoundError to 'command not found' (:285) and fails closed; no self-heal"
+  },
+  "notes": "Counter-evidence from this very card: run 10180 (2026-09-25) was hard-blocked by a fail-closed pre_tool_call hook whose script (drain_timer_stop_policy.py) was missing \u2014 the exact case \u2014 and the self-heal did not fire (0 lines). Either the hook lives outside a git checkout the healer recognises or the path is dead. Lead: decide after reading why it did not engage.",
+  "problem": "Absent shell-hook files treated as infrastructure failure with absence-only self-heal (restore from HEAD) + page.",
+  "verdict": "UNRESOLVED"
+ },
  "#1001": {
   "branch": null,
   "evidence": {
@@ -98,6 +115,40 @@
   "problem": "Iteration-limit summary leaked display_kind/display_metadata.",
   "verdict": "KEEP"
  },
+ "#1019": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 286
+   },
+   "fires": "'host at lsp.max_servers_per_host=N; running without LSP' 87 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #1019.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): no host cap in ../up/agent/lsp/ (host_slots.py absent)"
+  },
+  "notes": "Measured; generic \u2014 UPSTREAM-able (config.yaml knob, not env).",
+  "problem": "Per-host cap on running language servers (lsp.max_servers_per_host, default 3).",
+  "verdict": "KEEP"
+ },
+ "#1025": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 108
+   },
+   "fires": "'PASS=' 4 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #1025.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/redact.py:213-217 'Bare KEY/PASS \u2026 do not match' in _ENV_ASSIGN_RE"
+  },
+  "notes": "Adversary: run tests/agent/test_redact_pass_counter.py on ../up.",
+  "problem": "PASS=<n> test counters masked beside a FAIL counter.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#103": {
   "branch": null,
   "evidence": {
@@ -114,6 +165,59 @@
   "notes": "_scope_client_for_task is fork-only; the behaviour (bounded compaction call) is served upstream.",
   "problem": "Compaction summarizer hung 30 min on a saturated relay: timeout not threaded, retries not scoped.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#1047": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#709"
+    ],
+    "loc": 130
+   },
+   "fires": "see #709",
+   "original": "PR #1047 (t_4eeb020\u2026).",
+   "upstream_fix": "none",
+   "upstream_state": "RED-partial: upstream strips _kanban_stop_synthetic (../up/agent/session_persistence.py:38); candidate persistence fork-only"
+  },
+  "notes": "Kanban stop-guard family (#709,#658,#708,#1047): upstream ../up/agent/kanban_stop.py is the base (build_kanban_stop_nudge, session_called_kanban_terminal) but has none of _owns_dispatcher_task / _worker_run_ended / session_has_kanban_terminal_tool (grep 0 in ../up/agent). Fires: 'kanban stop-loop nudge issued' ~154 lines in window. Generic worker-lifecycle correctness; UPSTREAM-able as one PR \u2014 no branch produced this run.",
+  "problem": "Persist the stop-guard's assistant candidate; strip only the nudge.",
+  "verdict": "KEEP"
+ },
+ "#1052": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 297
+   },
+   "fires": "redact runs on every tool output ('redact' 3,919 lines in window); corrupted-JSON incidents not separately logged",
+   "original": "PR #1052 (t_d5\u2026 card).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): no per-leaf JSON redaction in ../up/agent/redact.py (grep 'leaf' 0)"
+  },
+  "notes": "Generic correctness bug in shared code. No branch produced this run.",
+  "problem": "Redacting JSON as text let a masked ENV value eat the closing quote; redact per leaf.",
+  "verdict": "UPSTREAM"
+ },
+ "#1054": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 208
+   },
+   "fires": "no marker",
+   "original": "PR #1054.",
+   "upstream_fix": "unknown",
+   "upstream_state": "partial (read-only): ../up/hermes_state_compression.py:102-106 marks superseded rows; whether duplicate active results per tool_call_id survive concurrent fork+compaction needs tests/\u2026/test_compression_concurrent_fork.py on ../up"
+  },
+  "notes": "Transcript-integrity class; do not drop on zero fires.",
+  "problem": "One active tool result per tool_call_id across in-place compaction.",
+  "verdict": "UNRESOLVED"
  },
  "#106": {
   "branch": null,
@@ -272,6 +376,23 @@
   "problem": "claude-sonnet-5 in known-model lists + pricing.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#136": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 1190
+   },
+   "fires": "'Scheduled auto-resume for N restart-interrupted session(s)' 203 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #136 (docs/BUILD-SPEC-preserve-prompt-restart.md).",
+   "upstream_fix": "upstream #57056 resume-pending note",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/gateway/run.py:1036-1048 builds a resume-pending recovery note for an interrupted turn \u2014 interactive platforms report and ask, non-interactive finish the work (#57056)"
+  },
+  "notes": "Adversary: diff the fork's prompt text vs upstream's; the auto-resume lines may be upstream's own path already.",
+  "problem": "Restart silently skipped interrupted work; preserve-and-prompt instead.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#161": {
   "branch": null,
   "evidence": {
@@ -428,6 +549,40 @@
   "problem": "Provenance stamp gated to single-pass; multi-pass sessions degraded.",
   "verdict": "KEEP"
  },
+ "#179": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 120
+   },
+   "fires": "dashboard-only; no marker",
+   "original": "PR #179.",
+   "upstream_fix": "unknown",
+   "upstream_state": "not settled: upstream moved web_server out of gateway/ (../up/gateway/web_server.py absent); needs the relocated file located and read"
+  },
+  "notes": "Relocation != fixed (README \u00a70).",
+  "problem": "Dashboard session-stats hot read blocked the event loop.",
+  "verdict": "UNRESOLVED"
+ },
+ "#186": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 554
+   },
+   "fires": "'pinned' 221 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (not attributable to this feature; mostly other subsystems)",
+   "original": "PR #186.",
+   "upstream_fix": "n/a",
+   "upstream_state": "n/a (D9)"
+  },
+  "notes": "Mixed desktop row; server half only backs the desktop pin UI.",
+  "problem": "Server-side pinned sessions (desktop).",
+  "verdict": "DROP"
+ },
  "#195": {
   "branch": null,
   "evidence": {
@@ -443,6 +598,25 @@
   },
   "notes": "",
   "problem": "Malformed-conversation 400 cascaded across every provider.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#196": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#547"
+    ],
+    "loc": 419
+   },
+   "fires": "'Repaired N message-alternation violations' 64+ in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (upstream's line)",
+   "original": "PR #196.",
+   "upstream_fix": "upstream repair_message_sequence",
+   "upstream_state": "GREEN (read-only): _prune_unanswered_tool_calls@../up/agent/agent_runtime_helpers.py:538 + repair_message_sequence@:622 (whole sequence, not just the tail)"
+  },
+  "notes": "",
+  "problem": "Mid-history unanswered tool_use not repaired before send.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#2": {
@@ -801,6 +975,23 @@
   "problem": "model.auto_recovery toggle + sticky cooldown on safety refusal.",
   "verdict": "DROP"
  },
+ "#237": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 207
+   },
+   "fires": "CLI-only; not in gateway/agent logs",
+   "original": "PR #237.",
+   "upstream_fix": "upstream auto_continue",
+   "upstream_state": "GREEN-equivalent (read-only): upstream CLI auto-continues an interrupted turn ('auto_continue': 'resumed interrupted turn' @../up/hermes_cli/cli_agent_setup_mixin.py:141)"
+  },
+  "notes": "Upstream resumes instead of nudging \u2014 stronger behaviour.",
+  "problem": "Nudge `chat -c` when the last turn was interrupted mid-flight.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#24": {
   "branch": null,
   "evidence": {
@@ -876,6 +1067,45 @@
   "notes": "Small generic config knob; upstream-able as-is. No branch produced this run (time).",
   "problem": "Per-model compression threshold as a config knob (compression.per_model_threshold).",
   "verdict": "UPSTREAM"
+ },
+ "#253": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#446",
+     "nopr:67d79e812d"
+    ],
+    "loc": 228
+   },
+   "fires": "in use: ~/.hermes/config.yaml:769 trigram_fts: false",
+   "original": "PR #253.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream disables FTS only on corruption (_fts_enabled@../up/hermes_state_fts.py:231,417); no config gate"
+  },
+  "notes": "Live config. Upstream replaced trigram with a CJK-bigram index when available (:20) \u2014 the lead may find the knob moot after sync.",
+  "problem": "Config gate to disable the trigram FTS index.",
+  "verdict": "KEEP"
+ },
+ "#257": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#303"
+    ],
+    "loc": 315
+   },
+   "fires": "see #303",
+   "original": "PR #257.",
+   "upstream_fix": "n/a",
+   "upstream_state": "n/a (D9, see #303)"
+  },
+  "notes": "Commits apps/*/node_modules paths \u2014 also a hygiene problem.",
+  "problem": "Rank session-title matches above content hits (desktop search).",
+  "verdict": "DROP"
  },
  "#26": {
   "branch": null,
@@ -1007,6 +1237,59 @@
   "notes": "Rides with #21.",
   "problem": "Split system prompt into identity+skills; per-message framing tokens.",
   "verdict": "KEEP"
+ },
+ "#3": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 42
+   },
+   "fires": "every git env in tool output",
+   "original": "PR #3.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'GIT_AUTHOR' 0 hits in ../up/agent/redact.py"
+  },
+  "notes": "42 loc, generic.",
+  "problem": "GIT_AUTHOR_*/GIT_COMMITTER_* redacted by the ENV-assignment rule.",
+  "verdict": "UPSTREAM"
+ },
+ "#300": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 233
+   },
+   "fires": "every delegated subagent (not logged)",
+   "original": "PR #300.",
+   "upstream_fix": "upstream compact_categories",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/prompt_builder.py:1280,1364 compact_categories demotes categories to a names-only line"
+  },
+  "notes": "Adversary: upstream's compaction is posture-driven, not subagent-driven \u2014 confirm subagents get it.",
+  "problem": "Compact skill index for subagents + per-task skill promotion.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#303": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#257"
+    ],
+    "loc": 368
+   },
+   "fires": "'session search' 4 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #303.",
+   "upstream_fix": "n/a",
+   "upstream_state": "n/a \u2014 D9: apps/desktop is upstream-owned; the server half (web_server.py + hermes_state search) only serves the desktop UI this row edits"
+  },
+  "notes": "Mixed desktop row. Adversary: confirm no non-desktop client calls the extended search endpoint.",
+  "problem": "Session search matches platform + channel/thread names (desktop).",
+  "verdict": "DROP"
  },
  "#309": {
   "branch": null,
@@ -1141,6 +1424,25 @@
   "problem": "Skill count on the /context Skill index line.",
   "verdict": "KEEP"
  },
+ "#324": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 1,
+    "dependents": [
+     "#559"
+    ],
+    "loc": 110
+   },
+   "fires": "no marker",
+   "original": "PR #324.",
+   "upstream_fix": "unknown",
+   "upstream_state": "not settled read-only: ../up/agent/verification_evidence.py handles && chains (:176,217,231) but a cd-prefix root rebinding was not found by grep"
+  },
+  "notes": "Run the fork test on ../up.",
+  "problem": "Verification evidence ignored a leading `cd <dir> &&` when keying to a root.",
+  "verdict": "UNRESOLVED"
+ },
  "#327": {
   "branch": null,
   "evidence": {
@@ -1176,6 +1478,23 @@
   "notes": "435 loc incl. 20 locale files (3/3 syncs). Repro: start a turn on a dead primary with a chain, /stop during the wait, on ../up.",
   "problem": "/stop ignored inside the fallback retry loop; 'Stopping' wording.",
   "verdict": "UNRESOLVED"
+ },
+ "#341": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 572
+   },
+   "fires": "'turn lease lost; refusing transcript write' 18 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (upstream's mechanism, not the fork gate)",
+   "original": "PR #341.",
+   "upstream_fix": "upstream session turn lease (hermes_state_compression.py:563-585 wait/abort callbacks)",
+   "upstream_state": "GREEN-equivalent (read-only): upstream durable session turn lease refuses transcript writes from a lost holder \u2014 the fork logs upstream's line 'Session DB append_message failed: Session turn lease lost; refusing transcript write' 18x"
+  },
+  "notes": "572 loc on run_agent.py/gateway/run.py (3/3). Adversary: replay tests/\u2026/test_persist_supersed*.py on ../up.",
+  "problem": "A /stop'd turn's zombie writes landed after the new turn (append-time generation gate).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#342": {
   "branch": null,
@@ -1214,6 +1533,23 @@
   "notes": "Rides with the #12 background_review decision.",
   "problem": "Background-review fork CLI session isolated from bridge routing.",
   "verdict": "KEEP"
+ },
+ "#37": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 492
+   },
+   "fires": "no log marker for a lockout; 'grace turn' 0",
+   "original": "PR #37.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream has the grace call (_budget_grace_call@../up/agent/agent_init.py:562, conversation_loop.py:1595, turn_iteration_prep.py:389) but no lockout (budget_grace_gate.py absent)"
+  },
+  "notes": "Safety guard with no counter \u2014 cannot show it ever denied a tool. Add a counter or accept as policy KEEP.",
+  "problem": "Deny-by-default side-effect lockout on the budget grace turn (Guard D-core).",
+  "verdict": "UNRESOLVED"
  },
  "#38": {
   "branch": null,
@@ -1399,6 +1735,25 @@
   "problem": "Pre-agent hygiene compression wrapped in a hardcoded 30s wait_for while the summariser is budgeted 300s.",
   "verdict": "UNRESOLVED"
  },
+ "#446": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#253"
+    ],
+    "loc": 151
+   },
+   "fires": "'trigram' 10 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #446.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN (read-only): _is_trigram_unavailable_error@../up/hermes_state_fts.py:178; families left alone when the vtable is not live (:141)"
+  },
+  "notes": "",
+  "problem": "_fts_rebuild_finish ran the trigram sweep when the trigram index was unavailable.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#447": {
   "branch": null,
   "evidence": {
@@ -1436,6 +1791,23 @@
   "notes": "Rides with #21; superseded by #46 in the fork.",
   "problem": "Fixed divisor 4.0\u21924.2 (post-deploy gate).",
   "verdict": "KEEP"
+ },
+ "#457": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 118
+   },
+   "fires": "n/a",
+   "original": "PR #457.",
+   "upstream_fix": "upstream _CFG_DOTTED_RE rewrite",
+   "upstream_state": "GREEN (read-only): ../up/agent/redact.py:262-267 uses possessive quantifiers (++, *+)"
+  },
+  "notes": "",
+  "problem": "Catastrophic backtracking in _CFG_DOTTED_RE.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#459": {
   "branch": null,
@@ -1584,6 +1956,25 @@
   "notes": "Adversary: confirm one hop \u2192 one message on ../up with a two-entry chain.",
   "problem": "One failover hop announced as two chat messages.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#500": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 1,
+    "dependents": [
+     "#12"
+    ],
+    "loc": 176
+   },
+   "fires": "'bg-review' 1,589 in window",
+   "original": "PR #500.",
+   "upstream_fix": "none",
+   "upstream_state": "RED-partial: ../up/agent/turn_finalizer.py:697-703 launches the fork but has no parent-task isolation for kanban"
+  },
+  "notes": "Rides with the #12 background_review decision.",
+  "problem": "Background-review forks must not fail the parent's kanban task.",
+  "verdict": "KEEP"
  },
  "#501": {
   "branch": null,
@@ -1753,6 +2144,25 @@
   "problem": "Entitlement 403 announced as '(auth refresh)' instead of '(account blocked)'.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#518": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "nopr:75b1b49ca7"
+    ],
+    "loc": 137
+   },
+   "fires": "every mem0 prefetch/sync on gateway turns (plugins tranche measured mem0 live)",
+   "original": "PR #518.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): ../up/agent/memory_manager.py strips skill scaffolding only (_strip_skill_scaffolding@:445); no harness-metadata strip"
+  },
+  "notes": "Rides with the plugins-tranche mem0 KEEPs. 0 syncs.",
+  "problem": "Gateway harness metadata leaked into the memory-provider fan-out.",
+  "verdict": "KEEP"
+ },
  "#528": {
   "branch": null,
   "evidence": {
@@ -1904,6 +2314,23 @@
   "problem": "Single global skew ratio wrong for text-heavy and tool-heavy turns; per-content-class ratios.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#547": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 93
+   },
+   "fires": "see #196",
+   "original": "PR #547.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN (read-only): ../up/agent/agent_runtime_helpers.py:273-274 'Canonical call_id || id precedence \u2026 bare id misses Codex call_id results'"
+  },
+  "notes": "",
+  "problem": "Pass 1.5 matched tool results on id not call_id.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#55": {
   "branch": null,
   "evidence": {
@@ -1942,6 +2369,23 @@
   "problem": "Plugin engines never received the session store \u2192 skew persistence inert.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#559": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 1,
+    "dependents": [],
+    "loc": 84
+   },
+   "fires": "no marker",
+   "original": "PR #559.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/verification_evidence.py:33,334 '`/usr/bin/env python3 script` names the same interpreter'"
+  },
+  "notes": "Adversary: `env -u X pytest` form specifically.",
+  "problem": "Env options before test commands not recognised.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#56": {
   "branch": null,
   "evidence": {
@@ -1978,6 +2422,23 @@
   "problem": "#528's floor was inert because a shipped default was treated as an operator value.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#573": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 246
+   },
+   "fires": "'No space left on device' 75 real disk-full lines in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (channel_directory); misattribution count not separable",
+   "original": "PR #573.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): shutdown_forensics absent upstream"
+  },
+  "notes": "Disk-full did happen in the window, so the discriminator has something to discriminate; unmeasured whether the blame ever misfired.",
+  "problem": "Restart-interrupted turn was blamed on a full disk.",
+  "verdict": "UNRESOLVED"
+ },
  "#576": {
   "branch": null,
   "evidence": {
@@ -1993,6 +2454,23 @@
   },
   "notes": "Generic; UPSTREAM candidate if the lead wants a branch.",
   "problem": "Restart drain could not see an in-flight compaction; SIGTERM killed a 4-minute /compress.",
+  "verdict": "KEEP"
+ },
+ "#578": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 534
+   },
+   "fires": "'routing entry' 5 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #578.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): set_session_archived in ../up/hermes_state_sessions.py (:1687-1695 bulk path) has no routing-entry retire (grep 'routing' 0 in its body)"
+  },
+  "notes": "Small, generic; UPSTREAM-able. 3/3 syncs (hermes_state.py).",
+  "problem": "Archiving flipped a flag but left the routing entry live.",
   "verdict": "KEEP"
  },
  "#587": {
@@ -2052,6 +2530,40 @@
   "notes": "1,143 loc on 3/3-sync files. Fires rarely as a preflight; the post-hoc 413 path upstream now handles. Adversary: is the preflight ever the thing that saved a turn? If not, this is a DROP.",
   "problem": "Preflight provider body byte limits before sending (413 avoidance).",
   "verdict": "KEEP"
+ },
+ "#600": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [],
+    "loc": 71
+   },
+   "fires": "0: no otlp key in ~/.hermes/config.yaml; 'otlp|span' matches in window are all unrelated",
+   "original": "PR #600.",
+   "upstream_fix": "n/a",
+   "upstream_state": "n/a"
+  },
+  "notes": "Exporter not configured in this deployment \u2014 never runs. 0 syncs, 71 loc.",
+  "problem": "Make a total OTLP span-export outage visible.",
+  "verdict": "DROP"
+ },
+ "#602": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 470
+   },
+   "fires": "silent path; 'multimodal' 1 line",
+   "original": "PR #602.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): no prior-turn multimodal expiry in ../up/agent (grep 0)"
+  },
+  "notes": "Cost-relevant if images recur in long sessions; measurable via blackbox comp_tool_result_tokens on image sessions. Not measured this run.",
+  "problem": "Expire prior-turn multimodal payloads (stop resending images).",
+  "verdict": "UNRESOLVED"
  },
  "#604": {
   "branch": null,
@@ -2225,6 +2737,23 @@
   "problem": "Pool read-phase 504 burned 3 retries before failing over.",
   "verdict": "KEEP"
  },
+ "#625": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 319
+   },
+   "fires": "no marker",
+   "original": "PR #625.",
+   "upstream_fix": "unknown",
+   "upstream_state": "not settled read-only: upstream reopened the writer (_open_writer_conn@../up/hermes_state.py:755) and has a readpool module (hermes_state_readpool.py); whether reads still share the writer conn needs tests/\u2026/test_writer_conn_thread_safety.py on ../up"
+  },
+  "notes": "Data-loss class \u2014 do not drop on zero fires.",
+  "problem": "Unlocked reads on the shared writer connection destroyed turns as session_persist raced.",
+  "verdict": "UNRESOLVED"
+ },
  "#629": {
   "branch": null,
   "evidence": {
@@ -2318,6 +2847,26 @@
   "problem": "gpt-6-astra in catalogs, metadata, pricing.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#65": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:14b186d6fa",
+     "nopr:17910311e6"
+    ],
+    "loc": 220
+   },
+   "fires": "'/undo' 2, '/redo' 0 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #65.",
+   "upstream_fix": "upstream /undo (_handle_undo_command@../up/gateway/slash_commands_session.py:431)",
+   "upstream_state": "read-only: /undo GREEN via rewind_user_turn@../up/hermes_state_rewind.py:45; /redo absent upstream"
+  },
+  "notes": "/undo+/redo family (#65, nopr:14b186d6fa, nopr:17910311e6; hermes_undo.py 22.9K wired into gateway/run.py, slash_commands.py, session.py). Upstream ships /undo [N] via rewind_user_turn@../up/hermes_state_rewind.py:45 + _handle_undo_command@../up/gateway/slash_commands_session.py:431; 'redo' 0 hits upstream. Measured use: '/undo' invoked 2x in the whole log window (Discord adapter log), '/redo' 0. The card body flags this family as a prime UPSTREAM candidate; the measurement does not support it \u2014 /redo has never been used and /undo is served upstream. Verdict DROP (take upstream's /undo). No revert branch: removal touches three 3/3-sync gateway files and must be done as one consolidated change at the next sync.",
+  "problem": "Preserve partial /redo progress, bound _states, public redo_count bump, clamp.",
+  "verdict": "DROP"
+ },
  "#650": {
   "branch": null,
   "evidence": {
@@ -2336,6 +2885,112 @@
   "notes": "Rides with #7.",
   "problem": "Codex notional route consulted external catalogs before the curated snapshot.",
   "verdict": "KEEP"
+ },
+ "#656": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "#893"
+    ],
+    "loc": 314
+   },
+   "fires": "'fail_closed=True' registrations ~5,284 lines (registration, not denials)",
+   "original": "PR #656.",
+   "upstream_fix": "upstream fail_closed",
+   "upstream_state": "GREEN (read-only): _fail_closed_block@../up/agent/shell_hooks.py:380; timeout/error on a fail_closed blocking hook blocks (:389-395), unparseable stdout blocks (:412)"
+  },
+  "notes": "0 syncs.",
+  "problem": "Failed security hooks did not deny before tool execution.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#658": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#709"
+    ],
+    "loc": 290
+   },
+   "fires": "see #709",
+   "original": "PR #658.",
+   "upstream_fix": "none",
+   "upstream_state": "RED: _worker_run_ended 0 hits upstream"
+  },
+  "notes": "Kanban stop-guard family (#709,#658,#708,#1047): upstream ../up/agent/kanban_stop.py is the base (build_kanban_stop_nudge, session_called_kanban_terminal) but has none of _owns_dispatcher_task / _worker_run_ended / session_has_kanban_terminal_tool (grep 0 in ../up/agent). Fires: 'kanban stop-loop nudge issued' ~154 lines in window. Generic worker-lifecycle correctness; UPSTREAM-able as one PR \u2014 no branch produced this run.",
+  "problem": "Lifecycle enforcer honors the originating run's terminal outcome.",
+  "verdict": "KEEP"
+ },
+ "#669": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 395
+   },
+   "fires": "0 fork log lines in window",
+   "original": "PR #669.",
+   "upstream_fix": "upstream codex account/sub pairing",
+   "upstream_state": "GREEN-equivalent (read-only): _codex_entry_tracks_singleton@../up/agent/credential_pool.py:346 + (chatgpt_account_id, sub) claim pair @:330-343 ('members of one ChatGPT workspace share chatgpt_account_id yet have their own sub')"
+  },
+  "notes": "Credential-pool freshness family (#669,#670,#671,#730,#673): upstream grew its own singleton-freshness logic (_singleton_predates_entry@../up/agent/credential_pool.py:427, _codex_entry_tracks_singleton@:346 'whether a Codex pool entry may adopt the auth.json singleton's token pair', _SINGLE_USE_REFRESH_PROVIDERS@:963 incl. xai-oauth). None of the fork's refuse/adopt log lines fired in the window (sample 'credential pool: .*(stale|refus|adopt|singleton|owner|producer)' = 0). Adversary: replay tests/agent/test_credential_pool_singleton_freshness.py and test_credential_pool_adopt_rotated_entry.py against ../up.",
+  "problem": "Cross-account + stale Codex singleton adoption; one shared account id.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#670": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 608
+   },
+   "fires": "0 fork log lines in window",
+   "original": "PR #670.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): _singleton_predates_entry@../up/agent/credential_pool.py:427; Nous singleton metadata mirroring @:183"
+  },
+  "notes": "Credential-pool freshness family (#669,#670,#671,#730,#673): upstream grew its own singleton-freshness logic (_singleton_predates_entry@../up/agent/credential_pool.py:427, _codex_entry_tracks_singleton@:346 'whether a Codex pool entry may adopt the auth.json singleton's token pair', _SINGLE_USE_REFRESH_PROVIDERS@:963 incl. xai-oauth). None of the fork's refuse/adopt log lines fired in the window (sample 'credential pool: .*(stale|refus|adopt|singleton|owner|producer)' = 0). Adversary: replay tests/agent/test_credential_pool_singleton_freshness.py and test_credential_pool_adopt_rotated_entry.py against ../up.",
+  "problem": "Refuse stale singleton pairs in the xAI and Nous readers.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#671": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 1,
+    "dependents": [],
+    "loc": 1047
+   },
+   "fires": "0 fork log lines in window",
+   "original": "PR #671.",
+   "upstream_fix": "none",
+   "upstream_state": "partial (read-only): upstream _seed_anthropic_singletons@../up/agent/credential_pool.py:2541 seeds without a producer stamp (grep 'producer' 0)"
+  },
+  "notes": "Credential-pool freshness family (#669,#670,#671,#730,#673): upstream grew its own singleton-freshness logic (_singleton_predates_entry@../up/agent/credential_pool.py:427, _codex_entry_tracks_singleton@:346 'whether a Codex pool entry may adopt the auth.json singleton's token pair', _SINGLE_USE_REFRESH_PROVIDERS@:963 incl. xai-oauth). None of the fork's refuse/adopt log lines fired in the window (sample 'credential pool: .*(stale|refus|adopt|singleton|owner|producer)' = 0). Adversary: replay tests/agent/test_credential_pool_singleton_freshness.py and test_credential_pool_adopt_rotated_entry.py against ../up. Needs the fork test on ../up to decide.",
+  "problem": "Gate singleton seeding and stamp the Anthropic producer.",
+  "verdict": "UNRESOLVED"
+ },
+ "#673": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 2078
+   },
+   "fires": "its own lines ('Codex owner row unavailable', 'deferred refresh unavailable') 0 in window; openai-codex 1,883 turns in 30d exercise the path silently",
+   "original": "PR #673 body (adversarial-review blockers addressed; docs/codex-owner-original-red.json).",
+   "upstream_fix": "none",
+   "upstream_state": "partial (read-only): upstream _codex_entry_tracks_singleton@../up/agent/credential_pool.py:346 addresses singleton adoption but has no owner store / generation receipt (codex_owner.py absent upstream)"
+  },
+  "notes": "2,078 loc. Cannot settle without running tests/agent/test_codex_owner_multiprocess.py against ../up (multiprocess refresh race). The guard only logs on failure, so 0 fires != unused.",
+  "problem": "Codex refresh ownership + quarantine generations across profiles (owner lock, durable receipts).",
+  "verdict": "UNRESOLVED"
  },
  "#674": {
   "branch": null,
@@ -2386,6 +3041,25 @@
   },
   "notes": "226 loc.",
   "problem": "Auto compression without a task fallback route did not inherit the main fallback policy after a watchdog abort.",
+  "verdict": "KEEP"
+ },
+ "#68": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#7"
+    ],
+    "loc": 8
+   },
+   "fires": "see #7",
+   "original": "PR #68 (8 loc comment).",
+   "upstream_fix": "none",
+   "upstream_state": "see #7"
+  },
+  "notes": "Rides with the notional-pricing family.",
+  "problem": "Document _lookup_official_docs_pricing precedence.",
   "verdict": "KEEP"
  },
  "#680": {
@@ -2465,6 +3139,25 @@
   "problem": "tests/test_hermes_state.py (10,900 lines, 537 tests) took 600s on CI and was SIGKILLed by the 300s per-file cap; split into 4 files.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#699": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "nopr:036ae92ba1"
+    ],
+    "loc": 112
+   },
+   "fires": "curator runs daily; accounting not separately logged",
+   "original": "PR #699.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see nopr:036ae92ba1)"
+  },
+  "notes": "Rides with curator family; unmeasured on its own.",
+  "problem": "Curator counted on-disk skills per pass, not across the run.",
+  "verdict": "KEEP"
+ },
  "#7": {
   "branch": null,
   "evidence": {
@@ -2518,6 +3211,42 @@
   "problem": "Rate-limit Retry-After honored on a pool-exhausted seat (wrong wait).",
   "verdict": "KEEP"
  },
+ "#708": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 106
+   },
+   "fires": "see #709",
+   "original": "PR #708.",
+   "upstream_fix": "none",
+   "upstream_state": "RED: session_has_kanban_terminal_tool 0 hits upstream"
+  },
+  "notes": "Kanban stop-guard family (#709,#658,#708,#1047): upstream ../up/agent/kanban_stop.py is the base (build_kanban_stop_nudge, session_called_kanban_terminal) but has none of _owns_dispatcher_task / _worker_run_ended / session_has_kanban_terminal_tool (grep 0 in ../up/agent). Fires: 'kanban stop-loop nudge issued' ~154 lines in window. Generic worker-lifecycle correctness; UPSTREAM-able as one PR \u2014 no branch produced this run.",
+  "problem": "Skip the stop-nudge when the session exposes no kanban terminal tool.",
+  "verdict": "KEEP"
+ },
+ "#709": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "#708"
+    ],
+    "loc": 172
+   },
+   "fires": "'kanban stop-loop nudge issued' ~154 in window",
+   "original": "PR #709.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): _owns_dispatcher_task 0 hits in ../up/agent"
+  },
+  "notes": "Kanban stop-guard family (#709,#658,#708,#1047): upstream ../up/agent/kanban_stop.py is the base (build_kanban_stop_nudge, session_called_kanban_terminal) but has none of _owns_dispatcher_task / _worker_run_ended / session_has_kanban_terminal_tool (grep 0 in ../up/agent). Fires: 'kanban stop-loop nudge issued' ~154 lines in window. Generic worker-lifecycle correctness; UPSTREAM-able as one PR \u2014 no branch produced this run.",
+  "problem": "Stop-nudge must check WHO owns the card, not just whether the tool exists.",
+  "verdict": "KEEP"
+ },
  "#722": {
   "branch": null,
   "evidence": {
@@ -2534,6 +3263,23 @@
   "notes": "Adversary: the bridge emits cache_creation_tokens (Anthropic name), upstream reads cache_write_tokens \u2014 verify the key alias on ../up before dropping.",
   "problem": "Anthropic-backed OpenAI bridges report cache_creation_tokens; transport ignored it.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#730": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [],
+    "loc": 344
+   },
+   "fires": "0 fork log lines in window",
+   "original": "PR #730.",
+   "upstream_fix": "unknown",
+   "upstream_state": "not settled read-only: upstream CredentialPool._adopt@../up/agent/credential_pool.py:1149 exists; whether the stale-key/no-match path adopts needs the fork test on ../up"
+  },
+  "notes": "Credential-pool freshness family (#669,#670,#671,#730,#673): upstream grew its own singleton-freshness logic (_singleton_predates_entry@../up/agent/credential_pool.py:427, _codex_entry_tracks_singleton@:346 'whether a Codex pool entry may adopt the auth.json singleton's token pair', _SINGLE_USE_REFRESH_PROVIDERS@:963 incl. xai-oauth). None of the fork's refuse/adopt log lines fired in the window (sample 'credential pool: .*(stale|refus|adopt|singleton|owner|producer)' = 0). Adversary: replay tests/agent/test_credential_pool_singleton_freshness.py and test_credential_pool_adopt_rotated_entry.py against ../up. 0 syncs (no conflict cost).",
+  "problem": "Adopt the rotated token when the agent's stale key matches no pool entry.",
+  "verdict": "UNRESOLVED"
  },
  "#739": {
   "branch": null,
@@ -2585,6 +3331,76 @@
   "problem": "No post-compaction chat announce with reconciling numbers; users could not see what a compaction did.",
   "verdict": "KEEP"
  },
+ "#764": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#942"
+    ],
+    "loc": 1015
+   },
+   "fires": "see #942",
+   "original": "PR #764.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #942)"
+  },
+  "notes": "Rides with #942.",
+  "problem": "Consume the out-of-band hermes_confab_notice response extension.",
+  "verdict": "UNRESOLVED"
+ },
+ "#768": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 538
+   },
+   "fires": "test-only",
+   "original": "PR #768.",
+   "upstream_fix": "upstream hermes_state_guard",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/hermes_state_guard.py:3,18-19 'a pytest-context process (env OR ancestry) can never open a production' state.db"
+  },
+  "notes": "538 loc incl. managed_scope.py; upstream guard covers the class.",
+  "problem": "Resolve the managed system scope through one session-wide pytest predicate.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#787": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 5589
+   },
+   "fires": "~/.hermes/blackbox/turns.db 30d: output_tokens_unknown=8 of 10,959 turns (usage_unknown/input/cache_write unknown = 0)",
+   "original": "PR #787 body: claude-bpx #186 bridge reports null completion_tokens + usage.output_tokens_unavailable on ~40% of parallel-batch turns.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): _usage_field@../up/agent/usage_pricing.py:340-352 returns 0 for a None/falsy hop \u2014 null is still a measured 0 upstream"
+  },
+  "notes": "Correct and measured, but the ratio is poor: 5,589 loc across agent_init/codex_runtime/conversation_loop/moa_loop + blackbox (3/3 syncs) for 8 flagged turns in 30d. The bridge-side reconciliation apparently fixed most of the nulls. Lead: consider shrinking to the usage_pricing discriminator + one blackbox column.",
+  "problem": "Provider-declared null usage (bridge honest-unknown) coerced to a measured 0.",
+  "verdict": "KEEP"
+ },
+ "#806": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 93
+   },
+   "fires": "'turn lease wait timed out' 13 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02); no notice storm observed",
+   "original": "PR #806.",
+   "upstream_fix": "n/a",
+   "upstream_state": "RED (no notice backoff upstream) but upstream has no repeated notice to back off \u2014 its lease wait logs only on timeout (../up/hermes_state_compression.py:563-585 debug callbacks)"
+  },
+  "notes": "Log-volume fix on a 3/3-sync file (hermes_state.py) with no measured volume problem. No revert branch this run.",
+  "problem": "Back off cross-process turn-lease wait notices.",
+  "verdict": "DROP"
+ },
  "#81": {
   "branch": null,
   "evidence": {
@@ -2623,6 +3439,23 @@
   "problem": "Announce degraded to two-line form on the session-hygiene path and printed the live count where the configured limit belongs.",
   "verdict": "KEEP"
  },
+ "#841": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 1,
+    "dependents": [],
+    "loc": 435
+   },
+   "fires": "security guard; no marker",
+   "original": "PR #841.",
+   "upstream_fix": "unknown",
+   "upstream_state": "not settled read-only: needs the fork's tests/agent/test_shell_hooks.py disclosure cases run against ../up"
+  },
+  "notes": "Security fix \u2014 do not DROP on a zero-fire count. 1 sync.",
+  "problem": "Two residual secret-disclosure channels to the model (outbound webhooks, shell hooks).",
+  "verdict": "UNRESOLVED"
+ },
  "#876": {
   "branch": null,
   "evidence": {
@@ -2658,6 +3491,42 @@
   "notes": "Generic catalog add; upstream will want it. No branch produced this run (time) \u2014 a 3-file port (model_metadata, reasoning_timeouts, models_catalog_static) minus the notional pricing tuple.",
   "problem": "grok-4.7 (GA 2026-09-21) as xAI flagship: catalog, pricing, 500K window.",
   "verdict": "UPSTREAM"
+ },
+ "#891": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 256
+   },
+   "fires": "'salvage' 3 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #891.",
+   "upstream_fix": "upstream sessions recover",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/hermes_state_repair.py:401-404 hint is `hermes sessions recover --source \u2026` and warns not to point raw sqlite3 at the live DB"
+  },
+  "notes": "",
+  "problem": "sqlite3 salvage remedy must survive being pasted into a shell.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#893": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "#656"
+    ],
+    "loc": 241
+   },
+   "fires": "no marker",
+   "original": "PR #893 (t_a53d38ad).",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent: upstream _fail_closed_block carries the runner error text (r['error'] or 'timed out after Ns') at ../up/agent/shell_hooks.py:395"
+  },
+  "notes": "Wording nuance only; adversary may disagree on the exact phrasing.",
+  "problem": "A crashed fail_closed hook was worded like a policy denial.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#898": {
   "branch": null,
@@ -2731,6 +3600,25 @@
   "problem": "Guard the two Opus 5.5 request-shape breaking changes.",
   "verdict": "UNRESOLVED"
  },
+ "#942": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#764"
+    ],
+    "loc": 1387
+   },
+   "fires": "no agent-side marker; 'confab' 4 incidental lines in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (incl. Ace: 'Confab-OOB lane live on all N subs')",
+   "original": "PR #942.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'confab_notice' / 'hermes_confab_notice' 0 hits in ../up/agent"
+  },
+  "notes": "Needed only while the relay emits the out-of-band confab extension. Measure on the relay side (notice count per day) before deciding KEEP vs DROP. 1,387 loc on 3/3-sync files.",
+  "problem": "Recover tool-call notices (confab notice) before empty-response handling.",
+  "verdict": "UNRESOLVED"
+ },
  "#95": {
   "branch": null,
   "evidence": {
@@ -2749,6 +3637,23 @@
   "notes": "",
   "problem": "Granular block only rendered on hygiene; the dominant in-turn threshold path degraded to one line on every real session.",
   "verdict": "KEEP"
+ },
+ "#958": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 114
+   },
+   "fires": "no marker",
+   "original": "PR #958.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): update_session_billing_route@../up/hermes_state_usage.py:85-90 docstring: route write clears system_prompt 'so the cached snapshot header is rebuilt' \u2014 deliberate upstream handling"
+  },
+  "notes": "Adversary: the fork wanted RETAIN, upstream deliberately rebuilds \u2014 check test_system_prompt_restore.py on ../up.",
+  "problem": "Session prompt lost across route-metadata writes.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#959": {
   "branch": null,
@@ -2822,6 +3727,23 @@
   "problem": "Forward-defense hardening of _content_to_text for structured summary content.",
   "verdict": "DROP"
  },
+ "#997": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [],
+    "loc": 217
+   },
+   "fires": "dead: grep 'output_split' over agent/ gateway/ plugins/ tools/ hermes_cli/ (non-test) hits only agent/output_split.py itself",
+   "original": "PR #997.",
+   "upstream_fix": "n/a",
+   "upstream_state": "n/a (fork-only module)"
+  },
+  "notes": "No importer on origin/main; the move's consumer never landed or was removed. 0 syncs. Revert branch attempted (see branch).",
+  "problem": "output_split: shared finished/unfinished output producer (pure move).",
+  "verdict": "DROP"
+ },
  "nopr:02a357eaf5": {
   "branch": null,
   "evidence": {
@@ -2840,6 +3762,64 @@
   "notes": "Base of the family.",
   "problem": "Announce formatter/emitter core (snippet extractor, engine-aware formatter, deduped emitter).",
   "verdict": "KEEP"
+ },
+ "nopr:036ae92ba1": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:e7d2b9f1bd",
+     "#699"
+    ],
+    "loc": 3213
+   },
+   "fires": "'skills-shared' 189 and 'curator: \u2026 shared: skipped (\u2026)' lines in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02); curator runs daily (97 snapshots)",
+   "original": "commit 036ae92ba1.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): ../up/agent/curator.py (1,184 lines vs fork 2,414) has no skills-shared scope or skill_split (grep 0)"
+  },
+  "notes": "Fleet shared-skills tree is fork infrastructure. Note most sampled runs report 'shared: skipped' (precheck/nothing over threshold) \u2014 the split half rarely acts.",
+  "problem": "Curator scope extended to skills-shared/ + oversized-skill split.",
+  "verdict": "KEEP"
+ },
+ "nopr:14b186d6fa": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#65"
+    ],
+    "loc": 173
+   },
+   "fires": "see #65",
+   "original": "commit 14b186d6fa.",
+   "upstream_fix": "see #65",
+   "upstream_state": "see #65"
+  },
+  "notes": "/undo+/redo family (#65, nopr:14b186d6fa, nopr:17910311e6; hermes_undo.py 22.9K wired into gateway/run.py, slash_commands.py, session.py). Upstream ships /undo [N] via rewind_user_turn@../up/hermes_state_rewind.py:45 + _handle_undo_command@../up/gateway/slash_commands_session.py:431; 'redo' 0 hits upstream. Measured use: '/undo' invoked 2x in the whole log window (Discord adapter log), '/redo' 0. The card body flags this family as a prime UPSTREAM candidate; the measurement does not support it \u2014 /redo has never been used and /undo is served upstream. Verdict DROP (take upstream's /undo). No revert branch: removal touches three 3/3-sync gateway files and must be done as one consolidated change at the next sync.",
+  "problem": "Show new-tail preview after /undo and /redo.",
+  "verdict": "DROP"
+ },
+ "nopr:17910311e6": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:14b186d6fa"
+    ],
+    "loc": 80
+   },
+   "fires": "see #65",
+   "original": "commit 17910311e6.",
+   "upstream_fix": "see #65",
+   "upstream_state": "see #65"
+  },
+  "notes": "/undo+/redo family (#65, nopr:14b186d6fa, nopr:17910311e6; hermes_undo.py 22.9K wired into gateway/run.py, slash_commands.py, session.py). Upstream ships /undo [N] via rewind_user_turn@../up/hermes_state_rewind.py:45 + _handle_undo_command@../up/gateway/slash_commands_session.py:431; 'redo' 0 hits upstream. Measured use: '/undo' invoked 2x in the whole log window (Discord adapter log), '/redo' 0. The card body flags this family as a prime UPSTREAM candidate; the measurement does not support it \u2014 /redo has never been used and /undo is served upstream. Verdict DROP (take upstream's /undo). No revert branch: removal touches three 3/3-sync gateway files and must be done as one consolidated change at the next sync.",
+  "problem": "Harden /undo-/redo tail preview (Greptile #224 P1s).",
+  "verdict": "DROP"
  },
  "nopr:1921a02047": {
   "branch": null,
@@ -2877,6 +3857,44 @@
   "problem": "_get_cached_client returned the raw caller model, bypassing normalize_resolved_model.",
   "verdict": "UNRESOLVED"
  },
+ "nopr:1b028678e1": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "nopr:3c413ca764"
+    ],
+    "loc": 9
+   },
+   "fires": "see nopr:3c413ca764",
+   "original": "commit 1b028678e1 (Greptile P2).",
+   "upstream_fix": "none",
+   "upstream_state": "see nopr:3c413ca764"
+  },
+  "notes": "9 loc; rides.",
+  "problem": "Mismatch net must not self-disable silently.",
+  "verdict": "KEEP"
+ },
+ "nopr:255a4c4546": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:ad8de4f275"
+    ],
+    "loc": 320
+   },
+   "fires": "n/a",
+   "original": "commit 255a4c4546 (refactor).",
+   "upstream_fix": "n/a",
+   "upstream_state": "n/a (isolation of fork gates; tool_gate.py absent upstream)"
+  },
+  "notes": "Isolation refactor \u2014 reduces tool_executor.py conflicts.",
+  "problem": "Extract fork tool-gate helpers into agent/tool_gate.py.",
+  "verdict": "KEEP"
+ },
  "nopr:2870fd4994": {
   "branch": null,
   "evidence": {
@@ -2913,6 +3931,25 @@
   },
   "notes": "Rides with #21256 (this is the isolation refactor).",
   "problem": "Layer per-entry reasoning_effort on upstream's chokepoint; fix mcp-discovery.",
+  "verdict": "KEEP"
+ },
+ "nopr:3c413ca764": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "nopr:1b028678e1"
+    ],
+    "loc": 426
+   },
+   "fires": "'residue' 13 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "commit 3c413ca764 (2026-07-10 ctx-residue diagnosis).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'mismatch'/'residue' 0 in ../up/agent/tool_executor.py"
+  },
+  "notes": "Fires rarely but real.",
+  "problem": "RC3 executor-residue gates + tool-submit context-mismatch net.",
   "verdict": "KEEP"
  },
  "nopr:4972c37aa9": {
@@ -2955,6 +3992,23 @@
   "problem": "Auxiliary routing runtime globals stayed on the primary after failover \u2192 aux tasks on stale model.",
   "verdict": "KEEP"
  },
+ "nopr:67d79e812d": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 80
+   },
+   "fires": "see #446",
+   "original": "commit 67d79e812d.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN (see #446)"
+  },
+  "notes": "",
+  "problem": "Survive a missing trigram tokenizer (FTS5 present, trigram absent).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "nopr:7188575694": {
   "branch": null,
   "evidence": {
@@ -2974,6 +4028,25 @@
   "problem": "No-byte TTFB watchdog fires before the stale timer.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "nopr:75b1b49ca7": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 1,
+    "dependents": [
+     "#518"
+    ],
+    "loc": 133
+   },
+   "fires": "see #518",
+   "original": "commit 75b1b49ca7.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): no reindex in ../up/agent/memory_manager.py"
+  },
+  "notes": "Rides with mem0.",
+  "problem": "Re-index provider routing after initialize() so config-gated tools are callable.",
+  "verdict": "KEEP"
+ },
  "nopr:78ce24d1db": {
   "branch": null,
   "evidence": {
@@ -2990,6 +4063,23 @@
   "notes": "",
   "problem": "Resolver ignored ProviderProfile.api_mode for explicit providers.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "nopr:7ac18ba0de": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 443
+   },
+   "fires": "n/a",
+   "original": "commit 7ac18ba0de (declared refactor).",
+   "upstream_fix": "n/a",
+   "upstream_state": "n/a (isolation refactor of fork code)"
+  },
+  "notes": "Moves fork code OUT of the 3/3-sync hermes_state.py \u2014 reduces conflict cost. Keep as long as any hermes_state row survives.",
+  "problem": "Extract pure hermes_state helpers into hermes_state_ext.py (fork-features.json).",
+  "verdict": "KEEP"
  },
  "nopr:85ee6f0f12": {
   "branch": null,
@@ -3120,6 +4210,25 @@
   "problem": "update_model re-derived the trigger from the old model's threshold_percent after a fallback.",
   "verdict": "UPSTREAM"
  },
+ "nopr:ad8de4f275": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:255a4c4546"
+    ],
+    "loc": 100
+   },
+   "fires": "n/a",
+   "original": "commit ad8de4f275.",
+   "upstream_fix": "n/a",
+   "upstream_state": "n/a"
+  },
+  "notes": "Rides.",
+  "problem": "Tighten tool gate extraction budget.",
+  "verdict": "KEEP"
+ },
  "nopr:af1cca05d5": {
   "branch": null,
   "evidence": {
@@ -3231,6 +4340,23 @@
   "problem": "Render provider/model on both sides of the announce.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "nopr:d97b1070f7": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 152
+   },
+   "fires": "n/a",
+   "original": "commit d97b1070f7.",
+   "upstream_fix": "n/a",
+   "upstream_state": "n/a: sync-residue edits to upstream-owned code; re-derived every sync"
+  },
+  "notes": "Parity-merge fallout, not a feature. Take upstream at next sync; any still-needed hunk will re-surface as a CI red there.",
+  "problem": "Reconcile full-suite CI reds after a parity sync (slices 1-4, 9).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "nopr:e2e69f6fd1": {
   "branch": null,
   "evidence": {
@@ -3284,6 +4410,25 @@
   },
   "notes": "Rides with #21256.",
   "problem": "None chokepoint resolution keeps current reasoning (session override survives).",
+  "verdict": "KEEP"
+ },
+ "nopr:e7d2b9f1bd": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "nopr:036ae92ba1"
+    ],
+    "loc": 156
+   },
+   "fires": "'shared: skipped (precheck failed (dirty working tree))' seen in window \u2014 the gate is live",
+   "original": "commit e7d2b9f1bd.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see nopr:036ae92ba1)"
+  },
+  "notes": "Rides with curator family.",
+  "problem": "Scope the shared-tree clean-tree gate to paths a pass touches.",
   "verdict": "KEEP"
  },
  "nopr:f20f0cc2cc": {
