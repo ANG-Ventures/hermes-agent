@@ -162,7 +162,13 @@
    }
   },
   "branch": null,
-  "notes": "Net-negative fork divergence: the helper still exists upstream, so this deletion is a recurring conflict hunk (1 ledger file x3). Neutral-to-DROP; lead may prefer DROP (re-adopt upstream's helper) to shrink the diff. Low stakes either way."
+  "notes": "Net-negative fork divergence: the helper still exists upstream, so this deletion is a recurring conflict hunk (1 ledger file x3). Neutral-to-DROP; lead may prefer DROP (re-adopt upstream's helper) to shrink the diff. Low stakes either way.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "nopr:8d20d24ed0": {
   "verdict": "KEEP",
@@ -182,7 +188,13 @@
    }
   },
   "branch": null,
-  "notes": "Follows #285 (compat glue for upstream test). Contributor-email half is scripts+misc territory."
+  "notes": "Follows #285 (compat glue for upstream test). Contributor-email half is scripts+misc territory.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0; original = commit message only",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#408": {
   "verdict": "KEEP",
@@ -218,7 +230,13 @@
    }
   },
   "branch": null,
-  "notes": "Fleet-specific (mirrors fleet notify.py policy) — not upstreamable. Problem measured (26 pages). Re-check fires after next host-down incident. Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict."
+  "notes": "Fleet-specific (mirrors fleet notify.py policy) — not upstreamable. Problem measured (26 pages). Re-check fires after next host-down incident. Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "nopr:d5b2992f2d": {
   "verdict": "KEEP",
@@ -239,7 +257,13 @@
    }
   },
   "branch": null,
-  "notes": "Operator-facing fork feature; #565 #507 depend on it. Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict."
+  "notes": "Operator-facing fork feature; #565 #507 depend on it. Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "original = commit message only",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#565": {
   "verdict": "KEEP",
@@ -259,7 +283,13 @@
    }
   },
   "branch": null,
-  "notes": "Follows nopr:d5b2992f2d."
+  "notes": "Follows nopr:d5b2992f2d.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#507": {
   "verdict": "KEEP",
@@ -279,7 +309,13 @@
    }
   },
   "branch": null,
-  "notes": "Follows nopr:d5b2992f2d; 107 loc."
+  "notes": "Follows nopr:d5b2992f2d; 107 loc.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#482": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -297,7 +333,13 @@
    }
   },
   "branch": null,
-  "notes": "Take upstream's ledger lifecycle at next sync. The dict-model half of the subject is #477. Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict."
+  "notes": "Take upstream's ledger lifecycle at next sync. The dict-model half of the subject is #477. Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "up cron/scheduler.py run_one_job :2705-2741 (create_execution / finish_execution on dispatch failure) + :3160-3177 (finish_execution on claim reject, mark_execution_running CAS before the run); ledger introduced upstream d9dd05b69d 2026-07-09 (feat(cron): add truthful execution ledger). Fork test tests/cron/test_ticker_execution_ledger.py run on up 1b57acf94a: 5 failed / 1 passed, every failure StopIteration in the test's own source-text helper (`def _process_one_job` is no longer a top-level function upstream) - shape, not behaviour.",
+   "notes": "Sha the auditor deferred: d9dd05b69d. Fork scheduler.py 9,154 lines vs upstream's split (scheduler_delivery.py) means the drop only happens at a whole-file sync."
+  }
  },
  "#477": {
   "verdict": "UPSTREAM",
@@ -333,7 +375,13 @@
    }
   },
   "branch": null,
-  "notes": "WEAK KEEP: 47 loc, fork telemetry-only. If the lead cannot find the telemetry consumer this becomes DROP. Upstream clears chat_id to stop async-delegation misrouting — ensure fork value does not reintroduce that (adversary check)."
+  "notes": "WEAK KEEP: 47 loc, fork telemetry-only. If the lead cannot find the telemetry consumer this becomes DROP. Upstream clears chat_id to stop async-delegation misrouting — ensure fork value does not reintroduce that (adversary check).",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#394": {
   "verdict": "KEEP",
@@ -512,7 +560,13 @@
    }
   },
   "branch": null,
-  "notes": "Base of #130."
+  "notes": "Base of #130.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "original = commit message only",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "nopr:bb4e64499c": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -533,7 +587,13 @@
    }
   },
   "branch": null,
-  "notes": "Original problem fixed upstream in a stricter form. The fork's _filter_fallback_chain_for_pinned_job is still load-bearing for the per-job chain (6ae6cbe84c/#130): on drop, re-home the cross-provider strip inside the per-job resolver and take upstream's global-chain rule. Also retire the HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK env var (non-secret env, AGENTS rubric)."
+  "notes": "Original problem fixed upstream in a stricter form. The fork's _filter_fallback_chain_for_pinned_job is still load-bearing for the per-job chain (6ae6cbe84c/#130): on drop, re-home the cross-provider strip inside the per-job resolver and take upstream's global-chain rule. Also retire the HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK env var (non-secret env, AGENTS rubric).",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "KEEP",
+   "evidence": "Upstream is stricter, not equivalent: up hermes_cli/fallback_config.py:123 scoped_fallback_chain returns None for a pinned owner when declared is None, and up cron/scheduler.py:108 _job_fallback_chain always passes declared=None -> a provider/model-pinned cron job upstream has NO fallback chain at all (e7bff4b6d8 2026-09-23). Upstream has no per-job `fallback` list and no `allow_cross_provider_fallback` opt-in. Live store ~/.hermes/cron/jobs.json (read 2026-09-25): 90 provider-pinned jobs, 17 jobs set allow_cross_provider_fallback: true (daily-journal, morning-digest, x-feed-brief, weekly-review, skill-patch-applier, debug-log-analysis, test-honesty-sweep, parity-drift-watch, weekly-pr-sweep, ...), 845 filter fires in the auditor's window. Both KEEP rows nopr:6ae6cbe84c and #130 return through _filter_fallback_chain_for_pinned_job (fork cron/scheduler.py:788 _resolve_job_fallback_chain).",
+   "notes": "One seam: bb4e64499c + 6ae6cbe84c + #130. Taking upstream's rule would silently remove the fallback net from the 17 opt-in jobs and every per-job `fallback` list. Trim candidate: retire the HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK env switch (AGENTS rubric). Candidate UPSTREAM offer: per-job fallback list + explicit cross-provider opt-in on top of e7bff4b6d8."
+  }
  },
  "nopr:05d38f1d0d": {
   "verdict": "KEEP",
@@ -551,7 +611,13 @@
    }
   },
   "branch": null,
-  "notes": "WEAK KEEP (1 job, 109 loc). Candidate DROP if that job is retired."
+  "notes": "WEAK KEEP (1 job, 109 loc). Candidate DROP if that job is retired.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "original = commit message only",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#614": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -569,7 +635,13 @@
    }
   },
   "branch": null,
-  "notes": "Take upstream's inert-heredoc handling. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "Take upstream's inert-heredoc handling. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "adv_probe_guard.py on up 1b57acf94a: inert python heredoc containing 'hermes gateway restart' -> blocked=False; executed heredocs (bash <<EOF / sh -s <<EOF) -> blocked=True. Fork origin/main blocks the inert case again (rows #920/#1017 re-scan Python bodies), so #614's intent is already overridden on the fork itself. 9aa0721b23 / 307cc814ad verified ancestors of upstream/main.",
+   "notes": "Upstream also misses `python3 - <<EOF os.system('hermes gateway restart')` (blocked=False) - that is #920/#1017's row (UPSTREAM), not #614's."
+  }
  },
  "#624": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -587,7 +659,12 @@
    }
   },
   "branch": null,
-  "notes": "Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "auditor probe_guard.py replayed on up 1b57acf94a: '#624 dir ref' blocked=False (ok). 9ac1e65b0a verified ancestor."
+  }
  },
  "#591": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -605,7 +682,13 @@
    }
   },
   "branch": null,
-  "notes": "False-positive fixed upstream. Residual difference: upstream never resolves through the cd, so it does not scan the launcher body at all (a lifecycle command inside such a launcher is not caught). Adversary may argue this as an UPSTREAM hardening; it is not the problem #591 was filed for. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "False-positive fixed upstream. Residual difference: upstream never resolves through the cd, so it does not scan the launcher body at all (a lifecycle command inside such a launcher is not caught). Adversary may argue this as an UPSTREAM hardening; it is not the problem #591 was filed for. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits.",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "UPSTREAM",
+   "evidence": "adv_probe_guard.py on up 1b57acf94a: `cd <dir> && ./proj` where ./proj is an executable whose body is `hermes gateway restart` -> blocked=False on upstream, blocked=True on fork 257ff440ba (benign `cd <dir> && ./stats` -> False on both). Upstream 9ac1e65b0a removes the false positive by never resolving through the cd chain; the fork resolves the launcher and scans it. The fork half that upstream lacks is the hardening the guard exists for (a gateway restart launched from inside its own turn).",
+   "notes": "False-positive half absorbed; the cd-chain resolution is not. Keep on fork until ported (audit/cron_tools/upstream-591); conflicts with upstream lifecycle_guard.py expected (2,469 vs 1,285 lines)."
+  }
  },
  "#818": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -623,7 +706,12 @@
    }
   },
   "branch": null,
-  "notes": "Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+  "notes": "Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "auditor probe replayed on up 1b57acf94a: '#818 data file' blocked=False (ok). d46abd445f verified ancestor."
+  }
  },
  "#319": {
   "verdict": "UPSTREAM",
@@ -839,7 +927,12 @@
    }
   },
   "branch": null,
-  "notes": "Own tests pass unchanged on upstream."
+  "notes": "Own tests pass unchanged on upstream.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "fork tests/cron/test_store_resolves_live_home.py copied as tests/cron/adv_test_store_resolves_live_home.py on up 1b57acf94a: `2 passed in 0.94s` (repo venv python 3.11, HERMES_HOME=mktemp). Upstream shas the auditor deferred: ec0227b435 2026-07-09 fix(cron): isolate profile store paths by context; 6c98eb2d45 2026-07-22; a65a647b04 2026-07-24 (_current_cron_store)."
+  }
  },
  "#351": {
   "verdict": "DROP",
@@ -857,7 +950,13 @@
    }
   },
   "branch": "audit/cron_tools/revert-351 @ b01df7bfba",
-  "notes": "Never fires in production (raises only inside a test harness pointed at the live home). Test-hermeticity belongs in conftest, not the store write path. Low confidence DROP — adversary: check whether any fleet harness still relies on it. Revert: hand-applied inverse of e49c23dac2 (textual revert conflicted; cron/jobs.py drifted around the guard) — exact -151/+0. Verified via test-gate on ace-ai: `pytest tests/cron/test_jobs.py tests/cron/test_cron_store_concurrency.py tests/cron/test_store_resolves_live_home.py` → 130 passed in 6.20s."
+  "notes": "Never fires in production (raises only inside a test harness pointed at the live home). Test-hermeticity belongs in conftest, not the store write path. Low confidence DROP — adversary: check whether any fleet harness still relies on it. Revert: hand-applied inverse of e49c23dac2 (textual revert conflicted; cron/jobs.py drifted around the guard) — exact -151/+0. Verified via test-gate on ace-ai: `pytest tests/cron/test_jobs.py tests/cron/test_cron_store_concurrency.py tests/cron/test_store_resolves_live_home.py` → 130 passed in 6.20s.",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "Auditor's 'no equivalent guard upstream' is false: up tests/home_io_guard.py (class HomeIOGuard, added 1c8fae6180 2026-09-09) is installed from up tests/conftest.py:1403-1405 and refuses Python filesystem writes from tests into the real Hermes home - the generic, conftest-level form of #351's store-level guard. Fork has no tests/home_io_guard.py (ls: No such file). Fork test on up: 3 failed (AttributeError _guard_against_test_write_to_live_store absent) + the remaining cases trip home_io_guard itself (FileNotFoundError/PermissionError from tests/home_io_guard.py:124 when the test points at /Users/nobody). The incident #351 was filed for is real: ~/.hermes/cron/jobs.json.EMPTY-INCIDENT-20260715-1730 (1.3K, live store replaced by a single 'research-rail-canary' fixture job).",
+   "notes": "Not a bare DROP: revert branch audit/cron_tools/revert-351 reopens the 2026-07-15 leak until the sync takes tests/home_io_guard.py + the conftest install. Sequence: take home_io_guard first, then revert-351."
+  }
  },
  "#830": {
   "verdict": "UPSTREAM",
@@ -1009,7 +1108,13 @@
    }
   },
   "branch": null,
-  "notes": "Fleet-specific (claude relay 503 shape). WEAK: unmeasured firing — lead may downgrade to DROP if relay 503s no longer occur."
+  "notes": "Fleet-specific (claude relay 503 shape). WEAK: unmeasured firing — lead may downgrade to DROP if relay 503s no longer occur.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#1027": {
   "verdict": "UPSTREAM",
@@ -1050,7 +1155,13 @@
    }
   },
   "branch": null,
-  "notes": "Structural cost-reducer, not a behavior patch. Follows the fate of the helpers it hosts (#1027, reasoning helper = #126)."
+  "notes": "Structural cost-reducer, not a behavior patch. Follows the fate of the helpers it hosts (#1027, reasoning helper = #126).",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#922": {
   "verdict": "KEEP",
@@ -1086,7 +1197,13 @@
    }
   },
   "branch": null,
-  "notes": "Drop ours; the 5 live jobs keep working on upstream's field."
+  "notes": "Drop ours; the 5 live jobs keep working on upstream's field.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "fork tests/cron/test_per_job_reasoning_effort.py copied to up 1b57acf94a as adv_test_per_job_reasoning_effort.py: `14 passed in 2.68s`. Upstream sha the auditor deferred: 4e1dd1a74b 2026-08-20 feat(cron): per-job reasoning_effort override in job definitions. Live: 5 scheduled jobs carry top-level reasoning_effort (morning-digest xhigh, x-feed-brief xhigh, skill-patch-applier xhigh, debug-log-analysis medium, test-honesty-sweep high) - the same key upstream reads.",
+   "notes": "Retire with it: cron/fork_ext/scheduler_ext.py::resolve_cron_reasoning_config + tests/golden/scheduler_ext + the reasoning half of docs/sync/fork-features.json entry 6 (upstream-intended -> absorbed)."
+  }
  },
  "#388": {
   "verdict": "KEEP",
@@ -1127,7 +1244,13 @@
    }
   },
   "branch": null,
-  "notes": "Follows #388."
+  "notes": "Follows #388.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#641": {
   "verdict": "UPSTREAM",
@@ -1181,7 +1304,13 @@
    }
   },
   "branch": null,
-  "notes": "Problem cannot occur on upstream's schema."
+  "notes": "Problem cannot occur on upstream's schema.",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "KEEP",
+   "evidence": "Upstream d464ae3652 (2026-07-28, feat(cron): user-owned model pins) REMOVED `model` from the model-facing CRONJOB_SCHEMA: the tool exposes only `pinned: bool` ('locks the CURRENT main agent model'); model/provider are a 'CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models)' (up tools/cronjob_tools.py:618). The fleet's cron doctrine requires the AGENT to pin the cron slot: ~/.hermes/skills-shared/general/scheduler/SKILL.md:146,208,294,299 (`model={\"model\":\"gpt-6-sol-900k\",\"provider\":\"openai-codex\"}` on every LLM cron; cron-config-lint REPIN_MODEL auto-repins drift). Fork schema tools/cronjob_tools.py:2613-2627 keeps the object form and #411's _coerce_model_override_arg (:962) accepts the flat string agents frequently pass. The auditor's 'problem cannot occur on upstream's schema' holds only because upstream deleted the argument - which the fleet cannot take.",
+   "notes": "NEEDS-LEAD flag on the larger seam: the agent-settable cron model pin (object schema + coercion) is fork-permanent in practice and has no docs/sync/fork-features.json entry. Every sync will re-delete it."
+  }
  },
  "#397": {
   "verdict": "KEEP",
@@ -1217,7 +1346,13 @@
    }
   },
   "branch": null,
-  "notes": "WEAK KEEP: overlaps #388 (auto-pin) and #397 (hard refusal). Lead may fold into those or DROP."
+  "notes": "WEAK KEEP: overlaps #388 (auto-pin) and #397 (hard refusal). Lead may fold into those or DROP.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#148": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1235,7 +1370,12 @@
    }
   },
   "branch": null,
-  "notes": "Only the wording differs. If the lead values the friendlier message, it is a 10-line UPSTREAM polish, not a fork patch."
+  "notes": "Only the wording differs. If the lead values the friendlier message, it is a 10-line UPSTREAM polish, not a fork patch.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "Upstream sha the auditor deferred: 7ecbe50d98 2026-09-08 fix(cron): validate script existence (tools/cronjob_job_args.py _validate_cron_script_path). Wording-only delta."
+  }
  },
  "#618": {
   "verdict": "UPSTREAM",
@@ -1396,7 +1536,12 @@
    }
   },
   "branch": null,
-  "notes": "Row-level DROP only: this is a census duplicate, there is nothing separate to revert (reverting it would revert #71). Verdict for the code follows #71 (UPSTREAM)."
+  "notes": "Row-level DROP only: this is a census duplicate, there is nothing separate to revert (reverting it would revert #71). Verdict for the code follows #71 (UPSTREAM).",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "census duplicate of #71 (identical patch-id); row-level only, nothing separate to revert."
+  }
  },
  "#83": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1416,7 +1561,13 @@
    }
   },
   "branch": null,
-  "notes": "Only meaningful on top of #71's resolver. If #71 goes upstream, the child path works via upstream's copy_context (the resolver reads HERMES_SESSION_* from the copied context); the dedicated _SEND_ORIGIN_* vars + tripwire are fork-only duplication. 814 loc / 3 ledger files for a path that never logged. Drop together with #71 once #71 lands upstream (not independently revertable today — #71 on fork reads get_send_origin())."
+  "notes": "Only meaningful on top of #71's resolver. If #71 goes upstream, the child path works via upstream's copy_context (the resolver reads HERMES_SESSION_* from the copied context); the dedicated _SEND_ORIGIN_* vars + tripwire are fork-only duplication. 814 loc / 3 ledger files for a path that never logged. Drop together with #71 once #71 lands upstream (not independently revertable today — #71 on fork reads get_send_origin()).",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "get_send_origin/set_send_origin/_SEND_ORIGIN_* have 0 consumers outside the PR paths (git grep origin/main); copy_context().run at up tools/delegate_tool_child_run.py:862 + delegate_tool_dispatch.py:150 verified by the auditor; shas 8e9628e9cf / 52419bda5d / 64957b7e02 ancestors.",
+   "notes": "Unit with #71 (UPSTREAM); not independently revertable."
+  }
  },
  "#88": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1436,7 +1587,13 @@
    }
   },
   "branch": null,
-  "notes": "Upstream fixed the latch with the same ContextVar design (cron store rework era). Drop ours, take theirs; delegate-child cron rebinding covered upstream by copy_context in delegate_tool_child_run.py:862. High conflict cost (7 files x3 syncs)."
+  "notes": "Upstream fixed the latch with the same ContextVar design (cron store rework era). Drop ours, take theirs; delegate-child cron rebinding covered upstream by copy_context in delegate_tool_child_run.py:862. High conflict cost (7 files x3 syncs).",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "fb6446fc9e ancestor; registry docs/sync/fork-features.json entry 1 lifecycle=absorbed (2026-08-31, measured). DEPENDENT the auditor missed: is_cron_session() has a live consumer outside the PR - tools/terminal_tool.py:179-181 (`session_is_messaging_surface() and not is_cron_session()`, added a09ec2ea99 2026-09-25 messaging foreground cap) inside try/except -> returns False (feature silently off) if the symbol disappears.",
+   "notes": "At the sync rewire terminal_tool.py to get_session_env('HERMES_CRON_SESSION') (up tools/approval_context.py:126-128 / gateway/session_context.py:173); add '#a09ec2ea99 consumer' to dependents."
+  }
  },
  "#583": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1456,7 +1613,12 @@
    }
   },
   "branch": null,
-  "notes": "The gap only existed on the fork because nopr:30a8a063e9 removed stripping from the explicit path; upstream never had it. Drop both together and take upstream's resolver (conflicts 2 files x3 syncs)."
+  "notes": "The gap only existed on the fork because nopr:30a8a063e9 removed stripping from the explicit path; upstream never had it. Drop both together and take upstream's resolver (conflicts 2 files x3 syncs).",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "up tools/delegate_tool_toolsets.py:110 strips after all three branches; 3e96c87f37 / d77505c007 ancestors."
+  }
  },
  "nopr:30a8a063e9": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1476,7 +1638,12 @@
    }
   },
   "branch": null,
-  "notes": "Part 1 is upstream behavior; part 2 was undone by #583. Nothing fork-specific left of value."
+  "notes": "Part 1 is upstream behavior; part 2 was undone by #583. Nothing fork-specific left of value.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "up tools/delegate_tool_toolsets.py:14-21 DELEGATE_BLOCKED_TOOLS has no execute_code; part 2 undone by #583 on the fork."
+  }
  },
  "#662": {
   "verdict": "UPSTREAM",
@@ -1514,7 +1681,13 @@
    }
   },
   "branch": null,
-  "notes": "Bugfix to fork-only /boomerang (#203). Verdict follows #203: if #203 is dropped, drop this with it."
+  "notes": "Bugfix to fork-only /boomerang (#203). Verdict follows #203: if #203 is dropped, drop this with it.",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": null,
+   "evidence": "fires unmeasured/0",
+   "notes": "KEEP-UNPROVEN flag: no positive fire count and/or no original evidence beyond the commit message; lead to decide whether to demand a measurement or trim."
+  }
  },
  "#553": {
   "verdict": "UPSTREAM",
@@ -1550,7 +1723,12 @@
    }
   },
   "branch": null,
-  "notes": "Upstream reworked the reader/reconcile ownership so the busy drain is off the common path. Residual risk: non-selectable reader fallback still reads to EOF — low (fd-less streams). 218 loc, 0 conflict files — cheap either way; drop ours on the next sync."
+  "notes": "Upstream reworked the reader/reconcile ownership so the busy drain is off the common path. Residual risk: non-selectable reader fallback still reads to EOF — low (fd-less streams). 218 loc, 0 conflict files — cheap either way; drop ours on the next sync.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "fcce28b5a4 / 1bfbeff4e5 ancestors; _DRAIN_DEADLINE_SECONDS/_DRAIN_MAX_BYTES 0 consumers outside process_registry.py."
+  }
  },
  "#788": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1568,7 +1746,12 @@
    }
   },
   "branch": null,
-  "notes": "Same fix upstream a month later. Drop ours (149 loc, 0 conflict files) on the next sync."
+  "notes": "Same fix upstream a month later. Drop ours (149 loc, 0 conflict files) on the next sync.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "1bfbeff4e5 ancestor (fix(process): reap children after early stdout EOF)."
+  }
  },
  "nopr:4d626ac813": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1589,7 +1772,13 @@
    }
   },
   "branch": null,
-  "notes": "Upstream took the same exclusion approach 13 days later. Drop ours."
+  "notes": "Upstream took the same exclusion approach 13 days later. Drop ours.",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "UPSTREAM",
+   "evidence": "Auditor's 'test module collection error on BOTH trees' was an import path (fork test imports the regex from tools.environments.base; upstream moved it to base_session_env). With that one import fixed, fork tests/tools/test_env_snapshot_session_leak.py on up 1b57acf94a: `2 failed, 2 passed` - test_incident_sequence_foreign_identity_does_not_stick finds `declare -x HERMES_HOME=\"/tmp/foreign_home\"` in the snapshot; test_exclude_pattern_shape: up regex (base_session_env.py:29-31) does not match HERMES_HOME. Live probe adv_probe_snapshot.py (LocalEnvironment, same interpreter): cmd1 `export HERMES_HOME=/tmp/foreign_home HERMES_KANBAN_TASK=t_foreign`, cmd2 echo -> up: HOME_=/tmp/foreign_home TASK=t_foreign; fork: HOME_=<process value> TASK=EMPTY. up unset list (base_session_env.py:69-77) covers HERMES_SESSION_*/HERMES_CRON_AUTO_DELIVER_*/HERMES_BROWSER_CONTROL_*/HERMES_DELEGATED_CHILD_CONTEXT/HERMES_CRON_SESSION/HERMES_UI_SESSION_ID only. f2e32ceead absorbed the HERMES_SESSION_* half, not the HERMES_HOME half the 2026-07-10 incident was about.",
+   "notes": "Blast radius is smaller than in July: both trees now key gateway environments session:<key> (up tools/terminal_tool.py:458-500), so the residual is the shared 'default' env (CLI + cron ticker) and subagents sharing the parent env. Offer upstream the HERMES_HOME= + HERMES_KANBAN_* exclusions (unit with #543, nopr:124a8c0706's regex widening)."
+  }
  },
  "nopr:124a8c0706": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1609,7 +1798,12 @@
    }
   },
   "branch": null,
-  "notes": "Follows 4d626ac813."
+  "notes": "Follows 4d626ac813.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "mktemp temp-name pin absorbed by 911d380296 (up base_session_env.py:36-37, :88-97). The regex-widening half rides the nopr:4d626ac813 unit (OVERTURNED -> UPSTREAM)."
+  }
  },
  "#543": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1629,7 +1823,13 @@
    }
   },
   "branch": null,
-  "notes": "Upstream exclusion set covers these markers. Drop ours."
+  "notes": "Upstream exclusion set covers these markers. Drop ours.",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "UPSTREAM",
+   "evidence": "Half absorbed: up c44b423e52 unsets HERMES_DELEGATED_CHILD_CONTEXT + HERMES_CRON_SESSION (base_session_env.py:74-76) but not ${!HERMES_KANBAN_*} (fork base.py:664-669 unsets both). adv_probe_snapshot.py on up 1b57acf94a: HERMES_KANBAN_TASK=t_foreign exported by one command is re-sourced by the next (TASK=t_foreign); fork: TASK=EMPTY. The dispatcher-owned worker markers the PR body names are exactly the un-absorbed half.",
+   "notes": "Fold into the nopr:4d626ac813 upstream offer (one exclusion-list PR)."
+  }
  },
  "#603": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1647,7 +1847,12 @@
    }
   },
   "branch": null,
-  "notes": "Upstream's pm.extras decides availability by importability, which is exactly #603's fix in a richer form. When the parity sync takes pm/, drop ensure_importable + the three backend probes; the fork test moves with it or dies."
+  "notes": "Upstream's pm.extras decides availability by importability, which is exactly #603's fix in a richer form. When the parity sync takes pm/, drop ensure_importable + the three backend probes; the fork test moves with it or dies.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "3d12e86ef1 / 3bbec90f23 / 6a5a6a05d2 ancestors; fleet terminal.backend is `local` on all 14 config.yaml (read-only grep), no modal/daytona/vercel backend configured anywhere -> the patched path never runs on this fleet."
+  }
  },
  "#575": {
   "verdict": "UPSTREAM",
@@ -1703,7 +1908,12 @@
    }
   },
   "branch": null,
-  "notes": "The only production code (base.py mktemp) is absorbed upstream. What remains is fork test-premise hygiene + a private --basetemp in scripts/run_tests_parallel.py; keep those as test infra, they are not a runtime burden, but stop carrying the base.py delta at the next sync. 5 conflict files (3 syncs) are all tests/runner."
+  "notes": "The only production code (base.py mktemp) is absorbed upstream. What remains is fork test-premise hygiene + a private --basetemp in scripts/run_tests_parallel.py; keep those as test infra, they are not a runtime burden, but stop carrying the base.py delta at the next sync. 5 conflict files (3 syncs) are all tests/runner.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "911d380296 / 0746903679 ancestors; production half (mktemp snapshot publish) at up base_session_env.py:88-97."
+  }
  },
  "#211": {
   "verdict": "DROP",
@@ -1721,7 +1931,13 @@
    }
   },
   "branch": "audit/cron_tools/revert-211 @ b378986496",
-  "notes": "1,123 loc of default-OFF code that no fleet config turns on and no log line ever shows. Dead on this fleet. If upstream merges #58144 (#209's yt-dlp ingestion) this becomes the natural security companion — re-offer it there, not here. Revert: git revert d080d1df1a; one conflict in tests/tools/test_url_safety.py resolved to HEAD minus the TestIpIsBlocked class; 6 files, +20/-1103. Verified via test-gate: `pytest tests/tools/test_url_safety.py tests/tools/test_video_analyze.py` → 80 passed in 12.75s."
+  "notes": "1,123 loc of default-OFF code that no fleet config turns on and no log line ever shows. Dead on this fleet. If upstream merges #58144 (#209's yt-dlp ingestion) this becomes the natural security companion — re-offer it there, not here. Revert: git revert d080d1df1a; one conflict in tests/tools/test_url_safety.py resolved to HEAD minus the TestIpIsBlocked class; 6 files, +20/-1103. Verified via test-gate: `pytest tests/tools/test_url_safety.py tests/tools/test_video_analyze.py` → 80 passed in 12.75s.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "auxiliary.vision.ytdlp_ssrf_proxy absent from ~/.hermes/config.yaml and all 13 profiles/*/config.yaml (read-only grep, 0 hits for 'ssrf'); SsrfFilteringProxy/ip_is_blocked/_ssrf_proxy_enabled 0 consumers outside the PR paths (git grep origin/main); 0 skill references. Revert branch audit/cron_tools/revert-211 (+20/-1103) keeps yt-dlp ingestion (15 yt_dlp hits remain in tools/vision_tools.py) and removes only proxy wiring.",
+   "notes": "The redirect-time SSRF hole #211 closes is open on the fork TODAY (proxy never enabled) and stays open after the revert - no change in exposure. Re-offer alongside #209 (upstream PR #58144) if that lands."
+  }
  },
  "#209": {
   "verdict": "UPSTREAM",
@@ -1799,7 +2015,13 @@
    }
   },
   "branch": "audit/cron_tools/revert-f504b1c928 @ b4a8d24b1e",
-  "notes": "720 loc + 2 conflict files (3 syncs) carrying two toolsets nobody has called in 3 months. DROP both. Config cleanup needed with the revert: 'messaging'/'moa' toolset names appear in ~/.hermes/config.yaml and argus/momus/aegis profile config.yamls (+ cron/scheduler.py disables 'messaging' by name) — those lines become unknown-toolset warnings, not failures. The 'moa' provider preset (agent/moa_loop.py, hermes_cli/inventory.py) is a different thing and stays. send_message routing rows (#71/#83 lineage) judged separately; they concern the send path the gateway still uses, not the agent-callable toolset. Revert branch reverts 7e505547a7 + 091b3f915d + f504b1c928 (3 commits); conflicts in hermes_cli/config.py (hunk moved to config_defaults, already free of mixture_of_agents) and tools_config.py (_DEFAULT_OFF_TOOLSETS minus 'moa') resolved; 8 files, +3/-735. Verified via test-gate: `pytest tests/test_toolsets.py tests/hermes_cli/test_tools_config.py` → 70 passed, 6 skipped in 12.38s. send_message tool + its tests stay (only the agent-callable toolset entry goes)."
+  "notes": "720 loc + 2 conflict files (3 syncs) carrying two toolsets nobody has called in 3 months. DROP both. Config cleanup needed with the revert: 'messaging'/'moa' toolset names appear in ~/.hermes/config.yaml and argus/momus/aegis profile config.yamls (+ cron/scheduler.py disables 'messaging' by name) — those lines become unknown-toolset warnings, not failures. The 'moa' provider preset (agent/moa_loop.py, hermes_cli/inventory.py) is a different thing and stays. send_message routing rows (#71/#83 lineage) judged separately; they concern the send path the gateway still uses, not the agent-callable toolset. Revert branch reverts 7e505547a7 + 091b3f915d + f504b1c928 (3 commits); conflicts in hermes_cli/config.py (hunk moved to config_defaults, already free of mixture_of_agents) and tools_config.py (_DEFAULT_OFF_TOOLSETS minus 'moa') resolved; 8 files, +3/-735. Verified via test-gate: `pytest tests/test_toolsets.py tests/hermes_cli/test_tools_config.py` → 70 passed, 6 skipped in 12.38s. send_message tool + its tests stay (only the agent-callable toolset entry goes).",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "DROP pending Ace ruling on registry entry 4 (fork-permanent)",
+   "evidence": "docs/sync/fork-features.json entry 4 'messaging + moa toolsets present' lifecycle=fork-permanent ('The fork intentionally exposes agent-callable messaging and MoA toolsets that upstream does not ship'), tests tests/agent/test_fork_custom_toolsets.py (the revert deletes them). Usage re-measured (read-only state.db, all 14 profiles): send_message tool_calls 19 in ~/.hermes (last 2026-06-23) + 2 aegis (last 06-09), mixture_of_agents 14 (last 2026-07-10), 0 elsewhere - dormant 3 months, auditor's numbers confirmed. 'messaging'/'moa' appear in platform_toolsets of all 14 config.yaml (become unknown-toolset warnings, model_tools.py:454); ~/.hermes/skills-shared/general/notify/SKILL.md:158-168 documents send_message for cross-destination sends; the `moa:` config section is the provider preset (stays).",
+   "notes": "Drop is sound on usage; the registry ruling is Ace's to retire (task step 3). Revert branch is otherwise safe (+3/-735; _DEFAULT_OFF_TOOLSETS import in tui_gateway/methods_profiles.py:650 survives)."
+  }
  },
  "nopr:091b3f915d": {
   "verdict": "DROP",
@@ -1819,7 +2041,12 @@
    }
   },
   "branch": "audit/cron_tools/revert-f504b1c928 @ b4a8d24b1e (combined)",
-  "notes": "Follows nopr:f504b1c928 (the moa tool); goes with its revert."
+  "notes": "Follows nopr:f504b1c928 (the moa tool); goes with its revert.",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "follows nopr:f504b1c928",
+   "evidence": "same unit / same revert branch."
+  }
  },
  "nopr:7e505547a7": {
   "verdict": "DROP",
@@ -1839,7 +2066,12 @@
    }
   },
   "branch": "audit/cron_tools/revert-f504b1c928 @ b4a8d24b1e (combined)",
-  "notes": "Follows nopr:f504b1c928 (the moa tool); goes with its revert."
+  "notes": "Follows nopr:f504b1c928 (the moa tool); goes with its revert.",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "follows nopr:f504b1c928",
+   "evidence": "same unit / same revert branch."
+  }
  },
  "#203": {
   "verdict": "UPSTREAM",
@@ -1954,7 +2186,13 @@
    }
   },
   "branch": null,
-  "notes": "D10a row: upstream honours approvals.mode: off on the shared gate as of 98a3324821, so the fork's predicate widening is absorbed. Take upstream's; keep the fork AST guard test only if the lead wants the canonical-helper ratchet as a fork policy (it will flag upstream's inline check on every sync)."
+  "notes": "D10a row: upstream honours approvals.mode: off on the shared gate as of 98a3324821, so the fork's predicate widening is absorbed. Take upstream's; keep the fork AST guard test only if the lead wants the canonical-helper ratchet as a fork policy (it will flag upstream's inline check on every sync).",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "KEEP",
+   "evidence": "(a) Auditor's fires premise is false: approvals.mode is 'off' at ~/.hermes/config.yaml:584 and profiles/aegis/config.yaml:498, and `mode: false` on argus/athena/cadmus/daedalus/daedalus-astra/-fable/-opus/-sol/marconi/momus - YAML off -> bool False, normalized to \"off\" in both trees (up tools/approval_context.py:205-206, fork tools/approval.py:3433-3434). 13 of 14 profiles run mode=off (chiron: manual), so the mode=off bypass is the fleet's primary approval bypass and fires on every dangerous-command gate. (b) Doctrine D10a (~/.hermes/skills-shared/coding/fork-parity-doctrine/SKILL.md:839-880): 'any fork-owned policy predicate that the config can widen or narrow is a fork-permanent seam and gets (a) a single helper, (b) an AST guard, (c) a registry entry' - the measured drift class from the #643 sync. Upstream 98a3324821 restores the behaviour (up tools/approval.py:973 _run_approval_gate, :1179, :1257, :488) but in the inline-at-4-sites form D10a documents losing terms at merge; fork keeps is_approval_bypass_active() at 4 sites (:3804/:4104/:4754/:5390) + tests/tools/test_approval_mode_off_bypass.py.",
+   "notes": "Behaviour parity upstream is real (take 98a3324821), but the helper + AST ratchet are the fork-permanent seam. At sync route upstream's inline sites through the helper. Lead: this seam has no docs/sync/fork-features.json entry although D10a requires one."
+  }
  },
  "nopr:74ed8a85c9": {
   "verdict": "KEEP",
@@ -1990,7 +2228,12 @@
    }
   },
   "branch": null,
-  "notes": "Upstream reached the same fix (session-scoped cron context) independently; the fork's _is_cron_session() variant can go at the next sync. Test-drift half of the commit is sync glue."
+  "notes": "Upstream reached the same fix (session-scoped cron context) independently; the fork's _is_cron_session() variant can go at the next sync. Test-drift half of the commit is sync glue.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "fb6446fc9e ancestor; docs/sync/fork-features.json entry 1 lifecycle=absorbed 2026-08-31 with measured probes (parent-in-cron / copy_context child / bare-submit control)."
+  }
  },
  "#387": {
   "verdict": "DROP",
@@ -2008,7 +2251,13 @@
    }
   },
   "branch": "audit/cron_tools/revert-387 @ aa36356eeb",
-  "notes": "Never used since it landed. 186 loc, 0 conflict files — cheap to carry, but dead code is dead code. Revert: git revert 1fa21ac599; conflicts in discord_tool.py (auto_archive_duration default drift) + test_discord_tool.py resolved to HEAD minus the react bits; +1/-177. Verified via test-gate: `pytest tests/tools/test_discord_tool.py` → 45 passed in 8.98s."
+  "notes": "Never used since it landed. 186 loc, 0 conflict files — cheap to carry, but dead code is dead code. Revert: git revert 1fa21ac599; conflicts in discord_tool.py (auto_archive_duration default drift) + test_discord_tool.py resolved to HEAD minus the react bits; +1/-177. Verified via test-gate: `pytest tests/tools/test_discord_tool.py` → 45 passed in 8.98s.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "Fires corrected: 4 discord action=react tool calls by Apollo (~/.hermes/state.db, 2026-07-20 16:25 .. 2026-07-21 08:46), 0 in all 13 profile state.dbs, 0 in the 66 days since - the auditor's '0 ever' missed the escaped-JSON encoding of tool_calls. _react/_unreact 0 consumers outside tools/discord_tool.py (gateway/relay/adapter.py:_react is the adapter's own method); 0 cron jobs, 0 non-archived skills reference the action.",
+   "notes": "Dormant since 2026-07-21; revert-387 safe (+1/-177)."
+  }
  },
  "#5": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2026,7 +2275,12 @@
    }
   },
   "branch": null,
-  "notes": "Absorbed upstream with the same message strings; take theirs at the next sync."
+  "notes": "Absorbed upstream with the same message strings; take theirs at the next sync.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "2c8a932f80 / aed2e156ad ancestors; same message strings upstream (auditor read)."
+  }
  },
  "#615": {
   "verdict": "UPSTREAM",
@@ -2116,7 +2370,12 @@
    }
   },
   "branch": null,
-  "notes": "Upstream fixed the producer (ACP binding) instead of the consumer (kanban fallthrough); the fork's fallthrough is then dead and its 'treat empty as unbound' rule contradicts upstream's contextvar-wins contract. Drop ours at the sync."
+  "notes": "Upstream fixed the producer (ACP binding) instead of the consumer (kanban fallthrough); the fork's fallthrough is then dead and its 'treat empty as unbound' rule contradicts upstream's contextvar-wins contract. Drop ours at the sync.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "a5f94e93ad ancestor. Fleet ACP use checked: cron acp-harness-regression (monthly) runs ~/.hermes/scripts/test_delegate.py --phase G against EXTERNAL ACP adapters (codex-acp, claude-agent-acp), not Hermes's acp_adapter kanban stamping. CLI kanban workers keep os.environ via get_session_env's CLI fallback."
+  }
  },
  "#252": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2134,7 +2393,12 @@
    }
   },
   "branch": null,
-  "notes": "Absorbed; take upstream's."
+  "notes": "Absorbed; take upstream's.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "0a75616514 ancestor; fork test 4 passed on up (auditor). browser.cdp_url set on 6 profiles."
+  }
  },
  "#784": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2152,7 +2416,12 @@
    }
   },
   "branch": null,
-  "notes": "Backport of an upstream commit that upstream already has; disappears at the sync. Tests-only row, follows its code (goal tests)."
+  "notes": "Backport of an upstream commit that upstream already has; disappears at the sync. Tests-only row, follows its code (goal tests).",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "f8f4d056f5 ancestor (cherry-picked with -x)."
+  }
  },
  "#585": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2170,6 +2439,11 @@
    }
   },
   "branch": null,
-  "notes": "No fork logic on top of the picks; SUPERSEDED with the 9 shas as evidence. At the sync keep only the 5-line fork-guard exemption in tests/test_managed_runtime_resolution.py (fork-only test) — nothing else to carry."
+  "notes": "No fork logic on top of the picks; SUPERSEDED with the 9 shas as evidence. At the sync keep only the 5-line fork-guard exemption in tests/test_managed_runtime_resolution.py (fork-only test) — nothing else to carry.",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": null,
+   "evidence": "all 9 pick shas verified ancestors of upstream/main 1b57acf94a."
+  }
  }
 }
