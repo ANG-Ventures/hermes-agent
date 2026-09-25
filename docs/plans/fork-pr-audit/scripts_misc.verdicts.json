@@ -20,6 +20,12 @@
     "verdict": "KEEP"
   },
   "#1029": {
+    "adversary": {
+      "evidence": "mutation-gate half has no caller ('manual'); only the CI test half is measured.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "KEEP-UNPROVEN"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -38,6 +44,12 @@
     "verdict": "KEEP"
   },
   "#105": {
+    "adversary": {
+      "evidence": "Only consumer is prose in ~/.hermes/skills-shared/hermes-harness/blackbox-turn-telemetry/references/perclass-cost-breakdown-build.md:59 (build record). Recent backup dir ~/.hermes/state/blackbox-backfill-bak-20260924-1715 is from backfill_cache_monitoring (t_10ba0347, state.db 2026-09-25 00:15), NOT this script. 0 cron/launchd callers.",
+      "new_verdict": null,
+      "notes": "Update the skill reference when the branch lands.",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-perclass-backfill",
     "evidence": {
       "cost": {
@@ -92,6 +104,12 @@
     "verdict": "KEEP"
   },
   "#116": {
+    "adversary": {
+      "evidence": "CORRECTION to auditor's '0 writes': ~/.hermes/logs/claude-bpx.log:8422 `[e60b4483] → tool_calls: [mem0_remember]` on route hermes-sess:20260806_004323_483e3a52-review (a background-review fork) — it fired at least once in Aug, and mem0_remember was resident in tools[] for 20260816_* sessions (bpx:10616-10644). Since then: 0 more bpx hits in 34,498 lines, 0 state.db tool_name='mem0_remember' rows in 60d. Dark for >30d.",
+      "new_verdict": null,
+      "notes": "Verdict stands on the 30-day window; revert belongs to agent/plugins tranches (conflicts).",
+      "result": "STANDS"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -110,6 +128,12 @@
     "verdict": "DROP"
   },
   "#118": {
+    "adversary": {
+      "evidence": "CORRECTION to auditor's '0 writes': ~/.hermes/logs/claude-bpx.log:8422 `[e60b4483] → tool_calls: [mem0_remember]` on route hermes-sess:20260806_004323_483e3a52-review (a background-review fork) — it fired at least once in Aug, and mem0_remember was resident in tools[] for 20260816_* sessions (bpx:10616-10644). Since then: 0 more bpx hits in 34,498 lines, 0 state.db tool_name='mem0_remember' rows in 60d. Dark for >30d.",
+      "new_verdict": null,
+      "notes": "Verdict stands on the 30-day window; revert belongs to agent/plugins tranches (conflicts).",
+      "result": "STANDS"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -150,6 +174,12 @@
     "verdict": "KEEP"
   },
   "#151": {
+    "adversary": {
+      "evidence": "Skills ~/.hermes/skills-shared/general/trivial-pr-fast-path/SKILL.md:159 and ~/.hermes/skills-shared/coding/greploop/SKILL.md:66 instruct the greptile.json label fast-lane, but Greptile no longer comments on fork PRs (REST issue-comments since 2026-08-25: 0 greptile authors), so the file has no effect.",
+      "new_verdict": null,
+      "notes": "Follow-up: drop the Greptile fast-lane paragraphs from both skills with the branch.",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-greptile",
     "evidence": {
       "cost": {
@@ -216,6 +246,12 @@
     "verdict": "KEEP"
   },
   "#188": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/hermes-harness/hermes-client-source-attribution/SKILL.md:61-83,121 prescribes stamping source:'dashboard' in web/src/lib/gatewayClient.ts (+ references/gatewayClient.source-injection.test.ts). turns.db: platform 'dashboard' = 4 turns, last 2026-07-04 (it DID fire; dormant 83 days).",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Skill-mandated attribution contract for a surface that is currently unused. 85 loc. Lead decides.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-web-source",
     "evidence": {
       "cost": {
@@ -234,6 +270,12 @@
     "verdict": "DROP"
   },
   "#189": {
+    "adversary": {
+      "evidence": "D9: apps/desktop taken wholesale from upstream; no fork-local src remains.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -252,6 +294,12 @@
     "verdict": "DROP"
   },
   "#194": {
+    "adversary": {
+      "evidence": "Upstream sha 7d27a31ce7 IS an ancestor of upstream/main (merge-base --is-ancestor ok) and is the same feature (fork-features.json[13] lifecycle=absorbed, upstream_ref #65895). compute_host_phase0_spike.py: 0 hits anywhere.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-oneshot-probes",
     "evidence": {
       "cost": {
@@ -270,6 +318,12 @@
     "verdict": "SUPERSEDED-BY-UPSTREAM"
   },
   "#22": {
+    "adversary": {
+      "evidence": "AUTHOR_MAP readers: contributor-check.yml + audit_pr_attribution.py scan merge-base..HEAD only; contributor_audit.py --since-tag has no scheduled caller (rg of cron/scripts/fleet/skills: 0). No contributors/emails/apollo@daemonarchy.local file exists, so a manual release-range audit spanning <=2026-06-30 would lose this mapping.",
+      "new_verdict": null,
+      "notes": "Low-risk; note for release tooling.",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-author-map-stale",
     "evidence": {
       "cost": {
@@ -295,6 +349,12 @@
     "verdict": "DROP"
   },
   "#268": {
+    "adversary": {
+      "evidence": "Server method session.changes@tui_gateway/server.py:11709 on origin/main has no client on either tree; turns.db has no livesync-sourced platform; skill consumer only tests this dead feature (see #272).",
+      "new_verdict": null,
+      "notes": "Same skill-retirement follow-up as #272.",
+      "result": "STANDS"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -315,6 +375,12 @@
     "verdict": "DROP"
   },
   "#272": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/hermes-harness/livesync-eyes-on-regression/SKILL.md:67,140-141 instructs using scripts/livesync-rc1-probe.py — a consumer, but of a dead feature: 0 session.changes calls in logs (auditor), desktop client use-session-changes.ts absent on origin/main and upstream/main (git grep: only unrelated 'session changes' comments).",
+      "new_verdict": null,
+      "notes": "Follow-up required with the drop: retire/archive the livesync-eyes-on-regression skill.",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-livesync-probes",
     "evidence": {
       "cost": {
@@ -360,6 +426,12 @@
     "verdict": "KEEP"
   },
   "#307": {
+    "adversary": {
+      "evidence": "Ran the fork's tests/tui_gateway/test_iso_certify_seam.py against upstream/main 59004a6235 (copied as an untracked probe file into ../up, venv python): `2 passed in 2.89s`. 7d27a31ce7 is an ancestor of upstream/main. fork-features.json[13] lifecycle=absorbed (not fork-permanent) -> no Ace ruling needed.",
+      "new_verdict": null,
+      "notes": "Fork delta in synthetic_turn.py (_env_float/_env_int vs upstream _SPEC_FIELDS) is for the tui_gateway auditor.",
+      "result": "STANDS"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -459,6 +531,12 @@
     "verdict": "KEEP"
   },
   "#612": {
+    "adversary": {
+      "evidence": "scripts/certify/dashboard_loop_certify.py is co-owned by gateway-tranche row #616; ~/.hermes/skills-shared/devops/dashboard-eventloop-starvation-triage/references/turn-isolation-certify-harness.md:48-50 names it the HARDENED harness that supersedes iso-certify for AC-4 certification. No run in 30d (dashboard turns: last 2026-07-04).",
+      "new_verdict": "cross-tranche (gateway #616)",
+      "notes": "revert-oneshot-probes deletes a file the gateway auditor owns; lead must reconcile with #616 before the branch lands.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-oneshot-probes",
     "evidence": {
       "cost": {
@@ -477,6 +555,12 @@
     "verdict": "DROP"
   },
   "#62": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/references/local-addenda-lcm-context-engine.md:96 prescribes `python scripts/lcm_qa_battery.py --tier 0` as THE gate for LCM changes; SKILL.md:48,864 (battery refuses Opus); tier 1/2 drive scripts/lcm_live_recovery.py (lcm_qa_battery.py:102). LCM plugin is live product code (15 commits to plugins/context_engine/lcm since 08-01).",
+      "new_verdict": "KEEP",
+      "notes": "Skill-prescribed CURRENT gate for LCM changes. Not measured running in 30d (state.db tool_calls: last matching invocation 2026-08-20) — keep as on-demand gate tooling, or DROP only together with a skill edit. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -498,6 +582,12 @@
     "verdict": "DROP"
   },
   "#695": {
+    "adversary": {
+      "evidence": "UPSTREAM verdict with no repro run (vitest not installed; 'red observed per PR body' only).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "KEEP-UNPROVEN"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -516,6 +606,12 @@
     "verdict": "UPSTREAM"
   },
   "#703": {
+    "adversary": {
+      "evidence": "Self-hosted pool is LIVE: `gh api repos/ANG-Ventures/hermes-agent/actions/runners` = 8 runners ace-media-ang-ventures-hermes-agent-1..8 online+busy (labels self-hosted,hermes-ci); ci-overflow controller launchd ai.hermes.ci-overflow-controller KeepAlive, heartbeat.json mtime 2026-09-25 08:06; cioc/service.py:69-75 treats CI_RUNNER_LABELS=[\"ubuntu-latest\"] as a legacy-evacuation switch -> the variable is a live toggle. .github/workflows/ci.yaml:26 (#704) indexes these 3 pins and stays on the revert branch (would go stale).",
+      "new_verdict": "KEEP",
+      "notes": "The pins are the guard for flipping CI_RUNNER_LABELS back (sudo/no-docker failures on the pool). Reverting only works while the variable happens to be ubuntu-latest.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-self-hosted-pool-gaps",
     "evidence": {
       "cost": {
@@ -597,6 +693,12 @@
     "verdict": "KEEP"
   },
   "#736": {
+    "adversary": {
+      "evidence": "ci-review-comment.yml state=disabled_manually (REST actions/workflows, 2026-09-25). Skill hits (~/.hermes/skills-shared/coding/probe-fidelity/references/own-verification-probe-in-the-reviewer-seat.md:179, kanban-swarm-operations review-round ref) are incident write-ups, not run instructions.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-ci-review-comment",
     "evidence": {
       "cost": {
@@ -639,6 +741,12 @@
     "verdict": "KEEP"
   },
   "#748": {
+    "adversary": {
+      "evidence": "ci-review-comment.yml state=disabled_manually (REST actions/workflows, 2026-09-25). Skill hits (~/.hermes/skills-shared/coding/probe-fidelity/references/own-verification-probe-in-the-reviewer-seat.md:179, kanban-swarm-operations review-round ref) are incident write-ups, not run instructions.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-ci-review-comment",
     "evidence": {
       "cost": {
@@ -788,6 +896,12 @@
     "verdict": "KEEP"
   },
   "#805": {
+    "adversary": {
+      "evidence": "census paths=[] (empty diff).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -806,6 +920,12 @@
     "verdict": "DROP"
   },
   "#847": {
+    "adversary": {
+      "evidence": "census paths=[] (empty diff).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -860,6 +980,12 @@
     "verdict": "KEEP"
   },
   "#87": {
+    "adversary": {
+      "evidence": "Only consumer is prose in ~/.hermes/skills-shared/hermes-harness/blackbox-turn-telemetry/references/perclass-cost-breakdown-build.md:59 (build record). Recent backup dir ~/.hermes/state/blackbox-backfill-bak-20260924-1715 is from backfill_cache_monitoring (t_10ba0347, state.db 2026-09-25 00:15), NOT this script. 0 cron/launchd callers.",
+      "new_verdict": null,
+      "notes": "Update the skill reference when the branch lands.",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-perclass-backfill",
     "evidence": {
       "cost": {
@@ -914,6 +1040,12 @@
     "verdict": "UNRESOLVED"
   },
   "#928": {
+    "adversary": {
+      "evidence": "windows.ps1: 0 hits in skills/scripts/fleet; fork test only.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-desktop-update-test",
     "evidence": {
       "cost": {
@@ -977,6 +1109,12 @@
     "verdict": "KEEP"
   },
   "#932": {
+    "adversary": {
+      "evidence": "ci_overflow_acceptance.py: only its own test; ~/dev/fleet-ops-scripts/ci-overflow-controller has 0 refs to ci_overflow_acceptance / receipts/preflight / preflight.json (the controller writes its own ~/.hermes/var/ci-overflow/receipts/).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-ci-overflow-phase0",
     "evidence": {
       "cost": {
@@ -1081,6 +1219,12 @@
     "verdict": "KEEP"
   },
   "nopr:0c96621b85": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1099,6 +1243,12 @@
     "verdict": "DROP"
   },
   "nopr:15e1d95f14": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1117,6 +1267,12 @@
     "verdict": "DROP"
   },
   "nopr:1b8af38096": {
+    "adversary": {
+      "evidence": "All 5 emails from the row have 0 occurrences in origin/main scripts/release.py (checked each).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": null,
     "evidence": {
       "cost": {
@@ -1142,6 +1298,12 @@
     "verdict": "SUPERSEDED-BY-UPSTREAM"
   },
   "nopr:1d5ebbe55a": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1163,6 +1325,12 @@
     "verdict": "DROP"
   },
   "nopr:1f8392335e": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1206,6 +1374,12 @@
     "verdict": "KEEP"
   },
   "nopr:2609ba7523": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/coding/eval-harness-oracle-discipline/references/live-eval-contention-and-probe-fidelity.md:133 names scripts/lcm_reset_aegis_store.sh the 'Reusable implementation'; lcm-context-engine SKILL.md:516.",
+      "new_verdict": "KEEP",
+      "notes": "Reusable store-reset runbook, skill-cited. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1226,6 +1400,12 @@
     "verdict": "DROP"
   },
   "nopr:26f69158d2": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1265,6 +1445,12 @@
     "verdict": "KEEP"
   },
   "nopr:2f33571c20": {
+    "adversary": {
+      "evidence": "Only reader of staging/* is tests/test_residual_cli_hint_pasteable.py (branch edits it). ~/.hermes/skills-shared/general/subagent-driven-development/references/brief-splits-write-surface.md:34 describes the staging/ CONVENTION, not these files. Live copies ~/.hermes/scripts/runtime-parity-check.py / fleet-gateway-restart.sh are maintained separately.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-staging",
     "evidence": {
       "cost": {
@@ -1283,6 +1469,12 @@
     "verdict": "DROP"
   },
   "nopr:3cd73eb4d4": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/ang-lifecycle/ang-swarm-plan/references/sibling-branch-topology-and-incremental-integration.md:56 prescribes `python scripts/probe_hermes_lcm_isolated.py --profile-dir ... ` as the integration behavior proof; file co-owned by plugins-tranche row #168 (not a scripts+misc DROP).",
+      "new_verdict": "KEEP",
+      "notes": "Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1301,6 +1493,12 @@
     "verdict": "DROP"
   },
   "nopr:40a6040932": {
+    "adversary": {
+      "evidence": "Same readers as #22; talmax1124 is also mapped by carlitosdiazplaza@gmail.com (release.py:2062), janrenz by janrenz@Mac.fritz.box (release.py:221).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-author-map-stale",
     "evidence": {
       "cost": {
@@ -1326,6 +1524,12 @@
     "verdict": "DROP"
   },
   "nopr:481ddd77b6": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1351,6 +1555,12 @@
     "verdict": "DROP"
   },
   "nopr:48376f7570": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1375,6 +1585,12 @@
     "verdict": "DROP"
   },
   "nopr:4899803ced": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1399,6 +1615,12 @@
     "verdict": "DROP"
   },
   "nopr:4b3698271f": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/references/local-addenda-lcm-context-engine.md:96 prescribes `python scripts/lcm_qa_battery.py --tier 0` as THE gate for LCM changes; SKILL.md:48,864 (battery refuses Opus); tier 1/2 drive scripts/lcm_live_recovery.py (lcm_qa_battery.py:102). LCM plugin is live product code (15 commits to plugins/context_engine/lcm since 08-01).",
+      "new_verdict": "KEEP",
+      "notes": "Skill-prescribed CURRENT gate for LCM changes. Not measured running in 30d (state.db tool_calls: last matching invocation 2026-08-20) — keep as on-demand gate tooling, or DROP only together with a skill edit. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1489,6 +1711,12 @@
     "verdict": "KEEP"
   },
   "nopr:589edef52a": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1673,6 +1901,12 @@
     "verdict": "UNRESOLVED"
   },
   "nopr:7d33c982d8": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1694,6 +1928,12 @@
     "verdict": "DROP"
   },
   "nopr:7ee021200e": {
+    "adversary": {
+      "evidence": "scripts/bench_lcm_context_engine.py: 0 hits in cron/hooks/scripts/fleet/skills/LaunchAgents; only reader is its own test tests/context_engine/test_lcm_benchmark_battery.py:7.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1712,6 +1952,12 @@
     "verdict": "DROP"
   },
   "nopr:834f0a0111": {
+    "adversary": {
+      "evidence": "~/.hermes/scripts/lcm_k2_autofire.sh:35 execs ~/.hermes/hermes-agent/scripts/lcm_k2_disambig_campaign.sh by absolute path; ~/.hermes/scripts/lcm_k2_autofire_net.sh:29 pgreps it. Neither is in any cron/launchd (jobs.json, LaunchAgents grep: 0); /tmp/lcm-k2-* markers absent.",
+      "new_verdict": "DROP only with ~/.hermes/scripts/lcm_k2_autofire*.sh",
+      "notes": "Revert-branch check #6: deleting scripts/lcm_k2_disambig_campaign.sh leaves a live (unscheduled) caller in ~/.hermes/scripts dangling. Drop both halves together or keep.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1871,6 +2117,12 @@
     "verdict": "KEEP"
   },
   "nopr:9f0c416088": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1889,6 +2141,12 @@
     "verdict": "DROP"
   },
   "nopr:a0367856d4": {
+    "adversary": {
+      "evidence": "lcm_aegis_stress.py / lcm_config_preflight.py: 0 live-dir hits; only docs/runbooks/lcm-aegis-apollo-cutover.md:28,51 (one-time Aegis->Apollo cutover, completed) + their own tests.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1907,6 +2165,12 @@
     "verdict": "DROP"
   },
   "nopr:a0a5e8a083": {
+    "adversary": {
+      "evidence": "Only reader of staging/* is tests/test_residual_cli_hint_pasteable.py (branch edits it). ~/.hermes/skills-shared/general/subagent-driven-development/references/brief-splits-write-surface.md:34 describes the staging/ CONVENTION, not these files. Live copies ~/.hermes/scripts/runtime-parity-check.py / fleet-gateway-restart.sh are maintained separately.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-staging",
     "evidence": {
       "cost": {
@@ -1925,6 +2189,12 @@
     "verdict": "DROP"
   },
   "nopr:a3fa06a6e4": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1943,6 +2213,12 @@
     "verdict": "DROP"
   },
   "nopr:a8ac516b63": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -1989,6 +2265,12 @@
     "verdict": "KEEP"
   },
   "nopr:ae486b7f0a": {
+    "adversary": {
+      "evidence": "scripts/mem0-destructive-spike.py: 0 hits in live dirs, skills or fork tree.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-oneshot-probes",
     "evidence": {
       "cost": {
@@ -2052,6 +2334,12 @@
     "verdict": "KEEP"
   },
   "nopr:c2cf19f6fd": {
+    "adversary": {
+      "evidence": "Repo copies scripts/lcm_k2_autofire{,_net}.sh have 0 callers; the live callers are the independent copies in ~/.hermes/scripts (lcm_k2_autofire_net.sh:42 calls ~/.hermes/scripts/lcm_k2_autofire.sh, not the repo copy).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2091,6 +2379,12 @@
     "verdict": "KEEP"
   },
   "nopr:d5cec6ec16": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2112,6 +2406,12 @@
     "verdict": "DROP"
   },
   "nopr:d9d2266dfe": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/coding/hermes-fork-pr-contribution/references/executing-an-upstream-parity-merge.md:92-93 prescribes `scripts/check_lcm_upstream_drift.py --metadata plugins/context_engine/lcm/VENDORED_FROM.txt --offline` as a step of every parity merge (syncs recur: 07-23/08-07/08-29); test file co-owned by plugins-tranche row #480.",
+      "new_verdict": "KEEP",
+      "notes": "Parity-merge procedure step; the next sync would run it. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2130,6 +2430,12 @@
     "verdict": "DROP"
   },
   "nopr:df420d15df": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2148,6 +2454,12 @@
     "verdict": "DROP"
   },
   "nopr:e0cf699f81": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2169,6 +2481,12 @@
     "verdict": "DROP"
   },
   "nopr:e29944b04e": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2193,6 +2511,12 @@
     "verdict": "DROP"
   },
   "nopr:e84170e4f8": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2244,6 +2568,12 @@
     "verdict": "KEEP"
   },
   "nopr:edcf3cf5d6": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2268,6 +2598,12 @@
     "verdict": "DROP"
   },
   "nopr:f3dfb89c2a": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2289,6 +2625,12 @@
     "verdict": "DROP"
   },
   "nopr:f923a9e07c": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2335,6 +2677,12 @@
     "verdict": "KEEP"
   },
   "nopr:fb3008a7ba": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
@@ -2353,6 +2701,12 @@
     "verdict": "DROP"
   },
   "nopr:fdee6d93f2": {
+    "adversary": {
+      "evidence": "~/.hermes/scripts/lcm_k2_autofire.sh:35 execs ~/.hermes/hermes-agent/scripts/lcm_k2_disambig_campaign.sh by absolute path; ~/.hermes/scripts/lcm_k2_autofire_net.sh:29 pgreps it. Neither is in any cron/launchd (jobs.json, LaunchAgents grep: 0); /tmp/lcm-k2-* markers absent.",
+      "new_verdict": "DROP only with ~/.hermes/scripts/lcm_k2_autofire*.sh",
+      "notes": "Revert-branch check #6: deleting scripts/lcm_k2_disambig_campaign.sh leaves a live (unscheduled) caller in ~/.hermes/scripts dangling. Drop both halves together or keep.",
+      "result": "NEEDS-LEAD"
+    },
     "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
     "evidence": {
       "cost": {
