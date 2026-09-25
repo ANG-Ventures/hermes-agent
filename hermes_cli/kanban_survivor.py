@@ -389,7 +389,70 @@ def _dangling_gitfile(path):
 
 def _repos(workspace, prune=None):
     """Find repos created inside scratch, including linked worktrees; no symlinks."""
-    found = [here for here, is_repo in _walk(workspace, prune) if is_repo]
+    return _with_enclosing(workspace, [here for here, is_repo in _walk(workspace, prune) if is_repo])
+
+
+def _covering_repos(workspace, claims, bases):
+    """Repositories that hold the card's claimed paths or its recorded bases.
+
+    Found without walking: each claim is followed DOWN from ``workspace`` one
+    component at a time, never through a symlink or a derived directory (the
+    same rules as :func:`_walk`), and every repository on that path counts --
+    so a claim inside a repo nested in the root yields both, and the nested
+    refusal in :func:`preserve` fires exactly as it would after a full walk.
+    """
+    found = []
+    targets = [Path(os.path.normpath(workspace / key)) for key in bases]
+    for claim in [*claims, *targets]:
+        try:
+            parts = claim.relative_to(workspace).parts
+        except ValueError:
+            continue
+        here = workspace
+        for part in parts:
+            here = here / part
+            if part in (".git", *_DERIVED_DIRS) or here.is_symlink() or not here.is_dir():
+                break
+            if _is_repo_on_disk(here) and here not in found:
+                found.append(here)
+    return found
+
+
+def _dir_repos(workspace, foreign, bases):
+    """``_repos`` for the completion pass of a shared ``dir`` workspace.
+
+    A ``dir`` workspace rooted at a shared home cannot be enumerated inside the
+    budget even after :class:`_ForeignNested` prunes every other card's
+    subtree (t_67f7a89c: ``~/.hermes`` walked 94,906 directories in 60 s cold
+    after pruning 1,627 foreign ones, and found ONE repository -- the root).
+    On that pass only, running out of budget is not a refusal: the result is
+    what the walk found before stopping, plus every repository covering the
+    card's own ``changed_files`` and recorded ``bases``, plus the root.
+
+    Fail-closed on the card's own work is kept: a claimed path's repository is
+    always captured (and a nested one still refuses), and Git's registered
+    worktrees/submodules were already checked in full before this runs. What
+    is given up is an unclaimed, unregistered hand clone beyond the budget --
+    and this pass never deletes a ``dir`` workspace (the verified-survivor
+    branch of :func:`preserve` already skips discovery entirely for the same
+    reason). The ``cleanup=True`` pass keeps the strict walk.
+    """
+    found = []
+    try:
+        for here, is_repo in _walk(workspace, foreign.prune):
+            if is_repo:
+                found.append(here)
+    except SurvivorUnavailable as exc:
+        log.warning("kanban survivor: %s scoping dir enumeration to claimed repositories: %s",
+                    foreign.own, exc)
+        if (workspace / ".git").exists() and workspace not in found:
+            found.insert(0, workspace)
+        found.extend(r for r in _covering_repos(workspace, foreign.claimed, bases) if r not in found)
+    return _with_enclosing(workspace, found)
+
+
+def _with_enclosing(workspace, found):
+    """Add ``workspace`` itself when an enclosing repository tracks files in it."""
     enclosing = next((p for p in (workspace, *workspace.parents) if (p / ".git").exists()), None)
     if workspace not in found and enclosing is not None:
         # Probe before inspecting: a scratch workspace under the tripwire
@@ -2411,7 +2474,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 f"({str(registered[0].relative_to(workspace))})"
             )
         stage = "_repos workspace scan"
-        repos = _repos(workspace, prune) if prune else _repos(workspace)
+        repos = _dir_repos(workspace, foreign, bases) if foreign else _repos(workspace)
         if foreign:
             repos = [repo for repo in repos if not foreign.foreign(repo)]
             if foreign.skipped:
