@@ -1091,6 +1091,50 @@ def _verify_landed(entries, workspace):
     return verified
 
 
+def _recorded_landed_claims(previous):
+    """Rebuild the `landed` claim a RECORDED receipt made, or refuse legibly.
+
+    Reclamation re-verifies the live commits a `kind: "landed"` receipt names
+    before it may delete the workspace. The row is persisted JSON -- a
+    hand-edited, partially written or legacy row can carry `landed: null`, a
+    non-object entry, or an entry without `repository`/`sha`. Indexing such a
+    row raised `TypeError`/`KeyError`, which no `except` tuple on the reaper
+    path names: the workspace survived, but with no `held_reason` and no
+    `workspace_held` event, so the card's recovery state was silent.
+    Every malformed shape is a refusal, raised as `SurvivorUnavailable` so it
+    persists through `_hold()` like any other doubt.
+    """
+    entries = previous.get("landed")
+    if not isinstance(entries, list) or not entries:
+        raise SurvivorUnavailable(
+            "survivor_unavailable: recorded landed receipt is malformed (landed is not a non-empty list)"
+        )
+    claims = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SurvivorUnavailable(
+                "survivor_unavailable: recorded landed receipt is malformed (entry is not an object)"
+            )
+        repository, sha = entry.get("repository"), entry.get("sha")
+        if not isinstance(repository, str) or not repository or not isinstance(sha, str) or not sha:
+            raise SurvivorUnavailable(
+                "survivor_unavailable: recorded landed receipt is malformed (entry needs repository and sha)"
+            )
+        claims.append({"repo_path": repository, "sha": sha})
+    return claims
+
+
+def _recorded_refs(previous):
+    """The recorded `refs` list, or empty when the row's `refs` is not a list.
+
+    A malformed `refs` (e.g. `null`) vouches for nothing; treating it as empty
+    turns it into the ordinary "recorded repository missing" refusal instead of
+    a `TypeError` that escapes `_hold()`.
+    """
+    refs = (previous or {}).get("refs")
+    return refs if isinstance(refs, list) else ()
+
+
 def _base(repo, published):
     # The nearest published ancestor of HEAD is a BOUNDARY commit of
     # `rev-list HEAD ^<every ref>`: git stops there precisely because the
@@ -2169,8 +2213,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         landed = (metadata or {}).get("landed")
         if cleanup and not landed and previous and previous.get("kind") == "landed":
             # Revalidate the recorded live commits before removing the workspace.
-            landed = [{"repo_path": entry["repository"], "sha": entry["sha"]}
-                      for entry in previous["landed"]]
+            landed = _recorded_landed_claims(previous)
         if landed:
             if not isinstance(landed, list):
                 raise SurvivorUnavailable("survivor_unavailable: landed must be a list")
@@ -2184,7 +2227,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # repository and appear clean while its work is still here.
                 refs = {}
                 if cleanup and _reusable(previous):
-                    refs = {ref["repository"]: ref for ref in (previous or {}).get("refs", ())
+                    refs = {ref["repository"]: ref for ref in _recorded_refs(previous)
                             if isinstance(ref, dict) and ref.get("repository") in missing}
                 if explicit:
                     if None in explicit:
@@ -2484,6 +2527,20 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         # rides the re-raised exception instead, for the CLI to render.
         _hold(conn, task_id, reason)
         raise _refusal(reason, hint=bool(getattr(exc, "override_hint", ""))) from exc
+    except (TypeError, KeyError, AttributeError, IndexError) as exc:
+        # Backstop for the malformed-record class. `previous` and `bases` are
+        # persisted JSON that this function indexes in many places; a shape
+        # nobody validated (hand-edited, partially written, legacy) raises one
+        # of these, which the tuple above does not name. Escaping here left the
+        # workspace retained but the card's recovery state SILENT -- no
+        # `held_reason`, no `workspace_held` event (Argus r4 P10/P12, #924).
+        # Doubt fails closed: HOLD with a persisted reason, keep the traceback
+        # in the log for whoever repairs the row.
+        _log.exception("kanban survivor: unreadable recovery state for %s", task_id)
+        reason = ("survivor_unavailable: recorded survivor state is malformed "
+                  f"({type(exc).__name__}); repair the row or recover the workspace by hand")
+        _hold(conn, task_id, reason)
+        raise _refusal(reason) from exc
 
 
 def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False):
