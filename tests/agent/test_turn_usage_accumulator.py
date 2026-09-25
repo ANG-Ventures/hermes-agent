@@ -108,7 +108,10 @@ def test_append_inside_success_block_only(tmp_path):
 
 
 def test_on_session_end_carries_turn_usage_kwarg():
-    src = inspect.getsource(tf.finalize_turn)
+    # finalize_turn and the early-exit backstop share one emitter.
+    assert "emit_session_end(" in inspect.getsource(tf.finalize_turn)
+    assert "emit_session_end(" in inspect.getsource(tf.emit_unfinalized_session_end)
+    src = inspect.getsource(tf.emit_session_end)
     assert '"on_session_end",' in src
     # turn_usage kwarg present in the fire call
     fire = src[src.index('"on_session_end",'):]
@@ -143,7 +146,7 @@ def test_turn_usage_fold_sums_calls():
 
 def test_turn_usage_includes_last_call_split_keys():
     """The fold must surface the FINAL call's cache split (window decomposition)."""
-    src = inspect.getsource(tf.finalize_turn)
+    src = inspect.getsource(tf.emit_session_end)
     fire = src[src.index('"on_session_end",'):]
     # The payload assembled just above the fire carries the three last-call keys.
     block = src[:src.index('"on_session_end",')]

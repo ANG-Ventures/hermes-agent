@@ -115,7 +115,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             final_text TEXT,
             cli_invocation_id TEXT,
             served_subs_json TEXT,
-            attribution TEXT
+            attribution TEXT,
+            terminal_error TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -299,7 +300,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # `served_subs_json` is the cheap per-turn display rollup
     # ({"sub-vps-7": 3, ...}); `attribution` is the turn's dominant provenance.
     # ALTER is NOT idempotent, hence the PRAGMA-guarded per-column pattern.
-    for _col in ("served_subs_json", "attribution"):
+    # `terminal_error` (t_6c09f0c2): NULL for a turn that ended normally; the
+    # turn_exit_reason for one that ended failed (fallback chain exhausted,
+    # raised, ...). Lets turn-level surfaces count failed turns.
+    for _col in ("served_subs_json", "attribution", "terminal_error"):
         if _col not in _existing:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} TEXT")
@@ -599,6 +603,7 @@ _INSERT_TURN_COLUMNS = (
     "output_tokens_unknown",
     "input_tokens_unknown", "cache_read_tokens_unknown",
     "cache_write_tokens_unknown", "usage_unknown",
+    "terminal_error",
 )
 
 _INSERT_TURN_SQL = (
@@ -690,6 +695,9 @@ def insert_turn(record: TurnRecord) -> None:
                     _bool_int(record.cache_read_tokens_unknown),
                     _bool_int(record.cache_write_tokens_unknown),
                     _bool_int(record.usage_unknown),
+                    scrub_and_truncate(record.terminal_error, 300)
+                    if record.terminal_error
+                    else None,
                 ),
             )
             _refresh_served_subs(conn, record.turn_id)
