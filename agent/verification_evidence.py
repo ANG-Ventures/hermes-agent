@@ -210,6 +210,47 @@ def _split_shell_segments(command: str, *, posix: bool = True) -> list[_ShellSeg
     return segments if all(s.tokens for s in segments) else []
 
 
+def _effective_cwd(command: str, cwd: str | Path | None) -> str | Path | None:
+    """Resolve the directory a verification command actually runs in.
+
+    A very common shape is ``cd /path/to/repo && pytest`` where the terminal
+    tool's own ``cwd`` is unrelated (often ``/``). The recorder keys evidence on
+    the resolved project root, so honoring a leading ``cd <dir>`` makes the
+    passing event credit the same root a file edit marked stale — instead of
+    dropping it against ``root=None``. Only a leading, literal ``cd <dir>`` is
+    honored (no globbing, no ``cd`` with flags, no ``cd -``); anything else
+    falls back to the tool-provided ``cwd`` unchanged.
+    """
+    if not command or not isinstance(command, str):
+        return cwd
+    segments = _split_shell_segments(command)
+    # Only a `cd` that the next command actually runs after (`&&` / `;`).
+    if not segments or segments[0].following_operator not in ("&&", ";"):
+        return cwd
+    first = segments[0].tokens
+    # Exactly `cd <dir>` — a single positional operand, no flags/options.
+    if len(first) != 2 or first[0] != "cd":
+        return cwd
+    target = first[1]
+    if target in ("-", "~") or target.startswith("-"):
+        return cwd
+    try:
+        candidate = Path(target).expanduser()
+        if not candidate.is_absolute():
+            # A relative `cd` is only meaningful against a known base cwd.
+            # With no base, resolving would fall through to the process CWD and
+            # could credit an unrelated dir — fall back to the (None) cwd instead.
+            if cwd is None:
+                return cwd
+            candidate = Path(cwd) / candidate
+        candidate = candidate.resolve()
+    except (OSError, ValueError, RuntimeError):
+        return cwd
+    if not candidate.is_dir():
+        return cwd
+    return candidate
+
+
 def _exit_status_is_attributable(segments: list[_ShellSegment], match_index: int, exit_code: int) -> bool:
     """Whether the shell's status proves the matched segment's own status.
 
@@ -431,6 +472,9 @@ def classify_verification_command(
     """
     if not command or not isinstance(command, str):
         return None
+    # Honor a leading `cd <dir> &&` so evidence keys to the directory the
+    # command actually runs in, not the (often unrelated) terminal-tool cwd.
+    cwd = _effective_cwd(command, cwd)
     facts = _project_facts(cwd)
     if not facts:
         return None
