@@ -7320,6 +7320,9 @@ class TurnRunner:
         # history and attached to the current addressed message as
         # API-only context, so persisted history stores only the real
         # addressed user turn.
+        # Idle-compaction gap anchor (cached + rebuilt agents): must use the
+        # RAW transcript — _build_gateway_agent_history drops most timestamps.
+        self._runner._stamp_idle_gap_anchor(agent, ctx.history, ctx._interrupt_depth)
         agent_history, observed_group_context = _build_gateway_agent_history(
             ctx.history,
             channel_prompt=ctx.channel_prompt,
@@ -36218,6 +36221,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if interrupt_depth == 0:
             from agent.session_activity import ActivityProvenance
 
+            # Keep the pre-reset clock for the idle-compaction gap: the reset
+            # below would otherwise make every resumed turn look 0s idle.
+            _prev_ts = getattr(agent, "_last_activity_ts", None)
+            agent._idle_gap_anchor_ts = (
+                _prev_ts
+                if isinstance(_prev_ts, (int, float)) and not isinstance(_prev_ts, bool)
+                else None
+            )
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
             agent._last_activity_provenance = ActivityProvenance.UNKNOWN
@@ -36227,6 +36238,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if hasattr(agent, "_last_flushed_db_idx"):
                 agent._last_flushed_db_idx = 0
         agent._api_call_count = 0
+
+    @staticmethod
+    def _stamp_idle_gap_anchor(
+        agent: Any, history: Any, interrupt_depth: int
+    ) -> None:
+        """Anchor the idle-compaction gap to the session's real last activity.
+
+        ``build_turn_context`` measures the idle gap from
+        ``agent._idle_gap_anchor_ts``. Both gateway agent paths zero
+        ``_last_activity_ts`` before the turn: a cached agent is reset by
+        ``_init_cached_agent_for_turn`` and an evicted/rebuilt agent (the idle
+        sweep evicts at the same 1h the idle trigger uses, and every restart
+        rebuilds) starts with a construction-time clock. So the anchor is the
+        latest of the pre-reset clock stashed by ``_init_cached_agent_for_turn``
+        and the newest persisted transcript row timestamp — the latter survives
+        eviction and restart. Interrupt-recursive turns are not resumes and get
+        no anchor.
+        """
+        if interrupt_depth != 0:
+            agent._idle_gap_anchor_ts = None
+            return
+
+        def _num(v: Any) -> Optional[float]:
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                return float(v)
+            return None
+
+        candidates = []
+        stashed = _num(getattr(agent, "_idle_gap_anchor_ts", None))
+        if stashed is not None:
+            candidates.append(stashed)
+        for msg in history or ():
+            if isinstance(msg, dict):
+                ts = _num(msg.get("timestamp"))
+                if ts is not None:
+                    candidates.append(ts)
+        agent._idle_gap_anchor_ts = max(candidates) if candidates else None
 
     def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
         """Fire on_session_end extraction before soft-evicting a live agent.
