@@ -20,7 +20,14 @@ Deliberate non-actions, each one a fail-safe:
 * a reason naming no PR is never touched, and burns no lookup budget;
 * a bare ``#N`` with no unambiguous repo context is dropped rather than guessed;
 * CLOSED-unmerged posts ONE advisory comment and never unblocks;
-* any lookup failure is a no-op plus one WARN — never a page, never an unblock.
+* any lookup failure is a no-op plus one WARN — never a page, never an unblock;
+* MERGED is not DEPLOYED: when the card's reason or body names a deploy tree
+  (``~/.hermes`` or ``~/.hermes/runtime/hermes-agent``) and the PR's repo
+  maps to one (:data:`DEPLOY_TREES`), the merge commit must also be an
+  ancestor of that tree's HEAD. Until it is, the card stays blocked and gets
+  ONE ``MERGED, awaiting deploy`` comment (t_289e8020: t_2789cbae was
+  re-unblocked twice into the same wall while ``~/.hermes`` sat 195 commits
+  behind origin/main).
 
 Harness safety
 --------------
@@ -150,6 +157,24 @@ _GIT_REMOTE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Repo -> the LIVE tree its merges must reach before a deploy-premised card may
+# resume. Keys are lowercased ``owner/repo``; values are ``~``-relative and are
+# expanded at check time. A repo absent from this map is merge-only (the
+# pre-t_289e8020 behaviour): there is no local tree whose HEAD means "live".
+DEPLOY_TREES: dict[str, str] = {
+    "ang-ventures/hermes-home": "~/.hermes",
+    "ang-ventures/hermes-agent": "~/.hermes/runtime/hermes-agent",
+}
+
+# A card that names a deploy tree is claiming "the change must be LIVE", not
+# merely merged. ``~/.hermes``, ``$HOME/.hermes`` and an absolute home path all
+# count; the trailing guard rejects look-alikes such as ``~/.hermes-home``.
+# Over-matching (a body naming ``~/.hermes/scripts/x.py``) only ever makes the
+# gate STRICTER — it waits for the deploy — never looser.
+_DEPLOY_TREE_MENTION_RE = re.compile(
+    r"(?:~|\$HOME|\$\{HOME\}|/Users/[^/\s]+|/home/[^/\s]+)/\.hermes(?![\w-])"
+)
+
 
 @dataclass(frozen=True)
 class PrRef:
@@ -198,6 +223,11 @@ class _PrefetchResult:
     # re-pointed in between is detected and skipped rather than resolved
     # against a stale repository.
     contexts: dict[str, tuple[tuple, Optional[str]]] = field(default_factory=dict)
+    # ``(tree, merge_sha) -> is-ancestor-of-HEAD`` for every merged ref on a
+    # deploy-premised card. ``git merge-base`` is a subprocess, so it is
+    # answered HERE, outside the writer lock, like every other shell-out. A
+    # key absent under the lock is "not verified this tick" and holds silently.
+    deployed: dict[tuple[str, str], bool] = field(default_factory=dict)
 
 
 # Process-lifetime cache keyed by ``(repo.lower(), number)``. MERGED is the
@@ -286,7 +316,11 @@ def _db_is_sandboxed() -> bool:
     return target.is_relative_to(root)
 
 
-def assert_write_allowed(query_fn: Optional[Callable] = None) -> None:
+def assert_write_allowed(
+    query_fn: Optional[Callable] = None,
+    *,
+    deploy_fn: Optional[Callable] = None,
+) -> None:
     """Refuse a gate mutation driven by a fabricated oracle on a live board.
 
     The one fact that matters is ORACLE IDENTITY: if ``query_fn`` is not the
@@ -304,8 +338,11 @@ def assert_write_allowed(query_fn: Optional[Callable] = None) -> None:
     Production is untouched: the dispatcher passes ``None`` or the real
     ``gh``-backed oracle, both of which return immediately.
     """
-    if query_fn is None or query_fn is _REAL_QUERY_PR:
-        return  # real oracle: the verdict is evidence, not fabrication.
+    # A stubbed DEPLOY oracle fabricates the other half of the unblock
+    # evidence ("merged AND live"), so it is held to the same identity test.
+    deploy_real = deploy_fn is None or deploy_fn is _REAL_IS_DEPLOYED
+    if (query_fn is None or query_fn is _REAL_QUERY_PR) and deploy_real:
+        return  # real oracles: the verdict is evidence, not fabrication.
     if _db_is_sandboxed():
         return
     try:
@@ -786,6 +823,90 @@ def _prune_cache() -> None:
 _REAL_QUERY_PR = query_pr
 
 
+# ---------------------------------------------------------------------------
+# Deploy premise: MERGED is not LIVE
+# ---------------------------------------------------------------------------
+
+
+def names_deploy_tree(*texts: Optional[str]) -> bool:
+    """True when any of ``texts`` names a deploy tree (``~/.hermes`` family)."""
+    return any(
+        isinstance(text, str) and _DEPLOY_TREE_MENTION_RE.search(text)
+        for text in texts
+    )
+
+
+def deploy_tree_for(repo: str) -> Optional[str]:
+    """The ``~``-relative deploy tree for ``repo``, or None (merge-only repo)."""
+    return DEPLOY_TREES.get(repo.lower()) if isinstance(repo, str) else None
+
+
+def is_deployed(tree: str, sha: str) -> bool:
+    """True only when ``sha`` is an ancestor of ``tree``'s HEAD.
+
+    ``git -C <tree> merge-base --is-ancestor <sha> HEAD``: rc 0 is the only
+    success. rc 1 (not an ancestor), rc 128 (object unknown — the tree has not
+    even fetched it), a missing tree, or a timeout all answer False: a card is
+    never resumed on a deploy that cannot be proven.
+    """
+    if not tree or not sha:
+        return False
+    path = os.path.expanduser(tree)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", path, "merge-base", "--is-ancestor", sha, "HEAD"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_QUERY_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return False
+    return proc.returncode == 0
+
+
+_REAL_IS_DEPLOYED = is_deployed
+
+
+def _deploy_checks(
+    refs: Iterable[PrRef], *, reason: Optional[str], body: Optional[str],
+) -> list[tuple[PrRef, str]]:
+    """``(ref, tree)`` pairs whose merge must ALSO be live before unblocking.
+
+    Empty unless the card's reason or body names a deploy tree; then one pair
+    per ref whose repo maps to a tree. Any other repo stays merge-only.
+    """
+    if not names_deploy_tree(reason, body):
+        return []
+    out: list[tuple[PrRef, str]] = []
+    for ref in refs:
+        tree = deploy_tree_for(ref.repo)
+        if tree:
+            out.append((ref, tree))
+    return out
+
+
+def _deploy_marker(pending: Iterable[tuple[str, Optional[str]]]) -> str:
+    names = sorted({f"{tree}@{sha or 'unknown'}" for tree, sha in pending})
+    return "<!-- gate-deploy:" + "|".join(names) + " -->"
+
+
+def _awaiting_deploy_sentence(
+    pending: list[tuple[PrRef, "_CacheEntry", str]],
+) -> str:
+    parts = [
+        f"{ref} MERGED, awaiting deploy of {(entry.sha or 'unknown')[:8]} "
+        f"into {tree}"
+        for ref, entry, tree in pending
+    ]
+    marker = _deploy_marker((tree, entry.sha) for _, entry, tree in pending)
+    return (
+        "gate held: " + "; ".join(parts) + ". The card's premise is the "
+        "change being LIVE, so it stays blocked until the merge commit is an "
+        f"ancestor of the tree's HEAD.\n{marker}"
+    )
+
+
 class _Resolver:
     """Bounded, cached PR-state resolution for one tick."""
 
@@ -900,6 +1021,17 @@ def _closed_ref_marker(refs: Iterable[PrRef]) -> str:
     return "<!-- gate-pr-set:" + "|".join(names) + " -->"
 
 
+def _has_comment_marker(
+    conn: sqlite3.Connection, task_id: str, marker: str,
+) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM task_comments "
+        "WHERE task_id = ? AND instr(body, ?) > 0 LIMIT 1",
+        (task_id, marker),
+    ).fetchone()
+    return row is not None
+
+
 def _already_flagged_closed(
     conn: sqlite3.Connection, task_id: str, refs: Iterable[PrRef]
 ) -> bool:
@@ -978,7 +1110,7 @@ def _blocked_gate_refs(
     conn: sqlite3.Connection,
     *,
     contexts: Optional[dict[str, tuple[tuple, Optional[str]]]] = None,
-) -> list[tuple[str, list[PrRef]]]:
+) -> list[tuple[str, list[PrRef], list[tuple[PrRef, str]]]]:
     """Snapshot in-scope blocked cards and their currently resolvable PR refs.
 
     ``contexts`` is a repo-context snapshot taken by the unlocked prefetch.
@@ -988,7 +1120,7 @@ def _blocked_gate_refs(
     it is None the caller is the direct, unlocked path and contexts are
     resolved inline.
     """
-    candidates: list[tuple[str, list[PrRef]]] = []
+    candidates: list[tuple[str, list[PrRef], list[tuple[PrRef, str]]]] = []
     for task_id, fingerprint, workspace_path, body, reason in _gate_candidates(conn):
         if contexts is None:
             default_repo = repo_context(workspace_path=workspace_path, body=body)
@@ -1002,7 +1134,9 @@ def _blocked_gate_refs(
             default_repo = cached[1]
         refs = parse_pr_refs(reason, default_repo=default_repo)
         if refs:
-            candidates.append((task_id, refs))
+            candidates.append(
+                (task_id, refs, _deploy_checks(refs, reason=reason, body=body))
+            )
     return candidates
 
 
@@ -1012,6 +1146,7 @@ def prefetch_pr_gate_states(
     query_fn: Optional[Callable[[str, int], Optional[dict]]] = None,
     max_lookups: int = MAX_LOOKUPS_PER_TICK,
     now: Optional[float] = None,
+    deploy_fn: Optional[Callable[[str, str], bool]] = None,
 ) -> _PrefetchResult:
     """Fetch stale PR states concurrently before the dispatch writer lock.
 
@@ -1021,12 +1156,14 @@ def prefetch_pr_gate_states(
     Six workers bound 30 five-second lookups to roughly 25 seconds worst case.
     """
     query_fn = query_fn or query_pr
+    deploy_fn = deploy_fn or is_deployed
     now = time.time() if now is None else now
     # Same harness-safety gate as the locked pass: refuse a fabricated oracle
     # aimed at a live board at the FIRST entry point of the tick.
-    assert_write_allowed(query_fn)
+    assert_write_allowed(query_fn, deploy_fn=deploy_fn)
     unique: dict[tuple[str, int], PrRef] = {}
     contexts: dict[str, tuple[tuple, Optional[str]]] = {}
+    deploy_checks: list[tuple[PrRef, str]] = []
     # Resolve repo context HERE, outside the writer lock: this is the seam that
     # shells out to ``git remote -v`` (same 5 s timeout as ``gh``), and a
     # degraded workspace would otherwise hold the board's single-writer lock
@@ -1034,7 +1171,9 @@ def prefetch_pr_gate_states(
     for task_id, fingerprint, workspace_path, body, reason in _gate_candidates(conn):
         default_repo = repo_context(workspace_path=workspace_path, body=body)
         contexts[task_id] = (fingerprint, default_repo)
-        for ref in parse_pr_refs(reason, default_repo=default_repo):
+        card_refs = parse_pr_refs(reason, default_repo=default_repo)
+        deploy_checks.extend(_deploy_checks(card_refs, reason=reason, body=body))
+        for ref in card_refs:
             key = (ref.repo.lower(), ref.number)
             entry = _CACHE.get(key)
             if entry is not None and (
@@ -1052,6 +1191,7 @@ def prefetch_pr_gate_states(
         return _PrefetchResult(
             payloads=payloads, capped=capped, now=now, errors=errors,
             contexts=contexts,
+            deployed=_prefetch_deploys(deploy_checks, payloads, deploy_fn),
         )
 
     workers = min(_PREFETCH_WORKERS, len(selected))
@@ -1074,7 +1214,41 @@ def prefetch_pr_gate_states(
     return _PrefetchResult(
         payloads=payloads, capped=capped, now=now, errors=errors,
         contexts=contexts,
+        deployed=_prefetch_deploys(deploy_checks, payloads, deploy_fn),
     )
+
+
+def _prefetch_deploys(
+    checks: list[tuple[PrRef, str]],
+    payloads: dict[tuple[str, int], Optional[dict]],
+    deploy_fn: Callable[[str, str], bool],
+) -> dict[tuple[str, str], bool]:
+    """Answer every deploy-ancestry question the locked pass can ask.
+
+    The merge SHA comes from this tick's payload or the permanent MERGED cache
+    — the same two sources :class:`_Resolver` will read under the lock — so
+    every key the locked pass looks up is present here. Unmerged or
+    SHA-less refs are skipped: they cannot be deployed yet.
+    """
+    out: dict[tuple[str, str], bool] = {}
+    for ref, tree in checks:
+        key = (ref.repo.lower(), ref.number)
+        sha: Optional[str] = None
+        payload = payloads.get(key)
+        if isinstance(payload, dict):
+            if payload.get("mergedAt") or str(payload.get("state") or "").upper() == "MERGED":
+                sha = _merge_sha(payload)
+        else:
+            entry = _CACHE.get(key)
+            if entry is not None and entry.state == "MERGED":
+                sha = entry.sha
+        if not sha or (tree, sha) in out:
+            continue
+        try:
+            out[(tree, sha)] = bool(deploy_fn(tree, sha))
+        except Exception:  # defensive seam: unprovable deploy = not deployed
+            out[(tree, sha)] = False
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1089,6 +1263,7 @@ def reevaluate_pr_gates(
     max_lookups: int = MAX_LOOKUPS_PER_TICK,
     now: Optional[float] = None,
     prefetched: Optional[_PrefetchResult] = None,
+    deploy_fn: Optional[Callable[[str, str], bool]] = None,
 ) -> list[GateOutcome]:
     """Re-evaluate every in-scope blocked card against its referenced PRs.
 
@@ -1100,13 +1275,14 @@ def reevaluate_pr_gates(
     every uncertain path degrades to no action.
     """
     query_fn = query_fn or query_pr
+    deploy_fn = deploy_fn or is_deployed
     if prefetched is not None:
         now = prefetched.now
     now = time.time() if now is None else now
     # Harness safety gate, BEFORE any card is read or mutated: a stubbed oracle
     # aimed at a live board is refused outright rather than allowed to write a
     # fabricated gate_auto_resolved. See the module docstring.
-    assert_write_allowed(query_fn)
+    assert_write_allowed(query_fn, deploy_fn=deploy_fn)
     resolver = _Resolver(
         query_fn=query_fn,
         max_lookups=max_lookups,
@@ -1120,7 +1296,7 @@ def reevaluate_pr_gates(
     # revalidation seam for an unlocked prefetch: if the card changed in the
     # interim, its fingerprint no longer matches the snapshot and it is skipped
     # (fail-safe), so this pass performs NO subprocess I/O of any kind.
-    for task_id, refs in _blocked_gate_refs(
+    for task_id, refs, deploy_checks in _blocked_gate_refs(
         conn, contexts=None if prefetched is None else prefetched.contexts,
     ):
 
@@ -1178,6 +1354,46 @@ def reevaluate_pr_gates(
             outcomes.append(GateOutcome(
                 task_id=task_id, action="held", prs=names,
                 detail="at least one referenced PR is still open",
+            ))
+            continue
+
+        # MERGED is not DEPLOYED. A card whose premise names a deploy tree may
+        # resume only once every mapped merge is an ancestor of that tree's
+        # HEAD. Under a prefetch this is a dict read (no subprocess under the
+        # writer lock); a key missing from the snapshot holds silently.
+        by_ref = {(r.repo.lower(), r.number): e for r, e in resolved}
+        pending: list[tuple[PrRef, _CacheEntry, str]] = []
+        unverified = False
+        for ref, tree in deploy_checks:
+            entry = by_ref[(ref.repo.lower(), ref.number)]
+            if not entry.sha:
+                pending.append((ref, entry, tree))
+                continue
+            if prefetched is not None:
+                live = prefetched.deployed.get((tree, entry.sha))
+            else:
+                try:
+                    live = bool(deploy_fn(tree, entry.sha))
+                except Exception:
+                    live = False
+            if live is None:
+                unverified = True
+            elif not live:
+                pending.append((ref, entry, tree))
+        if pending:
+            detail = _awaiting_deploy_sentence(pending)
+            marker = _deploy_marker((t, e.sha) for _, e, t in pending)
+            if not _has_comment_marker(conn, task_id, marker):
+                _safe_comment(conn, task_id, detail)
+            outcomes.append(GateOutcome(
+                task_id=task_id, action="awaiting_deploy", prs=names,
+                detail=detail,
+            ))
+            continue
+        if unverified:
+            outcomes.append(GateOutcome(
+                task_id=task_id, action="held", prs=names,
+                detail="deploy state not verified this tick; deferred",
             ))
             continue
 
