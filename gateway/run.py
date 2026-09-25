@@ -20457,15 +20457,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._restart_requested
                         or getattr(self, "_signal_initiated_shutdown", False)
                     ):
-                        _keep = process_registry.restart_durable_ids()
+                        try:
+                            _keep = process_registry.restart_durable_ids()
+                            if _keep:
+                                process_registry.hand_off_to_next_boot(_keep)
+                        except Exception as _e:
+                            # Never let the exemption skip the kill below.
+                            _keep = frozenset()
+                            logger.debug("restart_durable_ids (%s) error: %s", phase, _e)
                         if _keep:
-                            process_registry.hand_off_to_next_boot(_keep)
                             logger.info(
                                 "Shutdown (%s): keeping %d restart-durable "
                                 "background process(es) alive: %s",
                                 phase, len(_keep), ", ".join(sorted(_keep)),
                             )
-                    _killed = process_registry.kill_all(exclude_ids=_keep)
+                    _killed = (
+                        process_registry.kill_all(exclude_ids=_keep)
+                        if _keep else process_registry.kill_all()
+                    )
                     if _killed:
                         logger.info(
                             "Shutdown (%s): killed %d tool subprocess(es)",
