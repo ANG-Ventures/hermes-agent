@@ -1937,5 +1937,239 @@
   },
   "branch": null,
   "notes": "Follows #122; a correctness guard on the fleet's shared tree with one measured incident."
+ },
+ "#786": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "approvals.mode: off bypassed dangerous shell commands but _run_approval_gate (SSH-config writes, pattern_key=ssh_config_write) only checked YOLO flags, so Discord still posted an approval embed on every ~/.ssh/config write.",
+  "evidence": {
+   "original": "PR #786 body: 2026-09-20 symptom, gateway-context probe awaited a Discord button without the fix; AST ratchet test_approval_mode_off_bypass.py.",
+   "upstream_state": "GREEN (behavior): ../up tools/approval.py:973 `if _yolo_active() or approval_context._get_approval_mode() == \"off\": return _approved()` inside _run_approval_gate, comment names SSH-config writes. Fork test re-run on ../up via test-gate: 2 failed — both AttributeError 'tools.approval has no attribute _get_approval_mode' (seam moved to approval_context), i.e. test-seam drift, not behavior. The AST ratchet (test_no_handrolled_yolo_bypass_outside_the_canonical_helper) also fails on up because upstream inlines the mode check instead of routing through is_approval_bypass_active() — a structure preference, not a bug.",
+   "upstream_fix": "98a3324821 fix(approval): approvals.mode off bypasses the shared approval gate (2026-09-13); helper extracted b23e1c3077 (2026-07-01)",
+   "fires": "no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25); approvals.mode: off is not set in any fleet config.yaml (read-only grep) — the fleet runs on /yolo + env bypass",
+   "cost": {
+    "loc": 139,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "D10a row: upstream honours approvals.mode: off on the shared gate as of 98a3324821, so the fork's predicate widening is absorbed. Take upstream's; keep the fork AST guard test only if the lead wants the canonical-helper ratchet as a fork policy (it will flag upstream's inline check on every sync)."
+ },
+ "nopr:74ed8a85c9": {
+  "verdict": "KEEP",
+  "problem": "reboot/shutdown is on the unconditional hardline blocklist; fleet/ops agents (Aegis) must be able to restart the hosts they manage. HERMES_ALLOW_REBOOT downgrades that family to the approval-gated DANGEROUS layer; everything else stays hardline.",
+  "evidence": {
+   "original": "commit body: opt-in flag, default byte-identical; 129 tests. Offered upstream as PR #38976.",
+   "upstream_state": "RED: own tests on ../up: 12 failed / 17 passed (all downgrade cases); FM 29 passed. Read-only: ../up tools/approval.py has no _reboot_shutdown_allowed; approval_detection.py keeps reboot/shutdown hardline.",
+   "upstream_fix": "none — upstream PR #38976 CLOSED unmerged (gh api)",
+   "fires": "HERMES_ALLOW_REBOOT present in ~/.hermes/.env + 9 profile .env files (name grep only). Hardline reboot blocks still seen 2× in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (aegis: heredoc/ssh-wrapped reboot text matched the detector); no positive marker for a successful downgrade — the approved path logs nothing distinctive.",
+   "cost": {
+    "loc": 123,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Configured fleet-wide and upstream rejected it, so KEEP is the only viable verdict; measurement is weak (2 blocks, 0 visible downgrades). 123 loc, 1 conflict file (2 syncs). The lead may want a fire marker added so the next audit can measure it."
+ },
+ "nopr:ae6ebc87c4": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "After the upstream gate refactor, _run_approval_gate read raw os.environ HERMES_CRON_SESSION to detect cron; a cron-SPAWNED subagent in a ThreadPoolExecutor worker has no env marker (identity is a ContextVar), so it AUTO-APPROVED dangerous commands and defeated cron_mode: deny.",
+  "evidence": {
+   "original": "commit ae6ebc87c4 body: sync-slice reconciliation; security regression found by review, no incident cited. Also reconciles 2 drifted tests.",
+   "upstream_state": "GREEN (read-only): ../up tools/approval_context.py:126-128 _is_cron_approval_context() -> _session_env('HERMES_CRON_SESSION'); _session_env@approval_context.py:110 is contextvar-first (gateway.session_context.get_session_env) with os.environ fallback — the same ContextVar-first rule. No added test in the row (0 test fns) so no run.",
+   "upstream_fix": "fb6446fc9e fix(cron): scope cron approval context per session (2026-08-03)",
+   "fires": "no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 123,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Upstream reached the same fix (session-scoped cron context) independently; the fork's _is_cron_session() variant can go at the next sync. Test-drift half of the commit is sync glue."
+ },
+ "#387": {
+  "verdict": "DROP",
+  "problem": "The discord REST tool had pin/unpin/delete but no react/unreact; agents could not add an emoji reaction to a Discord message.",
+  "evidence": {
+   "original": "PR #387 body: feature gap, no incident.",
+   "upstream_state": "RED: own tests on ../up: 9 failed / 1 passed (no _react/_unreact in ../up tools/discord_tool.py); FM 10 passed.",
+   "upstream_fix": "none",
+   "fires": "0 tool calls: state.db (read-only) assistant tool_calls discord action=react/unreact = 0 in Apollo and in argus/momus/aegis/daedalus/athena/marconi, ever. Logs show only the adapter's own 👀 marker reactions (429s), not the tool.",
+   "cost": {
+    "loc": 186,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Never used since it landed. 186 loc, 0 conflict files — cheap to carry, but dead code is dead code. Revert branch pending."
+ },
+ "#5": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "write_file reported success from the exit code + wc -c only; a write clobbered moments later (open Obsidian tab, sync daemon, truncated stdin) was reported as success.",
+  "evidence": {
+   "original": "PR #5 body: diagnosed live — a series of write_file/patch calls returned success:true while an open editor reverted the file; patch_replace already had the read-back.",
+   "upstream_state": "GREEN (read-only): ../up tools/file_operations.py:1295 _verify_written_hash (sha256 of on-disk vs intended) called from write_file@1314; error text 'Post-write verification failed for {path}: on-disk content differs from intended write' at :1305/:1411 is the fork's exact string. Own test on ../up: 1 collection error (fork test module imports drifted); FM 1 failed / 2 passed (stale fork test).",
+   "upstream_fix": "2c8a932f80 feat(file): verify write_file content on disk and say so (2026-08-02); rewired in aed2e156ad (2026-09-02)",
+   "fires": "'Post-write verification failed for' 20 + 'could not re-read' 4 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) — the check catches real clobbers",
+   "cost": {
+    "loc": 125,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Absorbed upstream with the same message strings; take theirs at the next sync."
+ },
+ "#615": {
+  "verdict": "UPSTREAM",
+  "problem": "search_files ran rg with the default Rust regex engine (no look-around/backrefs), so a valid PCRE like (?<!def )symbol hard-errored 'unrecognized flag' instead of searching; auto-select --pcre2 for look-around syntax and retry on the PCRE2-only error.",
+  "evidence": {
+   "original": "PR #615 body: papercut pc-9320531b; the exact error line appears once in logs (the reported instance).",
+   "upstream_state": "RED (read-only): ../up tools/file_operations.py has no pcre2 handling (rg 'pcre2' = 0 hits; git log -S'pcre2' = 0). Own test on ../up: 1 collection error (imports _pattern_needs_pcre2); FM 23 passed.",
+   "upstream_fix": "none",
+   "fires": "1 look-around 'unrecognized flag' error in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (the papercut itself); post-fix successes leave no marker. The other 'unrecognized flag' hits are unrelated (patterns starting with '--').",
+   "cost": {
+    "loc": 182,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic tool robustness, 182 loc, 0 conflict files. Not measurable as a KEEP (silent success path); offer upstream."
+ },
+ "nopr:9a1db22e58": {
+  "verdict": "UPSTREAM",
+  "problem": "patch_v4a() with no recognised V4A headers (typically a bare unified diff) parsed to zero operations and returned success:true with files_modified while writing NOTHING — a false success.",
+  "evidence": {
+   "original": "commit body: silent no-op success class; guard returns an actionable error pointing at the missing header / mode='replace'.",
+   "upstream_state": "RED: own tests on ../up: test_bare_unified_diff_errors_not_silent_success FAILED + 1 more (2 failed / 1 passed); FM 3 passed. Read-only: rg 'No V4A file operations found' ../up/tools = 0.",
+   "upstream_fix": "none",
+   "fires": "'No V4A file operations found in patch' 74 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) — models hit this false-success path 74 times in the window; each is a silent no-op prevented",
+   "cost": {
+    "loc": 70,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Heavily measured, generic, 70 loc, 0 conflict files. Strong UPSTREAM; keep on the fork until it lands."
+ },
+ "#360": {
+  "verdict": "KEEP",
+  "problem": "Six tests failed on a macOS dev host (real terminal.cwd, user D-Bus systemd preflight, live model resolution) but passed on Linux CI; plus rg 0.10 emits per-file I/O errors without the 'rg: ' prefix so they were mis-parsed as matches.",
+  "evidence": {
+   "original": "PR #360 body: port of the fork-needed subset of upstream batch NousResearch#65334 (closed unmerged), re-verified file-by-file.",
+   "upstream_state": "RED for the rg hunk (read-only): ../up tools/file_operations.py has no _OS_ERROR_DIAGNOSTIC_RE / '(os error N)' folding. Own tests on ../up: 4 failed (sensitive-path + misplacement tests assume fork seams); FM 1 failed / 3 passed (fork test drift).",
+   "upstream_fix": "none — upstream PR #65334 closed unmerged",
+   "fires": "rg hunk inert on this fleet: host rg is modern (rg --version above), no '(os error' diagnostics in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25); the test-hygiene half fires on every local macOS test run",
+   "cost": {
+    "loc": 107,
+    "conflict_syncs": 1,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Test infra for the fork's own suite on macOS (same class as #345's test half). The production hunk is a 6-line robustness guard that never fires here; cost 107 loc, 1 conflict file (1 sync). KEEP as test infra, not as a runtime feature — the lead can fold the rg hunk into a drop at the next sync."
+ },
+ "#399": {
+  "verdict": "UPSTREAM",
+  "problem": "refresh_agent_mcp_tools() (between-turns MCP refresh, /reload-mcp, late-binding thread) re-injected tool families via an _add() that read schema['name'] on the raw entry; the LCM context engine returns already-wrapped {type:function,function:{...}} schemas, so every lcm_* tool was silently dropped from the rebuilt snapshot. agent_init normalizes; the refresh path did not (duplicated-normalizer drift).",
+  "evidence": {
+   "original": "PR #399 body: found in production on a fleet running context.engine: lcm with an MCP server (gbrain) registered — the recall half of LCM vanished after the first refresh.",
+   "upstream_state": "RED: own tests on ../up: test_refresh_preserves_wrapped_context_engine_schemas + ..._memory_provider_schemas FAILED (2 failed); FM 2 passed. Read-only: ../up tools/mcp_tool_agent.py:285-291 _add() still does schema.get('name') with no normalize_tool_schema (git log -S'normalize_tool_schema' on that file: 0).",
+   "upstream_fix": "none",
+   "fires": "no log line (silent drop / silent fix); 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25). The fleet runs context.engine: lcm on every gateway, so the pre-fix drop would hit every MCP refresh.",
+   "cost": {
+    "loc": 92,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic normalizer-drift fix in a path upstream still has unnormalized; 92 loc, 0 conflict files. Offer upstream with a wrapped-schema fixture (their memory providers can return wrapped form too)."
+ },
+ "#98": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "ACP bound the session-id ContextVar to '' (set_session_vars(session_key=session_id) with session_id defaulting to '') while writing the real id to os.environ; '' is not _UNSET, so _current_session_id() never fell through and ACP kanban session stamping returned None.",
+  "evidence": {
+   "original": "PR #98 body: live e2e of #97 caught the ACP regression the unit tests missed; 3 cases verified.",
+   "upstream_state": "GREEN (read-only): ../up acp_adapter/server.py:770-772 set_session_vars(session_key=session_id, session_id=session_id, cwd=state.cwd, cron_session='') — ACP now binds the REAL id into the ContextVar, so the empty-binding root cause is gone; kanban_tools.py:1049 reads get_session_env('HERMES_SESSION_ID') with no os.environ fallthrough by design (:1081 'deliberately NOT a fallback'). Own tests on ../up: 2 failed — both assert the fork's fallthrough helper (_current_session_id absent), a seam test, not the bug.",
+   "upstream_fix": "a5f94e93ad fix(acp): bind session_id in session context for subprocess (2026-08-01)",
+   "fires": "no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25); ACP is not a fleet surface (no acp sessions in profile logs)",
+   "cost": {
+    "loc": 81,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Upstream fixed the producer (ACP binding) instead of the consumer (kanban fallthrough); the fork's fallthrough is then dead and its 'treat empty as unbound' rule contradicts upstream's contextvar-wins contract. Drop ours at the sync."
+ },
+ "#252": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "browser_navigate/snapshot resolved CDP from env OR browser.cdp_url, but browser_console/eval gated on is_camofox_mode() which checked only the env var — on a host with a persistent config cdp_url, eval was routed to Camofox (HTTP 403 / 'JavaScript evaluation is not supported') while navigate worked.",
+  "evidence": {
+   "original": "PR #252 body: observed live, browser_console 403'd every call with Chrome connected on 127.0.0.1:9222.",
+   "upstream_state": "GREEN: own tests on ../up: 4 passed (and FM 4 passed). Read-only: ../up tools/browser_camofox.py:101 `if os.getenv('BROWSER_CDP_URL').strip() or _config_cdp_url(): return False` with the docstring naming the same precedence as _get_cdp_override().",
+   "upstream_fix": "0a75616514 security(browser): enforce cloud-metadata floor on all backends (2026-06-25) introduced _config_cdp_url in is_camofox_mode",
+   "fires": "no log line; 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25); the fleet drives CDP via browser.cdp_url so this path is exercised on every browser_console call",
+   "cost": {
+    "loc": 71,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Absorbed; take upstream's."
+ },
+ "#784": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "test_gateway_loop_goal_note_when_goal_active flaked in CI (ejected fork PR #773 from the merge queue twice): GoalManager's SessionDB bootstrap window is a fixed wall-clock budget for a background thread; pre-warm the goals SessionDB cache in async goal tests.",
+  "evidence": {
+   "original": "PR #784 body: CI runs 35532976143 / 35536457512 / 35514481851 with the 'goal ... not persisted — bootstrap window exceeded' warning.",
+   "upstream_state": "n/a — tests only; the pick f8f4d056f5 is an ancestor of upstream/main (git merge-base --is-ancestor: yes).",
+   "upstream_fix": "f8f4d056f5 (Teknium) — the row IS this commit, cherry-picked with -x",
+   "fires": "n/a (test-only)",
+   "cost": {
+    "loc": 20,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Backport of an upstream commit that upstream already has; disappears at the sync. Tests-only row, follows its code (goal tests)."
+ },
+ "#585": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Port of upstream's Browser Use CLI 3.0 mode (browser_exec, provider plugin, install, default backend) onto the fork so deploy.sh could advance the runtime tree ahead of the next parity sync.",
+  "evidence": {
+   "original": "PR #585 body: 9-commit family cherry-picked with -x from upstream; fork-side item: 'fork guard compliance — ASCII-only install.ps1 em-dash; reviewed uv-fallback exemption for browser_use_cli'.",
+   "upstream_state": "GREEN by construction: all 9 pick sources are ancestors of upstream/main. Spot-check for fork edits on top (diff of each file at 2c290c5a97 vs upstream at the last pick baa6b2e34d): tools/browser_use_cli.py, tools/browser_tool.py, plugins/browser/browser_use/provider.py, tests/tools/test_browser_use_cli.py, tests/plugins/browser/test_browser_provider_plugins.py, tests/tools/conftest.py, scripts/install.sh = 0 differing lines. Only fork-origin deltas: tests/test_managed_runtime_resolution.py +5 lines (fork guard exemption entry for browser_use_cli uv fallback) and one em-dash→ASCII in scripts/install.ps1; every other diff (cli.py 1027, config_defaults 342, ...) is base drift, not #585 edits.",
+   "upstream_fix": "a1835c8c17, 92968a5c7d, e076d230f4, 9e5e1740ed, 39a234b133, f21d9714e8, 7e04718ec3, 8d8bc85dca, baa6b2e34d (2026-07-17 → 08-11)",
+   "fires": "n/a — upstream code; browser_exec is the fleet's browser path (used by every browser skill)",
+   "cost": {
+    "loc": 2088,
+    "conflict_syncs": 3,
+    "conflict_files": 7,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "No fork logic on top of the picks; SUPERSEDED with the 9 shas as evidence. At the sync keep only the 5-line fork-guard exemption in tests/test_managed_runtime_resolution.py (fork-only test) — nothing else to carry."
  }
 }
