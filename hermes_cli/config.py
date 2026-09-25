@@ -6185,7 +6185,7 @@ def config_command(args):
 # ── Profile-driven env var injection ─────────────────────────────────────────
 # Any provider registered in providers/ with auth_type="api_key" automatically
 # gets its env_vars exposed in OPTIONAL_ENV_VARS without editing this file.
-# Runs once at import time.
+# Runs once, on the first read of OPTIONAL_ENV_VARS.
 
 _profile_env_vars_injected = False
 
@@ -6193,7 +6193,7 @@ _profile_env_vars_injected = False
 def _inject_profile_env_vars() -> None:
     """Populate OPTIONAL_ENV_VARS from provider profiles not already listed.
 
-    Called once at module load time. Idempotent — repeated calls are no-ops.
+    Runs on the first read of OPTIONAL_ENV_VARS. Idempotent — repeated calls are no-ops.
     """
     global _profile_env_vars_injected
     if _profile_env_vars_injected:
@@ -6220,8 +6220,9 @@ def _inject_profile_env_vars() -> None:
         pass
 
 
-# Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
-_inject_profile_env_vars()
+# Deferred to the first read of OPTIONAL_ENV_VARS: provider discovery imports
+# every model-provider plugin, which is far too expensive for import time.
+OPTIONAL_ENV_VARS.add_filler(_inject_profile_env_vars)
 
 
 # ── Platform-plugin env var injection ────────────────────────────────────────
@@ -6250,8 +6251,8 @@ _platform_plugin_env_vars_injected = False
 def _inject_platform_plugin_env_vars() -> None:
     """Populate OPTIONAL_ENV_VARS from bundled platform plugin manifests.
 
-    Called once at module load time. Idempotent — repeated calls are no-ops.
-    Failures are swallowed so a malformed plugin.yaml can't break CLI import.
+    Runs on the first read of OPTIONAL_ENV_VARS. Idempotent — repeated calls
+    are no-ops. Failures are swallowed so a malformed plugin.yaml can't break CLI import.
     """
     global _platform_plugin_env_vars_injected
     if _platform_plugin_env_vars_injected:
@@ -6317,5 +6318,5 @@ def _inject_platform_plugin_env_vars() -> None:
         pass
 
 
-# Eagerly inject so that platform plugin env vars show up in the setup wizard.
-_inject_platform_plugin_env_vars()
+# Deferred like the provider filler (registered after it, so it runs after it).
+OPTIONAL_ENV_VARS.add_filler(_inject_platform_plugin_env_vars)
