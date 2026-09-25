@@ -1,0 +1,2731 @@
+{
+  "#1006": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 1,
+        "dependents": [
+          ".github/workflows/tests.yml"
+        ],
+        "loc": 60
+      },
+      "fires": "tests.yml conditions on needs.placement.outputs.plan_attempt every run while placement is enabled [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Fixes the P2c BLOCK-ACTIVATION finding (t_f02c34f7, #954). GitHub \"Re-run failed jobs\" reuses the generate/placement outputs from attempt N, so attempt N+1 ran hosted slices under a stale plan with no reservation (run 35",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "re-run-failed-jobs reused attempt-N overflow plan (run 35966312383)",
+    "verdict": "KEEP"
+  },
+  "#1029": {
+    "adversary": {
+      "evidence": "mutation-gate half has no caller ('manual'); only the CI test half is measured.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "KEEP-UNPROVEN"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 12
+      },
+      "fires": "test-only + mutation-gate row; tests/test_ci_overflow_ledger.py runs in CI; mutation gate is manual (no caller) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Follow-up to #931 (Argus t_9b423c85 F4, card t_d56b534c). #931 closed F1/F3 and nine of the ten F4 rows. C4 (reserve() label allowlist) was still ungated: with the check deleted, 102/102 overflow tests passed and an unap",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "C4 reserve() label allowlist was ungated by the mutation gate",
+    "verdict": "KEEP"
+  },
+  "#105": {
+    "adversary": {
+      "evidence": "Only consumer is prose in ~/.hermes/skills-shared/hermes-harness/blackbox-turn-telemetry/references/perclass-cost-breakdown-build.md:59 (build record). Recent backup dir ~/.hermes/state/blackbox-backfill-bak-20260924-1715 is from backfill_cache_monitoring (t_10ba0347, state.db 2026-09-25 00:15), NOT this script. 0 cron/launchd callers.",
+      "new_verdict": null,
+      "notes": "Update the skill reference when the branch lands.",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-perclass-backfill",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 4
+      },
+      "fires": "as #87 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: The comment above `_safe_backup`'s `VACUUM INTO` claimed *\"VACUUM INTO won't take a bound param\"* — the **exact opposite** of what the code does (and has done correctly since SPEC-D, PR #87).  The code binds the destinat",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-perclass-backfill (family 'perclass-backfill'): removed 2 paths; dangling non-doc refs to removed scripts: none",
+    "problem": "backwards VACUUM INTO comment in backfill backup",
+    "verdict": "DROP"
+  },
+  "#112": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 2,
+        "dependents": [],
+        "loc": 757
+      },
+      "fires": "cron 'skew-convergence-check' enabled, last run 2026-09-21T10:00; ~/.hermes/scripts/skew-floor-tune-gate.py reads scripts/skew-distribution.py [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## What  Follows up the B(#110)+P2(#111) closeout backlog. Three things + one fenced fix:  - **T0 (fenced P2 correctness fix):** `record_skew_from_real` now CONSUMES `_last_rough_sent`. Pre-fix, one preflight `note_rough",
+      "upstream_fix": "none",
+      "upstream_state": "read-only: agent/context_engine.py record_skew_from_real is fork-only"
+    },
+    "notes": "",
+    "problem": "compaction skew telemetry + render harness + stale-rough median fix",
+    "verdict": "KEEP"
+  },
+  "#113": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 64
+      },
+      "fires": "scripts/compaction-render-proof.py is imported by tests/context_engine/test_compaction_render_e2e.py (CI) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Makes `compaction-render-proof.py --real-model` runnable standalone (AC-5 fidelity gate).  **Not a product bug** — the LCM summarizer correctly resolves model `auto` → the agent current main runtime (`_resolve_auto` prio",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "compaction-render-proof --real-model resolves like a live turn",
+    "verdict": "KEEP"
+  },
+  "#116": {
+    "adversary": {
+      "evidence": "CORRECTION to auditor's '0 writes': ~/.hermes/logs/claude-bpx.log:8422 `[e60b4483] → tool_calls: [mem0_remember]` on route hermes-sess:20260806_004323_483e3a52-review (a background-review fork) — it fired at least once in Aug, and mem0_remember was resident in tools[] for 20260816_* sessions (bpx:10616-10644). Since then: 0 more bpx hits in 34,498 lines, 0 state.db tool_name='mem0_remember' rows in 60d. Dark for >30d.",
+      "new_verdict": null,
+      "notes": "Verdict stands on the 30-day window; revert belongs to agent/plugins tranches (conflicts).",
+      "result": "STANDS"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 4,
+        "conflict_syncs": 3,
+        "dependents": [],
+        "loc": 1209
+      },
+      "fires": "0 writes in 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs): every one of the 5 mem0_remember log lines is 'check_fn check_mem0_remember_requirements returned False; dependent tools will be unavailable' (07-16, 07-27, 08-07, 09-08) even though config.yaml memory.background_review_mem0_write: true",
+      "original": "PR body: Lets the background self-improvement review fork persist durable user facts into mem0 (previously USER.md only), default-OFF (`memory.background_review_mem0_write`), leak-safe (manager-free registry tool), with a 4-tier ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "Dark since merge (#118 already reported 0 production rows); still dark after #118. eval/ files have no reader. Revert branch attempted via git revert; see branch field. | branch NOT built: reverse-apply leaves conflicts in ['toolsets.py']; #118: apply -R --3way rc=1 Applied patch to 'toolsets.py' with conflicts.\nApplied patch to 'tests/plugins/memory/test_mem0_remember.py' cleanly.\nU toolsets.py | #116: apply -R --3way rc=1 conflicts.\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nApplied patch to 'agent/background_review.py' with conflicts. | run 2: git revert on origin/main conflicts (#116: agent/background_review.py, plugins/memory/mem0/__init__.py + 3 tests; #118: toolsets.py). mem0_remember is still resident at toolsets.py:68. Reverting #118 alone would be a half-revert, so no branch. Hand-revert is for the agent/plugins auditor.",
+    "problem": "background-review fork can persist user facts to mem0 via mem0_remember (+eval/ artifacts)",
+    "verdict": "DROP"
+  },
+  "#118": {
+    "adversary": {
+      "evidence": "CORRECTION to auditor's '0 writes': ~/.hermes/logs/claude-bpx.log:8422 `[e60b4483] → tool_calls: [mem0_remember]` on route hermes-sess:20260806_004323_483e3a52-review (a background-review fork) — it fired at least once in Aug, and mem0_remember was resident in tools[] for 20260816_* sessions (bpx:10616-10644). Since then: 0 more bpx hits in 34,498 lines, 0 state.db tool_name='mem0_remember' rows in 60d. Dark for >30d.",
+      "new_verdict": null,
+      "notes": "Verdict stands on the 30-day window; revert belongs to agent/plugins tranches (conflicts).",
+      "result": "STANDS"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 1,
+        "dependents": [],
+        "loc": 38
+      },
+      "fires": "as #116: tool still unavailable (check_fn False) through 2026-09-08; 0 successful calls in window",
+      "original": "PR body: ## The bug The background-review mem0 write path (PR #116) has been **silently dark since merge** — it never wrote a single production row, and `mem0_remember` appears **0 times** in any gateway log.  ## Root cause `mem0",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch NOT built: reverse-apply leaves conflicts in ['toolsets.py']; #118: apply -R --3way rc=1 Applied patch to 'toolsets.py' with conflicts.\nApplied patch to 'tests/plugins/memory/test_mem0_remember.py' cleanly.\nU toolsets.py | #116: apply -R --3way rc=1 conflicts.\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nApplied patch to 'agent/background_review.py' with conflicts. | run 2: git revert on origin/main conflicts (#116: agent/background_review.py, plugins/memory/mem0/__init__.py + 3 tests; #118: toolsets.py). mem0_remember is still resident at toolsets.py:68. Reverting #118 alone would be a half-revert, so no branch. Hand-revert is for the agent/plugins auditor.",
+    "problem": "mem0_remember not resident in tools[] so background review could never call it",
+    "verdict": "DROP"
+  },
+  "#150": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 2,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/ci.yaml",
+          ".github/workflows/docker.yml"
+        ],
+        "loc": 49
+      },
+      "fires": "scripts/ci/classify_changes.py runs in detect-changes on every CI run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Problem — a one-letter label fix paid the full CI runtime  Changing `plugins/kanban/dashboard/dist/index.js` (`review`→`Review`, PR #149) ran the **entire 8-slice Python pytest matrix (~4 min/slice)** — which IS the w",
+      "upstream_fix": "none",
+      "upstream_state": "read-only: upstream classify_changes.py differs -123/+59 (no dist/ skip)"
+    },
+    "notes": "",
+    "problem": "skip Python matrix for built dashboard bundles",
+    "verdict": "KEEP"
+  },
+  "#151": {
+    "adversary": {
+      "evidence": "Skills ~/.hermes/skills-shared/general/trivial-pr-fast-path/SKILL.md:159 and ~/.hermes/skills-shared/coding/greploop/SKILL.md:66 instruct the greptile.json label fast-lane, but Greptile no longer comments on fork PRs (REST issue-comments since 2026-08-25: 0 greptile authors), so the file has no effect.",
+      "new_verdict": null,
+      "notes": "Follow-up: drop the Greptile fast-lane paragraphs from both skills with the branch.",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-greptile",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 6
+      },
+      "fires": "0: Greptile no longer reviews fork PRs — reviews on #990/#1000/#1010/#1020 contain no greptile author (REST, 2026-09-25); no repo reader of greptile.json [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Why  A one-letter label fix (#149) incurred full PR ceremony. Greptile reviews every PR by default and its unresolved threads block merge (branch protection `required_conversation_resolution: true`). For a genuinely t",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-greptile (family 'greptile'): removed greptile.json; exact grep for 'greptile.json' outside docs/*.md on the pushed branch -> 0 hits",
+    "problem": "greptile.json trivial-PR fast lane",
+    "verdict": "DROP"
+  },
+  "#153": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 2,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/ci.yaml",
+          ".github/workflows/docker.yml"
+        ],
+        "loc": 38
+      },
+      "fires": "as #150 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Why  Follow-up to #150. The ~4-min pytest matrix is the entire CI wall-clock, and it runs unless a change is *provably* python-irrelevant (`classify_changes.py` denylist). Two more safe classes were still forcing the ",
+      "upstream_fix": "none",
+      "upstream_state": "read-only: as #150"
+    },
+    "notes": "",
+    "problem": "skip Python matrix for media assets + git metadata",
+    "verdict": "KEEP"
+  },
+  "#169": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 3,
+        "conflict_syncs": 2,
+        "dependents": [
+          ".github/runner/README.md",
+          ".github/workflows/docker.yml",
+          ".github/workflows/tests-os.yml",
+          ".github/workflows/tests.yml",
+          "agent/coding_context.py",
+          "agent/display.py",
+          "hermes_cli/auth.py"
+        ],
+        "loc": 8
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## What  CI speed R1 (of the ranked plan in ~/.hermes/plans/2026-07-01_ci-speed-investigation.md):  - **ci.yml**: `slice_count` 8 → 10 - **tests.yml**: `HERMES_TEST_WORKERS=12` per slice (was `cpu_count*2` = 8 on 4-vCPU ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "Workers value now superseded at runtime by #731 cgroup sizing; slice count still live. 8 loc.",
+    "problem": "10 slices × 12 workers per slice",
+    "verdict": "KEEP"
+  },
+  "#188": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/hermes-harness/hermes-client-source-attribution/SKILL.md:61-83,121 prescribes stamping source:'dashboard' in web/src/lib/gatewayClient.ts (+ references/gatewayClient.source-injection.test.ts). turns.db: platform 'dashboard' = 4 turns, last 2026-07-04 (it DID fire; dormant 83 days).",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Skill-mandated attribution contract for a surface that is currently unused. 85 loc. Lead decides.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-web-source",
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 1,
+        "dependents": [],
+        "loc": 85
+      },
+      "fires": "0: ~/.hermes/blackbox/turns.db last 30 days has platforms discord/subagent/cron/telegram/cli/curator only — no 'dashboard' (or 'tui') turn [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Problem  The in-browser **web dashboard** chat (`web/`), the Electron desktop app, and the Ink TUI all drive the same `tui_gateway` JSON-RPC server, which stamps `platform='tui'` by default. PR #175 taught the **Elect",
+      "upstream_fix": "none",
+      "upstream_state": "n/a: upstream web client has no source field and no per-client attribution"
+    },
+    "notes": "branch audit/scripts_misc/revert-web-source (family 'web-source'): web/src/lib/gatewayClient{,.test}.ts = upstream/main bytes (2 files changed, 82 deletions(-)); fork diff on these files was only #188 + its teardown note; vitest NOT run (web node_modules not installed in the audit workspace)",
+    "problem": "web dashboard chat self-declares source='dashboard'",
+    "verdict": "DROP"
+  },
+  "#189": {
+    "adversary": {
+      "evidence": "D9: apps/desktop taken wholesale from upstream; no fork-local src remains.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 60
+      },
+      "fires": "n/a — src files absent/upstream on origin/main; node_modules paths are symlink artifacts [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Ace reported pinned sessions can no longer be dragged to reorder after the pin-sync update. Root cause: PR #186 made $pinnedSessionIds a read-only computed atom and dropped setPinnedSessionOrder + the sidebar reorderPinn",
+      "upstream_fix": "none",
+      "upstream_state": "n/a: desktop is upstream-owned (D9)"
+    },
+    "notes": "D9: desktop taken wholesale each sync. Nothing fork-local remains; no revert needed.",
+    "problem": "pinned drag-reorder over server-synced pins (desktop)",
+    "verdict": "DROP"
+  },
+  "#194": {
+    "adversary": {
+      "evidence": "Upstream sha 7d27a31ce7 IS an ancestor of upstream/main (merge-base --is-ancestor ok) and is the same feature (fork-features.json[13] lifecycle=absorbed, upstream_ref #65895). compute_host_phase0_spike.py: 0 hits anywhere.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-oneshot-probes",
+    "evidence": {
+      "cost": {
+        "conflict_files": 4,
+        "conflict_syncs": 3,
+        "dependents": [],
+        "loc": 1418
+      },
+      "fires": "compute_host: 0 log hits in window; scripts/compute_host_phase0_spike.py has 0 callers",
+      "original": "PR body: Phase 0 of docs/desktop/2026-07-04-dashboard-process-isolation-PRD.md (v1.5 CONVERGED, 9 review passes). Config read-site defaults via _load_dashboard_process_isolation_config (pass-9 RC-2); minimal compute_host + line-J",
+      "upstream_fix": "7d27a31ce7 feat(dashboard): isolate turns in compute host (#65895)",
+      "upstream_state": "GREEN: upstream carries tui_gateway/compute_host.py"
+    },
+    "notes": "Fork compute_host.py still differs +615/-382 vs upstream — that delta belongs to later fork rows (agent/tui_gateway tranches). The spike script drops with the oneshot-probes branch.",
+    "problem": "dashboard process-isolation phase-0 spike (compute_host + measurement)",
+    "verdict": "SUPERSEDED-BY-UPSTREAM"
+  },
+  "#22": {
+    "adversary": {
+      "evidence": "AUTHOR_MAP readers: contributor-check.yml + audit_pr_attribution.py scan merge-base..HEAD only; contributor_audit.py --since-tag has no scheduled caller (rg of cron/scripts/fleet/skills: 0). No contributors/emails/apollo@daemonarchy.local file exists, so a manual release-range audit spanning <=2026-06-30 would lose this mapping.",
+      "new_verdict": null,
+      "notes": "Low-risk; note for release tooling.",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-author-map-stale",
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 2,
+        "dependents": [
+          ".github/workflows/contributor-check.yml",
+          "agent/portal_tags.py",
+          "scripts/add_contributor.py",
+          "scripts/audit_pr_attribution.py",
+          "scripts/check_preyield_permit_release.py",
+          "scripts/contributor_audit.py"
+        ],
+        "loc": 1
+      },
+      "fires": "0: last origin/main commit by apollo@daemonarchy.local is 2026-06-30; contributor-check only inspects new PR commits [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Adds `apollo@daemonarchy.local` → `Kyzcreig` to `AUTHOR_MAP` in `scripts/release.py`.  **Why:** The Contributor Attribution Check fails (exit 1) when a commit author email isn't in AUTHOR_MAP. Apollo (Daemonarchy fleet a",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-author-map-stale (family 'author-map-stale'): removed 3 lines from scripts/release.py; ast ok",
+    "problem": "apollo@daemonarchy.local unmapped in AUTHOR_MAP",
+    "verdict": "DROP"
+  },
+  "#268": {
+    "adversary": {
+      "evidence": "Server method session.changes@tui_gateway/server.py:11709 on origin/main has no client on either tree; turns.db has no livesync-sourced platform; skill consumer only tests this dead feature (see #272).",
+      "new_verdict": null,
+      "notes": "Same skill-retirement follow-up as #272.",
+      "result": "STANDS"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 6,
+        "conflict_syncs": 3,
+        "dependents": [
+          "scripts/livesync-a1-watch.py"
+        ],
+        "loc": 1892
+      },
+      "fires": "0 'session.changes' calls in 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs); the only client (apps/desktop use-session-changes.ts) is gone from origin/main because desktop is taken from upstream (D9) — the server method in tui_gateway/server.py:11709 has no caller",
+      "original": "PR body: ## What  Phase 1 of cross-surface live session sync: a session open in the desktop app renders turns committed by OTHER surfaces (Discord/Telegram gateway, another desktop window) within one poll interval of commit — no ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a: upstream has no session.changes method and upstream desktop has no consumer"
+    },
+    "notes": "Largest-cost DROP in the tranche (6 conflict files, 3 syncs: hermes_state.py, tui_gateway/server.py, web_server.py, config.py). | branch NOT built: reverse-apply leaves conflicts in ['hermes_cli/config.py', 'hermes_state.py', 'tui_gateway/server.py']; #268: apply -R --3way rc=1 Applied patch to 'tui_gateway/server.py' with conflicts.\nApplied patch to 'hermes_state.py' with conflicts.\nApplied patch to 'hermes_cli/web_server.py' cleanly.\nApplied patch to 'hermes_cli/config.py' with conflicts.\nU hermes_cli/config.py\nU hermes_state.py\nU tui_gateway/server.py | run 2: scripts part is covered by audit/scripts_misc/revert-livesync-probes. The rest (hermes_state.py, tui_gateway/server.py, hermes_cli/config.py, desktop D9) conflicts in 10 files on git revert and is product code. Hand-revert belongs to the hermes_cli/gateway auditors; no branch here.",
+    "problem": "cross-surface live session sync phase 1: server session.changes polling + desktop consumer",
+    "verdict": "DROP"
+  },
+  "#272": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/hermes-harness/livesync-eyes-on-regression/SKILL.md:67,140-141 instructs using scripts/livesync-rc1-probe.py — a consumer, but of a dead feature: 0 session.changes calls in logs (auditor), desktop client use-session-changes.ts absent on origin/main and upstream/main (git grep: only unrelated 'session changes' comments).",
+      "new_verdict": null,
+      "notes": "Follow-up required with the drop: retire/archive the livesync-eyes-on-regression skill.",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-livesync-probes",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/livesync-a1-watch.py"
+        ],
+        "loc": 122
+      },
+      "fires": "0 callers (repo + live grep); probes for the #268 ship gate only [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Ship-gate probe fixes learned during the live RC-1 run (PR #268 follow-up): - `session.changes`/`session.resume` take the STORED state.db id; `session.create` persists lazily → probe now runs read-only over an existing i",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch NOT built: reverse-apply leaves conflicts in ['hermes_cli/config.py', 'hermes_state.py', 'tui_gateway/server.py']; #268: apply -R --3way rc=1 Applied patch to 'tui_gateway/server.py' with conflicts.\nApplied patch to 'hermes_state.py' with conflicts.\nApplied patch to 'hermes_cli/web_server.py' cleanly.\nApplied patch to 'hermes_cli/config.py' with conflicts.\nU hermes_cli/config.py\nU hermes_state.py\nU tui_gateway/server.py | run 2: branch built by deleting the 3 scripts (git revert conflicts because later edits touched rc1-probe). Verify: `git grep -e livesync-a1-watch -e livesync-derive-tsilence -e livesync-rc1-probe` on branch -> rc=1 (no refs left); commit 3 files, -444.",
+    "problem": "livesync RC-1 probe + t_silence derivation scripts",
+    "verdict": "DROP"
+  },
+  "#297": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 3,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 213
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Summary  - replace three `rerank_guard` wall-clock polling loops with callback/observer events - classify a PR as plugin-scoped only when every changed path stays inside one `plugins/<name>/` / `tests/plugins/<name>/`",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "plugin-scoped test jobs + deflaked rerank guard",
+    "verdict": "KEEP"
+  },
+  "#307": {
+    "adversary": {
+      "evidence": "Ran the fork's tests/tui_gateway/test_iso_certify_seam.py against upstream/main 59004a6235 (copied as an untracked probe file into ../up, venv python): `2 passed in 2.89s`. 7d27a31ce7 is an ancestor of upstream/main. fork-features.json[13] lifecycle=absorbed (not fork-permanent) -> no Ace ruling needed.",
+      "new_verdict": null,
+      "notes": "Fork delta in synthetic_turn.py (_env_float/_env_int vs upstream _SPEC_FIELDS) is for the tui_gateway auditor.",
+      "result": "STANDS"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 4,
+        "conflict_syncs": 3,
+        "dependents": [],
+        "loc": 978
+      },
+      "fires": "not a runtime path (certify harness); synthetic_turn: 0 log hits [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: # feat(dashboard): AC-4 turn-isolation certify harness + synthetic GIL-heavy turn seam  ## What & why  Builds the **AC-4 acceptance gate** for the dashboard process-isolation PRD (`docs/desktop/2026-07-04-dashboard-proce",
+      "upstream_fix": "7d27a31ce7 (#65895)",
+      "upstream_state": "GREEN: upstream ships scripts/iso-certify.py and tui_gateway/synthetic_turn.py"
+    },
+    "notes": "absorb 310/370. Remaining fork delta: iso-certify.py +14/-4, synthetic_turn.py +172/-64 vs upstream — take upstream's on next sync unless the tui_gateway auditor finds a live consumer of the extra seam.",
+    "problem": "AC-4 turn-isolation certify harness + synthetic GIL-heavy turn seam",
+    "verdict": "SUPERSEDED-BY-UPSTREAM"
+  },
+  "#347": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 141
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Summary  Fold the two findings from the delayed independent review of #345:  - preserve s6's documented modes by applying `chmod` after `chown`, while making host unit tests tolerate only the kernel's setgid-strip var",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "fold of full-suite review findings (s6 chmod-after-chown, runner)",
+    "verdict": "KEEP"
+  },
+  "#436": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 1,
+        "dependents": [],
+        "loc": 334
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: Worker t_d82545b8's absorption sweep, stacked on schema-v2 (#435 — merge that first; this PR contains its commit and will reduce to the sweep-only diff once #435 lands).  - turn-isolation family registered ABSORBED (upst",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "#439": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 1504
+      },
+      "fires": "KEEP-as-data — reader: hermes_parity state.py (STATE_FILE='.parity-state.json') and gates.py (appends gates.jsonl); last written by the 08-29 sync (#643) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Worktree salvage: the #420 parity merge shipped the code but the evidence ledger stayed local. Lands FORKDELTA-REVIEW.md (3 findings, corrects the 'zero regressions' claim in a published sibling doc), the 257-ack .parity",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "parity evidence data: .parity-state.json (257 acks) + gates.jsonl + FORKDELTA-REVIEW.md",
+    "verdict": "KEEP"
+  },
+  "#476": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 1,
+        "dependents": [
+          ".github/workflows/ci.yaml"
+        ],
+        "loc": 409
+      },
+      "fires": "ci.yaml line 349 pipes $NEEDS into scripts/ci/evaluate_needs.py on every run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Summary  - fail the umbrella job for `cancelled` and every result outside `success` / `skipped` - fail when a classifier-required lane is `skipped`, including Python `tests` and `lint` - move the evaluator into a pure",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (evaluate_needs.py fork-only)"
+    },
+    "notes": "",
+    "problem": "umbrella gate passed cancelled/skipped required lanes",
+    "verdict": "KEEP"
+  },
+  "#612": {
+    "adversary": {
+      "evidence": "scripts/certify/dashboard_loop_certify.py is co-owned by gateway-tranche row #616; ~/.hermes/skills-shared/devops/dashboard-eventloop-starvation-triage/references/turn-isolation-certify-harness.md:48-50 names it the HARDENED harness that supersedes iso-certify for AC-4 certification. No run in 30d (dashboard turns: last 2026-07-04).",
+      "new_verdict": "cross-tranche (gateway #616)",
+      "notes": "revert-oneshot-probes deletes a file the gateway auditor owns; lead must reconcile with #616 before the branch lands.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-oneshot-probes",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 1636
+      },
+      "fires": "scripts/certify/dashboard_loop_certify.py: 0 callers in repo/cron/launchd/hooks [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Stash-triage recovery (closeout loose end, 2026-08-19). `stash@{5}` from 2026-07-06 held the only copy of the dashboard-process-isolation PRD's **v1.6 fold** (INV-7/AC-13: client-disconnect cancels the turn — forced by t",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "Only the standalone script is removed; the recovered design docs are history (auto/docs tranche). | branch audit/scripts_misc/revert-oneshot-probes (family 'oneshot-probes'): removed 3 paths; dangling non-doc refs to removed scripts: none",
+    "problem": "recovered July design docs + loop-starvation certify harness",
+    "verdict": "DROP"
+  },
+  "#62": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/references/local-addenda-lcm-context-engine.md:96 prescribes `python scripts/lcm_qa_battery.py --tier 0` as THE gate for LCM changes; SKILL.md:48,864 (battery refuses Opus); tier 1/2 drive scripts/lcm_live_recovery.py (lcm_qa_battery.py:102). LCM plugin is live product code (15 commits to plugins/context_engine/lcm since 08-01).",
+      "new_verdict": "KEEP",
+      "notes": "Skill-prescribed CURRENT gate for LCM changes. Not measured running in 30d (state.db tool_calls: last matching invocation 2026-08-20) — keep as on-demand gate tooling, or DROP only together with a skill edit. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 10
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: ## Summary  - Adds explicit `encoding=\"utf-8\"` to LCM report `Path.write_text(...)` calls. - Fixes the inherited fork-wide `ruff enforcement (blocking)` failure (`PLW1514`). - Kept separate from PR #61 because that aux r",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "#695": {
+    "adversary": {
+      "evidence": "UPSTREAM verdict with no repro run (vitest not installed; 'red observed per PR body' only).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "KEEP-UNPROVEN"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 87
+      },
+      "fires": "test-only; red observed in fork merge queue per PR body; no local vitest run (ui-tui node_modules not installed here) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Problem  `ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts` fails inside the GitHub **merge queue**, blocking every PR on `main`:  ``` FAIL src/__tests__/virtualHistoryOffsetCache.test.ts > useVirtualHistory off",
+      "upstream_fix": "none",
+      "upstream_state": "read-only: ../up/ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts lacks the act()/IS_REACT_ACT_ENVIRONMENT settle (fork diff +57/-33)"
+    },
+    "notes": "branch NOT built: cherry-pick of #695 conflicts on upstream/main in ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts (fork file carries other fork deltas); needs a hand port + vitest run with ui-tui node_modules",
+    "problem": "virtualHistoryOffsetCache unmount-compensation test flaky in merge queue (act()/deferred rows)",
+    "verdict": "UPSTREAM"
+  },
+  "#703": {
+    "adversary": {
+      "evidence": "Self-hosted pool is LIVE: `gh api repos/ANG-Ventures/hermes-agent/actions/runners` = 8 runners ace-media-ang-ventures-hermes-agent-1..8 online+busy (labels self-hosted,hermes-ci); ci-overflow controller launchd ai.hermes.ci-overflow-controller KeepAlive, heartbeat.json mtime 2026-09-25 08:06; cioc/service.py:69-75 treats CI_RUNNER_LABELS=[\"ubuntu-latest\"] as a legacy-evacuation switch -> the variable is a live toggle. .github/workflows/ci.yaml:26 (#704) indexes these 3 pins and stays on the revert branch (would go stale).",
+      "new_verdict": "KEEP",
+      "notes": "The pins are the guard for flipping CI_RUNNER_LABELS back (sudo/no-docker failures on the pool). Reverting only works while the variable happens to be ubuntu-latest.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-self-hosted-pool-gaps",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 40
+      },
+      "fires": "moot now: vars.CI_RUNNER_LABELS=[\"ubuntu-latest\"] (read 2026-09-25) so the self-hosted pins/workarounds in 3 upstream workflows do nothing; contributors/emails/apollo@fleet is data only [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Closes the remaining gaps that kept `CI_RUNNER_LABELS=[\"self-hosted\",\"ace-ai\"]` from going fully green. Every failure below was read out of a real job log on PR #702 (all jobs on `ace-ai-ang-ventures-hermes-agent-*`), no",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (upstream runs hosted)"
+    },
+    "notes": "If the pool labels ever move back to self-hosted, re-apply. Adversary: check whether any of these 3 jobs is still placed via per-slice runs-on. | branch audit/scripts_misc/revert-self-hosted-pool-gaps (family 'self-hosted-pool-gaps'): hand-built reverse apply: #703: apply -R --3way rc=0 Applied patch to '.github/workflows/rust-tests.yml' cleanly.\nApplied patch to '.github/workfl",
+    "problem": "self-hosted pool gaps (sudo in rust tests, docker-lint, e2e-desktop) under CI_RUNNER_LABELS=self-hosted",
+    "verdict": "DROP"
+  },
+  "#721": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 2,
+        "dependents": [],
+        "loc": 816
+      },
+      "fires": "merge queue active on fork (ci.yaml merge_group runs); contributors/emails/daedalus@ang.local is KEEP-as-data (reader: contributor-check.yml) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Stacked on #719 (`fix/ci-cancel-stale-merge-group`) — that commit is the parent here; **merge #719 first**.  ## The waste `detect-changes` gated the whole classifier on `EVENT_NAME = pull_request`, so every merge_group c",
+      "upstream_fix": "none",
+      "upstream_state": "read-only: upstream detect-changes gates on pull_request only (action.yml differs +130/-19)"
+    },
+    "notes": "Upstream does not run a merge queue, so not upstreamable.",
+    "problem": "merge_group runs resolved an empty diff → full 44-job matrix for every batch",
+    "verdict": "KEEP"
+  },
+  "#728": {
+    "branch": "audit/scripts_misc/upstream-728",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 7
+      },
+      "fires": "test-only defect: fires on every run of those tests (inert mock) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: `_handle_update_command` moved from `gateway/run.py` into `gateway/slash_commands.py` during the god-file decomposition. It resolves its project root via `Path(__file__).parent.parent.resolve()` (slash_commands.py:1259) ",
+      "upstream_fix": "none",
+      "upstream_state": "RED by reading: ../up/tests/gateway/test_update_command.py:141,184 and test_update_streaming.py:111 still patch gateway.run.__file__; handler only in ../up/gateway/slash_commands.py"
+    },
+    "notes": "branch audit/scripts_misc/upstream-728 (family 'upstream-728'): on upstream/main — before: `pytest tests/gateway/test_update_command.py tests/gateway/test_update_streaming.py` -> FAILED tests/gateway/test_update_streaming.py::TestCmdUpdateGatewayMode::test_gateway_flag_enables_gateway_prompt_for_stash / 1 failed, 23 passed, 2 skipped, 7 warnings in 60.10s (0:01:00); after: `pytest tests/gateway/test_update_command.py tests/gateway/test_update_streaming.py` -> FAILED tests/gateway/test_update_streaming.py::TestCmdUpdateGatewayMode::test_gateway_flag_enables_gateway_prompt_for_stash / 1 failed, 23 passed, 2 skipped, 7 warnings in 23.38s | the 1 failure is identical before and after and unrelated: test_gateway_flag_enables_gateway_prompt_for_stash trips tests/home_io_guard.py ('TEST BUG: file I/O against the REAL home ... /tools') on unmodified ../up as well",
+    "problem": "3 tests patch gateway.run.__file__ but _handle_update_command lives in gateway/slash_commands.py → the .git guard is tested against the runner's real tree",
+    "verdict": "UPSTREAM"
+  },
+  "#731": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 3,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/runner/README.md",
+          ".github/workflows/docker.yml",
+          ".github/workflows/tests-os.yml",
+          ".github/workflows/tests.yml",
+          "agent/coding_context.py",
+          "agent/display.py",
+          "hermes_cli/auth.py"
+        ],
+        "loc": 379
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success); still places slices on self-hosted (CI_SELF_HOSTED_SLOTS=4) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Problem  `.github/workflows/tests.yml` pins `HERMES_TEST_WORKERS: \"12\"` and the runner takes it literally. The self-hosted ACE-AI runner containers are CFS-capped at `--cpus 2` — `/sys/fs/cgroup/cpu.max` reads `200000",
+      "upstream_fix": "none",
+      "upstream_state": "n/a: upstream runs on GitHub-hosted runners where nproc matches the quota; no cgroup read in ../up/scripts/run_tests*.py"
+    },
+    "notes": "",
+    "problem": "self-hosted runners are CFS-capped at 2 CPUs while nproc reports 24 → 6x oversubscription",
+    "verdict": "KEEP"
+  },
+  "#736": {
+    "adversary": {
+      "evidence": "ci-review-comment.yml state=disabled_manually (REST actions/workflows, 2026-09-25). Skill hits (~/.hermes/skills-shared/coding/probe-fidelity/references/own-verification-probe-in-the-reviewer-seat.md:179, kanban-swarm-operations review-round ref) are incident write-ups, not run instructions.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-ci-review-comment",
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 1,
+        "dependents": [
+          ".github/workflows/ci-review-comment.yml"
+        ],
+        "loc": 2447
+      },
+      "fires": "0: ci-review-comment.yml is disabled_manually on the fork since 2026-09-19 (GitHub workflow state); last 100 runs 48 cancelled/48 skipped/4 success, none since 09-19T11:54Z [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Why  `.github/workflows/ci-review-comment.yml` starts one poller per CI run, polling every 15 s with `secrets.GITHUB_TOKEN` (installation token, 1000 req/hr/repo). On 2026-09-19 the repo hit `API rate limit exceeded f",
+      "upstream_fix": "none",
+      "upstream_state": "read-only: upstream still ships ci-review-comment.yml + scripts/ci/live_comment.py (b9f82ed39f 2026-07-20)"
+    },
+    "notes": "Referenced only by a workflow the fork no longer runs. Revert = take upstream's live_comment.py + workflow verbatim (966-line divergence gone). | branch audit/scripts_misc/revert-ci-review-comment (family 'ci-review-comment'): live_comment.py + workflow = upstream/main bytes; `pytest tests/ci/test_live_comment.py` -> ......ss...                                                              [100%] / 9 passed, 2 skipped in 1.73s",
+    "problem": "ci-review-comment poller exhausted the installation token rate limit (2026-09-19)",
+    "verdict": "DROP"
+  },
+  "#747": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          ".github/workflows/publish-e2e-evidence.yml",
+          "scripts/ci/publish_e2e_evidence.py",
+          "scripts/ci/publish_evidence_step.sh"
+        ],
+        "loc": 2477
+      },
+      "fires": "publish-e2e-evidence.yml active: 2044 runs since 08-26, latest 2026-09-25T13:47Z (34 success/65 skipped of last 100) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## What  Owns the evidence-publisher lane that was reverted out of #736 by the scope ruling, and closes the round-1 **\"Masked Failures\"** P1 properly.  The publish step had no failure policy of its own. A blanket `contin",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (publish-e2e-evidence.yml is fork-only)"
+    },
+    "notes": "",
+    "problem": "publish-e2e-evidence had no failure policy; blanket continue-on-error would mask missing artifacts",
+    "verdict": "KEEP"
+  },
+  "#748": {
+    "adversary": {
+      "evidence": "ci-review-comment.yml state=disabled_manually (REST actions/workflows, 2026-09-25). Skill hits (~/.hermes/skills-shared/coding/probe-fidelity/references/own-verification-probe-in-the-reviewer-seat.md:179, kanban-swarm-operations review-round ref) are incident write-ups, not run instructions.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-ci-review-comment",
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 1,
+        "dependents": [
+          ".github/workflows/ci-review-comment.yml"
+        ],
+        "loc": 1625
+      },
+      "fires": "as #736 — workflow disabled since 2026-09-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Follow-up to #736 (squash-merged at 07:46Z). FleetReview's round-6 record on head `111527dd21` escalated on member errors and was never posted to GitHub, so its findings arrived after the merge. This PR fixes them on cur",
+      "upstream_fix": "none",
+      "upstream_state": "as #736"
+    },
+    "notes": "branch audit/scripts_misc/revert-ci-review-comment (family 'ci-review-comment'): live_comment.py + workflow = upstream/main bytes; `pytest tests/ci/test_live_comment.py` -> ......ss...                                                              [100%] / 9 passed, 2 skipped in 1.73s",
+    "problem": "round-6 poller findings on #736 (status loss, stale artifacts, shutdown budget)",
+    "verdict": "DROP"
+  },
+  "#749": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 9
+      },
+      "fires": "fleet-ci-fail-alert.yml: last 100 runs = 4 success + 1 failure non-skipped (it now fires); contributors/emails/apollo@agents.angventures.io KEEP-as-data [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: One-line fix under .github/workflows/** (needs `ci-reviewed`). Defect proof: `gh api repos/ANG-Ventures/hermes-agent/actions/workflows/fleet-ci-fail-alert.yml/runs?per_page=100` → 100× skipped; `Tests`/`Lint` are `workfl",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "fleet CI-fail alert subscribed to workflows that never emit workflow_run (100/100 skipped)",
+    "verdict": "KEEP"
+  },
+  "#752": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 527
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ci(run_tests_parallel): a file killed at the per-file timeout is a HANG, not a no-op  A pytest SIGKILL'd at the per-file wall ceiling never prints its `=== N passed ... ===` counts line, so the parsed summary is empty. T",
+      "upstream_fix": "none",
+      "upstream_state": "RED by reading: upstream scripts/run_tests_parallel.py has 0 'HANG' classifications (grep -c HANG = 0)"
+    },
+    "notes": "Upstream candidate later (generic), but interleaved with fork-only per-slice logic in the same 975-line divergence; no clean upstream branch built this pass.",
+    "problem": "a file SIGKILLed at the per-file timeout was reported as a no-op, not a HANG (main run 35495902532)",
+    "verdict": "KEEP"
+  },
+  "#766": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 3,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 528
+      },
+      "fires": "per-slice runs-on live: CI_SELF_HOSTED_SLOTS=4, CI_ARM_HOSTED_SLICES=3 read by run_tests_parallel --generate-slices every run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## What and why  The self-hosted pool has **17 slots** (ace-ai 8 + ace-media 8 + studio 1). A PR/merge_group run wants more than that, and every job read **one** label set (`vars.CI_RUNNER_LABELS`) for the whole matrix —",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "Cost: 6 upstream workflows edited, 3 conflict syncs — the most expensive KEEP in this tranche.",
+    "problem": "one CI_RUNNER_LABELS for the whole matrix → jobs queued in waves on a 17-slot pool",
+    "verdict": "KEEP"
+  },
+  "#780": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 4,
+        "conflict_syncs": 3,
+        "dependents": [],
+        "loc": 1681
+      },
+      "fires": "not countable: the consumer emits no log marker; only evidence of use is Ace's 2026-09-21 01:45 Discord message 'Confab-OOB lane live on all 20 subs + Mac' [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Why this is a new PR (the card said not to open one)  The card `t_3c012aba` instructed: fix the P1s **on the same branch**, push to `feat/confab-notice-consumer` so FleetReview re-reviews the new head, do not open a n",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (confab_notice is fork-only; 9 fork files import it)"
+    },
+    "notes": "Substance is agent/ + ui-tui code (agent tranche). Needs a bridge-side counter of delivered confab notices before KEEP/DROP.",
+    "problem": "5 FleetReview P1s on the OOB confab-notice consumer (agent/confab_notice.py + TUI/desktop render)",
+    "verdict": "UNRESOLVED"
+  },
+  "#79": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 2,
+        "dependents": [],
+        "loc": 822
+      },
+      "fires": "live: ~/.hermes/blackbox/turns.db — 4763 of 4932 turns in the last 7 days carry cost_cache_read_usd (read-only sqlite, 2026-09-25) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## What & why Surfaces the per-class **\\$** breakdown (uncached / cache-read / cache-write / output) that the pricing engine already computes per call and then **discards** — so the tokens.ace priciest-turns panel can ex",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (plugins/blackbox is fork-only)"
+    },
+    "notes": "The backfill script from this row drops with #87 (perclass-backfill branch); the engine/plugin part stays.",
+    "problem": "per-class $ breakdown (uncached/cache-read/cache-write/output) surfaced to blackbox + tokens.ace",
+    "verdict": "KEEP"
+  },
+  "#793": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 151
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success); CI_ARM_HOSTED_SLICES=3 (active) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## Summary  Opt-in GitHub-hosted ARM64 trial for the N lightest non-core test slices.  ```text --generate-slices   existing pool / ubuntu-latest assignment   + rank eligible slices by cached total duration, then index   ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "opt-in hosted ARM trial for the N lightest slices",
+    "verdict": "KEEP"
+  },
+  "#805": {
+    "adversary": {
+      "evidence": "census paths=[] (empty diff).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 0
+      },
+      "fires": "n/a (0 loc) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: ## What  `rich_sent_store.record()` is a read-modify-write of one JSON file finished by `os.replace` — the same shape th",
+      "upstream_fix": "none",
+      "upstream_state": "n/a"
+    },
+    "notes": "kind=empty: no content.",
+    "problem": "(empty diff — no content survives)",
+    "verdict": "DROP"
+  },
+  "#847": {
+    "adversary": {
+      "evidence": "census paths=[] (empty diff).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 0
+      },
+      "fires": "n/a (0 loc) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Closes the FleetReview P1 that argus independently reproduced on #832's head (card `t_13445a80`, round-4 finding 2). #83",
+      "upstream_fix": "none",
+      "upstream_state": "n/a"
+    },
+    "notes": "kind=empty: no content.",
+    "problem": "(empty diff — no content survives)",
+    "verdict": "DROP"
+  },
+  "#860": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 854
+      },
+      "fires": "guard tests/scripts/test_preyield_permit_release.py::test_repo_has_no_unguarded_preyield_permit_acquires runs in CI every run; heavy-read gate is on the live read path [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Second member of the bug class PR #827 fixed at `gateway/turn_admission.py`. Found by Argus during #827 round 4 (card `t_6745cd39`); carded as `t_01b35d9e`.  ## The bug  `hermes_cli/session_db_heavy_gate.py::session_db_h",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (hermes_cli/session_db_heavy_gate.py is fork-only)"
+    },
+    "notes": "",
+    "problem": "session_db_heavy_read_slot leaked its permit when the pre-yield region raised",
+    "verdict": "KEEP"
+  },
+  "#863": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 655
+      },
+      "fires": "as #860 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Follow-up to #860 (merged as `6319e227`); rebased onto `main` after that PR landed mid-run. Closes the FleetReview coverage gaps on that PR's new class guard `scripts/check_preyield_permit_release.py`, split out per hous",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "pre-yield permit check missed line-adjacent leaks / partial multi-permit releases",
+    "verdict": "KEEP"
+  },
+  "#87": {
+    "adversary": {
+      "evidence": "Only consumer is prose in ~/.hermes/skills-shared/hermes-harness/blackbox-turn-telemetry/references/perclass-cost-breakdown-build.md:59 (build record). Recent backup dir ~/.hermes/state/blackbox-backfill-bak-20260924-1715 is from backfill_cache_monitoring (t_10ba0347, state.db 2026-09-25 00:15), NOT this script. 0 cron/launchd callers.",
+      "new_verdict": null,
+      "notes": "Update the skill reference when the branch lands.",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-perclass-backfill",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 159
+      },
+      "fires": "one-shot backfill: scripts/backfill_perclass_cost.py has 0 cron/launchd callers; per-class columns are now written live (4763/4932 turns in last 7d have cost_cache_read_usd) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: The per-class backfill (`scripts/backfill_perclass_cost.py`) took an in-place `.bak-perclass-<ts>` via raw `shutil.copy2` on every `--apply` and **never pruned** — one reprice of the 6 fleet DBs left **799MB**, and each ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-perclass-backfill (family 'perclass-backfill'): removed 2 paths; dangling non-doc refs to removed scripts: none",
+    "problem": "per-class backfill backups never pruned (799MB)",
+    "verdict": "DROP"
+  },
+  "#873": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 705
+      },
+      "fires": "as #860 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: **STACKED on #863** (base is `fix/preyield-guard-hardening`, not `main`). Rebase to `main` after #863 merges; the diff is one file plus its tests.  Filed by Argus as t_9d51cb96 during review of #863. **Not a regression f",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "pre-yield permit check excused conditionally-exiting arms",
+    "verdict": "KEEP"
+  },
+  "#894": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 3,
+        "dependents": [],
+        "loc": 629
+      },
+      "fires": "not measurable from logs (operator-facing hint text) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: fix(cli): the six residual pasteable-hint sites must survive a real shell  Residual of the #889/#891 unreachable-remedy class. Eight sites across six subsystems interpolated a HERMES_HOME-derived path -- or an interprete",
+      "upstream_fix": "none",
+      "upstream_state": "not checked here: code sites are in gateway/run.py, hermes_cli/doctor.py, hermes_cli/plugins_cmd.py, plugins/platforms/whatsapp/adapter.py, tools/self_repo_guard.py"
+    },
+    "notes": "Bucketed here only because it also touched staging/scripts/runtime-parity-check.py (that part DROPs with the staging branch). The 5 code sites belong to the gateway/hermes_cli/plugins/cron+tools auditors — lead to route.",
+    "problem": "residual pasteable-hint sites must survive a shell (quote HERMES_HOME-derived paths)",
+    "verdict": "UNRESOLVED"
+  },
+  "#928": {
+    "adversary": {
+      "evidence": "windows.ps1: 0 hits in skills/scripts/fleet; fork test only.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-desktop-update-test",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 50
+      },
+      "fires": "fork-only test tests/test_desktop_update_windows_progress.py; desktop update path is upstream-owned (D9-adjacent)",
+      "original": "PR body: Replaces #925, whose GitHub pull-request head stopped synchronizing after a transient Actions/Git server error. Sets the fallback timer to zero so the release-file hold is required. Windows RED proof with only the hold r",
+      "upstream_fix": "none",
+      "upstream_state": "read-only: upstream reworked scripts/desktop-update/windows.ps1 on 09-23/09-24 (a3456765ed, 0f1544f903); fork file diverges +127/-266"
+    },
+    "notes": "Take upstream's windows.ps1 on next sync; the fork test pins a hold upstream has since rewritten. | branch audit/scripts_misc/revert-desktop-update-test (family 'desktop-update-test'): git revert -n d7d5b85496 applied clean",
+    "problem": "Windows progress sampling test gated on explicit release",
+    "verdict": "DROP"
+  },
+  "#929": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 303
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: #905 (b01891f52c) touched only plugins/blackbox/store.py; merge-group run 35831081688 resolved test_scope=plugin:blackbox and went green on the plugin slice + core smoke, while push-to-main run 35831538817 failed tests/t",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (plugin scoping is fork-only, #297)"
+    },
+    "notes": "",
+    "problem": "plugin-scoped matrix skipped the plugin's cross-tree consumers (push run 35831538817 red)",
+    "verdict": "KEEP"
+  },
+  "#931": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/ci_overflow_mutation_gate.py"
+        ],
+        "loc": 1311
+      },
+      "fires": "ci_overflow_placement.py imports scripts.ci_overflow_plan (APPROVED, ARM); placement is enabled (CI_OVERFLOW_PLACEMENT_ENABLED=true) and runs in tests.yml [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Pure planner, fail-closed runner/job sampler, bounded request decoder, CAS admission and exact-attempt phantom release. No workflows or production policy changed. Verification: 56 planner/ledger tests pass on fork/main; ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "scripts/ci_overflow_mutation_gate.py is a manual gate with no workflow caller — small, kept with its family.",
+    "problem": "CI overflow phase 1: pure planner + CAS ledger",
+    "verdict": "KEEP"
+  },
+  "#932": {
+    "adversary": {
+      "evidence": "ci_overflow_acceptance.py: only its own test; ~/dev/fleet-ops-scripts/ci-overflow-controller has 0 refs to ci_overflow_acceptance / receipts/preflight / preflight.json (the controller writes its own ~/.hermes/var/ci-overflow/receipts/).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-ci-overflow-phase0",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 1601
+      },
+      "fires": "0 callers: ci_overflow_acceptance.py is referenced only by its own test (fork .github/scripts grep); receipts/preflight.json has no reader; overflow already past Phase 2 (placement enabled) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Implements read-only Phase-0 preflight with named PASS/BLOCK/UNVERIFIABLE checks, fixture contracts, live receipt, and baseline. Live gate is intentionally BLOCK: controller App absent (Apollo card t_73f36116), hosted e2",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-ci-overflow-phase0 (family 'ci-overflow-phase0'): removed 4 paths; exact-path grep on the pushed branch for 'ci_overflow_acceptance' and 'receipts/preflight' outside docs/*.md -> 0 hits (the earlier stem grep over-matched 'preflight')",
+    "problem": "CI overflow Phase-0 read-only capability preflight + baseline receipt",
+    "verdict": "DROP"
+  },
+  "#938": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 2,
+        "dependents": [
+          ".github/workflows/tests.yml"
+        ],
+        "loc": 1121
+      },
+      "fires": "tests.yml runs ci_overflow_request.py + ci_overflow_placement.py place/gate; repo vars CI_OVERFLOW_PLACEMENT_ENABLED=true, CI_CLOUD_OVERFLOW=overflow, CI_CLOUD_MINUTES_PER_DAY=6000 (read 2026-09-25) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Kanban t_8e737f2c · spec ~/.hermes/plans/2026-09-21_ci-cloud-overflow-SPEC.md §5.1, §5.3, §5.3b, §7 Phase 2.  **Stacked on #931** (P1 planner/ledger): this branch carries #931's two commits cherry-picked onto current mai",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "Also touched ci-review-comment.yml (workflow disabled — see #736) and ci_overflow_acceptance.py (see #932).",
+    "problem": "CI overflow P2b: tests.yml placement wiring with local fallback",
+    "verdict": "KEEP"
+  },
+  "#944": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          ".github/workflows/publish-e2e-evidence.yml",
+          "scripts/ci/publish_e2e_evidence.py"
+        ],
+        "loc": 21
+      },
+      "fires": "same workflow as #747: 34 success in last 100 runs after the fix [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: `Publish E2E evidence` has been red on main intermittently (3 of the last 12 runs, e.g. 35907565152, 35906116553) with `expected the \"[HOST/]OWNER/REPO\" format, got \"/_work/.../publish-e2e-evidence.XXXX/gh-image-download",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "gh extension install <abs path> parsed as OWNER/REPO → Publish E2E evidence red 3/12 runs",
+    "verdict": "KEEP"
+  },
+  "#957": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          ".github/workflows/attribution-merge-group.yml"
+        ],
+        "loc": 1351
+      },
+      "fires": "attribution-merge-group.yml active: 124 runs since 08-26 (93 success / 7 failure), latest 2026-09-25T13:28Z [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "PR body: Merge-group-only job checks every queued PR head in the candidate against its fleet/attribution commit status. Fails closed on missing status, API error, truncated comparison or queue. Does not post a PR-head status.  Ro",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "merge-group candidates were not checked for fleet/attribution status",
+    "verdict": "KEEP"
+  },
+  "nopr:0242647e1f": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 37
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(ci): A5-A gate 2 aggregates per-path before deciding no-op RED  Root cause of the recurring false-RED (test_deepseek_v4_thinking_live: module skipif → 2 skipped): a file can appear in all_summaries MORE THAN ONCE und",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (A5-A guard is fork-only)"
+    },
+    "notes": "",
+    "problem": "A5-A gate 2 aggregates per-path before deciding no-op RED",
+    "verdict": "KEEP"
+  },
+  "nopr:0c96621b85": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 43
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: chore(lcm): batched Arm-B campaign w/ validation gate before full N=180",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:15e1d95f14": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 4080
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: docs(lcm-qa): preserve Arm-A/Arm-B campaign QA evidence + armab script tweak  20 LCM QA report artifacts (arm-a/arm-b exact + semantic validation runs) and a 1-line lcm_armab_campaign.sh edit, preserved during AC-6 runti",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:1b8af38096": {
+    "adversary": {
+      "evidence": "All 5 emails from the row have 0 occurrences in origin/main scripts/release.py (checked each).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/workflows/contributor-check.yml",
+          "agent/portal_tags.py",
+          "scripts/add_contributor.py",
+          "scripts/audit_pr_attribution.py",
+          "scripts/check_preyield_permit_release.py",
+          "scripts/contributor_audit.py"
+        ],
+        "loc": 7
+      },
+      "fires": "n/a — the 5 AUTHOR_MAP lines are already gone from origin/main scripts/release.py (grep count 0 each) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit subject: fix(ci): parity-sync CI gates — map 5 new upstream contributor emails in AUTHOR_MAP; reword test docstring that false-tripped gitleaks generic-api-key ('key: claude-opus-4.5')",
+      "upstream_fix": "upstream contributors/emails/ (present on 59004a6235)",
+      "upstream_state": "GREEN: all 5 emails have upstream contributors/emails/<email> files"
+    },
+    "notes": "Nothing left to revert.",
+    "problem": "5 upstream contributor emails unmapped during a parity sync",
+    "verdict": "SUPERSEDED-BY-UPSTREAM"
+  },
+  "nopr:1d5ebbe55a": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 322
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm): Arm-B live node-served recovery harness (PRD-7)  Proves the summary-node DAG works end-to-end in a live long session: plant sentinel -> drive 44 filler turns at default 20k/fanin-4 knobs -> assert depth>=1 con",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:1f8392335e": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 34
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm-qa): heartbeat campaign milestones to #hermes-lcm  Wire live-channel heartbeats into the Arm-A→Arm-B campaign so the run reports progress instead of going silent for ~3h: - Arm-A halfway one-shot pinger (lcm_arm",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:20a4f2a589": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 63
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(ci): A5-A explicit-noop gate is OPT-IN (--strict-noop), not default-on  ROOT CAUSE of the recurring CI red: the explicit-file 0-collect RED gate defaulted ON, but CI's run_tests.sh passes --files <all ~1900 files>, a",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (A5-A guard is fork-only)"
+    },
+    "notes": "",
+    "problem": "A5-A explicit-noop gate made opt-in (--strict-noop) after false REDs",
+    "verdict": "KEEP"
+  },
+  "nopr:2609ba7523": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/coding/eval-harness-oracle-discipline/references/live-eval-contention-and-probe-fidelity.md:133 names scripts/lcm_reset_aegis_store.sh the 'Reusable implementation'; lcm-context-engine SKILL.md:516.",
+      "new_verdict": "KEEP",
+      "notes": "Reusable store-reset runbook, skill-cited. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 191
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(PRD-8): implement Aegis LCM store reset runbook (dry-run verified)  Executable runbook for docs/PRD-8 (3-pass Opus reviewed). Modes:   --dry-run  plan + resolve env, mutate nothing (verified against live box)   --go",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:26f69158d2": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 2854
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm-arm-b): PRD-8.2 gate split — recovery-correctness vs condensation-reliability  The single Arm B gate scored 'no condensation node formed' identically to 'model failed to recover a stored fact', and counted trans",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:28be2e65c8": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 55
+      },
+      "fires": "imported by tests/golden/{state_ext,tool_gate}/runner.py + tests/scripts/test_refactor_equiv.py, which CI (ci.yaml, 1949 runs since 08-26) executes on every full-scope run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(refactor-equiv): address Greptile review — freeze datetime.datetime.now via subclass seam (RC-A spec compliance); widen stdlib branch gate to while/for/try/IfExp; relabel third relay mutation (module has no DB writes",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "refactor-equivalence harness (golden replay + mutation gate) backing the god-file extraction goldens",
+    "verdict": "KEEP"
+  },
+  "nopr:2f33571c20": {
+    "adversary": {
+      "evidence": "Only reader of staging/* is tests/test_residual_cli_hint_pasteable.py (branch edits it). ~/.hermes/skills-shared/general/subagent-driven-development/references/brief-splits-write-surface.md:34 describes the staging/ CONVENTION, not these files. Live copies ~/.hermes/scripts/runtime-parity-check.py / fleet-gateway-restart.sh are maintained separately.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-staging",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 1136
+      },
+      "fires": "0 readers: staging/ is referenced by nothing in the repo; the live ~/.hermes/scripts/runtime-parity-check.py (40,998 B, 2026-09-24) and fleet/fleet-gateway-restart.sh are maintained in hermes-home, not from staging/ [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(fleet): partial-restart ledger + parity re-drive actuator (A1b, staged)  Close the busy-skip gap: a gateway busy at deploy time is BUSY-SKIPPED, advised to #logs, then sits stale until a human re-runs. Add a durable",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-staging (family 'staging'): git rm staging/ (5 files); removed 3 staging-coupled test defs + 1 class-guard entry from tests/test_residual_cli_hint_pasteable.py (remaining 'staging/scripts' mentions: 2, docstring only); `pytest tests/test_residual_cli_hint_pasteable.py` -> ...........                                                              [100%] / 11 passed in 3.92s",
+    "problem": "partial-restart ledger + parity re-drive actuator, staged copies of home-local ops files",
+    "verdict": "DROP"
+  },
+  "nopr:3cd73eb4d4": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/ang-lifecycle/ang-swarm-plan/references/sibling-branch-topology-and-incremental-integration.md:56 prescribes `python scripts/probe_hermes_lcm_isolated.py --profile-dir ... ` as the integration behavior proof; file co-owned by plugins-tranche row #168 (not a scripts+misc DROP).",
+      "new_verdict": "KEEP",
+      "notes": "Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 680
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: test: add isolated LCM smoke gate  Adds the repeatable fork LCM isolated smoke probe, report artifact, and ABC drift tests for current ContextEngine abstract methods and host-read token state.  Verified: - venv/bin/pytho",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:40a6040932": {
+    "adversary": {
+      "evidence": "Same readers as #22; talmax1124 is also mapped by carlitosdiazplaza@gmail.com (release.py:2062), janrenz by janrenz@Mac.fritz.box (release.py:221).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-author-map-stale",
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 2,
+        "dependents": [
+          ".github/workflows/contributor-check.yml",
+          "agent/portal_tags.py",
+          "scripts/add_contributor.py",
+          "scripts/audit_pr_attribution.py",
+          "scripts/check_preyield_permit_release.py",
+          "scripts/contributor_audit.py"
+        ],
+        "loc": 2
+      },
+      "fires": "0: those authors' commits (last 2026-06-30/07-01) are already past; parity syncs are excluded rows [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit subject: fix(ci): map new upstream contributors in AUTHOR_MAP (talmax1124, janrenz)",
+      "upstream_fix": "none",
+      "upstream_state": "GREEN-irrelevant: upstream maps neither (release.py 0, contributors/emails 0) and its check only covers new PR commits"
+    },
+    "notes": "branch audit/scripts_misc/revert-author-map-stale (family 'author-map-stale'): removed 3 lines from scripts/release.py; ast ok",
+    "problem": "map upstream contributors talmax1124/janrenz in AUTHOR_MAP",
+    "verdict": "DROP"
+  },
+  "nopr:481ddd77b6": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/bench_lcm_context_engine.py",
+          "scripts/lcm_arm_b_node_recovery.py",
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_k2_disambig_campaign.sh",
+          "scripts/lcm_qa_battery.py"
+        ],
+        "loc": 430
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: PRD-8.1: probe-isolation harness (Arm A --probe-kind exact default, Arm B free-standing+collision confident-wrong detector)  - lcm_live_recovery: --probe-kind {exact,semantic,mixed} (default exact), --lcm-db evidence-rea",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:48376f7570": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/bench_lcm_context_engine.py",
+          "scripts/lcm_arm_b_node_recovery.py",
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_qa_battery.py"
+        ],
+        "loc": 16
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm): Wilson lower-bound gate default 0.95 -> 0.90 per PRD-6  The live-recovery harness hardcoded DEFAULT_WILSON_LOWER_MIN = 0.95, conflating the Wilson 95% lower-bound threshold with the point-recall threshold. PRD-",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:4899803ced": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/bench_lcm_context_engine.py",
+          "scripts/lcm_arm_b_node_recovery.py",
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_qa_battery.py"
+        ],
+        "loc": 213
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm): real session-mode live-recovery driver for Aegis shakedown  The inline LiveAegisDriver rendered the whole transcript (incl. the buried fact) into one prompt and expected JSON tool/usage markers the CLI never em",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:4b3698271f": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/references/local-addenda-lcm-context-engine.md:96 prescribes `python scripts/lcm_qa_battery.py --tier 0` as THE gate for LCM changes; SKILL.md:48,864 (battery refuses Opus); tier 1/2 drive scripts/lcm_live_recovery.py (lcm_qa_battery.py:102). LCM plugin is live product code (15 commits to plugins/context_engine/lcm since 08-01).",
+      "new_verdict": "KEEP",
+      "notes": "Skill-prescribed CURRENT gate for LCM changes. Not measured running in 30d (state.db tool_calls: last matching invocation 2026-08-20) — keep as on-demand gate tooling, or DROP only together with a skill edit. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 619
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm): null-safe lcm_grep query + Tier-0 QA battery (PRD-7)  - BUG-1: lcm_grep crashed on {\"query\": null} (uncaught AttributeError on   .strip()); the lone unguarded tool arg site. Null-safe coerce to match all   6 si",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "Row also carries the lcm_grep null-safe one-liner in plugins/context_engine/lcm/tools.py:2394 (`str(args.get('query') or '')`) — that line is vendored-LCM product code (plugins tranche, D1a) and is NOT touched by the revert branch; only scripts/lcm_qa_battery.py goes. | branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere (Tier-0 QA battery)",
+    "verdict": "DROP"
+  },
+  "nopr:4bf7d5f9cb": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 56
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: fix(parity): address Greptile review — $VENV rewrite on persisted bisect tails (derive venv from sys.executable); per-nodeid attribution in lint_nodeids (one rotted nodeid no longer smears the healthy set); catchup BFS v",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:510d8a2293": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 373
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: feat(hermes_parity): activate the 3 deferred merge-trap AST linters  Promotes dead-code-after-return, getattr-lambda-fallback, and duplicate-function-bodies from named-deferred to active (Ace's closeout call), joining un",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:51810bd85f": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 42
+      },
+      "fires": "imported by tests/golden/{state_ext,tool_gate}/runner.py + tests/scripts/test_refactor_equiv.py, which CI (ci.yaml, 1949 runs since 08-26) executes on every full-scope run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: test(cron): register scheduler extension mutations",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "refactor-equivalence harness (golden replay + mutation gate) backing the god-file extraction goldens",
+    "verdict": "KEEP"
+  },
+  "nopr:57abdd627b": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 1,
+        "dependents": [],
+        "loc": 12
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: fix(manifest): golden.json is a data file, not a pytest nodeid — guard it via paths; exclude manifest self-edits from the vacuous-coverage floor (maintenance commits would otherwise always trip it)",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:589edef52a": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/bench_lcm_context_engine.py",
+          "scripts/lcm_arm_b_node_recovery.py",
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_qa_battery.py"
+        ],
+        "loc": 368
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: PRD-8.1 build: VOID-redraw+void_rate (AC-2), enforcing param-pin (AC-7/CB-2), K=2 char (AC-3b)  - lcm_live_recovery: --void-redraw/--void-rate-max, VOID a no-store-lookup live trial + redraw to full scored N, hard-stop >",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:591ae3ef55": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 141
+      },
+      "fires": "imported by tests/golden/{state_ext,tool_gate}/runner.py + tests/scripts/test_refactor_equiv.py, which CI (ci.yaml, 1949 runs since 08-26) executes on every full-scope run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(refactor-equiv): golden runners refuse to write into a real HERMES_HOME  The state_ext golden runner writes config.yaml and seeds *.db files under $HERMES_HOME. Invoked outside Determinism() (direct CLI experiment, h",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "sandbox_guard rows (591ae3ef55/b9d2be48c9) fix a real 2026-07-16 clobber of the live ~/.hermes/config.yaml by the state_ext golden runner.",
+    "problem": "refactor-equivalence harness (golden replay + mutation gate) backing the god-file extraction goldens",
+    "verdict": "KEEP"
+  },
+  "nopr:595b6e78ae": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 124
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: feat(parity): add fork manifest lint",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:651f62e145": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 168
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: feat(parity): add catchup test selection",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:6ca97b5bcd": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 2,
+        "dependents": [
+          ".github/workflows/contributor-check.yml",
+          "agent/portal_tags.py",
+          "scripts/add_contributor.py",
+          "scripts/audit_pr_attribution.py",
+          "scripts/check_preyield_permit_release.py",
+          "scripts/contributor_audit.py"
+        ],
+        "loc": 6
+      },
+      "fires": "522 origin/main commits authored by that exact email since 2026-08-01; contributor-check.yml (via ci.yaml) greps release.py for it [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(ci): map bare Kyzcreig@users.noreply.github.com in AUTHOR_MAP  The fork owner's commits are authored as the BARE noreply form 'Kyzcreig@users.noreply.github.com', but AUTHOR_MAP only had the +id-prefixed '9063726+Kyz",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "bare Kyzcreig@users.noreply.github.com unmapped → contributor-check failed every owner PR",
+    "verdict": "KEEP"
+  },
+  "nopr:6e83005ed4": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 3,
+        "dependents": [],
+        "loc": 36
+      },
+      "fires": "KEEP-as-data for .parity-state.json/gates.jsonl (reader hermes_parity state.py/gates.py); desktop test hunks already replaced by upstream's desktop tree (D9, files absent on origin/main) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(ci): post-merge desktop reconciliation — electron node:test → vitest imports (3 files, upstream CI runs them under vitest); restore upstream git_branch searchable field into fork tokenized session search; ultra rows ",
+      "upstream_fix": "none",
+      "upstream_state": "read-only: apps/desktop parts are upstream-owned (D9); getattr guard is fork-local"
+    },
+    "notes": "Only the parity data + 1-line getattr guard survive on origin/main; nothing to revert.",
+    "problem": "post-merge reconciliation: .parity-state.json/gates.jsonl + getattr(agent,'reasoning_config',None) guard + desktop test import fixes",
+    "verdict": "KEEP"
+  },
+  "nopr:6f5e60d30b": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "agent/agent_init.py",
+          "agent/agent_runtime_helpers.py",
+          "agent/auxiliary_client.py",
+          "agent/billing_view.py",
+          "agent/chat_completion_helpers.py",
+          "agent/coding_context.py",
+          "agent/context_compressor.py",
+          "agent/context_engine.py"
+        ],
+        "loc": 419
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: feat(parity): wire catchup ack lint and tests gate",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:79715124fa": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 33
+      },
+      "fires": "imported by tests/golden/{state_ext,tool_gate}/runner.py + tests/scripts/test_refactor_equiv.py, which CI (ci.yaml, 1949 runs since 08-26) executes on every full-scope run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: test(restart_codec): add negative-scalar corpus case + scalar-branch clamp mutation",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "refactor-equivalence harness (golden replay + mutation gate) backing the god-file extraction goldens",
+    "verdict": "KEEP"
+  },
+  "nopr:7c3d5cdd0f": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 121
+      },
+      "fires": "lint_provider_collisions still wired into hermes doctor (doctor.py:1928); recording-boundary normalization unmeasured [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(telemetry): fN alias collision lint + stop composite model strings leaking to charts (A4 axis C)  C-1: normalize the recorded model column at the blackbox recording boundary — strip a FIRST-CLASS-provider prefix fro",
+      "upstream_fix": "none",
+      "upstream_state": "not checked: providers/__init__.py diverges +184/-346 vs upstream"
+    },
+    "notes": "Product code (providers/, hermes_cli/) — belongs to hermes_cli/agent auditors.",
+    "problem": "provider alias collision lint + strip first-class provider prefix from recorded model",
+    "verdict": "UNRESOLVED"
+  },
+  "nopr:7d33c982d8": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 123
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm): multi-sentinel-per-session Arm-B batching (~Kx cheaper)  --sentinels-per-session K plants K sentinels interleaved with filler in ONE long session, then recovers each from its depth>=1 condensation node. Amorti",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:7ee021200e": {
+    "adversary": {
+      "evidence": "scripts/bench_lcm_context_engine.py: 0 hits in cron/hooks/scripts/fleet/skills/LaunchAgents; only reader is its own test tests/context_engine/test_lcm_benchmark_battery.py:7.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 912
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat: add LCM benchmark battery  Adds the PRD-3 dry-run benchmark comparing raw, built-in compressor, and LCM arms over adversarial long transcript fixtures. The report records correctness-vs-raw, provider-observed/stub ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:834f0a0111": {
+    "adversary": {
+      "evidence": "~/.hermes/scripts/lcm_k2_autofire.sh:35 execs ~/.hermes/hermes-agent/scripts/lcm_k2_disambig_campaign.sh by absolute path; ~/.hermes/scripts/lcm_k2_autofire_net.sh:29 pgreps it. Neither is in any cron/launchd (jobs.json, LaunchAgents grep: 0); /tmp/lcm-k2-* markers absent.",
+      "new_verdict": "DROP only with ~/.hermes/scripts/lcm_k2_autofire*.sh",
+      "notes": "Revert-branch check #6: deleting scripts/lcm_k2_disambig_campaign.sh leaves a live (unscheduled) caller in ~/.hermes/scripts dangling. Drop both halves together or keep.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_k2_autofire.sh",
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 240
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm): staged K=2 disambiguation cutover campaign + reboot-survival autofire  PRD-8.3 powered gate, cost-correct staged shape (Opus AC-5/B1 review):   S0 store reset (clean nodes; harness matches by text)   S1 baseli",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:84da9fa36a": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 37
+      },
+      "fires": "imported by tests/golden/{state_ext,tool_gate}/runner.py + tests/scripts/test_refactor_equiv.py, which CI (ci.yaml, 1949 runs since 08-26) executes on every full-scope run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: Register tool gate refactor mutations",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "refactor-equivalence harness (golden replay + mutation gate) backing the god-file extraction goldens",
+    "verdict": "KEEP"
+  },
+  "nopr:84f1ed6e45": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 37
+      },
+      "fires": "imported by tests/golden/{state_ext,tool_gate}/runner.py + tests/scripts/test_refactor_equiv.py, which CI (ci.yaml, 1949 runs since 08-26) executes on every full-scope run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: test(refactor-equiv): add compaction mutations",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "refactor-equivalence harness (golden replay + mutation gate) backing the god-file extraction goldens",
+    "verdict": "KEEP"
+  },
+  "nopr:86c0e7d510": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 189
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: fix(parity): stabilize bisect classification",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:87c73d7d86": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 50
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(ci): A5-A no-op guard must not RED legit skips + testless files  CI surfaced two false-RED classes in the A5-A guard (the guard working — it flagged real 0-collect files — but too aggressively):   1. module-level pyt",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (A5-A guard is fork-only)"
+    },
+    "notes": "",
+    "problem": "A5-A guard must not RED importorskip/testless files",
+    "verdict": "KEEP"
+  },
+  "nopr:8dcc69611c": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 2,
+        "conflict_syncs": 2,
+        "dependents": [],
+        "loc": 554
+      },
+      "fires": "G1 refusal: 0 log hits for the refusal in window; repo scripts/local-skill-leak-check.py has 0 callers — the launchd job ai.hermes.skill-collision-check runs the skills-shared copy instead",
+      "original": "commit body: feat(skills): write-time skill-hygiene guard (A3)  Three guards closing the skill-hygiene leak/pollution class (spec A3):  G1 (tools/skill_manager_tool.py) — write-time placement guard: a non-local create whose resolved ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "Guard absence-of-fire is ambiguous (preventive). Script copy in repo is dead (DROP-able); tools/skill_manager_tool.py + agent/skill_utils.py guard belongs to cron+tools/agent auditors. Lead to split.",
+    "problem": "write-time skill-hygiene guard: refuse non-local skill creates outside skills-shared/, leak-check script",
+    "verdict": "UNRESOLVED"
+  },
+  "nopr:8e11a9370d": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 68
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: fix(parity): fall back to sys.executable when no fleet venv on a CI clean checkout  lint_manifest.lint_nodeids and gates' manifest-test runner hardcoded a ~/.hermes/hermes-agent/venv/bin/python fallback that is absent on",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:97e91756c2": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "agent/conversation_loop.py",
+          "agent/insights.py",
+          "agent/transcript_repair.py"
+        ],
+        "loc": 20
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: feat(parity): separate vacuous coverage acks",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:9f0c416088": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 83
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm-campaign): self-contained tightened-A + semantic-B campaign, venv-pinned  - Pin PY=venv/bin/python (anaconda 3.7 can't import the engine in-process). - Arm A: 36 filler turns (was 4) to force sentinel eviction p",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:a0367856d4": {
+    "adversary": {
+      "evidence": "lcm_aegis_stress.py / lcm_config_preflight.py: 0 live-dir hits; only docs/runbooks/lcm-aegis-apollo-cutover.md:28,51 (one-time Aegis->Apollo cutover, completed) + their own tests.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 1025
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm): add Aegis stress and config preflight gates  Adds deterministic Aegis stress driver, config/hash preflight checker, and Aegis-to-Apollo cutover runbook for PRD-6 Phase 5/6. Includes regression coverage for str",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:a0a5e8a083": {
+    "adversary": {
+      "evidence": "Only reader of staging/* is tests/test_residual_cli_hint_pasteable.py (branch edits it). ~/.hermes/skills-shared/general/subagent-driven-development/references/brief-splits-write-surface.md:34 describes the staging/ CONVENTION, not these files. Live copies ~/.hermes/scripts/runtime-parity-check.py / fleet-gateway-restart.sh are maintained separately.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-staging",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 2
+      },
+      "fires": "as 2f33571c20 — staging/ has no reader [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lint): explicit encoding on runtime-parity-check lockfile open (ruff blocking)  fork/main's ruff config flags open() in text mode without encoding=; A1b's staged lockfile open tripped it. One-line fix, no behavior ch",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-staging (family 'staging'): git rm staging/ (5 files); removed 3 staging-coupled test defs + 1 class-guard entry from tests/test_residual_cli_hint_pasteable.py (remaining 'staging/scripts' mentions: 2, docstring only); `pytest tests/test_residual_cli_hint_pasteable.py` -> ...........                                                              [100%] / 11 passed in 3.92s",
+    "problem": "ruff encoding fix on the staged runtime-parity-check.py",
+    "verdict": "DROP"
+  },
+  "nopr:a3fa06a6e4": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 8
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm-campaign): drain 45s after Arm A before Arm B (DB-flush race)  Arm A's gateway flushes its final session into the same lcm.db the Arm-B in-process engine reads; starting Arm B 1s after Arm A exits raced that flus",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:a8ac516b63": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 180
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm-arm-b): semantic probes + contention guard + front-loaded condensation  Three fixes from the failed K=10 validation (0/10 node-served): 1. DB-settle guard + retry in _node_served_recovery — the 'type object is   ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:aae6a302db": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 2
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lint): explicit encoding on read_text in A5-A testless detection (ruff blocking)",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (A5-A guard is fork-only)"
+    },
+    "notes": "",
+    "problem": "ruff PLW1514 encoding fix in A5-A testless detection",
+    "verdict": "KEEP"
+  },
+  "nopr:ae486b7f0a": {
+    "adversary": {
+      "evidence": "scripts/mem0-destructive-spike.py: 0 hits in live dirs, skills or fork tree.",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-oneshot-probes",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 188
+      },
+      "fires": "0 callers; spike result recorded (PASS) in the commit body [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: mem0 destructive-tools: Phase-0 SDK kill-gate spike (PASS)  Proves against a scratch user: update() carries metadata, history() returns priors, delete() 404s, bogus-delete not-found. Resolves spec Open-Q 1&2. Pins SDK ca",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-oneshot-probes (family 'oneshot-probes'): removed 3 paths; dangling non-doc refs to removed scripts: none",
+    "problem": "mem0 destructive-tools Phase-0 SDK kill-gate spike",
+    "verdict": "DROP"
+  },
+  "nopr:b7cb1472ec": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 1,
+        "dependents": [
+          "agent/agent_init.py",
+          "agent/agent_runtime_helpers.py",
+          "agent/auxiliary_client.py",
+          "agent/billing_view.py",
+          "agent/chat_completion_helpers.py",
+          "agent/coding_context.py",
+          "agent/context_compressor.py",
+          "agent/context_engine.py"
+        ],
+        "loc": 2618
+      },
+      "fires": "used by the 2026-08-29 parity sync: gates.jsonl records through ts 1788136253 (2026-08-31) written by gates.py; ACK-REVIEW-2026-08-30.md; fork-parity-doctrine.md prescribes it for every sync [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit/PR body: feat(scripts): hermes_parity — parity-sync CLI (status/start/gates/bisect/ack/finish/clean)  Automates the upstream/fork parity-sync workflow distilled from the 2026-07-10 sync (PR #255: 56 conflict files, 147 hunks, ~45",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "0 conflict cost except #436/57abdd627b (1 sync, docs/sync/fork-features.json). Not upstreamable (fork-parity tooling).",
+    "problem": "parity-sync CLI (hermes_parity) — fleet-only sync tooling, run once per upstream sync",
+    "verdict": "KEEP"
+  },
+  "nopr:b9d2be48c9": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 50
+      },
+      "fires": "imported by tests/golden/{state_ext,tool_gate}/runner.py + tests/scripts/test_refactor_equiv.py, which CI (ci.yaml, 1949 runs since 08-26) executes on every full-scope run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(review): guard test no longer writes into the real home; resolve candidate tmp roots",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "sandbox_guard rows (591ae3ef55/b9d2be48c9) fix a real 2026-07-16 clobber of the live ~/.hermes/config.yaml by the state_ext golden runner.",
+    "problem": "refactor-equivalence harness (golden replay + mutation gate) backing the god-file extraction goldens",
+    "verdict": "KEEP"
+  },
+  "nopr:c2cf19f6fd": {
+    "adversary": {
+      "evidence": "Repo copies scripts/lcm_k2_autofire{,_net}.sh have 0 callers; the live callers are the independent copies in ~/.hermes/scripts (lcm_k2_autofire_net.sh:42 calls ~/.hermes/scripts/lcm_k2_autofire.sh, not the repo copy).",
+      "new_verdict": null,
+      "notes": "",
+      "result": "STANDS"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 10
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm): use nohup instead of setsid for macOS K=2 autofire  macOS does not ship setsid, so the K=2 reboot-survival/autofire scripts failed with `setsid: command not found` when trying to detach the campaign/watchdog. U",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:cbe8b15d22": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 45
+      },
+      "fires": "fires on every hermes_state_ext log record (logger-name change, not a conditional path); 0 conflict cost [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(state-ext): keep the hermes_state logger name — logger identity is an observable output; renaming to hermes_state_ext would silently move records out of any handler/filter keyed on hermes_state (Greptile P2)",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (hermes_state_ext.py is fork-only)"
+    },
+    "notes": "45 loc, mostly BUILD-BRIEF doc; 1 functional line.",
+    "problem": "hermes_state_ext keeps the 'hermes_state' logger name after extraction (logger identity is observable output)",
+    "verdict": "KEEP"
+  },
+  "nopr:d5cec6ec16": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 25
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm-arm-b): interpreter guard + don't score import errors as recovery misses  THE actual root cause of every 0/N Arm-B run: the harness imports the LCM engine IN-PROCESS, but 'python3' on this fleet = anaconda 3.7.4 ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:d9d2266dfe": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/coding/hermes-fork-pr-contribution/references/executing-an-upstream-parity-merge.md:92-93 prescribes `scripts/check_lcm_upstream_drift.py --metadata plugins/context_engine/lcm/VENDORED_FROM.txt --offline` as a step of every parity merge (syncs recur: 07-23/08-07/08-29); test file co-owned by plugins-tranche row #480.",
+      "new_verdict": "KEEP",
+      "notes": "Parity-merge procedure step; the next sync would run it. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 446
+      },
+      "fires": "0 runs: no cron/launchd/hook/workflow invokes check_lcm_upstream_drift.py (live-tree grep, fork .github grep) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm): add upstream drift metadata checker  Adds structured LCM vendoring provenance fields, a read-only upstream security-drift checker, and offline/unit coverage for missing metadata and PASS/WARN/FAIL output.  Ver",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "VENDORED_FROM.txt provenance fields from this row are read by tests/context_engine/test_lcm_fork_load.py — kept; only the checker script + its test drop. | branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "read-only LCM upstream security-drift checker (scripts/check_lcm_upstream_drift.py)",
+    "verdict": "DROP"
+  },
+  "nopr:df420d15df": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 29
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: chore(lcm): sequential Arm-A->Arm-B N=180 campaign runner (PRD-7)",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:e0cf699f81": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 73
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm): Arm-B harness follows session rollover to node-bearing session  Live long sessions roll the session id on compaction-boundary rollover, so nodes for a planted conversation land under a NEW session id. Added _re",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:e29944b04e": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/bench_lcm_context_engine.py",
+          "scripts/lcm_arm_b_node_recovery.py",
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_qa_battery.py"
+        ],
+        "loc": 967
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm): add live recovery statistical harness  Adds scripts/lcm_live_recovery.py with deterministic dry-run fixtures, live Aegis subprocess driver seam, Wilson 95% lower-bound gate, semantic judge calibration, tool-ca",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:e84170e4f8": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/bench_lcm_context_engine.py",
+          "scripts/lcm_arm_b_node_recovery.py",
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_qa_battery.py"
+        ],
+        "loc": 44
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm-arm-a): route gateway LCM writes to --lcm-db via LCM_DATABASE_PATH  Arm A's --lcm-db only redirected the evidence reader (_grep_called_since) while the gateway kept writing the LCM store to the profile's lcm.db. ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:eb38ffc5b2": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "agent/conversation_loop.py",
+          "agent/trajectory.py",
+          "agent/transports/chat_completions.py",
+          "agent/usage_pricing.py",
+          "gateway/config.py",
+          "gateway/relay/media.py",
+          "gateway/run.py",
+          "gateway/session.py"
+        ],
+        "loc": 568
+      },
+      "fires": "imported by tests/golden/{state_ext,tool_gate}/runner.py + tests/scripts/test_refactor_equiv.py, which CI (ci.yaml, 1949 runs since 08-26) executes on every full-scope run [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: Add refactor equivalence harness",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "",
+    "problem": "refactor-equivalence harness (golden replay + mutation gate) backing the god-file extraction goldens",
+    "verdict": "KEEP"
+  },
+  "nopr:edcf3cf5d6": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:567 instructs `~/.hermes/hermes-agent/scripts/lcm_live_recovery.py --live --session-mode --profile aegis ...`; SKILL.md:870 Tier-2 gate Arm A; ~/.hermes/fleet/run-lcm-campaign.sh:34 execs it; imported by scripts/lcm_qa_battery.py:102 and tests/context_engine/test_lcm_probe_isolation.py:18.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-A driver of the skill-prescribed Tier-1/2 LCM gate; deleting it breaks lcm_qa_battery tier 1/2. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/bench_lcm_context_engine.py",
+          "scripts/lcm_arm_b_node_recovery.py",
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_qa_battery.py"
+        ],
+        "loc": 53
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: test(lcm): add Haiku session-mode shakedown controls  Add model/provider overrides, natural-threshold mode, filler-token control, and an explicit underpowered-live shakedown override for cost-controlled E2E runs that mus",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:f3dfb89c2a": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 36
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm): AC-5 baseline-repro toggle (--no-escalation) for K=2 disambiguation campaign  PRD-8.3 review (Opus AC-5) requires the powered K=2 campaign to run an A/B on IDENTICAL generator code: fixed arm (escalation ON) v",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:f923a9e07c": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:870-874 Tier-2 gate Arm B = scripts/lcm_arm_b_node_recovery.py; SKILL.md:486 (needs_escalation wiring), references/k2-disambiguation-fix-and-ab-loop.md:40; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:22 pgreps it; file also co-owned by plugins-tranche row nopr:efe50db808.",
+      "new_verdict": "KEEP",
+      "notes": "Arm-B driver of the skill-prescribed Tier-2 gate. docs/reports/lcm-qa/* in 26f69158d2 follow the auto/docs tranche. Revert branch revert-lcm-campaign-harness must be REBUILT: it deletes scripts/lcm_tail_budget_shakedown.py and scripts/probe_hermes_lcm_isolated.py (co-owned by plugins-tranche #168), tests/context_engine/test_lcm_upstream_drift_metadata.py (co-owned by #480), and scripts/lcm_arm_b_node_recovery.py (co-owned by nopr:efe50db808) — out-of-tranche deletions — plus the overturned gate tooling below.",
+      "result": "OVERTURNED"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_armab_campaign.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 234
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(lcm): PRD-8.3 multi-fact disambiguation — identifier fidelity + mandatory escalation  Fixes the K>=2 confident-wrong (10% in PRD-8.2 char run): the summarizer 'remove repetition' instruction merged distinct identifi",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "plugins/context_engine/lcm/escalation.py from this row is imported by the LCM engine (engine.py, extraction.py, tools.py …) — live product code for the plugins tranche (D1a); the revert branch leaves it. Only the harness edits drop. | branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere (K=2 disambiguation arm)",
+    "verdict": "DROP"
+  },
+  "nopr:fae13e5d9c": {
+    "branch": null,
+    "evidence": {
+      "cost": {
+        "conflict_files": 1,
+        "conflict_syncs": 3,
+        "dependents": [
+          ".github/actions/detect-changes/action.yml",
+          ".github/workflows/tests.yml",
+          "scripts/ci/classify_changes.py",
+          "scripts/ci_overflow_acceptance.py",
+          "scripts/ci_overflow_request.py",
+          "scripts/run_tests.sh"
+        ],
+        "loc": 152
+      },
+      "fires": "scripts/run_tests_parallel.py is invoked by tests.yml (matrix generation + per-slice run via run_tests.sh) on every CI run; fork CI: ci.yaml active (1949 runs since 2026-08-26, 71/100 latest success) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: feat(ci): loud no-op test guard — count executed tests, whole-suite-zero + explicit 0-collect RED (A5-A)",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only) (A5-A guard is fork-only)"
+    },
+    "notes": "",
+    "problem": "loud no-op test guard (count executed tests; whole-suite-zero RED)",
+    "verdict": "KEEP"
+  },
+  "nopr:fb3008a7ba": {
+    "adversary": {
+      "evidence": "~/.hermes/skills-shared/general/lcm-context-engine/SKILL.md:874,902 names scripts/lcm_armab_campaign.sh as the sequential Arm-A->Arm-B Tier-2 runner; ~/.hermes/scripts/lcm-arm-a-autofire-watch.sh:21 pgreps it. No invocation found in any state.db assistant tool_call in 60 days; not scheduled.",
+      "new_verdict": "KEEP or DROP+skill-edit",
+      "notes": "Campaign runner is skill-prescribed but one-shot (hard-coded June N=180 campaign, never run in 60d). Lead: DROP only if lcm-context-engine SKILL.md:874/902 and lcm-arm-a-autofire-watch.sh are updated in the same change. 1f8392335e's lcm_arma_halfway_ping.sh alone has 0 refs anywhere (would STAND). 15e1d95f14 reports = docs tranche.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [],
+        "loc": 4
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm-campaign): staged Arm A N=120 shakedown needs --allow-underpowered-live  The N=120 shakedown is intentionally below the 180 gate minimum; validate_run_config rejected it without the shakedown flag, producing no r",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  },
+  "nopr:fdee6d93f2": {
+    "adversary": {
+      "evidence": "~/.hermes/scripts/lcm_k2_autofire.sh:35 execs ~/.hermes/hermes-agent/scripts/lcm_k2_disambig_campaign.sh by absolute path; ~/.hermes/scripts/lcm_k2_autofire_net.sh:29 pgreps it. Neither is in any cron/launchd (jobs.json, LaunchAgents grep: 0); /tmp/lcm-k2-* markers absent.",
+      "new_verdict": "DROP only with ~/.hermes/scripts/lcm_k2_autofire*.sh",
+      "notes": "Revert-branch check #6: deleting scripts/lcm_k2_disambig_campaign.sh leaves a live (unscheduled) caller in ~/.hermes/scripts dangling. Drop both halves together or keep.",
+      "result": "NEEDS-LEAD"
+    },
+    "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+    "evidence": {
+      "cost": {
+        "conflict_files": 0,
+        "conflict_syncs": 0,
+        "dependents": [
+          "scripts/lcm_k2_autofire.sh",
+          "scripts/lcm_k2_autofire_net.sh",
+          "scripts/lcm_k2_disambig_campaign.sh"
+        ],
+        "loc": 46
+      },
+      "fires": "0 runs: no cron/launchd/hook invokes it; only callers are ~/.hermes/scripts/lcm-*-autofire*.sh + fleet/run-lcm-campaign.sh, themselves unscheduled, and the campaign worktree ~/.hermes/worktrees/lcm-campaign no longer exists; last commit to these files 2026-06-19 [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
+      "original": "commit body: fix(lcm): K=2 campaign — per-stage store reset + abort-safe done-marker  Two campaign bugs that compounded the loop: - per-stage reset_store(): only S0 reset before; baseline-repro's MERGED nodes   then polluted the fix ",
+      "upstream_fix": "none",
+      "upstream_state": "n/a (fleet-only)"
+    },
+    "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+    "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
+    "verdict": "DROP"
+  }
+}
