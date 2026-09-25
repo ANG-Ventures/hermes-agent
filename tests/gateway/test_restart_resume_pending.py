@@ -798,6 +798,71 @@ async def test_one_raising_replay_neither_wedges_gate_nor_eats_queue(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_replay_with_unavailable_adapter_is_retained_until_adapter_returns(monkeypatch):
+    """An adapter that is unavailable when the restore queue drains (e.g. mid-reconnect)
+    must not cost the user their message: the gate still opens, the event stays queued,
+    and it is replayed once the adapter is back."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_tasks = []
+    runner._startup_restore_retry_initial_delay = 0.01
+    monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "0")
+    runner._start_startup_warmup()
+
+    handled: list[str] = []
+
+    async def fake_handle_message(event: MessageEvent) -> None:
+        handled.append(event.text)
+
+    adapter.handle_message = fake_handle_message
+    inbound = MessageEvent(text="keep me", message_type=MessageType.TEXT,
+                           source=make_restart_source(chat_id="reconnecting-chat"))
+    runner._queue_startup_restore_event(inbound)
+
+    saved = runner.adapters.pop(Platform.TELEGRAM)
+    await asyncio.wait_for(runner._finish_startup_restore(), timeout=5)
+
+    # Availability first: the gate opens even though one replay could not run.
+    assert runner._startup_restore_in_progress is False
+    assert handled == []
+    assert runner._startup_restore_queue == [inbound]
+
+    runner.adapters[Platform.TELEGRAM] = saved
+    for _ in range(200):
+        if handled:
+            break
+        await asyncio.sleep(0.01)
+    assert handled == ["keep me"]
+    assert runner._startup_restore_queue == []
+
+
+@pytest.mark.asyncio
+async def test_retained_replay_retry_stops_on_shutdown(monkeypatch):
+    """The retry owner for retained replays exits when the gateway shuts down instead of
+    spinning forever on an adapter that will never come back."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_tasks = []
+    runner._startup_restore_retry_initial_delay = 0.01
+    monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "0")
+    runner._start_startup_warmup()
+
+    runner._queue_startup_restore_event(
+        MessageEvent(text="orphan", message_type=MessageType.TEXT,
+                     source=make_restart_source(chat_id="gone-chat")))
+    runner.adapters.pop(Platform.TELEGRAM)
+    await asyncio.wait_for(runner._finish_startup_restore(), timeout=5)
+
+    retry = runner._startup_restore_retry_task
+    assert retry is not None and not retry.done()
+    runner._shutdown_event.set()
+    await asyncio.wait_for(retry, timeout=5)
+    assert len(runner._startup_restore_queue) == 1
+
+
+@pytest.mark.asyncio
 async def test_post_drain_inbound_processes_instead_of_queueing(monkeypatch):
     """After a contained replay failure the gate is open, so the next inbound
     event dispatches instead of queueing into the (drained) restore queue."""

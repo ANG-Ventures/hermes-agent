@@ -89,20 +89,25 @@ class GatewayStartupMixin:
                 source.chat_id if source else "unknown",
             )
 
+    # First backoff (seconds) for replays retained because their adapter was unavailable; doubles to 5s.
+    _startup_restore_retry_initial_delay: float = 0.5
+
     async def _drain_startup_restore_queue(self) -> int:
-        """Replay inbound messages queued while startup auto-resume ran."""
+        """Replay inbound messages queued while startup auto-resume ran.
+
+        An event whose intake adapter is unavailable (e.g. mid-reconnect) is RETAINED on the queue,
+        not dropped: ``_finish_startup_restore`` opens the gate anyway and a background owner
+        replays it once the adapter is back (``_retry_retained_startup_restore_queue``)."""
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
+        retained: list = []
         while queue:
             event = queue.pop(0)
             try:
                 source = getattr(event, "source", None)
                 adapter = self._intake_adapter_for(source)
                 if adapter is None:
-                    logger.debug(
-                        "Dropping startup-restore queued message: adapter unavailable for %s",
-                        getattr(getattr(source, "platform", None), "value", None),
-                    )
+                    retained.append(event)
                     continue
                 # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
                 with suppress(Exception):
@@ -115,7 +120,43 @@ class GatewayStartupMixin:
                 logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
                 continue
             drained += 1
+        if retained:
+            # Keep FIFO for the next attempt; anything queued meanwhile goes after the retained head.
+            queue[:0] = retained
+            self._startup_restore_queue = queue
         return drained
+
+    async def _retry_retained_startup_restore_queue(self) -> None:
+        """Background owner for replays retained by ``_drain_startup_restore_queue``: retry with
+        backoff until the queue empties or the gateway starts shutting down."""
+        delay = max(0.01, float(self._startup_restore_retry_initial_delay))
+        last_warning = 0.0
+        while getattr(self, "_startup_restore_queue", None) and not self._startup_should_abort():
+            now = time.monotonic()
+            if now - last_warning >= 60.0:
+                last_warning = now
+                logger.warning(
+                    "Startup-restore replay deferred: %d queued message(s) waiting for an unavailable "
+                    "adapter; retrying in the background", len(self._startup_restore_queue),
+                )
+            await asyncio.sleep(delay)
+            if self._startup_should_abort():
+                break
+            drained = await self._drain_startup_restore_queue()
+            if drained:
+                logger.info("Replayed %d retained startup-restore message(s)", drained)
+            delay = min(delay * 2, 5.0)
+
+    def _schedule_startup_restore_retry(self) -> None:
+        """Start (at most one) retry owner when the post-gate drain retained messages."""
+        if not getattr(self, "_startup_restore_queue", None):
+            return
+        current = getattr(self, "_startup_restore_retry_task", None)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(self._retry_retained_startup_restore_queue())
+        task.add_done_callback(self._late_failure_callback("startup-restore retained replay retry failed"))
+        self._startup_restore_retry_task = self._retain_background_task(task)
 
     @staticmethod
     def _start_free_tier_bootstrap() -> None:
@@ -244,6 +285,7 @@ class GatewayStartupMixin:
             self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+        self._schedule_startup_restore_retry()
 
     @staticmethod
     def _late_failure_callback(message: str, *, level: int = logging.WARNING):
