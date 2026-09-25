@@ -312,9 +312,10 @@
     "conflict_syncs": 3,
     "conflict_files": 1,
     "dependents": []
-   }
+   },
+   "report_test": "tests/cron/test_cron_model_dict_form.py: 17 passed in 3.50s (local test-gate); red control (call sites reverted, helper kept): 4 failed / 13 passed -- RuntimeError 'has no model configured (job.model={...dict...})' and preflight target_model=dict"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-477 @ aef818b225",
   "notes": "Generic, small (_coerce_job_model). Upstream still RED. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/scheduler.py — needs a hand re-port (follow-up card)."
  },
  "#473": {
@@ -386,9 +387,10 @@
     "conflict_syncs": 3,
     "conflict_files": 2,
     "dependents": []
-   }
+   },
+   "report_test": "tests/gateway/test_response_filters.py: 8 passed in 6.87s (red control on unmodified gateway/response_filters.py: 1 failed -- is_autonomous_silence_response('`[SILENT]`') is False); tests/cron/test_scheduler.py -k 'SILENT or Silent or silent': 10 passed (test-gate remote ACE-MEDIA)"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-199 @ c5d858b216",
   "notes": "Generic. Fork logic now lives partly in gateway/response_filters.py (5/15 original lines remain in scheduler). Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/scheduler.py, tests/cron/test_scheduler.py — needs a hand re-port (follow-up card)."
  },
  "#139": {
@@ -872,9 +874,10 @@
     "conflict_syncs": 2,
     "conflict_files": 1,
     "dependents": []
-   }
+   },
+   "report_test": "tests/cron/test_jobs.py::TestStaleFireLockSweep: 4 passed (local test-gate); red control on unmodified cron/jobs.py: 1 failed, 3 passed -- orphan .fire-*.lock still exists"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-830 @ ee67617bf6",
   "notes": "Generic, 145 loc. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/jobs.py — needs a hand re-port (follow-up card)."
  },
  "#632": {
@@ -890,9 +893,10 @@
     "conflict_syncs": 2,
     "conflict_files": 2,
     "dependents": []
-   }
+   },
+   "report_test": "tests/cron/test_cron_humanize.py + tests/cron/test_blueprint_catalog.py: 33 passed (test-gate remote ACE-MEDIA); red control on unmodified cron/jobs.py: 18 failed, 1 passed; sibling tests/tools/test_blueprints.py + tests/cron/test_jobs.py -k 'schedule or display or list or blueprint': 38 passed"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-632 @ 96bb1464ac",
   "notes": "Generic UX, stdlib-only humanizer. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/jobs.py — needs a hand re-port (follow-up card)."
  },
  "#791": {
@@ -950,7 +954,9 @@
     "dependents": [
      "#521"
     ]
-   }
+   },
+   "report_test": "row's own test file on UNMODIFIED upstream/main 1b57acf94a (local test-gate): 1 failed, 5 passed -- the ONLY failure is the call-site guard 'reconciler not found': _reconcile_jobs_after_recovery (the caller that wrote last_status=error after restart) is fork-only (origin/main cron/scheduler_provider.py:207). Upstream mark_job_run already accepts status= (cron/jobs.py:2376) and upstream recovery (recover_interrupted_executions) marks only the executions ledger 'unknown', never calls mark_job_run -> no false 'error' to fix; no branch built.",
+   "report_recommend": "SUPERSEDED-BY-UPSTREAM (not applicable upstream)"
   },
   "branch": null,
   "notes": "Generic, small. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/jobs.py, cron/scheduler_provider.py, hermes_cli/cron.py — needs a hand re-port (follow-up card)."
@@ -1026,9 +1032,10 @@
     "dependents": [
      "nopr:e77a87d63a"
     ]
-   }
+   },
+   "report_test": "tests/cron/test_cron_script_job_timeout.py: 16 passed in 7.59s (local test-gate); red control (per-job kwargs not passed): E2E test 1 failed -- script ran 122 s and returned success; tests/cron/test_cron_script.py -k 'timeout or script': 31 passed, 1 skipped"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-1027 @ 3f0ce1ce57",
   "notes": "Measured, generic. Lives in fork-only cron/fork_ext/scheduler_ext.py. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cron/fork_ext/scheduler_ext.py, cron/scheduler.py — needs a hand re-port (follow-up card)."
  },
  "nopr:e77a87d63a": {
@@ -1250,9 +1257,10 @@
     "conflict_syncs": 2,
     "conflict_files": 2,
     "dependents": []
-   }
+   },
+   "report_test": "tests/tools/test_read_secrets_cat_word_boundary.py: 29 passed in 6.25s"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-618 @ c8dd6df648",
   "notes": "2-line generic fix. Strong UPSTREAM. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/cronjob_tools.py, tools/threat_patterns.py — needs a hand re-port (follow-up card)."
  },
  "#1024": {
@@ -1757,9 +1765,10 @@
     "conflict_syncs": 1,
     "conflict_files": 2,
     "dependents": []
-   }
+   },
+   "report_test": "tests/tools/test_vision_native_fast_path.py -k 'alias or missing_all': 2 passed, 20 deselected in 4.33s"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-314 @ 8eab2a9677",
   "notes": "Generic 2-line handler alias + schema note; trivially upstreamable. Unmeasured on the fleet (no marker), so not a KEEP on its own. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/vision_tools.py — needs a hand re-port (follow-up card)."
  },
  "#470": {
@@ -2041,9 +2050,10 @@
     "conflict_syncs": 0,
     "conflict_files": 0,
     "dependents": []
-   }
+   },
+   "report_test": "tests/tools/test_search_files_pcre2_lookaround.py: 24 passed in 8.59s (local test-gate, clean PATH); red control: new E2E ShellFileOperations.search test on unmodified tools/file_operations_search.py -> 1 failed ('Search failed: rg: regex parse error ... look-around ... is not supported'), with fix 1 passed"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-615 @ 88e5565213",
   "notes": "Generic tool robustness, 182 loc, 0 conflict files. Not measurable as a KEEP (silent success path); offer upstream. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/file_operations.py — needs a hand re-port (follow-up card)."
  },
  "nopr:9a1db22e58": {
@@ -2059,7 +2069,9 @@
     "conflict_syncs": 0,
     "conflict_files": 0,
     "dependents": []
-   }
+   },
+   "report_test": "row's TestPatchV4A on UNMODIFIED upstream/main 1b57acf94a via test-gate --remote (ACE-AI): 2 failed, 1 passed -- bare-diff test fails ONLY on the message assertion ('No V4A file operations' not in 'Patch validation failed ... Patch contains no changes'); whitespace-only test fails because upstream deliberately errors there too. No false success reproduces -> no branch built; recommend verdict SUPERSEDED-BY-UPSTREAM.",
+   "report_superseded": "upstream dfeedf613d (#63678, 2026-07-13, ancestor of 59004a6235): _validate_operations errors 'Patch contains no changes' when real_change_count==0, so a header-less patch already returns success=False and writes nothing on upstream"
   },
   "branch": null,
   "notes": "Heavily measured, generic, 70 loc, 0 conflict files. Strong UPSTREAM; keep on the fork until it lands. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tests/tools/test_file_tools_live.py, tools/file_operations.py — needs a hand re-port (follow-up card)."
@@ -2095,9 +2107,10 @@
     "conflict_syncs": 0,
     "conflict_files": 0,
     "dependents": []
-   }
+   },
+   "report_test": "tests/tools/test_refresh_agent_mcp_tools.py -k wrapped: 2 passed (red control on unmodified tools/mcp_tool_agent.py: 2 failed); whole file 21 passed in 4.66s (test-gate --remote ACE-AI)"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-399 @ 7c53a50493",
   "notes": "Generic normalizer-drift fix in a path upstream still has unnormalized; 92 loc, 0 conflict files. Offer upstream with a wrapped-schema fixture (their memory providers can return wrapped form too). Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tests/tools/test_refresh_agent_mcp_tools.py, tools/mcp_tool.py — needs a hand re-port (follow-up card)."
  },
  "#98": {
