@@ -726,7 +726,7 @@ class _RouteChecks:
     """Lock-free I/O results for an existing route (phase 1b of a transition)."""
     session_id: str  # the entry's session_id when snapshotted
     canonical_id: Optional[str]  # compression tip (may equal session_id)
-    is_stale: bool  # row already ended in state.db
+    stale_reason: Optional[str]  # "ended" / "never_persisted_stub" / None
     reset_reason: Optional[str]
 
 
@@ -936,7 +936,8 @@ class SessionStore(
         if not force_new and observed is not None:
             sid = observed.session_id
             checks = _RouteChecks(
-                sid, self._compression_tip_for_session_id(sid), self._is_session_ended_in_db(sid),
+                sid, self._compression_tip_for_session_id(sid),
+                self._routing_entry_staleness_in_db(observed),
                 self._route_reset_reason(observed),
             )
         # Phase 2 (lock): apply the decisions to _entries.
@@ -984,9 +985,15 @@ class SessionStore(
                 entry, snapshot_sid, checks.canonical_id if checks else None
             )
             checked = entry.session_id == snapshot_sid
-            stale_hit = checked and checks.is_stale
+            stale_hit = checked and checks.stale_reason is not None
             reset_reason = checks.reset_reason if checked else None
-            if stale_hit:
+            if stale_hit and checks.stale_reason == "never_persisted_stub":
+                logger.warning(
+                    "gateway.session: routing key %r -> %s is old and inert but absent from "
+                    "state.db; dropping failed-create stub and recovering/recreating the session",
+                    session_key, entry.session_id,
+                )
+            elif stale_hit:
                 # Stale routing self-heal: drop the entry and fall through to recovery (reopens
                 # agent_close / ws_orphan_reap rows, fresh session for other end_reasons).
                 logger.warning(

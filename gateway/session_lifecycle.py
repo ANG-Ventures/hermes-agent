@@ -55,6 +55,13 @@ def auto_continue_freshness_window() -> float:
         return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
 
 
+# Routing is persisted before the matching session row is created. Leave a full day for that
+# normally-synchronous write (DB contention, restart recovery) before an untouched missing-row
+# route can be classified as a failed create. Conservative, not a proof: an ancient empty
+# pre-SQLite route has the same shape, so the activity checks remain the primary protection.
+_NEVER_PERSISTED_STUB_GRACE = timedelta(hours=24)
+
+
 class SessionLifecycleMixin:
     """SessionStore explicit boundaries and crash-recovery markers."""
 
@@ -80,6 +87,40 @@ class SessionLifecycleMixin:
         except Exception:
             return False
         return bool(row is not None and row.get("end_reason") is not None)
+
+    @staticmethod
+    def _is_never_persisted_stub(entry: SessionEntry, *, now: Optional[datetime] = None) -> bool:
+        """True when a route whose ``sessions`` row is absent shows only failed-create evidence:
+        never touched since creation (``updated_at`` moves on every routed message), zero token
+        counters, and older than the grace window that covers the routing UPSERT -> row INSERT gap.
+        Such a stub otherwise swallows every message: transcript appends fail the FOREIGN KEY."""
+        if entry.updated_at != entry.created_at:
+            return False
+        if any((entry.input_tokens, entry.output_tokens, entry.cache_read_tokens,
+                entry.cache_write_tokens, entry.total_tokens, entry.last_prompt_tokens)):
+            return False
+        try:
+            age = (now or _now()).timestamp() - entry.created_at.timestamp()
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+            return False
+        return age >= _NEVER_PERSISTED_STUB_GRACE.total_seconds()
+
+    def _routing_entry_staleness_in_db(self, entry: SessionEntry) -> Optional[str]:
+        """``"ended"``, ``"never_persisted_stub"``, or None (not known stale). The store is
+        resolved from the entry's own key: a wrong-store lookup would read a live row as missing.
+        DB errors -> None; never block routing on a failed lookup."""
+        if not entry.session_id:
+            return None
+        db = self._db_for_key(entry.session_key)
+        if not db:
+            return None
+        try:
+            row = db.get_session(entry.session_id)
+        except Exception:
+            return None
+        if row is None:
+            return "never_persisted_stub" if self._is_never_persisted_stub(entry) else None
+        return "ended" if row.get("end_reason") is not None else None
 
     def _route_reset_reason(self, entry: SessionEntry) -> Optional[str]:
         """Only explicit suspension replaces a routed conversation; time never does."""

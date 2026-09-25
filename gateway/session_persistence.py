@@ -316,8 +316,9 @@ class SessionPersistenceMixin:
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove routing entries whose session has ended in state.db (startup, lock held). Stale ==
-        ``end_reason IS NOT NULL``; rows absent from the DB are kept; a ``None`` DB handle is a
-        no-op; DB errors are non-fatal."""
+        ``end_reason IS NOT NULL``, or the row is absent and the route is an old inert
+        failed-create stub (``_is_never_persisted_stub``); other absent rows (legacy) are kept; a
+        ``None`` DB handle is a no-op; DB errors are non-fatal."""
         if not self._entries:
             return
         stale_keys: list = []
@@ -330,7 +331,14 @@ class SessionPersistenceMixin:
                 if db is None:
                     continue
                 row = db.get_session(entry.session_id)
-                if row is None or row.get("end_reason") is None:
+                if row is None:
+                    if self._is_never_persisted_stub(entry):
+                        logger.warning(
+                            "gateway.session: pruning old inert routing entry %r -> %s; session "
+                            "row was never persisted", key, entry.session_id)
+                        stale_keys.append(key)
+                    continue
+                if row.get("end_reason") is None:
                     continue
                 verdict = self._stale_entry_verdict(key, entry, row)
                 if verdict == "prune":
