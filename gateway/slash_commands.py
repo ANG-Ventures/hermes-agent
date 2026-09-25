@@ -590,9 +590,16 @@ class GatewaySlashCommandsMixin:
         )
 
         if preserve_route_preferences:
-            self._rehydrate_manual_reset_route_preferences(session_key, new_entry)
+            # Off the loop: re-resolves the persisted route's credentials
+            # (config load + provider resolution; OAuth refresh can hit the
+            # network).
+            await asyncio.to_thread(
+                self._rehydrate_manual_reset_route_preferences, session_key, new_entry
+            )
         else:
-            self._set_session_model_override(session_key, None)
+            # Off the loop, same as the `/model reset` door: the setter does a
+            # synchronous session-store write.
+            await asyncio.to_thread(self._set_session_model_override, session_key, None)
             self._set_session_reasoning_override(session_key, None)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
@@ -2760,7 +2767,10 @@ class GatewaySlashCommandsMixin:
                             f"(route {_cur_provider} -> {result.target_provider}). "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._set_session_model_override(_session_key, {
+                        # Off the loop: the persistability check re-resolves
+                        # credentials (config load + provider resolution, which
+                        # can refresh an OAuth token over the network).
+                        await asyncio.to_thread(_self._set_session_model_override, _session_key, {
                             "model": result.new_model,
                             "provider": result.target_provider,
                             "api_key": result.api_key,
@@ -2959,7 +2969,9 @@ class GatewaySlashCommandsMixin:
                         return None  # Picker sent — adapter handles the response
 
             # Fallback: text list (for platforms without picker or if picker failed)
-            provider_label = get_label(current_provider)
+            # get_label can fall through to a synchronous models.dev fetch
+            # (requests.get) on a cold cache -- keep it off the loop.
+            provider_label = await asyncio.to_thread(get_label, current_provider)
             lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
 
             try:
@@ -3172,7 +3184,12 @@ class GatewaySlashCommandsMixin:
 
             # Store session override so next agent creation uses the new model
             # (single door — also persists the config-backed identity, RC-2/P3b).
-            self._set_session_model_override(session_key, {
+            # Off the loop: the persistability check re-resolves credentials
+            # (config load + provider resolution, which can refresh an OAuth
+            # token over the network). On-loop, this chain held Discord for
+            # 10 s on 2026-09-24 (PHASE=event_loop_blocked at
+            # open_credentialed_url) and expired /model interactions.
+            await asyncio.to_thread(self._set_session_model_override, session_key, {
                 "model": result.new_model,
                 "provider": result.target_provider,
                 "api_key": result.api_key,
