@@ -1261,6 +1261,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "'wake' (wake the agent only, no passive message). Omit to leave an "
              "existing subscription's mode unchanged (new subs default to 'notify').",
     )
+    p_nsub.add_argument(
+        "--wake",
+        action="store_true",
+        help="Shorthand for --delivery-mode notify+wake. Wake is opt-in only: "
+             "each wake is a full agent turn that queues the human's messages.",
+    )
 
     p_nlist = sub.add_parser(
         "notify-list",
@@ -5255,7 +5261,10 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             thread_id=args.thread_id, user_id=args.user_id,
             user_id_alt=getattr(args, "user_id_alt", None),
             notifier_profile=args.notifier_profile or _profile_author(),
-            delivery_mode=getattr(args, "delivery_mode", None),
+            delivery_mode=(
+                getattr(args, "delivery_mode", None)
+                or ("notify+wake" if getattr(args, "wake", False) else None)
+            ),
         )
     print(f"Subscribed {args.platform}:{args.chat_id}"
           + (f":{args.thread_id}" if args.thread_id else "")
