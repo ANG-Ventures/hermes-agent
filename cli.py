@@ -22520,7 +22520,10 @@ def main(
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
                         from hermes_cli.kanban_worker_exit import WorkerExit
-                        raise WorkerExit(result)
+                        from hermes_cli.kanban_worker_route import (
+                            apply_pin_refusal_to_result,
+                        )
+                        raise WorkerExit(apply_pin_refusal_to_result(cli.agent, result))
 
                 # A pinned kanban worker whose provider is in cooldown exits
                 # rate-limited (retry-preserving) instead of running elsewhere.

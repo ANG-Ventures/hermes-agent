@@ -111,17 +111,138 @@ def record_worker_route_substitution(
 
 def record_worker_route_pin_refused(
     *, provider: str, model: Optional[str], reason: Optional[str], rate_limited: bool,
+    stage: str = "auth", to_provider: Optional[str] = None, to_model: Optional[str] = None,
 ) -> bool:
-    """Record that a pinned worker refused to substitute and is exiting."""
+    """Record that a pinned worker refused to substitute provider.
+
+    ``stage`` is ``auth`` (startup; the worker exits) or ``runtime`` (a
+    mid-turn failover to ``to_provider`` was refused; the worker keeps
+    retrying its pinned provider).
+    """
     payload = {
+        "stage": stage,
         "provider": provider,
         "model": model or None,
         "rate_limited": bool(rate_limited),
     }
+    if to_provider:
+        payload["to_provider"] = to_provider
+        payload["to_model"] = to_model or None
     if reason:
         payload["reason"] = str(reason)[:300]
     logger.warning(
-        "PHASE=kanban_worker_route_pin_refused task=%s provider=%s model=%s rate_limited=%s reason=%s",
-        os.environ.get("HERMES_KANBAN_TASK"), provider, model, rate_limited, payload.get("reason"),
+        "PHASE=kanban_worker_route_pin_refused task=%s stage=%s provider=%s model=%s rate_limited=%s reason=%s",
+        os.environ.get("HERMES_KANBAN_TASK"), stage, provider, model, rate_limited, payload.get("reason"),
     )
     return _append_run_event(WORKER_ROUTE_PIN_REFUSED_EVENT, payload)
+
+
+# ---------------------------------------------------------------------------
+# Runtime (mid-turn) failover for a CARD-pinned worker (t_ed0289e3)
+# ---------------------------------------------------------------------------
+
+# ``failure_reason`` a pinned worker's failed result carries when it refused a
+# runtime failover and then ran out of retries on its pinned provider. Mapped
+# to a retry-preserving exit class in ``kanban_worker_exit``.
+PINNED_PROVIDER_FAILURE_REASON = "pinned_provider_unavailable"
+
+_RATE_LIMIT_REASONS = frozenset({"rate_limit", "billing", "upstream_rate_limit"})
+_card_pin_cache: dict = {}
+
+
+def card_pinned_provider() -> Optional[str]:
+    """The provider pinned on THIS worker's card row, else None.
+
+    Only a card pin (``hermes kanban set-model``, persisted in
+    ``tasks.model_override`` / ``provider_override``) counts. A board-wide
+    lane override and a capped-pool dispatch fallback rung ALSO reach the
+    worker as ``--provider``, but the dispatcher applies them to the in-memory
+    claim only and never writes them to the card, so reading the row is what
+    tells a card pin apart from a lane default. Fails open (None) when the
+    board cannot be read: an unreadable pin must not strand a worker without
+    its fallback chain.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id or not _is_owning_worker():
+        return None
+    if task_id in _card_pin_cache:
+        return _card_pin_cache[task_id]
+    provider = None
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_provider_health import model_override
+
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, task_id)
+        finally:
+            conn.close()
+        if task is not None:
+            _model, provider = model_override(task)
+    except Exception:
+        logger.debug("kanban card pin lookup failed for %s", task_id, exc_info=True)
+        return None
+    provider = (provider or "").strip().lower() or None
+    _card_pin_cache[task_id] = provider
+    return provider
+
+
+def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
+    """True when a card-pinned worker must NOT fail over to ``to_provider``.
+
+    Refuses only when (a) the card pins a provider, (b) this run is actually
+    serving on that pin (a dispatch fallback rung may have moved it), and
+    (c) the fallback target is a different provider. Same-provider entries
+    (another model / key on the pinned lane) stay allowed. The first refusal
+    per agent writes one ``worker_route_pin_refused`` run event and marks the
+    agent so a failed result exits retry-preserving
+    (:func:`apply_pin_refusal_to_result`).
+    """
+    pinned = card_pinned_provider()
+    if not pinned:
+        return False
+    primary = getattr(agent, "_primary_runtime", None)
+    primary = primary if isinstance(primary, dict) else {}
+    serving = str(primary.get("provider") or getattr(agent, "provider", "") or "").strip().lower()
+    if serving != pinned:
+        return False
+    if str(to_provider or "").strip().lower() == pinned:
+        return False
+    reason_value = str(getattr(reason, "value", reason) or "") or None
+    if not isinstance(getattr(agent, "_kanban_pin_refused_failover", None), dict):
+        agent._kanban_pin_refused_failover = {
+            "provider": pinned, "to_provider": to_provider, "reason": reason_value,
+        }
+        record_worker_route_pin_refused(
+            provider=pinned, model=getattr(agent, "model", None),
+            reason=reason_value, rate_limited=reason_value in _RATE_LIMIT_REASONS,
+            stage="runtime", to_provider=to_provider, to_model=to_model,
+        )
+    return True
+
+
+def apply_pin_refusal_to_result(agent, result):
+    """Make a pinned worker's failed run requeue instead of counting a failure.
+
+    Applies only when this agent refused a runtime failover, the run failed,
+    the classifier called the failure retryable, and it is not already a
+    retry-preserving class (a quota wall keeps its own reason). A
+    deterministic failure (bad request, context overflow, auth) still exits 1
+    so a broken card cannot requeue forever.
+    """
+    if not isinstance(result, dict) or not result.get("failed"):
+        return result
+    if not isinstance(getattr(agent, "_kanban_pin_refused_failover", None), dict):
+        return result
+    if not result.get("failure_retryable"):
+        return result
+    from hermes_cli.kanban_worker_exit import worker_exit_class
+
+    if worker_exit_class(result.get("failure_reason"), result.get("error", "")) is not None:
+        return result
+    logger.warning(
+        "PHASE=kanban_worker_pin_refused_exit task=%s original_failure_reason=%s",
+        os.environ.get("HERMES_KANBAN_TASK"), result.get("failure_reason"),
+    )
+    result["failure_reason"] = PINNED_PROVIDER_FAILURE_REASON
+    return result

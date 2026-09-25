@@ -15724,6 +15724,7 @@ def detect_crashed_workers(
                 _wall = {
                     "upstream_capacity": "provider capacity overload",
                     "pool_exhausted": "sub pool capped",
+                    "pinned_provider_unavailable": "pinned provider unavailable",
                 }.get(exit_class or "", "quota wall")
                 error_text = (
                     f"pid {pid} exited rate-limited ({_wall}) — "
