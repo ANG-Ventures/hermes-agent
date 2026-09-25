@@ -334,6 +334,37 @@ def _is_word_end(s: str, j: int, *, allow_plural: bool = True) -> bool:
     return False
 
 
+# Test-summary counters (``test-x.sh: PASS=174 FAIL=0``) share the bare
+# ``PASS`` key with MYSQL-style password vars, so _ENV_ASSIGN_RE masked the
+# count (``PASS=*** FAIL=0``) and reviewers read it as a hidden result.
+# Exempt ONLY this shape: key exactly ``PASS``, unquoted all-digit value, and a
+# sibling ``FAIL``/``FAILED``/``FAILURES``/``ERRORS`` numeric counter on the
+# SAME line. Everything else keeps masking: a lone ``PASS=1234`` (could be a
+# PIN), ``DB_PASS``/``PASSWORD``/``PASSWD``, quoted or non-digit values, and a
+# sibling on another line or with a non-numeric value.
+# Value: digits plus at most a few CLOSING punctuation chars that \S+ swallows
+# when the summary ends a sentence or a JSON string (``PASS=174"}``).
+_PASS_COUNTER_VALUE_RE = re.compile(r"\d{1,9}[,;.)\]}\"']{0,4}")
+_FAIL_COUNTER_SIBLING_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:FAIL|FAILED|FAILURES|ERRORS?)=\d+(?![A-Za-z0-9_])"
+)
+
+
+def _is_test_pass_counter(m) -> bool:
+    name, quote, value = m.group(1), m.group(2), m.group(3)
+    if name != "PASS" or quote or not _PASS_COUNTER_VALUE_RE.fullmatch(value):
+        return False
+    s = m.string
+    line_start = s.rfind("\n", 0, m.start()) + 1
+    line_end = s.find("\n", m.end())
+    if line_end == -1:
+        line_end = len(s)
+    return bool(
+        _FAIL_COUNTER_SIBLING_RE.search(s, line_start, m.start())
+        or _FAIL_COUNTER_SIBLING_RE.search(s, m.end(), line_end)
+    )
+
+
 def _key_has_secret_keyword(key: str) -> bool:
     """True if ``key`` contains a secret keyword at a word boundary.
 
@@ -918,6 +949,9 @@ def redact_sensitive_text(
                 # keys (the _ENV_ASSIGN_RE shape) short-circuit to legacy
                 # embedded matching inside the helper.
                 if not _key_has_secret_keyword(name):
+                    return m.group(0)
+                # ``PASS=174 FAIL=0`` test summary, not a password.
+                if _is_test_pass_counter(m):
                     return m.group(0)
                 return f"{name}={quote}{_mask_token(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
