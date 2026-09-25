@@ -64,7 +64,7 @@ Real `git diff --shortstat <merge-base> <branch>` of every revert branch on orig
 
 | card | keys | branch(es) |
 |---|---|---|
-| t_21eb16a1 | #257, #303 | audit/agent/revert-pr257 |
+| t_21eb16a1 | #257, #303 | to build |
 | t_ef01d4bc | #203, #204 | audit/cron_tools/upstream-203 |
 | t_6dd3bc1c | #1052 | audit/agent/upstream-1052 |
 | t_1b907b4d | #1025 | to build |
@@ -111,7 +111,7 @@ Real `git diff --shortstat <merge-base> <branch>` of every revert branch on orig
 | t_603de351 | #276 | to build |
 | t_d22f7e84 | #728 | audit/scripts_misc/upstream-728 |
 | t_a6ed9644 | #1054 | to build |
-| t_5fc4c88d | #806 | audit/agent/revert-pr806 |
+| t_5fc4c88d | #806 | to build |
 | t_cb481e35 | #418 | to build |
 | t_cb481e35 | #220 | to build |
 | t_cb481e35 | #216 | to build |

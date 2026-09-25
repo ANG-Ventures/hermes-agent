@@ -119,7 +119,7 @@ def rollup_md():
     out += ['', '## 3. Upstream PRs to open (one slice card each)', '', '| card | keys | branch(es) |', '|---|---|---|']
     for cd in CARDS:
         if cd['verdict'] == 'UPSTREAM':
-            out.append(f"| {IDS.get(cd['name'], cd['name'])} | {', '.join(cd['keys'])} | {', '.join(cd['branches']) or 'to build'} |")
+            out.append(f"| {IDS.get(cd['name'], cd['name'])} | {', '.join(cd['keys'])} | {', '.join(b for b in cd['branches'] if '/revert-' not in b) or 'to build'} |")
     # conflicts
     led = ledger_sets()
     out += ['', '## 4. Expected reduction in parity-merge conflicts', '',
