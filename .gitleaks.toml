@@ -96,6 +96,9 @@ paths = [
   '''tests/cli/test_show_config_credential\.py''',   # literal MASKED display fixtures "sk-pro...1234"/"sk-pro...5678" (the masking-under-test itself)
   '''tests/tools/test_stage2_hook_api_server_keygen\.py''',  # obviously-fake operator/env key fixtures (operator-env-key-0123456789, env-key-9876543210fedcba)
   '''website/docusaurus\.config\.ts''',             # Algolia DocSearch SEARCH-ONLY apiKey — public by design in every Docusaurus site
+  # Mapped 2026-09-25 (t_899f0539, apps/desktop taken wholesale from upstream; upstream-identical test fixtures):
+  '''apps/desktop/electron/updater/channel\.test\.ts''',        # fake channel identity token 'fedcba0987654321' (updater fixture)
+  '''apps/desktop/scripts/side-by-side\.windows\.test\.mjs''',  # fake channel identity token 'ab12cd34ef56ab78' (side-by-side fixture)
 ]
 # Regex allowlist — SOURCE files keep full scanning EXCEPT public OAuth *client
 # IDs* (client IDs are sent in browser auth flows — public by design, not
