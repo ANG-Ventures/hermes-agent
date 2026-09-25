@@ -15,7 +15,7 @@
    }
   },
   "branch": null,
-  "notes": "Highest-cost row in the tranche (3863 loc, 21 conflict files in all 3 syncs, touches run.py+session.py+slash_commands.py+cli.py+tui_gateway/server.py+15 locales). The /fast half is absorbed. The sticky-reset half is a product preference (keep the /model pin across a manual /new) that is unmeasured (0 fires, no incident) — per README rule that is not a KEEP. Lead/Ace ruling needed on whether the sticky-reset knob (default true) is wanted; if yes, re-port ONLY session-reset preservation as a small patch instead of carrying the 3.8k-line contract layer.",
+  "notes": "Highest-cost row in the tranche (3863 loc, 21 conflict files in all 3 syncs, touches run.py+session.py+slash_commands.py+cli.py+tui_gateway/server.py+15 locales). The /fast half is absorbed. The sticky-reset half is a product preference (keep the /model pin across a manual /new) that is unmeasured (0 fires, no incident) — per README rule that is not a KEEP. Lead/Ace ruling needed on whether the sticky-reset knob (default true) is wanted; if yes, re-port ONLY session-reset preservation as a small patch instead of carrying the 3.8k-line contract layer. | Discord native-slash usage in 2026-05-10..2026-09-25 logs (`slash '/X' invoked`): /model 330, /stop 266, /reset 42, /compress 34, /steer 24, /reasoning 19, /undo 2, /redo 0, /branch 0, /merge 0, /fast 0 (text-typed commands are not logged).",
   "subject": "fix(gateway): make fast route-aware and preserve manual reset preferences (#315)"
  },
  "#49": {
@@ -25,7 +25,7 @@
    "original": "feature PRD/spec (docs/specs/undo-redo-half-turn-*.md); no incident",
    "upstream_state": "GREEN-partial (read-only: upstream has single-turn /undo — _handle_undo_command@gateway/slash_commands_session.py:431, undo_last@hermes_cli/cli_session_mixin.py:762, _cmd_undo@tui_gateway/methods_tools.py:834; no /redo, no half-turn walk, no hermes_undo.py)",
    "upstream_fix": "upstream's own /undo (pre-existing); redo never adopted upstream",
-   "fires": "0 in 2026-05-10..2026-09-25 (16 literals incl. the success lines 'undo operation(s) (' / 'message(s) restored).' — nobody ran /undo or /redo on any gateway in 4.5 months of retained logs)",
+   "fires": "0 in 2026-05-10..2026-09-25 by log literal; Discord native-slash usage in 2026-05-10..2026-09-25 logs (`slash '/X' invoked`): /model 330, /stop 266, /reset 42, /compress 34, /steer 24, /reasoning 19, /undo 2, /redo 0, /branch 0, /merge 0, /fast 0 (text-typed commands are not logged).",
    "cost": {
     "loc": 3007,
     "conflict_files": 9,
@@ -34,7 +34,7 @@
    }
   },
   "branch": null,
-  "notes": "Feature never used in production (0 of 16 literals hit across 540 log files incl. success messages). 3007 loc, 9 conflict files (3 syncs), fork-only hermes_undo.py. Dependents: #353 #339 #356 (undo follow-ups) — revert together. Revert-branch attempt recorded in the branch pass at the end (see gateway.md footer). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Feature never used in production (0 of 16 literals hit across 540 log files incl. success messages). 3007 loc, 9 conflict files (3 syncs), fork-only hermes_undo.py. Dependents: #353 #339 #356 (undo follow-ups) — revert together. Revert-branch attempt recorded in the branch pass at the end (see gateway.md footer). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: /undo WAS used twice via Discord native slash (2026-09-15); /redo never. Verdict stands (take upstream's single-turn /undo; half-turn walk + /redo unused) but the revert is a hand port: 19 conflicted files. Left for continuation card.",
   "subject": "feat: reversible half-turn /undo + /redo across CLI, gateway, TUI (#49)"
  },
  "#157": {
@@ -129,7 +129,7 @@
    }
   },
   "branch": null,
-  "notes": "Take upstream's /branch. /merge is fork-only, unmeasured; if anyone uses it, re-port as a standalone slash mixin. 1719 loc, 5 conflict files (3 syncs), 15 locale files.",
+  "notes": "Take upstream's /branch. /merge is fork-only, unmeasured; if anyone uses it, re-port as a standalone slash mixin. 1719 loc, 5 conflict files (3 syncs), 15 locale files. | Discord native-slash usage in 2026-05-10..2026-09-25 logs (`slash '/X' invoked`): /model 330, /stop 266, /reset 42, /compress 34, /steer 24, /reasoning 19, /undo 2, /redo 0, /branch 0, /merge 0, /fast 0 (text-typed commands are not logged).",
   "subject": "feat: /branch spawns a Discord thread; /merge folds a session summary into any session (#221)"
  },
  "#782": {
@@ -281,7 +281,7 @@
    }
   },
   "branch": null,
-  "notes": "Dormant flag never enabled (0 fires in 4.5 months); desktop is D9 upstream-owned and upstream has its own session_auto_continue. 1272 loc, 3 conflict files (3 syncs). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Dormant flag never enabled (0 fires in 4.5 months); desktop is D9 upstream-owned and upstream has its own session_auto_continue. 1272 loc, 3 conflict files (3 syncs). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: revert conflicts in 3 files, 14 hunks, ~10.8k diff lines; the flag has since spread to tui_gateway/methods_session.py and config_defaults.py. Hand-built revert left for continuation card.",
   "subject": "feat(tui): desktop/TUI session auto-resume after backend restart (dormant flag) (#229)"
  },
  "#228": {
@@ -627,7 +627,7 @@
   "subject": "fix(gateway): move the deferred-restart arm off the event loop (ratchet 37 -> 26) (#832)"
  },
  "#80": {
-  "verdict": "DROP",
+  "verdict": "UNRESOLVED",
   "problem": "F2 restart-loop breaker needed an authoritative restart-initiator breadcrumb",
   "evidence": {
    "original": "PR body (breaker design)",
@@ -642,7 +642,7 @@
    }
   },
   "branch": null,
-  "notes": "Breadcrumbs are written and swept every boot but the breaker never tripped; upstream's restart_loop_guard (also present in fork, extended by #761/#906) covers the loop case. Revert with #70/#72/#86 as one unit. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
   "subject": "fix(gateway): authoritative restart-initiator breadcrumb for F2 breaker (#80)"
  },
  "#616": {
@@ -665,7 +665,7 @@
   "subject": "fix(tui-gateway): interrupt turns after websocket disconnect (#616)"
  },
  "#70": {
-  "verdict": "DROP",
+  "verdict": "UNRESOLVED",
   "problem": "restart-cascade replay loop (F1 drain-mark + F2 circuit breaker)",
   "evidence": {
    "original": "PR body (2026-06-21 cascade)",
@@ -680,7 +680,7 @@
    }
   },
   "branch": null,
-  "notes": "Predates upstream's breaker by 10 days; both now coexist in the fork. Revert unit: #70 #72 #80 #86 (+ nopr:0f64a3653b, #7536 stuck-loop counter rows follow). 701 loc, 2 conflict files. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
   "subject": "fix(gateway): break the restart-cascade replay loop (F1 drain-mark + F2 circuit-breaker) (#70)"
  },
  "#814": {
@@ -775,7 +775,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows #49 (DROP). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Follows #49 (DROP). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: /undo WAS used twice via Discord native slash (2026-09-15); /redo never. Verdict stands (take upstream's single-turn /undo; half-turn walk + /redo unused) but the revert is a hand port: 19 conflicted files. Left for continuation card.",
   "subject": "fix(undo): stop /undo·/redo reporting a false 'Nothing to undo.' on a swallowed error (#353)"
  },
  "#557": {
@@ -1178,7 +1178,7 @@
   "subject": "fix(kanban): resolve the wake's participant so an identity-less sub can't mint a phantom session (#562)"
  },
  "#170": {
-  "verdict": "DROP",
+  "verdict": "KEEP",
   "problem": "shared inactivity watchdog polling (refactor)",
   "evidence": {
    "original": "commit body (refactor)",
@@ -1193,7 +1193,7 @@
    }
   },
   "branch": null,
-  "notes": "Refactor with no consumer evidence; fork-only file. 494 loc, 2 conflict files (3 syncs). Revert attempt in branch pass. | BRANCH PASS 2026-09-25: revert-170: conflicts in cron/scheduler.py, gateway/run.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-170: conflicts in cron/scheduler.py, gateway/run.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "CORRECTED DROP -> KEEP in the branch pass: agent/inactivity_watch.py is live, imported by gateway/run.py:68/80 on fork main (the cron consumer has since dropped it). The revert has 5 conflict hunks where main's HEAD side has grown (50-60 lines vs 9-40 in the refactor), so reverting = rewriting evolved watchdog logic back inline in the 40k-line run.py with no evidence of benefit. Cost stays: 1 fork-only module + 2 imports. Lead may re-open if the inactivity watchdog itself is dropped.",
   "subject": "refactor: share inactivity watchdog polling (#170)"
  },
  "#801": {
@@ -1463,7 +1463,7 @@
   "subject": "fix(discord): stop \"is typing…\" orphaned by typing-loop recreate race (#69)"
  },
  "#7536": {
-  "verdict": "DROP",
+  "verdict": "UNRESOLVED",
   "problem": "stuck-loop counter must gate on genuine interruption, not clean drain",
   "evidence": {
    "original": "PR body",
@@ -1478,7 +1478,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows the F1/F2 unit (#70). Verify by reading run_shutdown.py:1830-1840 before revert. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Stuck-loop counter tweaks entangled with the F1/F2 unit (the unit's revert conflicts in tests/gateway/test_stuck_loop*.py). CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
   "subject": "fix(gateway): stuck-loop counter must gate on genuine interruption, not clean drain (#7536)"
  },
  "nopr:2ee2e03b68": {
@@ -1534,8 +1534,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "THE incident row. Generic, measured, reproduced on upstream main. Port = _UnboundedThreadExecutor + admission-floored operator cap + the two tests; touches only run.py (upstream's run.py is 6k lines, fork's 40k — hand rebase, but the diff is ~250 loc).",
+  "branch": "audit/gateway/upstream-936",
+  "notes": "THE incident row. Generic, measured, reproduced on upstream main. Port = _UnboundedThreadExecutor + admission-floored operator cap + the two tests; touches only run.py (upstream's run.py is 6k lines, fork's 40k — hand rebase, but the diff is ~250 loc). | UPSTREAM BRANCH audit/gateway/upstream-936 @ 24f7b7b869 on upstream/main 59004a6235: _TURN_MAX_WORKERS=None + _UnboundedThreadExecutor in gateway/run.py; new tests/gateway/test_turn_pool_unbounded.py; test_executor_pool_isolation.py stops importing the removed constant. Ran: `pytest tests/gateway/test_turn_pool_unbounded.py tests/gateway/test_executor_pool_isolation.py tests/gateway/test_shutdown_executor_quiesce.py tests/gateway/test_cleanup_off_loop.py` -> 18 passed. Mutation _TURN_MAX_WORKERS=10 -> 2 failed (barrier + 41st-body tests). Commit message is the PR body and does not mention the fork. Upstream has no admission-wait control; the message points at max_concurrent_sessions as the bound.",
   "subject": "fix(gateway): remove the turn-body executor cap — admission is the only concurrency control (Ace ruling 2026-09-23 08:47) (#936)"
  },
  "#746": {
@@ -1648,8 +1648,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Opt-in feature with no consumer and no evidence of being enabled. 348 loc. Revert attempt in branch pass. | BRANCH PASS 2026-09-25: revert-129: `git revert` off origin/main conflicts in plugins/platforms/discord/adapter.py (1 file); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-129: `git revert` off origin/main conflicts in plugins/platforms/discord/adapter.py (1 file); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "branch": "audit/gateway/revert-129",
+  "notes": "Opt-in feature, no consumer, 0 fires. REVERT BRANCH audit/gateway/revert-129 @ 0d40277163 off origin/main (hand-resolved 2 conflict hunks in plugins/platforms/discord/adapter.py: kept main's seeded_extra/_skip_env_bridge shape minus the reaction_journal keys; 349 deletions incl. tests/gateway/test_discord_reaction_journal.py). Ran: `pytest tests/gateway/test_discord_connect.py tests/gateway/test_discord_reactions.py` -> 19 passed, 1 failed (test_post_connect_initialization_retries_fingerprint_after_timeout); that test ALSO fails on origin/main (checked out HEAD~1: `1 failed`) so it is pre-existing, not caused by the revert. py_compile OK; rg for reaction_journal/REACTION_JOURNAL/_REACTION_SEQ after revert: 0 hits.",
   "subject": "feat(discord): opt-in raw-reaction journal for durable triage state (#129)"
  },
  "#427": {
@@ -1744,7 +1744,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows #49 (DROP). 18 files (15 locales). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Follows #49 (DROP). 18 files (15 locales). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: /undo WAS used twice via Discord native slash (2026-09-15); /redo never. Verdict stands (take upstream's single-turn /undo; half-turn walk + /redo unused) but the revert is a hand port: 19 conflicted files. Left for continuation card.",
   "subject": "fix(undo): refuse /undo·/redo while a /stop'd turn is still draining (#339)"
  },
  "#759": {
@@ -1820,11 +1820,11 @@
    }
   },
   "branch": null,
-  "notes": "Follows #221.",
+  "notes": "Follows #221. | Discord native-slash usage in 2026-05-10..2026-09-25 logs (`slash '/X' invoked`): /model 330, /stop 266, /reset 42, /compress 34, /steer 24, /reasoning 19, /undo 2, /redo 0, /branch 0, /merge 0, /fast 0 (text-typed commands are not logged).",
   "subject": "feat(merge): summarize only post-branch delta + post note to target's origin (#231)"
  },
  "#72": {
-  "verdict": "DROP",
+  "verdict": "UNRESOLVED",
   "problem": "F2 self-completing-restart-loop gap",
   "evidence": {
    "original": "PR body",
@@ -1839,7 +1839,7 @@
    }
   },
   "branch": null,
-  "notes": "F1/F2 unit with #70 #80 #86. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
   "subject": "fix(gateway): close the F2 self-completing-restart-loop gap (A' record-mark-at-gate + C1 skill detection) (#72)"
  },
  "#256": {
@@ -1934,7 +1934,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows #49 (DROP); touches agent/agent_init.py + turn_context.py — adversary: confirm the empty row is not persisted by upstream's path before revert (a stray empty user row also breaks role alternation). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Follows #49 (DROP); touches agent/agent_init.py + turn_context.py — adversary: confirm the empty row is not persisted by upstream's path before revert (a stray empty user row also breaks role alternation). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: /undo WAS used twice via Discord native slash (2026-09-15); /redo never. Verdict stands (take upstream's single-turn /undo; half-turn walk + /redo unused) but the revert is a hand port: 19 conflicted files. Left for continuation card.",
   "subject": "fix(resume): don't persist an empty user row on auto-resume (the /undo '(no text)' bug) (#356)"
  },
  "#396": {
@@ -1995,7 +1995,7 @@
   "subject": "fix(gateway): record one restart-loop ledger entry per process boot, not per resume scan (#906)"
  },
  "#86": {
-  "verdict": "DROP",
+  "verdict": "UNRESOLVED",
   "problem": "F2 breadcrumb backlog cleanup (config family, contract gate)",
   "evidence": {
    "original": "PR body",
@@ -2010,7 +2010,7 @@
    }
   },
   "branch": null,
-  "notes": "F1/F2 unit. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
   "subject": "feat(gateway): F2 breadcrumb backlog cleanup (config family, contract gate, watcher guardrail) (#86)"
  },
  "#843": {
@@ -2755,7 +2755,7 @@
   "subject": "fix(gateway): boot-resume marker must survive the SENTINEL phase of the recovery turn"
  },
  "nopr:0f64a3653b": {
-  "verdict": "DROP",
+  "verdict": "UNRESOLVED",
   "problem": "successful turns did not reset the stuck-loop restart counter",
   "evidence": {
    "original": "commit body",
@@ -2770,7 +2770,7 @@
    }
   },
   "branch": null,
-  "notes": "F1/F2 stuck-loop unit with #7536 #70. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Stuck-loop counter tweaks entangled with the F1/F2 unit (the unit's revert conflicts in tests/gateway/test_stuck_loop*.py). CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
   "subject": "fix(gateway): successful turns reset the stuck-loop restart counter again"
  },
  "#453": {
@@ -2865,7 +2865,7 @@
    }
   },
   "branch": null,
-  "notes": "Dead code path: #936 replaced _executor_max_workers sizing. Nothing left to revert beyond what #936 already overwrote; fold into #936's upstream port. | BRANCH PASS 2026-09-25: no revert: superseded inside the fork by #936, nothing left to revert; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: no revert: superseded inside the fork by #936, nothing left to revert; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Dead code path: #936 replaced _executor_max_workers sizing. Nothing left to revert beyond what #936 already overwrote; fold into #936's upstream port. | BRANCH PASS 2026-09-25: no revert: superseded inside the fork by #936, nothing left to revert; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: no revert: superseded inside the fork by #936, nothing left to revert; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | No revert branch: #936 already rewrote every line #934 added (_executor_max_workers sizing); nothing independent left to revert. Rolls into #936's upstream port.",
   "subject": "fix(gateway): size the turn-body executor to turn admission — admitted turns queued 2151-2356 s behind a 10-thread pool (Apollo 2026-09-23) (#934)"
  },
  "#904": {
@@ -3021,12 +3021,12 @@
   "subject": "fix(discord): populate parent_chat_id on native slash events in threads (#230)"
  },
  "nopr:4ed79b6dad": {
-  "verdict": "DROP",
+  "verdict": "KEEP",
   "problem": "Telegram network-reconnect ladder not configurable",
   "evidence": {
    "original": "commit body",
-   "upstream_state": "GREEN-equivalent (telegram moved to plugins/platforms/telegram with its own bounded reconnect ladder, adapter.py:414-428); fork path gateway/platforms/telegram.py no longer exists on fork main (PATHS-GONE-FORK)",
-   "upstream_fix": "upstream Telegram plugin migration",
+   "upstream_state": "RED (read-only: upstream hardcodes MAX_NETWORK_RETRIES = 10 @up/plugins/platforms/telegram/adapter.py:2111; fork carries network_retry_max/base_delay/max_delay (default 20/5/120) into plugins/platforms/telegram/adapter.py:807-823/3179-3181 and gateway/config.py:1859)",
+   "upstream_fix": "none",
    "fires": "n/a",
    "cost": {
     "loc": 81,
@@ -3036,7 +3036,7 @@
    }
   },
   "branch": null,
-  "notes": "Dead in fork: target file gone. Only gateway/config.py residue remains. | BRANCH PASS 2026-09-25: revert: conflicts in gateway/config.py, gateway/platforms/telegram.py (deleted on fork main), test file; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert: conflicts in gateway/config.py, gateway/platforms/telegram.py (deleted on fork main), test file; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "CORRECTED DROP -> KEEP in the branch pass: the probe flagged the original path gateway/platforms/telegram.py as gone, but the feature was CARRIED into the Telegram plugin on fork main (the mechanical revert conflicts because of exactly that). Unmeasured (no reconnect-ladder literal counted) -> KEEP-UNPROVEN; generic -> UPSTREAM candidate (config knob on the plugin).",
   "subject": "fix(telegram): make network-reconnect ladder configurable, raise default tolerance"
  },
  "#357": {
@@ -3073,8 +3073,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Measured incident, generic, 77 loc.",
+  "branch": "audit/gateway/upstream-935",
+  "notes": "Measured incident, generic, 77 loc. | UPSTREAM BRANCH audit/gateway/upstream-935 @ 794f2287ec on upstream/main: stderr handler -> hermes_logging._register_queued_handler at gateway/run.py start_gateway; new tests/gateway/test_stderr_log_handler_off_loop.py (AST contract + 1 s blocking-stream behavioral). Ran -> 2 passed; mutation (restore root.addHandler) -> 1 failed, 1 passed.",
   "subject": "fix(gateway): route the stderr log handler through the async QueueListener — a WARNING on the event loop was a synchronous disk write (#935)"
  },
  "#404": {
