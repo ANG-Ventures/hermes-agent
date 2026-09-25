@@ -281,32 +281,6 @@
     ]
   },
   {
-    "feature": "slash commands /undo and /redo (half-turn rewind with redo branch)",
-    "tests": [
-      "tests/test_undo_redo_stack.py",
-      "tests/gateway/test_undo_redo_half_turn.py",
-      "tests/gateway/test_undo_error_honesty.py",
-      "tests/gateway/test_undo_drain_guard.py"
-    ],
-    "paths": [
-      "hermes_undo.py",
-      "hermes_cli/commands.py",
-      "cli.py",
-      "gateway/run.py"
-    ],
-    "why": "Fork-authored half-turn rewind. COMMAND_REGISTRY is the single source every consumer derives from (/help, CLI autocomplete, Telegram command menu, Slack mapping, gateway dispatch), so deleting the two CommandDef rows in a commands.py merge resolution removes /undo and /redo from EVERY surface at once with no import error and no test failure — the shipped undo tests exercise the engine, not the routing. The registry-level canary closes exactly that gap.",
-    "lifecycle": "fork-permanent",
-    "upstream_ref": null,
-    "absorbed_date": null,
-    "surfaces": [
-      "cli",
-      "gateway",
-      "discord",
-      "telegram"
-    ],
-    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py (RED-proven: delete the CommandDef row)"
-  },
-  {
     "feature": "slash command /branch (alias /fork) incl. Discord context-inheriting thread spawn",
     "tests": [
       "tests/cli/test_branch_command.py",
