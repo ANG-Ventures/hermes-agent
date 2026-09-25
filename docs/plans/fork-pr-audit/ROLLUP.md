@@ -188,7 +188,7 @@ Row view: 238/795 ledger-touching rows are DROP/SUPERSEDED; they hold 551/1,727 
 
 ## 8. Slice cards (step 7)
 
-203 cards, all `parents=[t_03e35f0e]` derived-from, all in triage: `lead/created_ids.json`. Each of the 217 non-auto DROP/UPSTREAM
+203 cards, all `parents=[t_03e35f0e]` derived-from, all in triage: `lead/created_ids.json`. Each of the 202 non-auto DROP/UPSTREAM
 rows has its own card (`lead/card_ids.json` + `lead/split_ids.json`; FINAL.md `card` column). Where several rows land in one
 revert branch or one upstream port, each row still has its own card, and the card names the sibling card that carries the
 shared branch. Only two spec-sanctioned exceptions share a card: `auto` tests/docs rows join the card of the code they test
