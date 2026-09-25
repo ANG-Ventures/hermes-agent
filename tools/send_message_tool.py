@@ -168,12 +168,20 @@ def _handle_react(args, remove=False):
     if err:
         return tool_error(err)
     if not chat_id:
-        try:
-            from gateway.config import load_gateway_config
-            chat_id = load_gateway_config().get_home_channel(platform).chat_id
-        except Exception:
-            return tool_error(f"No chat specified and no home channel set for {platform_name}. "
-                              f"Use '{platform_name}:chat_id'.")
+        # Inside a live messaging turn a bare target means the turn's own channel; only
+        # cron/CLI/TUI/desktop/ACP contexts fall back to the platform home channel.
+        state, origin_chat, _origin_thread = _resolve_send_target(platform_name)
+        if state == _SEND_TARGET_ORIGIN:
+            chat_id = origin_chat
+        elif state == _SEND_TARGET_IN_TURN_UNRESOLVABLE:
+            return _origin_unresolvable_error(platform_name)
+        else:
+            try:
+                from gateway.config import load_gateway_config
+                chat_id = load_gateway_config().get_home_channel(platform).chat_id
+            except Exception:
+                return tool_error(f"No chat specified and no home channel set for {platform_name}. "
+                                  f"Use '{platform_name}:chat_id'.")
     # P5(a): same egress-authorization floor as the send path — a reaction is
     # an outbound act against a named destination, so an unattested relay
     # target must be refused here too, not just on `send`.
@@ -233,11 +241,21 @@ def _handle_send(args):
     media_dropped: list = []
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files, dropped=media_dropped)
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
-    used_home_channel = not chat_id
-    if used_home_channel:
-        chat_id, err = _home_chat_id(config, platform, platform_name)
-        if err:
-            return tool_error(err)
+    used_home_channel = used_origin_channel = False
+    if not chat_id:
+        # Inside a live messaging turn a bare target means the turn's own channel (thread kept);
+        # only cron/CLI/TUI/desktop/ACP contexts fall back to the platform home channel.
+        state, origin_chat, origin_thread = _resolve_send_target(platform_name)
+        if state == _SEND_TARGET_ORIGIN:
+            chat_id, used_origin_channel = origin_chat, True
+            thread_id = thread_id or origin_thread
+        elif state == _SEND_TARGET_IN_TURN_UNRESOLVABLE:
+            return _origin_unresolvable_error(platform_name)
+        else:
+            used_home_channel = True
+            chat_id, err = _home_chat_id(config, platform, platform_name)
+            if err:
+                return tool_error(err)
     if duplicate_skip := _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id):
         return json.dumps(duplicate_skip)
     # Slack: resolve user targets to DM channel IDs before sending. _parse_target_ref emits internal
@@ -276,6 +294,8 @@ def _handle_send(args):
         if isinstance(result, dict) and result.get("success"):
             if used_home_channel:
                 result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
+            elif used_origin_channel:
+                result["note"] = f"Sent to the current {platform_name} channel (chat_id: {chat_id})"
             if mirror_text and _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id):
                 result["mirrored"] = True
             if media_dropped:
@@ -752,6 +772,115 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 import re  # noqa: F401,E402
 import time  # noqa: F401,E402
 
+# ---------------------------------------------------------------------------
+# Origin-aware target resolution (fixes the silent home-channel leak)
+# ---------------------------------------------------------------------------
+# A send_message / react call with NO explicit chat target used to fall back to the
+# platform's global home channel. That is right for cron/CLI/standalone sends, but inside a
+# live MESSAGING turn the destination is the channel the turn is happening in: a mid-turn
+# update from a non-home channel otherwise leaks into the home channel (sometimes on a
+# different platform).
+#
+# Resolution is a single tri-state so the home arm is structurally unreachable
+# when a messaging origin is bound:
+#   ORIGIN              -> a messaging turn is live; route to its own channel
+#   IN_TURN_UNRESOLVABLE -> messaging turn live but origin not resolvable -> ERROR
+#   NOT_IN_TURN         -> no messaging origin (cron/CLI/TUI/desktop/ACP) -> home
+
+_SEND_TARGET_ORIGIN = "origin"
+_SEND_TARGET_IN_TURN_UNRESOLVABLE = "in_turn_unresolvable"
+_SEND_TARGET_NOT_IN_TURN = "not_in_turn"
+
+
+def _has_messaging_origin() -> bool:
+    """True only when a real messaging platform is bound for this turn.
+
+    Deliberately narrower than ``approval._is_gateway_approval_context()``: the
+    TUI/desktop/ACP gateways set ``HERMES_GATEWAY_SESSION`` (process env) WITHOUT
+    binding a messaging platform (``set_session_vars(session_key=…)`` leaves the
+    platform empty), so that helper would flag them as interactive and turn a
+    legitimate bare→home send into a hard error. The correct gate is "is a
+    messaging platform bound?" — i.e. a non-empty session platform — excluding
+    cron (which sets HERMES_CRON_SESSION and clears the platform).
+    """
+    try:
+        from utils import env_var_enabled
+        if env_var_enabled("HERMES_CRON_SESSION"):
+            return False
+        from tools.approval_context import _get_session_platform
+        return bool(_get_session_platform())
+    except Exception:
+        # Fail toward today's behavior (no messaging origin -> home fallback),
+        # never toward an in-turn error that could swallow a legitimate send.
+        return False
+
+
+def _interactive_origin(platform_name):
+    """Resolve the current turn's own (chat_id, thread_id) for ``platform_name``.
+
+    Reads the task-local HERMES_SESSION_* ContextVars the gateway binds per turn
+    (concurrency-safe — see gateway/session_context.py). Returns ``None`` when
+    no same-platform origin can be determined (e.g. the turn is on a different
+    platform than the one being sent to).
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    sess_platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+    want = (platform_name or "").strip().lower()
+
+    # Same-platform origin from the directly-bound chat id.
+    if sess_platform and sess_platform == want:
+        chat_id = (get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+        thread_id = (get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip() or None
+        if chat_id:
+            return (chat_id, thread_id)
+
+    # Fallback: parse the session key (same parse the gateway's background
+    # delivery path uses) when the chat-id env wasn't populated.
+    try:
+        from tools.approval_context import get_current_session_key
+        from gateway.run import _parse_session_key
+        parsed = _parse_session_key(get_current_session_key("") or "")
+        if parsed and (parsed.get("platform") or "").strip().lower() == want:
+            chat_id = (parsed.get("chat_id") or "").strip()
+            if chat_id:
+                thread_id = (parsed.get("session_id") or "").strip() or None
+                return (chat_id, thread_id)
+    except Exception:
+        pass
+
+    return None
+
+
+def _resolve_send_target(platform_name):
+    """Tri-state resolver for a bare (no explicit chat) send/react.
+
+    Returns ``(state, chat_id, thread_id)`` where ``state`` is one of the
+    ``_SEND_TARGET_*`` constants. The home-channel lookup is the caller's job and
+    only runs on ``NOT_IN_TURN`` — there is NO path where a live messaging turn
+    with an unresolvable target reaches the home channel.
+    """
+    if not _has_messaging_origin():
+        return (_SEND_TARGET_NOT_IN_TURN, None, None)
+    origin = _interactive_origin(platform_name)
+    if origin is not None:
+        return (_SEND_TARGET_ORIGIN, origin[0], origin[1])
+    return (_SEND_TARGET_IN_TURN_UNRESOLVABLE, None, None)
+
+
+def _origin_unresolvable_error(platform_name):
+    """Actionable error for a bare in-turn send whose origin can't be resolved."""
+    return tool_error(
+        f"No target chat specified and the current channel could not be resolved "
+        f"for {platform_name}. To reply to the channel you're in, just return your "
+        f"message as the reply (don't call send_message). To send elsewhere, use "
+        f"'{platform_name}:CHANNEL'."
+    )
+
+
 SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
     "description": (
@@ -759,8 +888,11 @@ SEND_MESSAGE_SCHEMA = {
         "IMPORTANT: When the user asks to send to a specific channel or person "
         "(not just a bare platform name), call send_message(action='list') FIRST to see "
         "available targets, then send to the correct one.\n"
-        "If the user just says a platform name like 'send to telegram', send directly "
-        "to the home channel without listing first."
+        "Do NOT use send_message to reply to the channel you are already in — just return "
+        "your message as the turn reply. Inside a live messaging turn, omitting the target "
+        "sends to the CURRENT channel (not the home channel); a bare platform name "
+        "(e.g. 'telegram') only falls back to the home channel from non-interactive "
+        "contexts like cron or the CLI."
     ),
     "parameters": {
         "type": "object",
@@ -772,7 +904,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Format: 'platform' (bare platform name — sends to the CURRENT channel inside a live messaging turn, or the home channel from cron/CLI), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
