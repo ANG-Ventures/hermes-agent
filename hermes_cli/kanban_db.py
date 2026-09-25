@@ -9439,17 +9439,24 @@ def _pin_file_agrees(a: Path, b: Path) -> bool:
     return identity_a is not None and identity_a == identity_b and tail_a == tail_b
 
 
-def _unknown_owner_may_claim(candidate: Path, stored: Path) -> bool:
-    """A missing stored path may only add a refusal, never admit deletion."""
+def _spelling_fold(path: Path) -> str:
+    """Lexical spelling fold: NFC, casefold, and the macOS Data firmlink.
+
+    Only ever used to ADD a match that forces stricter validation (or a
+    refusal); never as proof that two paths are the same object.
+    """
     import unicodedata
 
-    def fold(path: Path) -> str:
-        name = unicodedata.normalize("NFC", str(path)).casefold()
-        prefix = "/system/volumes/data"
-        if name.startswith(prefix + "/"):
-            name = name[len(prefix):]
-        return name.rstrip("/")
+    name = unicodedata.normalize("NFC", str(path)).casefold()
+    prefix = "/system/volumes/data"
+    if name.startswith(prefix + "/"):
+        name = name[len(prefix):]
+    return name.rstrip("/") or "/"
 
+
+def _unknown_owner_may_claim(candidate: Path, stored: Path) -> bool:
+    """A missing stored path may only add a refusal, never admit deletion."""
+    fold = _spelling_fold
     a, b = fold(candidate), fold(stored)
     return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
@@ -13093,6 +13100,36 @@ class _WorkspaceAdmission:
     mount_path: Path
 
 
+def _lexical_root_anchor(path: Path, root: Path) -> Optional[Path]:
+    """The lexical ancestor of ``path`` that names ``root`` in any spelling.
+
+    Walks ``path``'s own (unresolved) ancestors, so a symlinked alias is still
+    visible to the caller's escape check. An ancestor matches when it is the
+    same existing filesystem object as ``root`` (kernel resolves case, Unicode
+    and firmlink aliases) or, when either side is missing (lost mount), when
+    its spelling folds to the same string. Both only widen the set of rows
+    that get full mount validation, so the fold fails closed.
+    """
+    target = _spelling_fold(root)
+    root_identity = _path_identity(root)
+    for ancestor in (path, *path.parents):
+        if _spelling_fold(ancestor) == target:
+            return ancestor
+        if root_identity is not None and _path_identity(ancestor) == root_identity:
+            return ancestor
+    return None
+
+
+def _recorded_root_alias(root: Path, roots: dict) -> Optional[Path]:
+    """The recorded mount-root row that ``root`` aliases, if any."""
+    if root in roots:
+        return root
+    for recorded in roots:
+        if _spelling_fold(recorded) == _spelling_fold(root) or _same_path(recorded, root):
+            return recorded
+    return None
+
+
 def _validate_workspace_admission(
     task: Task, *, board: Optional[str] = None, conn=None, dry_run=False,
 ) -> Optional[_WorkspaceAdmission]:
@@ -13110,6 +13147,15 @@ def _validate_workspace_admission(
         for row in conn.execute("SELECT root, mount_path FROM workspace_mount_roots")
     }
     if root is not None and require_mount:
+        # A config root spelled differently from its recorded row (case, NFD,
+        # firmlink) is still that row: keep its admitted mount anchor so an
+        # unmounted root cannot fall through to a still-mounted parent.
+        recorded = _recorded_root_alias(root, roots)
+        if recorded is not None and recorded != root:
+            raise WorkspaceUnavailable(
+                f"workspaces_root_invalid: configured root {root} is an alias "
+                f"of recorded root {recorded}; use the recorded spelling"
+            )
         expected_mount = roots.get(root)
         mount_path = validate_mount(root, expected_mount=expected_mount)
         if expected_mount is None:
@@ -13137,12 +13183,26 @@ def _validate_workspace_admission(
         ):
             path_resolved = resolved(path)
             protected_resolved = resolved(protected)
-            if path.is_relative_to(protected) or path_resolved.is_relative_to(protected_resolved):
+            # Spelling-blind root match (t_800d50d2): Path.resolve() keeps
+            # case, NFC/NFD and the /System/Volumes/Data firmlink spelling, so
+            # a string compare alone lets an aliased row skip mount policy.
+            anchor = _lexical_root_anchor(path, protected)
+            if (
+                anchor is not None
+                or path_resolved.is_relative_to(protected_resolved)
+                or _same_tree(path, protected)
+            ):
                 validate_mount(protected, expected_mount=mount_path)
-                if not path.is_relative_to(protected) or path_resolved != path.absolute():
+                if anchor is None:
+                    # Reaches the root only through a symlink.
                     raise WorkspaceUnavailable("workspaces_root_invalid: workspace symlink escape")
-                validate_target(protected, path)
-                validate_persisted(path)
+                # Re-spell the task path under the recorded root; every later
+                # check then runs on the canonical spelling.
+                canonical = protected.joinpath(*path.parts[len(anchor.parts):])
+                if resolved(anchor) != anchor.absolute() or resolved(canonical) != canonical.absolute():
+                    raise WorkspaceUnavailable("workspaces_root_invalid: workspace symlink escape")
+                validate_target(protected, canonical)
+                validate_persisted(canonical)
                 return _WorkspaceAdmission(protected, mount_path)
     elif task.workspace_kind in (None, "scratch"):
         target = workspaces_root(board=board) / task.id
