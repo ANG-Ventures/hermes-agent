@@ -54,6 +54,7 @@ from agent.model_metadata import (
     estimate_request_tokens_rough,
 )
 from agent.tool_dispatch_helpers import _degrade_prior_turn_multimodal_messages
+from agent.turn_handoff import consume_handoff_context
 
 logger = logging.getLogger(__name__)
 
@@ -601,6 +602,15 @@ def build_turn_context(
     # new episode by definition, so clear it unconditionally here — before the
     # restore path can early-return — so a genuinely new failover always announces.
     agent._last_fallback_announced = None
+    # Quota verdicts are snapshot-derived and therefore turn-scoped. Cached
+    # gateway agents must reconsider the configured chain each turn so a sub
+    # whose five-hour window recovered is not permanently amputated.
+    try:
+        from agent.quota_registry_gate import reset_quota_gate_turn_state
+
+        reset_quota_gate_turn_state(agent)
+    except Exception:
+        logger.debug("Could not reset quota-gate turn state", exc_info=True)
     try:
         from agent.shared_transport_guard import reset_turn_state
 
@@ -1673,6 +1683,31 @@ def build_turn_context(
                 plugin_user_context + "\n\n" + _gateway_notes
                 if plugin_user_context
                 else _gateway_notes
+            )
+
+    # A prior turn cut by an unrecoverable provider failure left a durable
+    # handoff (tool calls issued, their results, half-written text, open
+    # todos). Inject it on this turn and consume it, so the user does not
+    # reconstruct the cut turn from chat scrollback. Rides the same
+    # user-message injection channel as plugin/gateway context so the
+    # ephemeral system prompt stays byte-stable. See agent.turn_handoff.
+    _turn_handoff_context = consume_handoff_context(agent)
+    if _turn_handoff_context:
+        _hc_turn_content = (
+            messages[current_turn_user_idx].get("content")
+            if 0 <= current_turn_user_idx < len(messages)
+            and isinstance(messages[current_turn_user_idx], dict)
+            else None
+        )
+        if isinstance(_hc_turn_content, list):
+            append_notes_to_multimodal_content(
+                _hc_turn_content, _turn_handoff_context
+            )
+        else:
+            plugin_user_context = (
+                plugin_user_context + "\n\n" + _turn_handoff_context
+                if plugin_user_context
+                else _turn_handoff_context
             )
 
     # Per-turn file-mutation verifier state.
