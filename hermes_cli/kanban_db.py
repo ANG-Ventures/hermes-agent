@@ -18171,6 +18171,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Union[int, Mapping[str, Any], None] = None,
     spawn_paused: Optional[str] = None,
+    spawn_limit: Optional[int] = None,
     reconcile_orphans: bool = True,
     budget_cache: Optional[dict] = None,
 ) -> DispatchResult:
@@ -18209,6 +18210,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             spawn_paused=spawn_paused,
+            spawn_limit=spawn_limit,
             reconcile_orphans=reconcile_orphans,
             pr_gate_prefetch=pr_gate_prefetch,
             budget_cache=budget_cache,
@@ -18235,6 +18237,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 spawn_paused=spawn_paused,
+                spawn_limit=spawn_limit,
                 reconcile_orphans=reconcile_orphans,
                 pr_gate_prefetch=pr_gate_prefetch,
                 budget_cache=budget_cache,
@@ -18306,6 +18309,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Union[int, Mapping[str, Any], None] = None,
     spawn_paused: Optional[str] = None,
+    spawn_limit: Optional[int] = None,
     reconcile_orphans: bool = True,
     pr_gate_prefetch=None,
     budget_cache: Optional[dict] = None,
@@ -18549,6 +18553,15 @@ def _dispatch_once_locked(
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
+
+    # Load-gate allowance (kanban.dispatch_load_gate, see kanban_load_gate):
+    # the per-tick number of NEW workers the host can absorb given current
+    # load plus the not-yet-visible ramp of recent spawns. Intersects with
+    # every concurrency cap above; it never raises a budget.
+    if spawn_limit is not None:
+        _limit = max(0, int(spawn_limit))
+        if spawn_budget is None or spawn_budget > _limit:
+            spawn_budget = _limit
 
     # Memory-pressure guard (OOF-30/OOF-77): even a well-chosen static cap
     # can't see the host's actual memory state (other tenants, bloated
@@ -20414,6 +20427,7 @@ def run_daemon(
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
+    load_gate=None,
 ) -> None:
     """Run the dispatcher in a loop until interrupted.
 
@@ -20426,6 +20440,11 @@ def run_daemon(
     the memory-derived default) exactly like the gateway-embedded
     dispatcher and ``hermes kanban dispatch`` — the standalone daemon must
     not be the one uncapped entry point (OOF-30).
+
+    ``load_gate`` (a :class:`kanban_load_gate.LoadGate`) applies the same
+    projected-load admission + per-tick burst cap the gateway-embedded
+    dispatcher uses; ``hermes kanban daemon`` builds it from
+    ``kanban.dispatch_load_gate``. ``None`` = ungated (test hook default).
     """
     import signal
     import threading
@@ -20460,13 +20479,20 @@ def run_daemon(
             max_in_progress = resolve_max_in_progress(
                 configured_max_in_progress()
             )
+            gate_kwargs: dict = {}
+            if load_gate is not None:
+                allowance, reason = load_gate.admit_now()
+                gate_kwargs = {"spawn_paused": reason, "spawn_limit": allowance}
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    **gate_kwargs,
                 )
+            if load_gate is not None:
+                load_gate.finish_tick(len(res.spawned or []), logger=_log)
             if on_tick is not None:
                 try:
                     on_tick(res)
