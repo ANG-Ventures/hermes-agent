@@ -293,7 +293,7 @@ class LoadGate:
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(self.snapshot(), sort_keys=True))
+            tmp.write_text(json.dumps(self.snapshot(), sort_keys=True), encoding="utf-8")
             os.replace(tmp, path)
         except OSError:
             try:
@@ -334,7 +334,7 @@ def state_path() -> Path:
 def read_state(path: "Optional[os.PathLike[str] | str]" = None) -> Optional[dict]:
     try:
         p = Path(path) if path is not None else state_path()
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
     return data if isinstance(data, dict) else None
