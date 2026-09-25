@@ -705,9 +705,56 @@ def contains_launchctl_submit_command(command: str) -> bool:
         index = _executed_command_index(segment)
         if index is not None and _executable_name(segment[index]) == "launchctl":
             arguments = segment[index + 1 :]
-            if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
+            if arguments and arguments[0].lower() == "submit":
+                return True
+            if arguments and arguments[0].lower() == "bootstrap" \
+                    and not _bootstrap_targets_readable_non_gateway_plist(arguments[1:]):
                 return True
     return False
+
+
+# A plist bigger than this is not read (bootstrap of it stays blocked).
+_MAX_BOOTSTRAP_PLIST_BYTES = 256 * 1024
+
+
+def _bootstrap_targets_readable_non_gateway_plist(arguments: list[str]) -> bool:
+    """True when ``launchctl bootstrap <domain> <plist>...`` loads only plists that already exist
+    and are provably not a gateway job.
+
+    For a NEW job the label is attacker-chosen, so submit/bootstrap are refused label-independently.
+    A plist already on disk is different: launchd reads ``Label`` from that file, so it is a fact.
+    Every plist must be a readable regular file (<= 256 KiB) that parses, whose ``Label`` is not a
+    gateway label and whose Program/ProgramArguments do not mention one. Anything else -- missing,
+    unreadable, unparseable, an unexpanded shell value, no plist argument -- keeps the block."""
+    import plistlib
+    import stat as _stat
+
+    plists = arguments[1:] if arguments else []
+    if not plists or any("$" in a or "`" in a for a in arguments):
+        return False
+    for raw in plists:
+        path = _expand_candidate_path(raw)
+        if path is None:
+            return False
+        try:
+            st = path.stat()
+            if not _stat.S_ISREG(st.st_mode) or st.st_size > _MAX_BOOTSTRAP_PLIST_BYTES:
+                return False
+            with open(path, "rb") as fh:
+                data = plistlib.load(fh)
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        label = data.get("Label")
+        if not isinstance(label, str) or not label.strip() or _HERMES_GATEWAY_LABEL_RE.search(label):
+            return False
+        program = [data.get("Program") or ""] + list(data.get("ProgramArguments") or [])
+        joined = " ".join(str(p) for p in program)
+        if _HERMES_GATEWAY_LABEL_RE.search(joined) or contains_gateway_lifecycle_command(joined) \
+                or re.search(r"(?i)\\bhermes\\b[^\\n]*\\bgateway\\b", joined):
+            return False
+    return True
 
 
 def _mask_data_sink_arguments(text: str) -> str:
