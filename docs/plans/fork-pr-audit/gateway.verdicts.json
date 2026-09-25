@@ -34,7 +34,7 @@
    }
   },
   "branch": null,
-  "notes": "Feature never used in production (0 of 16 literals hit across 540 log files incl. success messages). 3007 loc, 9 conflict files (3 syncs), fork-only hermes_undo.py. Dependents: #353 #339 #356 (undo follow-ups) — revert together. Revert-branch attempt recorded in the branch pass at the end (see gateway.md footer). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Feature never used in production (0 of 16 literals hit across 540 log files incl. success messages). 3007 loc, 9 conflict files (3 syncs), fork-only hermes_undo.py. Dependents: #353 #339 #356 (undo follow-ups) — revert together. Revert-branch attempt recorded in the branch pass at the end (see gateway.md footer). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "feat: reversible half-turn /undo + /redo across CLI, gateway, TUI (#49)"
  },
  "#157": {
@@ -281,7 +281,7 @@
    }
   },
   "branch": null,
-  "notes": "Dormant flag never enabled (0 fires in 4.5 months); desktop is D9 upstream-owned and upstream has its own session_auto_continue. 1272 loc, 3 conflict files (3 syncs). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Dormant flag never enabled (0 fires in 4.5 months); desktop is D9 upstream-owned and upstream has its own session_auto_continue. 1272 loc, 3 conflict files (3 syncs). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "feat(tui): desktop/TUI session auto-resume after backend restart (dormant flag) (#229)"
  },
  "#228": {
@@ -642,7 +642,7 @@
    }
   },
   "branch": null,
-  "notes": "Breadcrumbs are written and swept every boot but the breaker never tripped; upstream's restart_loop_guard (also present in fork, extended by #761/#906) covers the loop case. Revert with #70/#72/#86 as one unit. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Breadcrumbs are written and swept every boot but the breaker never tripped; upstream's restart_loop_guard (also present in fork, extended by #761/#906) covers the loop case. Revert with #70/#72/#86 as one unit. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(gateway): authoritative restart-initiator breadcrumb for F2 breaker (#80)"
  },
  "#616": {
@@ -680,7 +680,7 @@
    }
   },
   "branch": null,
-  "notes": "Predates upstream's breaker by 10 days; both now coexist in the fork. Revert unit: #70 #72 #80 #86 (+ nopr:0f64a3653b, #7536 stuck-loop counter rows follow). 701 loc, 2 conflict files. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Predates upstream's breaker by 10 days; both now coexist in the fork. Revert unit: #70 #72 #80 #86 (+ nopr:0f64a3653b, #7536 stuck-loop counter rows follow). 701 loc, 2 conflict files. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(gateway): break the restart-cascade replay loop (F1 drain-mark + F2 circuit-breaker) (#70)"
  },
  "#814": {
@@ -775,7 +775,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows #49 (DROP). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Follows #49 (DROP). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(undo): stop /undo·/redo reporting a false 'Nothing to undo.' on a swallowed error (#353)"
  },
  "#557": {
@@ -1193,7 +1193,7 @@
    }
   },
   "branch": null,
-  "notes": "Refactor with no consumer evidence; fork-only file. 494 loc, 2 conflict files (3 syncs). Revert attempt in branch pass. | BRANCH PASS 2026-09-25: revert-170: conflicts in cron/scheduler.py, gateway/run.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Refactor with no consumer evidence; fork-only file. 494 loc, 2 conflict files (3 syncs). Revert attempt in branch pass. | BRANCH PASS 2026-09-25: revert-170: conflicts in cron/scheduler.py, gateway/run.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-170: conflicts in cron/scheduler.py, gateway/run.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "refactor: share inactivity watchdog polling (#170)"
  },
  "#801": {
@@ -1478,7 +1478,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows the F1/F2 unit (#70). Verify by reading run_shutdown.py:1830-1840 before revert. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Follows the F1/F2 unit (#70). Verify by reading run_shutdown.py:1830-1840 before revert. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(gateway): stuck-loop counter must gate on genuine interruption, not clean drain (#7536)"
  },
  "nopr:2ee2e03b68": {
@@ -1649,7 +1649,7 @@
    }
   },
   "branch": null,
-  "notes": "Opt-in feature with no consumer and no evidence of being enabled. 348 loc. Revert attempt in branch pass. | BRANCH PASS 2026-09-25: revert-129: `git revert` off origin/main conflicts in plugins/platforms/discord/adapter.py (1 file); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Opt-in feature with no consumer and no evidence of being enabled. 348 loc. Revert attempt in branch pass. | BRANCH PASS 2026-09-25: revert-129: `git revert` off origin/main conflicts in plugins/platforms/discord/adapter.py (1 file); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-129: `git revert` off origin/main conflicts in plugins/platforms/discord/adapter.py (1 file); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "feat(discord): opt-in raw-reaction journal for durable triage state (#129)"
  },
  "#427": {
@@ -1744,7 +1744,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows #49 (DROP). 18 files (15 locales). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Follows #49 (DROP). 18 files (15 locales). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(undo): refuse /undo·/redo while a /stop'd turn is still draining (#339)"
  },
  "#759": {
@@ -1839,7 +1839,7 @@
    }
   },
   "branch": null,
-  "notes": "F1/F2 unit with #70 #80 #86. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "F1/F2 unit with #70 #80 #86. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(gateway): close the F2 self-completing-restart-loop gap (A' record-mark-at-gate + C1 skill detection) (#72)"
  },
  "#256": {
@@ -1934,7 +1934,7 @@
    }
   },
   "branch": null,
-  "notes": "Follows #49 (DROP); touches agent/agent_init.py + turn_context.py — adversary: confirm the empty row is not persisted by upstream's path before revert (a stray empty user row also breaks role alternation). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Follows #49 (DROP); touches agent/agent_init.py + turn_context.py — adversary: confirm the empty row is not persisted by upstream's path before revert (a stray empty user row also breaks role alternation). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(resume): don't persist an empty user row on auto-resume (the /undo '(no text)' bug) (#356)"
  },
  "#396": {
@@ -2010,7 +2010,7 @@
    }
   },
   "branch": null,
-  "notes": "F1/F2 unit. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "F1/F2 unit. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "feat(gateway): F2 breadcrumb backlog cleanup (config family, contract gate, watcher guardrail) (#86)"
  },
  "#843": {
@@ -2770,7 +2770,7 @@
    }
   },
   "branch": null,
-  "notes": "F1/F2 stuck-loop unit with #7536 #70. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "F1/F2 stuck-loop unit with #7536 #70. | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit F1/F2 (#70 #72 #80 #86 #7536 nopr:0f64a3653b): conflicts in gateway/run.py + 2 stuck-loop test files; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(gateway): successful turns reset the stuck-loop restart counter again"
  },
  "#453": {
@@ -2865,7 +2865,7 @@
    }
   },
   "branch": null,
-  "notes": "Dead code path: #936 replaced _executor_max_workers sizing. Nothing left to revert beyond what #936 already overwrote; fold into #936's upstream port. | BRANCH PASS 2026-09-25: no revert: superseded inside the fork by #936, nothing left to revert; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Dead code path: #936 replaced _executor_max_workers sizing. Nothing left to revert beyond what #936 already overwrote; fold into #936's upstream port. | BRANCH PASS 2026-09-25: no revert: superseded inside the fork by #936, nothing left to revert; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: no revert: superseded inside the fork by #936, nothing left to revert; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(gateway): size the turn-body executor to turn admission — admitted turns queued 2151-2356 s behind a 10-thread pool (Apollo 2026-09-23) (#934)"
  },
  "#904": {
@@ -3036,7 +3036,7 @@
    }
   },
   "branch": null,
-  "notes": "Dead in fork: target file gone. Only gateway/config.py residue remains. | BRANCH PASS 2026-09-25: revert: conflicts in gateway/config.py, gateway/platforms/telegram.py (deleted on fork main), test file; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
+  "notes": "Dead in fork: target file gone. Only gateway/config.py residue remains. | BRANCH PASS 2026-09-25: revert: conflicts in gateway/config.py, gateway/platforms/telegram.py (deleted on fork main), test file; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert: conflicts in gateway/config.py, gateway/platforms/telegram.py (deleted on fork main), test file; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad).",
   "subject": "fix(telegram): make network-reconnect ladder configurable, raise default tolerance"
  },
  "#357": {
