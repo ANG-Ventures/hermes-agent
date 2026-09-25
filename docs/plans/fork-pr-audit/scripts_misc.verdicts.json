@@ -38,7 +38,7 @@
   "verdict": "KEEP"
  },
  "#105": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-perclass-backfill",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -51,7 +51,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-perclass-backfill (family 'perclass-backfill'): removed 2 paths; dangling non-doc refs to removed scripts: none",
   "problem": "backwards VACUUM INTO comment in backfill backup",
   "verdict": "DROP"
  },
@@ -105,7 +105,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "Dark since merge (#118 already reported 0 production rows); still dark after #118. eval/ files have no reader. Revert branch attempted via git revert; see branch field.",
+  "notes": "Dark since merge (#118 already reported 0 production rows); still dark after #118. eval/ files have no reader. Revert branch attempted via git revert; see branch field. | branch NOT built: reverse-apply leaves conflicts in ['toolsets.py']; #118: apply -R --3way rc=1 Applied patch to 'toolsets.py' with conflicts.\nApplied patch to 'tests/plugins/memory/test_mem0_remember.py' cleanly.\nU toolsets.py | #116: apply -R --3way rc=1 conflicts.\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nApplied patch to 'agent/background_review.py' with conflicts.",
   "problem": "background-review fork can persist user facts to mem0 via mem0_remember (+eval/ artifacts)",
   "verdict": "DROP"
  },
@@ -123,7 +123,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch NOT built: reverse-apply leaves conflicts in ['toolsets.py']; #118: apply -R --3way rc=1 Applied patch to 'toolsets.py' with conflicts.\nApplied patch to 'tests/plugins/memory/test_mem0_remember.py' cleanly.\nU toolsets.py | #116: apply -R --3way rc=1 conflicts.\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nApplied patch to 'agent/background_review.py' with conflicts.",
   "problem": "mem0_remember not resident in tools[] so background review could never call it",
   "verdict": "DROP"
  },
@@ -150,7 +150,7 @@
   "verdict": "KEEP"
  },
  "#151": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-greptile",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -163,7 +163,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-greptile (family 'greptile'): removed greptile.json; exact grep for 'greptile.json' outside docs/*.md on the pushed branch -> 0 hits",
   "problem": "greptile.json trivial-PR fast lane",
   "verdict": "DROP"
  },
@@ -216,7 +216,7 @@
   "verdict": "KEEP"
  },
  "#188": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-web-source",
   "evidence": {
    "cost": {
     "conflict_files": 2,
@@ -229,7 +229,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a: upstream web client has no source field and no per-client attribution"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-web-source (family 'web-source'): web/src/lib/gatewayClient{,.test}.ts = upstream/main bytes (2 files changed, 82 deletions(-)); fork diff on these files was only #188 + its teardown note; vitest NOT run (web node_modules not installed in the audit workspace)",
   "problem": "web dashboard chat self-declares source='dashboard'",
   "verdict": "DROP"
  },
@@ -252,7 +252,7 @@
   "verdict": "DROP"
  },
  "#194": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-oneshot-probes",
   "evidence": {
    "cost": {
     "conflict_files": 4,
@@ -270,7 +270,7 @@
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#22": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-author-map-stale",
   "evidence": {
    "cost": {
     "conflict_files": 1,
@@ -290,7 +290,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-author-map-stale (family 'author-map-stale'): removed 3 lines from scripts/release.py; ast ok",
   "problem": "apollo@daemonarchy.local unmapped in AUTHOR_MAP",
   "verdict": "DROP"
  },
@@ -310,7 +310,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a: upstream has no session.changes method and upstream desktop has no consumer"
   },
-  "notes": "Largest-cost DROP in the tranche (6 conflict files, 3 syncs: hermes_state.py, tui_gateway/server.py, web_server.py, config.py).",
+  "notes": "Largest-cost DROP in the tranche (6 conflict files, 3 syncs: hermes_state.py, tui_gateway/server.py, web_server.py, config.py). | branch NOT built: reverse-apply leaves conflicts in ['hermes_cli/config.py', 'hermes_state.py', 'tui_gateway/server.py']; #268: apply -R --3way rc=1 Applied patch to 'tui_gateway/server.py' with conflicts.\nApplied patch to 'hermes_state.py' with conflicts.\nApplied patch to 'hermes_cli/web_server.py' cleanly.\nApplied patch to 'hermes_cli/config.py' with conflicts.\nU hermes_cli/config.py\nU hermes_state.py\nU tui_gateway/server.py",
   "problem": "cross-surface live session sync phase 1: server session.changes polling + desktop consumer",
   "verdict": "DROP"
  },
@@ -330,7 +330,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch NOT built: reverse-apply leaves conflicts in ['hermes_cli/config.py', 'hermes_state.py', 'tui_gateway/server.py']; #268: apply -R --3way rc=1 Applied patch to 'tui_gateway/server.py' with conflicts.\nApplied patch to 'hermes_state.py' with conflicts.\nApplied patch to 'hermes_cli/web_server.py' cleanly.\nApplied patch to 'hermes_cli/config.py' with conflicts.\nU hermes_cli/config.py\nU hermes_state.py\nU tui_gateway/server.py",
   "problem": "livesync RC-1 probe + t_silence derivation scripts",
   "verdict": "DROP"
  },
@@ -459,7 +459,7 @@
   "verdict": "KEEP"
  },
  "#612": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-oneshot-probes",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -472,12 +472,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "Only the standalone script is removed; the recovered design docs are history (auto/docs tranche).",
+  "notes": "Only the standalone script is removed; the recovered design docs are history (auto/docs tranche). | branch audit/scripts_misc/revert-oneshot-probes (family 'oneshot-probes'): removed 3 paths; dangling non-doc refs to removed scripts: none",
   "problem": "recovered July design docs + loop-starvation certify harness",
   "verdict": "DROP"
  },
  "#62": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -493,7 +493,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
@@ -511,12 +511,12 @@
    "upstream_fix": "none",
    "upstream_state": "read-only: ../up/ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts lacks the act()/IS_REACT_ACT_ENVIRONMENT settle (fork diff +57/-33)"
   },
-  "notes": "",
+  "notes": "branch NOT built: cherry-pick of #695 conflicts on upstream/main in ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts (fork file carries other fork deltas); needs a hand port + vitest run with ui-tui node_modules",
   "problem": "virtualHistoryOffsetCache unmount-compensation test flaky in merge queue (act()/deferred rows)",
   "verdict": "UPSTREAM"
  },
  "#703": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-self-hosted-pool-gaps",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -529,7 +529,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (upstream runs hosted)"
   },
-  "notes": "If the pool labels ever move back to self-hosted, re-apply. Adversary: check whether any of these 3 jobs is still placed via per-slice runs-on.",
+  "notes": "If the pool labels ever move back to self-hosted, re-apply. Adversary: check whether any of these 3 jobs is still placed via per-slice runs-on. | branch audit/scripts_misc/revert-self-hosted-pool-gaps (family 'self-hosted-pool-gaps'): hand-built reverse apply: #703: apply -R --3way rc=0 Applied patch to '.github/workflows/rust-tests.yml' cleanly.\nApplied patch to '.github/workfl",
   "problem": "self-hosted pool gaps (sudo in rust tests, docker-lint, e2e-desktop) under CI_RUNNER_LABELS=self-hosted",
   "verdict": "DROP"
  },
@@ -552,7 +552,7 @@
   "verdict": "KEEP"
  },
  "#728": {
-  "branch": null,
+  "branch": "audit/scripts_misc/upstream-728",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -565,7 +565,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED by reading: ../up/tests/gateway/test_update_command.py:141,184 and test_update_streaming.py:111 still patch gateway.run.__file__; handler only in ../up/gateway/slash_commands.py"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/upstream-728 (family 'upstream-728'): on upstream/main \u2014 before: `pytest tests/gateway/test_update_command.py tests/gateway/test_update_streaming.py` -> FAILED tests/gateway/test_update_streaming.py::TestCmdUpdateGatewayMode::test_gateway_flag_enables_gateway_prompt_for_stash / 1 failed, 23 passed, 2 skipped, 7 warnings in 60.10s (0:01:00); after: `pytest tests/gateway/test_update_command.py tests/gateway/test_update_streaming.py` -> FAILED tests/gateway/test_update_streaming.py::TestCmdUpdateGatewayMode::test_gateway_flag_enables_gateway_prompt_for_stash / 1 failed, 23 passed, 2 skipped, 7 warnings in 23.38s | the 1 failure is identical before and after and unrelated: test_gateway_flag_enables_gateway_prompt_for_stash trips tests/home_io_guard.py ('TEST BUG: file I/O against the REAL home ... /tools') on unmodified ../up as well",
   "problem": "3 tests patch gateway.run.__file__ but _handle_update_command lives in gateway/slash_commands.py \u2192 the .git guard is tested against the runner's real tree",
   "verdict": "UPSTREAM"
  },
@@ -597,7 +597,7 @@
   "verdict": "KEEP"
  },
  "#736": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-ci-review-comment",
   "evidence": {
    "cost": {
     "conflict_files": 1,
@@ -612,7 +612,7 @@
    "upstream_fix": "none",
    "upstream_state": "read-only: upstream still ships ci-review-comment.yml + scripts/ci/live_comment.py (b9f82ed39f 2026-07-20)"
   },
-  "notes": "Referenced only by a workflow the fork no longer runs. Revert = take upstream's live_comment.py + workflow verbatim (966-line divergence gone).",
+  "notes": "Referenced only by a workflow the fork no longer runs. Revert = take upstream's live_comment.py + workflow verbatim (966-line divergence gone). | branch audit/scripts_misc/revert-ci-review-comment (family 'ci-review-comment'): live_comment.py + workflow = upstream/main bytes; `pytest tests/ci/test_live_comment.py` -> ......ss...                                                              [100%] / 9 passed, 2 skipped in 1.73s",
   "problem": "ci-review-comment poller exhausted the installation token rate limit (2026-09-19)",
   "verdict": "DROP"
  },
@@ -639,7 +639,7 @@
   "verdict": "KEEP"
  },
  "#748": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-ci-review-comment",
   "evidence": {
    "cost": {
     "conflict_files": 1,
@@ -654,7 +654,7 @@
    "upstream_fix": "none",
    "upstream_state": "as #736"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-ci-review-comment (family 'ci-review-comment'): live_comment.py + workflow = upstream/main bytes; `pytest tests/ci/test_live_comment.py` -> ......ss...                                                              [100%] / 9 passed, 2 skipped in 1.73s",
   "problem": "round-6 poller findings on #736 (status loss, stale artifacts, shutdown budget)",
   "verdict": "DROP"
  },
@@ -860,7 +860,7 @@
   "verdict": "KEEP"
  },
  "#87": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-perclass-backfill",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -873,7 +873,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-perclass-backfill (family 'perclass-backfill'): removed 2 paths; dangling non-doc refs to removed scripts: none",
   "problem": "per-class backfill backups never pruned (799MB)",
   "verdict": "DROP"
  },
@@ -914,7 +914,7 @@
   "verdict": "UNRESOLVED"
  },
  "#928": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-desktop-update-test",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -927,7 +927,7 @@
    "upstream_fix": "none",
    "upstream_state": "read-only: upstream reworked scripts/desktop-update/windows.ps1 on 09-23/09-24 (a3456765ed, 0f1544f903); fork file diverges +127/-266"
   },
-  "notes": "Take upstream's windows.ps1 on next sync; the fork test pins a hold upstream has since rewritten.",
+  "notes": "Take upstream's windows.ps1 on next sync; the fork test pins a hold upstream has since rewritten. | branch audit/scripts_misc/revert-desktop-update-test (family 'desktop-update-test'): git revert -n d7d5b85496 applied clean",
   "problem": "Windows progress sampling test gated on explicit release",
   "verdict": "DROP"
  },
@@ -977,7 +977,7 @@
   "verdict": "KEEP"
  },
  "#932": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-ci-overflow-phase0",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -990,7 +990,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-ci-overflow-phase0 (family 'ci-overflow-phase0'): removed 4 paths; exact-path grep on the pushed branch for 'ci_overflow_acceptance' and 'receipts/preflight' outside docs/*.md -> 0 hits (the earlier stem grep over-matched 'preflight')",
   "problem": "CI overflow Phase-0 read-only capability preflight + baseline receipt",
   "verdict": "DROP"
  },
@@ -1081,7 +1081,7 @@
   "verdict": "KEEP"
  },
  "nopr:0c96621b85": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1094,12 +1094,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:15e1d95f14": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1112,7 +1112,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
@@ -1142,7 +1142,7 @@
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "nopr:1d5ebbe55a": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1158,12 +1158,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:1f8392335e": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1176,7 +1176,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
@@ -1206,7 +1206,7 @@
   "verdict": "KEEP"
  },
  "nopr:2609ba7523": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1221,12 +1221,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:26f69158d2": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1242,7 +1242,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
@@ -1265,7 +1265,7 @@
   "verdict": "KEEP"
  },
  "nopr:2f33571c20": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-staging",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1278,12 +1278,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-staging (family 'staging'): git rm staging/ (5 files); removed 3 staging-coupled test defs + 1 class-guard entry from tests/test_residual_cli_hint_pasteable.py (remaining 'staging/scripts' mentions: 2, docstring only); `pytest tests/test_residual_cli_hint_pasteable.py` -> ...........                                                              [100%] / 11 passed in 3.92s",
   "problem": "partial-restart ledger + parity re-drive actuator, staged copies of home-local ops files",
   "verdict": "DROP"
  },
  "nopr:3cd73eb4d4": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1296,12 +1296,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:40a6040932": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-author-map-stale",
   "evidence": {
    "cost": {
     "conflict_files": 1,
@@ -1321,12 +1321,12 @@
    "upstream_fix": "none",
    "upstream_state": "GREEN-irrelevant: upstream maps neither (release.py 0, contributors/emails 0) and its check only covers new PR commits"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-author-map-stale (family 'author-map-stale'): removed 3 lines from scripts/release.py; ast ok",
   "problem": "map upstream contributors talmax1124/janrenz in AUTHOR_MAP",
   "verdict": "DROP"
  },
  "nopr:481ddd77b6": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1346,12 +1346,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:48376f7570": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1370,12 +1370,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:4899803ced": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1394,12 +1394,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:4b3698271f": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1412,7 +1412,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "Row also carries the lcm_grep null-safe one-liner in plugins/context_engine/lcm/tools.py:2394 (`str(args.get('query') or '')`) \u2014 that line is vendored-LCM product code (plugins tranche, D1a) and is NOT touched by the revert branch; only scripts/lcm_qa_battery.py goes.",
+  "notes": "Row also carries the lcm_grep null-safe one-liner in plugins/context_engine/lcm/tools.py:2394 (`str(args.get('query') or '')`) \u2014 that line is vendored-LCM product code (plugins tranche, D1a) and is NOT touched by the revert branch; only scripts/lcm_qa_battery.py goes. | branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere (Tier-0 QA battery)",
   "verdict": "DROP"
  },
@@ -1489,7 +1489,7 @@
   "verdict": "KEEP"
  },
  "nopr:589edef52a": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1508,7 +1508,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
@@ -1673,7 +1673,7 @@
   "verdict": "UNRESOLVED"
  },
  "nopr:7d33c982d8": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1689,12 +1689,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:7ee021200e": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1707,12 +1707,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:834f0a0111": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1729,7 +1729,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
@@ -1871,7 +1871,7 @@
   "verdict": "KEEP"
  },
  "nopr:9f0c416088": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1884,12 +1884,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:a0367856d4": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1902,12 +1902,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:a0a5e8a083": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-staging",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1920,12 +1920,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-staging (family 'staging'): git rm staging/ (5 files); removed 3 staging-coupled test defs + 1 class-guard entry from tests/test_residual_cli_hint_pasteable.py (remaining 'staging/scripts' mentions: 2, docstring only); `pytest tests/test_residual_cli_hint_pasteable.py` -> ...........                                                              [100%] / 11 passed in 3.92s",
   "problem": "ruff encoding fix on the staged runtime-parity-check.py",
   "verdict": "DROP"
  },
  "nopr:a3fa06a6e4": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1938,12 +1938,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:a8ac516b63": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -1959,7 +1959,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
@@ -1989,7 +1989,7 @@
   "verdict": "KEEP"
  },
  "nopr:ae486b7f0a": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-oneshot-probes",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2002,7 +2002,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-oneshot-probes (family 'oneshot-probes'): removed 3 paths; dangling non-doc refs to removed scripts: none",
   "problem": "mem0 destructive-tools Phase-0 SDK kill-gate spike",
   "verdict": "DROP"
  },
@@ -2052,7 +2052,7 @@
   "verdict": "KEEP"
  },
  "nopr:c2cf19f6fd": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2068,7 +2068,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
@@ -2091,7 +2091,7 @@
   "verdict": "KEEP"
  },
  "nopr:d5cec6ec16": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2107,12 +2107,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:d9d2266dfe": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2125,12 +2125,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "VENDORED_FROM.txt provenance fields from this row are read by tests/context_engine/test_lcm_fork_load.py \u2014 kept; only the checker script + its test drop.",
+  "notes": "VENDORED_FROM.txt provenance fields from this row are read by tests/context_engine/test_lcm_fork_load.py \u2014 kept; only the checker script + its test drop. | branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "read-only LCM upstream security-drift checker (scripts/check_lcm_upstream_drift.py)",
   "verdict": "DROP"
  },
  "nopr:df420d15df": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2143,12 +2143,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:e0cf699f81": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2164,12 +2164,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:e29944b04e": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2188,12 +2188,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:e84170e4f8": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2212,7 +2212,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
@@ -2244,7 +2244,7 @@
   "verdict": "KEEP"
  },
  "nopr:edcf3cf5d6": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2263,12 +2263,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:f3dfb89c2a": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2284,12 +2284,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:f923a9e07c": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2305,7 +2305,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "plugins/context_engine/lcm/escalation.py from this row is imported by the LCM engine (engine.py, extraction.py, tools.py \u2026) \u2014 live product code for the plugins tranche (D1a); the revert branch leaves it. Only the harness edits drop.",
+  "notes": "plugins/context_engine/lcm/escalation.py from this row is imported by the LCM engine (engine.py, extraction.py, tools.py \u2026) \u2014 live product code for the plugins tranche (D1a); the revert branch leaves it. Only the harness edits drop. | branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere (K=2 disambiguation arm)",
   "verdict": "DROP"
  },
@@ -2335,7 +2335,7 @@
   "verdict": "KEEP"
  },
  "nopr:fb3008a7ba": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2348,12 +2348,12 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  },
  "nopr:fdee6d93f2": {
-  "branch": null,
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
   "evidence": {
    "cost": {
     "conflict_files": 0,
@@ -2370,7 +2370,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fleet-only)"
   },
-  "notes": "",
+  "notes": "branch audit/scripts_misc/revert-lcm-campaign-harness (family 'lcm-campaign-harness'): removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
   "problem": "one-shot LCM PRD-6/7/8 QA campaign harness (Arm-A/Arm-B/K=2); campaign concluded June; ships nowhere",
   "verdict": "DROP"
  }
