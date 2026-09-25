@@ -7,10 +7,12 @@ Exit code 2 blocks a ``pre_tool_call`` even without JSON (Claude-Code / Cursor).
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -311,17 +313,26 @@ def _windows_script_argv(argv: list[str]) -> list[str]:
 
 
 def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
-    """The single subprocess site: run ``spec.command`` with ``stdin_json`` on stdin. Same result keys for every outcome."""
-    result: Dict[str, Any] = {"returncode": None, "stdout": "", "stderr": "", "timed_out": False, "elapsed_seconds": 0.0, "error": None}
+    """The single subprocess site: run ``spec.command`` with ``stdin_json`` on stdin. Same result keys for every outcome.
 
-    def failed(error: str) -> Dict[str, Any]:
+    Two error channels. ``error`` reaches the MODEL (``_evaluate_result`` -> ``_fail_closed_block``),
+    so it never carries the command, argv or ``str(exc)`` — any of them can hold an inline
+    credential. ``error_detail`` is the operator channel (log, ``hermes hooks test``/``doctor``):
+    the full diagnostic, or ``None`` when there is nothing to add to ``error``.
+    """
+    result: Dict[str, Any] = {"returncode": None, "stdout": "", "stderr": "", "timed_out": False, "elapsed_seconds": 0.0,
+                              "error": None, "error_detail": None}
+
+    def failed(error: str, detail: Optional[str] = None) -> Dict[str, Any]:
         result["error"] = error
+        result["error_detail"] = detail
         return result
 
     try:
         argv = split_command_line(os.path.expanduser(spec.command))
     except ValueError as exc:
-        return failed(f"command {spec.command!r} cannot be parsed: {exc}")
+        # An unbalanced quote is exactly the shape that still holds an inline credential.
+        return failed(f"command cannot be parsed ({type(exc).__name__})", f"command cannot be parsed: {exc}")
     if not argv:
         return failed("empty command")
     t0 = time.monotonic()
@@ -346,8 +357,9 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         if getattr(exc, "winerror", None) == 193:
             # Unmapped suffix (.zsh, .fish, .rb, …) — the raw WinError text is localized, so an
             # operator on a non-English Windows could not act on it at all.
-            return failed(f"{argv[0]!r} {_NOT_DIRECTLY_EXECUTABLE}")
-        return failed(str(exc))
+            return failed(f"hook script {_NOT_DIRECTLY_EXECUTABLE}", f"{argv[0]!r} {_NOT_DIRECTLY_EXECUTABLE}")
+        # OSError stringifies the program path, and argv[0] can be the credential itself.
+        return failed(f"spawn failed ({type(exc).__name__})", f"spawn failed: {exc}")
     try:
         stdout, stderr = proc.communicate(input=stdin_json, timeout=spec.timeout)
     except BaseException as exc:
@@ -358,7 +370,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         if not isinstance(exc, Exception):
             raise
         if not isinstance(exc, subprocess.TimeoutExpired):  # pragma: no cover — defensive
-            return failed(str(exc))
+            return failed(f"communication failed ({type(exc).__name__})", f"communication failed: {exc}")
         result.update(timed_out=True, elapsed_seconds=round(time.monotonic() - t0, 3))
         return result
     result.update(returncode=proc.returncode, stdout=stdout or "", stderr=stderr or "", elapsed_seconds=round(time.monotonic() - t0, 3))
@@ -373,12 +385,54 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
             return None
         return _evaluate_result(spec, _spawn(spec, _serialize_payload(spec.event, kwargs)))
 
-    _callback.__name__ = _callback.__qualname__ = f"shell_hook[{spec.event}:{spec.command}]"
+    # The plugin dispatcher renders __name__ into model-facing block directives: never the raw command.
+    _callback.__name__ = _callback.__qualname__ = f"shell_hook[{spec.event}:{hook_display_name(spec.command)}]"
     return _callback
 
 
+# A display label may ONLY be a plain basename-shaped token. An allowlist on purpose: every command
+# shape nobody anticipated (``env TOK=secret prog``, ``https://user:secret@host``, an unbalanced
+# quote) must fall to the digest rather than become a label.
+_HOOK_LABEL_ALLOWED = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
+
+# Launchers rather than the hook's identity: keep looking past them for the script
+# (``/usr/bin/python3 /path/to/my-guard.py``).
+_HOOK_LAUNCHER_STEMS = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "env",
+    "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun",
+    "uv", "uvx", "npx", "pwsh", "powershell",
+})
+
+
+def hook_display_name(command: str) -> str:
+    """Stable, secret-free identifier for a hook *command*: ``<label>#<digest>``.
+
+    A hook command is operator-supplied and routinely carries credentials inline
+    (``sh -c 'export TOK=…; …'``), so it must never reach a model-visible string; only the log
+    gets it. *label* is a plain basename-shaped token from the front of the command, *digest* a
+    short hash of the whole command so two hooks stay distinguishable even when labels collide.
+    """
+    digest = hashlib.sha256(command.encode("utf-8", "replace")).hexdigest()[:8]
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()  # the allowlist below keeps this safe, not the parse
+    label = ""
+    for token in tokens:
+        if token.startswith("-"):
+            break  # a flag; what follows may be an inline program body (``-c '…'``)
+        base = os.path.basename(token)
+        if not _HOOK_LABEL_ALLOWED.match(base):
+            break
+        label = base
+        if base.split(".")[0].lower() not in _HOOK_LAUNCHER_STEMS:
+            break  # prefer a script after a launcher
+    return f"{label or 'hook'}#{digest}"
+
+
 def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:
-    return {"action": "block", "message": f"hook {spec.command} failed closed: {reason}"}
+    """Model-facing: names the hook by :func:`hook_display_name`, never by ``spec.command``."""
+    return {"action": "block", "message": f"hook {hook_display_name(spec.command)} failed closed: {reason}"}
 
 
 def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -388,7 +442,9 @@ def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any]) -> Optional[Dict[st
     blocking_event = spec.event in _BLOCKING_EVENTS
     fail_closed = spec.fail_closed and blocking_event
     if r["error"]:
-        logger.warning("shell hook failed (event=%s command=%s): %s", spec.event, spec.command, r["error"])
+        # Operator channel: the detailed reason; the block below keeps the redacted ``error``.
+        logger.warning("shell hook failed (event=%s command=%s): %s", spec.event, spec.command,
+                       r.get("error_detail") or r["error"])
     elif r["timed_out"]:
         logger.warning("shell hook timed out after %.2fs (event=%s command=%s)", r["elapsed_seconds"], spec.event, spec.command)
     if r["error"] or r["timed_out"]:

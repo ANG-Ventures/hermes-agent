@@ -227,7 +227,8 @@ def _cmd_test(args) -> None:
 
 def _print_run_result(result: Dict[str, Any]) -> None:
     if result.get("error"):
-        print(f"      ✗ error: {result['error']}")
+        # Operator channel: ``error`` is the redacted model-facing form (cannot tell EACCES from ENOEXEC).
+        print(f"      ✗ error: {result.get('error_detail') or result['error']}")
     elif result.get("timed_out"):
         print(f"      ✗ timed out after {result['elapsed_seconds']}s")
     else:
@@ -327,7 +328,7 @@ def _doctor_one(spec, shell_hooks) -> int:
                   f"on synthetic payload (timeout={spec.timeout}s)")
         elif result.get("error"):
             problems += 1
-            print(f"      ✗ execution error: {result['error']}")
+            print(f"      ✗ execution error: {result.get('error_detail') or result['error']}")
         else:
             rc = result.get("returncode")
             elapsed = result.get("elapsed_seconds", 0)

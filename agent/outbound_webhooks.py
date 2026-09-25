@@ -65,7 +65,15 @@ class WebhookTarget(_ToolMatcherMixin):
 
     @property
     def label(self) -> str:
+        """Operator-facing identity; may be the raw URL (a bearer credential) — LOG CHANNEL ONLY."""
         return self.name or self.url
+
+    @property
+    def display_label(self) -> str:
+        """Secret-free identity for model-facing text: the operator's ``name:``, else a URL digest."""
+        if self.name:
+            return self.name
+        return f"webhook#{hashlib.sha256(self.url.encode('utf-8', 'replace')).hexdigest()[:8]}"
 
 
 def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
@@ -233,7 +241,8 @@ def _make_callback(event: str, target: WebhookTarget):
             return
         _enqueue(_build_delivery(event, target, body, delivery_id))
 
-    _callback.__name__ = f"outbound_webhook[{event}:{target.label}]"
+    # The plugin dispatcher renders __name__ into model-facing block directives: never the URL.
+    _callback.__name__ = f"outbound_webhook[{event}:{target.display_label}]"
     _callback.__qualname__ = _callback.__name__
     return _callback
 

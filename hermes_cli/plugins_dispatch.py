@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import copy
+import hashlib
 import inspect
 import logging
 import queue
@@ -56,11 +57,37 @@ _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
 
+def _callback_label(callback: Any) -> str:
+    """Stable, secret-free identifier for a plugin *callback* — never ``repr()``.
+
+    Labels reach the MODEL through fail-closed block directives, and ``repr()`` of a
+    ``functools.partial`` (or any callable object) renders its bound state, credentials included.
+    A named callback keeps its ``__name__`` (trusted as-is); producers that synthesize them from operator
+    config sanitize at the source (``agent.shell_hooks.hook_display_name``,
+    ``agent.outbound_webhooks.WebhookTarget.display_label``). A partial is named by its wrapped
+    function; anything else by its type plus a digest of the qualified type name (not ``id()``,
+    which is per-process and recycled after GC).
+    """
+    for attr in ("__name__", "__qualname__"):
+        label = getattr(callback, attr, None)
+        if isinstance(label, str) and label:
+            return label
+    wrapped = getattr(callback, "func", None)
+    if wrapped is not None:
+        for attr in ("__name__", "__qualname__"):
+            label = getattr(wrapped, attr, None)
+            if isinstance(label, str) and label:
+                return f"{type(callback).__name__}({label})"
+    cls = type(callback)
+    fqtn = f"{getattr(cls, '__module__', '?')}.{getattr(cls, '__qualname__', cls.__name__)}"
+    return f"<{cls.__name__}#{hashlib.sha256(fqtn.encode('utf-8', 'replace')).hexdigest()[:8]}>"
+
+
 def _policy_error_block_directive(hook_name: str, cb: Callable, exc: BaseException) -> Dict[str, str]:
     """Block directive for a fail-closed hook whose callback raised: names the callback and the
     error (truncated — a hook that embeds tool args in its exception must not grow the tool
     result) so the operator can tell a crashing guard from a slow one."""
-    callback_name = getattr(cb, "__name__", repr(cb))
+    callback_name = _callback_label(cb)
     return {"action": "block",
             "message": f"{hook_name} plugin callback {callback_name} raised {type(exc).__name__}: {str(exc)[:200]}"}
 
@@ -255,7 +282,7 @@ class PluginDispatchMixin:
         truncates the message so a hook that embeds tool args in its error cannot grow the set
         per call; the set is cleared on unload alongside the timeout-suppression map.
         """
-        callback_name = getattr(cb, "__name__", repr(cb))
+        callback_name = _callback_label(cb)
         key = (hook_name, getattr(cb, "__module__", ""), getattr(cb, "__qualname__", callback_name),
                type(exc).__name__, str(exc)[:200])
         if key in self._hook_failures_reported:
@@ -273,7 +300,7 @@ class PluginDispatchMixin:
         suppressed, still running for this call id, over the abandoned-worker cap, timed out
         (worker abandoned, never joined), or the worker could not be started. Exceptions
         propagate."""
-        callback_name = getattr(cb, "__name__", repr(cb))
+        callback_name = _callback_label(cb)
         # Suppression is a fact about the CALLBACK — a hung one must keep its back-off —
         # so that key stays coarse. The gate must instead tell CONCURRENT CALLS apart.
         suppression_key = (hook_name, id(cb))
@@ -499,7 +526,7 @@ class PluginDispatchMixin:
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         for cb in self._hooks.get(hook_name, []):
-            callback_name = getattr(cb, "__name__", repr(cb))
+            callback_name = _callback_label(cb)
             try:
                 ret = cb(**self._hook_callback_kwargs(cb, kwargs))
                 if inspect.isawaitable(ret):
