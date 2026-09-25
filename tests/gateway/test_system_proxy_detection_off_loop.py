@@ -15,8 +15,11 @@ SCUTIL_OUT = "<dictionary> {\n  HTTPSEnable : 1\n  HTTPSProxy : 10.0.0.1\n  HTTP
 
 @pytest.fixture
 def probe(monkeypatch):
-    """Darwin + a slow, counted fake ``scutil``; records the thread each probe ran on."""
-    monkeypatch.setattr(base.sys, "platform", "darwin")
+    """A slow, counted fake ``scutil``; records the thread each probe ran on.
+
+    The probe only runs on a real macOS host (``sys.platform == "darwin"``), so the tests that
+    expect it to run carry ``platforms("macos")`` instead of faking the host OS.
+    """
     base.reset_macos_proxy_cache()
     calls = []
 
@@ -39,6 +42,7 @@ def _wait_for(pred, timeout=5.0):
     return False
 
 
+@pytest.mark.platforms("macos")
 def test_cold_memo_on_the_loop_returns_immediately_and_warms_off_thread(probe):
     async def scenario():
         loop_thread = threading.current_thread().name
@@ -54,6 +58,7 @@ def test_cold_memo_on_the_loop_returns_immediately_and_warms_off_thread(probe):
     assert base._detect_macos_system_proxy() == "http://10.0.0.1:3128"
 
 
+@pytest.mark.platforms("macos")
 def test_stale_memo_on_the_loop_is_served_while_revalidating(probe, monkeypatch):
     clock = {"t": 1000.0}
     monkeypatch.setattr(base.time, "monotonic", lambda: clock["t"])
@@ -71,11 +76,13 @@ def test_stale_memo_on_the_loop_is_served_while_revalidating(probe, monkeypatch)
     assert _wait_for(lambda: len(probe) == 2)
 
 
+@pytest.mark.platforms("macos")
 def test_off_loop_callers_keep_the_synchronous_probe(probe):
     assert base._detect_macos_system_proxy() == "http://10.0.0.1:3128"
     assert probe == [threading.current_thread().name]
 
 
+@pytest.mark.platforms("macos")
 def test_prime_then_on_loop_read_is_a_hit_with_no_probe(probe):
     assert base.prime_macos_proxy_cache() == "http://10.0.0.1:3128"
 
@@ -86,8 +93,8 @@ def test_prime_then_on_loop_read_is_a_hit_with_no_probe(probe):
     assert len(probe) == 1
 
 
-def test_non_darwin_never_probes(probe, monkeypatch):
-    monkeypatch.setattr(base.sys, "platform", "linux")
+@pytest.mark.platforms("linux", "windows")
+def test_non_darwin_never_probes(probe):
     assert base.prime_macos_proxy_cache() is None
     assert base._detect_macos_system_proxy() is None
     assert probe == []
