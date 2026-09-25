@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import collections.abc
 import logging
+import sys
 import threading
 import types
 from typing import Any, Callable, Mapping, Optional
@@ -152,11 +153,24 @@ def add_snapshot_hook(hook: Callable[[], None]) -> None:
 def snapshot() -> Generation:
     """Pin one generation for a multi-container read (``g = snapshot()``).
 
-    Same object :func:`current` returns, after the lazy-container hooks ran.
+    Returns the object :func:`current` returns (after the lazy-container
+    hooks ran), so readers that bind a snapshot see exactly what readers of
+    the module globals see. The one exception keeps that equivalence: if an
+    owning module's global no longer names its facade (a test rebinding it
+    with ``monkeypatch.setattr``), the snapshot carries the rebound object for
+    that container instead of the facade's generation.
     """
     for hook in _snapshot_hooks:
         hook()
-    return _current
+    gen = _current
+    rebound = None
+    for name, facade in tuple(FACADES.items()):
+        module = sys.modules.get(_OWNERS[name])
+        bound = getattr(module, name, facade) if module is not None else facade
+        if bound is not facade:
+            rebound = rebound or {}
+            rebound[name] = bound
+    return gen if rebound is None else _with(gen, rebound)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +356,12 @@ def _restore(gen: Generation) -> None:
             elif kind == "list":
                 list.clear(facade)
                 list.extend(facade, data)
+
+
+def _reset(*names: str) -> None:
+    """Empty the named containers (test-isolation support, like :func:`_restore`)."""
+    base = _current
+    _restore(_with(base, {n: _freeze(_KINDS[n], ()) for n in names}))
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +609,12 @@ class GuardedSet(collections.abc.Set):
 
     def copy(self) -> set:
         return set(self._data())
+
+    @classmethod
+    def _from_iterable(cls, iterable) -> set:
+        # Set-ABC operators (``|``, ``&``, ``-``) build their result through
+        # this hook; the result is a plain set, never a second facade.
+        return set(iterable)
 
     def __reduce_ex__(self, protocol):
         return (set, (set(self._data()),))

@@ -19,9 +19,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _clear_provider_caches():
-    providers._REGISTRY.clear()
-    providers._ALIASES.clear()
-    providers._PROVIDER_LIST_CACHE = None
+    from hermes_cli import provider_seam
+
+    provider_seam._reset("_REGISTRY", "_ALIASES")
     providers._discovered = False
     for mod in list(sys.modules.keys()):
         if mod.startswith("plugins.model_providers") or mod.startswith(
