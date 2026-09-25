@@ -1557,6 +1557,13 @@ class GatewayStartupMixin:
         if self._start_check_access_policy():
             return True
         await self._start_recover_previous_run()
+        # Prime the macOS system-proxy memo off the loop: adapters resolve their proxy inside connect(),
+        # on the loop, and a cold memo there would otherwise mean no proxy for the first connect.
+        try:
+            from gateway.platforms.base import prime_macos_proxy_cache
+            await asyncio.to_thread(prime_macos_proxy_cache)
+        except Exception as exc:
+            logger.debug("System-proxy prime failed: %s", exc)
         # The gateway is a boot owner of the Nous free tier, beside `cmd_chat` and `hermes serve`: every
         # demand-time site (provider resolution, /login, the connector token) is a read that needs the
         # identity to already exist. Blocking here, before any adapter connects, is what keeps a fast

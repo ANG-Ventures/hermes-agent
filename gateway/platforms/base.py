@@ -269,20 +269,12 @@ _MACOS_PROXY_TTL_SECONDS = 60.0
 _macos_proxy_cache: "tuple[float, str | None] | None" = None
 
 
-def _detect_macos_system_proxy() -> str | None:
-    """Read the macOS system HTTP(S) proxy via ``scutil --proxy``: ``http://host:port``
-    when an HTTP(S) proxy is enabled, else None (non-macOS or any subprocess error).
-
-    Memoised for ``_MACOS_PROXY_TTL_SECONDS``; call :func:`reset_macos_proxy_cache` to force a re-read.
-    """
+def _probe_macos_system_proxy() -> str | None:
+    """Run ``scutil --proxy`` and store the answer in the memo. BLOCKING (fork+exec, up to 3 s):
+    never call it on the event loop -- :func:`_detect_macos_system_proxy` routes loop callers around it."""
     global _macos_proxy_cache
 
-    if sys.platform != "darwin":
-        return None
-    cached = _macos_proxy_cache
     now = time.monotonic()
-    if cached is not None and (now - cached[0]) < _MACOS_PROXY_TTL_SECONDS:
-        return cached[1]
     try:
         out = subprocess.check_output(["scutil", "--proxy"], timeout=3, text=True, encoding='utf-8',
                                       errors='replace', stderr=subprocess.DEVNULL)
@@ -302,6 +294,71 @@ def _detect_macos_system_proxy() -> str | None:
             break
     _macos_proxy_cache = (now, resolved)
     return resolved
+
+
+# At most one background refresh in flight (see _detect_macos_system_proxy).
+_macos_proxy_refreshing = False
+_macos_proxy_refresh_lock = threading.Lock()
+
+
+def _on_running_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _refresh_macos_proxy_in_background() -> None:
+    """Re-probe on a daemon thread so a loop caller never waits on the subprocess."""
+    global _macos_proxy_refreshing
+
+    with _macos_proxy_refresh_lock:
+        if _macos_proxy_refreshing:
+            return
+        _macos_proxy_refreshing = True
+
+    def _worker() -> None:
+        global _macos_proxy_refreshing
+        try:
+            _probe_macos_system_proxy()
+        except Exception:
+            pass
+        finally:
+            with _macos_proxy_refresh_lock:
+                _macos_proxy_refreshing = False
+
+    threading.Thread(target=_worker, name="macos-proxy-probe", daemon=True).start()
+
+
+def _detect_macos_system_proxy() -> str | None:
+    """Read the macOS system HTTP(S) proxy via ``scutil --proxy``: ``http://host:port``
+    when an HTTP(S) proxy is enabled, else None (non-macOS or any subprocess error).
+
+    Memoised for ``_MACOS_PROXY_TTL_SECONDS``; call :func:`reset_macos_proxy_cache` to force a re-read.
+
+    On a thread with a running event loop a miss never probes inline: the subprocess (timeout 3 s)
+    would block every adapter in the process -- on a reconnect this is reached from ``connect()`` via
+    :func:`resolve_proxy_url`, and a stalled loop starves Discord's heartbeat ACK. The loop caller gets
+    the stale answer (``None`` on a cold memo) and a background thread refreshes it; gateway startup
+    primes the memo off-loop (:func:`prime_macos_proxy_cache`) so the first adapter connect is a hit.
+    """
+    if sys.platform != "darwin":
+        return None
+    cached = _macos_proxy_cache
+    if cached is not None and (time.monotonic() - cached[0]) < _MACOS_PROXY_TTL_SECONDS:
+        return cached[1]
+    if _on_running_event_loop():
+        _refresh_macos_proxy_in_background()
+        return cached[1] if cached is not None else None
+    return _probe_macos_system_proxy()
+
+
+def prime_macos_proxy_cache() -> str | None:
+    """Probe once, off the event loop, before adapters connect. BLOCKING; returns the value."""
+    if sys.platform != "darwin":
+        return None
+    return _probe_macos_system_proxy()
 
 
 def reset_macos_proxy_cache() -> None:
