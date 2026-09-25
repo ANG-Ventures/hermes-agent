@@ -971,7 +971,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): 'auto_recovery' 0 hits in ../up/agent"
   },
-  "notes": "Knob nobody sets; the sticky-refusal cooldown is the only live half and upstream treats content_policy_blocked as non-retryable already. Revert branch attempted at end of run.",
+  "notes": "Knob nobody sets; the sticky-refusal cooldown is the only live half and upstream treats content_policy_blocked as non-retryable already. REVERT: `git revert` off origin/main CONFLICTS in agent/chat_completion_helpers.py, tests/run_agent/test_primary_runtime_restore.py; no branch, needs a hand-built revert.",
   "problem": "model.auto_recovery toggle + sticky cooldown on safety refusal.",
   "verdict": "DROP"
  },
@@ -1511,7 +1511,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): fork-only blackbox cost.py; upstream has no MoA cost split"
   },
-  "notes": "MoA is not used by the fleet in the window; 300 loc on conversation_loop.py/moa_loop.py (3/3 syncs). Revert branch attempted at end of run.",
+  "notes": "MoA is not used by the fleet in the window; 300 loc on conversation_loop.py/moa_loop.py (3/3 syncs). REVERT: `git revert` off origin/main CONFLICTS in agent/conversation_loop.py, agent/moa_loop.py, plugins/blackbox/cost.py + 3 tests; no branch, needs a hand-built revert.",
   "problem": "Price MoA turns by physical model routes.",
   "verdict": "DROP"
  },
@@ -2532,7 +2532,7 @@
   "verdict": "KEEP"
  },
  "#600": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr600",
   "evidence": {
    "cost": {
     "conflict_syncs": 0,
@@ -2544,7 +2544,7 @@
    "upstream_fix": "n/a",
    "upstream_state": "n/a"
   },
-  "notes": "Exporter not configured in this deployment \u2014 never runs. 0 syncs, 71 loc.",
+  "notes": "Exporter not configured in this deployment \u2014 never runs. 0 syncs, 71 loc. REVERT: git revert 63aeeb5382 clean; `pytest -q tests/monitoring` -> 19 passed, 1 skipped. Correction: otlp_exporter IS wired (agent/monitoring/gateway_health_export.py:616, hermes_cli/main.py:12999) but only behind monitoring.gateway_health_export.enabled, which no config.yaml (main + 12 profiles) sets.",
   "problem": "Make a total OTLP span-export outage visible.",
   "verdict": "DROP"
  },
@@ -2695,12 +2695,12 @@
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): 'tailscale' 0 hits in ../up/agent except redact/model_metadata comments"
   },
-  "notes": "796 loc on 3/3-sync files (chat_completion_helpers, conversation_loop, error_classifier) + shared_transport_guard.py for a condition seen once in 4 months of logs. Revert branch attempted at end of run.",
+  "notes": "796 loc on 3/3-sync files (chat_completion_helpers, conversation_loop, error_classifier) + shared_transport_guard.py for a condition seen once in 4 months of logs. REVERT: `git revert` off origin/main CONFLICTS in chat_completion_helpers.py, conversation_loop.py, shared_transport_guard.py, hermes_cli/model_switch.py + 4 tests; no branch, needs a hand-built revert.",
   "problem": "Bound Tailscale transport outages in failover.",
   "verdict": "DROP"
  },
  "#622": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr622",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -2714,7 +2714,7 @@
    "upstream_fix": "none",
    "upstream_state": "see #621"
   },
-  "notes": "Rides with #621 revert.",
+  "notes": "Rides with #621 revert. REVERT: git revert 738c5bb699 clean; `pytest -q tests/agent/test_shared_transport_guard.py tests/run_agent/test_shared_transport_fallback.py` -> 23 passed. Only meaningful together with #621, whose revert conflicts (8 files) and needs a hand-built branch.",
   "problem": "Keep Tailscale errors terse.",
   "verdict": "DROP"
  },
@@ -3656,7 +3656,7 @@
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#959": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr959",
   "evidence": {
    "cost": {
     "conflict_syncs": 2,
@@ -3668,7 +3668,7 @@
    "upstream_fix": "upstream model_metadata gpt-5.5 rows",
    "upstream_state": "GREEN for context (../up/agent/model_metadata.py:302 1,050,000; :1694 codex 272K+bump); pricing row absent upstream (upstream prices openai direct via models.dev)"
   },
-  "notes": "Never fires; models.dev fallback would price it anyway. Revert branch attempted at end of run (see branch field).",
+  "notes": "Never fires; models.dev fallback would price it anyway. REVERT: git revert da2e883a7f clean; `pytest -q tests/agent/test_usage_pricing.py` -> 113 passed.",
   "problem": "Pin GPT-5.5 official list rate and context tier.",
   "verdict": "DROP"
  },
@@ -3728,7 +3728,7 @@
   "verdict": "DROP"
  },
  "#997": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr997",
   "evidence": {
    "cost": {
     "conflict_syncs": 0,
@@ -3740,7 +3740,7 @@
    "upstream_fix": "n/a",
    "upstream_state": "n/a (fork-only module)"
   },
-  "notes": "No importer on origin/main; the move's consumer never landed or was removed. 0 syncs. Revert branch attempted (see branch).",
+  "notes": "No importer on origin/main; the move's consumer never landed or was removed. 0 syncs. REVERT: git revert 0f34c5ec70 off origin/main clean; `pytest -q tests/plugins/blackbox -k output_split` -> 7 passed, 201 deselected; `import agent.model_metadata, plugins.blackbox.record, plugins.blackbox.last_turn` ok. Blackbox carries its own turn_output_split in plugins/blackbox/{record,last_turn}.py; agent/output_split.py has no importer.",
   "problem": "output_split: shared finished/unfinished output producer (pure move).",
   "verdict": "DROP"
  },
