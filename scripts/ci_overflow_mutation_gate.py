@@ -41,6 +41,8 @@ CASES = [
      "if any(", "test_arm_never_placed_on_core_when_core_goes_to_cloud", "tests/test_ci_overflow_plan.py"),
     ("C29-no-18-job-ceiling", "scripts/ci_overflow_ledger.py", "                or len(plan.jobs) > 18\n",
      "", "test_reserve_refuses_more_than_18_jobs", "tests/test_ci_overflow_ledger.py"),
+    ("C4-reserve-label-allowlist-off", "scripts/ci_overflow_ledger.py", "any(j.labels not in (POOL, X64, ARM) or",
+     "any(False or", "test_reserve_refuses_unapproved_label", "tests/test_ci_overflow_ledger.py"),
     ("C30-no-semantic-validation", "scripts/ci_overflow_ledger.py", "        _validate(data, self._today())\n", "",
      "test_semantically_corrupt_ledger_refuses_without_put", "tests/test_ci_overflow_ledger.py"),
     # Argus R3: restore the 586cd088 shape (no row key-set check, `row.get("terminal_on")`).
