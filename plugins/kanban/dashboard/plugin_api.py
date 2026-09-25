@@ -45,6 +45,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_constants import get_hermes_home
+
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -155,6 +157,99 @@ BOARD_COLUMNS: list[str] = [
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+
+
+def _state_db_paths() -> list[Path]:
+    """Every session store a card's ``session_id`` may live in (this profile,
+    the root profile, then each named profile), de-duplicated, in order."""
+    home = get_hermes_home()
+    root = home.parent.parent if home.parent.name == "profiles" else home
+    paths = [home / "state.db", root / "state.db"]
+    paths.extend(sorted((root / "profiles").glob("*/state.db")))
+    return list(dict.fromkeys(paths))
+
+
+def _viewer_home_ids(session_id: Optional[str]) -> frozenset[str]:
+    """The viewer's kanban home: ``kanban_db.home_ids`` (id + same-key
+    parent/child lineage, #951/#982) resolved against whichever profile's
+    state.db actually holds the session. Fail-open to the exact id."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return frozenset()
+    for path in _state_db_paths():
+        if not path.is_file():
+            continue
+        try:
+            with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+                found = db.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (sid,)
+                ).fetchone()
+        except (sqlite3.Error, OSError):
+            continue
+        if found:
+            return kanban_db.home_ids(sid, db_path=path) or frozenset({sid})
+    return frozenset({sid})
+
+
+def _worker_created_ids(conn: sqlite3.Connection) -> set[str]:
+    """Cards whose creation is PROVEN to come from a dispatched worker: the
+    ``parked_by_policy`` event ``create_task`` writes only when
+    ``kanban_worker_policy.is_dispatched_worker()`` held, carrying the
+    creating worker's task id. Profile-name ``created_by`` is NOT used: an
+    interactive session stamps the same value. Cards a worker created with
+    ``triage=True``/``initial_status=blocked`` are not parked and so are not
+    covered until the dedicated provenance column lands (#987/#998)."""
+    ids: set[str] = set()
+    for row in conn.execute(
+        "SELECT task_id, payload FROM task_events WHERE kind = 'parked_by_policy'"
+    ):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("worker_task_id"):
+            ids.add(row["task_id"])
+    return ids
+
+
+def _session_channel_origins(session_ids: set[str]) -> dict[str, tuple[str, str]]:
+    """Read chat origins across profiles without writing to any session DB."""
+    if not session_ids:
+        return {}
+    paths = _state_db_paths()
+    remaining = set(session_ids)
+    origins: dict[str, tuple[str, str]] = {}
+    for path in paths:
+        if not remaining or not path.is_file():
+            continue
+        try:
+            with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+                placeholders = ",".join("?" for _ in remaining)
+                rows = db.execute(
+                    f"SELECT id, source, chat_id FROM sessions WHERE id IN ({placeholders})",
+                    tuple(remaining),
+                ).fetchall()
+            for sid, source, chat_id in rows:
+                if source and chat_id:
+                    origins[sid] = (str(source).split(":")[-1].lower(), str(chat_id))
+                    remaining.discard(sid)
+        except (sqlite3.Error, OSError) as exc:
+            log.debug("kanban home channel lookup unavailable for %s: %s", path, exc)
+    return origins
+
+
+def _channel_display_names() -> dict[tuple[str, str], str]:
+    """Use the gateway's discovered channel directory when available."""
+    path = get_hermes_home() / "channel_directory.json"
+    try:
+        directory = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            (platform, str(channel["id"])): str(channel["name"])
+            for platform, channels in directory.get("platforms", {}).items()
+            for channel in channels if channel.get("id") and channel.get("name")
+        }
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
 
 
 def _task_dict(
@@ -398,6 +493,9 @@ def get_board(
     current_step_key: Optional[str] = Query(
         None, description="Restrict to tasks at this workflow step key",
     ),
+    session: Optional[str] = Query(
+        None, description="Viewer session id; flags cards in its kanban home",
+    ),
 ):
     """Return the full board grouped by status column.
 
@@ -470,6 +568,10 @@ def get_board(
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        origins = _session_channel_origins({t.session_id for t in tasks if t.session_id})
+        channel_names = _channel_display_names() if origins else {}
+        viewer_home = _viewer_home_ids(session)
+        worker_created = _worker_created_ids(conn)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -477,6 +579,12 @@ def get_board(
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
             d = _task_dict(t, latest_summary=preview)
+            origin = origins.get(t.session_id) if t.session_id else None
+            d["home_channel"] = (
+                channel_names.get(origin, origin[1]) if origin else None
+            )
+            d["in_viewer_home"] = bool(t.session_id) and t.session_id in viewer_home
+            d["worker_created"] = t.id in worker_created
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -517,6 +625,7 @@ def get_board(
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
+            "viewer_home_ids": sorted(viewer_home),
         }
     finally:
         conn.close()

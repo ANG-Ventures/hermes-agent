@@ -9,6 +9,32 @@
   width: 100%;
 }
 
+.hermes-kanban-home-facet {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.hermes-kanban-home-chip {
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 0.3rem 0.55rem;
+  font-size: 0.7rem;
+  line-height: 1;
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-home-chip--active {
+  color: var(--color-foreground);
+  background: var(--color-accent);
+}
+.hermes-kanban-home-chip:disabled { opacity: 0.5; cursor: not-allowed; }
+.hermes-kanban-home-channel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 9rem;
+  color: var(--color-muted-foreground);
+}
+
 /* ---- Code/pre reset (theme-immune default) --------------------------- *
  *
  * Themes (shipped AND user-installable) routinely paint every <code> and
