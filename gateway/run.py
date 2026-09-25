@@ -25808,14 +25808,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # contract). Resolve its tri-state immediately after session lookup,
         # before any session hygiene, onboarding, media enrichment, global
         # provider resolution, or agent construction can run.
-        # Off the loop: the lookup takes SessionStore._lock (threading.Lock),
-        # which a worker thread can hold across a routing load or save. Measured
-        # 2026-09-24 06:58 on Apollo: a single on-loop wait here blocked the
-        # event loop for ~100 s (PHASE=event_loop_blocked at session.py
-        # _ensure_loaded). Contract: tests/gateway/test_no_agent_construction_on_event_loop.py.
-        route_lookup = await asyncio.to_thread(
-            self._persisted_session_route_identity, session_key
-        )
+        route_lookup = self._persisted_session_route_identity(session_key)
         if route_lookup.state == "unavailable":
             return (
                 "⚠️ Provider authentication failed: The persisted session model "
