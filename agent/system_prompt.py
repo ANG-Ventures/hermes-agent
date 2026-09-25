@@ -309,8 +309,22 @@ def _skills_prompt(agent: Any) -> str:
         _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
     except Exception:
         _compact_cats = frozenset()
+    # delegate_task children inherit the parent's whole index but rarely read the descriptions: demote every
+    # category to names-only ("*") and keep full descriptions only for the skills the task named via
+    # tasks[i].skills. delegation.compact_skill_index: false restores the full index for children.
+    _promoted = frozenset()
+    if (agent.platform or "").lower() == "subagent":
+        try:
+            from tools.delegate_tool_config import _load_config as _delegation_config
+            _sub_compact = is_truthy_value((_delegation_config() or {}).get("compact_skill_index", True), default=True)
+        except Exception:
+            _sub_compact = True
+        if _sub_compact:
+            _compact_cats = frozenset({"*"}) | _compact_cats
+            _promoted = frozenset(getattr(agent, "_delegate_skills", ()) or ())
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent),
+                                         promoted_skills=_promoted or None)
 
 
 def _auto_load_parts(agent: Any) -> List[str]:
