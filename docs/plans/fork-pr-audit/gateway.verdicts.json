@@ -16,7 +16,12 @@
   },
   "branch": null,
   "notes": "Highest-cost row in the tranche (3863 loc, 21 conflict files in all 3 syncs, touches run.py+session.py+slash_commands.py+cli.py+tui_gateway/server.py+15 locales). The /fast half is absorbed. The sticky-reset half is a product preference (keep the /model pin across a manual /new) that is unmeasured (0 fires, no incident) — per README rule that is not a KEEP. Lead/Ace ruling needed on whether the sticky-reset knob (default true) is wanted; if yes, re-port ONLY session-reset preservation as a small patch instead of carrying the 3.8k-line contract layer. | Discord native-slash usage in 2026-05-10..2026-09-25 logs (`slash '/X' invoked`): /model 330, /stop 266, /reset 42, /compress 34, /steer 24, /reasoning 19, /undo 2, /redo 0, /branch 0, /merge 0, /fast 0 (text-typed commands are not logged).",
-  "subject": "fix(gateway): make fast route-aware and preserve manual reset preferences (#315)"
+  "subject": "fix(gateway): make fast route-aware and preserve manual reset preferences (#315)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "KEEP (route-identity layer) / ruling on sticky reset",
+   "evidence": "registry docs/sync/fork-features.json entry 17 '/fast' lifecycle=fork-permanent (Ace ruling) and entry 10 route identity upstream-intended. Symbols #315 added are consumed outside its files and are 0-hit upstream: lookup_persisted_route_identity (gateway/fork_ext/route_identity.py:39), sanitize_model_override_identity (gateway/chat_model_pins.py:29 = registry entry 0), PersistedSessionRouteLookup (gateway/run.py:3349). A revert breaks chat-model pins. At most the sticky-reset knob (preserve_route_preferences_on_manual_reset, hermes_cli/config_defaults.py:4306, not set in any fleet config) is droppable."
+  }
  },
  "#49": {
   "verdict": "DROP",
@@ -35,7 +40,12 @@
   },
   "branch": null,
   "notes": "Feature never used in production (0 of 16 literals hit across 540 log files incl. success messages). 3007 loc, 9 conflict files (3 syncs), fork-only hermes_undo.py. Dependents: #353 #339 #356 (undo follow-ups) — revert together. Revert-branch attempt recorded in the branch pass at the end (see gateway.md footer). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: /undo WAS used twice via Discord native slash (2026-09-15); /redo never. Verdict stands (take upstream's single-turn /undo; half-turn walk + /redo unused) but the revert is a hand port: 19 conflicted files. Left for continuation card.",
-  "subject": "feat: reversible half-turn /undo + /redo across CLI, gateway, TUI (#49)"
+  "subject": "feat: reversible half-turn /undo + /redo across CLI, gateway, TUI (#49)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "Ace ruling (fork-permanent)",
+   "evidence": "fork-features.json entry 14 '/undo and /redo' lifecycle=fork-permanent -> DROP needs Ace. Usage: /undo 2 native-slash invocations in 4.5 months. Revert unit must also remove tui_gateway/server.py:12357 _undo_session_core + :12385 _redo_session_core and their callers tui_gateway/methods_session.py:2909, methods_tools.py:1051, plus hermes_state.py _raise_if_rewind_would_orphan_tool - not in the auditor's file list."
+  }
  },
  "#157": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -54,7 +64,12 @@
   },
   "branch": null,
   "notes": "Fork's backfill still fires every boot (390 boots) but upstream's task does the same job on the same adapter. Before revert: confirm upstream's backfill also covers idle channels the drain never marked (fork tracks recent_channels in a shutdown-flushed state file; upstream uses last-bot-message cursor per channel). 2296 loc, 6 conflict files (3 syncs), touches agent/conversation_loop.py + run_agent.py.",
-  "subject": "fix(discord): recover messages dropped during a graceful restart drain window (#157)"
+  "subject": "fix(discord): recover messages dropped during a graceful restart drain window (#157)",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "KEEP",
+   "evidence": "fleet logs 2026-07-12..2026-09-25: PHASE=restart_backfill on 191 boots, 101 re-injected messages (425 total, reinject_failed=0), 98 of them scanning >2 channels; upstream _missed_message_backfill_channels (up plugins/platforms/discord/adapter.py:2186) defaults to allowed|free_response = 2 channels on the main profile (~/.hermes/config.yaml:541-542), so it cannot see the thread/DM channels the fork's recent_channels state covers; 0 'Backfilling missed Discord message' lines from upstream's path in the same window. Candidate for UPSTREAM later (channel-set gap), not a drop."
+  }
  },
  "#295": {
   "verdict": "KEEP",
@@ -130,7 +145,12 @@
   },
   "branch": null,
   "notes": "Take upstream's /branch. /merge is fork-only, unmeasured; if anyone uses it, re-port as a standalone slash mixin. 1719 loc, 5 conflict files (3 syncs), 15 locale files. | Discord native-slash usage in 2026-05-10..2026-09-25 logs (`slash '/X' invoked`): /model 330, /stop 266, /reset 42, /compress 34, /steer 24, /reasoning 19, /undo 2, /redo 0, /branch 0, /merge 0, /fast 0 (text-typed commands are not logged).",
-  "subject": "feat: /branch spawns a Discord thread; /merge folds a session summary into any session (#221)"
+  "subject": "feat: /branch spawns a Discord thread; /merge folds a session summary into any session (#221)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "SUPERSEDED for /branch; Ace ruling for /merge",
+   "evidence": "/branch half: upstream has _branched_from + sibling thread (dbcbd9d9db, verified ancestor) -> take upstream. /merge half: fork-features.json entry 16 lifecycle=fork-permanent (and entry 15 for the /branch Discord thread) -> needs Ace. /merge usage 0 (success path unlogged)."
+  }
  },
  "#782": {
   "verdict": "UPSTREAM",
@@ -168,7 +188,12 @@
   },
   "branch": null,
   "notes": "Upstream landed the same design 11 days after the fork; fork delta on top of upstream's copy is what #433 dedups. Desktop/dashboard = D9 upstream-owned. Take upstream's; audit only whether tui_gateway/server.py retains fork-only dispatch glue (see #433).",
-  "subject": "feat(tui_gateway): isolate dashboard turns in compute host (#198)"
+  "subject": "feat(tui_gateway): isolate dashboard turns in compute host (#198)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "upstream carries the helpers the fork's tui_gateway callers use (_session_uses_compute_host, _submit_prompt_to_compute_host, _send_compute_host_control, _get_compute_host_supervisor in up tui_gateway/compute_host_bridge.py + methods_*); fleet knob turn_isolation (config.yaml:356) is read by upstream (up hermes_cli/config_defaults.py:980, tui_gateway/server.py:1218). Registry entry 13 already lifecycle=absorbed. 7d27a31ce7 verified on upstream/main."
+  }
  },
  "#659": {
   "verdict": "KEEP",
@@ -225,7 +250,12 @@
   },
   "branch": null,
   "notes": "Measured only by absence of replays (no positive literal). Dependent #687 (retain refused completions). 1387 loc, 5 conflict files.",
-  "subject": "fix(delegation): acknowledge JSON completion outbox after delivery (#683)"
+  "subject": "fix(delegation): acknowledge JSON completion outbox after delivery (#683)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 in 2026-05-10..2026-09-25 (5 literals = failure paths; success path logs nothing)'; original='PR body describes observed replay after boots; fork tests (6 files)' - no positive production measurement"
+  }
  },
  "#871": {
   "verdict": "UPSTREAM",
@@ -282,7 +312,12 @@
   },
   "branch": null,
   "notes": "Dormant flag never enabled (0 fires in 4.5 months); desktop is D9 upstream-owned and upstream has its own session_auto_continue. 1272 loc, 3 conflict files (3 syncs). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: revert conflicts in 3 files, 14 hunks, ~10.8k diff lines; the flag has since spread to tui_gateway/methods_session.py and config_defaults.py. Hand-built revert left for continuation card.",
-  "subject": "feat(tui): desktop/TUI session auto-resume after backend restart (dormant flag) (#229)"
+  "subject": "feat(tui): desktop/TUI session auto-resume after backend restart (dormant flag) (#229)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead: flag IS enabled",
+   "evidence": "auditor premise 'dormant flag never enabled' is false: desktop_auto_resume: true at ~/.hermes/config.yaml:371 and profiles/aegis/config.yaml:323. The PR's only literals are logger.debug (not in INFO logs), so '0 fires' is unmeasurable rather than zero. Live consumers tui_gateway/methods_session.py:638/912/1132. Also carries the DESKTOP_REASON_RESTART_CONSUMED half of the F1 contract (see UNRESOLVED unit). D9 desktop is upstream-owned, so a DROP is plausible but it disables an operator-set knob: Ace/lead call."
+  }
  },
  "#228": {
   "verdict": "KEEP",
@@ -301,7 +336,12 @@
   },
   "branch": null,
   "notes": "Base of the fork route-announce family (#657 #249 #598 #318 #557 #403 #405 #742 #691 #520 build on it). Measured only by its tests; the footer correctness is user-visible on every turn. 1243 loc, 7 conflict files (3 syncs) — a hotspot.",
-  "subject": "feat(gateway): honest reasoning footer + in-session switch announce + restart-durable overrides (#228)"
+  "subject": "feat(gateway): honest reasoning footer + in-session switch announce + restart-durable overrides (#228)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 in 2026-05-10..2026-09-25 (4 literals = error paths)'; original='live root-cause in PR body (footer built with no reasoning= fell back to config)' - no positive production measurement"
+  }
  },
  "#456": {
   "verdict": "KEEP",
@@ -320,7 +360,12 @@
   },
   "branch": null,
   "notes": "Conflict-reduction refactor; dropping it would move 7 functions back into run.py. Keep as long as the restart family (#295 #761 …) stays.",
-  "subject": "refactor(gateway): extract restart policy helpers (#456)"
+  "subject": "refactor(gateway): extract restart policy helpers (#456)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='declared refactor (AST-byte-identical move to gateway/fork_ext/restart_policy.py' - no positive production measurement"
+  }
  },
  "#657": {
   "verdict": "KEEP",
@@ -339,7 +384,12 @@
   },
   "branch": null,
   "notes": "Fleet-specific (claude-bridge sub failover). 1146 loc, 7 conflict files (3 syncs).",
-  "subject": "fix(gateway): announce route and reasoning transitions consistently (#657)"
+  "subject": "fix(gateway): announce route and reasoning transitions consistently (#657)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal = error path); announces themselves are chat messages, not log lines'; original='reproduced 503 no-eligible-sub x3 -> 429 sequence in PR body' - no positive production measurement"
+  }
  },
  "#937": {
   "verdict": "KEEP",
@@ -377,7 +427,12 @@
   },
   "branch": null,
   "notes": "Hottest literal in the tranche but it is per-boot telemetry, not a defect firing. Upstream's own gate (Kyzcreig-ported base + Teknium refactor) covers the fail-open; fork's extra per-event retry/backoff replay owner is not evidenced as needed. 1020 loc, 1 conflict file.",
-  "subject": "fix(gateway): fail open startup restore intake (#301)"
+  "subject": "fix(gateway): fail open startup restore intake (#301)",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "UPSTREAM",
+   "evidence": "upstream _drain_startup_restore_queue (up gateway/run_startup.py:~100) logs 'Dropping startup-restore queued message: adapter unavailable' and continues = message LOST; fork replay owner deferred instead 11x with reason=adapter on 09-19..09-23 (gateway.log*). Upstream still drops -> generic fix, port it."
+  }
  },
  "#827": {
   "verdict": "KEEP",
@@ -415,7 +470,12 @@
   },
   "branch": null,
   "notes": "Correctness close-out for #821; follows #821's verdict (KEEP while launchd-exit-timeout drain is fork-owned; #861 then supersedes its deadline math). Not independently measured.",
-  "subject": "fix(gateway): close the round-3 FleetReview P1s on the shutdown budget (#838)"
+  "subject": "fix(gateway): close the round-3 FleetReview P1s on the shutdown budget (#838)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal = failure path)'; original='FleetReview round-3 record on #821 head ad9c32339e' - no positive production measurement"
+  }
  },
  "#817": {
   "verdict": "UPSTREAM",
@@ -510,7 +570,12 @@
   },
   "branch": null,
   "notes": "Reverting would re-introduce duplicate module-level defs. Follows #198 (SUPERSEDED): when upstream's compute host is taken wholesale this row dissolves. 880 loc, 1 conflict file.",
-  "subject": "fix(tui_gateway): dedup merge-introduced module-level defs + recover two dead compute-host fixes (#433)"
+  "subject": "fix(tui_gateway): dedup merge-introduced module-level defs + recover two dead compute-host fixes (#433)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='merge artifact diagnosed in PR body' - no positive production measurement"
+  }
  },
  "#821": {
   "verdict": "KEEP",
@@ -529,7 +594,12 @@
   },
   "branch": null,
   "notes": "Unmeasured beyond its tests (teardown timings live in gateway-exit-diag.log, not grepped here). Same family as #738 (Kyz upstream) / #838 / #861 — recommend the lead treats #738+#821+#838+#861 as ONE unit: the correct end state is UPSTREAM the whole drain-budget stack on top of aa0289f307.",
-  "subject": "fix(gateway): reserve launchd shutdown teardown headroom (#821)"
+  "subject": "fix(gateway): reserve launchd shutdown teardown headroom (#821)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (2 literals)'; original='PR body (teardown timing persisted to state/gateway.teardown.json; restart-inter' - no positive production measurement"
+  }
  },
  "#763": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -548,7 +618,12 @@
   },
   "branch": null,
   "notes": "Check before revert that upstream's sync path never vacates commands mid-sync (fork's 'never vacate' guard); registry-drift check is fork-only but has fired 0 times. Dependent #777 (review fixes) follows.",
-  "subject": "fix(discord): never vacate a slash command mid-sync, and self-heal after a 429 (#763)"
+  "subject": "fix(discord): never vacate a slash command mid-sync, and self-heal after a 429 (#763)",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "UPSTREAM",
+   "evidence": "auditor's up_fix cc8e5ec2af is the BASE the fork PR built on (git log -S _record_command_sync_rate_limit gives the same sha on fork). Upstream has 0 hits for _command_sync_retry_task / drift check: after a 429 it records and returns, retrying only on next reconnect. Fleet logs: 26 'rate-limited slash command sync' 09-13..09-20 07:04, 0 after the fork self-heal landed. Measured, generic, absent upstream."
+  }
  },
  "#249": {
   "verdict": "KEEP",
@@ -567,7 +642,12 @@
   },
   "branch": null,
   "notes": "Fleet-specific fallback UX (claude-bridge). Base for nopr:29059863f8 and nopr:5378b19f73. 847 loc, 2 conflict files.",
-  "subject": "feat(fallback): announce the model-restore leg where it happens — inline restore + pre-run re-init (refusing-pin fix) (#249)"
+  "subject": "feat(fallback): announce the model-restore leg where it happens — inline restore + pre-run re-init (refusing-pin fix) (#249)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (4 literals = failure paths)'; original='live 2026-07-08 observation in PR body' - no positive production measurement"
+  }
  },
  "#807": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -586,7 +666,12 @@
   },
   "branch": null,
   "notes": "Already Kyzcreig-authored upstream; the fork copy's executor cap was removed by #936. Keep only the PHASE=executor_wait line if #936 is ported.",
-  "subject": "fix(gateway): run session housekeeping on its own pool so it cannot starve turn bodies (#807)"
+  "subject": "fix(gateway): run session housekeeping on its own pool so it cannot starve turn bodies (#807)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "9815b44568 verified on upstream/main (same Kyzcreig change). tools/async_delegation.py _executor_max_workers is an unrelated module-local of the same name, not a consumer."
+  }
  },
  "#160": {
   "verdict": "KEEP",
@@ -605,7 +690,12 @@
   },
   "branch": null,
   "notes": "Unmeasured: guard never suppressed anything in the retained window. Telegram is a live fleet surface, so the guard is cheap insurance, but per README rule this is KEEP-UNPROVEN; adversary/lead may downgrade to DROP. 813 loc, 1 conflict file.",
-  "subject": "feat(telegram): hard-kill boot-redelivery duplicate-answer guard (scope B) (#160)"
+  "subject": "feat(telegram): hard-kill boot-redelivery duplicate-answer guard (scope B) (#160)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (3 literals incl. PHASE=tg_redelivery_suppressed — no suppression event in 4.5 months)'; original=\"PR body ('hard-kill duplicate-answer guard, scope B')\" - no positive production measurement"
+  }
  },
  "#832": {
   "verdict": "KEEP",
@@ -624,7 +714,12 @@
   },
   "branch": null,
   "notes": "Follows #295 (KEEP).",
-  "subject": "fix(gateway): move the deferred-restart arm off the event loop (ratchet 37 -> 26) (#832)"
+  "subject": "fix(gateway): move the deferred-restart arm off the event loop (ratchet 37 -> 26) (#832)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='t_13445a80 ratchet 37->26' - no positive production measurement"
+  }
  },
  "#80": {
   "verdict": "UNRESOLVED",
@@ -643,7 +738,12 @@
   },
   "branch": null,
   "notes": "CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
-  "subject": "fix(gateway): authoritative restart-initiator breadcrumb for F2 breaker (#80)"
+  "subject": "fix(gateway): authoritative restart-initiator breadcrumb for F2 breaker (#80)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead ruling (split F1 keep / F2 drop?)",
+   "evidence": "F1/F2 unit: fleet knobs that exist only for this breaker are set in live config - restart_initiated_ttl_secs 600, restart_loop_threshold 3, restart_loop_window_secs 300 (~/.hermes/config.yaml:75-77); bridged by gateway/fork_ext/restart_policy.py:120-123 (registry entry 9, upstream-intended, golden tests). #229's DESKTOP_REASON_RESTART_CONSUMED mirrors F1. Zero breaker trips measured, so value is unproven, but a DROP also orphans 3 config keys and a registry entry -> lead/Ace, not an auditor call."
+  }
  },
  "#616": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -662,7 +762,12 @@
   },
   "branch": null,
   "notes": "Kyzcreig-authored upstream; take upstream's.",
-  "subject": "fix(tui-gateway): interrupt turns after websocket disconnect (#616)"
+  "subject": "fix(tui-gateway): interrupt turns after websocket disconnect (#616)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "14b50f5edd verified on upstream/main. Revert caveat: scripts/certify/dashboard_loop_certify.py is NOT on upstream and is co-owned with scripts_misc #612 (NEEDS-LEAD there) - do not delete it in the gateway revert."
+  }
  },
  "#70": {
   "verdict": "UNRESOLVED",
@@ -681,7 +786,12 @@
   },
   "branch": null,
   "notes": "CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
-  "subject": "fix(gateway): break the restart-cascade replay loop (F1 drain-mark + F2 circuit-breaker) (#70)"
+  "subject": "fix(gateway): break the restart-cascade replay loop (F1 drain-mark + F2 circuit-breaker) (#70)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead ruling (split F1 keep / F2 drop?)",
+   "evidence": "F1/F2 unit: fleet knobs that exist only for this breaker are set in live config - restart_initiated_ttl_secs 600, restart_loop_threshold 3, restart_loop_window_secs 300 (~/.hermes/config.yaml:75-77); bridged by gateway/fork_ext/restart_policy.py:120-123 (registry entry 9, upstream-intended, golden tests). #229's DESKTOP_REASON_RESTART_CONSUMED mirrors F1. Zero breaker trips measured, so value is unproven, but a DROP also orphans 3 config keys and a registry entry -> lead/Ace, not an auditor call."
+  }
  },
  "#814": {
   "verdict": "KEEP",
@@ -700,7 +810,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN: no measurement; keep on the strength of its 4 tests + it being 3 days old (t_e253d9d5 family). Lead may downgrade.",
-  "subject": "fix(gateway): stop stale queued turn recursion (#814)"
+  "subject": "fix(gateway): stop stale queued turn recursion (#814)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a (no literal)'; original='PR body; 4 fork tests' - no positive production measurement"
+  }
  },
  "#967": {
   "verdict": "KEEP",
@@ -719,7 +834,12 @@
   },
   "branch": null,
   "notes": "Follows #157: if #157 is dropped for upstream's backfill, this row's fork half goes with it. Keep until then.",
-  "subject": "fix(discord): take restart-recovery persistence off the event loop + plugin-scope atomic-write lint (t_eb49443b) (#967)"
+  "subject": "fix(discord): take restart-recovery persistence off the event loop + plugin-scope atomic-write lint (t_eb49443b) (#967)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (3 literals)'; original='t_13445a80 ratchet' - no positive production measurement"
+  }
  },
  "#769": {
   "verdict": "KEEP",
@@ -738,7 +858,12 @@
   },
   "branch": null,
   "notes": "Restart-notice family (#790 #884 #904 #1004).",
-  "subject": "fix(gateway): name the killer on an unclean lifecycle-ledger exit (#769)"
+  "subject": "fix(gateway): name the killer on an unclean lifecycle-ledger exit (#769)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (5 literals = failure paths); attribution appears in gateway-exit-diag.log which was not grepped'; original='PR body' - no positive production measurement"
+  }
  },
  "nopr:29059863f8": {
   "verdict": "KEEP",
@@ -757,7 +882,12 @@
   },
   "branch": null,
   "notes": "Follows #249.",
-  "subject": "feat(fallback): announce the re-init model snap-back (unified recovery announce + (new turn)/(re-init) rider)"
+  "subject": "feat(fallback): announce the re-init model snap-back (unified recovery announce + (new turn)/(re-init) rider)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (2 literals = failure paths)'; original='commit body (A4 axis)' - no positive production measurement"
+  }
  },
  "#353": {
   "verdict": "DROP",
@@ -776,7 +906,12 @@
   },
   "branch": null,
   "notes": "Follows #49 (DROP). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: /undo WAS used twice via Discord native slash (2026-09-15); /redo never. Verdict stands (take upstream's single-turn /undo; half-turn walk + /redo unused) but the revert is a hand port: 19 conflicted files. Left for continuation card.",
-  "subject": "fix(undo): stop /undo·/redo reporting a false 'Nothing to undo.' on a swallowed error (#353)"
+  "subject": "fix(undo): stop /undo·/redo reporting a false 'Nothing to undo.' on a swallowed error (#353)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "follows #49",
+   "evidence": "same fork-permanent ruling as #49 (entry 14; test_undo_error_honesty.py is a registry test)."
+  }
  },
  "#557": {
   "verdict": "KEEP",
@@ -795,7 +930,12 @@
   },
   "branch": null,
   "notes": "Route-announce family (#228). KEEP-UNPROVEN beyond tests.",
-  "subject": "fix(model-switch): stop /model clobbering the session's reasoning effort (#467 contract) (#557)"
+  "subject": "fix(model-switch): stop /model clobbering the session's reasoning effort (#467 contract) (#557)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal)'; original='PR body' - no positive production measurement"
+  }
  },
  "#770": {
   "verdict": "KEEP",
@@ -833,7 +973,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN by log; relevant given 2026-09-23 host storm (load 86). Generic — UPSTREAM candidate.",
-  "subject": "fix(gateway): hold instead of exit-75 when the liveness miss is host starvation (#772)"
+  "subject": "fix(gateway): hold instead of exit-75 when the liveness miss is host starvation (#772)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a (no literal)'; original='PR body (2026-09-20 host load)' - no positive production measurement"
+  }
  },
  "#201": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -852,7 +997,12 @@
   },
   "branch": null,
   "notes": "Follows #198.",
-  "subject": "feat(tui_gateway): route isolated session metadata reads (#201)"
+  "subject": "feat(tui_gateway): route isolated session metadata reads (#201)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "follows #198 (7d27a31ce7 on upstream/main); remaining outside-path hits are gates.jsonl log rows, not code."
+  }
  },
  "#180": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -871,7 +1021,12 @@
   },
   "branch": null,
   "notes": "D9 desktop; take upstream.",
-  "subject": "fix(desktop): route live slash commands (#180)"
+  "subject": "fix(desktop): route live slash commands (#180)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "D9; outside-path hits only gates.jsonl."
+  }
  },
  "#142": {
   "verdict": "KEEP",
@@ -928,7 +1083,12 @@
   },
   "branch": null,
   "notes": "Follows #937.",
-  "subject": "fix(gateway): restart follow-ups keep adapter-granted admission; refused replays reported lost (t_43e058b7) (#961)"
+  "subject": "fix(gateway): restart follow-ups keep adapter-granted admission; refused replays reported lost (t_43e058b7) (#961)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (8 literals = failure paths)'; original='t_e253d9d5 r3' - no positive production measurement"
+  }
  },
  "#137": {
   "verdict": "KEEP",
@@ -947,7 +1107,12 @@
   },
   "branch": null,
   "notes": "Follows #295. KEEP-UNPROVEN by log.",
-  "subject": "fix(gateway): per-session quiescence + task-liveness reaper (busy-gateway deferred restart never fires) (#137)"
+  "subject": "fix(gateway): per-session quiescence + task-liveness reaper (busy-gateway deferred restart never fires) (#137)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (3 literals = failure paths)'; original='PR body' - no positive production measurement"
+  }
  },
  "#945": {
   "verdict": "KEEP",
@@ -966,7 +1131,12 @@
   },
   "branch": null,
   "notes": "Follows #937.",
-  "subject": "fix(gateway): spool adapter-parked follow-ups before teardown clears them (t_e253d9d5 r4, stacked on #937) (#945)"
+  "subject": "fix(gateway): spool adapter-parked follow-ups before teardown clears them (t_e253d9d5 r4, stacked on #937) (#945)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (6 literals = failure paths)'; original='t_e253d9d5 r4' - no positive production measurement"
+  }
  },
  "#970": {
   "verdict": "UPSTREAM",
@@ -1023,7 +1193,12 @@
   },
   "branch": null,
   "notes": "Kyzcreig-authored upstream; take upstream's. Base of the drain-budget unit (#821 #838 #861).",
-  "subject": "fix(gateway): cap signal-driven stop drain to launchd's live ExitTimeOut (#738)"
+  "subject": "fix(gateway): cap signal-driven stop drain to launchd's live ExitTimeOut (#738)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "aa0289f307 verified on upstream/main; 0 outside-path consumers."
+  }
  },
  "#862": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1042,7 +1217,12 @@
   },
   "branch": null,
   "notes": "Kyzcreig-authored upstream.",
-  "subject": "fix(gateway): move the thread-participation persist off the event loop (ratchet 17 -> 16) (#862)"
+  "subject": "fix(gateway): move the thread-participation persist off the event loop (ratchet 17 -> 16) (#862)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "ee8a3ded96 verified on upstream/main."
+  }
  },
  "#97": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1061,7 +1241,12 @@
   },
   "branch": null,
   "notes": "563 loc, 5 conflict files (3 syncs) — a hotspot worth dropping. Adversary: verify the v3-latch case (env restored on the wrong session) is covered by upstream's token scoping tests.",
-  "subject": "fix(gateway): stop per-session os.environ clobber across concurrent sessions (v3-latch bug class) (#97)"
+  "subject": "fix(gateway): stop per-session os.environ clobber across concurrent sessions (v3-latch bug class) (#97)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "SUPERSEDED for the run.py env clobber; keep kanban half",
+   "evidence": "hermes_cli/kanban_identity.py:48 imports tools.kanban_tools._current_session_id (added by #97); kanban_identity.py does not exist upstream and upstream kanban_tools has no _current_session_id def. The gateway env-clobber half is covered by upstream tests/gateway/test_session_env.py::test_session_key_no_race_condition_with_contextvars. Revert must be partial."
+  }
  },
  "nopr:b728ad49f9": {
   "verdict": "KEEP",
@@ -1080,7 +1265,12 @@
   },
   "branch": null,
   "notes": "Conflict-reduction refactor; dissolves if #315 and #659 both go.",
-  "subject": "refactor(gateway): extract route identity helpers"
+  "subject": "refactor(gateway): extract route identity helpers",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "#582": {
   "verdict": "KEEP",
@@ -1099,7 +1289,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN by log; generic — UPSTREAM candidate (small).",
-  "subject": "fix(gateway): bound the post-update notification retry so an undeliverable marker terminates (#582)"
+  "subject": "fix(gateway): bound the post-update notification retry so an undeliverable marker terminates (#582)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal)'; original='PR body' - no positive production measurement"
+  }
  },
  "#560": {
   "verdict": "KEEP",
@@ -1156,7 +1351,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN: needs a live check on upstream's post-6e5b084b8b slash path; adversary should reproduce.",
-  "subject": "fix(discord): native slash commands delivered the gateway reply twice (#716)"
+  "subject": "fix(discord): native slash commands delivered the gateway reply twice (#716)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a (no literal)'; original='PR body' - no positive production measurement"
+  }
  },
  "#562": {
   "verdict": "KEEP",
@@ -1175,7 +1375,12 @@
   },
   "branch": null,
   "notes": "Fleet-specific (kanban wake routing). KEEP-UNPROVEN by log; 1 conflict file (1 sync).",
-  "subject": "fix(kanban): resolve the wake's participant so an identity-less sub can't mint a phantom session (#562)"
+  "subject": "fix(kanban): resolve the wake's participant so an identity-less sub can't mint a phantom session (#562)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#170": {
   "verdict": "KEEP",
@@ -1194,7 +1399,12 @@
   },
   "branch": null,
   "notes": "CORRECTED DROP -> KEEP in the branch pass: agent/inactivity_watch.py is live, imported by gateway/run.py:68/80 on fork main (the cron consumer has since dropped it). The revert has 5 conflict hunks where main's HEAD side has grown (50-60 lines vs 9-40 in the refactor), so reverting = rewriting evolved watchdog logic back inline in the 40k-line run.py with no evidence of benefit. Cost stays: 1 fork-only module + 2 imports. Lead may re-open if the inactivity watchdog itself is dropped.",
-  "subject": "refactor: share inactivity watchdog polling (#170)"
+  "subject": "refactor: share inactivity watchdog polling (#170)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal)'; original='commit body (refactor)' - no positive production measurement"
+  }
  },
  "#801": {
   "verdict": "KEEP",
@@ -1213,7 +1423,12 @@
   },
   "branch": null,
   "notes": "Follows #761.",
-  "subject": "fix(gateway): charge dispatched resumes and preserve cap across rollbacks (#801)"
+  "subject": "fix(gateway): charge dispatched resumes and preserve cap across rollbacks (#801)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (4 literals = failure paths)'; original='PR body (#761 follow-up)' - no positive production measurement"
+  }
  },
  "#598": {
   "verdict": "KEEP",
@@ -1232,7 +1447,12 @@
   },
   "branch": null,
   "notes": "Route-announce family (#228). KEEP-UNPROVEN.",
-  "subject": "fix(gateway): deliver model route changes durably (#598)"
+  "subject": "fix(gateway): deliver model route changes durably (#598)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#883": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1251,7 +1471,12 @@
   },
   "branch": null,
   "notes": "Kyzcreig-authored upstream.",
-  "subject": "fix(gateway): move the artifact transport off the event loop (ratchet 15 -> 14) (#883)"
+  "subject": "fix(gateway): move the artifact transport off the event loop (ratchet 15 -> 14) (#883)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "f276ff3f6f verified on upstream/main."
+  }
  },
  "#758": {
   "verdict": "KEEP",
@@ -1270,7 +1495,12 @@
   },
   "branch": null,
   "notes": "Gate for the off-loop family; UPSTREAM together with the family if upstream wants the lint. 0 conflict files.",
-  "subject": "test(gateway): AST contract — no synchronous subprocess/sleep calls on the event loop (+ whatsapp connect off-loop) (#758)"
+  "subject": "test(gateway): AST contract — no synchronous subprocess/sleep calls on the event loop (+ whatsapp connect off-loop) (#758)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='t_13445a80 ratchet baseline' - no positive production measurement"
+  }
  },
  "#318": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1289,7 +1519,12 @@
   },
   "branch": null,
   "notes": "Take upstream's; verify effective-route display in a live /new.",
-  "subject": "fix(gateway): show effective route in reset banner (#318)"
+  "subject": "fix(gateway): show effective route in reset banner (#318)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "upstream _reset_notice_session_info at up gateway/slash_commands_session.py:190; no outside consumer (hermes_cli/config.py hit is a docstring)."
+  }
  },
  "#855": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1308,7 +1543,12 @@
   },
   "branch": null,
   "notes": "0 conflict files.",
-  "subject": "fix(gateway): move the sticker-description cache write off the event loop (ratchet 18 -> 17) (#855)"
+  "subject": "fix(gateway): move the sticker-description cache write off the event loop (ratchet 18 -> 17) (#855)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "upstream async sticker cache write; outside-path hits are generic names."
+  }
  },
  "nopr:19c2e7cc30": {
   "verdict": "KEEP",
@@ -1327,7 +1567,12 @@
   },
   "branch": null,
   "notes": "Follows #456 / restart family.",
-  "subject": "refactor(gateway): extract restart failure codec"
+  "subject": "refactor(gateway): extract restart failure codec",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "nopr:1832ed4e78": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1346,7 +1591,12 @@
   },
   "branch": null,
   "notes": "absorb 28%; 2 conflict files (3 syncs).",
-  "subject": "fix(gateway): bind session context at agent turn entry"
+  "subject": "fix(gateway): bind session context at agent turn entry",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "KEEP",
+   "evidence": "live consumer outside the PR: tools/delegate_tool.py:4056/4083 imports restore_session_vars (added by #285 52b51f7d3e, background delegate restart survival). Upstream has 0 hits for restore_session_vars anywhere. Revert = runtime ImportError in delegate_task restart path."
+  }
  },
  "#834": {
   "verdict": "UPSTREAM",
@@ -1384,7 +1634,12 @@
   },
   "branch": null,
   "notes": "Telegram is a live fleet surface; KEEP-UNPROVEN by log. 0 conflict files.",
-  "subject": "fix(telegram): make silent inbound update drops visible via an intake sentinel (#639)"
+  "subject": "fix(telegram): make silent inbound update drops visible via an intake sentinel (#639)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a (no literal extracted)'; original='PR body' - no positive production measurement"
+  }
  },
  "nopr:5074cd02b0": {
   "verdict": "KEEP",
@@ -1403,7 +1658,12 @@
   },
   "branch": null,
   "notes": "Compaction-announce family (#452 #316 #627 #404 #626 #173). KEEP-UNPROVEN by log; announces are chat messages.",
-  "subject": "feat(compaction-announce): announce hygiene compactions + Issue-8 abort guard (Phases 0/2/3)"
+  "subject": "feat(compaction-announce): announce hygiene compactions + Issue-8 abort guard (Phases 0/2/3)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal = skip path)'; original='commit body' - no positive production measurement"
+  }
  },
  "#851": {
   "verdict": "UPSTREAM",
@@ -1441,7 +1701,12 @@
   },
   "branch": null,
   "notes": "Follows #289/#295.",
-  "subject": "fix(gateway): boot-resume protection marker owned by turn lifecycle, not wrapper"
+  "subject": "fix(gateway): boot-resume protection marker owned by turn lifecycle, not wrapper",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "#69": {
   "verdict": "KEEP",
@@ -1460,7 +1725,12 @@
   },
   "branch": null,
   "notes": "Generic — UPSTREAM candidate; KEEP-UNPROVEN by log. 2 conflict files.",
-  "subject": "fix(discord): stop \"is typing…\" orphaned by typing-loop recreate race (#69)"
+  "subject": "fix(discord): stop \"is typing…\" orphaned by typing-loop recreate race (#69)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a (no literal)'; original='PR body' - no positive production measurement"
+  }
  },
  "#7536": {
   "verdict": "UNRESOLVED",
@@ -1479,7 +1749,12 @@
   },
   "branch": null,
   "notes": "Stuck-loop counter tweaks entangled with the F1/F2 unit (the unit's revert conflicts in tests/gateway/test_stuck_loop*.py). CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
-  "subject": "fix(gateway): stuck-loop counter must gate on genuine interruption, not clean drain (#7536)"
+  "subject": "fix(gateway): stuck-loop counter must gate on genuine interruption, not clean drain (#7536)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead ruling (split F1 keep / F2 drop?)",
+   "evidence": "F1/F2 unit: fleet knobs that exist only for this breaker are set in live config - restart_initiated_ttl_secs 600, restart_loop_threshold 3, restart_loop_window_secs 300 (~/.hermes/config.yaml:75-77); bridged by gateway/fork_ext/restart_policy.py:120-123 (registry entry 9, upstream-intended, golden tests). #229's DESKTOP_REASON_RESTART_CONSUMED mirrors F1. Zero breaker trips measured, so value is unproven, but a DROP also orphans 3 config keys and a registry entry -> lead/Ace, not an auditor call."
+  }
  },
  "nopr:2ee2e03b68": {
   "verdict": "KEEP",
@@ -1517,7 +1792,12 @@
   },
   "branch": null,
   "notes": "Code-skew family (#184 #493). KEEP-UNPROVEN; 0 conflict files.",
-  "subject": "feat(gateway): narrow code-skew guard to in-process import oracle (A1a)"
+  "subject": "feat(gateway): narrow code-skew guard to in-process import oracle (A1a)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body (A1a)' - no positive production measurement"
+  }
  },
  "#936": {
   "verdict": "UPSTREAM",
@@ -1574,7 +1854,12 @@
   },
   "branch": null,
   "notes": "Small generic fix — UPSTREAM candidate (one-line frozenset change).",
-  "subject": "fix(gateway): recognize reboot_interrupted as a first-class auto-resume reason (#96)"
+  "subject": "fix(gateway): recognize reboot_interrupted as a first-class auto-resume reason (#96)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#710": {
   "verdict": "KEEP",
@@ -1593,7 +1878,12 @@
   },
   "branch": null,
   "notes": "Fleet preference (kanban threads live a week). KEEP-UNPROVEN by log; 1 conflict file (2 syncs).",
-  "subject": "fix(discord): thread auto_archive_duration 1440 -> 10080 (retire idle-thread archiver) (#710)"
+  "subject": "fix(discord): thread auto_archive_duration 1440 -> 10080 (retire idle-thread archiver) (#710)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#581": {
   "verdict": "KEEP",
@@ -1612,7 +1902,12 @@
   },
   "branch": null,
   "notes": "Generic — UPSTREAM candidate on session_persistence.py. KEEP-UNPROVEN by log.",
-  "subject": "[verified] fix(gateway): reap never-persisted routing stubs (#581)"
+  "subject": "[verified] fix(gateway): reap never-persisted routing stubs (#581)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body ([verified])' - no positive production measurement"
+  }
  },
  "#104": {
   "verdict": "KEEP",
@@ -1631,7 +1926,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN by log (notice is a chat message). 2 conflict files.",
-  "subject": "fix(gateway): revive the dead session auto-reset chat notice (#104)"
+  "subject": "fix(gateway): revive the dead session auto-reset chat notice (#104)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#129": {
   "verdict": "DROP",
@@ -1650,7 +1950,12 @@
   },
   "branch": "audit/gateway/revert-129",
   "notes": "Opt-in feature, no consumer, 0 fires. REVERT BRANCH audit/gateway/revert-129 @ 0d40277163 off origin/main (hand-resolved 2 conflict hunks in plugins/platforms/discord/adapter.py: kept main's seeded_extra/_skip_env_bridge shape minus the reaction_journal keys; 349 deletions incl. tests/gateway/test_discord_reaction_journal.py). Ran: `pytest tests/gateway/test_discord_connect.py tests/gateway/test_discord_reactions.py` -> 19 passed, 1 failed (test_post_connect_initialization_retries_fingerprint_after_timeout); that test ALSO fails on origin/main (checked out HEAD~1: `1 failed`) so it is pre-existing, not caused by the revert. py_compile OK; rg for reaction_journal/REACTION_JOURNAL/_REACTION_SEQ after revert: 0 hits.",
-  "subject": "feat(discord): opt-in raw-reaction journal for durable triage state (#129)"
+  "subject": "feat(discord): opt-in raw-reaction journal for durable triage state (#129)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead: feature is live",
+   "evidence": "auditor 'fires 0 / no consumer' is false on the write side: discord.reaction_journal is set at ~/.hermes/config.yaml:567 and ~/.hermes/greenhouse/reactions.jsonl is being written right now (seq 40092 at 2026-09-25T18:40:40Z, 2366 lines since 09-24). No reader found (rg over greenhouse/, scripts/, skills-shared, cron: 0 hits; greenhouse collector reads reactions via the Discord API). So: an operator-enabled writer with no reader. Revert branch audit/gateway/revert-129 must also remove the config key."
+  }
  },
  "#427": {
   "verdict": "KEEP",
@@ -1669,7 +1974,12 @@
   },
   "branch": null,
   "notes": "Generic — UPSTREAM candidate; KEEP-UNPROVEN by log.",
-  "subject": "fix(gateway): stop double-posting the STT transcript echo for one voice message (#427)"
+  "subject": "fix(gateway): stop double-posting the STT transcript echo for one voice message (#427)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#666": {
   "verdict": "KEEP",
@@ -1688,7 +1998,12 @@
   },
   "branch": null,
   "notes": "Follows #659.",
-  "subject": "fix(gateway): redirect shape-only legacy session aliases at store load, before startup replay can write (#666)"
+  "subject": "fix(gateway): redirect shape-only legacy session aliases at store load, before startup replay can write (#666)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal)'; original='PR body (#659 follow-up)' - no positive production measurement"
+  }
  },
  "#757": {
   "verdict": "KEEP",
@@ -1745,7 +2060,12 @@
   },
   "branch": null,
   "notes": "Follows #49 (DROP). 18 files (15 locales). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: /undo WAS used twice via Discord native slash (2026-09-15); /redo never. Verdict stands (take upstream's single-turn /undo; half-turn walk + /redo unused) but the revert is a hand port: 19 conflicted files. Left for continuation card.",
-  "subject": "fix(undo): refuse /undo·/redo while a /stop'd turn is still draining (#339)"
+  "subject": "fix(undo): refuse /undo·/redo while a /stop'd turn is still draining (#339)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "follows #49",
+   "evidence": "same fork-permanent ruling as #49 (entry 14; test_undo_drain_guard.py is a registry test)."
+  }
  },
  "#759": {
   "verdict": "UPSTREAM",
@@ -1783,7 +2103,12 @@
   },
   "branch": null,
   "notes": "Mixed desktop row: apps/ part DROP by D9; tui_gateway/server.py part consumed by fork dashboard/mobile identity (D9 trap). KEEP-UNPROVEN.",
-  "subject": "feat(tui_gateway): client-identity source so desktop/dashboard/mobile aren't all \"tui\" (#175)"
+  "subject": "feat(tui_gateway): client-identity source so desktop/dashboard/mobile aren't all \"tui\" (#175)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#1004": {
   "verdict": "KEEP",
@@ -1802,7 +2127,12 @@
   },
   "branch": null,
   "notes": "Follows #790.",
-  "subject": "fix(gateway): a SIGKILLed safe-restart is announced as planned, not UNPLANNED (#1004)"
+  "subject": "fix(gateway): a SIGKILLed safe-restart is announced as planned, not UNPLANNED (#1004)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal)'; original='PR body (restart-notice family)' - no positive production measurement"
+  }
  },
  "#231": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1821,7 +2151,12 @@
   },
   "branch": null,
   "notes": "Follows #221. | Discord native-slash usage in 2026-05-10..2026-09-25 logs (`slash '/X' invoked`): /model 330, /stop 266, /reset 42, /compress 34, /steer 24, /reasoning 19, /undo 2, /redo 0, /branch 0, /merge 0, /fast 0 (text-typed commands are not logged).",
-  "subject": "feat(merge): summarize only post-branch delta + post note to target's origin (#231)"
+  "subject": "feat(merge): summarize only post-branch delta + post note to target's origin (#231)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "follows #221 /merge",
+   "evidence": "fork-features.json entry 16 /merge fork-permanent."
+  }
  },
  "#72": {
   "verdict": "UNRESOLVED",
@@ -1840,7 +2175,12 @@
   },
   "branch": null,
   "notes": "CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
-  "subject": "fix(gateway): close the F2 self-completing-restart-loop gap (A' record-mark-at-gate + C1 skill detection) (#72)"
+  "subject": "fix(gateway): close the F2 self-completing-restart-loop gap (A' record-mark-at-gate + C1 skill detection) (#72)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead ruling (split F1 keep / F2 drop?)",
+   "evidence": "F1/F2 unit: fleet knobs that exist only for this breaker are set in live config - restart_initiated_ttl_secs 600, restart_loop_threshold 3, restart_loop_window_secs 300 (~/.hermes/config.yaml:75-77); bridged by gateway/fork_ext/restart_policy.py:120-123 (registry entry 9, upstream-intended, golden tests). #229's DESKTOP_REASON_RESTART_CONSUMED mirrors F1. Zero breaker trips measured, so value is unproven, but a DROP also orphans 3 config keys and a registry entry -> lead/Ace, not an auditor call."
+  }
  },
  "#256": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1859,7 +2199,12 @@
   },
   "branch": null,
   "notes": "Kyzcreig-authored upstream.",
-  "subject": "fix(gateway): bound the startup-restore inbound gate on a slow boot-resume turn (#256)"
+  "subject": "fix(gateway): bound the startup-restore inbound gate on a slow boot-resume turn (#256)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "769dba1758 verified on upstream/main. Revert caveat: gateway/fork_ext/restart_policy.py (registry entry 9, golden tests tests/golden/restart_policy/) re-homes _startup_restore_drain_timeout_secs + the HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT bridge; the revert must update the golden or keep the fork_ext copy."
+  }
  },
  "nopr:2f530dd026": {
   "verdict": "KEEP",
@@ -1878,7 +2223,12 @@
   },
   "branch": null,
   "notes": "Footer family (nopr:11f8a67f01, nopr:4c595fc6f1, #334, #403, #405). Ace-visible on every gateway reply. 3 conflict files.",
-  "subject": "feat(gateway): runtime-footer provider_model, context_full, reasoning fields"
+  "subject": "feat(gateway): runtime-footer provider_model, context_full, reasoning fields",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "nopr:11f8a67f01": {
   "verdict": "KEEP",
@@ -1897,7 +2247,12 @@
   },
   "branch": null,
   "notes": "Footer family.",
-  "subject": "feat(runtime-footer): add msgs field (raw count vs hygiene hard-limit)"
+  "subject": "feat(runtime-footer): add msgs field (raw count vs hygiene hard-limit)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "nopr:0da8ba5356": {
   "verdict": "KEEP",
@@ -1916,7 +2271,12 @@
   },
   "branch": null,
   "notes": "Follows #289/#295.",
-  "subject": "fix(gateway): protect boot-resume recovery turns from busy-input interrupts"
+  "subject": "fix(gateway): protect boot-resume recovery turns from busy-input interrupts",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "#356": {
   "verdict": "DROP",
@@ -1935,7 +2295,12 @@
   },
   "branch": null,
   "notes": "Follows #49 (DROP); touches agent/agent_init.py + turn_context.py — adversary: confirm the empty row is not persisted by upstream's path before revert (a stray empty user row also breaks role alternation). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert unit #49+#353+#339+#356: 19 conflicted files (run.py, slash_commands.py, 15 locales, ...); mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: /undo WAS used twice via Discord native slash (2026-09-15); /redo never. Verdict stands (take upstream's single-turn /undo; half-turn walk + /redo unused) but the revert is a hand port: 19 conflicted files. Left for continuation card.",
-  "subject": "fix(resume): don't persist an empty user row on auto-resume (the /undo '(no text)' bug) (#356)"
+  "subject": "fix(resume): don't persist an empty user row on auto-resume (the /undo '(no text)' bug) (#356)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead: test before revert",
+   "evidence": "part of the #49 unit, but the defect is not undo-only: upstream synthesizes an empty-text internal resume event (up gateway/run_startup.py:611) and has 0 hits for _empty_resume_synthetic/any empty-row guard in agent/, run_agent.py, gateway/. An empty persisted user row also breaks role alternation. Run tests/run_agent/test_empty_resume_user_row.py on upstream/main before dropping."
+  }
  },
  "#396": {
   "verdict": "KEEP",
@@ -1954,7 +2319,12 @@
   },
   "branch": null,
   "notes": "Generic UX — UPSTREAM candidate; KEEP-UNPROVEN by log.",
-  "subject": "fix(gateway): ack a message queued during startup-restore (re-land of #258) (#396)"
+  "subject": "fix(gateway): ack a message queued during startup-restore (re-land of #258) (#396)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (2 literals = failure paths)'; original='PR body (re-land of #258)' - no positive production measurement"
+  }
  },
  "#306": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -1973,7 +2343,12 @@
   },
   "branch": null,
   "notes": "4 conflict files (3 syncs). Adversary: confirm upstream also CLEARS (not just skips) stale flags so they don't resurface.",
-  "subject": "fix(gateway): clear stale resume markers (#306)"
+  "subject": "fix(gateway): clear stale resume markers (#306)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "upstream never CLEARS stale flags (0 hits for clear_stale_resume_pending/RESUME_FLAG_STALE in up gateway/) - it only skips them via the freshness window each boot. Measured value of clearing: 1 'stale resume_pending' line in the log window. Skip-forever is harmless, so the drop stands; revert must also drop the resume_flag_stale_clear entry in gateway/fork_ext/restart_policy.py:117 (registry entry 9 golden)."
+  }
  },
  "#906": {
   "verdict": "KEEP",
@@ -1992,7 +2367,12 @@
   },
   "branch": null,
   "notes": "Generic — UPSTREAM candidate (restart_loop_guard.py is upstream-owned).",
-  "subject": "fix(gateway): record one restart-loop ledger entry per process boot, not per resume scan (#906)"
+  "subject": "fix(gateway): record one restart-loop ledger entry per process boot, not per resume scan (#906)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#86": {
   "verdict": "UNRESOLVED",
@@ -2011,7 +2391,12 @@
   },
   "branch": null,
   "notes": "CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
-  "subject": "feat(gateway): F2 breadcrumb backlog cleanup (config family, contract gate, watcher guardrail) (#86)"
+  "subject": "feat(gateway): F2 breadcrumb backlog cleanup (config family, contract gate, watcher guardrail) (#86)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead ruling (split F1 keep / F2 drop?)",
+   "evidence": "F1/F2 unit: fleet knobs that exist only for this breaker are set in live config - restart_initiated_ttl_secs 600, restart_loop_threshold 3, restart_loop_window_secs 300 (~/.hermes/config.yaml:75-77); bridged by gateway/fork_ext/restart_policy.py:120-123 (registry entry 9, upstream-intended, golden tests). #229's DESKTOP_REASON_RESTART_CONSUMED mirrors F1. Zero breaker trips measured, so value is unproven, but a DROP also orphans 3 config keys and a registry entry -> lead/Ace, not an auditor call."
+  }
  },
  "#843": {
   "verdict": "KEEP",
@@ -2030,7 +2415,12 @@
   },
   "branch": null,
   "notes": "Follows #295.",
-  "subject": "fix(gateway): make the delivery-ack barrier registry generation-ordered and scoped (#843)"
+  "subject": "fix(gateway): make the delivery-ack barrier registry generation-ordered and scoped (#843)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body (#295 follow-up)' - no positive production measurement"
+  }
  },
  "#173": {
   "verdict": "KEEP",
@@ -2049,7 +2439,12 @@
   },
   "branch": null,
   "notes": "Compaction-announce family; KEEP-UNPROVEN.",
-  "subject": "feat(gateway): granular CompactionStats breakdown for manual /compress (#173)"
+  "subject": "feat(gateway): granular CompactionStats breakdown for manual /compress (#173)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#333": {
   "verdict": "KEEP",
@@ -2068,7 +2463,12 @@
   },
   "branch": null,
   "notes": "Mixed desktop row (apps/ DROP by D9); server.py footer seam consumed by dashboard. Follows #357.",
-  "subject": "feat(desktop): /footer command — runtime-metadata footer on desktop turns (#333)"
+  "subject": "feat(desktop): /footer command — runtime-metadata footer on desktop turns (#333)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#140": {
   "verdict": "KEEP",
@@ -2087,7 +2487,12 @@
   },
   "branch": null,
   "notes": "Likely superseded by upstream's shutdown watchdog; kept KEEP only because the drain-budget unit (#821/#838/#861) builds on its executor-drain timing. Lead: fold into that unit.",
-  "subject": "fix(gateway): hard-exit after graceful shutdown so a wedged worker can't strand the gateway (#140)"
+  "subject": "fix(gateway): hard-exit after graceful shutdown so a wedged worker can't strand the gateway (#140)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (2 literals)'; original='PR body' - no positive production measurement"
+  }
  },
  "#358": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2106,7 +2511,12 @@
   },
   "branch": null,
   "notes": "D9-adjacent (tui_gateway). Adversary: confirm empty-string text (not missing key) is rejected upstream.",
-  "subject": "fix(gateway): reject empty prompt.submit + skip no-op model-switch side effects (#358)"
+  "subject": "fix(gateway): reject empty prompt.submit + skip no-op model-switch side effects (#358)",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead: upstream claim falsified",
+   "evidence": "auditor claimed upstream rejects empty prompt.submit via contracts; up tui_gateway/methods_prompt.py:564-700 has no empty/whitespace text check (only side-agent RPCs check 'text required' :1190). Fork rejects with 4020. Defect still present upstream, but unmeasured (no literal). UPSTREAM (5-line guard) or DROP as unmeasured."
+  }
  },
  "#184": {
   "verdict": "KEEP",
@@ -2125,7 +2535,12 @@
   },
   "branch": null,
   "notes": "Code-skew family (nopr:ec4b3176ff, #493). KEEP-UNPROVEN by log; 1 conflict file (1 sync).",
-  "subject": "fix(gateway): narrow stale-code /model guard to runtime Python changes only (#184)"
+  "subject": "fix(gateway): narrow stale-code /model guard to runtime Python changes only (#184)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "nopr:ba371ef32f": {
   "verdict": "KEEP",
@@ -2144,7 +2559,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN; small (233 loc).",
-  "subject": "fix(discord): let free-response channels quote bot mentions"
+  "subject": "fix(discord): let free-response channels quote bot mentions",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "#403": {
   "verdict": "KEEP",
@@ -2163,7 +2583,12 @@
   },
   "branch": null,
   "notes": "Footer family.",
-  "subject": "fix(footer): honor per-model reasoning_overrides and fallback per-entry effort (#403)"
+  "subject": "fix(footer): honor per-model reasoning_overrides and fallback per-entry effort (#403)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#1007": {
   "verdict": "KEEP",
@@ -2182,7 +2607,12 @@
   },
   "branch": null,
   "notes": "1 day old; generic — UPSTREAM candidate. KEEP-UNPROVEN by log.",
-  "subject": "fix(gateway): refuse to start a turn whose generation was invalidated during pre-flight (#1007)"
+  "subject": "fix(gateway): refuse to start a turn whose generation was invalidated during pre-flight (#1007)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#452": {
   "verdict": "KEEP",
@@ -2201,7 +2631,12 @@
   },
   "branch": null,
   "notes": "Compaction-announce family; LCM telemetry consumer is the fleet's LCM plugin. 3 conflict files, 15 locales.",
-  "subject": "feat(compress): interim progress ack + per-event LCM compaction telemetry (#452)"
+  "subject": "feat(compress): interim progress ack + per-event LCM compaction telemetry (#452)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal)'; original='PR body' - no positive production measurement"
+  }
  },
  "#627": {
   "verdict": "KEEP",
@@ -2220,7 +2655,12 @@
   },
   "branch": null,
   "notes": "Compaction-announce family; with #626 #404.",
-  "subject": "fix(agent): manual compression banners name their trigger at the chokepoint (#627)"
+  "subject": "fix(agent): manual compression banners name their trigger at the chokepoint (#627)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "nopr:cf58afc340": {
   "verdict": "KEEP",
@@ -2239,7 +2679,12 @@
   },
   "branch": null,
   "notes": "Route-announce family (#228).",
-  "subject": "feat(model): announce mid-session /model switch in-chat (A4 axis A)"
+  "subject": "feat(model): announce mid-session /model switch in-chat (A4 axis A)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal)'; original='commit body (A4 axis A)' - no positive production measurement"
+  }
  },
  "#899": {
   "verdict": "KEEP",
@@ -2277,7 +2722,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN; 4 conflict files (3 syncs), 15 locales — candidate to UPSTREAM to kill the locale churn.",
-  "subject": "fix(compress): distinguish a persist-FAILURE from a genuine no-op (#44794) (#316)"
+  "subject": "fix(compress): distinguish a persist-FAILURE from a genuine no-op (#44794) (#316)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body (#44794)' - no positive production measurement"
+  }
  },
  "#705": {
   "verdict": "KEEP",
@@ -2296,7 +2746,12 @@
   },
   "branch": null,
   "notes": "Drain-budget unit (#738 #821 #838 #861). KEEP-UNPROVEN by log.",
-  "subject": "fix(gateway): --replace waits the full drain budget before SIGKILL (state.db corruption class) (#705)"
+  "subject": "fix(gateway): --replace waits the full drain budget before SIGKILL (state.db corruption class) (#705)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#742": {
   "verdict": "KEEP",
@@ -2315,7 +2770,12 @@
   },
   "branch": null,
   "notes": "Route-announce family.",
-  "subject": "fix(gateway): /model switch note names the LIVE route, not the stale override (#742)"
+  "subject": "fix(gateway): /model switch note names the LIVE route, not the stale override (#742)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal)'; original='PR body' - no positive production measurement"
+  }
  },
  "nopr:7fabbdba23": {
   "verdict": "KEEP",
@@ -2353,7 +2813,12 @@
   },
   "branch": null,
   "notes": "absorb 22%.",
-  "subject": "fix(discord): stop typing indicator getting stuck on rate-limited channels (#34)"
+  "subject": "fix(discord): stop typing indicator getting stuck on rate-limited channels (#34)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "no outside consumer; upstream typing loop honours retry_after."
+  }
  },
  "#750": {
   "verdict": "KEEP",
@@ -2372,7 +2837,12 @@
   },
   "branch": null,
   "notes": "Follows #289/#295.",
-  "subject": "fix(gateway): boot-resume gate looks past session_meta; cron-only drain overrun keeps .clean_shutdown (#750)"
+  "subject": "fix(gateway): boot-resume gate looks past session_meta; cron-only drain overrun keeps .clean_shutdown (#750)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#304": {
   "verdict": "KEEP",
@@ -2391,7 +2861,12 @@
   },
   "branch": null,
   "notes": "Generic — UPSTREAM candidate; KEEP-UNPROVEN.",
-  "subject": "fix(kanban): stop false \"profile health\" stall warning when dispatcher is throttled (#304)"
+  "subject": "fix(kanban): stop false \"profile health\" stall warning when dispatcher is throttled (#304)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#493": {
   "verdict": "KEEP",
@@ -2410,7 +2885,12 @@
   },
   "branch": null,
   "notes": "Code-skew family.",
-  "subject": "feat(gateway): config toggle for the model-switch stale-code guard (#493)"
+  "subject": "feat(gateway): config toggle for the model-switch stale-code guard (#493)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#884": {
   "verdict": "KEEP",
@@ -2448,7 +2928,12 @@
   },
   "branch": null,
   "notes": "Mixed desktop row (apps/ DROP by D9). Server half is the livesync seam (D9 trap); consumer check needed by lead — if fork livesync is reverted (scripts+misc revert-livesync branch exists), this DROPs with it.",
-  "subject": "fix(desktop): stop live-sync duplicating every message on send (#352)"
+  "subject": "fix(desktop): stop live-sync duplicating every message on send (#352)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#527": {
   "verdict": "KEEP",
@@ -2467,7 +2952,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN; adversary should check upstream's runtime_kwargs source.",
-  "subject": "fix(compress): inherit resident live route (#527)"
+  "subject": "fix(compress): inherit resident live route (#527)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#584": {
   "verdict": "UPSTREAM",
@@ -2524,7 +3014,12 @@
   },
   "branch": null,
   "notes": "Footer family chokepoint; 8 conflict files (3 syncs) — hotspot. Dissolves only if the whole footer family goes.",
-  "subject": "refactor: unify r:<effort> display-label mapping into one chokepoint (reasoning_label) (#405)"
+  "subject": "refactor: unify r:<effort> display-label mapping into one chokepoint (reasoning_label) (#405)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='declared refactor' - no positive production measurement"
+  }
  },
  "nopr:a11aecf67b": {
   "verdict": "KEEP",
@@ -2543,7 +3038,12 @@
   },
   "branch": null,
   "notes": "Follows #289. KEEP-UNPROVEN.",
-  "subject": "feat(gateway): post-restart auto-closeout nudge on resume note, cache-safe (A5-B)"
+  "subject": "feat(gateway): post-restart auto-closeout nudge on resume note, cache-safe (A5-B)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body (A5-B)' - no positive production measurement"
+  }
  },
  "#751": {
   "verdict": "KEEP",
@@ -2562,7 +3062,12 @@
   },
   "branch": null,
   "notes": "Follows #659.",
-  "subject": "fix(gateway): resolve Discord chat types for session-key migration concurrently (311 serial lookups delayed boot-resume to ~70s) (#751)"
+  "subject": "fix(gateway): resolve Discord chat types for session-key migration concurrently (311 serial lookups delayed boot-resume to ~70s) (#751)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "nopr:6e862490c8": {
   "verdict": "KEEP",
@@ -2581,7 +3086,12 @@
   },
   "branch": null,
   "notes": "Merge-reconciliation glue; follows whatever it reconciles. Not independently revertible.",
-  "subject": "fix(gateway): complete fork/upstream reconciliation for slice-5 CI reds"
+  "subject": "fix(gateway): complete fork/upstream reconciliation for slice-5 CI reds",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body (merge reconciliation)' - no positive production measurement"
+  }
  },
  "#1031": {
   "verdict": "KEEP",
@@ -2600,7 +3110,12 @@
   },
   "branch": null,
   "notes": "Follows #315: if the sticky-reset layer goes, this goes.",
-  "subject": "fix(gateway): persisted route lookup off the event loop; one-hop SessionStore ratchet (t_ac9e21cf) (#1031)"
+  "subject": "fix(gateway): persisted route lookup off the event loop; one-hop SessionStore ratchet (t_ac9e21cf) (#1031)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='t_a… card (subject)' - no positive production measurement"
+  }
  },
  "#589": {
   "verdict": "KEEP",
@@ -2619,7 +3134,12 @@
   },
   "branch": null,
   "notes": "Follows #562.",
-  "subject": "harden(kanban): single-source the creator-stamp shape rule + contract tests (#589)"
+  "subject": "harden(kanban): single-source the creator-stamp shape rule + contract tests (#589)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#691": {
   "verdict": "KEEP",
@@ -2638,7 +3158,12 @@
   },
   "branch": null,
   "notes": "Follows #659.",
-  "subject": "fix(gateway): honor durable chat pins in reset banners (#691)"
+  "subject": "fix(gateway): honor durable chat pins in reset banners (#691)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='0 (1 literal)'; original='PR body' - no positive production measurement"
+  }
  },
  "#19": {
   "verdict": "KEEP",
@@ -2657,7 +3182,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN; small.",
-  "subject": "fix(gateway): bind originating channel into session context for plugin slash commands (#19)"
+  "subject": "fix(gateway): bind originating channel into session context for plugin slash commands (#19)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#687": {
   "verdict": "KEEP",
@@ -2676,7 +3206,12 @@
   },
   "branch": null,
   "notes": "Follows #683.",
-  "subject": "fix(delegation): retain refused completions and shutdown claims (#687)"
+  "subject": "fix(delegation): retain refused completions and shutdown claims (#687)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a (no literal)'; original='PR body (#683 follow-up)' - no positive production measurement"
+  }
  },
  "#694": {
   "verdict": "KEEP",
@@ -2695,7 +3230,12 @@
   },
   "branch": null,
   "notes": "Small cosmetic fix; UPSTREAM candidate. KEEP-UNPROVEN by log.",
-  "subject": "fix(gateway): count only user messages in the /queue \"(N queued)\" readout (#694)"
+  "subject": "fix(gateway): count only user messages in the /queue \"(N queued)\" readout (#694)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#401": {
   "verdict": "KEEP",
@@ -2714,7 +3254,12 @@
   },
   "branch": null,
   "notes": "Generic; UPSTREAM candidate. KEEP-UNPROVEN.",
-  "subject": "fix(gateway): /stop cancels pending clarify prompts so the next message isn't swallowed (#401)"
+  "subject": "fix(gateway): /stop cancels pending clarify prompts so the next message isn't swallowed (#401)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#197": {
   "verdict": "KEEP",
@@ -2733,7 +3278,12 @@
   },
   "branch": null,
   "notes": "Route-announce family; 15 locales, 3 conflict files.",
-  "subject": "feat(gateway): show reasoning effort in /model switch confirmation (#197)"
+  "subject": "feat(gateway): show reasoning effort in /model switch confirmation (#197)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "nopr:c05a81d90a": {
   "verdict": "KEEP",
@@ -2752,7 +3302,12 @@
   },
   "branch": null,
   "notes": "Follows #289/#295.",
-  "subject": "fix(gateway): boot-resume marker must survive the SENTINEL phase of the recovery turn"
+  "subject": "fix(gateway): boot-resume marker must survive the SENTINEL phase of the recovery turn",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "nopr:0f64a3653b": {
   "verdict": "UNRESOLVED",
@@ -2771,7 +3326,12 @@
   },
   "branch": null,
   "notes": "Stuck-loop counter tweaks entangled with the F1/F2 unit (the unit's revert conflicts in tests/gateway/test_stuck_loop*.py). CORRECTED DROP -> UNRESOLVED in the branch pass. F1 (restart_consumed / restart_consumed_interrupted reasons, fork run.py:1795-1806 + _AUTO_RESUME_REASONS extension :15290-15300) is part of the #295 SELF-restart contract: a session that initiated its own restart is excluded from auto-resume so restart->resume->restart cannot cascade. Upstream's restart_loop_guard (b48cacb97b) is a coarser backstop that skips ALL auto-resume for a boot, not a per-session exclusion, so it is not equivalent. Measured in 544 log files: 'Auto-suspended replay-loop session' 0, 'F2 restart-initiator signal=breadcrumb (authoritative' 0 -> the F2 breaker and the #80 breadcrumb have never decided anything, but breadcrumbs are written/swept every boot (119 lines). Mechanical revert of the unit conflicts in gateway/run.py + 2 stuck-loop tests. Needs a lead ruling: keep F1 (#70/#72 restart_consumed half) and drop F2+breadcrumb (#80/#86) as a hand-built split, or keep the unit.",
-  "subject": "fix(gateway): successful turns reset the stuck-loop restart counter again"
+  "subject": "fix(gateway): successful turns reset the stuck-loop restart counter again",
+  "adversary": {
+   "result": "needs-lead",
+   "new_verdict": "lead ruling (split F1 keep / F2 drop?)",
+   "evidence": "F1/F2 unit: fleet knobs that exist only for this breaker are set in live config - restart_initiated_ttl_secs 600, restart_loop_threshold 3, restart_loop_window_secs 300 (~/.hermes/config.yaml:75-77); bridged by gateway/fork_ext/restart_policy.py:120-123 (registry entry 9, upstream-intended, golden tests). #229's DESKTOP_REASON_RESTART_CONSUMED mirrors F1. Zero breaker trips measured, so value is unproven, but a DROP also orphans 3 config keys and a registry entry -> lead/Ace, not an auditor call."
+  }
  },
  "#453": {
   "verdict": "KEEP",
@@ -2790,7 +3350,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN; adversary should check upstream's session-context bind site.",
-  "subject": "fix(gateway): bind the real profile in session context, not \"\" (#453)"
+  "subject": "fix(gateway): bind the real profile in session context, not \"\" (#453)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#939": {
   "verdict": "KEEP",
@@ -2809,7 +3374,12 @@
   },
   "branch": null,
   "notes": "Follows #827 throttle. Generic; port together with #936.",
-  "subject": "fix(gateway): boot-resume fan-out is unbounded by default — every restart-interrupted session resumes at once (Ace ruling 2026-09-23 09:40) (#939)"
+  "subject": "fix(gateway): boot-resume fan-out is unbounded by default — every restart-interrupted session resumes at once (Ace ruling 2026-09-23 09:40) (#939)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a (config default change)'; original='2026-09-23 Apollo freeze follow-up (aegis story sec.7)' - no positive production measurement"
+  }
  },
  "#290": {
   "verdict": "KEEP",
@@ -2828,7 +3398,12 @@
   },
   "branch": null,
   "notes": "Follows #289.",
-  "subject": "fix(gateway): harden auto-resume durability and scope (#290)"
+  "subject": "fix(gateway): harden auto-resume durability and scope (#290)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#777": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2847,7 +3422,12 @@
   },
   "branch": null,
   "notes": "Follows #763.",
-  "subject": "fix(discord): port command-sync retry review fixes (#777)"
+  "subject": "fix(discord): port command-sync retry review fixes (#777)",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "UPSTREAM",
+   "evidence": "rides #763 (review fixes on the same retry path)."
+  }
  },
  "#934": {
   "verdict": "DROP",
@@ -2866,7 +3446,12 @@
   },
   "branch": null,
   "notes": "Dead code path: #936 replaced _executor_max_workers sizing. Nothing left to revert beyond what #936 already overwrote; fold into #936's upstream port. | BRANCH PASS 2026-09-25: no revert: superseded inside the fork by #936, nothing left to revert; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: no revert: superseded inside the fork by #936, nothing left to revert; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | No revert branch: #936 already rewrote every line #934 added (_executor_max_workers sizing); nothing independent left to revert. Rolls into #936's upstream port.",
-  "subject": "fix(gateway): size the turn-body executor to turn admission — admitted turns queued 2151-2356 s behind a 10-thread pool (Apollo 2026-09-23) (#934)"
+  "subject": "fix(gateway): size the turn-body executor to turn admission — admitted turns queued 2151-2356 s behind a 10-thread pool (Apollo 2026-09-23) (#934)",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "UPSTREAM (fold into #936)",
+   "evidence": "not dead code: _executor_max_workers() def (gateway/run.py:222) and its call site (run.py:32186, blame 88b0478ae3 = #934) are LIVE and are what #936 sizes through. Nothing to revert; the code travels with the #936 upstream port (audit/gateway/upstream-936)."
+  }
  },
  "#904": {
   "verdict": "KEEP",
@@ -2904,7 +3489,12 @@
   },
   "branch": null,
   "notes": "Footer family.",
-  "subject": "fix(gateway): restore served provider + reasoning in turn result; re-wire served-route persist (#520)"
+  "subject": "fix(gateway): restore served provider + reasoning in turn result; re-wire served-route persist (#520)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "nopr:6dc72a75d4": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2923,7 +3513,12 @@
   },
   "branch": null,
   "notes": "Adversary: verify upstream never attributes internal=True events to the user in transcript rows.",
-  "subject": "fix(gateway): synthetic internal events must never impersonate the user"
+  "subject": "fix(gateway): synthetic internal events must never impersonate the user",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "no outside consumer."
+  }
  },
  "#334": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2942,7 +3537,12 @@
   },
   "branch": null,
   "notes": "Kyzcreig-authored upstream.",
-  "subject": "feat(footer): opt-in 'latency' field — wall-clock turn duration (#334)"
+  "subject": "feat(footer): opt-in 'latency' field — wall-clock turn duration (#334)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "ad345a99d8 verified on upstream/main; fleet footer field 'latency' (config.yaml:349) is upstream's field."
+  }
  },
  "#745": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2961,7 +3561,12 @@
   },
   "branch": null,
   "notes": "Revert is a no-op diff against upstream.",
-  "subject": "fix(gateway): persist active_agent_keys when a turn is promoted sentinel -> agent (#745)"
+  "subject": "fix(gateway): persist active_agent_keys when a turn is promoted sentinel -> agent (#745)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "100% absorbed; no consumer."
+  }
  },
  "#460": {
   "verdict": "KEEP",
@@ -2980,7 +3585,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN; drain family.",
-  "subject": "fix(gateway): clear resume_pending for sessions that finished during a timed-out drain (#460)"
+  "subject": "fix(gateway): clear resume_pending for sessions that finished during a timed-out drain (#460)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#53": {
   "verdict": "KEEP",
@@ -2999,7 +3609,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN; small.",
-  "subject": "fix(gateway): classify credential-resolution errors as auth failures (#53)"
+  "subject": "fix(gateway): classify credential-resolution errors as auth failures (#53)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#230": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3018,7 +3633,12 @@
   },
   "branch": null,
   "notes": "",
-  "subject": "fix(discord): populate parent_chat_id on native slash events in threads (#230)"
+  "subject": "fix(discord): populate parent_chat_id on native slash events in threads (#230)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "no outside consumer."
+  }
  },
  "nopr:4ed79b6dad": {
   "verdict": "KEEP",
@@ -3037,7 +3657,12 @@
   },
   "branch": null,
   "notes": "CORRECTED DROP -> KEEP in the branch pass: the probe flagged the original path gateway/platforms/telegram.py as gone, but the feature was CARRIED into the Telegram plugin on fork main (the mechanical revert conflicts because of exactly that). Unmeasured (no reconnect-ladder literal counted) -> KEEP-UNPROVEN; generic -> UPSTREAM candidate (config knob on the plugin).",
-  "subject": "fix(telegram): make network-reconnect ladder configurable, raise default tolerance"
+  "subject": "fix(telegram): make network-reconnect ladder configurable, raise default tolerance",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "#357": {
   "verdict": "KEEP",
@@ -3056,7 +3681,12 @@
   },
   "branch": null,
   "notes": "Mixed desktop row (apps/ DROP by D9); server.py footer seam is the D9 trap, consumed by #333.",
-  "subject": "fix(desktop): ship the runtime footer as metadata, not message text (#357)"
+  "subject": "fix(desktop): ship the runtime footer as metadata, not message text (#357)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#935": {
   "verdict": "UPSTREAM",
@@ -3094,7 +3724,12 @@
   },
   "branch": null,
   "notes": "Compaction-announce family.",
-  "subject": "fix(compress): manual /compress granular Model line shows session-truthful r:<effort> (#404)"
+  "subject": "fix(compress): manual /compress granular Model line shows session-truthful r:<effort> (#404)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#626": {
   "verdict": "KEEP",
@@ -3113,7 +3748,12 @@
   },
   "branch": null,
   "notes": "With #627.",
-  "subject": "fix(gateway): manual /compress banner names its trigger (#626)"
+  "subject": "fix(gateway): manual /compress banner names its trigger (#626)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "nopr:f29eede0e2": {
   "verdict": "KEEP",
@@ -3132,7 +3772,12 @@
   },
   "branch": null,
   "notes": "Follows nopr:217d61ddce.",
-  "subject": "fix(gateway): hand back the resume pre-claim WITHOUT stripping protection"
+  "subject": "fix(gateway): hand back the resume pre-claim WITHOUT stripping protection",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "#571": {
   "verdict": "UPSTREAM",
@@ -3170,7 +3815,12 @@
   },
   "branch": null,
   "notes": "KEEP-UNPROVEN.",
-  "subject": "fix(tui): retain a refused kanban batch instead of dropping it (#698)"
+  "subject": "fix(tui): retain a refused kanban batch instead of dropping it (#698)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#984": {
   "verdict": "KEEP",
@@ -3189,7 +3839,12 @@
   },
   "branch": null,
   "notes": "Cache invariant; if upstream's pin covers internal events this becomes SUPERSEDED. KEEP-UNPROVEN.",
-  "subject": "fix(gateway): internal events reuse the pinned session-context prompt (prefix-cache A→B→A) (#984)"
+  "subject": "fix(gateway): internal events reuse the pinned session-context prompt (prefix-cache A→B→A) (#984)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#395": {
   "verdict": "KEEP",
@@ -3227,7 +3882,12 @@
   },
   "branch": null,
   "notes": "Route-announce family; KEEP-UNPROVEN.",
-  "subject": "feat(gateway): show reasoning effort in the session-reset banner (#183)"
+  "subject": "feat(gateway): show reasoning effort in the session-reset banner (#183)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body' - no positive production measurement"
+  }
  },
  "#911": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3246,7 +3906,12 @@
   },
   "branch": null,
   "notes": "Upstream fixed it 20 days earlier; the fork needed its own copy only because fork run.py still carries the pre-split watcher. Resolves at next parity sync.",
-  "subject": "fix(gateway): loop-wakeup watcher reads state_meta off the event loop (10-50 s loop blocks; Discord 3 s ack misses) + sync-DB-in-coroutine lint (#911)"
+  "subject": "fix(gateway): loop-wakeup watcher reads state_meta off the event loop (10-50 s loop blocks; Discord 3 s ack misses) + sync-DB-in-coroutine lint (#911)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "98428d20bc verified on upstream/main."
+  }
  },
  "#422": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3265,7 +3930,12 @@
   },
   "branch": null,
   "notes": "Kyzcreig-authored upstream.",
-  "subject": "fix(test): hermetic env-detection tests — pin container/supervisor/HOME probes (#422)"
+  "subject": "fix(test): hermetic env-detection tests — pin container/supervisor/HOME probes (#422)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "bcec6c8d39 verified on upstream/main."
+  }
  },
  "nopr:5378b19f73": {
   "verdict": "KEEP",
@@ -3284,7 +3954,12 @@
   },
   "branch": null,
   "notes": "Follows #249.",
-  "subject": "fix(fallback): address Greptile review on the recovery-announce helper"
+  "subject": "fix(fallback): address Greptile review on the recovery-announce helper",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "#633": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3303,7 +3978,12 @@
   },
   "branch": null,
   "notes": "",
-  "subject": "fix(gateway): bound Discord reconnect backoff (#633)"
+  "subject": "fix(gateway): bound Discord reconnect backoff (#633)",
+  "adversary": {
+   "result": "stands",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "no outside consumer. Behaviour differs (fork Discord cap 120s, run.py:5055, vs upstream 300s general cap) but unmeasured."
+  }
  },
  "#635": {
   "verdict": "UPSTREAM",
@@ -3341,7 +4021,12 @@
   },
   "branch": null,
   "notes": "Merge-reconciliation glue; 33 loc.",
-  "subject": "fix(gateway): restore fork systemd exit-0 restart branch (Linux CI slice 3)"
+  "subject": "fix(gateway): restore fork systemd exit-0 restart branch (Linux CI slice 3)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "#163": {
   "verdict": "KEEP",
@@ -3360,7 +4045,12 @@
   },
   "branch": null,
   "notes": "Comment-only, follows #137.",
-  "subject": "fix(gateway): correct reaper design comment (_touch_activity is NOT dead code) + hoist compaction_stats imports (#163)"
+  "subject": "fix(gateway): correct reaper design comment (_touch_activity is NOT dead code) + hoist compaction_stats imports (#163)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='PR body (comment-only)' - no positive production measurement"
+  }
  },
  "#138": {
   "verdict": "KEEP",
@@ -3379,7 +4069,12 @@
   },
   "branch": null,
   "notes": "Follows #137; 22 loc.",
-  "subject": "chore(gateway): address Greptile review — observable non-int row-id + None-vs-empty comment (#138)"
+  "subject": "chore(gateway): address Greptile review — observable non-int row-id + None-vs-empty comment (#138)",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "nopr:0fee1b8b64": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3398,7 +4093,12 @@
   },
   "branch": null,
   "notes": "Follows nopr:1832ed4e78.",
-  "subject": "fix(gateway): per-token exception guard in restore_session_vars (review)"
+  "subject": "fix(gateway): per-token exception guard in restore_session_vars (review)",
+  "adversary": {
+   "result": "overturned",
+   "new_verdict": "KEEP",
+   "evidence": "the per-token guard lives inside restore_session_vars, which tools/delegate_tool.py:4083 still calls (see nopr:1832ed4e78)."
+  }
  },
  "nopr:4c595fc6f1": {
   "verdict": "KEEP",
@@ -3417,7 +4117,12 @@
   },
   "branch": null,
   "notes": "Footer family; 15 loc.",
-  "subject": "fix(gateway): pass agent provider into runtime-footer result dict"
+  "subject": "fix(gateway): pass agent provider into runtime-footer result dict",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  },
  "nopr:59429f36db": {
   "verdict": "KEEP",
@@ -3436,6 +4141,11 @@
   },
   "branch": null,
   "notes": "11 loc; KEEP-UNPROVEN.",
-  "subject": "fix(gateway): clear typing indicator on stale-result early-return path"
+  "subject": "fix(gateway): clear typing indicator on stale-result early-return path",
+  "adversary": {
+   "result": "keep-unproven",
+   "new_verdict": "KEEP-UNPROVEN",
+   "evidence": "fires='n/a'; original='commit body' - no positive production measurement"
+  }
  }
 }
