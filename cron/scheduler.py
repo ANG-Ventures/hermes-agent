@@ -870,6 +870,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
+    LATE_FIRE_KEY,
     AmbiguousJobReference,
     _ensure_cron_dir,
     advance_next_run,
@@ -5137,6 +5138,11 @@ def _build_job_prompt(
     user_prompt = str(job.get("prompt") or "")
     if extra_prompt:
         user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
+    # One-shot fired late by the restart catch-up (t_9bfdd7e3): say so up
+    # front so the agent re-checks a time-sensitive action before taking it.
+    from cron.jobs import late_fire_note
+    if job.get(LATE_FIRE_KEY):
+        user_prompt = f"{late_fire_note(job[LATE_FIRE_KEY])}\n\n{user_prompt}"
     prompt = user_prompt
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
@@ -8690,6 +8696,39 @@ _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
 _last_dead_owner_reap_at: Optional[float] = None
 
 
+def _deliver_missed_oneshot_notices(adapters=None, loop=None) -> int:
+    """Deliver queued MISSED notices for one-shots the due-scan retired.
+
+    The due-scan runs under the jobs lock and only queues them; delivery is
+    framed as a failure (success=False) to the job's own deliver target so a
+    one-shot that never ran is loud, not a success-looking line in
+    cron/output. Best-effort: delivery errors are logged, never raised.
+    """
+    from cron.jobs import drain_missed_oneshot_notices
+
+    delivered = 0
+    for notice in drain_missed_oneshot_notices():
+        job = notice.get("job") or {}
+        try:
+            err = _deliver_result(
+                job, notice.get("text") or "", success=False,
+                adapters=adapters, loop=loop,
+            )
+            if err:
+                logger.error(
+                    "Job '%s': MISSED one-shot notice failed to deliver: %s",
+                    job.get("id", "?"), err,
+                )
+            else:
+                delivered += 1
+        except Exception as exc:
+            logger.error(
+                "Job '%s': MISSED one-shot notice delivery raised: %s",
+                job.get("id", "?"), exc,
+            )
+    return delivered
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -8819,6 +8858,7 @@ def tick(
                 logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 
         due_jobs = get_due_jobs()
+        _deliver_missed_oneshot_notices(adapters=adapters, loop=loop)
 
         # Bound the in-flight set BEFORE the dedup guard is consulted, so a
         # leaked claim is force-released in-cycle rather than silently eating
@@ -8922,6 +8962,10 @@ def tick(
             # compatible; real callers using return_job=True never take it.
             claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
             claimed_job["execution_id"] = job["execution_id"]
+            # The persisted record the CAS returns never carries the transient
+            # late-fire stamp from the due-scan; carry it across.
+            if job.get(LATE_FIRE_KEY):
+                claimed_job[LATE_FIRE_KEY] = job[LATE_FIRE_KEY]
             return run_one_job(
                 claimed_job,
                 adapters=adapters,

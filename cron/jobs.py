@@ -117,6 +117,67 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
+# Restart catch-up window for one-shots (``cron.oneshot_catchup_s``). A
+# gateway restart is routine (every runtime deploy), so a one-shot whose fire
+# time fell inside the down window is FIRED LATE on boot — with a note
+# prepended to its prompt — when it is past due by at most this much. Beyond
+# it the record is retired and a loud MISSED notice is delivered. This only
+# widens the due-scan / misfire-backstop gate: create/update/resume still
+# reject a run time more than ONESHOT_GRACE_SECONDS in the past.
+DEFAULT_ONESHOT_CATCHUP_SECONDS = 6 * 3600
+
+# Transient (never persisted) key stamped on the in-memory due-job snapshot of
+# a one-shot fired late; _build_job_prompt turns it into the late-fire note.
+LATE_FIRE_KEY = "late_fire_seconds"
+
+
+def _oneshot_catchup_seconds() -> float:
+    """Resolve ``cron.oneshot_catchup_s`` from config.yaml.
+
+    Default ``DEFAULT_ONESHOT_CATCHUP_SECONDS`` (6h). Never narrower than
+    ONESHOT_GRACE_SECONDS; a non-positive value disables the catch-up (the
+    pre-existing 120s behaviour).
+    """
+    value: float = float(DEFAULT_ONESHOT_CATCHUP_SECONDS)
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        raw = cron_cfg.get("oneshot_catchup_s", DEFAULT_ONESHOT_CATCHUP_SECONDS)
+        value = float(raw) if raw is not None else float(DEFAULT_ONESHOT_CATCHUP_SECONDS)
+    except Exception:
+        value = float(DEFAULT_ONESHOT_CATCHUP_SECONDS)
+    return max(float(ONESHOT_GRACE_SECONDS), value)
+
+
+def late_fire_note(late_seconds: Any) -> str:
+    """Prompt prefix for a one-shot fired late after a gateway restart."""
+    try:
+        minutes = max(1, int(round(float(late_seconds) / 60.0)))
+    except (TypeError, ValueError):
+        minutes = 1
+    return (
+        f"[Note: this scheduled task fired late by {minutes} min after a "
+        "gateway restart — its scheduled time fell while the scheduler was "
+        "down. Check that the action still makes sense now before acting.]"
+    )
+
+
+# One-shots retired by the due-scan because they were past due beyond the
+# catch-up window. The scan runs under _jobs_lock and must not deliver, so it
+# queues a snapshot here; the scheduler tick drains it and delivers a loud
+# MISSED notice to the job's own deliver target.
+_missed_oneshot_notices: List[Dict[str, Any]] = []
+_missed_oneshot_notices_lock = threading.Lock()
+
+
+def drain_missed_oneshot_notices() -> List[Dict[str, Any]]:
+    """Pop every queued missed-one-shot notice (``{"job": ..., "text": ...}``)."""
+    with _missed_oneshot_notices_lock:
+        drained = list(_missed_oneshot_notices)
+        _missed_oneshot_notices.clear()
+    return drained
+
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -3691,31 +3752,60 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
         )
 
 
-def _write_missed_oneshot_diagnostic(job: Dict[str, Any], next_run: str) -> None:
+def _write_missed_oneshot_diagnostic(
+    job: Dict[str, Any],
+    next_run: str,
+    *,
+    window_seconds: Optional[float] = None,
+) -> None:
     """Leave an operator-visible trace when a never-ran one-shot is retired
-    because its persisted run time fell outside the grace window.
+    because its persisted run time fell outside the catch-up window.
 
     The record is removed because the scheduler will never fire it (see the
     grace gate in ``_get_due_jobs_locked``); without a diagnostic the job
-    would just vanish. Best-effort: a diagnostic failure never blocks the
-    removal itself.
+    would just vanish. The same text is queued for LOUD delivery to the job's
+    deliver target (drained by the scheduler tick). Best-effort: a diagnostic
+    failure never blocks the removal itself.
     """
+    if window_seconds is None:
+        window_seconds = ONESHOT_GRACE_SECONDS
     try:
+        now = _hermes_now()
+        try:
+            late_min = int(
+                (now - _ensure_aware(datetime.fromisoformat(next_run))).total_seconds()
+                // 60
+            )
+        except Exception:
+            late_min = -1
+        late_txt = f"{late_min} min" if late_min >= 0 else "unknown"
         text = (
-            "# Cron job removed before firing (run time outside grace window)\n\n"
+            "# ⚠️ MISSED — scheduled job did NOT run (removed before firing, "
+            "run time outside grace window)\n\n"
             f"- job id: {job.get('id')}\n"
             f"- name: {job.get('name')}\n"
             f"- scheduled run time: {next_run}\n"
-            f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
-            f"- removed at: {_hermes_now().isoformat()}\n\n"
-            "This one-shot's run time is more than the grace window in the "
-            "past (scheduler down past the window, host asleep, or jobs.json "
-            "edited), which is outside the 'will never fire' contract "
-            "enforced at create/update/resume time. The job was removed "
-            "without running; recreate it (or use the Run button) to "
-            "schedule it again.\n"
+            f"- past due by: {late_txt}\n"
+            f"- catch-up window: {int(window_seconds)}s (cron.oneshot_catchup_s)\n"
+            f"- removed at: {now.isoformat()}\n\n"
+            "This one-shot NEVER RAN. Its run time is further in the past than "
+            "the restart catch-up window (scheduler down past the window, host "
+            "asleep, or jobs.json edited), so it was removed without running. "
+            "Whatever it was armed to do has NOT happened — recreate it (or "
+            "use the Run button) if it is still needed.\n"
         )
         save_job_output(job.get("id", ""), text)
+        with _missed_oneshot_notices_lock:
+            _missed_oneshot_notices.append({"job": dict(job), "text": text})
+        logger.error(
+            "Job '%s' (%s): one-shot MISSED — due %s, %s past due, beyond the "
+            "%ds catch-up window; removed WITHOUT running",
+            job.get("name", job.get("id", "?")),
+            job.get("id"),
+            next_run,
+            late_txt,
+            int(window_seconds),
+        )
     except Exception as e:
         logger.debug(
             "Failed to write missed-oneshot diagnostic for job %r: %s",
@@ -4648,12 +4738,42 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # them — only the due-scan acted differently and dispatched a
                 # wall-clock one-shot hours late (gateway down past the
                 # window, host asleep, hand-edited jobs.json).
-                if kind == "once" and (now - next_run_dt).total_seconds() > ONESHOT_GRACE_SECONDS:
+                #
+                # Restart catch-up (t_9bfdd7e3): past the 120s grace but
+                # within cron.oneshot_catchup_s (default 6h), a never-dispatched
+                # one-shot FIRES LATE instead — its time fell inside a gateway
+                # restart, which is routine. The in-memory snapshot carries
+                # LATE_FIRE_KEY so the prompt gets a late-fire note.
+                _overdue_s = (now - next_run_dt).total_seconds()
+                _catchup_s: float = float(ONESHOT_GRACE_SECONDS)
+                if kind == "once" and _overdue_s > ONESHOT_GRACE_SECONDS:
+                    _catchup_s = _oneshot_catchup_seconds()
+                    _unclaimed = not (job.get("run_claim") or job.get("fire_claim"))
+                    if (
+                        _unclaimed
+                        and not manual_run
+                        and _overdue_s <= _catchup_s
+                        and not job.get("last_run_at")
+                    ):
+                        job[LATE_FIRE_KEY] = int(_overdue_s)
+                        logger.warning(
+                            "Job '%s': one-shot due %s is %.0f min past due "
+                            "(inside the %ds restart catch-up window) — firing "
+                            "late now",
+                            job.get("name", job.get("id", "?")),
+                            next_run,
+                            _overdue_s / 60,
+                            int(_catchup_s),
+                        )
+                        _overdue_s = 0.0  # fall through to normal dispatch
+                if kind == "once" and _overdue_s > ONESHOT_GRACE_SECONDS:
                     if not (job.get("run_claim") or job.get("fire_claim")):
                         # Nothing was ever dispatched — retire the record with
                         # a diagnostic so it stops being scanned and the miss
                         # is operator-visible (retire-not-silently-delete).
-                        _write_missed_oneshot_diagnostic(job, next_run)
+                        _write_missed_oneshot_diagnostic(
+                            job, next_run, window_seconds=_catchup_s
+                        )
                         for rj in raw_jobs:
                             if rj["id"] == job["id"]:
                                 raw_jobs.remove(rj)
