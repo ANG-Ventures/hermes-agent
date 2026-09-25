@@ -4357,21 +4357,18 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
-        if args.coverage is not None:
-            task = kb.get_task(conn, tid)
-            if task is None or task.status != "running" or task.current_run_id is None:
-                print(f"cannot record coverage for {tid}: no active review run", file=sys.stderr)
-                return 1
-            kb.add_comment(
-                conn, tid, _profile_author(),
-                "review_coverage: " + str(kb.redact_review_value(args.coverage)),
-                run_id=task.current_run_id,
-            )
         ok, detail = kb.request_changes(
             conn,
             tid,
             reason=reason,
             expected_run_id=_worker_run_id_for(tid),
+            # Human/orchestrator reviewer on a parked review card: open the
+            # review run as the caller in the same transaction (no-op for a
+            # worker run, which passes its own run id).
+            claimer=_profile_author(),
+            # Recorded on the run being closed, inside the same transaction,
+            # so the parked-review send-back can satisfy the coverage gate.
+            coverage=args.coverage,
         )
         if not ok:
             print(

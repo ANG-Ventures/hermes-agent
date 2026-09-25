@@ -980,8 +980,8 @@ class UpdateTaskBody(BaseModel):
 # owner); the routes pre-check it only to return a clear 409.
 _REVIEW_EXIT_STATUSES = frozenset({"done", "blocked", "archived"})
 _REVIEW_EXIT_REFUSAL = (
-    "Claim review and request changes with a full coverage comment; "
-    "direct review reopening is retired"
+    "Claim review and request changes with a full coverage comment "
+    "(POST /tasks/{id}/request-changes); direct review reopening is retired"
 )
 
 
@@ -1997,6 +1997,50 @@ def reclaim_task_endpoint(
                 ),
             )
         return {"ok": True, "task_id": task_id}
+    finally:
+        conn.close()
+
+
+class RequestChangesBody(BaseModel):
+    reason: str
+    # review_coverage JSON text; required for a card parked in ``review``.
+    coverage: Optional[str] = None
+    author: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/request-changes")
+def request_changes_endpoint(
+    task_id: str,
+    payload: RequestChangesBody,
+    board: Optional[str] = Query(None),
+):
+    """Return a review card to its implementer with a coverage record.
+
+    The dashboard's review -> ready/todo status writes are refused (a card
+    leaves review only through a verdict); this is the send-back verdict.
+    Maps 1:1 to ``hermes kanban request-changes <id> <reason> --coverage``:
+    a card parked in ``review`` gets its review run opened as the caller and
+    closed in the same transaction.
+    """
+    if not payload.reason.strip():
+        raise HTTPException(status_code=400, detail="reason is required")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        ok, detail = kanban_db.request_changes(
+            conn, task_id,
+            reason=payload.reason,
+            claimer=(payload.author or "dashboard"),
+            coverage=payload.coverage,
+        )
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail=f"cannot request changes for {task_id}: {detail or 'invalid review state'}",
+            )
+        return {"ok": True, "task_id": task_id, "implementer": detail}
     finally:
         conn.close()
 
