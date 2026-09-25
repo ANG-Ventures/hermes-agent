@@ -100,6 +100,10 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "agent-browser runs via `npx`, resolved against the extended browser "
         "PATH that _merge_browser_path() already seeds with the managed dirs."
     ),
+    ("apps/desktop/electron/fixtures/source-backend.py", "uv"): (
+        "Test fixture drives the real uv deliberately placed on the test "
+        "runner's PATH; it is not Hermes-owned subprocess resolution."
+    ),
 }
 
 
