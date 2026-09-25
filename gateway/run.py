@@ -20445,7 +20445,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 """
                 try:
                     from tools.process_registry import process_registry
-                    _killed = process_registry.kill_all()
+                    # RESTART-only exemption (t_1191e078): on the graceful path
+                    # of a restart (in-band restart, or an unplanned supervisor
+                    # SIGTERM such as `launchctl kickstart -k` that KeepAlive
+                    # revives), durable notify_on_complete children survive and
+                    # stay in the checkpoint; the next boot re-adopts them and
+                    # delivers their result. A planned stop and the
+                    # post-interrupt (drain-timeout) phase still kill all (#8202).
+                    _keep = frozenset()
+                    if phase == "final-cleanup" and (
+                        self._restart_requested
+                        or getattr(self, "_signal_initiated_shutdown", False)
+                    ):
+                        try:
+                            _keep = process_registry.restart_durable_ids()
+                            if _keep:
+                                process_registry.hand_off_to_next_boot(_keep)
+                        except Exception as _e:
+                            # Never let the exemption skip the kill below.
+                            _keep = frozenset()
+                            logger.debug("restart_durable_ids (%s) error: %s", phase, _e)
+                        if _keep:
+                            logger.info(
+                                "Shutdown (%s): keeping %d restart-durable "
+                                "background process(es) alive: %s",
+                                phase, len(_keep), ", ".join(sorted(_keep)),
+                            )
+                    _killed = (
+                        process_registry.kill_all(exclude_ids=_keep)
+                        if _keep else process_registry.kill_all()
+                    )
                     if _killed:
                         logger.info(
                             "Shutdown (%s): killed %d tool subprocess(es)",

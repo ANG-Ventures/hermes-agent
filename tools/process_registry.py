@@ -65,6 +65,11 @@ logger = logging.getLogger(__name__)
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 
+
+def _process_output_dir() -> Path:
+    """Where durable_output spawns write their log + exit files."""
+    return get_hermes_home() / "state" / "process_output"
+
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
@@ -403,6 +408,11 @@ class ProcessSession:
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
+    # Restart-durable output (t_1191e078): stdout/stderr go to this file and a
+    # wrapper writes the exit code to ``exit_path``, so a child that outlives a
+    # gateway restart keeps its output and its result can be recovered on boot.
+    output_log: str = ""
+    exit_path: str = ""
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -494,6 +504,12 @@ class ProcessRegistry:
         # injection (the bug #8228 originally fixed).  drain_notifications()
         # consults this set; the gateway/tui watchers deliberately do NOT.
         self._poll_observed: set = set()
+
+        # Sessions handed off to the next gateway boot on restart (t_1191e078).
+        # Their checkpoint entry is kept even if this process sees them exit
+        # before it dies: its in-memory completion would die with it, so the
+        # next boot must rebuild it from the log + exit file.
+        self._handoff_ids: set = set()
 
         # Global watch-match circuit breaker — across all sessions.
         # Prevents sibling processes from collectively flooding the user even
@@ -849,6 +865,9 @@ class ProcessRegistry:
         # Identity-aware liveness: a recycled PID (alive but a different process
         # than we spawned) must be treated as "our process exited", so it is
         # moved to finished and can never be tree-killed by a later kill().
+        if session.output_log:
+            # Restart-durable spawn: the log file is the live output source.
+            self._load_durable_output(session)
         if self._host_pid_is_ours(session.pid, session.host_start_time):
             return session
 
@@ -856,9 +875,12 @@ class ProcessRegistry:
             if session.exited:
                 return session
             session.exited = True
-            # Recovered sessions no longer have a waitable handle, so the real
-            # exit code is unavailable once the original process object is gone.
-            session.exit_code = None
+            # Recovered sessions no longer have a waitable handle; only a
+            # durable_output spawn's wrapper recorded the real exit code.
+            session.exit_code = (
+                self._read_durable_exit_code(session.exit_path)
+                if session.exit_path else None
+            )
 
         self._move_to_finished(session)
         return session
@@ -1046,6 +1068,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        durable_output: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1056,6 +1079,11 @@ class ProcessRegistry:
             use_pty: If True, use a pseudo-terminal via ptyprocess for interactive
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
+            durable_output: POSIX pipe mode only. Send stdout/stderr to a file
+                     under ``<home>/state/process_output/`` and record the exit
+                     code via a wrapper instead of piping to this process, so
+                     the child can survive a gateway restart without SIGPIPE
+                     and its result is recoverable on the next boot.
         """
         # Guard against the `A && B &` subshell-wait trap (issue #68915).
         # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds
@@ -1175,6 +1203,25 @@ class ProcessRegistry:
         # cgroup (and the messaging control plane with it). This applies to
         # both pipe mode and the PTY path above.
         shell_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
+        output_fh = None
+        if durable_output and not _IS_WINDOWS:
+            out_dir = _process_output_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            session.output_log = str(out_dir / f"{session.id}.log")
+            session.exit_path = str(out_dir / f"{session.id}.exit")
+            output_fh = open(session.output_log, "ab")
+            # The wrapper (not this process) records the exit code, atomically,
+            # so the result survives this process exiting first. ``trap : TERM``
+            # (a handler, reset on exec, NOT an inherited ignore) keeps the
+            # wrapper waiting on a tree-kill until its child is gone, so the
+            # child is never reparented away from the kill and the exit file
+            # still records how it ended.
+            shell_argv = [
+                "/bin/sh", "-c",
+                'x="$1"; shift; trap : TERM; "$@"; rc=$?; '
+                'printf "%s\\n" "$rc" > "$x.tmp" && mv -f "$x.tmp" "$x"; exit "$rc"',
+                "sh", session.exit_path, *shell_argv,
+            ]
         in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
         use_systemd_scope = (
             in_supervised_gateway and _systemd_run_user_scope_available()
@@ -1215,19 +1262,23 @@ class ProcessRegistry:
                     _systemd_run_user_scope_available(),
                 )
 
-        proc = subprocess.Popen(
-            spawn_argv,
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=popen_start_new_session,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                spawn_argv,
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=output_fh if output_fh is not None else subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=popen_start_new_session,
+                **_popen_kwargs,
+            )
+        finally:
+            if output_fh is not None:
+                output_fh.close()  # the child holds its own copy of the fd
 
         session.process = proc
         session.pid = proc.pid
@@ -1236,7 +1287,7 @@ class ProcessRegistry:
         try:
             # Start output reader thread
             reader = threading.Thread(
-                target=self._reader_loop,
+                target=self._file_reader_loop if session.output_log else self._reader_loop,
                 args=(session,),
                 daemon=True,
                 name=f"proc-reader-{session.id}",
@@ -1540,6 +1591,90 @@ class ProcessRegistry:
                     "exited" if session.exit_code is not None else "handle-lost"
                 )
             self._move_to_finished(session)
+
+    def _file_reader_loop(self, session: ProcessSession):
+        """Background thread: tail a ``durable_output`` session's log file.
+
+        Same buffering/watch/emit behaviour as ``_reader_loop``, but the child
+        writes to a file, not a pipe to this process, so it can outlive us.
+        There is no EOF on a file: stop once the direct child (the exit-code
+        wrapper) has exited, after a final drain.
+        """
+        first_chunk = True
+        offset = 0
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+        def _append_chunk(chunk: str):
+            nonlocal first_chunk
+            if first_chunk:
+                chunk = self._clean_shell_noise(chunk)
+                first_chunk = False
+            with session._lock:
+                session.output_buffer += chunk
+                if len(session.output_buffer) > session.max_output_chars:
+                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            self._check_watch_patterns(session, chunk)
+            self._emit_output(session, chunk)
+
+        def _drain():
+            nonlocal offset
+            try:
+                with open(session.output_log, "rb") as fh:
+                    fh.seek(offset)
+                    while True:
+                        raw = fh.read(65536)
+                        if not raw:
+                            break
+                        offset += len(raw)
+                        chunk = decoder.decode(raw)
+                        if chunk:
+                            _append_chunk(chunk)
+            except OSError as e:
+                logger.debug("Process output file read failed for %s: %s", session.id, e)
+
+        proc = session.process
+        try:
+            while not session.exited:
+                _drain()
+                if proc is None or proc.poll() is not None:
+                    break
+                time.sleep(0.2)
+            _drain()
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                _append_chunk(tail)
+        except Exception as e:
+            logger.debug("Process output file reader ended: %s", e)
+        finally:
+            session.stdout_closed = True
+            session.exited = True
+            if session.completion_reason != "killed":
+                session.exit_code = getattr(proc, "returncode", None)
+                session.completion_reason = (
+                    "exited" if session.exit_code is not None else "handle-lost"
+                )
+            self._move_to_finished(session)
+
+    @staticmethod
+    def _load_durable_output(session: ProcessSession) -> None:
+        """Refresh a detached ``durable_output`` session's buffer from its log tail."""
+        try:
+            size = os.path.getsize(session.output_log)
+            with open(session.output_log, "rb") as fh:
+                fh.seek(max(0, size - session.max_output_chars))
+                data = fh.read()
+        except OSError:
+            return
+        with session._lock:
+            session.output_buffer = data.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _read_durable_exit_code(exit_path: str) -> Optional[int]:
+        """Exit code the spawn wrapper recorded, or None when it never wrote one."""
+        try:
+            return int(Path(exit_path).read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
 
     def _env_poller_loop(
         self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
@@ -2092,6 +2227,8 @@ class ProcessRegistry:
         """
         if session is None or session.exited:
             return
+        if session.output_log:
+            return  # file-tail reader never blocks on an orphaned pipe
         proc = getattr(session, "process", None)
         if proc is None:
             return
@@ -2799,7 +2936,42 @@ class ProcessRegistry:
                 killed += 1
         return killed
 
+    def restart_durable_ids(self) -> frozenset:
+        """Running sessions that should outlive a gateway RESTART (t_1191e078).
+
+        Only host-PID ``durable_output`` spawns (output + exit code land on disk,
+        not a pipe to this process) that asked for ``notify_on_complete`` and
+        carry a routable origin (``session_key`` + watcher platform), so the next
+        boot's recovered watcher can deliver the completion to the caller.
+        Everything else is still killed on every stop.
+        """
+        with self._lock:
+            return frozenset(
+                s.id for s in self._running.values()
+                if not s.exited
+                and s.notify_on_complete
+                and s.session_key
+                and s.watcher_platform
+                and s.output_log
+                and s.pid_scope == "host"
+            )
+
+    def hand_off_to_next_boot(self, ids) -> None:
+        """Keep ``ids`` in the checkpoint until this process exits (see _handoff_ids)."""
+        with self._lock:
+            self._handoff_ids.update(ids)
+        self._write_checkpoint()
+
     # ----- Cleanup / Pruning -----
+
+    @staticmethod
+    def _discard_durable_files(session: Optional[ProcessSession]) -> None:
+        for path in (getattr(session, "output_log", ""), getattr(session, "exit_path", "")):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _prune_if_needed(self):
         """Remove oldest finished sessions if over MAX_PROCESSES. Must hold _lock."""
@@ -2810,7 +2982,7 @@ class ProcessRegistry:
             if (now - s.started_at) > FINISHED_TTL_SECONDS
         ]
         for sid in expired:
-            del self._finished[sid]
+            self._discard_durable_files(self._finished.pop(sid, None))
             self._completion_consumed.discard(sid)
             self._poll_observed.discard(sid)
 
@@ -2818,7 +2990,7 @@ class ProcessRegistry:
         total = len(self._running) + len(self._finished)
         if total >= MAX_PROCESSES and self._finished:
             oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
-            del self._finished[oldest_id]
+            self._discard_durable_files(self._finished.pop(oldest_id, None))
             self._completion_consumed.discard(oldest_id)
             self._poll_observed.discard(oldest_id)
 
@@ -2844,8 +3016,11 @@ class ProcessRegistry:
         try:
             with self._lock:
                 entries = []
-                for s in self._running.values():
-                    if not s.exited:
+                handed_off = [
+                    s for s in self._finished.values() if s.id in self._handoff_ids
+                ]
+                for s in list(self._running.values()) + handed_off:
+                    if not s.exited or s.id in self._handoff_ids:
                         # Lazily backfill the kernel start time for host PIDs so
                         # recovery after restart can detect PID recycling even
                         # for sessions spawned before this field existed.
@@ -2865,6 +3040,8 @@ class ProcessRegistry:
                             "pid_scope": s.pid_scope,
                             "host_start_time": s.host_start_time,
                             "systemd_unit": s.systemd_unit,
+                            "output_log": s.output_log,
+                            "exit_path": s.exit_path,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
@@ -2935,7 +3112,8 @@ class ProcessRegistry:
             # watcher tree-kill a stranger (e.g. a browser). Re-validate the
             # kernel start time recorded in the checkpoint.
             recorded_start = entry.get("host_start_time")
-            if not self._host_pid_is_ours(pid, recorded_start):
+            still_ours = self._host_pid_is_ours(pid, recorded_start)
+            if not still_ours:
                 if self._is_host_pid_alive(pid):
                     logger.info(
                         "Not recovering session %s: pid %d is alive but its "
@@ -2952,7 +3130,11 @@ class ProcessRegistry:
                         pid,
                     )
                     unresolved_scope_entries.append(entry)
-                continue
+                if not entry.get("output_log"):
+                    continue
+                # A durable_output spawn that finished while no gateway was
+                # running: its log + exit file still hold the result, so adopt
+                # it below and finish it immediately instead of dropping it.
 
             session = ProcessSession(
                 id=entry["session_id"],
@@ -2963,6 +3145,8 @@ class ProcessRegistry:
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
                 systemd_unit=entry.get("systemd_unit", ""),
+                output_log=entry.get("output_log", ""),
+                exit_path=entry.get("exit_path", ""),
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
                 detached=True,  # Can't read output, but can report status + kill
@@ -2997,6 +3181,8 @@ class ProcessRegistry:
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })
+            if not still_ours:
+                self._refresh_detached_session(session)
 
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
 
