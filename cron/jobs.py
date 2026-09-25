@@ -3536,6 +3536,21 @@ def _mark_job_run_locked(
                 # The transient manual-run context is single-fire: whatever
                 # run just completed consumed it (or superseded it).
                 job.pop("manual_run_prompt", None)
+                # Consecutive failures carrying the IDENTICAL error string —
+                # read (before this write) by the scheduler's repeated-error
+                # page gate, which pages a stuck no_agent job once instead of
+                # per tick (t_04822736). Any success or changed error resets.
+                if success or not error:
+                    job["error_repeat_streak"] = 0
+                elif (
+                    job.get("last_status") == "error"
+                    and job.get("last_error") == error
+                ):
+                    job["error_repeat_streak"] = (
+                        int(job.get("error_repeat_streak") or 0) + 1
+                    )
+                else:
+                    job["error_repeat_streak"] = 1
                 job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
                 # A healthy run means the configuration validates again — drop
