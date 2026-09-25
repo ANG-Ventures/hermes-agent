@@ -277,6 +277,40 @@ class TestSshRemoteExemption:
     def test_ssh_local_or_split_still_blocked(self, text):
         assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
 
+    # 2026-09-25: a MULTI-LINE quoted remote command. The local shell hands the
+    # whole quoted string to ssh, so a newline or `;` inside it never starts a
+    # new local segment — but the line-scoped scan saw `systemctl --user
+    # restart hermes-gateway` on its own line with no `ssh` before it and
+    # blocked a legitimate sibling-host restart (ACE-AI's Agora unit shares
+    # this host's `hermes-gateway` unit name).
+    @pytest.mark.parametrize("text", [
+        "ssh -o BatchMode=yes ace-ai-lan 'cd ~/.hermes\ncp config.yaml config.yaml.bak\n"
+        "systemctl --user restart hermes-gateway; sleep 20; systemctl --user is-active hermes-gateway'",
+        "timeout 150 ssh ace-ai-lan 'cd ~/.hermes; systemctl --user restart hermes-gateway'",
+        "ssh ace-ai \"cd /tmp && sudo systemctl restart hermes-gateway.service\"",
+        "ssh ace-ai 'echo starting\nlaunchctl kickstart -k gui/501/ai.hermes.gateway\necho done'",
+        "echo pre && ssh ace-ai 'true\nhermes gateway restart'",
+    ])
+    def test_ssh_remote_multiline_quoted_command_allowed(self, text):
+        assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
+
+    @pytest.mark.parametrize("text", [
+        # Quote region CLOSED before the lifecycle line → it runs locally.
+        "ssh ace-ai 'uptime'\nsystemctl --user restart hermes-gateway",
+        "ssh ace-ai 'cd /tmp\nuptime' && systemctl restart hermes-gateway",
+        # $(...) inside a DOUBLE-quoted remote string executes LOCALLY first.
+        "ssh ace-ai \"echo $(hermes gateway restart)\"",
+        "ssh ace-ai \"uptime\necho `hermes gateway restart`\"",
+        # Loopback target, multi-line.
+        "ssh localhost 'cd /tmp\nsystemctl restart hermes-gateway'",
+        "ssh ace@127.0.0.1 'true\nhermes gateway restart'",
+        # The quote was opened by a non-ssh command.
+        "bash -c 'cd /tmp\nhermes gateway restart'",
+        "echo 'note:\nhermes gateway restart' && hermes gateway restart",
+    ])
+    def test_ssh_remote_multiline_still_blocked_when_not_remote(self, text):
+        assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+
     @pytest.mark.parametrize("text", [
         # Trailing-boundary fix must not weaken real commands.
         "hermes gateway restart",
