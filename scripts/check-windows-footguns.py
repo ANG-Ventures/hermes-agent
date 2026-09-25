@@ -721,7 +721,9 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
             matches.append((i, line.rstrip(), fg))
 
     text_rule = next((fg for fg in footguns if fg.name == _SUBPROCESS_TEXT_RULE), None)
-    if text_rule is not None and not (
+    # Parse only files that contain ``text=True`` at all: ast.parse on every
+    # file doubled --all wall time and tripped the 60s full-repo-scan test.
+    if text_rule is not None and text_rule.pattern.search(text) and not (
         text_rule.path_allowlist and any(s in str(path) for s in text_rule.path_allowlist)
     ):
         # ast numbers lines on \r\n, \r and \n only; str.splitlines() also
