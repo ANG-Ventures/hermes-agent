@@ -72,6 +72,56 @@ def test_same_model_review_reuses_exact_parent_tools_without_memory_provider():
         clear_thread_tool_whitelist()
 
 
+def test_review_fork_inherited_tools_survive_compaction_refresh():
+    """A mid-review compaction boundary runs refresh_agent_mcp_tools(content_aware=True).
+    The fork has no memory manager (skip_memory), so an unguarded rebuild would drop the
+    inherited mem0_* schemas and re-break the cache prefix; the frozen generation refuses it."""
+    import copy as _copy
+    from agent.background_review import build_cache_parity_fork
+    from tools.mcp_tool import refresh_agent_mcp_tools
+
+    parent_tools = [
+        {"type": "function", "function": {"name": "skill_view", "parameters": {}}},
+        {"type": "function", "function": {"name": "mem0_search", "parameters": {"type": "object"}}},
+    ]
+    parent = SimpleNamespace(
+        model="test-model", provider="openai", platform="cli", session_id="parent",
+        tools=parent_tools, valid_tool_names={"skill_view", "mem0_search"},
+        _cached_system_prompt="unchanged system", session_start=object(),
+        _memory_store=None, _memory_enabled=False, _user_profile_enabled=False,
+        enabled_toolsets=["skills"], disabled_toolsets=None, request_overrides={},
+    )
+
+    class Fork:
+        def __init__(self, **kwargs):
+            self.enabled_toolsets = kwargs.get("enabled_toolsets")
+            self.disabled_toolsets = kwargs.get("disabled_toolsets")
+            self.tools = [parent_tools[0]]
+            self.valid_tool_names = {"skill_view"}
+            self._tool_snapshot_generation = 0
+            self._memory_manager = None
+            self.context_compressor = None
+
+    runtime = {"model": "test-model", "provider": "openai", "routed": False}
+    with patch("run_agent.AIAgent", Fork), patch(
+        "agent.background_review._resolve_review_runtime", return_value=runtime
+    ):
+        fork, _, routed = build_cache_parity_fork(parent, max_iterations=3)
+    assert not routed
+    before = _copy.deepcopy(fork.tools)
+
+    # Control: an unfrozen copy IS rewritten by the refresh (mem0 dropped), so the
+    # assertion below gates the freeze rather than a no-op refresh.
+    control = SimpleNamespace(**{k: _copy.deepcopy(v) for k, v in vars(fork).items()})
+    control._tool_snapshot_generation = 0
+    refresh_agent_mcp_tools(control, content_aware=True)
+    assert "mem0_search" not in control.valid_tool_names
+
+    assert refresh_agent_mcp_tools(fork, content_aware=True) == set()
+    assert fork.tools == before
+    assert fork.valid_tool_names == {"skill_view", "mem0_search"}
+
+
 def _make_agent_stub(agent_cls):
     """Create a minimal AIAgent-like object with just enough state for _spawn_background_review."""
     agent = object.__new__(agent_cls)
