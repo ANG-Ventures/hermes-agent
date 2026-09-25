@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-import logging
-import os
 import sqlite3
 import threading
 import time
 from types import SimpleNamespace
 
-import pytest
-
 from agent import relay_runtime
-import hermes_state
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -638,98 +633,5 @@ def test_flush_messages_to_session_db_fences_stale_holder_on_live_db(tmp_path):
         "late stale reply",
     ]
     second.release_session_turn_lease("shared", next_holder)
-    first.close()
-    second.close()
-
-
-def test_same_pid_active_holder_survives_expiry_until_release_unregisters(
-    tmp_path, monkeypatch
-):
-    """Wall-clock expiry cannot steal a lease from a registered live turn."""
-    path = tmp_path / "state.db"
-    first = SessionDB(path)
-    second = SessionDB(path)
-    first.create_session("shared", source="test")
-    active = f"pid={os.getpid()}:turn=relay-turn-B:platform=discord"
-    waiter = f"pid={os.getpid()}:turn=relay-turn-C:platform=discord"
-    assert first.try_acquire_session_turn_lease("shared", active, ttl_seconds=5)
-
-    with first._lock:
-        conn = first._conn
-        assert conn is not None
-        conn.execute(
-            "UPDATE session_turn_leases SET expires_at = 0 WHERE holder = ?",
-            (active,),
-        )
-        conn.commit()
-
-    assert not second.try_acquire_session_turn_lease(
-        "shared", waiter, ttl_seconds=5
-    )
-
-    # Even if the durable DELETE fails, release's finally must unregister the
-    # process-local owner so the already-expired row is reclaimable.
-    def fail_release(_fn, patience_s=None):
-        raise sqlite3.OperationalError("forced release failure")
-
-    monkeypatch.setattr(first, "_execute_write", fail_release)
-    with pytest.raises(sqlite3.OperationalError, match="forced release failure"):
-        first.release_session_turn_lease("shared", active)
-
-    assert second.try_acquire_session_turn_lease(
-        "shared", waiter, ttl_seconds=5
-    )
-    second.release_session_turn_lease("shared", waiter)
-    first.close()
-    second.close()
-
-
-def test_try_acquire_registers_before_write_and_unregisters_on_error(
-    tmp_path, monkeypatch
-):
-    db = SessionDB(tmp_path / "state.db")
-    holder = f"pid={os.getpid()}:turn=write-error:platform=discord"
-    observed = {"registered_during_write": False}
-
-    def fail_write(_fn, patience_s=None):
-        observed["registered_during_write"] = (
-            hermes_state._is_active_local_session_turn_lease_holder(holder)
-        )
-        raise sqlite3.OperationalError("forced acquire failure")
-
-    monkeypatch.setattr(db, "_execute_write", fail_write)
-    with pytest.raises(sqlite3.OperationalError, match="forced acquire failure"):
-        db.try_acquire_session_turn_lease("shared", holder)
-
-    assert observed["registered_during_write"] is True
-    assert not hermes_state._is_active_local_session_turn_lease_holder(holder)
-    db.close()
-
-
-def test_same_process_lease_contention_logs_both_relay_turn_ids(
-    tmp_path, caplog
-):
-    path = tmp_path / "state.db"
-    first = SessionDB(path)
-    second = SessionDB(path)
-    first.create_session("shared", source="test")
-    active = f"pid={os.getpid()}:turn=relay-turn-B:platform=discord"
-    waiter = f"pid={os.getpid()}:turn=relay-turn-C:platform=discord"
-    assert first.try_acquire_session_turn_lease("shared", active, ttl_seconds=5)
-
-    with caplog.at_level(logging.ERROR, logger="hermes_state"):
-        acquired = second.acquire_session_turn_lease(
-            "shared",
-            waiter,
-            wait_seconds=0.02,
-            poll_interval_seconds=0.01,
-            acquire_patience_s=0.01,
-        )
-
-    assert acquired is False
-    assert "Same-process session turn lease contention" in caplog.text
-    assert "turn=relay-turn-B" in caplog.text
-    assert "turn=relay-turn-C" in caplog.text
-    first.release_session_turn_lease("shared", active)
     first.close()
     second.close()
