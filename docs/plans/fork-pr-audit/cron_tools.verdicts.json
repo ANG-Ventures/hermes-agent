@@ -552,5 +552,275 @@
   },
   "branch": null,
   "notes": "WEAK KEEP (1 job, 109 loc). Candidate DROP if that job is retired."
+ },
+ "#614": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Lifecycle words inside a heredoc BODY were read as an invocation (papercut pc-fccd2771).",
+  "evidence": {
+   "original": "PR #614 body.",
+   "upstream_state": "GREEN on ../up: python heredoc whose string literal says 'hermes gateway restart' -> blocked=False (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script). NOTE fork origin/main now BLOCKS the same case (blocked=True) — later rows #920/#1017 re-scan Python bodies, so #614's intent is already overridden on the fork",
+   "upstream_fix": "9aa0721b23 (2026-08-23 inert heredoc bodies no longer trip the guard, #88336); 307cc814ad (2026-08-12 shared heredoc masking helper)",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 289,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Take upstream's inert-heredoc handling. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "#624": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "A script body naming a DIRECTORY path failed closed as an unsafe script (papercut pc-fb1bd018).",
+  "evidence": {
+   "original": "PR #624 body.",
+   "upstream_state": "GREEN on ../up: bash <script with DIR=\"<existing dir>\"> -> blocked=False (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "9ac1e65b0a (2026-08-15 do not treat directories as unsafe lifecycle scripts, #86753)",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 115,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "#591": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "`cd /p/proj && ./proj stats` resolved ./proj to the directory and hard-blocked every gbrain launcher call.",
+  "evidence": {
+   "original": "PR #591 body (every ~/gbrain/gbrain launcher call, Aug 2026).",
+   "upstream_state": "GREEN on ../up for the false positive: cd <dir> && ./proj stats -> blocked=False (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script) — via upstream's directory rule",
+   "upstream_fix": "9ac1e65b0a (directory != unsafe script)",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 94,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "False-positive fixed upstream. Residual difference: upstream never resolves through the cd, so it does not scan the launcher body at all (a lifecycle command inside such a launcher is not caught). Adversary may argue this as an UPSTREAM hardening; it is not the problem #591 was filed for. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "#818": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Oversized non-executable data file at command position (from a Python heredoc line) failed closed.",
+  "evidence": {
+   "original": "PR #818 body (bash /tmp/ac8-close.sh blocked, measured).",
+   "upstream_state": "GREEN on ../up: bash <script with python heredoc sqlite3.connect('~/.hermes/kanban.db')> -> blocked=False (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "d46abd445f (2026-09-18 a data file only mentioned in an inert heredoc never fails the guard closed)",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 184,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "#319": {
+  "verdict": "UPSTREAM",
+  "problem": "(a) `kill` inside `skill` paths matched Branch D; (b) lifecycle phrase as quoted DATA (echo/grep arg) blocked.",
+  "evidence": {
+   "original": "PR #319 body.",
+   "upstream_state": "(a) GREEN on ../up (skill path -> blocked=False); (b) RED on ../up: echo 'hermes gateway restart' -> blocked=True, fork -> False (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "(a) a74eb2dd41 (2026-08-22 quote-aware segmentation + word boundaries); (b) none",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 126,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": [
+     "#594"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Trim to the quoted-data half (_match_is_quoted_data/_open_quote_at) and offer upstream together with #594 (same class: text consumers). Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "#594": {
+  "verdict": "UPSTREAM",
+  "problem": "`git commit -m \"...hermes gateway restart...\"` blocked (message text is never executed).",
+  "evidence": {
+   "original": "commit/PR #594 body.",
+   "upstream_state": "RED on ../up: git commit -m \"docs: run hermes gateway restart after deploy\" -> blocked=True; fork -> False (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "none",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 54,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": [
+     "#319"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Generic false positive; bundle with #319(b) as one upstream PR. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "nopr:116493ff97": {
+  "verdict": "UPSTREAM",
+  "problem": "ssh-wrapped REMOTE gateway restart (`ssh ace-ai \"systemctl restart hermes-gateway\"`) blocked locally.",
+  "evidence": {
+   "original": "commit body (fleet maintenance of remote hosts).",
+   "upstream_state": "RED on ../up: ssh ace-ai \"systemctl restart hermes-gateway\" -> blocked=True; fork -> False (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "none",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 91,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": [
+     "nopr:c559189dd2",
+     "nopr:10a1424335"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Generic (remote host cannot SIGTERM the local gateway). Ship with its two Greptile hardenings nopr:c559189dd2 + nopr:10a1424335 as one upstream PR. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "nopr:c559189dd2": {
+  "verdict": "UPSTREAM",
+  "problem": "Loopback/env-assignment bypasses of the ssh-remote exemption (::ffff:127.x, REMOTE=/usr/bin/ssh ...).",
+  "evidence": {
+   "original": "commit body (Greptile P1s).",
+   "upstream_state": "n/a upstream (no exemption to bypass): ../up blocks both probes (blocked=True); fork blocks both (blocked=True) (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "n/a",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 10,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": [
+     "nopr:116493ff97"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Hardening of 116493ff97; lives or dies with it."
+ },
+ "nopr:10a1424335": {
+  "verdict": "UPSTREAM",
+  "problem": "Bracketed IPv6 loopback (ssh [::1]) bypassed the ssh-remote exemption.",
+  "evidence": {
+   "original": "commit body (Greptile P1).",
+   "upstream_state": "n/a upstream (no exemption): ../up blocked=True, fork blocked=True (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "n/a",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 4,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": [
+     "nopr:116493ff97"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "4 loc; follows 116493ff97."
+ },
+ "#740": {
+  "verdict": "UPSTREAM",
+  "problem": "Supervised gateway could not run lifecycle commands against a SIBLING profile's gateway (label-blind regex) — defeated the Aegis break-glass profile.",
+  "evidence": {
+   "original": "PR #740 body (Aegis launchd job ai.hermes.gateway-aegis).",
+   "upstream_state": "RED on ../up: XPC_SERVICE_NAME=ai.hermes.gateway, `launchctl kickstart -k gui/501/ai.hermes.gateway-aegis` -> blocked=True; fork -> False; self-target blocked on both (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "none",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25); fork-only block message 'uninstall THIS gateway from inside the gateway process' (2 hits in fork tools/terminal_tool.py, 0 upstream) = 136 blocks",
+   "cost": {
+    "loc": 788,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Needed by the fleet's recovery design (Aegis) and generic to any multi-profile install (upstream names profile gateways ai.hermes.gateway-<profile>). 788 loc — biggest guard row. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "#767": {
+  "verdict": "UPSTREAM",
+  "problem": "(1) `launchctl bootstrap <existing non-gateway plist>` refused label-independently; (2) guard blocks invisible inside execute_code.",
+  "evidence": {
+   "original": "PR #767 body (reloading fleetreview router plist from the gateway, reproduced live).",
+   "upstream_state": "(1) RED on ../up: bootstrap of an on-disk plist with Label ai.fleetreview.router -> blocked=True; fork -> False; missing-plist still blocked on both (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script). (2) not probed",
+   "upstream_fix": "none",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25); 'Blocked: launchctl submit' 53 (09-02→09-25) are the refusals this row narrows",
+   "cost": {
+    "loc": 966,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic. 966 loc incl. tests. Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "#920": {
+  "verdict": "UPSTREAM",
+  "problem": "Python heredocs: read-only diagnostic reads were blocked by the shell-reference walk, while dangerous Python payloads needed label-aware scanning.",
+  "evidence": {
+   "original": "PR #920 body (red control: 4 failed on fork/main).",
+   "upstream_state": "RED (security gap, not the false positive): on ../up: python heredoc `subprocess.run(['launchctl','kickstart','-k','gui/501/ai.hermes.gateway'])` -> blocked=False and `os.system('hermes gateway restart')` -> blocked=False (upstream treats every inert heredoc body as data); fork -> blocked=True for both. Benign python log read allowed on up, BLOCKED on fork when the literal contains the lifecycle phrase (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "none (upstream 9aa0721b23 went the other way: inert bodies are data)",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 326,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": [
+     "#933",
+     "#1017"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Real bypass on upstream: a python heredoc can restart/kill the gateway from inside it. Offer #920+#933+#1017 as one security PR upstream. Fork cost: 3 rows, ~750 loc, 5+ review rounds; the fork is now stricter than #614 intended (it re-blocks benign literals). Fork cron/lifecycle_guard.py is 2,469 lines vs upstream 1,285 (+tools/shell_heredoc.py 407 vs 231); upstream has independently hardened the same guard 52 commits."
+ },
+ "#933": {
+  "verdict": "UPSTREAM",
+  "problem": "Fix-forward for #920: heredoc body attributed to the wrong command; rebound trusted callables not failing closed.",
+  "evidence": {
+   "original": "PR #933 body (details on private kanban task).",
+   "upstream_state": "RED (read-only, same gap as #920): on ../up: python heredoc `subprocess.run(['launchctl','kickstart','-k','gui/501/ai.hermes.gateway'])` -> blocked=False and `os.system('hermes gateway restart')` -> blocked=False (upstream treats every inert heredoc body as data); fork -> blocked=True for both. Benign python log read allowed on up, BLOCKED on fork when the literal contains the lifecycle phrase (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script)",
+   "upstream_fix": "none",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 194,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": [
+     "#920"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #920."
+ },
+ "#1017": {
+  "verdict": "UPSTREAM",
+  "problem": "Read-only Python path mask trusted a deny-list; in-place mutation via Load-context calls bypassed it.",
+  "evidence": {
+   "original": "PR #1017 body, card t_594a24a2 (Argus r5 mutation probe).",
+   "upstream_state": "RED (read-only, same gap as #920): on ../up: python heredoc `subprocess.run(['launchctl','kickstart','-k','gui/501/ai.hermes.gateway'])` -> blocked=False and `os.system('hermes gateway restart')` -> blocked=False (upstream treats every inert heredoc body as data); fork -> blocked=True for both. Benign python log read allowed on up, BLOCKED on fork when the literal contains the lifecycle phrase (probe data/probe_guard*.py run with PYTHONPATH=<tree> repo venv, calling contains_gateway_lifecycle_command_or_referenced_script). Own tests on ../up: 16 failed, 5 passed (ImportError-free run; fork: 21 passed)",
+   "upstream_fix": "none",
+   "fires": "guard block messages: 'uninstall THIS gateway from inside the gateway process' 136 (09-19→09-25), 'Blocked: launchctl submit' 53 (09-02→09-25) — cluster-level, not attributable per row; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 236,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": [
+     "#920"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #920."
  }
 }
