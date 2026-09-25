@@ -5275,14 +5275,27 @@ def compress_context(
                     agent._flushed_db_message_session_id = agent.session_id
                 _session_commit_succeeded = True
             except Exception as e:
-                if (
+                _rotation_rollback = bool(
                     not in_place
                     and locals().get("old_session_id")
                     and agent.session_id == old_session_id
-                ):
+                )
+                # In-place sibling (t_aace5343): archive_and_compact() is atomic, so a
+                # raise before it returned (lease lost, TranscriptInvariantError, I/O)
+                # left EVERY pre-compaction row active. Handing back the compacted
+                # list anyway makes the next append-only flush INSERT it on top of the
+                # rows it was meant to replace — the live set then holds the summary
+                # AND the turns it summarized, each tool exchange twice.
+                _in_place_rollback = bool(
+                    in_place
+                    and not compacted_in_place
+                    and messages_before_compression is not None
+                )
+                if _rotation_rollback or _in_place_rollback:
                     # Atomic publication failed (including lease loss): keep the
                     # parent live and discard the stale compacted snapshot.
-                    old_session_id = None
+                    if _rotation_rollback:
+                        old_session_id = None
                     # NOTE: _db_flush_scan_prefix is intentionally NOT cleared
                     # here. The flush's bounded scan is identity-based
                     # (messages[i] is prefix[i]); the deepcopy rollback below
