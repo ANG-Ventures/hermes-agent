@@ -33,7 +33,14 @@ on:
     types:
       - completed
     # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
-    branches-ignore: [ci-overflow-ledger]
+    # *THROWAWAY* / *repro* branches: a worker proving a red on purpose is not an
+    # alert (t_2afda99d: daedalus/t_bc0052b9-THROWAWAY-repro paged #alerts 8x for
+    # one deliberately red run, once per re-run attempt).
+    branches-ignore:
+      - ci-overflow-ledger
+      - '**THROWAWAY**'
+      - '**throwaway**'
+      - '**repro**'
 
 permissions:
   contents: read
