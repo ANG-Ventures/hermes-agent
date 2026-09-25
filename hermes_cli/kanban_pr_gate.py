@@ -10,8 +10,18 @@ This module makes that mechanical. Each dispatcher tick:
 
 1. parse the LAST ``blocked``-family event's reason for PR references,
 2. resolve each reference's state through ``gh`` (bounded + cached),
-3. when EVERY referenced PR is MERGED, unblock the card, post the evidence as a
-   comment, and write one ``gate_auto_resolved`` event so a sweep can count it.
+3. drop HISTORY refs — a PR that had already merged when the card blocked (or
+   that this gate already resolved for this card) cannot be what the card is
+   waiting on; it is context the worker cited, not the gate,
+4. when EVERY remaining referenced PR is MERGED, unblock the card, post the
+   evidence as a comment, and write one ``gate_auto_resolved`` event so a
+   sweep can count it. A reason whose refs are ALL history is left alone.
+
+Step 3 exists because of t_20b94ef5 (2026-09-24): blocked twice with
+``kind=dependency`` on an unmerged sibling CARD, both reasons mentioning the
+long-merged PR #953 as background. Both times the gate read #953 as the gate
+condition, unblocked the card within minutes, and respawned a worker for
+nothing (runs 8911, 8934).
 
 Deliberate non-actions, each one a fail-safe:
 
@@ -994,26 +1004,108 @@ class _Resolver:
 # ---------------------------------------------------------------------------
 
 
-def _latest_block_reason(
+def _latest_block_event(
     conn: sqlite3.Connection, task_id: str
-) -> Optional[str]:
-    """Reason text of the most recent block-family event for a task."""
+) -> tuple[Optional[str], Optional[float]]:
+    """``(reason, created_at)`` of the most recent block-family event.
+
+    ``created_at`` is what separates a PR the card is WAITING on from a PR its
+    reason merely cites as history: one already merged at block time cannot be
+    the thing the card is blocked on.
+    """
     placeholders = ",".join("?" * len(_BLOCK_EVENT_KINDS))
     row = conn.execute(
-        f"SELECT payload FROM task_events WHERE task_id = ? "
+        f"SELECT payload, created_at FROM task_events WHERE task_id = ? "
         f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
         (task_id, *_BLOCK_EVENT_KINDS),
     ).fetchone()
     if row is None or not row["payload"]:
-        return None
+        return None, None
+    try:
+        blocked_at = float(row["created_at"]) if row["created_at"] is not None else None
+    except (TypeError, ValueError):
+        blocked_at = None
     try:
         payload = json.loads(row["payload"])
     except (TypeError, ValueError):
-        return None
+        return None, blocked_at
     if not isinstance(payload, dict):
-        return None
+        return None, blocked_at
     reason = payload.get("reason")
-    return reason if isinstance(reason, str) else None
+    return (reason if isinstance(reason, str) else None), blocked_at
+
+
+def _latest_block_reason(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Reason text of the most recent block-family event for a task."""
+    return _latest_block_event(conn, task_id)[0]
+
+
+def _parse_merged_at(value: Optional[str]) -> Optional[float]:
+    """GitHub ``mergedAt`` (ISO-8601, ``Z`` suffix) as epoch seconds, or None."""
+    if not value or not isinstance(value, str):
+        return None
+    from datetime import datetime, timezone
+
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _previously_resolved_refs(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Lower-cased PR names a prior ``gate_auto_resolved`` on this card cited.
+
+    A PR this gate already resolved for the card is spent: re-reading it from a
+    later block reason is the t_20b94ef5 loop. This is the fallback for a PR
+    whose ``mergedAt`` is missing or unparseable, where the time test cannot
+    decide.
+    """
+    spent: set[str] = set()
+    for row in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'gate_auto_resolved'",
+        (task_id,),
+    ):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        prs = payload.get("prs") if isinstance(payload, dict) else None
+        if isinstance(prs, list):
+            spent.update(str(p).lower() for p in prs if isinstance(p, str))
+    return spent
+
+
+def _is_history(
+    ref: PrRef,
+    entry: _CacheEntry,
+    *,
+    blocked_at: Optional[float],
+    spent: set[str],
+) -> bool:
+    """True when ``ref`` cannot be what the card is blocked on.
+
+    Only a MERGED PR can be history. It is history when it merged at or before
+    the block event, or when this gate already resolved it for this card.
+    """
+    if entry.state != "MERGED":
+        return False
+    if str(ref).lower() in spent:
+        return True
+    merged_ts = _parse_merged_at(entry.merged_at)
+    return (
+        merged_ts is not None
+        and blocked_at is not None
+        and merged_ts <= blocked_at
+    )
 
 
 def _closed_ref_marker(refs: Iterable[PrRef]) -> str:
@@ -1080,10 +1172,11 @@ _PREFETCH_WORKERS = 6
 
 def _gate_candidates(
     conn: sqlite3.Connection,
-) -> list[tuple[str, tuple, Optional[str], Optional[str], str]]:
+) -> list[tuple[str, tuple, Optional[str], Optional[str], str, Optional[float]]]:
     """In-scope blocked cards whose reason could name a PR. Pure DB reads.
 
-    Returns ``(task_id, fingerprint, workspace_path, body, reason)``. The
+    Returns ``(task_id, fingerprint, workspace_path, body, reason,
+    blocked_at)``. The
     fingerprint is every input ``repo_context`` depends on, so a cached
     context can be proven still applicable without re-deriving it.
     """
@@ -1094,14 +1187,15 @@ def _gate_candidates(
         f"ORDER BY id",
         tuple(sorted(GATE_BLOCK_KINDS)),
     ).fetchall()
-    out: list[tuple[str, tuple, Optional[str], Optional[str], str]] = []
+    out: list[tuple[str, tuple, Optional[str], Optional[str], str, Optional[float]]] = []
     for row in rows:
-        reason = _latest_block_reason(conn, row["id"])
+        reason, blocked_at = _latest_block_event(conn, row["id"])
         if not reason or ("#" not in reason and "pull/" not in reason):
             continue
         fingerprint = (row["workspace_path"], row["body"], reason)
         out.append(
-            (row["id"], fingerprint, row["workspace_path"], row["body"], reason)
+            (row["id"], fingerprint, row["workspace_path"], row["body"], reason,
+             blocked_at)
         )
     return out
 
@@ -1110,8 +1204,8 @@ def _blocked_gate_refs(
     conn: sqlite3.Connection,
     *,
     contexts: Optional[dict[str, tuple[tuple, Optional[str]]]] = None,
-) -> list[tuple[str, list[PrRef], list[tuple[PrRef, str]]]]:
-    """Snapshot in-scope blocked cards and their currently resolvable PR refs.
+) -> list[tuple[str, list[PrRef], list[tuple[PrRef, str]], Optional[float]]]:
+    """Snapshot in-scope blocked cards, their resolvable PR refs, deploy checks, and block time.
 
     ``contexts`` is a repo-context snapshot taken by the unlocked prefetch.
     When supplied this function performs NO subprocess I/O: a card absent from
@@ -1120,8 +1214,10 @@ def _blocked_gate_refs(
     it is None the caller is the direct, unlocked path and contexts are
     resolved inline.
     """
-    candidates: list[tuple[str, list[PrRef], list[tuple[PrRef, str]]]] = []
-    for task_id, fingerprint, workspace_path, body, reason in _gate_candidates(conn):
+    candidates: list[tuple[str, list[PrRef], list[tuple[PrRef, str]], Optional[float]]] = []
+    for (
+        task_id, fingerprint, workspace_path, body, reason, blocked_at,
+    ) in _gate_candidates(conn):
         if contexts is None:
             default_repo = repo_context(workspace_path=workspace_path, body=body)
         else:
@@ -1135,7 +1231,7 @@ def _blocked_gate_refs(
         refs = parse_pr_refs(reason, default_repo=default_repo)
         if refs:
             candidates.append(
-                (task_id, refs, _deploy_checks(refs, reason=reason, body=body))
+                (task_id, refs, _deploy_checks(refs, reason=reason, body=body), blocked_at)
             )
     return candidates
 
@@ -1168,7 +1264,9 @@ def prefetch_pr_gate_states(
     # shells out to ``git remote -v`` (same 5 s timeout as ``gh``), and a
     # degraded workspace would otherwise hold the board's single-writer lock
     # for seconds per card.
-    for task_id, fingerprint, workspace_path, body, reason in _gate_candidates(conn):
+    for (
+        task_id, fingerprint, workspace_path, body, reason, _blocked_at,
+    ) in _gate_candidates(conn):
         default_repo = repo_context(workspace_path=workspace_path, body=body)
         contexts[task_id] = (fingerprint, default_repo)
         card_refs = parse_pr_refs(reason, default_repo=default_repo)
@@ -1296,7 +1394,7 @@ def reevaluate_pr_gates(
     # revalidation seam for an unlocked prefetch: if the card changed in the
     # interim, its fingerprint no longer matches the snapshot and it is skipped
     # (fail-safe), so this pass performs NO subprocess I/O of any kind.
-    for task_id, refs, deploy_checks in _blocked_gate_refs(
+    for task_id, refs, deploy_checks, blocked_at in _blocked_gate_refs(
         conn, contexts=None if prefetched is None else prefetched.contexts,
     ):
 
@@ -1339,6 +1437,29 @@ def reevaluate_pr_gates(
                 ))
             continue
 
+        # A ref already merged when the card blocked (or already resolved by
+        # this gate for this card) is context, not the gate. See t_20b94ef5.
+        # A deploy-premised ref is never history: a card that blocked on
+        # "#N live in <tree>" after #N merged is waiting on the DEPLOY, which
+        # the merge time says nothing about (t_289e8020).
+        spent = _previously_resolved_refs(conn, task_id)
+        deploy_keys = {(r.repo.lower(), r.number) for r, _ in deploy_checks}
+        gating = [
+            (r, e) for r, e in resolved
+            if (r.repo.lower(), r.number) in deploy_keys
+            or not _is_history(r, e, blocked_at=blocked_at, spent=spent)
+        ]
+        if not gating:
+            outcomes.append(GateOutcome(
+                task_id=task_id, action="history_only", prs=names,
+                detail="every referenced PR had already merged before the "
+                       "block (or was already resolved for this card); "
+                       "not a PR gate",
+            ))
+            continue
+        resolved = gating
+        names = tuple(str(r) for r, _ in gating)
+
         closed = [(r, e) for r, e in resolved if e.state == "CLOSED"]
         if closed:
             detail = _closed_sentence(closed)
@@ -1365,7 +1486,11 @@ def reevaluate_pr_gates(
         pending: list[tuple[PrRef, _CacheEntry, str]] = []
         unverified = False
         for ref, tree in deploy_checks:
-            entry = by_ref[(ref.repo.lower(), ref.number)]
+            entry = by_ref.get((ref.repo.lower(), ref.number))
+            if entry is None:
+                # Filtered out above as history: it is not the gate, so its
+                # deploy state cannot hold the card either.
+                continue
             if not entry.sha:
                 pending.append((ref, entry, tree))
                 continue
