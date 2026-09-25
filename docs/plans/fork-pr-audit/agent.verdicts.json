@@ -1,0 +1,141 @@
+{
+ "#213": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#220",
+     "#443",
+     "#418",
+     "#216",
+     "#217"
+    ],
+    "loc": 1231
+   },
+   "fires": "every session.list call: ~/.hermes/config.yaml:372 dashboard.session_list_denorm: true (flag ON in production); not log-instrumented so no count",
+   "original": "PR #213 body + docs/desktop/2026-07-05-session-list-loop-starvation-PRD.md: 2263ms->135ms measured on live 3.2GB DB, byte-identical top-400 ordering vs the CTE oracle, verified by Apollo on a copy of the real DB.",
+   "upstream_fix": "none (c2088efe9e adds last_activity_at for a different consumer)",
+   "upstream_state": "RED (read-only): list_sessions_rich@../up/hermes_state_sessions.py:1296-1331 still runs the WITH RECURSIVE chain/chain_max CTE per list call (order_by_last_active=True, used by tui_gateway/methods_session.py:139). Upstream's sessions.last_activity_at (c2088efe9e) serves the activity watchdog and list_recent_sessions_bounded (session_search), not the sidebar list."
+  },
+  "notes": "Family #213/#217/#220/#443/#418/#216 = ~5.5k loc on hermes_state.py, which upstream has dissolved into ~30 state_*.py modules (upstream hermes_state.py is 1,737 lines vs the fork's 17,575). Generic (any large DB), measured, unfixed upstream => UPSTREAM as ONE consolidated port onto hermes_state_sessions.py (last_activity_at could be the column). Not a rebase: 5.5k lines against a split file needs its own card; no upstream branch produced in this run. Live code is #220's re-land, not #213's.",
+  "problem": "Dashboard/desktop session.list walked a recursive CTE per call: 2263ms on the live 3.2GB state.db; denormalized effective_last_active + two-stage indexed query brought it to 135ms (17x).",
+  "verdict": "UPSTREAM"
+ },
+ "#216": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#220"
+    ],
+    "loc": 8
+   },
+   "fires": "one-shot on DB open when marker != VERSION; not logged",
+   "original": "PR #216 (2026-07-06), 8 loc; superseded by #220's VERSION=5 bump but the line survives in the family.",
+   "upstream_fix": "none",
+   "upstream_state": "RED by inheritance (see #443)"
+  },
+  "notes": "Trivial; rides with the family.",
+  "problem": "Force recency backfill marker v3 so already-migrated DBs re-run the denorm backfill.",
+  "verdict": "UPSTREAM"
+ },
+ "#217": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 1704
+   },
+   "fires": "n/a",
+   "original": "PR #217 body: live mis-ordering on new discord/desktop sessions; reverted tree byte-identical to pre-denorm d080d1df1.",
+   "upstream_fix": "none",
+   "upstream_state": "n/a (net-zero history row: #213 + #217 = 0; live code is #220)"
+  },
+  "notes": "No code of its own survives on origin/main; nothing to revert (a revert of a revert would re-land the buggy #213). DROP = 'no standalone value', recorded so the lead does not double count the family's loc.",
+  "problem": "Revert of #213/#215/#216 after a live resume-picker mis-ordering (gateway _flush/_insert bypassed the maintenance hook).",
+  "verdict": "DROP"
+ },
+ "#220": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#443",
+     "#418",
+     "#216",
+     "hermes_state_ext.py:_session_list_denorm_enabled"
+    ],
+    "loc": 1197
+   },
+   "fires": "flag ON: ~/.hermes/config.yaml:372 session_list_denorm: true; serves every dashboard session.list (not log-counted)",
+   "original": "PR #220 body: 17x list speedup; byte-diff against live 3.9GB state.db caught the VERSION=4 poisoned-marker bug.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): see #213 \u2014 list_sessions_rich@../up/hermes_state_sessions.py:1296-1331 recursive CTE per call."
+  },
+  "notes": "This is the live implementation of the #213 family. Same consolidated-port recommendation as #213.",
+  "problem": "Re-land of the session.list denorm behind dashboard.session_list_denorm (default off), with the backfill VERSION bumped past a poisoned marker on the live DB.",
+  "verdict": "UPSTREAM"
+ },
+ "#418": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#220"
+    ],
+    "loc": 243
+   },
+   "fires": "part of the ON denorm path; not separately logged",
+   "original": "PR #418 (2026-07-24): parent rewrite left stale root recency; fork test coverage in test_hermes_state_* (denorm).",
+   "upstream_fix": "none",
+   "upstream_state": "RED by inheritance (see #443)"
+  },
+  "notes": "Fold into the consolidated port.",
+  "problem": "Denorm maintenance across parent_session_id rewrites.",
+  "verdict": "UPSTREAM"
+ },
+ "#443": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#220"
+    ],
+    "loc": 1112
+   },
+   "fires": "part of the ON denorm path (config.yaml:372); not separately logged",
+   "original": "PR #443 (2026-07-26): import/flush paths bypassed _bump_effective_last_active_for_message; fork tests test_session_list_denorm_reland.",
+   "upstream_fix": "none",
+   "upstream_state": "RED by inheritance (upstream has no effective_last_active column; the defect class = 'denorm maintained on all write paths' only exists once the port lands)"
+  },
+  "notes": "Fold into the #213/#220 consolidated port; not separable.",
+  "problem": "Denorm maintenance gap: effective_last_active not maintained across session import and message-flush paths (stale ordering).",
+  "verdict": "UPSTREAM"
+ },
+ "#697": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "docs/sync/fork-features.json TestSearchSessionsByTitle pointer",
+     ".parity-state.json"
+    ],
+    "loc": 22162
+   },
+   "fires": "n/a (test layout; no runtime code)",
+   "original": "PR #697 body: CI 600.5s vs 300s per-file cap, setup 27.6s vs call 5.6s measured; collection parity 583==583.",
+   "upstream_fix": "d10bb2ab6f (test: make tests/ mirror the source tree) + 21c7ae8563 (split SessionDB into mixins)",
+   "upstream_state": "GREEN (read-only): upstream has no tests/test_hermes_state.py; it is a directory tests/hermes_state/ of ~50 small files (34,979 lines), so the per-file cost problem cannot recur there."
+  },
+  "notes": "Not a DROP: reverting recreates the 600s file. On the next parity sync adopt upstream's tests/hermes_state/ layout and re-home the fork-only tests (denorm, title-search, FTS gate) into it. No revert branch by design.",
+  "problem": "tests/test_hermes_state.py (10,900 lines, 537 tests) took 600s on CI and was SIGKILLed by the 300s per-file cap; split into 4 files.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ }
+}
