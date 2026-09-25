@@ -244,7 +244,12 @@ def _inherited_context_prefill(parent_agent, delegation_cfg: Any, child_model: O
                     max_tokens = min(max_tokens, int(window * 0.25))
             except Exception:
                 pass
-        history = getattr(parent_agent, "_session_messages", None) or getattr(parent_agent, "conversation_history", None)
+        # Gateway agents keep the live transcript in _session_messages (no conversation_history);
+        # the CLI uses conversation_history. Present-but-empty _session_messages means nothing to
+        # inherit, so fall back only when it is absent.
+        history = getattr(parent_agent, "_session_messages", None)
+        if history is None:
+            history = getattr(parent_agent, "conversation_history", None)
         folded = _fold_conversation_history_to_context(history, max_tokens)
         return [folded] if folded is not None else None
     except Exception as exc:
