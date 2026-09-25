@@ -611,12 +611,6 @@ def build_turn_context(
         reset_quota_gate_turn_state(agent)
     except Exception:
         logger.debug("Could not reset quota-gate turn state", exc_info=True)
-    try:
-        from agent.shared_transport_guard import reset_turn_state
-
-        reset_turn_state(agent)
-    except Exception:
-        logger.debug("Could not reset shared-transport turn state", exc_info=True)
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
