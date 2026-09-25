@@ -846,6 +846,52 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+# Whole-key form of _JSON_FIELD_RE's key alternation, for per-leaf JSON
+# redaction (redact_sensitive_json) where the key is already a parsed string.
+_JSON_KEY_FULL_RE = re.compile(_JSON_KEY_NAMES, re.IGNORECASE)
+
+
+def redact_sensitive_json(value, **kwargs):
+    """Redact a JSON-compatible structure leaf by leaf; return a new structure.
+
+    Use this instead of ``redact_sensitive_text(json.dumps(obj))`` followed by
+    ``json.loads``. The text patterns are not JSON-aware: an unquoted value
+    group like _ENV_ASSIGN_RE's ``(\\S+)`` swallows the closing ``"`` / ``}``
+    of the string it sits in, so ``{"x": "DB_PASSWORD=abc"}`` serializes,
+    masks to ``{"x": "DB_PASSWORD=***`` and no longer parses (t_d59ca5db).
+    Redacting each string (keys included) on its own can never touch JSON
+    syntax. The serialized path's key-based rule (``"password": "..."``,
+    _JSON_FIELD_RE) is kept: a string value under such a key is masked
+    whole. ``kwargs`` are passed through to redact_sensitive_text.
+    """
+    if isinstance(value, str):
+        return redact_sensitive_text(value, **kwargs)
+    if isinstance(value, dict):
+        key_rule = (
+            (kwargs.get("force") or _REDACT_ENABLED)
+            and not kwargs.get("code_file")
+            and not kwargs.get("file_read")
+        )
+        out = {}
+        for k, v in value.items():
+            new_k = redact_sensitive_text(k, **kwargs) if isinstance(k, str) else k
+            if (
+                key_rule
+                and isinstance(k, str)
+                and isinstance(v, str)
+                and v
+                and _JSON_KEY_FULL_RE.fullmatch(k)
+                and not _ENV_LOOKUP_VALUE_RE.match(v)
+            ):
+                out[new_k] = _mask_token(v)
+            else:
+                out[new_k] = redact_sensitive_json(v, **kwargs)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [redact_sensitive_json(v, **kwargs) for v in value]
+    return value
+
+
 def redact_sensitive_text(
     text: str,
     *,
