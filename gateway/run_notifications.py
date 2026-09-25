@@ -38,6 +38,8 @@ _UPDATE_FAILED_NOTICE = (
 # configured at all — no adapter will ever appear — would keep itself on disk and re-log a
 # deferred line on every poll, in every process, forever. Stop waiting past this age.
 _UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS = 3600.0
+# Same leak for a marker whose update never wrote an exit code (process died mid-update).
+_UPDATE_NOTIFY_MAX_RUNNING_WAIT_SECONDS = 24 * 3600.0
 
 
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
@@ -750,6 +752,16 @@ class GatewayNotificationsMixin:
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
             if not paths.exit_code.exists():
+                age = self._marker_age_seconds(pending)
+                if age is not None and age > _UPDATE_NOTIFY_MAX_RUNNING_WAIT_SECONDS:
+                    # The watcher writes exit_code=124 after its deadline, but only within one boot;
+                    # a gateway restarting faster than that deadline re-arms it every time, so a
+                    # marker whose update process died would defer forever. No update runs this long.
+                    logger.warning(
+                        "Post-update notification for %s:%s dropped after %.1fh: update never "
+                        "reported an exit code", platform_str, chat_id, age / 3600.0)
+                    self._clear_update_markers(paths, pending.get("session_key"))
+                    return True
                 return _defer("Update notification deferred: update still running")
             exit_code = self._update_exit_code(paths)
             output = paths.output.read_bytes().decode("utf-8", errors="replace") if paths.output.exists() else ""
