@@ -1873,6 +1873,10 @@ def create_board(
     return meta
 
 
+# Phantom board dirs already warned about in this process (see list_boards).
+_PHANTOM_BOARD_WARNED: set[str] = set()
+
+
 def _board_db_is_empty(db_path: Path) -> bool:
     """Return True if ``db_path`` is a kanban DB holding zero tasks.
 
@@ -1957,13 +1961,18 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 # is genuinely empty; a dir with real cards is someone's data and
                 # must stay visible even if board.json was lost.
                 if has_db and not has_meta and _board_db_is_empty(child / "kanban.db"):
-                    _log.warning(
-                        "kanban: ignoring phantom board dir %s (kanban.db with 0 "
-                        "tasks and no board.json). If this slug was renamed, add "
-                        "it to %s; otherwise remove the directory.",
-                        child,
-                        board_aliases_path(),
-                    )
+                    # Warn once per process per dir: list_boards() runs on every
+                    # watcher/dispatcher tick (~5 s), and an unchanged phantom
+                    # repeating forever buried real errors in the gateway log.
+                    if str(child) not in _PHANTOM_BOARD_WARNED:
+                        _PHANTOM_BOARD_WARNED.add(str(child))
+                        _log.warning(
+                            "kanban: ignoring phantom board dir %s (kanban.db with 0 "
+                            "tasks and no board.json). If this slug was renamed, add "
+                            "it to %s; otherwise remove the directory.",
+                            child,
+                            board_aliases_path(),
+                        )
                     continue
                 meta = read_board_metadata(normed)
                 if meta.get("archived") and not include_archived:
