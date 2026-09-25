@@ -1149,9 +1149,10 @@
     "conflict_syncs": 2,
     "conflict_files": 2,
     "dependents": []
-   }
+   },
+   "report_test": "tests/tools/test_cronjob_model_provider_vendor.py: 16 passed (test-gate remote ACE-AI); red control (call sites removed, helper kept): 3 failed, 13 passed -- cross-vendor create/update accepted; tests/tools/test_cronjob_tools.py -k 'create or update or model or provider': 12 passed. Port note: fork's name-prefix vendor maps (fleet provider names) replaced by upstream's provider catalog, per the verdict."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-641 @ ee3cae50b6",
   "notes": "Generic create-time validation; vendor map needs to be upstream's provider catalog, not the fleet's. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/cronjob_tools.py — needs a hand re-port (follow-up card)."
  },
  "#484": {
@@ -1381,9 +1382,10 @@
      "#88",
      "nopr:f578c82019"
     ]
-   }
+   },
+   "report_test": "tests/tools/test_send_message_origin.py: 9 passed in 6.74s (local test-gate; the file's importorskip('telegram') dropped -- the tests never touch telegram); red control on unmodified tools/send_message_tool.py: 5 failed, 4 passed (in-turn bare send delivered to home-9999, not origin); tests/tools/test_send_message_tool.py -k 'home or target or react or bare': 8 passed, 1 deselected (TestParseTargetRef::test_prefixes_and_suffixes_are_platform_scoped fails identically on unmodified upstream: home-io guard, env artifact)"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-71 @ 72b160f20a",
   "notes": "Real misroute class still present upstream and generic (any gateway user with a home channel). Rarely fires on this fleet (3 in 06-02→09-25) so the fork cost (497 loc) is not justified as a fork patch — propose upstream, then drop ours. Same patch-id as nopr:f578c82019 (duplicate row). Upstream branch not built this run (see handoff). Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/send_message_tool.py — needs a hand re-port (follow-up card)."
  },
  "nopr:f578c82019": {
@@ -1499,9 +1501,10 @@
     "conflict_syncs": 3,
     "conflict_files": 1,
     "dependents": []
-   }
+   },
+   "report_test": "tests/tools/test_registry_unknown_args.py: 7 passed in 4.98s; red control on unmodified tools/registry.py + delegate_tool.py: 7 failed; sibling tests/tools/test_registry.py + test_delegate.py -k 'dispatch or register or legacy or goal': 20 passed"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-662 @ 4efe432593",
   "notes": "Generic registry-level contract; measured heavily. Propose upstream (registry option + delegate_task opt-in). Fix the stale FM test before proposing. Upstream branch not built this run. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/registry.py — needs a hand re-port (follow-up card)."
  },
  "#204": {
@@ -1537,9 +1540,10 @@
     "conflict_syncs": 1,
     "conflict_files": 1,
     "dependents": []
-   }
+   },
+   "report_test": "tests/tools/test_base_environment_high_fd_drain.py: 7 passed in 6.14s (local test-gate); red control on unmodified base_output.py + process_registry.py: 5 failed, 2 passed ('HIGH_FD_MARKER_OK' in '' and background read_log output '' with fd>1024; fail-loud signature); sibling test_process_registry.py + test_base_environment.py -k 'drain or output or reader or wait': 24 passed"
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-553 @ 0afeab330e",
   "notes": "Generic, silent-data-loss class, live-reproduced on upstream. Strong UPSTREAM (upstream split the drain into base_output.py — patch must be re-ported there + process_registry _reader_loop). Upstream branch not built this run. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in tools/environments/base.py, tools/process_registry.py — needs a hand re-port (follow-up card)."
  },
  "#415": {
@@ -1672,9 +1676,10 @@
     "dependents": [
      "#577"
     ]
-   }
+   },
+   "report_test": "tests/hermes_cli/test_terminal_limits_config.py: 9 passed in 2.25s (local test-gate); red control on unmodified tree: 9 failed; siblings test_parse_env_var.py + test_terminal_pre_guard_deadline.py + test_terminal_foreground_timeout_cap.py: 13 passed, 1 failed -- test_invalid_foreground_timeout_falls_back_to_default fails identically on unmodified upstream (host env exports TERMINAL_MAX_FOREGROUND_TIMEOUT=3600). Port note: upstream 55d61f16ba promotes over-cap foreground calls to background; the cap is enforced at that seam (_plan_execution) and the schema drift fix uses registry dynamic_schema_overrides instead of in-place mutation."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-575 @ f79a255f99",
   "notes": "Generic (upstream's own AGENTS.md rule), small, measured (every fleet profile sets it). Offer #575+#577 as one upstream PR; note upstream 55d61f16ba changed over-cap semantics (promote to background) so the port must re-derive the enforcement seam. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in hermes_cli/config.py, hermes_cli/config_defaults.py, tools/terminal_tool.py — needs a hand re-port (follow-up card)."
  },
  "#577": {
@@ -1690,9 +1695,10 @@
     "conflict_syncs": 0,
     "conflict_files": 0,
     "dependents": []
-   }
+   },
+   "report_test": "tests/hermes_cli/test_terminal_limits_config.py: 9 passed in 2.25s (local test-gate); red control on unmodified tree: 9 failed; siblings test_parse_env_var.py + test_terminal_pre_guard_deadline.py + test_terminal_foreground_timeout_cap.py: 13 passed, 1 failed -- test_invalid_foreground_timeout_falls_back_to_default fails identically on unmodified upstream (host env exports TERMINAL_MAX_FOREGROUND_TIMEOUT=3600). Port note: upstream 55d61f16ba promotes over-cap foreground calls to background; the cap is enforced at that seam (_plan_execution) and the schema drift fix uses registry dynamic_schema_overrides instead of in-place mutation."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-575 @ f79a255f99",
   "notes": "Follows #575; ship together. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in hermes_cli/config.py, hermes_cli/config_defaults.py, tools/terminal_tool.py (bundle #575) — needs a hand re-port (follow-up card)."
  },
  "#345": {
@@ -1863,9 +1869,10 @@
     "conflict_syncs": 3,
     "conflict_files": 5,
     "dependents": []
-   }
+   },
+   "report_test": "tests/tools/test_delegate_inherit_context.py: 10 passed in 3.68s (local test-gate); red control (wiring reverted, helper kept): 2 failed, 8 passed -- child prefill stays 'boot seed', per-task flag not threaded; siblings test_delegate.py + test_delegate_group_schema.py + test_delegate_images.py: 75 passed, 1 failed identically on unmodified upstream (test_child_dedicated_db_follows_parents_db_path, macOS /private/var symlink). Scope per verdict: inherit_context primitive only; /boomerang command surface dropped; config key is delegation.inherit_max_tokens (was boomerang.inherit_max_tokens); flag is per-task (upstream's model-facing schema is tasks-only)."
   },
-  "branch": null,
+  "branch": "audit/cron_tools/upstream-203 @ eefd533c9a",
   "notes": "The delegate_task primitive is generic and was used 45×; the /boomerang command wrapper (cli.py, gateway/run.py, commands.py — 3 of the 5 conflict files) was never used. Offer inherit_context upstream (delegate_tool.py + its test only) and drop the command surface at the next sync; usage is declining (1 in 30d) so this is not a KEEP. Upstream branch NOT built: cherry-pick onto upstream/main 59004a6235 CONFLICTS in cli.py, gateway/run.py, hermes_cli/commands.py, run_agent.py, tests/hermes_cli/test_boomerang_command.py, tools/delegate_tool.py — needs a hand re-port (follow-up card)."
  },
  "#556": {
