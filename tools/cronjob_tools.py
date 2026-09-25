@@ -588,6 +588,8 @@ def _action_create(a: Dict[str, Any]) -> str:
         # A model-supplied base_url must not route a named provider's stored credential
         # to an attacker endpoint.
         or _validate_cron_base_url(a["provider"], a["base_url"])
+        # A cross-vendor model/provider pin fails every fire; refuse it before persisting.
+        or _model_provider_vendor_error(a["model"], a["provider"], a["base_url"])
         # bot-chat targets are machine-local: fail the CREATE, not the run.
         or _validate_bot_chat_deliver(deliver)
         # failure_deliver shares deliver's grammar and validators.
@@ -729,6 +731,53 @@ def _pick(updates: Dict[str, Any], job: Dict[str, Any], key: str) -> Any:
     return updates[key] if key in updates else job.get(key)
 
 
+def _model_provider_vendor_error(model: Any, provider: Any, base_url: Any = None) -> Optional[str]:
+    """Refuse a pin whose model belongs to a different vendor than a single-vendor provider serves
+    (e.g. a ``gpt-*`` model on ``anthropic``): every fire of such a job fails with HTTP 400, so
+    storing it only schedules failures.
+
+    Uses the provider catalog: the provider's native vendor is the ONE vendor its catalog models
+    belong to (aggregators and multi-vendor resellers have none), the model's vendor comes from
+    ``detect_vendor``. Fail-open on anything it cannot place: unknown names, aggregators,
+    ``custom`` providers, or an explicit ``base_url`` (which may serve anything). ``model`` may be
+    a plain name or the ``{"model", "provider"}`` object form."""
+    if isinstance(model, dict):
+        providers = (provider, model.get("provider"))
+        model = model.get("model")
+    else:
+        providers = (provider,)
+    model_name = str(model or "").strip()
+    if not model_name or base_url:
+        return None
+    try:
+        from hermes_cli.model_normalize import detect_vendor
+        from hermes_cli.models import _AGGREGATOR_PROVIDERS, _PROVIDER_MODELS, normalize_provider
+
+        model_vendor = detect_vendor(model_name)
+        if not model_vendor:
+            return None
+        for candidate in providers:
+            raw = str(candidate or "").strip().lower()
+            if not raw or raw == "auto" or raw.startswith("custom"):
+                continue
+            normalized = normalize_provider(raw)
+            if normalized in _AGGREGATOR_PROVIDERS:
+                continue
+            native = {detect_vendor(mid) for mid in _PROVIDER_MODELS.get(normalized, ())}
+            if len(native) != 1 or None in native:
+                continue
+            (provider_vendor,) = native
+            if provider_vendor != model_vendor:
+                return (
+                    f"model '{model_name}' ({model_vendor}) cannot run on provider '{raw}', which "
+                    f"serves {provider_vendor} models -- every run of this job would fail with "
+                    "HTTP 400, and retrying will not help. Pick a provider that serves this "
+                    "model, or a model this provider serves.")
+    except Exception:
+        logger.debug("model/provider vendor check skipped", exc_info=True)
+    return None
+
+
 def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str, Any]) -> Optional[str]:
     """prompt / name / deliver / skills / model pins; returns an error string or None."""
     prompt, deliver, skill, skills = a["prompt"], a["deliver"], a["skill"], a["skills"]
@@ -775,7 +824,10 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
-    return _validate_cron_base_url(_pick(updates, job, "provider"), _pick(updates, job, "base_url"))
+    # Same for the EFFECTIVE model/provider pair: an update may change only one side.
+    return (_model_provider_vendor_error(_pick(updates, job, "model"), _pick(updates, job, "provider"),
+                                         _pick(updates, job, "base_url"))
+            or _validate_cron_base_url(_pick(updates, job, "provider"), _pick(updates, job, "base_url")))
 
 
 def _update_script_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str, Any]) -> Optional[str]:
