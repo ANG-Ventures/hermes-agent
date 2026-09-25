@@ -1,10 +1,10 @@
 # gateway tranche — auditor verdicts (t_35a3b292)
 
-Rows: 181 · verdicts banked: 80 · log window scanned: 2026-05-10..2026-09-25 (540 files, 821 MiB under ~/.hermes/logs + profiles/*/logs; older history is rotated away — a 0 here means 'not in the last ~6 days', not 'never').
+Rows: 181 · verdicts banked: 110 · log window scanned: 2026-05-10..2026-09-25 (540 files, 821 MiB under ~/.hermes/logs + profiles/*/logs; older history is rotated away — a 0 here means 'not in the last ~6 days', not 'never').
 
 Upstream = NousResearch/hermes-agent main @ 59004a6235 (worktree ../up). Fork main @ ec84b3d155 (2026-09-25). `read-only:` = upstream state established by reading the upstream path, not a live run.
 
-Counts: KEEP=46, DROP=7, UPSTREAM=10, SUPERSEDED-BY-UPSTREAM=17, UNRESOLVED=0
+Counts: KEEP=65, DROP=12, UPSTREAM=13, SUPERSEDED-BY-UPSTREAM=20, UNRESOLVED=0
 
 | PR | problem + evidence | upstream RED/GREEN (how) | upstream fix sha | fire count (window) | cost loc/conflict(syncs) | verdict | branch |
 |---|---|---|---|---|---|---|---|
@@ -88,36 +88,36 @@ Counts: KEEP=46, DROP=7, UPSTREAM=10, SUPERSEDED-BY-UPSTREAM=17, UNRESOLVED=0
 | #7536 fix(gateway): stuck-loop counter must gate on genuine interruption, no | stuck-loop counter must gate on genuine interruption, not clean drain — PR body | read-only: upstream _increment_restart_failure_counts@run_shutdown.py:1326 is called with the CURRENT _running_agents (:1837 comment) — the clean-drain case is already excluded upstream | upstream run_shutdown.py:1837 (active-session gating) | n/a | 397/1(3) deps=[] | **DROP** |  Follows the F1/F2 unit (#70). Verify by reading run_shutdown.py:1830-1840 before revert. |
 | nopr:2ee2e03b68 feat(gateway): resume-request dropbox — external resume asks without t | external resume requests had to edit sessions.json; resume-request dropbox — commit body | RED (gateway/resume_requests.py fork-only) | none | 220 in 2026-05-10..2026-09-25 (PHASE=dropbox_resume 214) | 396/1(3) deps=[] | **KEEP** |  Measured (safe-restart watcher uses it). Follows #295. |
 | nopr:ec4b3176ff feat(gateway): narrow code-skew guard to in-process import oracle (A1a | code-skew guard narrowed to in-process import oracle — commit body (A1a) | RED-partial (upstream gateway/code_skew.py exists but _loaded_first_party_paths 0 hits) | none | n/a | 389/0(0) deps=[] | **KEEP** |  Code-skew family (#184 #493). KEEP-UNPROVEN; 0 conflict files. |
-| #746 | _pending_ | | | | 382/3(3) | — | |
-| #96 | _pending_ | | | | 377/1(3) | — | |
-| #710 | _pending_ | | | | 365/1(2) | — | |
-| #581 | _pending_ | | | | 362/1(2) | — | |
-| #104 | _pending_ | | | | 350/2(3) | — | |
-| #129 | _pending_ | | | | 348/1(2) | — | |
-| #427 | _pending_ | | | | 342/1(3) | — | |
-| #666 | _pending_ | | | | 339/1(2) | — | |
-| #757 | _pending_ | | | | 329/1(2) | — | |
-| #869 | _pending_ | | | | 328/0(0) | — | |
-| #339 | _pending_ | | | | 328/3(3) | — | |
-| #759 | _pending_ | | | | 326/1(3) | — | |
-| #175 | _pending_ | | | | 322/2(3) | — | |
-| #1004 | _pending_ | | | | 315/1(3) | — | |
-| #231 | _pending_ | | | | 313/2(3) | — | |
-| #72 | _pending_ | | | | 308/2(3) | — | |
-| #256 | _pending_ | | | | 300/3(3) | — | |
-| nopr:2f530dd026 | _pending_ | | | | 299/3(3) | — | |
-| nopr:11f8a67f01 | _pending_ | | | | 294/2(3) | — | |
-| nopr:0da8ba5356 | _pending_ | | | | 289/1(3) | — | |
-| #356 | _pending_ | | | | 285/5(3) | — | |
-| #396 | _pending_ | | | | 269/1(3) | — | |
-| #306 | _pending_ | | | | 264/4(3) | — | |
-| #906 | _pending_ | | | | 263/3(3) | — | |
-| #936 | _pending_ | | | | 259/1(3) | — | |
-| #86 | _pending_ | | | | 258/3(3) | — | |
-| #843 | _pending_ | | | | 251/1(3) | — | |
-| #173 | _pending_ | | | | 250/2(3) | — | |
-| #333 | _pending_ | | | | 243/1(3) | — | |
-| #140 | _pending_ | | | | 238/2(3) | — | |
+| #746 feat(gateway): agent.resume_interrupted_turns=always — continue a sibl | agent.resume_interrupted_turns=always — continue a sibling turn past an incomplete tail — PR body (config knob) | n/a (fork classifier knob, #289) | n/a | 1190 (shared boot_resume_scheduled literal) | 382/3(3) deps=[] | **KEEP** |  Follows #289. |
+| #96 fix(gateway): recognize reboot_interrupted as a first-class auto-resum | reboot_interrupted not recognized as an auto-resume reason — PR body | RED (read-only: _AUTO_RESUME_REASONS@up/gateway/run.py:4013 = {restart_timeout, shutdown_timeout, restart_interrupted} — no reboot_interrupted) | none | n/a | 377/1(3) deps=[] | **KEEP** |  Small generic fix — UPSTREAM candidate (one-line frozenset change). |
+| #710 fix(discord): thread auto_archive_duration 1440 -> 10080 (retire idle- | Discord thread auto_archive_duration 1440 -> 10080; idle-thread archiver retired — PR body | read-only: upstream adapter creates threads with the default duration; absorb 22% | none | n/a | 365/1(2) deps=[] | **KEEP** |  Fleet preference (kanban threads live a week). KEEP-UNPROVEN by log; 1 conflict file (2 syncs). |
+| #581 [verified] fix(gateway): reap never-persisted routing stubs (#581) | never-persisted routing stubs accumulated in the session store — PR body ([verified]) | RED (_is_never_persisted_stub 0 hits upstream) | none | n/a | 362/1(2) deps=[] | **KEEP** |  Generic — UPSTREAM candidate on session_persistence.py. KEEP-UNPROVEN by log. |
+| #104 fix(gateway): revive the dead session auto-reset chat notice (#104) | dead session auto-reset chat notice never sent — PR body | RED (_reset_reason_text 0 hits upstream) | none | n/a | 350/2(3) deps=[] | **KEEP** |  KEEP-UNPROVEN by log (notice is a chat message). 2 conflict files. |
+| #129 feat(discord): opt-in raw-reaction journal for durable triage state (# | opt-in raw-reaction journal for durable triage state (Discord) — PR body (feature) | RED (on_raw_reaction_add 0 hits upstream) | none | 0 (2 literals = soft-fail paths); no consumer of the journal found in the fork (rg reaction_journal → adapter only) | 348/1(2) deps=[] | **DROP** |  Opt-in feature with no consumer and no evidence of being enabled. 348 loc. Revert attempt in branch pass. |
+| #427 fix(gateway): stop double-posting the STT transcript echo for one voic | STT transcript echo double-posted for one voice message — PR body | RED (_stt_echo_dedupe_key 0 hits upstream) | none found | n/a | 342/1(3) deps=[] | **KEEP** |  Generic — UPSTREAM candidate; KEEP-UNPROVEN by log. |
+| #666 fix(gateway): redirect shape-only legacy session aliases at store load | shape-only legacy session aliases had to be redirected at store load, before startup replay — PR body (#659 follow-up) | n/a (fork canonical-route migration) | n/a | 0 (1 literal) | 339/1(2) deps=[] | **KEEP** |  Follows #659. |
+| #757 fix(discord): surface discord.py heartbeat-blocked events as a structu | discord.py heartbeat-blocked warnings were unstructured; surface as PHASE=event_loop_blocked with the innermost repo frame — PR body | RED (_DiscordHeartbeatBlockedMirror 0 hits upstream; upstream logs discord.py's raw warning) | none | 434 in 2026-05-10..2026-09-25 (PHASE=event_loop_blocked platform=discord 328) | 329/1(2) deps=[] | **KEEP** |  Measured (328 loop blocks caught) — the instrument behind #911/#935. Generic — UPSTREAM candidate. |
+| #869 fix(gateway): move the whole boot lifecycle record off the event loop  | whole boot lifecycle record written on the event loop — ratchet 18->17 | RED (read-only: up/gateway/lifecycle_ledger.py writes inline; 'offload' 0 hits) | none | 0 (1 literal) | 328/0(0) deps=[] | **UPSTREAM** |  Off-loop family; 0 conflict files. |
+| #339 fix(undo): refuse /undo·/redo while a /stop'd turn is still draining ( | /undo·/redo refused while a /stop'd turn is still draining — PR body | n/a (fork /undo·/redo) | n/a | 0 (2 literals) | 328/3(3) deps=[] | **DROP** |  Follows #49 (DROP). 18 files (15 locales). |
+| #759 fix(gateway): stop blocking the event loop with the system-proxy probe | macOS system-proxy probe (subprocess) and boot recovery blocked the event loop — PR body | RED (_probe_macos_system_proxy/_refresh_system_proxy_in_background 0 hits upstream; base.py proxy probe still inline) | none | 0 (1 literal) | 326/1(3) deps=[] | **UPSTREAM** |  Off-loop family; 1 conflict file. |
+| #175 feat(tui_gateway): client-identity source so desktop/dashboard/mobile  | desktop/dashboard/mobile clients all reported as 'tui' — client-identity source — PR body | RED for the tui_gateway/server.py half (_sanitize_client_source 0 hits upstream) | none | n/a | 322/2(3) deps=[] | **KEEP** |  Mixed desktop row: apps/ part DROP by D9; tui_gateway/server.py part consumed by fork dashboard/mobile identity (D9 trap). KEEP-UNPROVEN. |
+| #1004 fix(gateway): a SIGKILLed safe-restart is announced as planned, not UN | a SIGKILLed safe-restart was announced as UNPLANNED — PR body (restart-notice family) | n/a (fork_ext/unclean_restart_notice.py) | n/a | 0 (1 literal) | 315/1(3) deps=[] | **KEEP** |  Follows #790. |
+| #231 feat(merge): summarize only post-branch delta + post note to target's  | /merge summarized the whole session; post note to target origin — PR body | n/a (/merge is fork-only, see #221) | n/a | 0 (2 literals) | 313/2(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Follows #221. |
+| #72 fix(gateway): close the F2 self-completing-restart-loop gap (A' record | F2 self-completing-restart-loop gap — PR body | GREEN-equivalent (upstream restart_loop_guard b48cacb97b) | b48cacb97b | 0 (2 literals) | 308/2(3) deps=[] | **DROP** |  F1/F2 unit with #70 #80 #86. |
+| #256 fix(gateway): bound the startup-restore inbound gate on a slow boot-re | startup-restore inbound gate unbounded on a slow boot-resume turn — PR body | GREEN (_startup_restore_drain_timeout_secs@up/gateway/run.py:948) | 769dba1758 2026-07-26 (Kyzcreig, same change upstream) | n/a | 300/3(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Kyzcreig-authored upstream. |
+| nopr:2f530dd026 feat(gateway): runtime-footer provider_model, context_full, reasoning  | runtime-footer provider_model, context_full, reasoning fields — commit body | RED-partial (read-only: upstream runtime_footer.py has reasoning but not the fork's provider_model/context_full/msgs fields; _split_provider_model 0 hits) | none | n/a | 299/3(3) deps=[] | **KEEP** |  Footer family (nopr:11f8a67f01, nopr:4c595fc6f1, #334, #403, #405). Ace-visible on every gateway reply. 3 conflict files. |
+| nopr:11f8a67f01 feat(runtime-footer): add msgs field (raw count vs hygiene hard-limit) | runtime-footer msgs field (raw count vs hygiene hard-limit) — commit body | RED (_resolve_footer_message_stats 0 hits) | none | n/a | 294/2(3) deps=[] | **KEEP** |  Footer family. |
+| nopr:0da8ba5356 fix(gateway): protect boot-resume recovery turns from busy-input inter | boot-resume recovery turns interrupted by busy-input — commit body | n/a (fork boot-resume) | n/a | n/a | 289/1(3) deps=[] | **KEEP** |  Follows #289/#295. |
+| #356 fix(resume): don't persist an empty user row on auto-resume (the /undo | empty user row persisted on auto-resume (the /undo '(no text)' bug) — PR body | read-only: upstream synthesizes an empty-text internal event for resume (run_startup.py:611) and its own transcript path; the /undo '(no text)' symptom is a fork /undo artifact | n/a | n/a | 285/5(3) deps=[] | **DROP** |  Follows #49 (DROP); touches agent/agent_init.py + turn_context.py — adversary: confirm the empty row is not persisted by upstream's path before revert (a stray empty user row also breaks role alternation). |
+| #396 fix(gateway): ack a message queued during startup-restore (re-land of  | a message queued during startup-restore got no ack — PR body (re-land of #258) | RED (read-only: _queue_startup_restore_event@up/gateway/run_startup.py:79 logs only; no ack send) | none | 0 (2 literals = failure paths) | 269/1(3) deps=[] | **KEEP** |  Generic UX — UPSTREAM candidate; KEEP-UNPROVEN by log. |
+| #306 fix(gateway): clear stale resume markers (#306) | stale resume markers never cleared — PR body | GREEN-equivalent (read-only: upstream _resume_pending_candidates freshness window @run_startup.py:588-590 skips stale markers; clear_resume_pending on claim :292-307) | upstream freshness window (_auto_continue_freshness_window) | n/a | 264/4(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  4 conflict files (3 syncs). Adversary: confirm upstream also CLEARS (not just skips) stale flags so they don't resurface. |
+| #906 fix(gateway): record one restart-loop ledger entry per process boot, n | restart-loop ledger recorded one entry per resume scan instead of per process boot — PR body | RED (read-only: upstream restart_loop_guard.check_and_record is called per _resume_pending_candidates call — run_startup.py:554 — i.e. per platform scan; _current_process_boot_id 0 hits) | none | n/a | 263/3(3) deps=[] | **KEEP** |  Generic — UPSTREAM candidate (restart_loop_guard.py is upstream-owned). |
+| #936 fix(gateway): remove the turn-body executor cap — admission is the onl | turn bodies ran on a 10-thread pool while admission was unbounded; after a restart 6-8 resumes filled the pool and every later turn (incl. Ace's) queued invisibly for 5-39 min — the 2026-09-23 Apollo freeze — ~/.hermes/profiles/aegis/plans/2026-09-23_apollo-freeze-investigation-story.md; PHASE=executor_wait … inflight=10 queued=2 max_workers=10 | RED — LIVE REPRO on ../up (repro_936.py, venv python): `upstream _TURN_MAX_WORKERS = 10 / pool max_workers = 10 / 11 admitted bodies -> 0 ran concurrently, 11 waited past the 3s barrier (queued)`; source: _TURN_MAX_WORKERS = 10 @up/gateway/run.py:61, _get_executor:4302 | none (upstream 1011c07966 introduced the 10-cap; 9815b44568 split housekeeping off it but kept 10) | n/a (this row removes the cap; the diagnosing line is #807's PHASE=executor_wait, 112 fires) | 259/1(3) deps=[] | **UPSTREAM** |  THE incident row. Generic, measured, reproduced on upstream main. Port = _UnboundedThreadExecutor + admission-floored operator cap + the two tests; touches only run.py (upstream's run.py is 6k lines, fork's 40k — hand rebase, but the diff is ~250 loc). |
+| #86 feat(gateway): F2 breadcrumb backlog cleanup (config family, contract  | F2 breadcrumb backlog cleanup (config family, contract gate) — PR body | GREEN-equivalent (restart_loop_guard) | b48cacb97b | n/a | 258/3(3) deps=[] | **DROP** |  F1/F2 unit. |
+| #843 fix(gateway): make the delivery-ack barrier registry generation-ordere | delivery-ack barrier registry not generation-ordered/scoped — PR body (#295 follow-up) | n/a (fork deferred-restart delivery barrier) | n/a | n/a | 251/1(3) deps=[] | **KEEP** |  Follows #295. |
+| #173 feat(gateway): granular CompactionStats breakdown for manual /compress | granular CompactionStats breakdown for manual /compress — PR body | RED (agent/compaction_stats.py fork-only) | none | n/a | 250/2(3) deps=[] | **KEEP** |  Compaction-announce family; KEEP-UNPROVEN. |
+| #333 feat(desktop): /footer command — runtime-metadata footer on desktop tu | /footer command on desktop turns — PR body | RED for the tui_gateway/server.py half (_turn_runtime_footer 0 hits upstream) | none | n/a | 243/1(3) deps=[] | **KEEP** |  Mixed desktop row (apps/ DROP by D9); server.py footer seam consumed by dashboard. Follows #357. |
+| #140 fix(gateway): hard-exit after graceful shutdown so a wedged worker can | a wedged worker stranded the gateway after graceful shutdown — PR body | GREEN-partial (read-only: upstream run_shutdown.py:2118-2120 os._exit past drain+grace) — but _executor_drain_timeout/_force_process_exit 0 hits | upstream shutdown watchdog os._exit (run_shutdown.py:2118) | 0 (2 literals) | 238/2(3) deps=[] | **KEEP** |  Likely superseded by upstream's shutdown watchdog; kept KEEP only because the drain-budget unit (#821/#838/#861) builds on its executor-drain timing. Lead: fold into that unit. |
 | #358 | _pending_ | | | | 237/2(3) | — | |
 | #184 | _pending_ | | | | 234/1(1) | — | |
 | nopr:ba371ef32f | _pending_ | | | | 233/1(2) | — | |
