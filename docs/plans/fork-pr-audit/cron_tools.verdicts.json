@@ -1128,5 +1128,131 @@
   },
   "branch": null,
   "notes": "Follows #388."
+ },
+ "#641": {
+  "verdict": "UPSTREAM",
+  "problem": "cronjob create accepted cross-vendor model/provider pairs that then 400 every fire.",
+  "evidence": {
+   "original": "PR #641 body (hit real jobs 2026-08-19 and 08-29).",
+   "upstream_state": "RED (read-only): upstream _update_core_fields@tools/cronjob_tools.py:764-770 stores model/provider verbatim, only _validate_cron_base_url; no vendor check. own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 error in 2.15s'] FM:['14 passed, 116 deselected in 14.72s']",
+   "upstream_fix": "none",
+   "fires": "'fails every run with HTTP 400 (the model field names a different vendor...' 8 log lines; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 256,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic create-time validation; vendor map needs to be upstream's provider catalog, not the fleet's."
+ },
+ "#484": {
+  "verdict": "KEEP",
+  "problem": "deliver='discord' (bare platform) silently shipped to the home channel when the job had no same-platform origin.",
+  "evidence": {
+   "original": "PR #484 body.",
+   "upstream_state": "read-only: upstream deliver normalization _resolve_cron_context_deliver@tools/cronjob_tools.py:747 — no bare-platform refusal found; upstream schema now tells the model to omit deliver for 'this chat'. own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 error in 2.53s'] FM:['15 passed, 108 deselected in 7.14s']",
+   "upstream_fix": "none found",
+   "fires": "refusal message 1 log line; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (state.db hits = strings inside session transcripts, incl. tool results; indicative only, not a fire count)",
+   "cost": {
+    "loc": 166,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "WEAK KEEP (1 fire). Adversary: verify whether upstream's omit-deliver default already removes the footgun; if so -> DROP."
+ },
+ "#411": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "cronjob tool schema took model as an OBJECT; a flat model string was silently dropped.",
+  "evidence": {
+   "original": "PR #411 body (observed 2026-07-21).",
+   "upstream_state": "GREEN (read-only): upstream cronjob() signature takes model: Optional[str] + provider: Optional[str] @tools/cronjob_tools.py:910-911 and stores them directly (:764-767) — the object shape is gone",
+   "upstream_fix": "upstream cronjob schema reshape (flat model/provider; sha deferred to adversary)",
+   "fires": "no log marker; own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['8 failed, 5 errors in 10.10s'] FM:['13 passed in 7.67s']",
+   "cost": {
+    "loc": 275,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Problem cannot occur on upstream's schema."
+ },
+ "#397": {
+  "verdict": "KEEP",
+  "problem": "deliver=origin on a sub-hourly recurring job pollutes Ace's live session every tick (was only caught by daily lint).",
+  "evidence": {
+   "original": "PR #397 body (2026-07-18 finalizer every 10m).",
+   "upstream_state": "read-only: no sub-hourly/origin admission check in upstream tools/cronjob_tools.py. own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 error in 2.65s'] FM:['2 failed, 24 passed, 82 deselected in 7.58s']",
+   "upstream_fix": "none",
+   "fires": "refusal text 70 log lines; 11 scheduled deliver=origin jobs in live stores; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 282,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fleet policy (cron-config-lint rule I1), measured firing. Note fork's own tests: 2 failed on origin/main — flag to lead."
+ },
+ "#389": {
+  "verdict": "KEEP",
+  "problem": "Create-time warnings for unpinned LLM crons and immortal origin-delivery jobs.",
+  "evidence": {
+   "original": "PR #389 body (fleet lint caught an immortal origin job after the fact).",
+   "upstream_state": "read-only: no admission warnings upstream. own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 error in 2.67s'] FM:['5 passed, 77 deselected in 8.34s']",
+   "upstream_fix": "none",
+   "fires": "0 log lines (warnings are returned in the tool result, not logged); 235 transcript mentions (state.db hits = strings inside session transcripts, incl. tool results; indicative only, not a fire count)",
+   "cost": {
+    "loc": 143,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "WEAK KEEP: overlaps #388 (auto-pin) and #397 (hard refusal). Lead may fold into those or DROP."
+ },
+ "#148": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "script= accepted inline script bodies and 'file.sh --args', which then errored every tick.",
+  "evidence": {
+   "original": "PR #148 body.",
+   "upstream_state": "GREEN (live probe on ../up, data/probe3.py): upstream _validate_cron_script_path@tools/cronjob_job_args.py:365 rejects both shapes at create time ('Script file not found: .../scripts/check.sh --verbose') because it requires the file to exist; fork gives a more specific message",
+   "upstream_fix": "upstream create-time existence check (cronjob_job_args.py; sha deferred)",
+   "fires": "fork refusal messages 81 log lines (these would be refused upstream too, with a less specific message); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 67,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Only the wording differs. If the lead values the friendlier message, it is a 10-line UPSTREAM polish, not a fork patch."
+ },
+ "#618": {
+  "verdict": "UPSTREAM",
+  "problem": "read_secrets threat pattern fired on any word ending in 'cat' (pipecat...) followed by '.env' anywhere in 2 KB — blocked a whole AGENTS.md.",
+  "evidence": {
+   "original": "PR #618 body, papercut pc-49dc8417.",
+   "upstream_state": "RED: upstream pattern r'cat\\s+[^\\n]{0,2048}(\\.env|...)' @tools/threat_patterns.py:77 matches 'We use pipecat for voice. Tokens are in .env files.' (re.search -> True); fork uses r'\\bcat[ \\t]+' @tools/threat_patterns.py:135. own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['10 failed, 19 passed in 12.45s'] FM:['29 passed in 6.54s']",
+   "upstream_fix": "none",
+   "fires": "no log marker (block surfaces in tool result); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 158,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "2-line generic fix. Strong UPSTREAM."
  }
 }
