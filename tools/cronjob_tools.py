@@ -57,6 +57,67 @@ def get_current_agent_model() -> Tuple[Optional[str], Optional[str]]:
 # agent's own model" rather than a literal model id.
 _AUTO_MODEL = "auto"
 
+# Reason recorded on a job whose flagship model was INHERITED through the
+# "auto" sentinel rather than chosen by the caller. The flagship ban
+# (hermes_cli.model_policy.validate_worker_model) guards caller-chosen worker
+# routes; an auto pin copies the creating session's own elected model, so the
+# session that is already allowed to run that model may pin its crons to it.
+_AUTO_PIN_FLAGSHIP_REASON = "auto-pin: inherited creating agent's own elected model"
+
+
+def _flagship_reason_for_auto_pin(
+    resolved_model: Optional[str],
+    auto_pin: bool,
+    allow_flagship_reason: Optional[str],
+) -> Optional[str]:
+    """Return the ``allow_flagship_reason`` to persist alongside an auto pin.
+
+    The ONE place the auto-pin exemption is synthesized: every path that turns
+    the ``auto`` sentinel into the creating session's model (create, update,
+    script->LLM update) must go through here so ``update model='auto'``
+    persists the same row ``create model='auto'`` does. Synthesized only when
+    the auto actually resolved to a model; an explicit caller reason wins.
+    """
+    if resolved_model and auto_pin and not str(allow_flagship_reason or "").strip():
+        return _AUTO_PIN_FLAGSHIP_REASON
+    return allow_flagship_reason
+
+
+def _pool_for_single_sub(
+    provider: Optional[str], model: Optional[str] = None
+) -> Optional[str]:
+    """Return a durable pool route only for a transient single-sub seat.
+
+    ``provider`` is classified by IDENTITY (name or registered alias resolved
+    through the provider registry), never by spelling, so ``claude-api-proxy``
+    maps like ``claude-apx-0``.
+
+    ``model`` is the HALF-PIN guard: when a caller supplies a model of its own
+    (model-only spec, no provider), the seat's pool is glued on only if that
+    pool provably serves the model's vendor. A non-Claude model (``gpt-5.5``)
+    or a model whose vendor cannot be inferred returns None, so the caller
+    falls through to its pre-existing resolution exactly as if no seat were
+    live. The ``auto`` path omits ``model``: the creating session already ran
+    that model on that seat, so the pair is known-good by construction.
+    """
+    if not isinstance(provider, str):
+        return None
+    from providers import get_provider_profile
+    profile = get_provider_profile(provider)
+    canonical = profile.name if profile else provider
+    if re.fullmatch(r"claude-bpx-\d+", canonical):
+        pool = "claude-bpr"
+    elif re.fullmatch(r"claude-apx-\d+", canonical):
+        pool = "claude-apr"
+    else:
+        return None
+    if model is not None:
+        model_vendor = _vendor_of(model, _MODEL_VENDOR_PREFIXES)
+        pool_vendor = _vendor_of(pool, _PROVIDER_VENDOR_PREFIXES)
+        if not model_vendor or model_vendor != pool_vendor:
+            return None
+    return pool
+
 
 def _resolve_cron_llm_model(
     model: Optional[str], provider: Optional[str]
@@ -98,7 +159,7 @@ def _resolve_cron_llm_model(
     if want_auto:
         a_provider, a_model = get_current_agent_model()
         if a_model:
-            return (a_model, a_provider or provider)
+            return (a_model, _pool_for_single_sub(a_provider) or a_provider or provider)
         # Could not resolve "auto" → leave the job UNPINNED rather than guess.
         # Drop both the "auto" sentinel and any provider that rode along with it
         # (a config-pinned provider glued to an unresolved model is worse than
@@ -110,6 +171,10 @@ def _resolve_cron_llm_model(
 
     if not model and default_model:
         return (default_model, default_provider or provider)
+
+    if model and not provider:
+        live_provider, _ = get_current_agent_model()
+        return (model, _pool_for_single_sub(live_provider, model))
 
     return (model, provider)
 # Cadence for the heartbeat that keeps the calling agent's inactivity watchdog
@@ -947,6 +1012,10 @@ def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
     if model_name and model_name.strip().lower() == "auto":
         return (provider_name, model_name)
     if model_name and not provider_name:
+        live_provider, _ = get_current_agent_model()
+        pool_provider = _pool_for_single_sub(live_provider, model_name)
+        if pool_provider:
+            return (pool_provider, model_name)
         # Pin to the current main provider so the job is stable
         try:
             from hermes_cli.config import load_config
@@ -2055,8 +2124,9 @@ def cronjob(
                 model, provider = _resolve_cron_llm_model(model, provider)
                 # An auto pin inherits the creating agent's elected primary;
                 # it is not a caller-chosen flagship route.
-                if model and auto_pin and not str(allow_flagship_reason or "").strip():
-                    allow_flagship_reason = "auto-pin: inherited creating agent's own elected model"
+                allow_flagship_reason = _flagship_reason_for_auto_pin(
+                    model, auto_pin, allow_flagship_reason
+                )
             # Job-shape validation differs by mode:
             #   - no_agent=True → script is the job; prompt/skills are optional
             #     (and irrelevant to execution).
@@ -2367,6 +2437,10 @@ def cronjob(
 
         if normalized == "update":
             updates: Dict[str, Any] = {}
+            # Model resolution must use the mode AFTER this update, not the
+            # stored mode: a script job can become an LLM job (or vice versa)
+            # in the same request that changes its model.
+            effective_no_agent = bool(no_agent) if no_agent is not None else bool(job.get("no_agent"))
             if prompt is not None:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
@@ -2390,6 +2464,21 @@ def cronjob(
                 updates["skills"] = canonical_skills
                 updates["skill"] = canonical_skills[0] if canonical_skills else None
             if model is not None:
+                if isinstance(model, str) and model.strip().lower() == _AUTO_MODEL and not effective_no_agent:
+                    model, provider = _resolve_cron_llm_model(model, provider)
+                    updates["provider"] = _normalize_optional_job_value(provider)
+                    # Same exemption create applies: an inherited flagship is
+                    # the session's own elected model, not a caller-chosen
+                    # worker route. Without it update_job's validate_worker_model
+                    # refuses the very row create just persisted.
+                    allow_flagship_reason = _flagship_reason_for_auto_pin(
+                        model, True, allow_flagship_reason
+                    )
+                elif model and provider is None and not effective_no_agent:
+                    live_provider, _ = get_current_agent_model()
+                    pool_provider = _pool_for_single_sub(live_provider, model)
+                    if pool_provider:
+                        updates["provider"] = pool_provider
                 updates["model"] = _normalize_optional_job_value(model)
                 updates["allow_flagship_reason"] = allow_flagship_reason
             if provider is not None:
@@ -2716,6 +2805,11 @@ def _cronjob_tool_handler(args: Dict[str, Any], **kw: Any) -> str:
         args.get("model"), args.get("provider")
     )
     resolved_provider, resolved_model = _resolve_model_override(model_obj)
+    # The object flattener normally pins a model-only spec to the live/config
+    # provider. A request whose target is script-only must not inherit that
+    # route before cronjob() can apply its effective-mode guard.
+    if args.get("no_agent") is True and isinstance(model_obj, dict) and not model_obj.get("provider"):
+        resolved_provider = None
     # When the model spec was uninterpretable (spec_warning set), the intent is
     # to leave the job auto-pinned — so DON'T let a stray sibling ``provider``
     # arg leak through as a provider-without-model half-pin (Greptile #411 P2).
