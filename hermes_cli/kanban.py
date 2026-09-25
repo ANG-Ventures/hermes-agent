@@ -5441,12 +5441,9 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
     evidence_unavailable = index is None
     try:
         from gateway.routing_identity import (
-            creator_stamp_is_session_key as _stamp_is_key,
             effective_routing_lane as _effective_lane,
         )
     except Exception:  # pragma: no cover - same guard as the index import
-        def _stamp_is_key(stamp):
-            return ":" in str(stamp or "")
 
         def _effective_lane(**_kwargs):
             # Fail CLOSED, never fall back to a raw tuple. A hand-built lane
@@ -5487,7 +5484,7 @@ def _cmd_notify_repair(args: argparse.Namespace) -> int:
         # unstamped -> bind when the index knows the creator, else fall back
         # to the lane-wide evidence; the exactly-one rule below still
         # refuses on 0 or >1 candidates either way.
-        if _stamp_is_key(creator_session_id):
+        if ":" in creator_session_id:
             bound = {
                 item for item in evidence if item[3] == creator_session_id
             }

@@ -6,29 +6,6 @@ from typing import Any, Optional
 from types import SimpleNamespace
 
 
-def creator_stamp_is_session_key(stamp: Any) -> bool:
-    """Whether a ``tasks.session_id`` creator stamp is a session KEY.
-
-    🔴 SINGLE SOURCE OF TRUTH for the stamp-shape discrimination — the
-    2026-08-12 phantom-session regression (fork #588) happened because #568
-    compared this column against routing-index keys unconditionally.
-    ``tasks.session_id`` is a mixed-format column:
-
-    * gateway-created tasks stamp the creating turn's session KEY
-      (``agent:main:discord:group:<chat>:<user>`` — always contains ``:``);
-    * worker/CLI-created tasks stamp a RAW session id
-      (``20260811_220323_2eafab`` — never contains ``:``).
-
-    A raw id can NEVER equal a routing-index key, so key-equality against a
-    raw stamp silently yields empty evidence and re-mints the phantom
-    session. Every consumer that binds evidence to the creator stamp MUST
-    branch on this helper — never inline ``":" in stamp`` (two inlined
-    copies is how normalizer drift starts) and never assume one format.
-    Contract-tested by ``tests/test_creator_stamp_shape_contract.py``.
-    """
-    return ":" in str(stamp or "")
-
-
 def canonical_chat_type(platform: str, chat_type: str) -> str:
     """Compatibility for pre-resolver Discord guild-channel envelopes."""
     return "group" if platform == "discord" and chat_type == "channel" else chat_type
