@@ -3486,6 +3486,19 @@ def ensure_messages_dedup_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE messages ADD COLUMN timestamp_reconstructed INTEGER DEFAULT 0")
     if "timestamp_verified" not in columns:
         conn.execute("ALTER TABLE messages ADD COLUMN timestamp_verified INTEGER DEFAULT 0")
+    # Session reads filter ``superseded_by IS NULL`` (store._VISIBLE_MESSAGE_CLAUSE).
+    # Without this partial index that filter forces a table lookup per row, so
+    # COUNT(*) on a 63k-row session went from ~2 ms (covering index) to ~75 ms
+    # (measured on the live store 2026-09-24). Existence is checked first so a
+    # store open does not take the write lock once the index exists.
+    has_visible_index = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_msg_session_visible'"
+    ).fetchone()
+    if not has_visible_index:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_session_visible "
+            "ON messages(session_id, store_id) WHERE superseded_by IS NULL"
+        )
 
 
 def run_versioned_migrations(conn: sqlite3.Connection) -> None:
