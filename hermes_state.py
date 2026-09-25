@@ -4072,6 +4072,19 @@ class RewindWouldOrphanError(ValueError):
 
 
 
+class TranscriptInvariantError(ValueError):
+    """A transcript rewrite would leave two ACTIVE result rows for one tool call.
+
+    Raised inside the write transaction (so it rolls back) by
+    :meth:`SessionDB.archive_and_compact`: the live set it publishes must hold
+    at most one ``role='tool'`` row per ``(session_id, tool_call_id)``, or the
+    next resume replays the same tool exchange twice. Keys that were ALREADY
+    duplicated in the pre-compaction live set (legacy rows, providers that
+    reuse index-style ids such as ``terminal:0``) are tolerated — the
+    invariant is that a compaction never INTRODUCES a duplicate.
+    """
+
+
 class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
@@ -13578,6 +13591,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return int(row[0]) if row else 0
 
+    @staticmethod
+    def _active_duplicate_tool_result_ids(conn, session_id: str) -> set:
+        """tool_call_ids with more than one ACTIVE ``role='tool'`` row in *session_id*."""
+        return {
+            row[0]
+            for row in conn.execute(
+                "SELECT tool_call_id FROM messages "
+                "WHERE session_id = ? AND active = 1 AND role = 'tool' "
+                "AND tool_call_id IS NOT NULL AND tool_call_id != '' "
+                "GROUP BY tool_call_id HAVING COUNT(*) > 1",
+                (session_id,),
+            ).fetchall()
+        }
+
     def archive_and_compact(
         self,
         session_id: str,
@@ -13685,6 +13712,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # the pre-compaction transcript stays discoverable; live-context
             # loads (active=1 only) still exclude them. Tail originals are
             # archived too — their clones (below) carry the live copy.
+            # One-result-per-tool-call invariant (t_aace5343): remember which
+            # keys were already duplicated in the live set so only a duplicate
+            # this compaction INTRODUCES fails the commit.
+            preexisting_dup_tool_results = self._active_duplicate_tool_result_ids(
+                conn, session_id
+            )
             conn.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
                 "WHERE session_id = ? AND active = 1",
@@ -13701,6 +13734,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._clone_message_tail_rows(conn, tail_ids, session_id)
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
+
+            introduced = (
+                self._active_duplicate_tool_result_ids(conn, session_id)
+                - preexisting_dup_tool_results
+            )
+            if introduced:
+                raise TranscriptInvariantError(
+                    f"archive_and_compact({session_id!r}) would publish "
+                    f"{len(introduced)} tool_call_id(s) with more than one active "
+                    f"result row (e.g. {sorted(introduced)[:3]}); rolled back"
+                )
 
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
