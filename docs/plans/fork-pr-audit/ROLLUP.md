@@ -185,3 +185,12 @@ Row view: 238/795 ledger-touching rows are DROP/SUPERSEDED; they hold 551/1,727 
 - #88 dependent: tools/terminal_tool.py:179-181 uses is_cron_session(); rewire at sync.
 - Skill edits owed with DROPs: lcm-context-engine SKILL.md:874/902, hermes-client-source-attribution, livesync-eyes-on-regression (#268/#272), trivial-pr-fast-path + greploop (#151), blackbox-turn-telemetry perclass ref (#87/#105).
 - Ref-namespace note: `audit/final` (this docs branch) blocks a ref named `audit/final/…`; the desktop revert is `audit/final-revert-desktop-retired`.
+
+## 8. Slice cards (step 7)
+
+203 cards, all `parents=[t_03e35f0e]` derived-from, all in triage: `lead/created_ids.json`. Each of the 217 non-auto DROP/UPSTREAM
+rows has its own card (`lead/card_ids.json` + `lead/split_ids.json`; FINAL.md `card` column). Where several rows land in one
+revert branch or one upstream port, each row still has its own card, and the card names the sibling card that carries the
+shared branch. Only two spec-sanctioned exceptions share a card: `auto` tests/docs rows join the card of the code they test
+(step 3: "a tests-only row whose code got DROP joins that revert"), and the 37 `auto-desktop-retired` rows share one card
+t_899f0539 for the single combined branch `audit/final-revert-desktop-retired` (step 3).

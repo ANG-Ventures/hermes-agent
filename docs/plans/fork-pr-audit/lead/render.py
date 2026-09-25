@@ -11,6 +11,8 @@ key2card = {}
 for c in CARDS:
     for k in c['keys'] + c['followers']:
         key2card[k] = IDS.get(c['name'], 'card:' + c['name'])
+SPLIT = json.load(open(L + 'split_ids.json')) if os.path.exists(L + 'split_ids.json') else {}
+key2card.update(SPLIT)
 ORDER = ['gateway', 'agent', 'hermes_cli', 'plugins', 'cron+tools', 'scripts+misc', 'auto', 'auto-cherry-pick', 'auto-desktop-retired']
 VS = ['KEEP', 'UPSTREAM', 'SUPERSEDED-BY-UPSTREAM', 'DROP', 'UNRESOLVED']
 
