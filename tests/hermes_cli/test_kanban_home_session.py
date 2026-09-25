@@ -905,3 +905,100 @@ def test_home_lint_silent_when_green_and_backfill(kanban_home, capsys):
     capsys.readouterr()
     assert kc._cmd_home_lint(argparse.Namespace(backfill=False, dry_run=False, json=False)) == 0
     assert capsys.readouterr().out == ""  # silent when green
+
+
+# --- t_7a8ec7c9: assignee = profile of the caller SESSION; --operator ---
+
+
+def _session_in_profile_statedb(home, profile, sid):
+    import sqlite3
+    d = home / "profiles" / profile if profile != "default" else home
+    d.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(d / "state.db")
+    c.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)")
+    c.execute("INSERT INTO sessions (id) VALUES (?)", (sid,))
+    c.commit()
+    c.close()
+
+
+def test_session_owner_profile_reads_profile_statedb(kanban_home):
+    _session_in_profile_statedb(kanban_home, "aegis", OTHER)
+    _session_in_profile_statedb(kanban_home, "default", "root_sess")
+    assert kb.session_owner_profile(OTHER) == "aegis"
+    assert kb.session_owner_profile("root_sess") == "default"
+    assert kb.session_owner_profile("nope") is None
+
+
+def test_assignee_session_profile_exempt_despite_root_home_env(kanban_home):
+    # t_3510860e 09-25: an aegis session ran the CLI with the home repointed at
+    # the root board, so the profile env read "default". The session is aegis's.
+    _session_in_profile_statedb(kanban_home, "aegis", OTHER)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee="aegis")
+        with kb.mutation_actor(session_ids=(OTHER,), profile="default"):
+            assert kb.unblock_task(conn, tid)
+        assert _comments(conn, tid) == []
+
+
+def test_session_profile_not_assignee_still_refused(kanban_home):
+    _session_in_profile_statedb(kanban_home, "aegis", OTHER)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee="daedalus")
+        with kb.mutation_actor(session_ids=(OTHER,), profile="default"):
+            with pytest.raises(kb.ForeignSessionMutationError) as exc:
+                kb.unblock_task(conn, tid)
+    assert '--operator "<who: why>"' in str(exc.value)
+
+
+def test_operator_override_records_event_and_no_comment(kanban_home):
+    _session_in_profile_statedb(kanban_home, "aegis", OTHER)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee="daedalus")
+        with kb.mutation_actor(session_ids=(OTHER,), profile="default",
+                               operator="Ace via Aegis: ruled (a)"):
+            assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status != "blocked"
+        assert _comments(conn, tid) == []
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "operator_override"]
+        assert len(ev) == 1
+        assert ev[0].payload["reason"] == "Ace via Aegis: ruled (a)"
+        assert ev[0].payload["action"] == "unblock"
+        assert ev[0].payload["home"] == HOME
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "takeover"]
+
+
+def test_operator_override_refused_for_non_operator_profile(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee="worker-a")
+        with kb.mutation_actor(session_ids=(OTHER,), profile="argus",
+                               operator="argus: because"):
+            with pytest.raises(kb.ForeignSessionMutationError) as exc:
+                kb.unblock_task(conn, tid)
+        assert "operator profiles" in str(exc.value)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_operator_override_needs_who_and_why(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee="worker-a")
+        with kb.mutation_actor(session_ids=(OTHER,), profile="aegis",
+                               operator="just do it"):
+            with pytest.raises(kb.ForeignSessionMutationError) as exc:
+                kb.unblock_task(conn, tid)
+        assert "<who: why>" in str(exc.value)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_cli_operator_flag(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", OTHER)
+    monkeypatch.setenv("HERMES_PROFILE", "aegis")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME, assignee="daedalus")
+    out = kc.run_slash(f"unblock {tid}")
+    assert "refused unblock" in out and "--operator" in out
+    kc.run_slash(f"unblock {tid} --operator 'Ace via Aegis: ruled (a)'")
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "blocked"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "operator_override" in kinds and "takeover" not in kinds
+        assert _comments(conn, tid) == []

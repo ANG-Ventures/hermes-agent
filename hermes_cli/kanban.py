@@ -1485,6 +1485,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                      "(or an unhomed card); records a takeover event and "
                      "posts REASON as a comment the home session sees.",
             )
+            _p.add_argument(
+                "--operator",
+                dest="operator",
+                default=None,
+                metavar="WHO: WHY",
+                help="Operator profiles (apollo/default, aegis) applying a "
+                     "relayed human decision to a foreign card; records an "
+                     "operator_override event, posts no comment.",
+            )
     return kanban_parser
 
 
@@ -1656,6 +1665,7 @@ def kanban_command(args: argparse.Namespace) -> int:
                 profile=_profile_author(),
                 foreign_ok=getattr(args, "foreign_ok", None),
                 surface="cli",
+                operator=getattr(args, "operator", None),
             )
         try:
             with actor_scope:
