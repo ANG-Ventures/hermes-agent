@@ -9653,11 +9653,26 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
         home = kanban_home()
     except OSError:
         home = None
+    # ``kanban.workspaces_root`` (e.g. a RAM-disk mount) places scratch dirs
+    # at ``<root>/<board>/<task>``. Those per-board roots are managed exactly
+    # like the legacy ones; the configured root itself and ``<root>/<board>``
+    # stay refused by strict descendancy. Without them every scratch dir under
+    # a configured root was refused forever and never reclaimed (t_bbea6686).
+    try:
+        from hermes_cli.kanban_workspace_policy import configured_root
+        configured, _require_mount = configured_root()
+    except Exception:
+        configured = None
     if home is not None:
         try:
             roots.append(((home / "kanban" / "workspaces").resolve(strict=False), DEFAULT_BOARD))
         except OSError:
             pass
+        if configured is not None:
+            try:
+                roots.append(((configured / DEFAULT_BOARD).resolve(strict=False), DEFAULT_BOARD))
+            except OSError:
+                pass
         try:
             boards_parent = (home / "kanban" / "boards").resolve(strict=False)
         except OSError:
@@ -9677,6 +9692,11 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                     roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
                 except OSError:
                     continue
+                if configured is not None and entry.name != DEFAULT_BOARD:
+                    try:
+                        roots.append(((configured / entry.name).resolve(strict=False), entry.name))
+                    except OSError:
+                        continue
     memo: dict = {}
     for root, board in roots:
         try:
