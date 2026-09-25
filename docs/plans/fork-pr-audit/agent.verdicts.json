@@ -1,4 +1,236 @@
 {
+ "#100": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#76",
+     "#406"
+    ],
+    "loc": 509
+   },
+   "fires": "TAG_MISSING 2, PENDING_CALLER_DELIVERY 10 (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02) \u2014 the observability half fires; the tag is read on every LCM compaction (52 'LCM compaction #')",
+   "original": "PR #100 body (two revertable commits).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits); upstream plugins/context_engine/lcm is the vendored LCM (D1a) and has no _lcm_summary tag"
+  },
+  "notes": "Touches the vendored LCM engine (plugins tranche D1a rules apply to that half).",
+  "problem": "Summary-row detection by regex over flattened content was fragile; LCM engine now tags its summary row (_lcm_summary) + degrade observability.",
+  "verdict": "KEEP"
+ },
+ "#101": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "#76"
+    ],
+    "loc": 478
+   },
+   "fires": "COMPACTION_STATS_RECONCILE_FAILED 1 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02 (i.e. reconciliation holds on all but one compaction)",
+   "original": "PR #101 body: live 2026-06-22.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "Fork-only file agent/compaction_stats.py; 0 sync conflicts.",
+  "problem": "Hygiene stats conflated two 'kept' populations; announce silently degraded on real hygiene compactions.",
+  "verdict": "KEEP"
+ },
+ "#106": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#76",
+     "#109",
+     "#110"
+    ],
+    "loc": 5466
+   },
+   "fires": "COMPACTION_STATS_RECONCILE_FAILED 1 vs 213 reconciled granular blocks (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "PR #106 body: live marker 'COMPACTION_STATS_RECONCILE_FAILED in-turn token pre: cleared 0 + folded 629319 + kept 17947 != pre 646165' (2026-06-26).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "5466 loc is mostly tests (fixture replay). find_inturn_kept_cut lives on fork main; _inturn_norm_row was folded by later refactors.",
+  "problem": "In-turn stats measured folded pre-side but kept comp-side; PRE identity failed once LCM sanitized the kept tail \u2192 two-line degrade.",
+  "verdict": "KEEP"
+ },
+ "#109": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 487
+   },
+   "fires": "n/a (dead)",
+   "original": "PR #109 body: 3 of 5 LCM compactions still degraded after #106.",
+   "upstream_fix": "none",
+   "upstream_state": "n/a \u2014 code already gone from fork origin/main: _engine_in_context_sanitize/_partition_pre_by_comp_kept/_read_engine_b_partition absent (dossier syms_missing_fork); replaced by #110 provenance stamp + #164 consolidation"
+  },
+  "notes": "Nothing left to revert; recorded so the family loc is not double counted. No revert branch.",
+  "problem": "Residual A-floor exhaustive partition for the in-turn announce after #106.",
+  "verdict": "DROP"
+ },
+ "#110": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#76",
+     "#178"
+    ],
+    "loc": 503
+   },
+   "fires": "harvest_provenance_partition runs on every LCM compaction (52 'LCM compaction #') and APPROX_ATTRIBUTION fell to 3 (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "PR #110 body (Option B).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "Touches vendored LCM engine (stamp emitter).",
+  "problem": "Exact folded/kept split via provenance-stamped rows instead of positional index.",
+  "verdict": "KEEP"
+ },
+ "#161": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#178"
+    ],
+    "loc": 56
+   },
+   "fires": "APPROX_ATTRIBUTION 3 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #161: #logs 2026-07-01 'kept_tail 75378 / pre 74447 = 101.3%'.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "56 loc display fix on a live marker; not worth a revert.",
+  "problem": "APPROX_ATTRIBUTION marker printed a >100% kept_tail/pre ratio.",
+  "verdict": "KEEP"
+ },
+ "#164": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "#76"
+    ],
+    "loc": 253
+   },
+   "fires": "structural; used by every hygiene/in-turn partition (213 renders)",
+   "original": "PR #164 (refactor of fork-only compaction_stats.py).",
+   "upstream_fix": "none",
+   "upstream_state": "n/a (fork-only file)"
+  },
+  "notes": "Reverting a refactor of fork-only code has no value; rides with the family.",
+  "problem": "Refactor: consolidate compaction row subtraction into one _signature_partition helper.",
+  "verdict": "KEEP"
+ },
+ "#172": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#174",
+     "#176",
+     "#629"
+    ],
+    "loc": 635
+   },
+   "fires": "0: 'No changes from compression', 'Full request size', 'Compacted stored transcript' all 0 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #172 live 2026-07-02.",
+   "upstream_fix": "upstream manual_compression_feedback.py (see git log upstream/main -- agent/manual_compression_feedback.py)",
+   "upstream_state": "GREEN-equivalent (read-only): upstream ships its own manual feedback module ../up/agent/manual_compression_feedback.py + conversation_compression_manual.py"
+  },
+  "notes": "Manual /compress is rare; take upstream's feedback module on the next sync and drop the fork variant (D3).",
+  "problem": "/compress feedback self-contradicted ('No changes' above a 420K win) across the stored-transcript vs wire axes.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#174": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#172"
+    ],
+    "loc": 176
+   },
+   "fires": "0 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #174 live 2026-07-02.",
+   "upstream_fix": "upstream manual_compression_feedback.py",
+   "upstream_state": "see #172"
+  },
+  "notes": "rides with #172",
+  "problem": "Manual /compress granular block labeled by stored-transcript basis.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#176": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#172"
+    ],
+    "loc": 189
+   },
+   "fires": "0 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #176.",
+   "upstream_fix": "upstream manual_compression_feedback.py",
+   "upstream_state": "see #172"
+  },
+  "notes": "rides with #172",
+  "problem": "Wire-first /compress feedback (real measured tokens lead).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#177": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#76"
+    ],
+    "loc": 492
+   },
+   "fires": "TAG_MISSING 2 / APPROX_ATTRIBUTION 3 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02 (down from every LCM call)",
+   "original": "PR #177 body: measured 2026-07-02 in apollo agent.log.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Stats block ran for every compress() incl. no-ops, spamming APPROX_ATTRIBUTION/TAG_MISSING for announces that never render.",
+  "verdict": "KEEP"
+ },
+ "#178": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#110"
+    ],
+    "loc": 500
+   },
+   "fires": "APPROX_ATTRIBUTION 3 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02 (was the dominant degrade marker)",
+   "original": "PR #178 body (stacks on #177).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Provenance stamp gated to single-pass; multi-pass sessions degraded.",
+  "verdict": "KEEP"
+ },
  "#213": {
   "branch": null,
   "evidence": {
@@ -80,6 +312,44 @@
   "problem": "Re-land of the session.list denorm behind dashboard.session_list_denorm (default off), with the backfill VERSION bumped past a poisoned marker on the live DB.",
   "verdict": "UPSTREAM"
  },
+ "#402": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#76"
+    ],
+    "loc": 122
+   },
+   "fires": "'r:<effort>' segment rendered in every granular block (specimen 'r:medium') (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "PR #402 live repro 2026-07-19 Discord #fix-truenas-connection.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Announce showed the global reasoning effort, not the session override.",
+  "verdict": "KEEP"
+ },
+ "#406": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "#100"
+    ],
+    "loc": 116
+   },
+   "fires": "TAG_MISSING 2 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02 (from thousands before per the PR)",
+   "original": "PR #406: offline replay vs daedalus real data; mirrors upstream NousResearch#67880 (left open).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): the marker regex the fix anchors is fork-only (agent/compaction_stats.py); upstream #67880 was a contribution never merged (verify: no 'TAG_MISSING' in ../up)"
+  },
+  "notes": "",
+  "problem": "Un-anchored summary-marker regex classified tool results quoting past summaries as summary rows \u2192 TAG_MISSING false-fire \u2192 watcher page.",
+  "verdict": "KEEP"
+ },
  "#418": {
   "branch": null,
   "evidence": {
@@ -118,6 +388,120 @@
   "problem": "Denorm maintenance gap: effective_last_active not maintained across session import and message-flush paths (stale ordering).",
   "verdict": "UPSTREAM"
  },
+ "#502": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:bf30e92673"
+    ],
+    "loc": 156
+   },
+   "fires": "every rendered announce carries a reason clause (217/217 'Context compacted' lines have a parenthesised trigger, 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "PR #502: Ace's standing rule 'all compactions should have attribution. always.'; AST audit of all 10 call sites.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "22% of production compactions had no trigger attribution.",
+  "verdict": "KEEP"
+ },
+ "#503": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#686"
+    ],
+    "loc": 328
+   },
+   "fires": "'before measured, after next-request estimate' rider in every block; 'Counters disagree' 1 (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "PR #503: Ace's report '~503K \u2192 ~62K vs 733.5k/1M'.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Banner and footer used different token counters; show both when they disagree.",
+  "verdict": "KEEP"
+ },
+ "#511": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "#506"
+    ],
+    "loc": 312
+   },
+   "fires": "'maintenance compaction' 1 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02; the no-change close path guards every maintenance pass",
+   "original": "PR #511: specimen session 20260807_183558_0c25fadb.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "Fork-only file; 0 sync conflicts.",
+  "problem": "A pass that compacted nothing (214\u2192214) claimed 'Context compacted'.",
+  "verdict": "KEEP"
+ },
+ "#629": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "#172"
+    ],
+    "loc": 36
+   },
+   "fires": "'you ran /compress' 0 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02",
+   "original": "PR #629: Ace asked 'where'd it say manual here?'.",
+   "upstream_fix": "upstream manual_compression_feedback.py",
+   "upstream_state": "see #172"
+  },
+  "notes": "36 loc; rides with #172 \u2014 re-apply the wording on upstream's module if it lacks it.",
+  "problem": "Trigger clause should say 'manual' literally.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#630": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#502"
+    ],
+    "loc": 160
+   },
+   "fires": "not separable from #502 (acp/tui surfaces not in the sampled logs)",
+   "original": "PR #630 trigger inventory table.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "Small (160 loc); rides with #502.",
+  "problem": "Trigger-attribution coverage on the remaining surfaces (acp, cli, tui).",
+  "verdict": "KEEP"
+ },
+ "#686": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#503"
+    ],
+    "loc": 273
+   },
+   "fires": "'Counters disagree' 1 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02 (i.e. the false accusation is gone)",
+   "original": "PR #686 (2026-09-13).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Auto banner blamed the estimator for a counter disagreement that was a basis difference.",
+  "verdict": "KEEP"
+ },
  "#697": {
   "branch": null,
   "evidence": {
@@ -137,5 +521,244 @@
   "notes": "Not a DROP: reverting recreates the 600s file. On the next parity sync adopt upstream's tests/hermes_state/ layout and re-home the fork-only tests (denorm, title-search, FTS gate) into it. No revert branch by design.",
   "problem": "tests/test_hermes_state.py (10,900 lines, 537 tests) took 600s on CI and was SIGKILLed by the 300s per-file cap; split into 4 files.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#76": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#81",
+     "#84",
+     "#95",
+     "#100",
+     "#101",
+     "#106",
+     "#110",
+     "#177",
+     "#178",
+     "#503",
+     "#511",
+     "#686",
+     "nopr:f20f0cc2cc"
+    ],
+    "loc": 1352
+   },
+   "fires": "'Context compacted' 217, granular block ('Removed from live context'/'Replacement cost') 213, 'engine: lcm' 219 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02; specimen gateway.log:4949-4957",
+   "original": "PR #76 body: granular reconciling announce on both trigger paths; CompactionStats guard; fixes 222\u2192222 misclassification and triple-prefix bug; frozen 748-msg real-session fixture as oracle.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "compaction-announce family (~35 rows, ~10.5k loc): agent/compaction_stats.py (1034 l) + agent/fork_ext/compaction_ext.py (566 l) are fork-only files (no sync conflicts); the sync cost is the hooks in agent/conversation_compression.py + gateway/run.py (3/3 syncs). Recommend the lead treat the family as ONE unit: keep, and finish the extraction into fork_ext so the conflict surface is one call site.",
+  "problem": "No post-compaction chat announce with reconciling numbers; users could not see what a compaction did.",
+  "verdict": "KEEP"
+ },
+ "#81": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#76"
+    ],
+    "loc": 446
+   },
+   "fires": "the rendered '\u2022 N tool-result messages \u2192 ~XK reclaimed' line appears in all 213 granular blocks (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "PR #81: Ace flagged the live note; derive-by-subtraction design.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "Rendered line is visible in the gateway.log specimen.",
+  "problem": "Raw tool output was mislabeled as older chat in the announce; sub-split tool-result vs other.",
+  "verdict": "KEEP"
+ },
+ "#84": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#76"
+    ],
+    "loc": 510
+   },
+   "fires": "hygiene path: 'message-count safety limit' 0 but 'hygiene' 233 and hygiene compactions still route through build_hygiene_stats (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "PR #84: Ace-reported live line '\ud83d\udddc\ufe0f Context compacted (message-count safety limit: 1075 messages): 1075\u219233'.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "Part of the live family; hygiene_eligible_msgs present on fork main.",
+  "problem": "Announce degraded to two-line form on the session-hygiene path and printed the live count where the configured limit belongs.",
+  "verdict": "KEEP"
+ },
+ "#95": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "#76"
+    ],
+    "loc": 158
+   },
+   "fires": "in-turn announces ('context pressure before API call' 174 + 'crossed the compaction threshold' 30) render the granular block (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "PR #95 body: measured on every real session (list-content messages).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Granular block only rendered on hygiene; the dominant in-turn threshold path degraded to one line on every real session.",
+  "verdict": "KEEP"
+ },
+ "#99": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [],
+    "loc": 241
+   },
+   "fires": "0 (no structured-summary path exists in production per the PR's own statement)",
+   "original": "PR #99 body: 'forward-defense, not a live bug' \u2014 the live LCM summary is a flat string.",
+   "upstream_fix": "none",
+   "upstream_state": "n/a (fork-only helper in agent/compaction_stats.py; no upstream counterpart)"
+  },
+  "notes": "Problem unproven by the PR's own admission. Revert branch attempted in this run (see branch field); if it conflicts, the lead can drop it with the family consolidation.",
+  "problem": "Forward-defense hardening of _content_to_text for structured summary content.",
+  "verdict": "DROP"
+ },
+ "nopr:02a357eaf5": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#76"
+    ],
+    "loc": 479
+   },
+   "fires": "'Context compacted' 217, granular block ('Removed from live context'/'Replacement cost') 213, 'engine: lcm' 219 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02; specimen gateway.log:4949-4957",
+   "original": "commit 02a357eaf5 (2026-06-20), tasks 1-3 of the compaction-announce plan.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "Base of the family.",
+  "problem": "Announce formatter/emitter core (snippet extractor, engine-aware formatter, deduped emitter).",
+  "verdict": "KEEP"
+ },
+ "nopr:2870fd4994": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:02a357eaf5"
+    ],
+    "loc": 142
+   },
+   "fires": "'Context compacted' 217, granular block ('Removed from live context'/'Replacement cost') 213, 'engine: lcm' 219 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02; specimen gateway.log:4949-4957",
+   "original": "commit 2870fd4994.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Wire the announce at the engine-agnostic compress_context done-site.",
+  "verdict": "KEEP"
+ },
+ "nopr:b56024aa7a": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:02a357eaf5"
+    ],
+    "loc": 157
+   },
+   "fires": "PENDING_CALLER_DELIVERY 10, STATUS_CALLBACK_FAILED 1 (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "commit b56024aa7a (Phase 6).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Silent delivery holes: in-turn callback raise / no callback \u2192 loud markers.",
+  "verdict": "KEEP"
+ },
+ "nopr:bf30e92673": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#502",
+     "#630"
+    ],
+    "loc": 118
+   },
+   "fires": "'context pressure before API call' 174 + 'crossed the compaction threshold' 30 (54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02)",
+   "original": "commit bf30e92673 (Phase 1).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "'Why this fired' clause (trigger_reason + value) in the announce.",
+  "verdict": "KEEP"
+ },
+ "nopr:c7d0795102": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:4972c37aa9"
+    ],
+    "loc": 157
+   },
+   "fires": "'after model fallback' 19 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02",
+   "original": "commit c7d0795102.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Link a compaction to a same-turn preceding fallback ('after model fallback' rider).",
+  "verdict": "KEEP"
+ },
+ "nopr:f20f0cc2cc": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#76"
+    ],
+    "loc": 796
+   },
+   "fires": "'Context compacted' 217, granular block ('Removed from live context'/'Replacement cost') 213, 'engine: lcm' 219 in 54 rotated gateway/agent logs (~/.hermes/logs + profiles/*/logs); main gateway.log.1 starts 2026-09-21, oldest profile log 2026-06-02; specimen gateway.log:4949-4957",
+   "original": "commit f20f0cc2cc (2026-07-16) fork_ext closeout.",
+   "upstream_fix": "none",
+   "upstream_state": "n/a (fork-only module)"
+  },
+  "notes": "This is the direction the family should finish in (one hook in conversation_compression.py).",
+  "problem": "Refactor: extract fork announce helpers into agent/fork_ext/compaction_ext.py.",
+  "verdict": "KEEP"
+ },
+ "nopr:f84b4ae6e4": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:bf30e92673"
+    ],
+    "loc": 39
+   },
+   "fires": "same clause counts as nopr:bf30e92673",
+   "original": "commit f84b4ae6e4 (Phases 4/5).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream emits only the start status \u2014 _announce_compression_start@../up/agent/conversation_compression.py:4006 (COMPACTION_STATUS/automatic_compaction_status_message); no post-compaction 'Context compacted' announce exists in ../up/agent, ../up/gateway or ../up/plugins (grep 0 hits)"
+  },
+  "notes": "",
+  "problem": "Thread trigger_reason from all in-turn call sites.",
+  "verdict": "KEEP"
  }
 }
