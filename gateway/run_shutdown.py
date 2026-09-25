@@ -1971,9 +1971,12 @@ class GatewayShutdownMixin:
         for _session_key in list(self._running_agents):
             self._release_running_agent_state(_session_key)
         # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
+        # Off-loop (unbounded os.replace inside the timed shutdown path). The LIVE view with drain=True, not a
+        # dict() copy: a message can arrive during the await, and only snapshot-and-clear before it keeps that
+        # message from being wiped unflushed by the clear() below.
         with suppress(Exception):
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+            from gateway.shutdown_flush import flush_pending_to_file_async
+            await flush_pending_to_file_async(self._pending_messages, reason="shutdown", drain=True)
         # The overflow FIFO tail lives in SessionState.conversation.queued_events — flush it too.
         with suppress(Exception):
             from gateway.shutdown_flush import flush_overflow_to_file
@@ -1984,7 +1987,6 @@ class GatewayShutdownMixin:
         # Live SessionState views: clear() resets one field per session (never a wholesale dict swap).
         self._running_agents.clear()
         self._running_agents_ts.clear()
-        self._pending_messages.clear()
         self._pending_approvals.clear()
         for _attr in ("_active_session_leases", "_busy_ack_ts"):  # absent on bare shutdown-path doubles
             if hasattr(self, _attr):

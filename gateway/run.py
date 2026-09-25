@@ -6098,13 +6098,19 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         from gateway.lifecycle_ledger import mark_exited
         mark_exited(exit_code, reason="graceful_shutdown")
 
+    def _fence_write_lanes() -> None:
+        # os._exit skips shutdown_flush's atexit fences; a queued pending-message flush or transcript spool
+        # write that dies with the process is unrecoverable user data. Bounded (shared 10 s budget).
+        from gateway.shutdown_flush import fence_lanes_for_hard_exit
+        fence_lanes_for_hard_exit(timeout=10.0)
+
     def _drain_logs() -> None:
         # os._exit bypasses the listener's atexit drain. Bounded, no restart — NOT flush_log_queue():
         # a listener wedged on the rotation lock would re-freeze shutdown in an unbounded stop() join.
         from hermes_logging import drain_log_queue
         drain_log_queue(timeout=1.0)
 
-    for _step in (_release_locks, _mark_exited, _drain_logs):
+    for _step in (_release_locks, _fence_write_lanes, _mark_exited, _drain_logs):
         _best_effort(_step)
     os._exit(exit_code)
 

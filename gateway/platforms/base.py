@@ -4631,13 +4631,18 @@ class BasePlatformAdapter(ABC):
                                "releasing tracking and letting them unwind in the background",
                                self.name, sum(not t.done() for t in tasks))
                 break
-        with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+        # Flush pending messages to disk before clearing, OFF the loop: each payload ends in an unbounded
+        # os.replace and the other adapters are still draining. drain=True snapshots AND clears the slot
+        # before the await, so a message arriving during the offload lands in an empty slot and survives.
+        with contextlib.suppress(Exception):
+            from gateway.shutdown_flush import flush_pending_to_file_async
+            await flush_pending_to_file_async(self._pending_messages, reason="adapter_shutdown", drain=True)
         for state in self._text_debounce_store().values():
             state.cancel_timer()
+        # _pending_messages is NOT cleared here: the drain above already took it, and a message that
+        # arrived during the flush await must survive for the next flush.
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
-                       self._pending_messages, self._active_sessions, self._text_debounce_store()):
+                       self._active_sessions, self._text_debounce_store()):
             bucket.clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:
