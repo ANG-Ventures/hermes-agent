@@ -153,6 +153,18 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
+# Per-path locks serializing read-modify-write cycles on the restart-failure counts file (see
+# GatewayShutdownMixin._restart_failure_counts_rmw). Keyed on the path so tests pointing at a tmpdir
+# get their own lock and two runners sharing a home share one.
+_RESTART_FAILURE_COUNTS_LOCKS: Dict[str, threading.Lock] = {}
+_RESTART_FAILURE_COUNTS_LOCKS_GUARD = threading.Lock()
+
+
+def _restart_failure_counts_lock(path: Path) -> threading.Lock:
+    with _RESTART_FAILURE_COUNTS_LOCKS_GUARD:
+        return _RESTART_FAILURE_COUNTS_LOCKS.setdefault(str(path), threading.Lock())
+
+
 class GatewayShutdownMixin:
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
@@ -1323,13 +1335,34 @@ class GatewayShutdownMixin:
         except Exception:
             return None
 
-    def _increment_restart_failure_counts(self, active_session_keys: set) -> None:
-        """Increment persisted restart-failure counters for active sessions; drop the rest (loop broken)."""
+    def _restart_failure_counts_rmw(self, mutate: Callable[[dict], Optional[dict]]) -> None:
+        """One serialized read -> mutate -> write cycle on the restart-failure counts file.
+
+        ``atomic_json_write`` makes each WRITE atomic, not the read-modify-write PAIR. Two overlapping
+        cycles (e.g. two sessions finishing turns at once, each clearing its own key) both read the
+        pre-state and the later write resurrects the key the earlier one removed. Every mutator goes
+        through here under a process-wide lock keyed on the path. ``mutate`` returns the new dict
+        (``None`` = leave the file untouched); an empty result unlinks the file.
+        """
         from utils import atomic_json_write
         path = self._stuck_loop_counts_path()
-        counts = self._read_json_counts(path) or {}
+        with _restart_failure_counts_lock(path):
+            counts = self._read_json_counts(path) or {}
+            if not isinstance(counts, dict):
+                counts = {}
+            new = mutate(counts)
+            if new is None:
+                return
+            if new:
+                atomic_json_write(path, new, indent=None)
+            else:
+                path.unlink(missing_ok=True)
+
+    def _increment_restart_failure_counts(self, active_session_keys: set) -> None:
+        """Increment persisted restart-failure counters for active sessions; drop the rest (loop broken)."""
         with suppress(Exception):
-            atomic_json_write(path, {key: counts.get(key, 0) + 1 for key in active_session_keys}, indent=None)
+            self._restart_failure_counts_rmw(
+                lambda counts: {key: counts.get(key, 0) + 1 for key in active_session_keys})
 
     def _suspend_stuck_loop_sessions(self) -> int:
         """Suspend sessions active across too many restarts (startup, AFTER crash-turn recovery)."""
@@ -1360,20 +1393,18 @@ class GatewayShutdownMixin:
 
     async def _clear_restart_failure_count(self, session_key: str) -> None:
         """Clear a completed session's restart-failure counter off-loop (atomic_json_write fsyncs)."""
-        from utils import atomic_json_write
-        path = self._stuck_loop_counts_path()
-        if not path.exists():
+        if not self._stuck_loop_counts_path().exists():
             return
-        # The whole read/mutate/write is guarded (as on main): a corrupt counters file
-        # (non-dict JSON) must never raise out of a session-completion path.
+
+        def _drop(counts: dict) -> Optional[dict]:
+            if session_key not in counts:
+                return None
+            return {k: v for k, v in counts.items() if k != session_key}
+
+        # The whole read/mutate/write runs as ONE locked cycle on a worker thread; it is guarded (as on
+        # main) so a corrupt counters file never raises out of a session-completion path.
         try:
-            counts = self._read_json_counts(path) or {}
-            if session_key in counts:
-                del counts[session_key]
-                if counts:
-                    await asyncio.to_thread(atomic_json_write, path, counts, indent=None)
-                else:
-                    path.unlink(missing_ok=True)
+            await asyncio.to_thread(self._restart_failure_counts_rmw, _drop)
         except Exception:
             pass
 
