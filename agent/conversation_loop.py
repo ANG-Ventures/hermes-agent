@@ -1405,7 +1405,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
-    if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+    stale_field = (
+        _stored_prompt_runtime_mismatch(agent, stored_prompt) if stored_prompt else None
+    )
+    if stored_prompt and stale_field is None:
         # Bot Chat capability epoch: an eternal bot session must adopt
         # user-initiated capability changes (skills/toolsets/MCP/SOUL/roster)
         # on the next message, not at /new or compression. The stored prompt
@@ -1510,10 +1513,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         return
     if stored_prompt:
         stored_state = "stale_runtime"
+        field, stored_value, runtime_value = stale_field
         logger.info(
-            "Stored system prompt for session %s has stale runtime identity; "
-            "rebuilding for model=%s provider=%s.",
+            "Stored system prompt for session %s has stale runtime identity "
+            "(%s: stored=%r runtime=%r); rebuilding for model=%s provider=%s.",
             agent.session_id,
+            field,
+            stored_value,
+            runtime_value,
             getattr(agent, "model", "") or "",
             getattr(agent, "provider", "") or "",
         )
@@ -1580,6 +1587,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
+    return _stored_prompt_runtime_mismatch(agent, prompt) is None
+
+
+def _stored_prompt_runtime_mismatch(agent, prompt: str):
+    """Return ``(field, stored, runtime)`` for the first stale identity field.
+
+    ``None`` when the stored prompt matches the runtime and may be reused.
+    """
 
     def line_value(label: str) -> str:
         """Last matching line wins.
@@ -1626,12 +1641,12 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_model = line_value("Model")
     current_model = str(getattr(agent, "model", "") or "").strip()
     if stored_model and current_model and stored_model != current_model:
-        return False
+        return ("Model", stored_model, current_model)
 
     stored_provider = line_value("Provider")
     current_provider = str(getattr(agent, "provider", "") or "").strip()
     if stored_provider and current_provider and stored_provider != current_provider:
-        return False
+        return ("Provider", stored_provider, current_provider)
 
     # Detect cwd drift: if the stored prompt was built in a different working
     # directory, reuse would silently inject a stale path into the prefix cache.
@@ -1640,8 +1655,9 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # rejected (they would always differ from the launch dir's os.getcwd()).
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd:
-        if stored_cwd != str(resolve_agent_cwd()):
-            return False
+        current_cwd = str(resolve_agent_cwd())
+        if stored_cwd != current_cwd:
+            return ("Current working directory", stored_cwd, current_cwd)
 
     # Detect runtime-surface drift: the stored prompt records which platform it
     # was built for (e.g. "desktop" vs "cli"). Reusing a desktop-built prompt on
@@ -1649,9 +1665,9 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_platform = line_value("Platform")
     current_platform = str(getattr(agent, "platform", "") or "").strip()
     if stored_platform and current_platform and stored_platform != current_platform:
-        return False
+        return ("Platform", stored_platform, current_platform)
 
-    return True
+    return None
 
 
 # The three _get_continuation_prompt variants below, in named-constant form

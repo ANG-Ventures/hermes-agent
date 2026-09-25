@@ -4697,6 +4697,12 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
+        # A compaction that runs while a fallback model is answering builds
+        # (or keeps) a prompt naming the FALLBACK. That is right in memory,
+        # but the stored row must carry the primary identity or the next turn
+        # rejects it as stale and rebuilds (cold prefix cache).
+        from agent.chat_completion_helpers import prompt_for_persistence
+
         _session_commit_succeeded = False
         _commit_started_at = time.monotonic()
         split_status = "not_applicable"
@@ -4983,7 +4989,9 @@ def compress_context(
                             or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                             model=agent.model,
                             model_config=agent._session_init_model_config,
-                            system_prompt=new_system_prompt,
+                            system_prompt=prompt_for_persistence(
+                                agent, new_system_prompt
+                            ),
                             messages=compressed,
                             cwd=getattr(agent, "working_directory", None),
                             profile_name=_profile_for_child,
@@ -5281,7 +5289,8 @@ def compress_context(
                 # Rotation already published prompt + compacted handoff atomically.
                 if in_place:
                     agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
+                        agent.session_id,
+                        prompt_for_persistence(agent, new_system_prompt),
                     )
                     agent._last_flushed_db_idx = 0
                 else:
