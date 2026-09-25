@@ -119,7 +119,15 @@ def _hermetic_repo_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _merged(sha: str = "abcdef1234567890", at: str = "2026-09-20T13:05:00Z") -> dict:
+# Default merge time is AFTER any block a test can create: a PR that merged
+# before the block is history, not a gate (t_20b94ef5), so the "the gate PR
+# merged" fixture must merge later than the block it releases. Tests about
+# history refs pass an explicit past ``at``.
+_AFTER_ANY_BLOCK = "2099-01-01T00:00:00Z"
+_BEFORE_ANY_BLOCK = "2020-01-01T00:00:00Z"
+
+
+def _merged(sha: str = "abcdef1234567890", at: str | None = _AFTER_ANY_BLOCK) -> dict:
     return {"state": "MERGED", "mergedAt": at, "mergeCommitSha": sha}
 
 
@@ -846,6 +854,101 @@ def test_all_merged_unblocks_and_records_one_event(kanban_home: Path) -> None:
         assert comments[0] == outcomes[0].detail
 
 
+def _gate_events(conn, tid: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) c FROM task_events "
+        "WHERE task_id = ? AND kind = 'gate_auto_resolved'",
+        (tid,),
+    ).fetchone()["c"]
+
+
+def test_pr_merged_before_the_block_is_history_not_a_gate(
+    kanban_home: Path,
+) -> None:
+    """t_20b94ef5: a dependency block on a sibling CARD that cites an
+    already-merged PR as background must stay blocked.
+
+    Pre-fix, the gate read the cited PR as the gate condition, found it
+    merged, and unblocked the card within one tick — twice in ten minutes,
+    each time respawning a worker for nothing.
+    """
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn,
+            kind="dependency",
+            reason=(
+                "Waiting on t_082e7650 (per-tick pool spawn budget fix). The "
+                "deployed o/r#953 lets whole bursts through, so resume once "
+                "the t_082e7650 PR is merged and deployed."
+            ),
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        outcomes = prg.reevaluate_pr_gates(
+            conn,
+            query_fn=_stub({("o/r", 953): _merged(at=_BEFORE_ANY_BLOCK)}),
+        )
+        assert [o.action for o in outcomes] == ["history_only"]
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _gate_events(conn, tid) == 0
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM task_comments WHERE task_id = ?", (tid,)
+        ).fetchone()["c"] == 0
+
+
+def test_history_ref_does_not_mask_or_satisfy_a_live_gate(
+    kanban_home: Path,
+) -> None:
+    """A reason citing one old merged PR AND one live PR gates on the live one."""
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn, reason="o/r#953 landed already; now merge o/r#7 then unblock me",
+        )
+        old = _merged(at=_BEFORE_ANY_BLOCK)
+        held = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 953): old, ("o/r", 7): _open_pr()}),
+        )
+        assert [o.action for o in held] == ["held"]
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        prg.clear_cache()
+        done = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 953): old, ("o/r", 7): _merged()}),
+        )
+        assert [o.action for o in done] == ["unblocked"]
+        payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'gate_auto_resolved'",
+            (tid,),
+        ).fetchone()["payload"])
+        # Only the live gate is cited as the evidence.
+        assert payload["prs"] == ["o/r#7"]
+
+
+def test_pr_already_resolved_for_this_card_is_not_resolved_again(
+    kanban_home: Path,
+) -> None:
+    """Fallback for an unknown ``mergedAt``: a PR this gate already resolved
+    for the card is spent, so a later block that re-cites it stays blocked."""
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        unknown_time = _stub({("o/r", 7): _merged(at=None)})
+        first = prg.reevaluate_pr_gates(conn, query_fn=unknown_time)
+        assert [o.action for o in first] == ["unblocked"]
+
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, kind="dependency",
+            reason="o/r#7 is in; now waiting on sibling card t_deadbeef",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        prg.clear_cache()
+        second = prg.reevaluate_pr_gates(conn, query_fn=unknown_time)
+        assert [o.action for o in second] == ["history_only"]
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _gate_events(conn, tid) == 1
+
+
 def test_one_open_pr_holds_the_card(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = _blocked_card(conn, reason="merge o/r#7 and o/r#8 then unblock me")
@@ -1157,7 +1260,7 @@ def test_dispatch_tick_resolves_a_satisfied_gate(
             argv, 0,
             stdout=json.dumps({
                 "state": "closed",
-                "merged_at": "2026-09-20T13:05:00Z",
+                "merged_at": "2099-01-01T00:00:00Z",
                 "merge_commit_sha": "deadbeefcafebabe",
             }),
             stderr="",
@@ -1562,7 +1665,7 @@ from hermes_cli import kanban_pr_gate as prg
 
 # Fabricated oracle: every PR is MERGED, and gh is never consulted.
 prg.query_pr = lambda repo, number: {{
-    "state": "MERGED", "mergedAt": "2026-09-21T07:32:50Z",
+    "state": "MERGED", "mergedAt": "2099-01-01T00:00:00Z",
     "mergeCommitSha": "deadbeefcafe1234",
 }}
 
@@ -1733,7 +1836,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_pr_gate as prg
 
 prg.query_pr = lambda repo, number: {{
-    "state": "MERGED", "mergedAt": "2026-09-21T07:32:50Z",
+    "state": "MERGED", "mergedAt": "2099-01-01T00:00:00Z",
     "mergeCommitSha": "deadbeefcafe1234",
 }}
 
@@ -1863,3 +1966,277 @@ def test_dispatch_once_propagates_a_sandbox_escape_instead_of_absorbing_it(
         assert conn.execute(
             "SELECT COUNT(*) c FROM task_events WHERE kind = 'gate_auto_resolved'"
         ).fetchone()["c"] == 0
+
+
+
+# ---------------------------------------------------------------------------
+# MERGED is not DEPLOYED (t_289e8020)
+# ---------------------------------------------------------------------------
+#
+# t_2789cbae blocked on "ANG-Ventures/hermes-home#605 must be LIVE in
+# ~/.hermes". The gate unblocked it on the merge alone while the live tree sat
+# 195 commits behind origin/main, so the worker re-blocked into the same wall
+# twice and the card was escalated to triage. A card whose premise names a
+# deploy tree may only resume once the merge commit is an ancestor of that
+# tree's HEAD.
+
+_HOME_SHA = "a01d7ff2" + "0" * 32
+_AGENT_SHA = "b02e8ee3" + "0" * 32
+
+
+class _DeployOracle:
+    """Stub ``deploy_fn``: ``(tree, sha) -> bool`` from a mutable set."""
+
+    def __init__(self, live=()):
+        self.live = set(live)
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, tree: str, sha: str) -> bool:
+        self.calls.append((tree, sha))
+        return (tree, sha) in self.live
+
+
+def _comments(conn, tid):
+    return [
+        r["body"] for r in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id", (tid,)
+        )
+    ]
+
+
+def test_names_deploy_tree_truth_table() -> None:
+    assert prg.names_deploy_tree("must be live in ~/.hermes")
+    assert prg.names_deploy_tree("deployed into ~/.hermes/runtime/hermes-agent")
+    assert prg.names_deploy_tree(None, "body: /Users/ace/.hermes is 195 behind")
+    assert prg.names_deploy_tree("$HOME/.hermes/scripts/x.py")
+    assert not prg.names_deploy_tree("merge o/r#7 then unblock me")
+    assert not prg.names_deploy_tree("the ~/.hermes-home clone")
+    assert not prg.names_deploy_tree(None, None)
+
+
+def test_deploy_tree_map_is_the_documented_one() -> None:
+    assert prg.deploy_tree_for("ANG-Ventures/hermes-home") == "~/.hermes"
+    assert (
+        prg.deploy_tree_for("ang-ventures/hermes-agent")
+        == "~/.hermes/runtime/hermes-agent"
+    )
+    assert prg.deploy_tree_for("o/r") is None
+    assert prg.deploy_tree_for("NousResearch/hermes-agent") is None
+
+
+def test_merged_but_not_deployed_holds_and_comments_once(kanban_home: Path) -> None:
+    """hermes-home -> ~/.hermes branch: merge alone must NOT unblock."""
+    oracle = _DeployOracle()
+    query = _stub({("ANG-Ventures/hermes-home", 605): _merged(_HOME_SHA)})
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn,
+            reason="needs ANG-Ventures/hermes-home#605 LIVE in ~/.hermes",
+        )
+        for _ in range(3):  # three ticks: still exactly one comment
+            outcomes = prg.reevaluate_pr_gates(
+                conn, query_fn=query, deploy_fn=oracle,
+            )
+            assert [o.action for o in outcomes] == ["awaiting_deploy"]
+        assert kb.get_task(conn, tid).status == "blocked"
+        comments = _comments(conn, tid)
+        assert len(comments) == 1
+        assert "MERGED, awaiting deploy of a01d7ff2 into ~/.hermes" in comments[0]
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM task_events "
+            "WHERE task_id = ? AND kind = 'gate_auto_resolved'", (tid,),
+        ).fetchone()["c"] == 0
+    assert oracle.calls[0] == ("~/.hermes", _HOME_SHA)
+
+    # The tree catches up: the next tick unblocks.
+    oracle.live.add(("~/.hermes", _HOME_SHA))
+    with kb.connect() as conn:
+        outcomes = prg.reevaluate_pr_gates(conn, query_fn=query, deploy_fn=oracle)
+        assert [o.action for o in outcomes] == ["unblocked"]
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_runtime_tree_is_checked_against_a_real_git_checkout(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """hermes-agent -> runtime tree, through the REAL ``git merge-base`` seam."""
+    tree = tmp_path / "runtime-tree"
+    tree.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tree, env=env, check=True,
+            stdout=subprocess.PIPE, text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("commit", "-q", "--allow-empty", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "upstream")
+    git("commit", "-q", "--allow-empty", "-m", "the merge")
+    merged = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-")  # live HEAD stays behind the merge
+    assert git("rev-parse", "HEAD") == base
+
+    monkeypatch.setitem(
+        prg.DEPLOY_TREES, "ang-ventures/hermes-agent", str(tree),
+    )
+    query = _stub({("ANG-Ventures/hermes-agent", 1001): _merged(merged)})
+    reason = (
+        "blocked until ANG-Ventures/hermes-agent#1001 is deployed to "
+        "~/.hermes/runtime/hermes-agent"
+    )
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason=reason)
+        outcomes = prg.reevaluate_pr_gates(conn, query_fn=query)
+        assert [o.action for o in outcomes] == ["awaiting_deploy"]
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert f"awaiting deploy of {merged[:8]} into {tree}" in _comments(conn, tid)[0]
+
+    git("merge", "-q", "--ff-only", "upstream")  # the deploy lands
+    with kb.connect() as conn:
+        outcomes = prg.reevaluate_pr_gates(conn, query_fn=query)
+        assert [o.action for o in outcomes] == ["unblocked"]
+
+
+def test_unknown_merge_object_in_tree_is_not_deployed(tmp_path: Path) -> None:
+    tree = tmp_path / "t"
+    tree.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=tree, check=True)
+    assert prg.is_deployed(str(tree), "f" * 40) is False
+    assert prg.is_deployed(str(tmp_path / "missing"), "f" * 40) is False
+    assert prg.is_deployed(str(tree), "") is False
+
+
+def test_other_repo_stays_merge_only_even_when_a_tree_is_named(
+    kanban_home: Path,
+) -> None:
+    """Unmapped repo -> today's behaviour; the deploy oracle is never asked."""
+    oracle = _DeployOracle()
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn, reason="merge o/r#7, then it is live in ~/.hermes",
+        )
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 7): _merged()}), deploy_fn=oracle,
+        )
+        assert [o.action for o in outcomes] == ["unblocked"]
+        assert kb.get_task(conn, tid).status == "ready"
+    assert oracle.calls == []
+
+
+def test_mapped_repo_without_a_deploy_premise_stays_merge_only(
+    kanban_home: Path,
+) -> None:
+    """No tree named in reason or body -> merge is still sufficient."""
+    oracle = _DeployOracle()
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn, reason="merge ANG-Ventures/hermes-home#605 then unblock me",
+        )
+        outcomes = prg.reevaluate_pr_gates(
+            conn,
+            query_fn=_stub({("ANG-Ventures/hermes-home", 605): _merged(_HOME_SHA)}),
+            deploy_fn=oracle,
+        )
+        assert [o.action for o in outcomes] == ["unblocked"]
+        assert kb.get_task(conn, tid).status == "ready"
+    assert oracle.calls == []
+
+
+def test_deploy_premise_in_the_body_counts(kanban_home: Path) -> None:
+    oracle = _DeployOracle()
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn,
+            reason="merge ANG-Ventures/hermes-home#605 then unblock me",
+            body="precondition: the fix is live in ~/.hermes",
+        )
+        outcomes = prg.reevaluate_pr_gates(
+            conn,
+            query_fn=_stub({("ANG-Ventures/hermes-home", 605): _merged(_HOME_SHA)}),
+            deploy_fn=oracle,
+        )
+        assert [o.action for o in outcomes] == ["awaiting_deploy"]
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_merged_without_a_sha_holds_on_a_deploy_premise(kanban_home: Path) -> None:
+    """No merge SHA means no provable deploy: stay blocked, never guess."""
+    oracle = _DeployOracle()
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn, reason="ANG-Ventures/hermes-home#605 live in ~/.hermes",
+        )
+        payload = {"state": "MERGED", "mergedAt": "2026-09-24T00:00:00Z",
+                   "mergeCommitSha": None}
+        outcomes = prg.reevaluate_pr_gates(
+            conn,
+            query_fn=_stub({("ANG-Ventures/hermes-home", 605): payload}),
+            deploy_fn=oracle,
+        )
+        assert [o.action for o in outcomes] == ["awaiting_deploy"]
+        assert kb.get_task(conn, tid).status == "blocked"
+    assert oracle.calls == []
+
+
+def test_deploy_check_runs_in_prefetch_never_under_the_lock(
+    kanban_home: Path,
+) -> None:
+    """The ancestry probe is a subprocess, so it belongs to the unlocked half."""
+    oracle = _DeployOracle({("~/.hermes", _HOME_SHA)})
+    query = _stub({("ANG-Ventures/hermes-home", 605): _merged(_HOME_SHA)})
+
+    def explode(tree, sha):  # pragma: no cover - must never be called
+        raise AssertionError("deploy_fn ran in the locked pass")
+
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn, reason="ANG-Ventures/hermes-home#605 live in ~/.hermes",
+        )
+        prefetched = prg.prefetch_pr_gate_states(
+            conn, query_fn=query, deploy_fn=oracle,
+        )
+        assert prefetched.deployed == {("~/.hermes", _HOME_SHA): True}
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=query, deploy_fn=explode, prefetched=prefetched,
+        )
+        assert [o.action for o in outcomes] == ["unblocked"]
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_prefetch_uses_the_permanent_merged_cache_for_deploy_checks(
+    kanban_home: Path,
+) -> None:
+    """A MERGED ref served from cache (no lookup this tick) is still checked."""
+    query = _stub({("ANG-Ventures/hermes-home", 605): _merged(_HOME_SHA)})
+    oracle = _DeployOracle()
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn, reason="ANG-Ventures/hermes-home#605 live in ~/.hermes",
+        )
+        first = prg.prefetch_pr_gate_states(conn, query_fn=query, deploy_fn=oracle)
+        assert [o.action for o in prg.reevaluate_pr_gates(
+            conn, query_fn=query, deploy_fn=oracle, prefetched=first,
+        )] == ["awaiting_deploy"]
+
+        oracle.live.add(("~/.hermes", _HOME_SHA))
+        second = prg.prefetch_pr_gate_states(conn, query_fn=query, deploy_fn=oracle)
+        assert second.payloads == {}  # served from the MERGED cache
+        assert second.deployed == {("~/.hermes", _HOME_SHA): True}
+        assert [o.action for o in prg.reevaluate_pr_gates(
+            conn, query_fn=query, deploy_fn=oracle, prefetched=second,
+        )] == ["unblocked"]
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_stubbed_deploy_oracle_against_a_live_board_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fabricated "it is live" is fabricated unblock evidence too."""
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    with pytest.raises(prg.SandboxEscape):
+        prg.assert_write_allowed(None, deploy_fn=lambda tree, sha: True)
+    prg.assert_write_allowed(None, deploy_fn=prg._REAL_IS_DEPLOYED)

@@ -173,7 +173,7 @@ class StartupResumePool:
         return future
 
     def _pump(self):
-        while self.pending and len(self.running) < self.concurrency:
+        while self.pending and (self.concurrency is None or len(self.running) < self.concurrency):
             future, callback, args = self.pending.popleft()
             if future.cancelled():
                 continue

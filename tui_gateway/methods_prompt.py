@@ -1397,7 +1397,7 @@ def _(rid, params: dict) -> dict:
         finally:
             _clear_session_context(session_tokens)
 
-    threading.Thread(target=run, daemon=True).start()
+    _start_counted_thread(run, name=task_id)
     return _ok(rid, {"task_id": task_id})
 
 
@@ -1468,7 +1468,7 @@ def _(rid, params: dict) -> dict:
         finally:
             _clear_session_context(session_tokens)
 
-    threading.Thread(target=run, daemon=True).start()
+    _start_counted_thread(run, name=task_id)
     return _ok(rid, {"task_id": task_id})
 
 

@@ -184,7 +184,8 @@ def _parse_heredoc_operator(command: str, index: int):
 def _scan_heredoc_command_unit(command: str, start: int):
     """Scan one logical shell command, ignoring markers in quotes/comments.
 
-    Returns ``(end_index, heredoc_specs, unknown_operator, has_list_operator)``
+    Returns ``(end_index, heredoc_specs, unknown_operator, has_list_operator,
+    owner_range)``
     where each spec is ``(delimiter, strip_tabs, quoted)``.
     ``unknown_operator`` reports a ``<<`` token that could not be parsed
     soundly — the caller must fail closed and leave the command unmodified.
@@ -197,12 +198,15 @@ def _scan_heredoc_command_unit(command: str, start: int):
     specs = []
     unknown_operator = False
     has_list_operator = False
+    segment_start = start
+    owner_start = None
+    owner_end = None
 
     while cursor < len(command):
         char = command[cursor]
         if comment:
             if char == "\n":
-                return cursor, specs, unknown_operator, has_list_operator
+                return cursor, specs, unknown_operator, has_list_operator, (owner_start, owner_end)
             cursor += 1
             continue
 
@@ -232,7 +236,7 @@ def _scan_heredoc_command_unit(command: str, start: int):
                 cursor += 1
                 continue
         if char == "\n":
-            return cursor, specs, unknown_operator, has_list_operator
+            return cursor, specs, unknown_operator, has_list_operator, (owner_start, owner_end)
         if command.startswith("<<<", cursor):
             cursor += 3
             continue
@@ -244,12 +248,18 @@ def _scan_heredoc_command_unit(command: str, start: int):
                 continue
             cursor, delimiter, strip_tabs, quoted = parsed
             specs.append((delimiter, strip_tabs, quoted))
+            if owner_start is None:
+                owner_start = segment_start
             continue
         if char in ";|&":
             has_list_operator = True
+            if char == ";":
+                if owner_start is not None and owner_end is None:
+                    owner_end = cursor
+                segment_start = cursor + 1
         cursor += 1
 
-    return len(command), specs, unknown_operator, has_list_operator
+    return len(command), specs, unknown_operator, has_list_operator, (owner_start, owner_end)
 
 
 def _find_heredoc_close(
@@ -278,24 +288,25 @@ def _find_heredoc_close(
         cursor = after
 
 
-def strip_inert_heredoc_bodies(command: str) -> str:
-    """Mask heredoc bodies that are provably inert data; keep the rest.
+def _inert_heredoc_ranges(
+    command: str, *, python_semicolon_chain: bool = False
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Return safely masked ranges and the subset fed to Python.
 
-    See the module docstring for the qualification rules. Masked bodies are
-    replaced with an equivalent number of newlines so positions of the
-    surrounding real command text keep their line structure. On ANY ambiguity
+    See the module docstring for the qualification rules. On ANY ambiguity
     (unparseable ``<<`` token, unterminated heredoc, unquoted delimiter,
     compound opener, nested shell scope, unknown consumer) the original
     command is returned unchanged — a scanner false positive is acceptable,
     hiding real shell syntax is not.
     """
     ranges: list[tuple[int, int]] = []
+    python_ranges: list[tuple[int, int]] = []
     command_start = 0
 
     # Fast path: no '<<' anywhere means no heredoc can exist — skip the state
     # machine entirely. This function runs on every terminal tool call.
     if "<<" not in command:
-        return command
+        return ranges, python_ranges
     # No heredoc opener can start after the last '<<' occurrence; once the
     # scan passes it, the rest of the command needs no per-char walk.
     last_opener_index = command.rfind("<<")
@@ -303,11 +314,11 @@ def strip_inert_heredoc_bodies(command: str) -> str:
     while command_start < len(command):
         if command_start > last_opener_index:
             break
-        command_end, specs, unknown_operator, has_list_operator = (
+        command_end, specs, unknown_operator, has_list_operator, owner_range = (
             _scan_heredoc_command_unit(command, command_start)
         )
         if unknown_operator:
-            return command
+            return [], []
         if not specs:
             if command_end >= len(command):
                 break
@@ -316,7 +327,7 @@ def strip_inert_heredoc_bodies(command: str) -> str:
         if command_end >= len(command):
             # Opener with no following body line: nothing to mask, and the
             # heredoc is unterminated — leave everything visible.
-            return command
+            return [], []
 
         body_cursor = command_end + 1
         body_ranges: list[tuple[int, int]] = []
@@ -334,16 +345,53 @@ def strip_inert_heredoc_bodies(command: str) -> str:
             body_ranges.append((body_cursor, close_end))
             body_cursor = close_end
         if unterminated:
-            return command
+            return [], []
 
-        if all(quoted for _delimiter, _strip_tabs, quoted in specs) and not has_list_operator:
+        if all(quoted for _delimiter, _strip_tabs, quoted in specs):
             masked_opener = _mask_simple_quotes(command[command_start:command_end])
-            if not _contains_nested_shell_scope(masked_opener) and (
-                _INERT_HEREDOC_CONSUMER_RE.search(masked_opener)
+            consumer_opener = masked_opener
+            if has_list_operator and python_semicolon_chain and len(specs) == 1:
+                # The command bearing << owns stdin, not the last command on
+                # the line. Pipes and conditionals remain ambiguous.
+                if owner_range[0] is not None:
+                    owner_opener = _mask_simple_quotes(
+                        command[owner_range[0]:owner_range[1] or command_end]
+                    )
+                    if not any(c in owner_opener for c in "|&"):
+                        consumer_opener = owner_opener
+            consumer_match = _INERT_HEREDOC_CONSUMER_RE.search(consumer_opener)
+            if has_list_operator and (
+                not python_semicolon_chain or consumer_opener == masked_opener
+                or not consumer_match
             ):
+                consumer_match = None
+            if not _contains_nested_shell_scope(masked_opener) and consumer_match:
                 ranges.extend(body_ranges)
+                consumer = consumer_match.group(0)
+                if re.search(r"(?i)python(?:3(?:\.\d+)*)?$", consumer):
+                    python_ranges.extend(body_ranges)
         command_start = body_cursor
 
+    return ranges, python_ranges
+
+
+def inert_python_heredoc_bodies(
+    command: str, *, semicolon_chain: bool = False
+) -> tuple[str, ...]:
+    """Return safely bounded Python stdin source, not shell commands."""
+    _ranges, python_ranges = _inert_heredoc_ranges(
+        command, python_semicolon_chain=semicolon_chain
+    )
+    return tuple(command[start:end] for start, end in python_ranges)
+
+
+def strip_inert_heredoc_bodies(
+    command: str, *, python_semicolon_chain: bool = False
+) -> str:
+    """Mask heredoc bodies that are provably inert data; keep the rest."""
+    ranges, _python_ranges = _inert_heredoc_ranges(
+        command, python_semicolon_chain=python_semicolon_chain
+    )
     if not ranges:
         return command
     # Single-pass rebuild: ranges are sorted and non-overlapping, so join the

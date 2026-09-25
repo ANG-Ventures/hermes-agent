@@ -326,7 +326,8 @@ VALID_HOOKS: Set[str] = {
     #   exit_kind: "clean_exit" | "rate_limited" | "infra_unavailable"
     #              | "nonzero_exit" | "signaled" | "unknown",
     #   exit_code: int | None,
-    #   outcome: "crashed" | "rate_limited" | "infra_unavailable",
+    #   outcome: "crashed" | "rate_limited" | "infra_unavailable"
+    #            | "cohort_death",
     #   retry_status: str  (the phase the task was released back to).
     "on_kanban_worker_exited",
     # on_kanban_worker_stale_claim fires when release_stale_claims reclaims
@@ -7043,6 +7044,57 @@ def _resolve_block_from_details(
     return None
 
 
+# Wrapper commands that run their argument as the real command head
+# (``sudo diff a b`` executes ``diff``).  Their own option/assignment tokens are
+# skipped before reading the head.
+_DIFF_GUARD_PREFIX_COMMANDS = frozenset({
+    "sudo", "env", "nice", "time", "command", "exec", "nohup", "timeout",
+    "gtimeout", "stdbuf", "ionice", "caffeinate", "builtin",
+})
+_DIFF_GUARD_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")", "\n", ";;", "|&"})
+_RTK_DIFF_RE = re.compile(r"(?<![\w-])rtk\s+diff(?:\s|$)")
+
+
+def _command_runs_diff(command: str) -> bool:
+    """True when any shell segment of *command* has ``diff`` as its command head.
+
+    Rewriters such as RTK treat every segment after ``&&``, ``||``, ``;``,
+    ``|`` or a newline -- and the command after wrappers like ``sudo``/``env``
+    -- as a head, so a string-start anchor misses ``cd X && diff a b``.
+    Over-matching is the safe direction here: a false positive only keeps the
+    caller's original command.
+    """
+    import shlex
+
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:  # unbalanced quotes: fall back to a permissive scan
+        return re.search(r"(?:^|[\s;&|()])diff(?:\s|$)", command) is not None
+    at_head = True
+    after_prefix = False
+    for tok in tokens:
+        if tok in _DIFF_GUARD_SEPARATORS or (tok and set(tok) <= set(";&|()\n")):
+            at_head, after_prefix = True, False
+            continue
+        if not at_head:
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):  # VAR=value assignment
+            continue
+        if after_prefix and (tok.startswith("-") or tok.isdigit() or re.match(r"^\d+(\.\d+)?[smhd]?$", tok)):
+            continue  # wrapper options/arguments (nice -n 5, timeout 30, env -i)
+        base = tok.rsplit("/", 1)[-1]
+        if base == "diff":
+            return True
+        if base in _DIFF_GUARD_PREFIX_COMMANDS:
+            after_prefix = True
+            continue
+        at_head, after_prefix = False, False
+    return False
+
+
 def _dispatch_pre_tool_call_hooks(
     tool_name: str,
     args: Optional[Dict[str, Any]],
@@ -7071,11 +7123,30 @@ def _dispatch_pre_tool_call_hooks(
     Callers that also need input transformation should call this
     function and apply ``modified_args`` if not ``None``.
     """
+    original_command = args.get("command") if tool_name == "terminal" and isinstance(args, dict) else None
+    raw_diff = isinstance(original_command, str) and _command_runs_diff(original_command)
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
     )
+    if isinstance(original_command, str) and not raw_diff:
+        # Backstop derived from the rewriter's own output: if a hook turned
+        # the command into ``rtk diff`` anywhere, it found a diff head the
+        # shell-segment scan above did not.
+        rewritten = (details.modified_args or args).get("command")
+        raw_diff = isinstance(rewritten, str) and (
+            len(_RTK_DIFF_RE.findall(rewritten)) > len(_RTK_DIFF_RE.findall(original_command))
+        )
+    if raw_diff and isinstance(args, dict):
+        # RTK can report whitespace-only differences as equality with exit 0.
+        # Preserve both the in-place and returned-directive command paths.
+        args["command"] = original_command
+        if details.modified_args is not None:
+            details = _PreToolCallDirective(
+                action=details.action, message=details.message, rule_key=details.rule_key,
+                modified_args={**details.modified_args, "command": original_command},
+            )
     block_msg = _resolve_block_from_details(
         details, tool_name,
         turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id,

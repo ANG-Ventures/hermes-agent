@@ -690,12 +690,13 @@ def build_turn_context(
         )
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
+    agent._blackbox_compaction = {"idle_compaction_fired": False}
     agent._current_api_request_id = ""
     # Publish this agent's (provider, model) so cronjob(action="create") can
     # resolve model="auto" to the creating agent's own model instead of leaving
     # a new LLM cron unpinned (which inherits the runtime primary — often Opus —
-    # at fire time). Module-global backed (NOT a ContextVar — a ContextVar set
-    # here is invisible across the tool-executor's asyncio task boundary).
+    # at fire time). The tool executor rebinds from this agent at dispatch,
+    # including when an asyncio task boundary did not inherit this context.
     try:
         from tools.cronjob_tools import set_current_agent_model
         set_current_agent_model(
@@ -1026,6 +1027,15 @@ def build_turn_context(
                 # must leave the turn's flush baseline and user-message index
                 # untouched.
                 if messages is not _idle_input:
+                    _comp = agent._blackbox_compaction
+                    _comp["idle_compaction_fired"] = True
+                    if _comp.get("compaction_tokens_before") is None:
+                        _comp["compaction_tokens_before"] = _idle_tokens
+                    if _comp.get("compaction_tokens_after") is None:
+                        _comp["compaction_tokens_after"] = estimate_request_tokens_rough(
+                            messages, system_prompt=active_system_prompt or "",
+                            tools=agent.tools or None,
+                        )
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )

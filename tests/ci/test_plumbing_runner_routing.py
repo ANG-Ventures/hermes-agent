@@ -48,10 +48,13 @@ def test_ci_review_label_requests_full_rerun():
 def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
     # Pin the declaration: injecting labels into a test would bypass this binding.
     job = yaml.safe_load((WORKFLOWS / "tests.yml").read_text())["jobs"]["e2e"]
-    assert job["runs-on"] == (
-        "${{ contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
+    # Non-merge_group events and merge_group with managed placement disabled
+    # keep the legacy binding; managed merge_group uses overflow labels.
+    assert job["runs-on"].startswith(
+        "${{ (github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && ("
+        "contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
         "&& fromJSON(format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"'))) "
-        "|| fromJSON('[\"ubuntu-latest\"]') }}"
+        "|| fromJSON('[\"ubuntu-latest\"]')) || "
     )
 
 

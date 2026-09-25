@@ -579,28 +579,39 @@ def _auto_truncate_response_history(
     """
     if limit <= 0 or len(conversation_history) <= limit:
         return conversation_history
+    from agent.confab_notice import is_metadata_only_tool_notice
 
+    event_indices = {
+        index for index, message in enumerate(conversation_history)
+        if is_metadata_only_tool_notice(message)
+    }
+    content_indices = [
+        index for index in range(len(conversation_history)) if index not in event_indices
+    ]
+    if len(content_indices) <= limit:
+        return conversation_history
     summary_indices = [
         index
         for index, message in enumerate(conversation_history)
-        if _is_compressed_summary_message(message)
+        if index not in event_indices and _is_compressed_summary_message(message)
     ]
     if not summary_indices:
-        return conversation_history[-limit:]
+        kept_indices = set(content_indices[-limit:]) | event_indices
+        return [conversation_history[index] for index in sorted(kept_indices)]
 
     kept_indices = set(summary_indices[:limit])
     remaining = limit - len(kept_indices)
     if remaining > 0:
         summary_index_set = set(summary_indices)
         for index in range(len(conversation_history) - 1, -1, -1):
-            if index in summary_index_set:
+            if index in summary_index_set or index in event_indices:
                 continue
             kept_indices.add(index)
             remaining -= 1
             if remaining <= 0:
                 break
 
-    return [conversation_history[index] for index in sorted(kept_indices)]
+    return [conversation_history[index] for index in sorted(kept_indices | event_indices)]
 
 
 def _normalize_chat_content(
@@ -1613,6 +1624,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # _inject_browser_control_artifacts().
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
+        # Per-profile single-flight locks for the off-loop store construction
+        # in _artifact_store_for_async(); see that method for why a lost race
+        # would strand an artifact's in-memory receipt index.
+        self._browser_control_artifact_locks: Dict[str, asyncio.Lock] = {}
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1694,8 +1709,38 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    @staticmethod
+    def _checkout_hold_refusal() -> Optional[str]:
+        """Shared-checkout admission hold check (gateway/checkout_admission.py).
+
+        Runs on the event loop in the same non-awaiting block as the caller's
+        pending-work reservation, and the gateway's acknowledgment snapshot
+        also runs on that loop, so a request that passes here is always
+        counted (via ``active_agent_work_count``) by the next snapshot.
+        """
+        try:
+            from gateway.checkout_admission import process_gate
+
+            gate = process_gate("gateway")
+        except Exception:
+            return None
+        if gate is None:
+            return None
+        refusal = gate.check(internal=False)
+        return refusal.reason if refusal is not None else None
+
     def _draining_response(self) -> Optional["web.Response"]:
         """Return a retryable response while the gateway drains existing work."""
+        held = self._checkout_hold_refusal()
+        if held is not None:
+            return web.json_response(
+                _openai_error(
+                    "Gateway is paused for a maintenance update; retry shortly.",
+                    code="checkout_held",
+                ),
+                status=503,
+                headers={"Retry-After": "5"},
+            )
         if not self._gateway_is_draining():
             return None
         return web.json_response(
@@ -3846,6 +3891,41 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("could not attach artifact store to broker", exc_info=True)
         return store
 
+    async def _artifact_store_for_async(self, profile: str) -> ArtifactStore:
+        """Async variant for the artifact routes: resolve the store off-loop.
+
+        ``_artifact_store_for`` is blocking on its construction path —
+        ``ArtifactStore.__init__`` does ``mkdir`` plus a full ``iterdir``
+        orphan sweep, and the caller then runs ``prune_expired`` (a glob and
+        one ``unlink`` per expired entry).  On a cold profile under
+        filesystem pressure that is unbounded, and it runs on the single
+        aiohttp event-loop thread.
+
+        The cache hit stays on the loop (a dict lookup); only the
+        construction is offloaded.  A per-profile single-flight lock is
+        load-bearing, not decoration: the offload introduces a real await
+        between the cache miss and the cache fill, so two concurrent first
+        requests for the same profile would otherwise each build a store and
+        the second would evict the first.  The stores hold their receipt
+        index IN MEMORY, so an artifact uploaded through the evicted
+        instance would be invisible to every later download.  Same
+        single-flight shape as ``_ensure_session_db_async``.
+        """
+        profile_key = str(profile or "default")
+        store = self._browser_control_artifacts.get(profile_key)
+        if store is not None:
+            return store
+        lock = self._browser_control_artifact_locks.get(profile_key)
+        if lock is None:
+            lock = self._browser_control_artifact_locks.setdefault(
+                profile_key, asyncio.Lock()
+            )
+        async with lock:
+            store = self._browser_control_artifacts.get(profile_key)
+            if store is not None:
+                return store
+            return await asyncio.to_thread(self._artifact_store_for, profile_key)
+
     def _artifact_limiter(self) -> ArtifactRateLimiter:
         """Return the per-principal artifact route limiter (lazy)."""
         if self._browser_control_artifact_limiter is None:
@@ -3942,7 +4022,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Bounded read: cap at the store's byte cap + 1 so an oversize body
         # is detected and rejected without buffering unbounded data.
         try:
-            store = self._artifact_store_for(profile)
+            store = await self._artifact_store_for_async(profile)
         except ArtifactError as exc:
             return web.json_response(_openai_error(str(exc), code="artifact_rejected"), status=500)
         max_bytes = store.max_bytes
@@ -3961,8 +4041,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if not data:
             return web.json_response(_openai_error("Empty artifact body."), status=400)
 
+        # ``store`` ends in the mkstemp + write + os.fsync + os.replace tail,
+        # whose duration is unbounded under filesystem pressure, and this is a
+        # coroutine on the single aiohttp loop thread (frozen in the
+        # reachability ratchet as
+        # ``api_server.py _handle_artifact_upload -> os.fsync``).  Offload the
+        # whole validated write; the caller genuinely needs its receipt, so
+        # this awaits rather than fires-and-forgets — the point is that the
+        # LOOP keeps serving other requests while the rename is in flight.
         try:
-            receipt = store.store(
+            receipt = await asyncio.to_thread(
+                store.store,
                 data,
                 filename=filename,
                 content_type=content_type,
@@ -4028,8 +4117,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         artifact_id = request.match_info.get("artifact_id", "")
         try:
-            store = self._artifact_store_for(profile)
-            data, receipt = store.load(
+            store = await self._artifact_store_for_async(profile)
+            # CLASS SWEEP, not just the frozen entry: ``load`` reads the whole
+            # artifact off disk, re-hashes it, and unlinks it — the same
+            # unbounded blocking shape as the upload's rename, on the same
+            # single loop thread.  It escaped the ratchet only because the DFS
+            # reports the first sink per coroutine and this chain has no
+            # lexical ``os.*`` sink name in it.
+            data, receipt = await asyncio.to_thread(
+                store.load,
                 artifact_id,
                 scope=_ArtifactScopeFacade(
                     principal,

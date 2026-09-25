@@ -104,6 +104,57 @@ class _LoopFloorTimerHandle:
             self._timer.cancel()
 
 
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+def describe_blocked_loop_thread(thread_ident: Optional[int]) -> tuple[str, str]:
+    """Return ``(site, stack)`` for the thread running the event loop.
+
+    ``site`` is ``path:line func`` of the innermost frame under the repo root
+    (``unknown`` if none); ``stack`` is the formatted stack (last 30 frames).
+    Pure in-process frame walk (``sys._current_frames``) — no signals, no
+    external profiler. Never raises.
+    """
+    try:
+        import traceback
+
+        frame = sys._current_frames().get(thread_ident) if thread_ident else None
+        if frame is None:
+            return "unknown", "(loop thread frame unavailable)"
+        summary = traceback.extract_stack(frame)
+        site = "unknown"
+        for fs in summary:
+            fn = fs.filename or ""
+            if fn.startswith(_REPO_ROOT) and "/site-packages/" not in fn and "/.venv/" not in fn:
+                rel = os.path.relpath(fn, _REPO_ROOT)
+                site = f"{rel}:{fs.lineno} {fs.name}"
+        stack = "".join(traceback.format_list(summary[-30:]))
+        return site, stack
+    except Exception:
+        return "unknown", "(loop thread stack capture failed)"
+
+
+def _log_blocked_loop_site(thread_ident: Optional[int], blocked_s: float) -> None:
+    """Emit the structured ``PHASE=event_loop_blocked ... site=`` line + stack.
+
+    ``site=`` is last on the line so ``unclean_restart_notice._BLOCKED_SITE_RE``
+    picks it up on the next boot. Never raises.
+    """
+    try:
+        site, stack = describe_blocked_loop_thread(thread_ident)
+        logger.error(
+            "PHASE=event_loop_blocked source=liveness_watchdog seconds=%d site=%s",
+            int(blocked_s),
+            site,
+        )
+        logger.error(
+            "PHASE=event_loop_blocked source=liveness_watchdog loop-thread stack:\n%s",
+            stack,
+        )
+    except Exception:
+        pass
+
+
 class _LoopLivenessWatchdogHandle:
     """Small lifecycle handle for the daemon liveness thread."""
 
@@ -293,6 +344,14 @@ def start_loop_liveness_watchdog(
     timeout = probe_timeout
     strikes_limit = max_strikes
     stop_event = threading.Event()
+    # The thread whose stack names the blocking site when probes go unanswered.
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    loop_thread_ident = (
+        threading.get_ident() if running is loop else threading.main_thread().ident
+    )
 
     def _wait_for_probe(probe_event: threading.Event) -> Optional[bool]:
         deadline = time.monotonic() + timeout
@@ -414,6 +473,7 @@ def start_loop_liveness_watchdog(
                     )
                 except Exception:
                     pass
+            _log_blocked_loop_site(loop_thread_ident, strikes * (interval + timeout))
             try:
                 faulthandler.dump_traceback(all_threads=True)
             except Exception:
@@ -595,7 +655,7 @@ def arm_shutdown_watchdog(
     exit_code: int = 1,
     dump_path: Optional[Path] = None,
     name: str = "gateway-shutdown-watchdog",
-) -> threading.Event:
+) -> Optional[threading.Event]:
     """Arm a daemon-thread hard-exit backstop for a wedged shutdown path.
 
     If ``done_event`` is set before ``delay_s`` elapses, the thread exits
@@ -604,6 +664,25 @@ def arm_shutdown_watchdog(
 
     Never raises. Returns the ``done_event`` (creating one when omitted) so
     the caller can disarm on successful completion.
+
+    🔴 Returns ``None`` when no backstop was armed, i.e. the thread start
+    itself failed. ``threading.Thread.start`` raises ``RuntimeError: can't
+    start new thread`` under thread/FD exhaustion or memory pressure —
+    exactly the wedged-shutdown condition the watchdog exists for — and
+    returning the ``done`` event regardless made that indistinguishable from
+    success. A caller that REPLACES a live watchdog (see
+    ``gateway.run._rearm_shutdown_watchdog``) then retires the running
+    backstop in favour of a thread that does not exist, leaving the shutdown
+    with no hard-exit at all: no dump, no ``mark_exited`` ledger entry, and
+    no ordered PID-file / runtime-lock release before launchd's SIGKILL.
+    Returning ``None`` is the only signal a never-raises API can give, so
+    every replace-style caller MUST check it. Callers that merely ADD a
+    backstop can keep ignoring the return: they already hold the event they
+    passed in, and a ``None`` there means only that the optional backstop is
+    absent, which is the pre-existing behaviour.
+
+    The deliberate ``delay_s <= 0`` disable still returns the event: nothing
+    was armed, but nothing was asked for either, so it is not a failure.
     """
     done = done_event if done_event is not None else threading.Event()
     try:
@@ -677,7 +756,12 @@ def arm_shutdown_watchdog(
     try:
         threading.Thread(target=_watchdog, daemon=True, name=name).start()
     except Exception:
-        logger.debug("Failed to arm shutdown watchdog", exc_info=True)
+        # Signal the failure to the caller. `logger.debug` alone left a
+        # replace-style caller (the stop-path re-arm) unable to distinguish
+        # "armed" from "no thread exists", so it retired the live backstop in
+        # favour of nothing. This API never raises, so None IS the signal.
+        logger.warning("Failed to arm shutdown watchdog", exc_info=True)
+        return None
     return done
 
 

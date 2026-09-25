@@ -177,6 +177,8 @@ except ImportError:  # pragma: no cover
 from hermes_constants import get_hermes_home
 from utils import atomic_replace
 
+from agent import shell_hooks_missing as _missing
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 60
@@ -215,6 +217,10 @@ _registered_lock = threading.Lock()
 # ``.lock`` file via ``fcntl.flock`` and bypass this.
 _allowlist_write_lock = threading.Lock()
 
+# Delivery seam for absent-hook pages (agent/shell_hooks_missing.py reads it from this
+# module at call time, so tests and replays patch it here).
+_page_missing_hook = _missing.page_missing_hook
+
 
 @dataclass
 class ShellHookSpec:
@@ -225,6 +231,7 @@ class ShellHookSpec:
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     fail_closed: bool = False
+    missing_hook_policy: str = _missing.DEFAULT_MISSING_HOOK_POLICY
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -379,6 +386,7 @@ def reset_for_tests() -> None:
     """Clear the idempotence set.  Test-only helper."""
     with _registered_lock:
         _registered.clear()
+    _missing.reset_pages_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +404,14 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
     if not isinstance(hooks_cfg, dict):
         return []
 
+    policy = hooks_cfg.get("missing_hook_policy", _missing.DEFAULT_MISSING_HOOK_POLICY)
+    if policy not in _missing.MISSING_HOOK_POLICIES:
+        logger.warning(
+            "hooks.missing_hook_policy must be one of %s; got %r — using %s",
+            ", ".join(_missing.MISSING_HOOK_POLICIES), policy, _missing.DEFAULT_MISSING_HOOK_POLICY,
+        )
+        policy = _missing.DEFAULT_MISSING_HOOK_POLICY
+
     specs: List[ShellHookSpec] = []
 
     for event_name, entries in hooks_cfg.items():
@@ -403,7 +419,7 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
         # are config sub-sections nested under `hooks:` for related
         # functionality (e.g. output-spill budgets, outbound webhooks —
         # the latter parsed by agent/outbound_webhooks.py).
-        if event_name in ("output_spill", "outbound"):
+        if event_name in ("output_spill", "outbound", "missing_hook_policy"):
             continue
         if event_name in SHELL_UNSUPPORTED_HOOKS:
             # Registering would "succeed" while the hook's return value is
@@ -445,6 +461,7 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
         for i, raw in enumerate(entries):
             spec = _parse_single_entry(event_name, i, raw)
             if spec is not None:
+                spec.missing_hook_policy = policy
                 specs.append(spec)
 
     return specs
@@ -546,7 +563,22 @@ def _parse_single_entry(
 _TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
 
 
+def _hook_script(spec: ShellHookSpec) -> Optional[Path]:
+    """The hook's script file, when the command names one (``python3 /x/hook.py``, ``/x/hook.sh``)."""
+    script = Path(os.path.expanduser(_command_script_path(spec.command)))
+    return script if script.suffix.lower() in _SCRIPT_EXTENSIONS else None
+
+
 def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
+    """Run the hook, first repairing absent tracked hook files (agent/shell_hooks_missing.py).
+
+    A result carrying ``infra_failure`` means the hook's files were absent on disk and could not
+    be restored. That result is never a policy verdict.
+    """
+    return _missing.spawn_with_self_heal(spec, stdin_json, _spawn_once, _hook_script(spec))
+
+
+def _spawn_once(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     """Run ``spec.command`` as a subprocess with ``stdin_json`` on stdin.
 
     Returns a diagnostic dict with the same keys for every outcome
@@ -578,6 +610,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         "elapsed_seconds": 0.0,
         "error": None,
         "error_detail": None,
+        "infra_failure": None,
     }
     try:
         # Windows-safe: plain shlex.split eats backslashes in paths (#78293).
@@ -623,7 +656,9 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             **_popen_kwargs,
         )
     except FileNotFoundError:
+        # The executable itself is absent on disk: the hook could not run at all.
         result["error"] = "command not found"
+        result["infra_failure"] = argv[0]
         return result
     except PermissionError:
         result["error"] = "command not executable"
@@ -848,7 +883,7 @@ def _malfunction_block(
 
 
 def _evaluate_result(
-    spec: ShellHookSpec, r: Dict[str, Any],
+    spec: ShellHookSpec, r: Dict[str, Any], *, page: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Turn a :func:`_spawn` diagnostic dict into the hook's contribution.
 
@@ -872,6 +907,18 @@ def _evaluate_result(
     """
     blocking_event = spec.event in _BLOCKING_EVENTS
     fail_closed = spec.fail_closed and blocking_event
+
+    # Absent hook files (measured on disk by _spawn, never inferred from output) are an
+    # infrastructure failure: infra-labelled verdict + page, never a policy verdict.
+    if r.get("infra_failure"):
+        if blocking_event:
+            return _missing.missing_hook_verdict(spec, r, page=page, display=hook_display_name(spec.command))
+        if page:
+            _missing.page_once(str(r["infra_failure"]), str(r.get("restore_outcome") or r["error"]))
+        return None
+    if r.get("restore_outcome") and page:
+        # Repaired and re-run: evaluate the real result below, but still page the repair.
+        _missing.page_once(str(_hook_script(spec)), str(r["restore_outcome"]))
 
     if r["error"]:
         # Log/operator channel gets the DETAILED reason when there is one; the
@@ -931,6 +978,13 @@ def _evaluate_result(
             # "failed closed" for both is what sent an operator hunting a
             # merge they never attempted while the real cause was an absent
             # module. Same fail-closed outcome, self-describing message.
+            diagnosis = _crash_diagnosis(stderr)
+            if diagnosis and page:
+                # Present but unloadable: nothing tracked is absent (_spawn checked), so this is an
+                # operator call, not a self-heal. Page it; restore nothing; allow nothing.
+                script = _hook_script(spec)
+                _missing.page_once(str(script or hook_display_name(spec.command)),
+                                   f"hook present but unloadable at {script}: {diagnosis}")
             return _malfunction_block(spec, r["returncode"], stderr)
 
     stdout = (r["stdout"] or "").strip()
@@ -1366,5 +1420,6 @@ def run_once(
     prints is exactly what the dispatcher would receive."""
     stdin_json = _serialize_payload(spec.event, kwargs)
     result = _spawn(spec, stdin_json)
-    result["parsed"] = _evaluate_result(spec, result)
+    # Diagnostic: may repair absent files, but never pages #alerts.
+    result["parsed"] = _evaluate_result(spec, result, page=False)
     return result

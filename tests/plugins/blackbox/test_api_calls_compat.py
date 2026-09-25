@@ -116,6 +116,14 @@ def test_ac7_populated_migration_preserves_five_consumers(legacy_copy):
 
 
 def test_insert_turn_placeholder_probe_detects_malformed_insert(legacy_copy, monkeypatch):
+    # The legacy_copy fixture deliberately stubs _connect WITHOUT _ensure_schema so
+    # test_ac7 can capture a pre-migration BEFORE arm. insert_turn's real connector
+    # always migrates first (store._connect), so migrate once here — otherwise the
+    # positive control writes into a schema that predates the columns it binds and
+    # the probe stops discriminating malformed SQL from a missing column.
+    with sqlite3.connect(legacy_copy) as conn:
+        store._ensure_schema(conn)
+
     class BadInsert(sqlite3.Connection):
         def execute(self, sql, parameters=()):
             # Matches the turns INSERT regardless of its conflict strategy, so

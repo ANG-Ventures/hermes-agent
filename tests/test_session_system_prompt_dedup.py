@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 
@@ -76,7 +77,7 @@ def test_prompt_replacement_and_route_changes_collect_only_orphans(db):
         confirmed=True,
     )
     s1 = db.get_session("s1")
-    assert s1["system_prompt"] is None
+    assert s1["system_prompt"] == shared_prompt
     assert json.loads(s1["model_config"])["_branched_from"] == "parent"
     assert db.get_session("s2")["system_prompt"] == shared_prompt
     assert _prompt_count(db) == 1
@@ -86,13 +87,45 @@ def test_prompt_replacement_and_route_changes_collect_only_orphans(db):
         provider="openrouter",
         base_url="https://example.test/v1",
     )
-    assert db.get_session("s2")["system_prompt"] is None
-    assert _prompt_count(db) == 0
+    assert db.get_session("s2")["system_prompt"] == shared_prompt
+    assert _prompt_count(db) == 1
 
     db.update_system_prompt("s2", "replacement")
     assert db.get_session("s2")["system_prompt"] == "replacement"
     db.update_system_prompt("s2", None)
-    assert _prompt_count(db) == 0
+    assert _prompt_count(db) == 1  # s1 still references the original snapshot
+
+
+def test_route_updates_keep_prompt_until_replacement_is_ready(db):
+    """Changing routes must not leave a continuing session with a NULL prompt."""
+    prompt = "Model: original\nProvider: old"
+    db.create_session("s1", "telegram", model="original", system_prompt=prompt)
+
+    db.update_session_billing_route("s1", provider="old", base_url="https://new.example/v1")
+    assert db.get_session("s1")["system_prompt"] == prompt
+
+    db.update_session_model("s1", "replacement", provider="new")
+    assert db.get_session("s1")["system_prompt"] == prompt
+
+    db.update_session_runtime_lock("s1", model="replacement", provider="new", confirmed=True)
+    assert db.get_session("s1")["system_prompt"] == prompt
+
+    db.update_system_prompt("s1", "Model: replacement\nProvider: new")
+    assert db.get_session("s1")["system_prompt"] == "Model: replacement\nProvider: new"
+    assert _prompt_count(db) == 1
+
+
+def test_explicit_prompt_clear_records_writer_stack(db, caplog):
+    db.create_session("s1", "cli", system_prompt="stored prompt")
+    with caplog.at_level(logging.WARNING, logger="hermes_state"):
+        db.update_system_prompt("s1", None)
+    assert db.get_session("s1")["system_prompt"] is None
+    assert any(
+        "s1" in record.getMessage()
+        and "update_system_prompt" in (record.stack_info or "")
+        and "test_explicit_prompt_clear_records_writer_stack" in (record.stack_info or "")
+        for record in caplog.records
+    )
 
 
 def test_existing_session_enrichment_does_not_leak_unused_prompt(db):

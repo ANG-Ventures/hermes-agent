@@ -92,6 +92,14 @@ _MESSAGE_SELECT_COLUMNS = (
     "ingested_at, observed_at, observed_at_source"
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
+# Session-scoped reads see only the LOGICAL transcript. The replay-block dedup
+# migration soft-hides non-canonical replay copies by setting ``superseded_by``;
+# those copies sit at the HIGH store_ids (the session tail), so a read that
+# includes them feeds hidden rows into re-bind reconcile, compaction, counts and
+# token totals. Every per-session read must carry this predicate (the partial
+# index ``idx_msg_session_visible`` keeps it index-driven). Reads by explicit
+# store_id and whole-corpus coverage scans stay raw on purpose.
+_VISIBLE_MESSAGE_CLAUSE = "superseded_by IS NULL"
 _UNKNOWN_SOURCE = "unknown"
 
 
@@ -490,6 +498,16 @@ class MessageStore:
                     search_content = _index_safe_text(plain_content, self._ingest_protection_config)
                 except RuntimeError:
                     search_content = None
+                if search_content is None:
+                    # Undecryptable row: search_content is ALREADY NULL. Writing
+                    # NULL over NULL is a no-op for the row but fires
+                    # ``msg_fts_update`` (delete + re-insert into the FTS5
+                    # index). On the fleet DB (3 such rows, 2.5 M-doc index)
+                    # that trigger write cost 4-57 s per boot holding the
+                    # write lock — on EVERY engine load, since the rows stay
+                    # NULL forever. Leave them alone; the loop's no-progress
+                    # guard below terminates the pass.
+                    continue
                 try:
                     self._conn.execute(
                         "UPDATE messages SET search_content = ? WHERE store_id = ?",
@@ -909,7 +927,7 @@ class MessageStore:
                   limit: int = 1000,
                   conversation_id: str | None = None) -> List[Dict[str, Any]]:
         """Get messages in a store_id range for a session."""
-        where = ["session_id = ?", "store_id >= ?"]
+        where = ["session_id = ?", "store_id >= ?", _VISIBLE_MESSAGE_CLAUSE]
         args: list[Any] = [session_id, start_id]
         conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
         if conversation_clause:
@@ -935,7 +953,7 @@ class MessageStore:
         time_from: float | None = None,
         time_to: float | None = None,
     ) -> tuple[list[str], list[Any]]:
-        where = ["session_id = ?"]
+        where = ["session_id = ?", _VISIBLE_MESSAGE_CLAUSE]
         args: list[Any] = [session_id]
         if roles:
             placeholders = ",".join("?" for _ in roles)
@@ -1016,14 +1034,14 @@ class MessageStore:
         prior = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                 FROM messages
-                WHERE session_id = ? AND store_id < ?
+                WHERE session_id = ? AND store_id < ? AND {_VISIBLE_MESSAGE_CLAUSE}
                 ORDER BY store_id DESC LIMIT ?""",
             (session_id, anchor_store_id, before),
         ).fetchall()
         following = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                 FROM messages
-                WHERE session_id = ? AND store_id >= ?
+                WHERE session_id = ? AND store_id >= ? AND {_VISIBLE_MESSAGE_CLAUSE}
                 ORDER BY store_id LIMIT ?""",
             (session_id, anchor_store_id, after + 1),
         ).fetchall()
@@ -1035,7 +1053,7 @@ class MessageStore:
         """Get all messages for a session, ordered by store_id."""
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ?
+               WHERE session_id = ? AND {_VISIBLE_MESSAGE_CLAUSE}
                ORDER BY store_id LIMIT ?""",
             (session_id, limit),
         ).fetchall()
@@ -1047,7 +1065,7 @@ class MessageStore:
         """Get session messages after a store_id, ordered by store_id."""
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ? AND store_id > ?
+               WHERE session_id = ? AND store_id > ? AND {_VISIBLE_MESSAGE_CLAUSE}
                ORDER BY store_id LIMIT ?""",
             (session_id, after_store_id, limit),
         ).fetchall()
@@ -1062,7 +1080,7 @@ class MessageStore:
                FROM (
                    SELECT {_MESSAGE_SELECT_COLUMNS}
                    FROM messages
-                   WHERE session_id = ?
+                   WHERE session_id = ? AND {_VISIBLE_MESSAGE_CLAUSE}
                    ORDER BY store_id DESC
                    LIMIT ?
                )
@@ -1072,17 +1090,17 @@ class MessageStore:
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_count(self, session_id: str) -> int:
-        """Count messages in a session."""
+        """Count visible (non-superseded) messages in a session."""
         row = self._conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+            f"SELECT COUNT(*) FROM messages WHERE session_id = ? AND {_VISIBLE_MESSAGE_CLAUSE}",
             (session_id,),
         ).fetchone()
         return row[0] if row else 0
 
     def get_session_token_total(self, session_id: str) -> int:
-        """Sum of token estimates for a session."""
+        """Sum of token estimates for a session's visible messages."""
         row = self._conn.execute(
-            "SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE session_id = ?",
+            f"SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE session_id = ? AND {_VISIBLE_MESSAGE_CLAUSE}",
             (session_id,),
         ).fetchone()
         return row[0] if row else 0

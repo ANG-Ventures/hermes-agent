@@ -165,19 +165,24 @@ def _ledger_paths(root: Path) -> list[Path]:
     return out
 
 
-def _sum_ledger(ledger: Path, since_ts: int, board_ids: set[str]) -> float:
-    """Sum ``cost_usd`` for in-window worker turns whose card is on this board.
+def _ledger_card_costs(ledger: Path, since_ts: int) -> list[tuple[str, float]]:
+    """``(card_id, cost_usd)`` for every in-window worker turn in this ledger.
 
-    ONE query per ledger: the window filter is pushed into SQL, the board
-    membership test is done in Python against the pre-computed id set (a
-    parameterised ``IN`` over thousands of ids would be worse than this).
+    ONE query per ledger: the window filter is pushed into SQL. The result is
+    deliberately BOARD-INDEPENDENT — the ledgers are the same files for every
+    board on the host, so this is the part worth caching once per tick. The
+    board membership test is the cheap set lookup left to ``_sum_ledgers``
+    (a parameterised ``IN`` over thousands of ids would be worse than this).
+
+    Rows are returned in ledger order so a per-board sum accumulates in exactly
+    the order the old per-ledger loop did.
     """
     uri = f"file:{ledger}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
     except sqlite3.Error as exc:
         _warn_once(str(ledger), "turn ledger", exc)
-        return 0.0
+        return []
     try:
         rows = conn.execute(
             "SELECT cost_usd, user_text FROM turns "
@@ -186,31 +191,86 @@ def _sum_ledger(ledger: Path, since_ts: int, board_ids: set[str]) -> float:
         ).fetchall()
     except sqlite3.Error as exc:
         _warn_once(str(ledger), "turn ledger", exc)
-        return 0.0
+        return []
     finally:
         try:
             conn.close()
         except Exception:
             pass
-    total = 0.0
+    out: list[tuple[str, float]] = []
     for cost, text in rows:
         if not text or "work kanban task" not in text:
             continue
         match = _TASK_ID_RE.search(text)
-        if match is None or match.group(0) not in board_ids:
+        if match is None:
             continue
         try:
-            total += float(cost)
+            value = float(cost)
         except (TypeError, ValueError):
             continue
+        out.append((match.group(0), value))
+    return out
+
+
+def _window_start_ts(
+    window_hours: int, *, now: Optional[int] = None, cache: Optional[dict] = None,
+) -> int:
+    """Start of the rolling window, PINNED for the life of ``cache``.
+
+    Without the pin, each board calls ``time.time()`` a few ms apart, every
+    board gets a different ``since_ts``, and the board-independent ledger cache
+    below misses on every board — the exact failure this change exists to fix.
+    An explicit ``now`` (tests, dispatcher) bypasses the pin entirely.
+    """
+    if now is not None:
+        return int(now) - window_hours * 3600
+    if cache is None:
+        return int(time.time()) - window_hours * 3600
+    key = ("_tick_now", int(window_hours))
+    pinned = cache.get(key)
+    if pinned is None:
+        pinned = int(time.time())
+        cache[key] = pinned
+    return int(pinned) - window_hours * 3600
+
+
+def _all_ledger_card_costs(
+    root: Path, since_ts: int,
+) -> list[list[tuple[str, float]]]:
+    """One list of ``(card_id, cost)`` per ledger, outer list in ledger order."""
+    return [
+        _ledger_card_costs(ledger, since_ts) for ledger in _ledger_paths(root)
+    ]
+
+
+def _sum_ledgers(
+    root: Path,
+    since_ts: int,
+    board_ids: set[str],
+    *,
+    cache: Optional[dict] = None,
+) -> float:
+    """Total in-window cost of turns whose card is on this board.
+
+    The expensive half (opening every ledger) does not depend on the board, so
+    it is cached on ``(root, since_ts)`` — NOT on the board db path, which is
+    distinct for every board and therefore misses on every board.
+    """
+    key = ("_ledger_card_costs", str(root), int(since_ts))
+    if cache is not None and key in cache:
+        per_ledger = cache[key]
+    else:
+        per_ledger = _all_ledger_card_costs(root, since_ts)
+        if cache is not None:
+            cache[key] = per_ledger
+    total = 0.0
+    for ledger_rows in per_ledger:
+        subtotal = 0.0
+        for card_id, cost in ledger_rows:
+            if card_id in board_ids:
+                subtotal += cost
+        total += subtotal
     return total
-
-
-def _sum_ledgers(root: Path, since_ts: int, board_ids: set[str]) -> float:
-    return sum(
-        _sum_ledger(ledger, since_ts, board_ids)
-        for ledger in _ledger_paths(root)
-    )
 
 
 def board_spend_usd(
@@ -225,15 +285,23 @@ def board_spend_usd(
 
     ``cache`` is a caller-owned dict scoped to one dispatcher tick — pass the
     same dict for every board so the ledgers are read once, not once per board.
+    The per-board entry only memoises the cheap board-membership filter; the
+    ledger reads are cached separately (and board-independently) inside
+    ``_sum_ledgers``, which is what makes a tick 10 ledger opens instead of
+    10 x N_boards.
     """
     path = Path(board_db_path)
     key = (str(path), int(window_hours))
     if cache is not None and key in cache:
         return cache[key]
     root = _hermes_root(home)
-    since_ts = int(now if now is not None else time.time()) - window_hours * 3600
+    since_ts = _window_start_ts(window_hours, now=now, cache=cache)
     board_ids = _board_task_ids(path)
-    spend = 0.0 if not board_ids else _sum_ledgers(root, since_ts, board_ids)
+    spend = (
+        0.0
+        if not board_ids
+        else _sum_ledgers(root, since_ts, board_ids, cache=cache)
+    )
     if cache is not None:
         cache[key] = spend
     return spend

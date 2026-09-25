@@ -49,7 +49,12 @@ KNOWN_SOURCES = frozenset({
 # the current column order.
 SESSIONS_LAYOUT_NFIELDS = frozenset({55, 54, 52})
 SESSIONS_LEGACY_MINIMAL_NFIELD = 14
-SESSION_MODEL_USAGE_NFIELD = 18
+# session_model_usage record widths: 18 = pre-UNKNOWN-provenance rows (also every
+# row written before the five ``*_unknown`` columns were ALTERed in -- SQLite does
+# not rewrite old records), 23 = current schema. Recovery must accept BOTH or it
+# silently drops every usage row written after the migration.
+SESSION_MODEL_USAGE_NFIELDS = (18, 23)
+SESSION_MODEL_USAGE_NFIELD = SESSION_MODEL_USAGE_NFIELDS[0]  # legacy alias
 
 # Plausible unix-epoch window for started_at heuristics on legacy layouts.
 _EPOCH_LOW = 1_000_000_000.0   # 2001
@@ -270,8 +275,8 @@ def classify_lost_and_found_row(
     if not _is_session_id(cells[0] if cells else None):
         return None
 
-    if nfield == SESSION_MODEL_USAGE_NFIELD:
-        # 18 fields, session id first, model string second.
+    if nfield in SESSION_MODEL_USAGE_NFIELDS:
+        # 18 (legacy) or 23 fields, session id first, model string second.
         if len(cells) > 1 and isinstance(cells[1], str) and cells[1]:
             return "session_model_usage"
         return None

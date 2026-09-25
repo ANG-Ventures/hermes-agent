@@ -33,7 +33,7 @@ import logging
 import os
 from typing import Any, Optional
 
-from agent.redact import redact_sensitive_text
+from agent.redact import redact_sensitive_json, redact_sensitive_text
 from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.goals import judge_goal
 from hermes_cli.kanban_identity import safe_comment_provenance
@@ -288,46 +288,20 @@ _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 
 def _goal_judge_available() -> bool:
-    """True when an auxiliary client is configured for the goal judge.
-
-    ``judge_goal`` is fail-open at the source: when no auxiliary model can
-    be reached it returns a ``"continue"`` verdict that is indistinguishable
-    from a real "not done yet" judgment. The completion gate must not treat
-    that as a rejection, or an unconfigured/degraded auxiliary model would
-    wedge every ``goal_mode`` worker (it could never close its own task).
-
-    So we probe availability first and only enforce the gate when a judge is
-    actually reachable. This mirrors the same client lookup ``judge_goal``
-    performs internally.
-    """
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return False
-    return client is not None and bool(model)
+    """Tool-surface judge availability probe; see ``goals.goal_judge_available``."""
+    from hermes_cli.goals import goal_judge_available
+    return goal_judge_available()
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
-    if not task or not task.goal_mode or not _goal_judge_available():
-        return None
-    verdict = "done"
-    reason = ""
-    try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-            last_response=evidence.strip(),
-        )
-    except Exception as judge_exc:
-        # Keep the existing fail-open semantics: an unavailable/broken
-        # auxiliary judge must not permanently wedge goal-mode work.
-        logger.warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
-            judge_exc,
-            exc_info=True,
-        )
-    return reason if verdict != "done" else None
+def _goal_mode_handoff_rejection(task, evidence: str, *, conn=None, task_id=None) -> Optional[str]:
+    """Tool-surface wiring of the shared goal-mode handoff gate."""
+    from hermes_cli.goals import kanban_handoff_rejection
+    return kanban_handoff_rejection(
+        task, evidence, conn=conn, task_id=task_id,
+        worker_run_id_for=_worker_run_id,
+        judge_available=_goal_judge_available,
+        judge=judge_goal,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +329,7 @@ _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
 
 
-def heartbeat_current_worker_from_env() -> bool:
+def heartbeat_current_worker_from_env(progress_at: Optional[float] = None) -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
 
@@ -400,7 +374,10 @@ def heartbeat_current_worker_from_env() -> bool:
             except (TypeError, ValueError):
                 run_id = None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_worker(
+                    conn, tid, note=None, expected_run_id=run_id,
+                    progress_at=progress_at,
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:
@@ -682,6 +659,9 @@ def _handle_list(args: dict, **kw) -> str:
     include_archived, bool_error = _parse_bool_arg(args, "include_archived")
     if bool_error:
         return tool_error(bool_error)
+    flat, bool_error = _parse_bool_arg(args, "all")
+    if bool_error:
+        return tool_error(bool_error)
     limit = args.get("limit")
     if limit is None:
         limit = KANBAN_LIST_DEFAULT_LIMIT
@@ -712,8 +692,43 @@ def _handle_list(args: dict, **kw) -> str:
             )
             truncated = len(rows) > limit
             tasks = rows[:limit]
+            # Session-first view (same rule as ``hermes kanban list``): when
+            # the caller has a session, only THIS session's cards come back
+            # in full; every other session's card collapses to
+            # id/status/title. ``all=true`` restores the flat view.
+            grouped: dict[str, Any] = {}
+            home = frozenset()
+            if not flat:
+                from tools.async_delegation import _current_origin_session_id
+
+                for sid in (_current_origin_session_id(), _current_session_id()):
+                    home |= kb.home_ids(sid)
+            if home:
+                mine = [t for t in tasks if t.session_id and t.session_id in home]
+                others = [t for t in tasks if not (t.session_id and t.session_id in home)]
+                summaries = [_task_summary_dict(kb, conn, t) for t in mine]
+                grouped = {
+                    "grouped": True,
+                    "this_session_count": len(mine),
+                    "other_sessions": [
+                        {
+                            "id": t.id,
+                            "status": t.status,
+                            "title": t.title,
+                            **({"unhomed": True} if getattr(t, "unhomed", False) else {}),
+                        }
+                        for t in others
+                    ],
+                    "other_sessions_note": (
+                        "not yours: comment, don't act (foreign_ok/--takeover "
+                        "REASON to act; all=true for the flat view)"
+                    ),
+                }
+            else:
+                summaries = [_task_summary_dict(kb, conn, t) for t in tasks]
             return json.dumps({
-                "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
+                "tasks": summaries,
+                **grouped,
                 "count": len(tasks),
                 "limit": limit,
                 "truncated": truncated,
@@ -753,12 +768,16 @@ def _handle_complete(args: dict, **kw) -> str:
     if result:
         result = redact_sensitive_text(str(result), force=True)
     if metadata is not None and isinstance(metadata, dict):
-        meta_json = json.dumps(metadata)
-        meta_json = redact_sensitive_text(meta_json, force=True)
-        try:
-            metadata = json.loads(meta_json)
-        except json.JSONDecodeError:
-            pass
+        # Per-leaf: masking the serialized string can eat a closing quote
+        # and leave the stored metadata unparseable (t_d59ca5db).
+        metadata = redact_sensitive_json(metadata, force=True)
+    superseded_by = args.get("superseded_by")
+    if superseded_by is not None:
+        if not isinstance(superseded_by, str):
+            return tool_error(
+                f"superseded_by must be a string, got {type(superseded_by).__name__}"
+            )
+        superseded_by = redact_sensitive_text(superseded_by, force=True)
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -813,9 +832,10 @@ def _handle_complete(args: dict, **kw) -> str:
                 metadata["artifacts"] = merged
             else:
                 metadata["artifacts"] = artifacts
-    if not (summary or result):
+    if not (summary or result or superseded_by is not None):
         return tool_error(
-            "provide at least one of: summary (preferred), result"
+            "provide at least one of: summary (preferred), result — or "
+            "superseded_by if the card's premise was already satisfied elsewhere"
         )
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(
@@ -823,13 +843,40 @@ def _handle_complete(args: dict, **kw) -> str:
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
     survivor_pr, survivor_ref = args.get("survivor_pr"), args.get("survivor_ref")
+    normalized: dict[str, object] = {}
     for value, name in ((survivor_pr, "survivor_pr"), (survivor_ref, "survivor_ref")):
-        if value is not None and not isinstance(value, str):
-            return tool_error(
-                f"{name} must be a string, got {type(value).__name__}"
-            )
-    survivor_pr = (survivor_pr or "").strip() or None
-    survivor_ref = (survivor_ref or "").strip() or None
+        # Repeatable and repository-qualified, matching --survivor-pr/--survivor-ref
+        # and kb.complete_task's Sequence. A multi-repository loss needs one
+        # claim PER vanished repository; a single string cannot express that,
+        # and the refusal that names the remedy would otherwise be unreachable
+        # from this surface.
+        if value is None:
+            normalized[name] = None
+            continue
+        if isinstance(value, str):
+            normalized[name] = value.strip() or None
+            continue
+        if isinstance(value, (list, tuple)):
+            claims = []
+            for index, item in enumerate(value):
+                if not isinstance(item, str):
+                    return tool_error(
+                        f"{name} must be a string or a list of strings; "
+                        f"element {index} is {type(item).__name__}"
+                    )
+                item = item.strip()
+                if item:
+                    claims.append(item)
+            # All-blank normalizes to None, never to [""] — an empty claim must
+            # not reach the verifier as a survivor the operator never made.
+            normalized[name] = claims or None
+            continue
+        return tool_error(
+            f"{name} must be a string or a list of strings, "
+            f"got {type(value).__name__}"
+        )
+    survivor_pr = normalized["survivor_pr"]
+    survivor_ref = normalized["survivor_ref"]
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -840,9 +887,14 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            # A superseded close asserts the card's premise no longer holds —
+            # there is no work for the judge to grade against the acceptance
+            # criteria, and gating it would put the worker straight back in the
+            # "no honest verb, exit silently" trap this disposition removes.
+            rejection = None if superseded_by is not None else _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
+                conn=conn, task_id=tid,
             )
             if rejection is not None:
                 return tool_error(
@@ -860,6 +912,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                     survivor_pr=survivor_pr, survivor_ref=survivor_ref,
+                    superseded_by=superseded_by,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -867,6 +920,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"{artifact_err}. Your task is still in-flight and its "
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
+                )
+            except kb.EmptySupersedeError as supersede_err:
+                # Gate runs before any write, so nothing was mutated; say so
+                # or the model reads a tool_error as terminal and blocks.
+                return tool_error(
+                    f"kanban_complete blocked: {supersede_err}. Your task is still "
+                    f"in-flight (no state change). Retry with a non-empty "
+                    f"superseded_by naming what satisfied the premise."
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -1010,11 +1071,8 @@ def _handle_request_review(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     if metadata is not None:
-        metadata_json = redact_sensitive_text(json.dumps(metadata), force=True)
-        try:
-            metadata = json.loads(metadata_json)
-        except json.JSONDecodeError:
-            return tool_error("metadata could not be safely serialized")
+        # Per-leaf redaction; see kanban_complete (t_d59ca5db).
+        metadata = redact_sensitive_json(metadata, force=True)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     reviewer = args.get("reviewer") or None
     if reviewer:
@@ -1026,7 +1084,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            rejection = _goal_mode_handoff_rejection(task, summary, conn=conn, task_id=tid)
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
@@ -1213,8 +1271,25 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
+def _read_attach_source_path(raw: str, max_bytes: int) -> bytes:
+    """Read a ``kanban_attach`` source file from the host filesystem.
+
+    Requires an absolute path (after ``~`` expansion) to a regular file, so
+    the result never depends on the process cwd. Reads at most
+    ``max_bytes + 1`` bytes: an oversize file is then rejected by
+    ``store_attachment_bytes``'s own cap without being buffered whole.
+    """
+    expanded = os.path.expanduser(raw.strip())
+    if not os.path.isabs(expanded):
+        raise ValueError(f"path must be absolute: {raw!r}")
+    if not os.path.isfile(expanded):
+        raise ValueError(f"not a regular file: {expanded}")
+    with open(expanded, "rb") as fh:
+        return fh.read(max_bytes + 1)
+
+
 def _handle_attach(args: dict, **kw) -> str:
-    """Attach an inline (base64) file to a task.
+    """Attach a file to a task, read from ``path`` or decoded from base64.
 
     Mirrors the dashboard's upload endpoint for the agent surface: decode
     the payload, enforce the shared size cap, write it under the per-task
@@ -1234,18 +1309,53 @@ def _handle_attach(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
-    filename = args.get("filename")
+    source_path = args.get("path")
+    content_b64 = args.get("content_base64")
+    has_path = isinstance(source_path, str) and bool(source_path.strip())
+    has_b64 = content_b64 is not None and bool(str(content_b64).strip())
+    if has_path == has_b64:
+        return tool_error(
+            "pass exactly one of path (preferred: the file is read server-side, "
+            "byte-exact) or content_base64"
+        )
+    import hashlib
+    expected = args.get("expected_sha256")
+    if expected is not None and (not isinstance(expected, str) or not expected.strip()):
+        expected = None
+    if has_path:
+        # The bytes never pass through the model. A model that has to
+        # re-emit a file as base64 transcribes it token by token and drops
+        # or invents characters on larger payloads (t_31148bf8); reading the
+        # file here is the only byte-exact route.
+        try:
+            data = _read_attach_source_path(
+                source_path, kb.KANBAN_ATTACHMENT_MAX_BYTES
+            )
+        except (OSError, ValueError) as e:
+            return tool_error(f"kanban_attach: cannot read path: {e}")
+        filename = args.get("filename") or os.path.basename(
+            os.path.expanduser(source_path.strip())
+        )
+    else:
+        filename = args.get("filename")
+        import base64
+        import binascii
+        try:
+            data = base64.b64decode(str(content_b64), validate=True)
+        except (binascii.Error, ValueError) as e:
+            return tool_error(f"content_base64 is not valid base64: {e}")
+        if expected is None:
+            return tool_error(
+                "expected_sha256 is required with content_base64 (or pass path "
+                "instead, which reads the file byte-exact)"
+            )
     if not filename or not str(filename).strip():
         return tool_error("filename is required")
-    content_b64 = args.get("content_base64")
-    if not content_b64 or not str(content_b64).strip():
-        return tool_error("content_base64 is required")
-    import base64
-    import binascii
-    try:
-        data = base64.b64decode(str(content_b64), validate=True)
-    except (binascii.Error, ValueError) as e:
-        return tool_error(f"content_base64 is not valid base64: {e}")
+    digest = hashlib.sha256(data).hexdigest()
+    if expected is not None and expected.strip().lower() != digest:
+        return tool_error(
+            "expected_sha256 does not match the attachment bytes; nothing stored"
+        )
     content_type = args.get("content_type")
     board = args.get("board")
     try:
@@ -1260,7 +1370,7 @@ def _handle_attach(args: dict, **kw) -> str:
                 uploaded_by="agent",
                 board=board,
             )
-            return _ok(task_id=tid, attachment_id=att_id, size=len(data))
+            return _ok(task_id=tid, attachment_id=att_id, size=len(data), sha256=digest)
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:
@@ -1456,6 +1566,12 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    from hermes_cli import kanban_worker_policy as _worker_policy
+    assignee, assignee_remap, assignee_err = _worker_policy.resolve_worker_assignee(
+        assignee
+    )
+    if assignee_err:
+        return tool_error(f"kanban_create: {assignee_err}")
     body = args.get("body")
     parents = args.get("parents") or []
     parents_kind = args.get("parents_kind")
@@ -1579,6 +1695,11 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
+            if assignee_remap is not None:
+                with kb.write_txn(conn):
+                    kb._append_event(
+                        conn, new_tid, "assignee_remapped", assignee_remap,
+                    )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
@@ -1589,6 +1710,7 @@ def _handle_create(args: dict, **kw) -> str:
                 project_id=new_task.project_id if new_task else None,
                 reasoning_effort=(new_task.reasoning_effort if new_task else None),
                 subscribed=subscribed,
+                **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
             )
         finally:
             conn.close()
@@ -1937,6 +2059,15 @@ KANBAN_LIST_SCHEMA = {
                 "type": "integer",
                 "description": "Optional maximum rows to return (default 50, max 200).",
             },
+            "all": {
+                "type": "boolean",
+                "description": (
+                    "Flat view. By default, when this session has a home, "
+                    "only its own cards are returned in full under `tasks` "
+                    "and other sessions' cards are collapsed under "
+                    "`other_sessions`."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": [],
@@ -1960,7 +2091,11 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. If you "
+        "verify the card's premise NO LONGER HOLDS — the work already "
+        "landed on current main via a sibling card, PR or commit — do "
+        "not exit silently: complete with ``superseded_by`` pointing at "
+        "whatever satisfied it."
     ),
     "parameters": {
         "type": "object",
@@ -1968,6 +2103,21 @@ KANBAN_COMPLETE_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "superseded_by": {
+                "type": "string",
+                "description": (
+                    "Evidence pointer for a card whose premise was "
+                    "ALREADY SATISFIED before you got to it — the card "
+                    "id, PR url, or commit sha that did the work (e.g. "
+                    "\"t_0c5ac29a -> #889\"). Closes the task done with "
+                    "outcome ``superseded`` and requires no "
+                    "``summary``/``result``: the pointer IS the evidence, "
+                    "and there is no artifact to hand off. Only use it "
+                    "after you VERIFIED the premise against current main "
+                    "— and never with an empty value, which is refused. "
+                    "Leave it unset for ordinary work."
+                ),
             },
             "summary": {
                 "type": "string",
@@ -2033,7 +2183,8 @@ KANBAN_COMPLETE_SCHEMA = {
                 ),
             },
             "survivor_pr": {
-                "type": "string",
+                "type": ["string", "array"],
+                "items": {"type": "string"},
                 "description": (
                     "Only when completion already REFUSED with "
                     "``survivor_unavailable``: name the pull request that "
@@ -2043,12 +2194,20 @@ KANBAN_COMPLETE_SCHEMA = {
                     "OPEN or MERGED) and records it as the durable "
                     "survivor; an unverifiable claim still refuses. This "
                     "is the ``--survivor-pr`` escape hatch that error "
-                    "names. Never pass it speculatively — it authorises "
-                    "deleting a workspace whose work is not pushed."
+                    "names. Pass a LIST when more than one recorded "
+                    "repository vanished, qualifying every claim as "
+                    "``<workspace-relative-repo>=owner/repo#123`` — each "
+                    "vanished repository needs its own claim, an "
+                    "unqualified one stands only for a single lost "
+                    "repository, and a claim naming a repository still on "
+                    "disk is refused. Never pass it speculatively — it "
+                    "authorises deleting a workspace whose work is not "
+                    "pushed."
                 ),
             },
             "survivor_ref": {
-                "type": "string",
+                "type": ["string", "array"],
+                "items": {"type": "string"},
                 "description": (
                     "Alternative to ``survivor_pr`` when the work landed "
                     "on a branch or tag rather than a PR: "
@@ -2056,7 +2215,10 @@ KANBAN_COMPLETE_SCHEMA = {
                     "branch/tag tip on that remote or the completion "
                     "still refuses. Use a clean clone URL — a URL "
                     "carrying credentials is rejected, and is redacted "
-                    "before the rejection is echoed or logged."
+                    "before the rejection is echoed or logged. Repeatable "
+                    "as a list with the same "
+                    "``<workspace-relative-repo>=<claim>`` qualifier as "
+                    "``survivor_pr``."
                 ),
             },
             "board": _board_schema_prop(),
@@ -2250,12 +2412,14 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_ATTACH_SCHEMA = {
     "name": "kanban_attach",
     "description": (
-        "Attach a file to a task by passing its bytes inline (base64). "
-        "Use for genuine file artifacts the next worker or a human should "
-        "be able to download — generated reports, images, exports. The "
-        "file is stored as a real attachment (not a comment link) under "
-        "the task's attachments dir, capped at 25 MB. Prefer "
-        "kanban_attach_url when you only have a URL."
+        "Attach a file to a task. PREFER path: the file is read server-side, "
+        "byte-exact. content_base64 makes you re-type the bytes, and long "
+        "payloads come back altered, so use it only for content that exists "
+        "nowhere on disk (write it to a file first when you can). Use for "
+        "genuine artifacts the next worker or a human should download — "
+        "reports, images, exports. Stored under the task's attachments dir, "
+        "capped at 25 MB. Prefer kanban_attach_url when you only have a URL. "
+        "Returns the stored SHA-256."
     ),
     "parameters": {
         "type": "object",
@@ -2271,9 +2435,27 @@ KANBAN_ATTACH_SCHEMA = {
                     "Directory components are stripped; only the leaf is kept."
                 ),
             },
+            "path": {
+                "type": "string",
+                "description": (
+                    "Absolute path of the file to attach, on the machine "
+                    "running the agent. Read byte-exact; no encoding needed. "
+                    "Pass this OR content_base64, not both."
+                ),
+            },
             "content_base64": {
                 "type": "string",
-                "description": "The file contents, base64-encoded. Max 25 MB decoded.",
+                "description": (
+                    "The file contents, base64-encoded (max 25 MB decoded). "
+                    "Fallback for content with no file; requires expected_sha256."
+                ),
+            },
+            "expected_sha256": {
+                "type": "string",
+                "description": (
+                    "SHA-256 hex digest of the original bytes. Required with "
+                    "content_base64; optional with path. A mismatch stores nothing."
+                ),
             },
             "content_type": {
                 "type": "string",
@@ -2281,7 +2463,7 @@ KANBAN_ATTACH_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["filename", "content_base64"],
+        "required": [],
     },
 }
 
@@ -2618,6 +2800,65 @@ KANBAN_LINK_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Home-session guard binding (see kanban_db.check_home_session)
+# ---------------------------------------------------------------------------
+
+_FOREIGN_OK_PROP = {
+    "type": "string",
+    "description": (
+        "Only when the card's home session is ANOTHER session and you are "
+        "not its assignee: the reason you must act on it anyway. The action "
+        "is then allowed and the reason is posted as a comment the home "
+        "session sees. Omit otherwise -- prefer kanban_comment on foreign cards."
+    ),
+}
+for _schema in (
+    KANBAN_COMPLETE_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_UNBLOCK_SCHEMA,
+    KANBAN_REQUEST_REVIEW_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
+    KANBAN_LINK_SCHEMA,
+):
+    _schema["parameters"]["properties"]["foreign_ok"] = _FOREIGN_OK_PROP
+
+
+def _caller_profile() -> Optional[str]:
+    prof = os.environ.get("HERMES_PROFILE")
+    if prof:
+        return prof
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or None
+    except Exception:
+        return None
+
+
+def _with_mutation_actor(handler):
+    """Bind the calling session/profile for the kanban_db home-session guard.
+
+    The guard itself lives in ONE place (``kanban_db._home_session_guarded``);
+    this only tells it who is calling. Session ids mirror exactly what
+    ``kanban_create`` stamps (origin id, then the resolved current id), so a
+    card created by this session always matches it.
+    """
+
+    def wrapped(args: dict, **kw) -> str:
+        from hermes_cli import kanban_db as _kb
+        from tools.async_delegation import _current_origin_session_id
+
+        with _kb.mutation_actor(
+            session_ids=(_current_origin_session_id(), _current_session_id()),
+            profile=_caller_profile(),
+            foreign_ok=(args or {}).get("foreign_ok"),
+            surface="tool",
+        ):
+            return handler(args, **kw)
+
+    wrapped.__name__ = getattr(handler, "__name__", "wrapped")
+    wrapped.__wrapped__ = handler
+    return wrapped
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -2643,7 +2884,7 @@ registry.register(
     name="kanban_complete",
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
-    handler=_handle_complete,
+    handler=_with_mutation_actor(_handle_complete),
     check_fn=_check_kanban_mode,
     emoji="✔",
 )
@@ -2652,7 +2893,7 @@ registry.register(
     name="kanban_block",
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
-    handler=_handle_block,
+    handler=_with_mutation_actor(_handle_block),
     check_fn=_check_kanban_mode,
     emoji="⏸",
 )
@@ -2661,7 +2902,7 @@ registry.register(
     name="kanban_request_review",
     toolset="kanban",
     schema=KANBAN_REQUEST_REVIEW_SCHEMA,
-    handler=_handle_request_review,
+    handler=_with_mutation_actor(_handle_request_review),
     check_fn=_check_kanban_mode,
     emoji="👀",
 )
@@ -2670,7 +2911,7 @@ registry.register(
     name="kanban_request_changes",
     toolset="kanban",
     schema=KANBAN_REQUEST_CHANGES_SCHEMA,
-    handler=_handle_request_changes,
+    handler=_with_mutation_actor(_handle_request_changes),
     check_fn=_check_kanban_mode,
     emoji="↩",
 )
@@ -2733,7 +2974,7 @@ registry.register(
     name="kanban_unblock",
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
-    handler=_handle_unblock,
+    handler=_with_mutation_actor(_handle_unblock),
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
 )
@@ -2742,7 +2983,7 @@ registry.register(
     name="kanban_link",
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
-    handler=_handle_link,
+    handler=_with_mutation_actor(_handle_link),
     check_fn=_check_kanban_mode,
     emoji="🔗",
 )

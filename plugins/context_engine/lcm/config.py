@@ -484,6 +484,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("doctor_clean_apply_enabled", "LCM_DOCTOR_CLEAN_APPLY_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_enabled", "LCM_EMPTY_LIFECYCLE_GC_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_threshold", "LCM_EMPTY_LIFECYCLE_GC_THRESHOLD", int),
+    _EnvFieldSpec("empty_lifecycle_gc_interval_hours", "LCM_EMPTY_LIFECYCLE_GC_INTERVAL_HOURS", float),
     _EnvFieldSpec("temporal_rollups_enabled", "LCM_TEMPORAL_ROLLUPS_ENABLED", bool),
     _EnvFieldSpec("rollup_daily_target_tokens", "LCM_ROLLUP_DAILY_TARGET_TOKENS", int),
     _EnvFieldSpec("rollup_daily_max_tokens", "LCM_ROLLUP_DAILY_MAX_TOKENS", int),
@@ -904,6 +905,9 @@ class LCMConfig:
     # ingested its first message yet. Set to 0 only in trusted/test
     # environments that intentionally want immediate empty-row pruning.
     empty_lifecycle_gc_max_age_hours: float | None = 24.0
+    # Minimum hours between GC passes per process (in-memory throttle). The
+    # pass runs from on_session_start on every agent init; <= 0 runs every time.
+    empty_lifecycle_gc_interval_hours: float = 6.0
 
     # -- Temporal rollups ---
     # Disabled by default; the engine's ingest/build hooks are flag-gated.

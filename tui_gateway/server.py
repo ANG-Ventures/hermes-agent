@@ -2978,12 +2978,15 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     # drivers (desktop app) can show an explicit "Summarizing…" indicator —
     # otherwise a mid-turn compaction looks like the transcript reset itself.
     if out_kind == "lifecycle":
-        from agent.confab_notice import CONFAB_NOTICE_TEXT
+        from agent.confab_notice import CONFAB_NOTICE_TEXT, TOOL_CALL_NOTICE_TEXT, confab_notice_status
         from agent.conversation_compression import COMPACTION_STATUS_MARKER
 
         if COMPACTION_STATUS_MARKER in body:
             out_kind = "compacting"
-        elif CONFAB_NOTICE_TEXT in body:
+        elif CONFAB_NOTICE_TEXT in body or any(
+            confab_notice_status(notice_kind) in body
+            for notice_kind in TOOL_CALL_NOTICE_TEXT
+        ):
             # Same reason: the confab notice also arrives as a generic
             # "lifecycle" status, and the desktop status handler renders
             # nothing for lifecycle text — so the live half of the triage
@@ -3066,6 +3069,81 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     return rid, method, params
 
 
+# ── Shared-checkout admission hold (gateway/checkout_admission.py) ──────
+# Every RPC -- stdio, and every existing or new WebSocket connection -- goes
+# through handle_request, so gating here covers persistent connections too.
+# Methods that start agent work take an admission ticket BEFORE the handler
+# persists anything; the ticket is released when the handler returns (by then
+# ``session["running"]`` counts the turn) or handed to the worker thread via
+# ``_start_counted_thread`` for fire-and-forget work (background / btw).
+_CHECKOUT_GATED_METHODS = frozenset({"prompt.submit", "prompt.background", "prompt.btw"})
+_checkout_gate_ref = None
+_checkout_rpc_ticket: contextvars.ContextVar = contextvars.ContextVar(
+    "checkout_rpc_ticket", default=None
+)
+
+
+def _serve_active_work() -> dict:
+    """Authoritative serve-process work: running sessions + side work."""
+    running = sum(1 for s in list(_sessions.values()) if s.get("running"))
+    counts = {"sessions_running": running}
+    try:
+        from agent.conversation_compression import compactions_in_flight
+
+        counts["compaction"] = int(compactions_in_flight())
+    except ImportError:
+        pass
+    try:
+        from cron.scheduler import get_running_job_ids
+
+        counts["cron"] = len(get_running_job_ids())
+    except ImportError:
+        pass
+    return counts
+
+
+def enable_checkout_admission(kind: str = "serve"):
+    """Install this process's admission gate (called by the serve lifespan).
+
+    Returns the gate (caller runs ``gate.publish_forever()`` on its serving
+    loop) or None when ``checkout_admission`` is disabled for this kind.
+    """
+    global _checkout_gate_ref
+    from gateway.checkout_admission import process_gate
+
+    gate = process_gate(kind)
+    if gate is not None:
+        gate.set_active_work(_serve_active_work)
+        gate.set_serving(lambda: {"ok": True, "sessions": len(_sessions)})
+    _checkout_gate_ref = gate
+    return gate
+
+
+def _start_counted_thread(target, *, name: str | None = None) -> threading.Thread:
+    """Start fire-and-forget agent work, keeping the RPC's admission ticket
+    (if any) held until the work finishes instead of until the RPC returns."""
+    box = _checkout_rpc_ticket.get()
+    ticket = None
+    if box is not None:
+        ticket, box["ticket"] = box.get("ticket"), None
+
+    def _run():
+        try:
+            target()
+        finally:
+            if ticket is not None:
+                ticket.release()
+
+    th = threading.Thread(target=_run, daemon=True, name=name)
+    try:
+        th.start()
+    except BaseException:
+        if ticket is not None:
+            ticket.release()
+        raise
+    return th
+
+
 def handle_request(req: dict) -> dict | None:
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
@@ -3075,11 +3153,30 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
+    box = None
+    gate = _checkout_gate_ref
+    if gate is not None and method in _CHECKOUT_GATED_METHODS:
+        from gateway.checkout_admission import AdmissionRefused
+
+        try:
+            box = {"ticket": gate.admit(f"rpc:{method}")}
+        except AdmissionRefused as exc:
+            logger.info("refusing %s: %s", method, exc.reason)
+            return _err(
+                rid,
+                5075,
+                "paused for a maintenance update; not accepting new turns — retry shortly",
+            )
     token = _current_rpc_method.set(method)
+    box_token = _checkout_rpc_ticket.set(box) if box is not None else None
     try:
         return fn(rid, params)
     finally:
+        if box_token is not None:
+            _checkout_rpc_ticket.reset(box_token)
         _current_rpc_method.reset(token)
+        if box is not None and box.get("ticket") is not None:
+            box["ticket"].release()
 
 
 def handle_request_bound(req: dict, transport: Optional[Transport] = None) -> dict | None:
@@ -7816,10 +7913,28 @@ def _get_usage(agent) -> dict:
     # data exists — e.g. Codex app-server reports no latency, and a session
     # with zero cache reads shows no hit% rather than an alarming 0.
     try:
+        from agent.usage_pricing import (
+            prompt_tokens_unknown, session_total_tokens_unknown,
+            session_usage_unknown_flags,
+        )
+
         _prompt_total = int(getattr(agent, "session_prompt_tokens", 0) or 0)
         _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
-        if _prompt_total > 0 and _cache_read > 0:
+        # UNKNOWN != 0, cumulative. Same absorbing rule as the classic CLI bar:
+        # an unmeasured call adds 0 to both terms, so a ratio over it is
+        # fabricated. Emit the explicit unknown flag and NO pct, rather than a
+        # number the TUI would colour as a real hit rate.
+        _flags = session_usage_unknown_flags(agent)
+        _ratio_unknown = (
+            prompt_tokens_unknown(_flags) or _flags["cache_read_tokens_unknown"]
+        )
+        if _ratio_unknown:
+            usage["cache_hit_unknown"] = True
+        elif _prompt_total > 0 and _cache_read > 0:
             usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
+        usage.update({f"session_{k}": v for k, v in _flags.items() if v})
+        if session_total_tokens_unknown(agent):
+            usage["session_total_tokens_unknown"] = True
     except Exception:
         pass
     try:
@@ -10118,6 +10233,20 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             continue
         role = m.get("role")
         if role not in {"user", "assistant", "tool", "system"}:
+            continue
+        from agent.confab_notice import confab_notice_status, is_metadata_only_tool_notice, notice_from_display_row
+        if is_metadata_only_tool_notice(m):
+
+            notice = notice_from_display_row(
+                role, m.get("display_kind"), m.get("display_metadata")
+            )
+            if notice:
+                messages.append({
+                    "role": "system",
+                    "text": confab_notice_status(notice["kind"]),
+                    "display_kind": "confab_notice",
+                    "display_metadata": m["display_metadata"],
+                })
             continue
         # An explicit display_kind="hidden" row is model-facing scaffolding
         # (compaction references, interrupted-turn checkpoints). The string
@@ -13526,6 +13655,23 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> bool:
+    # Every caller has already set session["running"] (so the turn is counted
+    # by _serve_active_work). Under a ``freeze`` hold even continuations are
+    # refused here -- before the turn thread starts -- and reported, never
+    # interrupted mid-run. ``drain`` admits them (they are counted).
+    _gate = _checkout_gate_ref
+    if _gate is not None:
+        _refusal = _gate.check(internal=True)
+        if _refusal is not None:
+            with session["history_lock"]:
+                session["running"] = False
+            logger.info("deferring turn for %s: %s", sid, _refusal.reason)
+            _emit(
+                "error",
+                sid,
+                {"message": "Paused for a maintenance update; this turn was not started — resend shortly."},
+            )
+            return False
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False

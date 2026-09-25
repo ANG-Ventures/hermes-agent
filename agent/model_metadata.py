@@ -578,6 +578,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     # moment it ships; the catch-all is for legacy Claude 3.x only.
     # (Substring match: this key also covers "claude-opus-5-fast", also 1M.)
     "claude-opus-5": 1000000,
+    # Claude Opus 5.5 (1M context, 128k max output) — released 2026-09-22.
+    # Listed explicitly rather than leaning on the "claude-opus-5" substring
+    # so the longest-key-first lookup resolves the exact id, and so the next
+    # id that breaks the prefix relationship still has a row here.
+    # (Substring match: this key also covers "claude-opus-5-5-fast", also 1M.)
+    "claude-opus-5-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4.8": 1000000,
     "claude-opus-4-7": 1000000,
@@ -4184,7 +4190,7 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     )
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k in ("_anthropic_content_blocks", "reasoning_details") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+        if k in ("_anthropic_content_blocks", "reasoning_details", "_src_idx") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
             continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it

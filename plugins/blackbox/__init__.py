@@ -57,6 +57,83 @@ _lock = Lock()
 _sessions: dict[str, dict[str, Any]] = {}
 
 
+def _field(obj: Any, key: str) -> Any:
+    return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+
+def _cache_creation_tiers(usage: Any) -> tuple[int | None, int | None]:
+    """Keep unreported cache tiers NULL rather than imputing them.
+
+    Two wire shapes carry the split: Anthropic-native ``usage.cache_creation``
+    (apx/apr, direct), and the OpenAI-shaped bpx/bpr bridge egress
+    ``usage.prompt_tokens_details.cache_creation`` (same inner keys).
+    """
+    creation = _field(usage, "cache_creation")
+    if not creation:
+        details = _field(usage, "prompt_tokens_details")
+        creation = _field(details, "cache_creation") if details is not None else None
+    if not creation or isinstance(creation, (int, float, str)):
+        return None, None
+    def value(key: str) -> int | None:
+        raw = _field(creation, key)
+        return int(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else None
+    return value("ephemeral_5m_input_tokens"), value("ephemeral_1h_input_tokens")
+
+
+def record_api_call(
+    *,
+    turn_id: str,
+    seq: int,
+    ts: float,
+    provider: str,
+    model: str,
+    usage: Any,
+    api_mode: str,
+    sub_key: str | None,
+    attribution: str,
+    http_status: int | None,
+    relay_synthetic: bool,
+    route_id: str | None,
+    cache_ttl_requested: str | None = None,
+) -> None:
+    """Persist one completion attempt when Blackbox is enabled.
+
+    This is deliberately a thin, fail-loud plugin boundary. The transport
+    caller owns fail-open handling so sequence-allocation or schema errors are
+    visible in logs without changing inference behavior.
+    """
+    if _config() is None:
+        return
+    from agent.usage_pricing import CanonicalUsage, normalize_usage
+    from plugins.blackbox import store
+
+    canonical = (
+        usage
+        if isinstance(usage, CanonicalUsage)
+        else normalize_usage(usage, provider=provider, api_mode=api_mode)
+        if usage is not None
+        else CanonicalUsage(request_count=0)
+    )
+    tier_5m, tier_1h = _cache_creation_tiers(usage)
+    store.insert_api_call(
+        turn_id,
+        seq,
+        ts=ts,
+        provider=provider,
+        model=model,
+        usage=canonical,
+        sub_key=sub_key,
+        attribution=attribution,
+        http_status=http_status,
+        relay_synthetic=relay_synthetic,
+        route_id=route_id,
+        cache_write_5m=tier_5m,
+        cache_write_1h=tier_1h,
+        cache_ttl_requested=cache_ttl_requested,
+    )
+
+
+
 def _turn_id() -> str:
     return "turn_" + uuid.uuid4().hex
 
@@ -323,7 +400,7 @@ def _build_record(
     )
 
     return TurnRecord(
-        turn_id=_turn_id(),
+        turn_id=str(kwargs.get("turn_id") or _turn_id()),
         parent_turn_id=usage.get("parent_turn_id"),
         is_subagent=is_subagent,
         depth=depth,
@@ -339,14 +416,24 @@ def _build_record(
         tools=list(state.get("tools") or []),
         input_tokens=_int_value(usage.get("input_tokens")),
         output_tokens=_int_value(usage.get("output_tokens")),
+        output_tokens_unknown=bool(usage.get("output_tokens_unknown")),
+        input_tokens_unknown=bool(usage.get("input_tokens_unknown")),
+        cache_read_tokens_unknown=bool(usage.get("cache_read_tokens_unknown")),
+        cache_write_tokens_unknown=bool(usage.get("cache_write_tokens_unknown")),
+        usage_unknown=bool(usage.get("usage_unknown")),
         cache_read_tokens=_int_value(usage.get("cache_read_tokens")),
         cache_write_tokens=_int_value(usage.get("cache_write_tokens")),
+        idle_compaction_fired=usage.get("idle_compaction_fired"),
+        compaction_tokens_before=_int_or_none_value(usage.get("compaction_tokens_before")),
+        compaction_tokens_after=_int_or_none_value(usage.get("compaction_tokens_after")),
+        compaction_cost_usd=usage.get("compaction_cost_usd"),
         reasoning_tokens=_int_value(usage.get("reasoning_tokens")),
         context_used=_int_value(usage.get("context_used")),
         context_length=_int_value(usage.get("context_length")),
         last_cache_read_tokens=_int_or_none_value(usage.get("last_cache_read_tokens")),
         last_cache_write_tokens=_int_or_none_value(usage.get("last_cache_write_tokens")),
         last_uncached_tokens=_int_or_none_value(usage.get("last_uncached_tokens")),
+        last_call_prompt_unknown=bool(usage.get("last_call_prompt_unknown")),
         comp_sys_tokens=_comp_get(usage, "sys_tokens"),
         comp_tool_schema_tokens=_comp_get(usage, "tool_schema_tokens"),
         comp_history_tokens=_comp_get(usage, "history_tokens"),
@@ -369,6 +456,11 @@ def _build_record(
         final_text=str(final_response or "") if store_text else "",
         tool_calls=tool_calls if store_text else [],
         cli_invocation_id=kwargs.get("cli_invocation_id"),
+        terminal_error=(
+            str(kwargs.get("turn_exit_reason") or "failed")
+            if kwargs.get("failed")
+            else None
+        ),
     )
 
 

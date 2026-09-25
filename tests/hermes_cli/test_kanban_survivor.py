@@ -179,7 +179,14 @@ def test_workspace_deletion_has_one_choke_point():
                 if name == "rmtree" or {"worktree", "remove"} <= strings or any("rm -rf" in s for s in strings):
                     removals.append((path.name, node.name))
     assert removals
-    assert set(removals) == {("kanban_survivor.py", "remove_workspace_dir")}
+    assert set(removals) == {
+        ("kanban_survivor.py", "remove_workspace_dir"),
+        # Reviewed exception (t_dad1edd7 QA r2 R1): discards dead mirror
+        # staging repos -- <mirrors>/<owner>/.<repo>.git.build-* only, under
+        # the mirror flock, never a workspace. Resuming them in place instead
+        # promoted a killed fetch's tmp_pack residue into the precious mirror.
+        ("kanban_clone.py", "_discard_dead_builds"),
+    }
 
 
 @pytest.mark.parametrize("target", [None, "missing"])
@@ -541,15 +548,17 @@ def test_record_baseline_skips_unreadable_dirs_instead_of_failing_dispatch(board
     # negative control: a non-permission walk error still propagates
     class Boom(OSError):
         pass
-    def exploding_walk(*a, **k):
-        k["onerror"](Boom("disk on fire"))
-        return iter(())
+    def exploding_scandir(*a, **k):
+        raise Boom("disk on fire")
     conn.execute("DELETE FROM task_workspace_survivors WHERE task_id = ?", (tid,))
     conn.commit()
-    orig = survivor.os.walk
-    survivor.os.walk = exploding_walk
+    # The enumeration reads directories via os.scandir (t_6c46905a replaced the
+    # os.walk form to drop a per-child is_symlink stat and to bound the walk).
+    # The PROPERTY under test is unchanged: only PermissionError is swallowed.
+    orig = survivor.os.scandir
+    survivor.os.scandir = exploding_scandir
     try:
         with pytest.raises(Boom):
             survivor.record_baseline(conn, tid, ws)
     finally:
-        survivor.os.walk = orig
+        survivor.os.scandir = orig

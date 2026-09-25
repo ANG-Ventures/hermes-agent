@@ -76,9 +76,29 @@ def test_cli_publishes_terminal_result(cli_worker, monkeypatch, capsys, reason, 
     payload = json.loads(cli_worker.read_text())
     assert payload["exit_code"] == code
     assert payload["failure_reason"] == reason
+    assert payload["model_turn_completed"] is False
     assert isinstance(payload["ts"], (int, float))
     assert "error" not in payload
     assert judge_calls == ([] if reason else [True])
+
+
+def test_cli_receipt_marks_a_successful_model_response(cli_worker, monkeypatch):
+    result = {
+        "failed": False,
+        "completed": True,
+        "failure_reason": None,
+        "error": "",
+        "final_response": "Nothing to implement: already fixed by #889.",
+    }
+    monkeypatch.setattr(cli, "HermesCLI", fake_cli(result))
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(query="work", quiet=True, toolsets="terminal")
+
+    assert exc.value.code == 0
+    payload = json.loads(cli_worker.read_text())
+    assert payload["exit_code"] == 0
+    assert payload["model_turn_completed"] is True
 
 
 def test_goal_continuation_quota_escapes_before_judge_block(cli_worker, monkeypatch):

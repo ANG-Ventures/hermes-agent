@@ -10,7 +10,7 @@ import tempfile
 import time
 
 
-# Exit classes stamped into the receipt. All three route to the
+# Exit classes stamped into the receipt. All of them route to the
 # retry-preserving ``KANBAN_RATE_LIMIT_EXIT_CODE``; they are kept distinct so
 # telemetry (the receipt, the ``rate_limited`` event payload, the worker-exit
 # hook) can tell a quota wall from a capped relay pool from a vendor that is
@@ -18,6 +18,7 @@ import time
 EXIT_CLASS_QUOTA = "quota"                        # rate_limit / billing
 EXIT_CLASS_POOL_EXHAUSTED = "pool_exhausted"      # our relay: no eligible sub
 EXIT_CLASS_UPSTREAM_CAPACITY = "upstream_capacity"  # vendor 529/503 overload
+EXIT_CLASS_PINNED_PROVIDER = "pinned_provider_unavailable"  # card pin refused a failover
 
 # Upstream CAPACITY overload — the vendor (Anthropic/OpenAI 529-style) is
 # full. Matched only when the classifier already stamped
@@ -75,6 +76,10 @@ def worker_exit_class(failure_reason: str | None, error: str = "") -> str | None
         return EXIT_CLASS_POOL_EXHAUSTED
     if is_upstream_capacity_exit(failure_reason, error):
         return EXIT_CLASS_UPSTREAM_CAPACITY
+    if failure_reason == EXIT_CLASS_PINNED_PROVIDER:
+        # A card-pinned worker refused a runtime failover and its pinned
+        # provider kept failing (t_ed0289e3): a route outage, not a task error.
+        return EXIT_CLASS_PINNED_PROVIDER
     return None
 
 
@@ -87,6 +92,15 @@ class WorkerExit(SystemExit):
 
         self.failure_reason = result.get("failure_reason") if isinstance(result, dict) else None
         self.exit_class = None
+        # Positive evidence for the dispatcher's reproduced-clean-exit shortcut.
+        # A provider/bootstrap abort can also exit 0 on older wrappers, but it
+        # cannot produce a successful model response. Fail closed: absent and
+        # legacy receipts remain ineligible for the shortcut.
+        self.model_turn_completed = bool(
+            isinstance(result, dict)
+            and not result.get("failed")
+            and result.get("final_response")
+        )
         code = 0
         if isinstance(result, dict) and result.get("failed"):
             code = 1
@@ -110,6 +124,7 @@ def report_exit(exc: BaseException | None) -> None:
         code,
         getattr(exc, "failure_reason", None),
         exit_class=getattr(exc, "exit_class", None),
+        model_turn_completed=bool(getattr(exc, "model_turn_completed", False)),
     )
 
 
@@ -139,8 +154,21 @@ def read_exit_class(path: Path) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def write_exit_status(code: int, failure_reason: str | None = None,
-                      exit_class: str | None = None) -> None:
+def read_model_turn_completed(path: Path) -> bool:
+    """Whether this run produced a successful model response.
+
+    Missing/legacy/malformed receipts fail closed: they cannot authorize the
+    reproduced-clean-exit shortcut.
+    """
+    return _read_receipt(path).get("model_turn_completed") is True
+
+
+def write_exit_status(
+    code: int,
+    failure_reason: str | None = None,
+    exit_class: str | None = None,
+    model_turn_completed: bool = False,
+) -> None:
     """Atomically publish only from the owning worker; never record error text."""
     from agent.delegation_context import owns_kanban_worker_authority
 
@@ -153,8 +181,13 @@ def write_exit_status(code: int, failure_reason: str | None = None,
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=path.name + ".", delete=False) as stream:
             temp = Path(stream.name)
-            json.dump({"exit_code": code, "failure_reason": failure_reason,
-                       "exit_class": exit_class, "ts": time.time()}, stream)
+            json.dump({
+                "exit_code": code,
+                "failure_reason": failure_reason,
+                "exit_class": exit_class,
+                "model_turn_completed": model_turn_completed is True,
+                "ts": time.time(),
+            }, stream)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp, path)

@@ -65,6 +65,11 @@ DEFAULT_GUARD_ENABLED = True
 # success, fallback activation) without touching them.
 _ATTEMPTS_ATTR = "_empty_attempt_history"
 _STREAK_COST_ATTR = "_empty_streak_cost_usd"
+# True when any attempt in this streak could only be priced from its MEASURED
+# buckets (some bucket was declared unmeasured). The accumulated streak cost is
+# then a LOWER BOUND, and the user-facing line must say so rather than present
+# a floor as an estimate of the whole.
+_STREAK_COST_FLOORED_ATTR = "_empty_streak_cost_is_floor"
 _ENABLED_ATTR = "_empty_guard_enabled"
 _THRESHOLD_ATTR = "_empty_guard_cost_threshold_usd"
 
@@ -144,19 +149,82 @@ def _attempts(agent: Any) -> List[EmptyAttempt]:
     return attempts
 
 
+def _attempt_cost_is_floor(agent: Any, response: Any) -> bool:
+    """Was this attempt's cost priceable only from its MEASURED buckets?
+
+    Split out from the cost itself so ``_estimate_attempt_cost`` stays the ONE
+    seam every caller (and every test double) goes through for the number. The
+    discriminator is a separate question about the same payload, and this path
+    runs at most a handful of times per empty streak, so re-normalizing is free.
+    """
+    raw_usage = getattr(response, "usage", None)
+    if not raw_usage:
+        return False
+    try:
+        from agent.usage_pricing import normalize_usage
+
+        return bool(
+            normalize_usage(
+                raw_usage,
+                provider=getattr(agent, "provider", None),
+                api_mode=getattr(agent, "api_mode", None),
+            ).total_tokens_unknown
+        )
+    except Exception:  # noqa: BLE001 — pricing must never break the loop
+        logger.debug("empty-guard: floor discrimination failed", exc_info=True)
+        return False
+
+
+def _attempt_cost(agent: Any, response: Any) -> Tuple[Optional[Decimal], bool]:
+    """``(cost, is_floor)`` for one attempt. ``(None, False)`` when unpriceable.
+
+    ``is_floor`` is True when the provider declared some bucket unmeasured and
+    the number is therefore a MEASURED-BUCKETS-ONLY lower bound, not the whole
+    bill. ``estimate_usage_cost`` refuses that usage outright (the settled
+    UNKNOWN contract), which used to make this guard silently inert for exactly
+    the payloads guard #1 also fails open on — a bridge that nulls only its
+    output count kept the full 3-retry budget while re-sending a measured 400k
+    prompt each time (r6 round-4 finding 3). The floor can only understate the
+    bill, so a ceiling comparison against it never trips early.
+    """
+    cost = _estimate_attempt_cost(agent, response)
+    if cost is None:
+        return (None, False)
+    return (cost, _attempt_cost_is_floor(agent, response))
+
+
 def _estimate_attempt_cost(agent: Any, response: Any) -> Optional[Decimal]:
-    """Best-effort USD estimate for one attempt. None when unknown."""
+    """Best-effort USD estimate for one attempt. None when unknown.
+
+    For a usage whose total is UNKNOWN this returns the MEASURED-BUCKETS floor
+    rather than nothing: ``estimate_usage_cost`` correctly refuses to state that
+    usage's cost, but the retry-budget DECISION still has the data it needs, and
+    a lower bound can only fail safe. Callers that display the figure must ask
+    ``streak_cost_is_floor`` and say "at least" (r6 round-4 finding 3).
+    """
     raw_usage = getattr(response, "usage", None)
     if not raw_usage:
         return None
     try:
-        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+        from agent.usage_pricing import (
+            estimate_usage_cost,
+            measured_cost_floor,
+            normalize_usage,
+        )
 
         canonical = normalize_usage(
             raw_usage,
             provider=getattr(agent, "provider", None),
             api_mode=getattr(agent, "api_mode", None),
         )
+        if canonical.total_tokens_unknown:
+            return measured_cost_floor(
+                getattr(agent, "model", "") or "",
+                canonical,
+                provider=getattr(agent, "provider", None),
+                base_url=getattr(agent, "base_url", None),
+                api_key=getattr(agent, "api_key", None),
+            )
         result = estimate_usage_cost(
             getattr(agent, "model", "") or "",
             canonical,
@@ -189,6 +257,16 @@ def _zero_output(agent: Any, response: Any) -> tuple:
     output = getattr(canonical, "output_tokens", None)
     if output is None:
         return (False, False)
+    # UNKNOWN != 0. A provider that declared its output unmeasured (the bridge's
+    # ``completion_tokens: null`` + ``output_tokens_unavailable``) normalizes to
+    # output_tokens=0 with the discriminator set — that is MISSING usage, not
+    # evidence the model generated nothing. Reading it as a measured zero would
+    # let two such attempts satisfy ``deterministic_empty()`` and cut the retry
+    # budget on a transient, contradicting this module's own fail-open rule.
+    if getattr(canonical, "output_tokens_unknown", False) or getattr(
+        canonical, "usage_unknown", False
+    ):
+        return (False, False)
     # A present-but-empty usage object (some proxies emit usage with no
     # fields) normalizes to all zeros. A genuine completion always has
     # input tokens — without them the usage is not evidence, fail open.
@@ -213,6 +291,7 @@ def record_empty_attempt(agent: Any, *, finish_reason: str, response: Any) -> No
     if getattr(agent, "_empty_content_retries", 0) == 0:
         attempts.clear()
         setattr(agent, _STREAK_COST_ATTR, Decimal("0"))
+        setattr(agent, _STREAK_COST_FLOORED_ATTR, False)
 
     usage_present, zero_output = _zero_output(agent, response)
     attempts.append(
@@ -225,10 +304,12 @@ def record_empty_attempt(agent: Any, *, finish_reason: str, response: Any) -> No
         )
     )
 
-    cost = _estimate_attempt_cost(agent, response)
+    cost, is_floor = _attempt_cost(agent, response)
     if cost is not None and cost > 0:
         prior = getattr(agent, _STREAK_COST_ATTR, Decimal("0")) or Decimal("0")
         setattr(agent, _STREAK_COST_ATTR, prior + cost)
+        if is_floor:
+            setattr(agent, _STREAK_COST_FLOORED_ATTR, True)
 
 
 def deterministic_empty(agent: Any) -> bool:
@@ -270,3 +351,14 @@ def streak_cost_usd(agent: Any) -> Optional[Decimal]:
     if cost is None or cost <= 0:
         return None
     return cost
+
+
+def streak_cost_is_floor(agent: Any) -> bool:
+    """True when ``streak_cost_usd`` is a lower bound, not a whole-bill estimate.
+
+    Set when any attempt in the streak had a declared-unmeasured bucket and was
+    therefore priced from its measured buckets only. The user-facing line must
+    say "at least" rather than present a floor as the estimate — an UNKNOWN
+    shown as an exact figure is the defect class this work removes.
+    """
+    return bool(getattr(agent, _STREAK_COST_FLOORED_ATTR, False))

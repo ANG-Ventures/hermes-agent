@@ -95,6 +95,12 @@ class TestEstimateMessagesTokensRough:
             estimate_messages_tokens_rough([msg])
         )
 
+    def test_compaction_source_index_does_not_change_estimate(self):
+        """A transient restore stamp cannot move the compaction tail boundary."""
+        rows = [{"role": "user", "content": f"turn {i}"} for i in range(40)]
+        stamped = [dict(row, _src_idx=i) for i, row in enumerate(rows)]
+        assert estimate_messages_tokens_rough(stamped) == estimate_messages_tokens_rough(rows)
+
     def test_message_with_list_content(self):
         """Vision messages with multimodal content arrays.
 
@@ -353,6 +359,7 @@ class TestDefaultContextLengths:
              mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
              mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
             one_m = (
+                "claude-opus-5-5",
                 "claude-opus-5",
                 "claude-sonnet-5",
                 "claude-fable-5",
@@ -453,6 +460,8 @@ class TestDefaultContextLengths:
         from unittest.mock import patch as mock_patch
 
         frontier = [
+            "claude-opus-5-5",
+            "claude-opus-5-5-fast",
             "claude-opus-5",
             "claude-opus-5-fast",
             "claude-sonnet-5",
@@ -1432,17 +1441,21 @@ class TestStripProviderPrefix:
     def test_registered_profile_name_and_alias_are_stripped(self, monkeypatch):
         import providers
         from providers import ProviderProfile
+        from hermes_cli import provider_seam
 
-        monkeypatch.setattr(providers, "_REGISTRY", {})
-        monkeypatch.setattr(providers, "_ALIASES", {})
-        monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+        generation = provider_seam.current()
+        provider_seam._reset("_REGISTRY", "_ALIASES")
         monkeypatch.setattr(providers, "_discovered", True)
-        providers.register_provider(
-            ProviderProfile(name="fake-provider", aliases=("fake-alias",))
-        )
+        try:
+            providers.register_provider(
+                ProviderProfile(name="fake-provider", aliases=("fake-alias",))
+            )
 
-        assert _strip_provider_prefix("fake-provider:org/model") == "org/model"
-        assert _strip_provider_prefix("fake-alias:org/model") == "org/model"
+            assert _strip_provider_prefix("fake-provider:org/model") == "org/model"
+            assert _strip_provider_prefix("fake-alias:org/model") == "org/model"
+        finally:
+            provider_seam._restore(generation)
+
 
     def test_bundled_plugin_provider_prefix_is_stripped(self):
         assert _strip_provider_prefix("fireworks:accounts/fireworks/models/foo") == (

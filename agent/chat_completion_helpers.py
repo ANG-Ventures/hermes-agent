@@ -40,6 +40,7 @@ from agent.confab_notice import (
     CONFAB_NOTICE_FIELD,
     CONFAB_NOTICE_KEY,
     extract_confab_notice,
+    is_metadata_only_tool_notice,
 )
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, _ceil_chars_to_tokens
@@ -54,6 +55,7 @@ from agent.message_sanitization import (
 from agent.fork_ext.relay_headers import _pool_affinity_headers, _pool_lane, _pool_lane_src
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.shared_transport_guard import _TAILSCALE_RELAY_PROVIDERS
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -62,6 +64,260 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
+_POOL_HEADER_NAMES = (
+    "x-pool-served-by",
+    "x-pool-route-id",
+    "x-pool-unreachable",
+)
+_POOLED_PROVIDERS = _TAILSCALE_RELAY_PROVIDERS
+_PINNED_PROVIDER_KEYS = {
+    "xai-oauth": "supergrok",
+    "gemini-bridge": "gemini",
+}
+_PINNED_CLAUDE_PROVIDER_RE = re.compile(r"^claude-[ab]px-\d+$")
+_POOL_SUB_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_API_CALL_SEQ_INIT_LOCK = threading.Lock()
+_API_CALL_FAILURE_LOCK = threading.Lock()
+
+
+
+def _snapshot_pool_headers(response: Any) -> dict[str, str]:
+    """Copy only relay-minted attribution headers from an httpx response."""
+    source = getattr(response, "headers", None)
+    if source is None:
+        return {}
+    snapshot: dict[str, str] = {}
+    for name in _POOL_HEADER_NAMES:
+        try:
+            value = source.get(name)
+        except Exception:
+            value = None
+        if value is not None:
+            snapshot[name] = str(value)
+    return snapshot
+
+
+
+def _stamp_pool_headers(message: Any, headers: dict[str, str]) -> Any:
+    """Keep one call's identity carrier beside that call's native usage."""
+    if message is not None:
+        setattr(message, "pool_headers", dict(headers))
+    return message
+
+
+
+def _next_api_call_seq(agent: Any, turn_id: str) -> int:
+    """Allocate a per-turn call sequence under the accumulator's lock."""
+    lock = getattr(agent, "_api_call_seq_lock", None)
+    if lock is None:
+        # Agent setup is single-threaded, but two first calls can still race in
+        # tests or unusual embeddings. A module lock makes lazy installation
+        # deterministic without retaining the agent in global state.
+        with _API_CALL_SEQ_INIT_LOCK:
+            lock = getattr(agent, "_api_call_seq_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                agent._api_call_seq_lock = lock
+    with lock:
+        counters = getattr(agent, "_api_call_seq_by_turn", None)
+        if not isinstance(counters, dict):
+            counters = {}
+            agent._api_call_seq_by_turn = counters
+        seq = int(counters.get(turn_id, 0))
+        counters[turn_id] = seq + 1
+        return seq
+
+
+
+def _codex_sub_key(agent: Any) -> Optional[str]:
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is None:
+        return None
+    try:
+        current = pool.current()
+        if current is None:
+            return None
+        from hermes_cli.auth import get_codex_account_id
+
+        account_id = get_codex_account_id(current.access_token)
+        return f"codex:{account_id[:8]}" if account_id else None
+    except Exception:
+        return None
+
+
+
+def _api_call_identity(agent: Any, headers: dict[str, str]) -> tuple[Optional[str], str]:
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    served_by = headers.get("x-pool-served-by")
+    if served_by:
+        if _POOL_SUB_KEY_RE.fullmatch(served_by):
+            return served_by, "wire"
+        _note_api_call_recording_failure(agent)
+        logger.warning("invalid x-pool-served-by value; recording NULL identity")
+    if _PINNED_CLAUDE_PROVIDER_RE.fullmatch(provider):
+        return provider, "pinned"
+    if provider in _PINNED_PROVIDER_KEYS:
+        return _PINNED_PROVIDER_KEYS[provider], "pinned"
+    if provider == "openai-codex":
+        return _codex_sub_key(agent), "wire"
+    return None, "wire"
+
+
+
+def _note_api_call_recording_failure(agent: Any) -> None:
+    """Expose fail-open ledger loss to in-process health/status probes."""
+    try:
+        with _API_CALL_FAILURE_LOCK:
+            agent._api_call_recording_failures = int(
+                getattr(agent, "_api_call_recording_failures", 0) or 0
+            ) + 1
+    except Exception:
+        pass
+
+
+
+def _requested_cache_ttl(api_kwargs: dict | None) -> str | None:
+    """Read outbound cache markers, not the potentially clamped config tier."""
+    if not isinstance(api_kwargs, dict):
+        return None
+    found = set()
+    def walk(node):
+        if isinstance(node, dict):
+            marker = node.get("cache_control")
+            if isinstance(marker, dict) and marker.get("type") == "ephemeral":
+                found.add("1h" if marker.get("ttl") == "1h" else "5m")
+            for value in node.values():
+                if isinstance(value, (list, dict)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+    for key in ("system", "messages", "tools"):
+        walk(api_kwargs.get(key))
+    return "1h" if "1h" in found else "5m" if "5m" in found else None
+
+
+def _emit_api_call_record(
+    agent: Any,
+    *,
+    usage: Any,
+    headers: Optional[dict[str, str]] = None,
+    http_status: Optional[int] = None,
+    api_kwargs: Optional[dict] = None,
+) -> None:
+    """Fail-open bridge from the inference chokepoint to Blackbox.
+
+    An empty turn id means no conversation turn is in progress (startup probes
+    and provider health checks); those calls intentionally have no parent
+    ``turns`` row and are outside the per-turn ledger contract.
+    """
+    try:
+        turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+        if not turn_id:
+            return
+        provider = str(getattr(agent, "provider", "") or "")
+        model = str(getattr(agent, "model", "") or "")
+        pool_headers = dict(headers or {})
+        sub_key, attribution = _api_call_identity(agent, pool_headers)
+        seq = _next_api_call_seq(agent, turn_id)
+        from plugins.blackbox import record_api_call
+
+        record_api_call(
+            turn_id=turn_id,
+            seq=seq,
+            ts=time.time(),
+            provider=provider,
+            model=model,
+            usage=usage,
+            api_mode=str(getattr(agent, "api_mode", "") or ""),
+            sub_key=sub_key,
+            attribution=attribution,
+            http_status=http_status,
+            relay_synthetic="x-pool-unreachable" in pool_headers,
+            route_id=pool_headers.get("x-pool-route-id"),
+            cache_ttl_requested=_requested_cache_ttl(api_kwargs),
+        )
+    except Exception:
+        _note_api_call_recording_failure(agent)
+        logger.warning("blackbox API-call attribution insert failed", exc_info=True)
+
+
+
+def _note_billed_response(agent: Any, response: Any) -> None:
+    """Register a transport-accepted (billed) response for loop accounting.
+
+    The per-call ledger row is written HERE, at the transport chokepoint, for
+    every HTTP-200 the provider returns. The conversation loop's session
+    counters and Blackbox ``_turn_calls`` only commit the response the loop
+    ACCEPTS; one it rejects afterwards (content-filter refusal, invalid shape,
+    length/empty retry, redirect crossing) and fails over from was still
+    billed, and used to vanish from the turn totals (I4 class 2).
+
+    Every billed response is therefore parked in ``agent._billed_unaccounted``
+    together with the route that produced it (the provider/model change on
+    failover, so they must be captured now). The loop's accept site consumes
+    the entry it commits; anything still parked at the next attempt, or at
+    turn end, is settled by
+    ``conversation_loop._settle_unaccepted_billed_responses``.
+    Fail-open: accounting must never break the call.
+    """
+    try:
+        pending = getattr(agent, "_billed_unaccounted", None)
+        if not isinstance(pending, list):
+            pending = []
+            agent._billed_unaccounted = pending
+        pending.append({
+            "response": response,
+            "provider": str(getattr(agent, "provider", "") or ""),
+            "model": str(getattr(agent, "model", "") or ""),
+            "base_url": str(getattr(agent, "base_url", "") or ""),
+            "api_mode": str(getattr(agent, "api_mode", "") or ""),
+            "turn_id": str(getattr(agent, "_current_turn_id", "") or ""),
+        })
+    except Exception:
+        logger.debug("billed-response registration failed", exc_info=True)
+
+
+def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[dict] = None) -> None:
+    if response is None or getattr(response, "_api_call_failure_recorded", False):
+        return
+    # Registered BEFORE the pooled-header guard below: a response whose ledger
+    # row cannot be attributed was still billed and must still be counted.
+    _note_billed_response(agent, response)
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if provider in _POOLED_PROVIDERS and not hasattr(response, "pool_headers"):
+        _note_api_call_recording_failure(agent)
+        logger.warning(
+            "pooled provider response lost pool_headers stamp; skipping "
+            "per-call attribution (provider=%s api_mode=%s)",
+            provider,
+            getattr(agent, "api_mode", ""),
+        )
+        return
+    headers = getattr(response, "pool_headers", None)
+    _emit_api_call_record(
+        agent,
+        usage=getattr(response, "usage", None),
+        headers=headers if isinstance(headers, dict) else {},
+        http_status=200,
+        api_kwargs=api_kwargs,
+    )
+
+
+
+def _record_failed_api_call(agent: Any, error: BaseException, api_kwargs: Optional[dict] = None) -> None:
+    response = getattr(error, "response", None)
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(response, "status_code", None)
+    _emit_api_call_record(
+        agent,
+        usage=None,
+        headers=_snapshot_pool_headers(response),
+        http_status=int(status) if isinstance(status, int) else None,
+        api_kwargs=api_kwargs,
+    )
+
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -996,7 +1252,29 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client(
             "anthropic_messages_request", kind="anthropic_messages"
         )
-        return agent._anthropic_messages_create(api_kwargs, client=request_client)
+        pool_headers: dict[str, str] = {}
+
+        def _capture_with_pool_headers(http_response: Any) -> None:
+            pool_headers.update(_snapshot_pool_headers(http_response))
+            agent._capture_anthropic_response_headers(http_response)
+
+        # Keep the agent seam — interrupt/stale watchdog tests and the 413
+        # recovery path mock it, and a non-pooled provider has no attribution
+        # headers to snapshot. Only widen the call with the pool-header
+        # callback for pooled providers, where the wire stamp is the contract.
+        # The callback is call-scoped: swapping one onto the shared agent races
+        # interrupt-abandoned workers and can transpose two calls' headers.
+        if str(getattr(agent, "provider", "") or "").strip().lower() in _POOLED_PROVIDERS:
+            message = agent._anthropic_messages_create(
+                api_kwargs,
+                client=request_client,
+                on_response=_capture_with_pool_headers,
+            )
+        else:
+            message = agent._anthropic_messages_create(
+                api_kwargs, client=request_client
+            )
+        return _stamp_pool_headers(message, pool_headers)
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
         # normalize_converse_response produces an OpenAI-compatible
@@ -1049,6 +1327,13 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    if str(getattr(agent, "provider", "") or "").strip().lower() in _POOLED_PROVIDERS:
+        # _create_request_openai_client is the sole make_client supplied here;
+        # it returns the OpenAI SDK client (or a test Mock, which never routes a
+        # real pooled call). The SDK guarantees with_raw_response + parse().
+        raw_response = request_client.chat.completions.with_raw_response.create(**api_kwargs)
+        response = raw_response.parse()
+        return _stamp_pool_headers(response, _snapshot_pool_headers(raw_response))
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -1280,7 +1565,9 @@ def direct_api_call(agent, api_kwargs: dict):
         # ticker only refreshes the activity clock.
         while not activity_hb_stop.wait(_DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS):
             try:
-                agent._touch_activity("waiting for non-streaming API response")
+                agent._touch_activity(
+                    "waiting for non-streaming API response", progress=False,
+                )
             except Exception:
                 pass
 
@@ -1403,7 +1690,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
-        return direct_api_call(agent, api_kwargs)
+        try:
+            response = direct_api_call(agent, api_kwargs)
+        except Exception as exc:
+            _record_failed_api_call(agent, exc, api_kwargs)
+            raise
+        _record_successful_api_call(agent, response, api_kwargs)
+        return response
 
     result = {"response": None, "error": None}
 
@@ -1990,11 +2283,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _join_worker_for_relay_teardown(t, label="Non-streaming")
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
+        _record_failed_api_call(agent, result["error"], api_kwargs)
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _record_successful_api_call(agent, result["response"], api_kwargs)
     return result["response"]
 
 
@@ -3300,6 +3595,20 @@ def try_activate_fallback(
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)  # skip invalid, try next
 
+    # A card-pinned kanban worker never leaves its pinned provider mid-turn
+    # (t_ed0289e3): a card pinned to openai-codex to escape a bridge fault must
+    # not run on the bridge after the first codex error. Skip cross-provider
+    # entries (same-provider ones stay usable); an exhausted chain returns
+    # False and the run ends retry-preserving via apply_pin_refusal_to_result.
+    from hermes_cli.kanban_worker_route import refuse_runtime_failover
+
+    if refuse_runtime_failover(agent, fb_provider, fb_model, reason):
+        logger.warning(
+            "Fallback skip: %s/%s refused — kanban card pins this worker's provider",
+            fb_provider, fb_model,
+        )
+        return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)
+
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
         unavailable.add(fb_key)
@@ -3896,6 +4205,16 @@ def try_activate_fallback(
                 "failover", old_provider, old_model, fb_provider, fb_model,
                 old_effort=_old_eff, new_effort=_new_eff,
             )
+            # Kanban worker: put the swap on the card's run (t_4fe0700a) so
+            # a pinned route that ended up elsewhere is visible on the board.
+            from hermes_cli.kanban_worker_route import (
+                record_worker_route_substitution,
+            )
+            record_worker_route_substitution(
+                stage="runtime", from_provider=old_provider, from_model=old_model,
+                to_provider=fb_provider, to_model=fb_model,
+                reason=getattr(reason, "value", reason),
+            )
             # Chat announce — gated on model.announce_route_change (default on).
             _announce_on = True
             try:
@@ -3996,6 +4315,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
         for msg in messages:
+            if is_metadata_only_tool_notice(msg):
+                continue
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason"):
@@ -4020,7 +4341,29 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # here, diverging the summary request's prefix at the EARLIEST
             # sidecar-carrying message and re-prefilling the whole transcript
             # at exactly the moment the context is largest.
-            substitute_api_content(api_msg)
+            _api_content = substitute_api_content(api_msg)
+            # Display-only timeline metadata (#764 confab notice, model-switch
+            # / typed event rows, hidden redirect placeholders). Never a
+            # provider field — mirror the main loop's api_msg builder, which
+            # pops both from every outgoing copy. Without this a DB-reloaded
+            # confab row sends display_kind + display_metadata (bridge
+            # request_id, detector grammar label) on the summary request, and
+            # strict Chat Completions gateways reject the unknown keys.
+            _display_kind = api_msg.pop("display_kind", None)
+            api_msg.pop("display_metadata", None)
+            # Same legacy hidden-placeholder heal as the main loop (#88955):
+            # once display_kind is stripped, an empty hidden assistant row
+            # with no sidecar would otherwise go out as empty assistant text.
+            if (
+                _display_kind == "hidden"
+                and api_msg.get("role") == "assistant"
+                and not _api_content
+                and not (api_msg.get("content") or "").strip()
+                and not api_msg.get("tool_calls")
+            ):
+                from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+
+                api_msg["content"] = _INTERRUPTED_PLACEHOLDER
             if _needs_sanitize:
                 # In MoA mode, agent.model is the virtual preset name,
                 # not the actual aggregator model.  Resolve the real
@@ -4067,6 +4410,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     api_msg.pop(internal_key, None)
 
         summary_extra_body = {}
+        summary_user = None
         try:
             from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE as _OMIT_TEMP
         except Exception:
@@ -4139,9 +4483,26 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                         base_url=agent.base_url,
                         reasoning_config=agent.reasoning_config,
                     )
+                    # The transport also takes the profile's per-session routing
+                    # identity (the OpenAI ``user`` field) from
+                    # build_api_kwargs_extras. Carry ONLY that onto this direct call:
+                    # without it a session-routed provider (claude-bridge pools)
+                    # gets the summary request keyless. Other top-level extras stay
+                    # transport-only (reasoning is handled above).
+                    _, _summary_top = provider_profile.build_api_kwargs_extras(
+                        reasoning_config=None,
+                        supports_reasoning=False,
+                        model=agent.model,
+                        base_url=agent.base_url,
+                        session_id=getattr(agent, "session_id", None),
+                        bridge_route_suffix=getattr(agent, "_bridge_route_suffix", None),
+                    )
+                    summary_user = (_summary_top or {}).get("user")
             except Exception:
                 pass
 
+            if summary_user:
+                summary_kwargs["user"] = summary_user
             if profile_extra_body:
                 summary_extra_body.update(profile_extra_body)
             if provider_preferences and "provider" not in profile_extra_body and (
@@ -4259,6 +4620,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
+                if summary_user:
+                    summary_kwargs["user"] = summary_user
 
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
@@ -5020,6 +5383,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        pool_headers: dict[str, str] = {}
         # Out-of-band confab notice (see agent/confab_notice.py). Rides the
         # final usage chunk. The validation contract is one notice per
         # response: a SECOND valid notice invalidates the accumulator and the
@@ -5058,6 +5422,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
+            pool_headers.update(_snapshot_pool_headers(response))
             attempt_stream_response["value"] = response
             agent._capture_rate_limits(response)
             agent._capture_credits(response)
@@ -5673,7 +6038,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # clean turn's response object is byte-identical to before.
         if confab_notice_acc["value"] is not None:
             setattr(_mock_response, CONFAB_NOTICE_FIELD, confab_notice_acc["value"])
-        return _mock_response
+        return _stamp_pool_headers(_mock_response, pool_headers)
 
     def _call_anthropic(request_client):
         """Stream an Anthropic Messages API response.
@@ -5707,7 +6072,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
-        _stream_context = {"manager": None, "stream": None}
+        _stream_context = {"manager": None, "stream": None, "pool_headers": {}}
         base_final_message = None
 
         from agent import relay_llm
@@ -5739,6 +6104,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
             _stream_context["stream"] = raw_stream
+            _stream_context["pool_headers"] = _snapshot_pool_headers(
+                getattr(raw_stream, "response", None)
+            )
             # The Anthropic SDK exposes the raw httpx response on
             # ``stream.response``. Snapshot diagnostics immediately so they
             # survive a stream that dies before the first event.
@@ -5931,7 +6299,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     "block was still incomplete; treating as a "
                     "mid-tool-call stream drop (#80498)."
                 )
-            return _repair_anthropic_message_surrogates(base_final_message)
+            return _stamp_pool_headers(
+                _repair_anthropic_message_surrogates(base_final_message),
+                _stream_context["pool_headers"],
+            )
         final_message = accumulator.response(base_final_message)
         if (
             not getattr(final_message, "content", None)
@@ -5947,7 +6318,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "block was still incomplete; treating as a "
                 "mid-tool-call stream drop (#80498)."
             )
-        return _repair_anthropic_message_surrogates(final_message)
+        return _stamp_pool_headers(
+            _repair_anthropic_message_surrogates(final_message),
+            _stream_context["pool_headers"],
+        )
 
     def _call():
         import httpx as _httpx
@@ -5956,6 +6330,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
+                result["failure_recorded"] = False
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
@@ -6005,6 +6380,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             type(e).__name__,
                         )
                         return
+                    # The transport made a real attempt. Append its zero-token
+                    # row before retry/failover classification; interrupt-forced
+                    # closes returned above are deliberately excluded.
+                    _record_failed_api_call(agent, e, api_kwargs)
+                    result["failure_recorded"] = True
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                     )
@@ -6625,6 +7005,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )],
                 usage=None,
                 _dropped_tool_names=_partial_names or None,
+                _api_call_failure_recorded=bool(result.get("failure_recorded")),
             )
             if _content_filter_terminated:
                 _stub._content_filter_terminated = True
@@ -6653,6 +7034,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # pending stream-error reason so it can't leak a stale "(connection
         # dropped)" rider onto an unrelated later failover.
         agent._pending_stream_error_reason = None
+        _record_successful_api_call(agent, result["response"], api_kwargs)
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────

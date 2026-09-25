@@ -39,30 +39,65 @@ class SurvivorUnavailable(ValueError):
 
 log = logging.getLogger(__name__)
 
-def _git(repo, *args, env=None, check=True, input=None):
+def _git_env(env=None, *, lazy_fetch=False):
+    """The environment every survivor git call runs with.
+
+    * ``GIT_NO_REPLACE_OBJECTS``: local replace refs can substitute another
+      tree for the only raw commit; authority reads inspect raw objects.
+    * ``GIT_NO_LAZY_FETCH`` (git >= 2.44; older git ignores it and is merely
+      slow): a "does THIS repository hold X" probe must never go to the
+      network. In a ``blob:none``/promisor clone ``cat-file`` on an advertised
+      head the store lacks triggers an on-demand fetch per SHA -- measured 36 s
+      for 32 missing heads on t_fc150853's workspace, past the 30 s ``_git``
+      timeout, which surfaced as the bare "capture failed" (Argus r1 F2).
+      Only content materialisation (``_snapshot``) may opt back in.
+    * Discovery overrides (``GIT_DIR``/``GIT_WORK_TREE``/...) INHERITED from
+      the caller are dropped: they re-point ``git -C <repo>`` at another tree.
+      Values a caller sets on purpose (``_snapshot``'s ``GIT_INDEX_FILE``)
+      differ from ``os.environ`` and are kept.
+    """
+    base = dict(os.environ if env is None else env)
+    for key in _ext._DISCOVERY_ENV:
+        if key in base and base[key] == os.environ.get(key):
+            base.pop(key)
+    base["GIT_NO_REPLACE_OBJECTS"] = "1"
+    if lazy_fetch:
+        base.pop("GIT_NO_LAZY_FETCH", None)
+    else:
+        base["GIT_NO_LAZY_FETCH"] = "1"
+    return base
+
+
+def _git(repo, *args, env=None, check=True, input=None, timeout=30, lazy_fetch=False):
+    # ``-C`` names the repository; ``cwd`` is pinned to a neutral directory so
+    # nothing about the CALLER's cwd (a scratch workspace under the tripwire
+    # gitfile, Argus r1 F1) can influence discovery. The path is made absolute
+    # against the process cwd first, so a relative ``repo`` keeps its meaning.
     result = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", "-C", os.path.abspath(str(repo)), *args],
         stdin=subprocess.DEVNULL if input is None else None,
-        input=input,
-        capture_output=True, timeout=30, env=env,
+        input=input, cwd=_ext.neutral_cwd(),
+        capture_output=True, timeout=timeout, env=_git_env(env, lazy_fetch=lazy_fetch),
     )
     if check and result.returncode:
         # Git stderr can contain credential-bearing remote URLs, so it is never
-        # persisted: the raised message stays constant and the detail goes to
-        # the log, redacted by the same helper that guards an echoed claim.
+        # persisted. The subcommand and returncode are safe to include in the
+        # hold; the stderr goes to the log through the existing redaction path.
         #
         # Without this, every occurrence costs an attribution pass. A failure
         # that is purely environmental (t_169d6e46: a concurrent pytest session
         # deleting this repo's tmp_path, so git exits 128 "cannot change to
         # '<path>': No such file or directory") is indistinguishable from a real
-        # capture defect once it reaches the caller as a bare
+        # capture defect when the caller receives only the old bare
         # "survivor_unavailable: git inspection failed".
         log.warning(
             "kanban survivor: git %s failed rc=%s in %s: %s",
             args[0] if args else "?", result.returncode, _ext.redact(str(repo)),
             _ext.redact(result.stderr.decode("utf-8", "replace").strip()),
         )
-        raise SurvivorUnavailable("survivor_unavailable: git inspection failed")
+        raise SurvivorUnavailable(
+            f"survivor_unavailable: git {args[0] if args else '?'} failed (rc={result.returncode})"
+        )
     return result
 
 
@@ -206,28 +241,245 @@ def _explain_broken_object_store(repo, key, workspace, bases=()):
     )
 
 
+# Directories that cannot hold a survivor because their contents are DERIVED:
+# a package manager, an interpreter or a linter can regenerate every byte. They
+# are pruned so the walk never descends into them.
+#
+# The set is deliberately narrow, and the narrowness is the point. Pruning by
+# "this subtree is big" is what a reader reaching for a fix naturally proposes
+# (t_6c46905a proposed exactly `.worktrees`, `kanban`, `var`, `wt`, `plans`,
+# `skills-shared`, `sessions`, `runs`, `logs`, `backups`) and it is UNSOUND:
+# measured against every `bases` row on the live board, that list drops 691 of
+# the 832 recorded repository keys -- i.e. it prunes away the repositories the
+# walk exists to find, silently turning a HOLD into a delete for real unpushed
+# work. `kanban/workspaces/*` alone holds 422 recorded repos, and `.worktrees`
+# is where the dispatcher puts every worktree card.
+#
+# This set instead drops 0 of those 832 keys, so it can never lose a survivor,
+# and it is still worth ~10% of the entries on a real worktree workspace
+# (measured 2,128/21,877 on t_dbfa8eb2, 353/4,124 on t_19f4a9d3). Anything
+# added here must be re-measured the same way: coverage first, speed second.
+_DERIVED_DIRS = frozenset({
+    "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".venv", ".venvs", "venv",
+})
+
+# Hard ceiling on directories inspected by one enumeration. A gate that cannot
+# finish must SAY so rather than hang: unbounded, this walk visited 850,853
+# directories in 227 s on an idle disk for a `dir` workspace rooted at the
+# fleet home, and `kanban_complete` died at its 420 s tool ceiling having
+# written nothing at all -- no output, no error, no terminal state (t_6c46905a,
+# faulthandler caught it inside `is_symlink` under `os.walk`).
+#
+# 50,000 is ~6.7 s measured on that tree and leaves >2x headroom over the
+# largest real workspace on the board (21,877 directories).
+DEFAULT_WALK_BUDGET_ENTRIES = 50_000
+
+
+def _walk_budget():
+    """Entry ceiling for one enumeration; invalid env values fall back silently."""
+    raw = os.environ.get("HERMES_KANBAN_SURVIVOR_WALK_BUDGET", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+    return DEFAULT_WALK_BUDGET_ENTRIES
+
+
+def _over_budget(what, workspace, visited, budget):
+    """The refusal for a tree too large to enumerate, naming count and path.
+
+    Fail-closed and LEGIBLE: the count and the path are what tell an operator
+    which tree to point the workspace at instead, and neither is
+    credential-bearing, so both are safe to persist as ``held_reason``.
+    """
+    return SurvivorUnavailable(
+        f"survivor_unavailable: {what} exceeded the {budget} directory budget after "
+        f"{visited} entries under {workspace} -- the workspace is too large to "
+        "enumerate; point the card at the specific repository or worktree instead of "
+        "a whole home directory, or raise HERMES_KANBAN_SURVIVOR_WALK_BUDGET"
+    )
+
+
+def _subdirs(here):
+    """Immediate non-symlink subdirectory names, and whether ``.git`` is present.
+
+    ``os.scandir`` answers "is this a directory" and "is this a symlink" from
+    the dirent the readdir already returned, so the per-child ``is_symlink()``
+    stat the previous ``os.walk`` form issued -- 853,413 of them on the fleet
+    home -- is not paid at all.
+
+    An unreadable directory (EACCES/EPERM) cannot hold a repo the worker could
+    have written to, so skipping it loses no survivor. Raising took down every
+    dispatch tick for a `dir` workspace rooted at a real home (2026-09-20:
+    `var/skills-portal/caddy`, root-owned 0700, made the whole default board
+    unspawnable). Anything else is still fatal.
+    """
+    try:
+        with os.scandir(here) as it:
+            entries = list(it)
+    except PermissionError as exc:
+        log.warning("kanban survivor: skipping unreadable dir %s (%s)", here, exc.strerror)
+        return [], False
+    names = set()
+    children = []
+    for entry in entries:
+        names.add(entry.name)
+        if entry.name in (".git", *_DERIVED_DIRS):
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                children.append(Path(entry.path))
+        except OSError:
+            continue
+    return children, ".git" in names
+
+
+def _walk(workspace):
+    """Directories under ``workspace``, pruned and bounded; depth-first.
+
+    Yields ``(path, is_repo)``. Raises :class:`SurvivorUnavailable` rather than
+    running forever when the tree exceeds the entry budget.
+    """
+    budget = _walk_budget()
+    visited = 0
+    stack = [Path(workspace)]
+    while stack:
+        here = stack.pop()
+        visited += 1
+        if visited > budget:
+            raise _over_budget("repository enumeration", workspace, visited, budget)
+        children, is_repo = _subdirs(here)
+        yield here, is_repo
+        stack.extend(children)
+
+
+def _dangling_gitfile(path):
+    """True when ``path/.git`` is a gitfile whose ``gitdir:`` target is absent.
+
+    Git stops its upward discovery at the FIRST ``.git`` it meets, so a
+    dangling gitfile there means no repository encloses anything below it:
+    there are no objects anywhere that could hold a survivor. This is the
+    deliberate tripwire shape (``kanban/workspaces/.git`` -> ``/nonexistent``,
+    incident t_82a5c853) that keeps scratch-workspace git off the live repo.
+    A ``.git`` DIRECTORY, or a gitfile whose target exists, is a repository
+    that may hold work, and stays fail-closed.
+    """
+    marker = path / ".git"
+    try:
+        if not marker.is_file():
+            return False
+        first = marker.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+    except OSError:
+        return False
+    if not first or not first[0].startswith("gitdir:"):
+        return False
+    target = Path(first[0][len("gitdir:"):].strip())
+    if not target.is_absolute():
+        target = path / target
+    try:
+        return not target.exists()
+    except OSError:
+        return False
+
+
 def _repos(workspace):
     """Find repos created inside scratch, including linked worktrees; no symlinks."""
-    found = []
-    def fail(exc):
-        # An unreadable directory (EACCES/EPERM) cannot hold a repo the worker
-        # could have written to, so skipping it loses no survivor. Raising here
-        # took down every dispatch tick for a `dir` workspace rooted at a real
-        # home (2026-09-20: `var/skills-portal/caddy`, root-owned 0700, made the
-        # whole default board unspawnable). Anything else is still fatal.
-        if isinstance(exc, PermissionError):
-            log.warning("kanban survivor: skipping unreadable dir %s (%s)", exc.filename, exc.strerror)
-            return
-        raise exc
-    for root, dirs, files in os.walk(workspace, followlinks=False, onerror=fail):
-        if ".git" in dirs or ".git" in files:
-            found.append(Path(root))
-        dirs[:] = sorted(d for d in dirs if d != ".git" and not (Path(root) / d).is_symlink())
-    if workspace not in found and any((p / ".git").exists() for p in (workspace, *workspace.parents)):
+    found = [here for here, is_repo in _walk(workspace) if is_repo]
+    enclosing = next((p for p in (workspace, *workspace.parents) if (p / ".git").exists()), None)
+    if workspace not in found and enclosing is not None:
+        # Probe before inspecting: a scratch workspace under the tripwire
+        # gitfile makes every git call exit 128 "not a git repository", and
+        # that means NO enclosing repository -- not an unreadable one. Only
+        # the structural dangling-gitfile shape is excused; anything else
+        # that fails the probe still raises below.
+        probe = _git(workspace, "rev-parse", "--show-toplevel", check=False)
+        if probe.returncode and _dangling_gitfile(enclosing):
+            return found
         tracked = _git(workspace, "ls-files", "--", ".")
         if tracked.returncode == 0 and tracked.stdout:
             found.insert(0, workspace)
     return found
+
+
+def _is_repo_on_disk(path):
+    """A registry entry is proof only if the path is a repository ON DISK.
+
+    THE discriminator for both registry sources. Git's registries record what
+    git *knows about*, not what is *present*, and both of them lie in the same
+    direction:
+
+      * a `160000` gitlink stays in the index of a linked worktree even though
+        `git worktree add` does NOT check submodules out -- the path on disk is
+        an empty directory (measured: `~/.hermes/.worktrees/t_01322a3f` carries
+        18 gitlinks, 0 of them materialised);
+      * `git worktree list` keeps listing a worktree whose directory was
+        deleted but never pruned -- which is exactly what a failed
+        `git worktree remove` leaves behind.
+
+    Trusting either unfiltered made `preserve()` refuse on a repository that is
+    not there, and the raise precedes every survivor-consulting branch, so not
+    even `--survivor-unbound` could reach it: 26/28 `~/.hermes/.worktrees/t_*`
+    and 49/50 `ace-media-homelab/.worktrees/t_*` cards were fail-closed HELD
+    where they complete on main.
+
+    `.git` may be a directory (clone, checked-out submodule) or a file (linked
+    worktree, modern submodule), so `exists()` is the right test and costs one
+    stat per registry hit -- 0.07-0.12 s over the whole fleet home.
+    """
+    try:
+        return (path / ".git").exists()
+    except OSError:
+        return False
+
+
+def _registered_nested(workspace):
+    """Nested repos Git ALREADY knows about, without walking the filesystem.
+
+    Git's own registries answer this in O(refs): `worktree list` enumerates
+    every linked worktree of the repo at ``workspace``, and a `160000` index
+    entry is a gitlink (a submodule). Both are read from metadata, so the cost
+    does not scale with the tree -- measured 1.2 s and 0.05 s on the fleet home,
+    against 227 s for the walk that finds the same thing. The registry path is
+    the arm that satisfies the card's <10 s acceptance bar; re-measured after
+    review at 2.34 s cold / 0.10--0.14 s warm. The bounded fallback remains
+    disk-contention sensitive (21.47--23.14 s in the same measurement), but it
+    terminates with a named refusal instead of hanging silently.
+
+    Every hit is confirmed present via :func:`_is_repo_on_disk` before it is
+    returned; see there for why a bare registry entry is not proof.
+
+    Used ONLY as a positive: a path Git lists AND that is a repository on disk
+    really is a nested repository, so finding one is proof. The converse does
+    not hold and must not be inferred -- a repo a worker cloned by hand is in
+    neither registry (measured: these two registries account for 47 of the 813
+    repositories recorded for t_f5ebd9db), which is why this supplements the
+    walk's refusal rather than replacing the walk.
+    """
+    if not (workspace / ".git").exists():
+        return []
+    nested = []
+    listing = _git(workspace, "worktree", "list", "--porcelain", check=False)
+    if listing.returncode == 0:
+        for line in listing.stdout.decode("utf-8", "replace").splitlines():
+            if not line.startswith("worktree "):
+                continue
+            try:
+                path = Path(line[len("worktree "):]).resolve()
+            except OSError:
+                continue
+            if path != workspace and path.is_relative_to(workspace) and _is_repo_on_disk(path):
+                nested.append(path)
+    index = _git(workspace, "ls-files", "--stage", check=False)
+    if index.returncode == 0:
+        for line in index.stdout.decode("utf-8", "replace").splitlines():
+            meta, _, path = line.partition("\t")
+            if meta.split(" ", 1)[0] == "160000" and path and _is_repo_on_disk(workspace / path):
+                nested.append(workspace / path)
+    return nested
 
 
 def _state(conn, task_id):
@@ -244,7 +496,18 @@ def record_baseline(conn, task_id, workspace):
         return
     bases, held, survivor = _state(conn, task_id)
     workspace = Path(workspace)
-    for repo in _repos(workspace):
+    try:
+        discovered = _repos(workspace)
+    except SurvivorUnavailable as exc:
+        # This runs at dispatch, before the worker exists. A refusal here would
+        # make the card UNSPAWNABLE -- the same failure mode the EACCES skip
+        # exists to avoid (2026-09-20, `var/skills-portal/caddy`). An empty
+        # `bases` is the honest record for a tree we could not enumerate, and it
+        # costs no survivor: `preserve` re-enumerates at completion under the
+        # same budget and fails closed there, where there is a run to hold.
+        log.warning("kanban survivor: baseline skipped for %s: %s", task_id, exc)
+        discovered = []
+    for repo in discovered:
         key = str(repo.relative_to(workspace))
         if key not in bases:
             head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
@@ -308,9 +571,88 @@ def _temporary_roots():
     return [Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp")]
 
 
-def _durable_remote(repo, remote, workspace):
+def _excluded_roots(workspace):
+    """Roots a repo must NOT live under to count as durable/canonical."""
+    # Never the fail-closed resolver: a worker spawned before
+    # kanban.workspaces_root changed carries a stale pin, and raising here
+    # turned every in-flight completion into survivor_unavailable (HELD).
+    return [workspace, *kb.workspace_root_candidates(), kb.kanban_home() / "kanban" / "workspaces",
+            kb.kanban_home() / "kanban" / "boards", *_temporary_roots()]
+
+
+def _independent_storage(repo, workspace):
+    """Require local ref authority to retain its Git storage after disposal.
+
+    Gitfiles and linked worktrees are fine when BOTH their private and common
+    directories are durable. Reject alternates and internal storage symlinks
+    conservatively: proving a checkout path alone says nothing about the objects
+    it borrows. Ordinary hardlinked clones remain independent on unlink.
+    """
+    if any(os.environ.get(key) for key in (
+        "GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    )):
+        return False
+    try:
+        excluded = [root.resolve() for root in _excluded_roots(workspace)]
+
+        def durable(path):
+            return not any(path.resolve(strict=True).is_relative_to(root) for root in excluded)
+
+        if not durable(repo):
+            return False
+        config = _git(repo, "config", "--null", "--get-regexp",
+                      r"^(extensions\.partialclone|remote\..*\.promisor)$", check=False)
+        if config.returncode not in (0, 1):
+            return False
+        for field in config.stdout.split(b"\0"):
+            key, _, value = field.partition(b"\n")
+            if key.lower() == b"extensions.partialclone" and value:
+                return False
+            if key.lower().endswith(b".promisor") and value.lower() in (b"true", b"yes", b"on", b"1"):
+                return False
+        directories = set()
+        result = _git(repo, "rev-parse", "--path-format=absolute", "--git-dir",
+                      "--git-common-dir", "--git-path", "objects", check=False)
+        paths = result.stdout.splitlines()
+        if result.returncode or len(paths) != 3:
+            return False
+        for raw in paths:
+            path = Path(os.fsdecode(raw).strip())
+            if not path.is_dir() or not durable(path):
+                return False
+            directories.add(path.resolve(strict=True))
+
+        def fail(exc):
+            raise exc
+
+        for directory in directories:
+            for root, dirs, files in os.walk(directory, followlinks=False, onerror=fail):
+                for name in dirs + files:
+                    path = Path(root) / name
+                    if path.is_symlink():
+                        return False
+                    if name.endswith(".promisor"):
+                        return False
+                    if name in {"alternates", "http-alternates"} and path.is_file() and path.stat().st_size:
+                        return False
+        complete = _git(
+            repo, "rev-list", "--objects", "--missing=print", "HEAD", check=False,
+        )
+        if complete.returncode or any(
+            line.startswith(b"?") for line in complete.stdout.splitlines()
+        ):
+            return False
+        return True
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+
+
+def _durable_remote(repo, remote, workspace, storage_cache=None):
     # Expand insteadOf aliases, then resolve symlinks before checking scope.
     url = _git(repo, "remote", "get-url", remote).stdout.decode().strip()
+    if storage_cache is not None:
+        storage_cache[("url", remote)] = url
     parsed = urlsplit(url)
     if parsed.scheme in {"https", "http", "ssh", "git"}:
         return True
@@ -320,14 +662,21 @@ def _durable_remote(repo, remote, workspace):
         return False
     path = Path(unquote(parsed.path) if parsed.scheme else url).expanduser()
     path = (repo / path).resolve()
-    roots = [workspace, kb.workspaces_root(), kb.kanban_home() / "kanban" / "workspaces",
-             kb.kanban_home() / "kanban" / "boards", *_temporary_roots()]
-    return remote == "origin" and not any(path.is_relative_to(root.resolve()) for root in roots)
+    if remote != "origin":
+        return False
+    if storage_cache is not None:
+        if path not in storage_cache:
+            storage_cache[path] = _independent_storage(path, workspace)
+        return storage_cache[path]
+    return _independent_storage(path, workspace)
 
 
-def _published_refs(repo, workspace):
-    for remote in _git(repo, "remote").stdout.decode().splitlines():
-        if not _durable_remote(repo, remote, workspace):
+def _published_refs(repo, workspace, storage_cache=None):
+    remotes = _git(repo, "remote").stdout.decode().splitlines()
+    if storage_cache is not None:
+        storage_cache[("remotes",)] = remotes
+    for remote in remotes:
+        if not _durable_remote(repo, remote, workspace, storage_cache):
             continue
         try:
             advertised = _git(repo, "ls-remote", "--heads", remote, check=False)
@@ -437,6 +786,358 @@ def _remote_survivor(repo, head, published):
     return dict(covered[0], head=head)
 
 
+# A rewriting mirror (hermes-home's "isolated remote sync") republishes every
+# commit under a NEW sha, so `_remote_survivor` can never match a clone of it and
+# the capture falls through to a bundle of a 94 MB home tree, which always
+# exceeds KANBAN_ATTACHMENT_MAX_BYTES (2026-09-20, t_e69d693a).
+#
+# `git patch-id` survives the rewrite, but it is the identity of a commit's
+# DIFF, not of its content: two commits on different parents can produce
+# byte-identical diffs over different trees, and patch-id normalises whitespace
+# away. The live hermes-home mirror demonstrates this on the very pair the fix
+# was designed around — 9f25d7cce and e747d18db share a patch-id while their
+# trees differ by 58 files. So a patch-id hit is ADVISORY ANNOTATION ONLY and
+# never authority to delete a workspace (Apollo ruling, 2026-09-20).
+#
+# The durable target for a home-clone workspace is the LIVE CANONICAL TREE it
+# was cloned from — a local repository outside every kanban/temp root — which is
+# covered by the fleet-backup tier. The rewriting mirror is not a faithful copy
+# and must not be the bar.
+_CONTENT_SCAN_DEPTH = 25
+_CONTENT_SCAN_BUDGET = 100
+
+
+def _canonical_repos(repo, workspace, storage_cache=None):
+    """Local repositories this repo's remotes resolve to, outside every disposable root.
+
+    A `file:`/path remote pointing at a live checkout (``~/.hermes``) is the
+    canonical tree: it holds the real objects, it is what the workspace was
+    cloned from, and it is what the fleet-backup tier covers. Remotes inside a
+    kanban workspace, board, or temp root are disposable and never canonical.
+    """
+    remotes = (storage_cache.get(("remotes",)) if storage_cache is not None else None)
+    if remotes is None:
+        remotes = _git(repo, "remote").stdout.decode().splitlines()
+    for remote in remotes:
+        raw = storage_cache.get(("url", remote)) if storage_cache is not None else None
+        if raw is None:
+            url = _git(repo, "remote", "get-url", remote, check=False)
+            if url.returncode:
+                continue
+            raw = url.stdout.decode().strip()
+        parsed = urlsplit(raw)
+        if parsed.scheme not in {"", "file"} or parsed.netloc not in {"", "localhost"}:
+            continue
+        if not parsed.scheme and ":" in raw and not raw.startswith(("/", ".")):
+            continue  # scp-style SSH: not a local path
+        path = Path(unquote(parsed.path) if parsed.scheme else raw).expanduser()
+        try:
+            path = (repo / path).resolve(strict=True)
+        except OSError:
+            continue
+        if storage_cache is not None and path in storage_cache:
+            independent = storage_cache[path]
+        else:
+            independent = _independent_storage(path, workspace)
+            if storage_cache is not None:
+                storage_cache[path] = independent
+        if not independent:
+            continue
+        yield {"remote": remote, "repository_path": str(path)}
+
+
+def _canonical_survivor(repo, head, workspace, storage_cache=None):
+    """Accept ``head`` when a LIVE canonical tree can reach it from its HEAD.
+
+    This is the deletion authority for a home-clone workspace: the commit is not
+    only present in a durable local repo, it is on that repo's current line of
+    work. Reachability (not sha equality) is the predicate, so the rewriting
+    mirror never enters into it.
+    """
+    for candidate in _canonical_repos(repo, workspace, storage_cache):
+        live = Path(candidate["repository_path"])
+        if _git(live, "merge-base", "--is-ancestor", head, "HEAD", check=False).returncode == 0:
+            return dict(candidate, sha=head, head=head, matched_by="canonical",
+                        branch=_git(live, "rev-parse", "--abbrev-ref", "HEAD",
+                                    check=False).stdout.decode().strip() or "HEAD")
+    return None
+
+
+def _patch_id(repo, sha, env=None):
+    """Content identity of one commit's diff. None when it cannot be computed."""
+    diff = _git(repo, "diff-tree", "-p", "--full-index", "--no-ext-diff",
+                "--no-textconv", "--no-renames", "--root", sha, env=env, check=False)
+    if diff.returncode or not diff.stdout:
+        return None
+    result = subprocess.run(
+        ["git", "-C", os.path.abspath(str(repo)), "patch-id", "--stable"],
+        input=diff.stdout, capture_output=True, timeout=30,
+        cwd=_ext.neutral_cwd(), env=_git_env(env),
+    )
+    if result.returncode or not result.stdout.strip():
+        return None
+    return result.stdout.split()[0].decode()
+
+
+def _exact_commit_diff(repo, sha):
+    """Full blob-identified diff; unlike patch-id this retains whitespace and bytes."""
+    diff = _git(repo, "diff-tree", "-p", "--binary", "--no-commit-id",
+                "--full-index", "--no-ext-diff", "--no-textconv",
+                "--no-renames", "--root", sha, check=False)
+    return diff.stdout if not diff.returncode and diff.stdout else None
+
+
+def _landed_contains_history(workspace_repo, landed_repo, landed_sha):
+    """Return how ``landed_sha`` contains the workspace's final committed tree."""
+    workspace_head = _git(
+        workspace_repo, "rev-parse", "--verify", "HEAD^{commit}", check=False,
+    )
+    if workspace_head.returncode:
+        return None
+    workspace_head = workspace_head.stdout.decode().strip()
+    # Historical ancestry and identical commit diffs can both be undone by a
+    # later canonical commit. Only the current live tree can authorize deletion.
+    workspace_history = _git(workspace_repo, "rev-list", workspace_head, check=False)
+    landed_history = _git(landed_repo, "rev-list", landed_sha, check=False)
+    if workspace_history.returncode or landed_history.returncode:
+        return None
+    landed_commits = set(landed_history.stdout.decode().split())
+    work_commits = workspace_history.stdout.decode().split()
+    shared = next((commit for commit in work_commits if commit in landed_commits), None)
+    # Compare net worker changes, not paths touched by inherited history.
+    # A shared HEAD still needs its path guard against later live reverts.
+    if shared and shared != workspace_head:
+        touched = _git(workspace_repo, "diff", "--no-renames", "--name-only", "-z", shared, workspace_head, check=False)
+    else:
+        touched = _git(workspace_repo, "log", "--no-renames", "--name-only", "-z", "--format=", workspace_head, check=False)
+    live_head = _git(landed_repo, "rev-parse", "--verify", "HEAD^{commit}", check=False)
+    if touched.returncode or live_head.returncode or not touched.stdout:
+        return None
+    work_tree = _git(workspace_repo, "ls-tree", "-rz", "--full-tree", workspace_head, check=False)
+    live_tree = _git(landed_repo, "ls-tree", "-rz", "--full-tree", live_head.stdout.decode().strip(), check=False)
+    if work_tree.returncode or live_tree.returncode:
+        return None
+    def entries(tree):
+        return dict(item.split(b"\t", 1)[::-1] for item in tree.stdout.split(b"\0") if item)
+    work_entries, live_entries = entries(work_tree), entries(live_tree)
+    if any(work_entries.get(path) != live_entries.get(path) for path in set(touched.stdout.split(b"\0")) - {b""}):
+        return None
+    if _git(
+        landed_repo, "merge-base", "--is-ancestor", workspace_head, landed_sha,
+        check=False,
+    ).returncode == 0:
+        return "ancestor"
+
+    missing = [
+        commit for commit in work_commits
+        if commit not in landed_commits
+    ]
+    if not missing:
+        return "ancestor"
+
+    needed = set()
+    for commit in missing:
+        diff = _exact_commit_diff(workspace_repo, commit)
+        if diff is None:
+            return None
+        needed.add(diff)
+    for commit in landed_commits:
+        diff = _exact_commit_diff(landed_repo, commit)
+        if diff in needed:
+            needed.remove(diff)
+            if not needed:
+                return "exact-diff"
+    return None
+
+
+def _content_advisory(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
+    """ADVISORY ONLY: a published commit with the same normalized patch-id.
+
+    Recorded in the sidecar as a recovery hint ("the mirror's <sha> looks like
+    this work"), NEVER as authority to delete a workspace: patch-id is diff
+    identity, not content identity, and the live hermes-home mirror produces
+    false positives on exactly the pair this feature was designed around.
+
+    Fetches each durable remote head shallowly into a throwaway bare repo that
+    borrows ``repo``'s objects, then walks it looking for a matching patch-id.
+    The deepest fetched commit is a shallow boundary — Git would diff it against
+    the empty tree and invent a bogus patch-id — so it is never scanned.
+    """
+    target = _patch_id(repo, head)
+    if target is None:
+        return None
+    objects = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects").stdout.decode().strip()
+    env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects)
+    with tempfile.TemporaryDirectory(prefix="kanban-content-") as tmp:
+        probe = Path(tmp) / "probe.git"
+        _git(repo, "init", "--bare", str(probe))
+        for ref in published:
+            if budget <= 0:
+                return None
+            url = _git(repo, "remote", "get-url", ref["remote"]).stdout.decode().strip()
+            fetch_env = dict(env, KANBAN_FETCH_URL=url)
+            try:
+                fetched = _git(
+                    probe, "--config-env=remote.candidate.url=KANBAN_FETCH_URL",
+                    "fetch", "--no-tags", "--depth", str(_CONTENT_SCAN_DEPTH + 1),
+                    "candidate", f"+refs/heads/{ref['branch']}:refs/heads/candidate",
+                    env=fetch_env, check=False, timeout=120,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            if fetched.returncode:
+                continue
+            walk = _git(probe, "rev-list", "--max-count", str(_CONTENT_SCAN_DEPTH),
+                        "refs/heads/candidate", env=env, check=False)
+            if walk.returncode:
+                continue
+            for sha in walk.stdout.decode().split():
+                if budget <= 0:
+                    return None
+                budget -= 1
+                if _patch_id(probe, sha, env=env) == target:
+                    return dict(ref, sha=sha, head=head, matched_by="patch-id",
+                                advisory=True, patch_id=target)
+            _git(probe, "update-ref", "-d", "refs/heads/candidate", env=env, check=False)
+    return None
+
+
+def _verify_landed(entries, workspace):
+    """Verify an explicit `landed` claim against a LIVE CANONICAL repository.
+
+    The escape hatch for work that was committed into a repo the workspace only
+    mirrors. The bar (Apollo ruling, 2026-09-20): the named repository must be a
+    real repository OUTSIDE every disposable root — a live tree covered by the
+    fleet-backup tier — and the sha must resolve there AND be reachable from that
+    tree's HEAD. Publication on a durable remote is NOT required, because the
+    hermes-home mirror rewrites trees and is not a faithful copy; requiring it
+    would make the claim unsatisfiable by construction.
+
+    Every repository in the workspace must be clean and its committed history
+    must be represented by a named landed commit, either by exact ancestry or
+    byte-exact commit diffs. Patch-id remains advisory for remote
+    mirrors; neither it nor a normalized diff can bind workspace commits.
+
+    Every failure mode raises — an unverifiable claim must never be accepted,
+    because accepting it authorises deleting the only remaining copy of the code.
+    """
+    verified = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SurvivorUnavailable("survivor_unavailable: landed entry is not an object")
+        repo_path, sha = entry.get("repo_path"), entry.get("sha")
+        if not repo_path or not sha:
+            raise SurvivorUnavailable("survivor_unavailable: landed entry needs repo_path and sha")
+        repo = Path(repo_path).expanduser()
+        if not repo.is_dir():
+            raise SurvivorUnavailable("survivor_unavailable: landed repository missing")
+        repo = repo.resolve(strict=True)
+        if _git(repo, "rev-parse", "--git-dir", check=False).returncode:
+            raise SurvivorUnavailable("survivor_unavailable: landed path is not a repository")
+        if not _independent_storage(repo, workspace):
+            # A workspace/board/temp tree is itself disposable: pointing `landed`
+            # at one would let the capture authorise deleting its own only copy.
+            raise SurvivorUnavailable("survivor_unavailable: landed repository is not a durable tree")
+        resolved = _git(repo, "rev-parse", "--verify", f"{sha}^{{commit}}", check=False)
+        if resolved.returncode:
+            raise SurvivorUnavailable("survivor_unavailable: landed commit not in repository")
+        sha = resolved.stdout.decode().strip()
+        if _git(repo, "merge-base", "--is-ancestor", sha, "HEAD", check=False).returncode:
+            raise SurvivorUnavailable("survivor_unavailable: landed commit not reachable from HEAD")
+        record = {"repository": str(repo), "sha": sha, "matched_by": "canonical",
+                  "branch": _git(repo, "rev-parse", "--abbrev-ref", "HEAD",
+                                 check=False).stdout.decode().strip() or "HEAD"}
+        published = list(_published_refs(repo, workspace))
+        ref = _remote_survivor(repo, sha, published)
+        if ref:
+            record["published"] = {"remote": ref["remote"], "branch": ref["branch"],
+                                   "sha": ref["sha"], "matched_by": "sha"}
+        else:
+            hint = _content_advisory(repo, sha, published)
+            if hint:
+                # Advisory: same diff on the mirror. Not why we accepted.
+                record["published"] = {"remote": hint["remote"], "branch": hint["branch"],
+                                       "sha": hint["sha"], "matched_by": "patch-id",
+                                       "advisory": True}
+        verified.append(record)
+
+    workspace_repos = _repos(workspace)
+    if not workspace_repos or _loose_files(workspace, workspace_repos):
+        raise SurvivorUnavailable("survivor_unavailable: landed workspace has uncaptured files")
+    used_entries = set()
+    for repo in workspace_repos:
+        status = _git(repo, "status", "--porcelain", "--untracked-files=all", check=False)
+        if status.returncode or status.stdout:
+            raise SurvivorUnavailable("survivor_unavailable: landed workspace is not clean")
+        workspace_head = _git(repo, "rev-parse", "--verify", "HEAD^{commit}", check=False)
+        if workspace_head.returncode:
+            raise SurvivorUnavailable("survivor_unavailable: workspace repository has no commit")
+        binding = None
+        for index, record in enumerate(verified):
+            matched_by = _landed_contains_history(repo, Path(record["repository"]), record["sha"])
+            if matched_by:
+                binding = (index, record, matched_by)
+                break
+        if binding is None:
+            raise SurvivorUnavailable(
+                "survivor_unavailable: landed commit does not contain workspace history"
+            )
+        index, record, matched_by = binding
+        used_entries.add(index)
+        record.setdefault("workspace_repositories", []).append({
+            "repository": str(repo.relative_to(workspace)),
+            "head": workspace_head.stdout.decode().strip(),
+            "matched_by": matched_by,
+        })
+    if used_entries != set(range(len(verified))):
+        raise SurvivorUnavailable("survivor_unavailable: landed claim is unrelated to workspace")
+    return verified
+
+
+def _recorded_landed_claims(previous):
+    """Rebuild the `landed` claim a RECORDED receipt made, or refuse legibly.
+
+    Reclamation re-verifies the live commits a `kind: "landed"` receipt names
+    before it may delete the workspace. The row is persisted JSON -- a
+    hand-edited, partially written or legacy row can carry `landed: null`, a
+    non-object entry, or an entry without `repository`/`sha`. Indexing such a
+    row raised `TypeError`/`KeyError`, which no `except` tuple on the reaper
+    path names: the workspace survived, but with no `held_reason` and no
+    `workspace_held` event, so the card's recovery state was silent.
+    Every malformed shape is a refusal, raised as `SurvivorUnavailable` so it
+    persists through `_hold()` like any other doubt.
+    """
+    entries = previous.get("landed")
+    if not isinstance(entries, list) or not entries:
+        raise SurvivorUnavailable(
+            "survivor_unavailable: recorded landed receipt is malformed (landed is not a non-empty list)"
+        )
+    claims = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SurvivorUnavailable(
+                "survivor_unavailable: recorded landed receipt is malformed (entry is not an object)"
+            )
+        repository, sha = entry.get("repository"), entry.get("sha")
+        if not isinstance(repository, str) or not repository or not isinstance(sha, str) or not sha:
+            raise SurvivorUnavailable(
+                "survivor_unavailable: recorded landed receipt is malformed (entry needs repository and sha)"
+            )
+        claims.append({"repo_path": repository, "sha": sha})
+    return claims
+
+
+def _recorded_refs(previous):
+    """The recorded `refs` list, or empty when the row's `refs` is not a list.
+
+    A malformed `refs` (e.g. `null`) vouches for nothing; treating it as empty
+    turns it into the ordinary "recorded repository missing" refusal instead of
+    a `TypeError` that escapes `_hold()`.
+    """
+    refs = (previous or {}).get("refs")
+    return refs if isinstance(refs, list) else ()
+
+
 def _base(repo, published):
     # The nearest published ancestor of HEAD is a BOUNDARY commit of
     # `rev-list HEAD ^<every ref>`: git stops there precisely because the
@@ -471,7 +1172,23 @@ def _base(repo, published):
     return min(candidates)[1]
 
 
-def _snapshot(repo, base, prefix):
+def _snapshot(repo, base, prefix, *, irreversible_delete=False):
+    """A bundle when ``base`` is None, else a binary patch against ``base``.
+
+    ``irreversible_delete`` (used by ``_capture`` only when the full binary
+    patch exceeds the attachment limit) re-cuts it with
+    ``--irreversible-delete``. That only
+    omits the PREIMAGE of wholly deleted files, and a patch against ``base``
+    only ever deletes files that exist in ``base`` -- a published commit, so
+    every omitted byte is derivable from it (``--full-index`` keeps the exact
+    blob ids that name them). Added and modified content is untouched, so any
+    new byte is still captured in full, and an over-limit result still
+    refuses in ``_store``. t_3684ae00's truncated checkout is the measured
+    case: 12,318 deletions, 0 added lines, 164.8 MB full vs 2.7 MB cut
+    (Argus r1 F3). The cut patch does not ``git apply`` as-is (git refuses a
+    removal without contents); recovery is ``git rm`` of the listed paths,
+    so the full form stays the default whenever it fits.
+    """
     with tempfile.TemporaryDirectory(prefix="kanban-index-") as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
         index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip())
@@ -480,7 +1197,7 @@ def _snapshot(repo, base, prefix):
             shutil.copy2(index, env["GIT_INDEX_FILE"])
         else:
             _git(repo, "read-tree", "--empty", env=env)
-        _git(repo, "add", "-A", "--", ".", env=env)
+        _git(repo, "add", "-A", "--", ".", env=env, lazy_fetch=True)
         if base is None:
             tree = _git(repo, "write-tree", env=env).stdout.decode().strip()
             head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
@@ -496,13 +1213,19 @@ def _snapshot(repo, base, prefix):
             _git(recovery, "update-ref", "refs/heads/implementation", commit, env=bundle_env)
             _git(recovery, "symbolic-ref", "HEAD", "refs/heads/implementation", env=bundle_env)
             bundle = Path(tmp) / "implementation.bundle"
-            _git(recovery, "bundle", "create", str(bundle), "--all", env=bundle_env)
+            _git(recovery, "bundle", "create", str(bundle), "--all", env=bundle_env, lazy_fetch=True)
             return bundle.read_bytes()
         return _git(
             repo, "diff", "--cached", "--relative", "--binary", "--full-index", "--no-ext-diff",
-            "--no-textconv", "--no-renames", f"--src-prefix=a/{prefix}",
-            f"--dst-prefix=b/{prefix}", base, "--", ".", env=env,
+            "--no-textconv", "--no-renames", *(["--irreversible-delete"] if irreversible_delete else []),
+            f"--src-prefix=a/{prefix}", f"--dst-prefix=b/{prefix}", base, "--", ".", env=env,
+            lazy_fetch=True, timeout=_SNAPSHOT_TIMEOUT,
         ).stdout
+
+
+#: A full binary diff of a large truncated checkout is legitimately slow (the
+#: 164.8 MB t_3684ae00 case); 30 s is the probe budget, not the content one.
+_SNAPSHOT_TIMEOUT = 300
 
 
 def _capture(repo, key, workspace):
@@ -511,11 +1234,25 @@ def _capture(repo, key, workspace):
     Extracted verbatim from `preserve`'s loop so the object-reading steps sit
     inside a single `try` the caller can classify. Behaviour is unchanged.
     """
-    published = list(_published_refs(repo, workspace))
+    storage_cache = {}
+    published = list(_published_refs(repo, workspace, storage_cache))
     head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
     dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
     if not dirty and head.returncode == 0:
-        ref = _remote_survivor(repo, head.stdout.decode().strip(), published)
+        sha = head.stdout.decode().strip()
+        # A rewriting mirror republishes the same content under a new sha, so
+        # sha equality can never hold for a home clone. The fallback is the
+        # LIVE CANONICAL TREE the workspace was cloned from — never a patch-id
+        # hit, which is diff identity only.
+        ref = (_remote_survivor(repo, sha, published)
+               or _canonical_survivor(repo, sha, workspace, storage_cache))
+        if ref and ref.get("matched_by") == "canonical":
+            hint = _content_advisory(repo, sha, published)
+            if hint:
+                ref = dict(ref, mirror_hint={
+                    "remote": hint["remote"], "branch": hint["branch"],
+                    "sha": hint["sha"], "matched_by": "patch-id", "advisory": True,
+                })
         if ref:
             return ref, None, None
     base = _base(repo, published)
@@ -756,6 +1493,12 @@ def _verified_explicit(task_id, survivor_ref, survivor_pr, *, unbound=False):
                     f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)} "
                     f"against the remote"
                 )
+        except _ext.Unverified as exc:
+            # The remote answered and said why the claim fails (e.g. the SHA
+            # is not reachable from the default branch). Say it.
+            raise SurvivorUnavailable(
+                f"survivor_unavailable: could not verify {flag} {_ext.redact(claim)}: {exc}"
+            ) from exc
         except _ext.AmbiguousRef as exc:
             # A THIRD outcome, and reporting it as either of the other two lies.
             # The remote answered, and it answered with several refs that all
@@ -944,15 +1687,47 @@ def _loose_files(workspace, repos):
     A remote ref vouches only for the repositories it was resolved from; files
     beside them (notes, scripts, a tarball) are captured by nothing, so an
     inferred survivor must never trade them for a delete.
+
+    Bounded by the same budget as `_repos` for the same reason, and pruned by
+    the same derived-directory set -- a `node_modules` tree is not evidence a
+    survivor has to vouch for, and descending into one is what made this walk
+    unbounded.
     """
-    for root, dirs, files in os.walk(workspace, followlinks=False):
-        here = Path(root)
+    budget = _walk_budget()
+    visited = 0
+    stack = [Path(workspace)]
+    while stack:
+        here = stack.pop()
+        visited += 1
+        if visited > budget:
+            raise _over_budget("loose-file scan", workspace, visited, budget)
         if here in repos:
-            dirs[:] = []
             continue
-        if files or any((here / d).is_symlink() for d in dirs):
+        try:
+            with os.scandir(here) as it:
+                entries = list(it)
+        except PermissionError as exc:
+            log.warning("kanban survivor: skipping unreadable dir %s (%s)", here, exc.strerror)
+            continue
+        children = []
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                # Unreadable metadata cannot be classified as "no evidence".
+                return True
+            if entry.is_symlink():
+                # A symlink is an entry no repository's ref vouches for. The
+                # previous form reported it via `is_symlink` on the child; the
+                # scandir form has to test it before the directory branch, or a
+                # symlink to a directory would be silently skipped.
+                return True
+            if is_dir:
+                if entry.name not in _DERIVED_DIRS:
+                    children.append(Path(entry.path))
+                continue
             return True
-        dirs[:] = sorted(d for d in dirs if not (here / d).is_symlink())
+        stack.extend(children)
     return False
 
 
@@ -992,6 +1767,31 @@ def _external(conn, task_id, metadata, evidence, urls, explicit, *, discover, cl
 
 _PATCH_KEYS = ("path", "sha256", "bytes", "sidecar")
 
+def _carries_recovery_artifact(survivor):
+    """Does this row's OWN sidecar stand beside recoverable bytes?
+
+    `sidecar` alone does not make a row a recovery pointer. Two kinds write an
+    `implementation.json` that is pure METADATA -- `landed` (which repo/sha a
+    live canonical tree holds the work at) and the canonical `ref` arm (which
+    LIVE tree holds a sha the published remote does not carry). Neither stores
+    a byte of the implementation: the durable copy is the named repository.
+
+    A genuine recovery row does store bytes, and always alongside a pointer to
+    them -- `path` for a concatenated `implementation.patch`, `bundles` for
+    git bundles. Discriminating on the ARTIFACT rather than on the `kind`
+    label covers both new metadata-only kinds at once and keeps covering any
+    later one, and it cannot be fooled by a row `_unshrunk` has already
+    relabelled.
+
+    Getting this wrong corrupts the durable recovery index rather than merely
+    mislabelling it: a metadata sidecar treated as a patch makes `_unshrunk`
+    relabel the row `kind: "patch"` with `notice: "NOT PUSHED"` and a
+    `patches` list of JSON manifests holding no patch bytes, after the
+    workspace has already been deleted (2026-09-23 review of #796).
+    """
+    entry = survivor or {}
+    return bool(entry.get("path") or entry.get("bundles"))
+
 
 def _patch_pointers(survivor):
     """Every stored patch a survivor row points at, top-level slot first.
@@ -1002,12 +1802,22 @@ def _patch_pointers(survivor):
     must retain a patch from an earlier capture as well keeps the extras in
     `patches`. Reading through one accessor keeps every consumer -- the
     non-shrink guard and the sidecar manifest scan -- seeing all of them.
+
+    The top-level slot is gated by :func:`_carries_recovery_artifact` so a
+    metadata-only `landed`/canonical-`ref` sidecar is not mistaken for stored
+    patch bytes. Entries already displaced into `patches` are NOT re-gated:
+    they were vetted when they were displaced, and a bundle row's pointer
+    legitimately carries only a `sidecar` once its `bundles` have been merged
+    into the fresh row.
     """
     pointers = []
-    for entry in ((survivor or {}), *((survivor or {}).get("patches") or ())):
+    row = survivor if isinstance(survivor, dict) else {}
+    for index, entry in enumerate((row, *(row.get("patches") or ()))):
         if not isinstance(entry, dict):
             continue
         pointer = {key: entry.get(key) for key in _PATCH_KEYS}
+        if index == 0 and not _carries_recovery_artifact(entry):
+            continue
         if pointer["path"] or pointer["sidecar"]:
             pointers.append(pointer)
     return pointers
@@ -1066,6 +1876,126 @@ def _vouched_repositories(survivor):
             if isinstance(entry, dict) and isinstance(entry.get("repository"), str):
                 keys.add(entry["repository"])
     return keys | _all_sidecar_repositories(survivor)
+
+
+def _authoritative_repositories(survivor):
+    """Repository keys a RECORDED survivor may authorise RECLAMATION for.
+
+    :func:`_vouched_repositories` answers "does the recovery index account for
+    this repository?" and must keep counting unbound refs, or the non-shrink
+    guard would drop them from the index. Deletion authority is a narrower
+    question with a different answer for exactly one shape: an UNBOUND operator
+    ref is a human assertion the kernel could not corroborate, and
+    :func:`_reusable` limits it to the one completion that asserted it.
+
+    The `missing <= absent` relaxation in :func:`preserve` consulted the wide
+    set, so an unbound `--survivor-pr` for a vanished repository recorded at
+    completion became standing authority in the SAME call's cleanup: the root
+    repository ignored the vanished one's directory, nothing captured it, and
+    reclamation `rmtree`d committed-but-unpublished bytes (Argus P9, t_60592755,
+    on both #924's base and head). Stored bundles and patches still vouch --
+    they hold the bytes themselves.
+    """
+    keys = set()
+    for entry in ((survivor or {}).get("refs") or ()):
+        if isinstance(entry, dict) and isinstance(entry.get("repository"), str) \
+                and not entry.get("unbound"):
+            keys.add(entry["repository"])
+    for entry in ((survivor or {}).get("bundles") or ()):
+        if isinstance(entry, dict) and isinstance(entry.get("repository"), str):
+            keys.add(entry["repository"])
+    return keys | _all_sidecar_repositories(survivor)
+
+
+_SHA1 = re.compile(r"[0-9a-f]{40}")
+
+
+def _holds_commit_by_stat(path, sha):
+    """Stat-only proof that the repository at `path` still holds `sha`.
+
+    `_replaced_orphans` runs on every completion AND reclamation pass, and the
+    terminal transition is gated on a fixed git-spawn budget
+    (test_kanban_terminal_transition_ref_cost). The common case -- the same
+    repository, dispatch commit still a loose object or still HEAD's ref --
+    is answerable from the object/ref files without a process.
+
+    Only POSITIVE answers are trusted: a loose object file named `sha` in THIS
+    repository's own `.git` directory, or `HEAD`'s ref file naming it, cannot
+    exist in a re-initialised repository. Anything else (a gitfile worktree,
+    packed objects or refs, an unreadable file) returns False and the caller
+    falls back to `git cat-file -e`, so this never decides "replaced".
+    """
+    if not isinstance(sha, str) or not _SHA1.fullmatch(sha):
+        return False
+    gitdir = path / ".git"
+    try:
+        if not gitdir.is_dir():
+            return False
+        if (gitdir / "objects" / sha[:2] / sha[2:]).is_file():
+            return True
+        head = (gitdir / "HEAD").read_text(encoding="ascii").strip()
+        if head.startswith("ref: "):
+            name = head[5:].strip()
+            if ".." in name.split("/"):
+                return False
+            head = (gitdir / name).read_text(encoding="ascii").strip()
+        return head == sha
+    except (OSError, ValueError):
+        return False
+
+
+def _replaced_orphans(workspace, bases):
+    """Recorded repositories re-initialised in place over ignored bytes.
+
+    `bases` binds a repository KEY to the commit it held at dispatch; the key
+    alone is not identity. Remove `a/.git`, `git init a` again and ignore the
+    old files, and every existing check is satisfied: `_repos` still returns
+    `a`, `bases - keys` is empty, `status --untracked-files=all` is clean -- yet
+    the new HEAD cannot reach the recorded commit, whose objects went with the
+    old `.git`, and the ignored files on disk are the only copy of that work.
+    Neither a landed claim nor a capture of the NEW repository covers them
+    (Argus P8, t_60592755: completion landed, workspace deleted, live and
+    bundle both lacked the bytes).
+
+    The discriminator is both conditions at once, which is what keeps the
+    positive control completing: the recorded commit is not an object in the
+    repository now at that path (identity replaced), AND that repository
+    ignores non-derived files (bytes no survivor can carry). A replacement
+    that commits the old files instead is captured normally.
+
+    Returns ``{key: [ignored entries...]}``; empty when nothing is orphaned.
+    """
+    orphans = {}
+    for key, sha in sorted((bases or {}).items()):
+        if not sha:
+            continue
+        path = workspace if key == "." else workspace / key
+        if not _is_repo_on_disk(path):
+            # Vanished outright (the `missing` arms own that shape), or a `.`
+            # base recorded from an ENCLOSING repository -- re-initialising in
+            # place would put a `.git` here. A stat, not a spawn: this runs on
+            # every completion and reclamation pass (ref-cost gate).
+            continue
+        if _holds_commit_by_stat(path, sha) or \
+                _git(path, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0:
+            continue  # same identity (or history still holds the dispatch commit)
+        listed = _git(path, "ls-files", "-z", "--others", "--ignored", "--exclude-standard",
+                      "--directory", "--", ".", check=False)
+        if listed.returncode:
+            # Cannot enumerate what is ignored: that is doubt, not "nothing".
+            orphans[key] = ["<unreadable>"]
+            continue
+        entries = []
+        for raw in listed.stdout.split(b"\0"):
+            name = raw.decode(errors="replace").rstrip("/")
+            if not name or any(part in _DERIVED_DIRS for part in Path(name).parts):
+                continue
+            if _is_repo_on_disk(path / name):
+                continue  # a nested repository is enumerated in its own right
+            entries.append(name)
+        if entries:
+            orphans[key] = entries
+    return orphans
 
 
 def _patch_carry(previous, survivor):
@@ -1209,17 +2139,46 @@ def _hold(conn, task_id, reason):
 
 
 def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
-             survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=()):
+             survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
+             survivor_none=False, survivor_reason=None):
     """Return a verified survivor or None for non-code work; fail closed on doubt."""
     bases, held, previous = _state(conn, task_id)
     if cleanup and held:
         raise SurvivorUnavailable(held)
+    if cleanup and previous and previous.get("kind") == "none":
+        # A no-ref close records a deployment assertion, not a durable copy of
+        # workspace bytes. The automatic completion cleanup has no authority to
+        # discard them, even when there was no changed_files claim.
+        raise SurvivorUnavailable("survivor_unavailable: survivor-none cannot authorize workspace deletion")
+    stage = "task lookup"
     try:
         task = kb.get_task(conn, task_id)
         if task is None:
             raise SurvivorUnavailable("survivor_unavailable: task missing")
+        if survivor_none:
+            if cleanup:
+                raise SurvivorUnavailable("survivor_unavailable: survivor-none is not reusable for workspace deletion")
+            if survivor_ref or survivor_pr or survivor_unbound:
+                raise SurvivorUnavailable("survivor_unavailable: survivor-none cannot be mixed with remote claims")
+            reason = (survivor_reason or "").strip()
+            followups = re.findall(r"\bt_[0-9a-f]{8}\b", reason)
+            if not reason or len(followups) != 1 or not kb.get_task(conn, followups[0]):
+                raise SurvivorUnavailable("survivor_unavailable: survivor-none needs a reason naming one existing follow-up card")
+            return _record(conn, task_id, {"kind": "none", "reason": reason,
+                                            "follow_up_card": followups[0]}, previous)
+        stage = "remote survivor verification"
         explicit = _verified_explicit(task_id, survivor_ref, survivor_pr,
                                       unbound=survivor_unbound)
+        if explicit and task.workspace_kind == "dir" and not cleanup:
+            # A shared directory is NEVER removed at completion. Its other
+            # repositories (including ignored review worktrees) belong to
+            # other cards, not this claim. Capture them neither as this card's
+            # evidence nor as a reason to veto a verified external survivor.
+            # The cleanup=True path still inspects every byte before deletion.
+            return _record(conn, task_id, _external(
+                conn, task_id, metadata, evidence, (), explicit,
+                discover=False, cleanup=False, previous=previous,
+            ), previous)
         claimed = bool((metadata or {}).get("changed_files"))
         # Review approval often has no new changed_files: inherit the implementer's claim.
         claimed = claimed or any(
@@ -1239,6 +2198,80 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 )
             return None
         workspace = workspace.resolve(strict=True)
+        orphans = _replaced_orphans(workspace, bases)
+        if orphans:
+            # Placed ahead of EVERY exit -- landed, ordinary capture, and the
+            # reclamation relaxation -- because each of them would otherwise
+            # certify the replacement repository and hand the old identity's
+            # ignored bytes to the reaper. No operator claim is accepted here:
+            # a ref for the OLD repository cannot vouch for files that exist
+            # only on this disk. The remedy is to resolve the bytes.
+            detail = "; ".join(f"{key}: {', '.join(names[:5])}" + (" ..." if len(names) > 5 else "")
+                               for key, names in orphans.items())
+            raise SurvivorUnavailable(
+                "survivor_unavailable: recorded repository replaced in place no longer holds "
+                f"its dispatch commit and ignores files no survivor captures ({detail}); "
+                "commit them to the replacement or remove them, then complete again"
+            )
+        landed = (metadata or {}).get("landed")
+        if cleanup and not landed and previous and previous.get("kind") == "landed":
+            # Revalidate the recorded live commits before removing the workspace.
+            landed = _recorded_landed_claims(previous)
+        if landed:
+            if not isinstance(landed, list):
+                raise SurvivorUnavailable("survivor_unavailable: landed must be a list")
+            survivor = {"kind": "landed", "landed": _verify_landed(landed, workspace)}
+            present = {entry["repository"] for claim in survivor["landed"]
+                       for entry in claim["workspace_repositories"]}
+            missing = set(bases) - present
+            if missing:
+                # A landed commit binds only repositories still on disk. A
+                # replacement root can ignore the files of a vanished child
+                # repository and appear clean while its work is still here.
+                refs = {}
+                if cleanup and _reusable(previous):
+                    refs = {ref["repository"]: ref for ref in _recorded_refs(previous)
+                            if isinstance(ref, dict) and ref.get("repository") in missing}
+                if explicit:
+                    if None in explicit:
+                        if len(missing) != 1 or len(explicit) != 1:
+                            raise SurvivorUnavailable(
+                                "survivor_unavailable: qualify each missing repository survivor"
+                            )
+                        explicit = {next(iter(missing)): explicit[None]}
+                    if set(explicit) - missing:
+                        raise SurvivorUnavailable(
+                            "survivor_unavailable: operator survivors name repositories still present"
+                        )
+                    refs.update({key: dict(ref, repository=key) for key, ref in explicit.items()})
+                if missing - refs.keys():
+                    raise SurvivorUnavailable(
+                        f"survivor_unavailable: recorded repository missing; {_ext.HINT}"
+                    )
+                survivor["refs"] = [refs[key] for key in sorted(missing)]
+            survivor["sidecar"] = _store(
+                conn, task_id, "implementation.json",
+                json.dumps(survivor, sort_keys=True).encode(), "application/json",
+            )["path"]
+            return _record(conn, task_id, survivor, previous)
+        # Git's registries answer "is there a nested repository here" in O(refs).
+        # For the `dir`-workspace-rooted-at-a-home shape this is the whole fix:
+        # that tree ALWAYS reaches the nested-repository refusal below, so the
+        # walk spent 227 s (measured on ~/.hermes: 850,853 directories) deriving
+        # a verdict Git could state in 1.2 s. Asking first turns a silent hang
+        # into an immediate, legible refusal.
+        #
+        # Only a positive short-circuits: the absence of a registered nested
+        # repo proves nothing (a hand-made clone is in neither registry), so
+        # that case falls through to the bounded walk exactly as before.
+        stage = "registered nested repository scan"
+        registered = _registered_nested(workspace)
+        if registered:
+            raise SurvivorUnavailable(
+                "survivor_unavailable: nested repository requires separate recovery "
+                f"({str(registered[0].relative_to(workspace))})"
+            )
+        stage = "_repos workspace scan"
         repos = _repos(workspace)
         if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
             # A patch cannot add a gitlink and files below the same path.
@@ -1264,6 +2297,19 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # `bases` is written once, before dispatch, so it does not know
             # about a repository the worker cloned afterwards.
             absent = _vouched_repositories(previous) - keys
+            # Coverage by an UNBOUND ref alone is not delete authority: it
+            # authorised the completion that recorded it and nothing more (see
+            # `_reusable`, `_authoritative_repositories`). Without this the
+            # same-call cleanup after an unbound completion `rmtree`d the
+            # vanished repository's ignored bytes.
+            unbound_only = absent - _authoritative_repositories(previous)
+            if unbound_only:
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: missing repositories "
+                    f"({', '.join(sorted(unbound_only))}) are vouched for only by an unbound "
+                    "operator survivor, which authorises one completion, not reclamation; "
+                    "re-assert a survivor bound to the card or recover the files by hand"
+                )
             # `missing <= absent` is the coverage test: every repository `bases`
             # says vanished must be one the recorded survivor actually accounts
             # for. A survivor vouching for some OTHER repository buys nothing.
@@ -1371,8 +2417,19 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         patches, refs, bundles, repositories = [], list(carried), list(carried_bundles), []
         for repo in repos:
             key = str(repo.relative_to(workspace))
+            stage = f"capture repository {key}"
             try:
                 ref, base, data = _capture(repo, key, workspace)
+                irreversible = False
+                if base is not None and data and len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
+                    # Only deleted-file preimages are dropped, and those are
+                    # derivable from the published ``base`` (see ``_snapshot``).
+                    # Still over the limit means real new bytes: ``_store``
+                    # refuses below, fail-closed.
+                    stage = f"irreversible-delete recut of repository {key}"
+                    data = _snapshot(repo, base, "" if key == "." else key + "/",
+                                     irreversible_delete=True)
+                    irreversible = True
             except SurvivorUnavailable:
                 # Every object-reading step above (`status`, `diff`, and
                 # `_snapshot`'s `git bundle` inside pack-objects) raises the
@@ -1389,15 +2446,36 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 bundle = _store(conn, task_id, name, data, "application/x-git-bundle")
                 bundles.append(dict(bundle, repository=key))
             elif data:
-                header = f"# kanban repository={json.dumps(key)} base={base}\n".encode()
+                header = (f"# kanban repository={json.dumps(key)} base={base}"
+                          f"{' irreversible-delete=1' if irreversible else ''}\n").encode()
                 patches.append(header + data)
-            repositories.append({"repository": key, "base_sha": base})
+            entry = {"repository": key, "base_sha": base}
+            if irreversible:
+                # Recorded so a recoverer knows deleted-file preimages were
+                # omitted as derivable from `base_sha`, not lost.
+                entry["irreversible_delete"] = True
+            repositories.append(entry)
         if repos and not bundles and len(refs) == len(repos) + len(carried):
             survivor = {"kind": "ref", "refs": refs}
+            if any(ref.get("matched_by") == "canonical" for ref in refs):
+                survivor["sidecar"] = _store(
+                    conn, task_id, "implementation.json",
+                    json.dumps(survivor, sort_keys=True).encode(), "application/json",
+                )["path"]
         elif patches or bundles:
             data = b"".join(patches)
             survivor = {"kind": "bundle" if bundles else "patch", "notice": "NOT PUSHED",
                         "bundles": bundles, "refs": refs}
+            if explicit:
+                # A verified explicit claim (e.g. a squash-merged PR) is the
+                # implementation's provenance; the captured bytes are only the
+                # workspace's residual delta. Persist the claim instead of
+                # dropping it, and do not label landed work "NOT PUSHED"
+                # (Argus r1 F5: t_fc150853 closed as refs:[] + NOT PUSHED
+                # although #195 had verified as merged deb2603).
+                survivor["claims"] = [dict(ref, repository=key or ".")
+                                      for key, ref in sorted(explicit.items(), key=lambda i: i[0] or "")]
+                survivor["notice"] = "WORKSPACE DELTA CAPTURED; implementation landed per verified claim"
             if patches:
                 survivor.update(_store(conn, task_id, "implementation.patch", data, "text/x-patch"))
             manifest = dict(survivor, repositories=repositories)
@@ -1441,14 +2519,31 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # became JSON `null` while `held_reason` was cleared. The invariant
             # is not "reclamation may not shrink the index" but "nothing may".
             survivor = previous
+        stage = "record survivor"
         return _record(conn, task_id, survivor, previous)
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as exc:
-        reason = str(exc) if isinstance(exc, SurvivorUnavailable) else "survivor_unavailable: capture failed"
+        reason = (str(exc) if isinstance(exc, SurvivorUnavailable) else
+                  f"survivor_unavailable: capture failed at {stage}: "
+                  f"{type(exc).__name__}: {_ext.redact(str(exc))}")
         # `reason` is what gets PERSISTED (held_reason + a workspace_held event
         # kanban_show replays to workers), so it must stay hint-free. The hint
         # rides the re-raised exception instead, for the CLI to render.
         _hold(conn, task_id, reason)
         raise _refusal(reason, hint=bool(getattr(exc, "override_hint", ""))) from exc
+    except (TypeError, KeyError, AttributeError, IndexError) as exc:
+        # Backstop for the malformed-record class. `previous` and `bases` are
+        # persisted JSON that this function indexes in many places; a shape
+        # nobody validated (hand-edited, partially written, legacy) raises one
+        # of these, which the tuple above does not name. Escaping here left the
+        # workspace retained but the card's recovery state SILENT -- no
+        # `held_reason`, no `workspace_held` event (Argus r4 P10/P12, #924).
+        # Doubt fails closed: HOLD with a persisted reason, keep the traceback
+        # in the log for whoever repairs the row.
+        _log.exception("kanban survivor: unreadable recovery state for %s", task_id)
+        reason = ("survivor_unavailable: recorded survivor state is malformed "
+                  f"({type(exc).__name__}); repair the row or recover the workspace by hand")
+        _hold(conn, task_id, reason)
+        raise _refusal(reason) from exc
 
 
 def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False):

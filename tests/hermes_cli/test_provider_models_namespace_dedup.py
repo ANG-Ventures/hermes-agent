@@ -51,7 +51,8 @@ def _run_merge(curated, live, slug=_SLUG):
     """Invoke the real provider_model_ids() generic api-key-provider path."""
     profile = _StubProfile(live)
     with (
-        patch.dict(_PROVIDER_MODELS, {slug: list(curated)}),
+        # The facade is additive (no key removal), so swap in a plain copy.
+        patch("hermes_cli.models._PROVIDER_MODELS", {**_PROVIDER_MODELS, slug: list(curated)}),
         patch("providers.get_provider_profile", return_value=profile),
         patch(
             "hermes_cli.auth.resolve_api_key_provider_credentials",

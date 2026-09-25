@@ -111,14 +111,30 @@ def test_gateway_tick_summary_counts_and_names_parent_satisfied_sticky_cards():
 
 
 def test_gateway_workspace_refused_summary_names_reason_and_tasks():
+    from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND
+
     summary = _format_workspace_refused_summary([
         ("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch/kanban-workspaces"),
         ("t_stranded", "stranded_by_mount_loss: /Volumes/ramscratch/kanban-workspaces/t_stranded"),
     ])
     assert summary == (
         "workspace_refused=2 (stranded_by_mount_loss: t_stranded; "
-        "workspaces_root_unmounted: t_missing)"
+        "workspaces_root_unmounted: t_missing) "
+        f"| recover stranded scratch cards: {STRANDED_RECOVERY_COMMAND}"
     )
+
+
+def test_workspace_refused_summary_names_recovery_only_when_stranded():
+    from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND as cmd
+
+    unmounted = _format_workspace_refused_summary([
+        ("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch/kanban-workspaces"),
+    ])
+    assert cmd not in unmounted
+    stranded = _format_workspace_refused_summary([
+        ("t_a", "stranded_by_mount_loss: /x/t_a"),
+    ])
+    assert stranded.endswith(cmd)
 
 
 def test_workspace_refusal_notifier_delivers_once_per_outage_and_rearms():
@@ -201,6 +217,96 @@ def test_workspace_refusal_sender_uses_default_profile_error_route(tmp_path, mon
     assert argv[argv.index("--profile") + 1] == "default"
     assert argv[argv.index("--sev") + 1] == "error"
     assert kwargs["stdin"] is subprocess.DEVNULL
+
+
+def test_guard_stuck_notifier_pages_once_and_rearms():
+    from gateway.kanban_watchers import _GuardStuckNotifier, _stall_streak_is_bad
+    item = {"task_id": "t_test", "clear_verb": 'hermes kanban requeue t_test "<reason>"'}
+    notifier = _GuardStuckNotifier()
+    sent = []
+    def send(board, row):
+        sent.append((board, row))
+        return True
+    assert notifier.observe([("default", item)], send) == 1
+    assert notifier.observe([("default", item)], send) == 0
+    assert sent[0][1]["clear_verb"] == 'hermes kanban requeue t_test "<reason>"'
+    assert _stall_streak_is_bad(True, True, [("default", _FakeResult())], guard_stuck=True)
+    assert notifier.observe([], send, observed_boards=set()) == 0  # lock/probe failure: unknown, not recovered
+    assert notifier.observe([("default", item)], send) == 0
+    assert notifier.observe([], send, observed_boards={"default"}) == 0  # observed recovery
+    assert notifier.observe([("default", item)], send) == 1
+
+
+def test_guard_stuck_notifier_retries_failed_send_after_unobserved_tick():
+    from gateway.kanban_watchers import _GuardStuckNotifier
+    item = {"task_id": "t_test", "clear_verb": 'hermes kanban requeue t_test "<reason>"'}
+    notifier = _GuardStuckNotifier()
+    calls = []
+    def send(board, row):
+        calls.append(board)
+        return len(calls) > 1
+    assert notifier.observe([("default", item)], send) == 0
+    assert notifier.observe([], send, observed_boards=set()) == 0
+    assert notifier.observe([("default", item)], send) == 1
+    assert len(calls) == 2
+
+
+def test_guard_stuck_probe_distinguishes_empty_board_from_skipped_or_failed(monkeypatch):
+    from contextlib import contextmanager
+    from hermes_cli import kanban_db as kb
+    from gateway.kanban_watchers import _guard_stuck_cards
+
+    @contextmanager
+    def connect(*, board):
+        if board == "failed":
+            raise OSError("probe failed")
+        yield object()
+
+    monkeypatch.setattr(kb, "connect_closing", connect)
+    monkeypatch.setattr(kb, "respawn_guard_stuck_tasks", lambda conn, **kw: [])
+    cards, observed = _guard_stuck_cards([
+        ("healthy", _FakeResult()),
+        ("locked", _FakeResult(skipped_locked=True)),
+        ("failed", _FakeResult()),
+    ])
+    assert cards == []
+    assert observed == {"healthy"}
+
+
+def test_guard_stuck_sender_routes_to_alerts(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    from types import SimpleNamespace
+    from gateway.kanban_watchers import _send_guard_stuck_alert
+    script = tmp_path / ".hermes" / "scripts" / "notify.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    calls = []
+    monkeypatch.setattr("gateway.kanban_watchers.subprocess.run", lambda argv, **kw: (calls.append((argv, kw)) or SimpleNamespace(returncode=0)))
+    assert _send_guard_stuck_alert("default", {"task_id": "t_test", "clear_verb": 'hermes kanban requeue t_test "<reason>"'})
+    argv, kwargs = calls[0]
+    assert argv[argv.index("--channel") + 1] == "discord"
+    assert argv[argv.index("--sev") + 1] == "error"
+    assert 'hermes kanban requeue t_test "<reason>"' in argv[argv.index("--send") + 1]
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert _send_guard_stuck_alert("default", {
+        "task_id": "t_pid", "reason": "prior_worker_still_alive",
+        "prev_pid": 97056, "clear_verb": "hermes kanban show t_pid",
+    })
+    pid_message = calls[-1][0][calls[-1][0].index("--send") + 1]
+    assert "prior_worker_still_alive" in pid_message
+    assert "97056" in pid_message
+    assert "hermes kanban show t_pid" in pid_message
+    assert "requeue alone cannot bypass" in pid_message
+    assert "READY card: prior_worker_still_alive" in pid_message  # no status -> ready door
+    assert _send_guard_stuck_alert("default", {
+        "task_id": "t_rev", "reason": "prior_worker_still_alive", "status": "review",
+        "prev_pid": 97057, "clear_verb": "hermes kanban show t_rev",
+    })
+    review_message = calls[-1][0][calls[-1][0].index("--send") + 1]
+    assert "REVIEW card: prior_worker_still_alive" in review_message
+    assert "READY" not in review_message
 
 
 def test_stall_respawn_guard_is_benign_not_bad():

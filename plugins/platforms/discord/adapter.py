@@ -192,6 +192,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 
 from gateway.platforms.helpers import (
+    CoalescingJsonWriter,
     MessageDeduplicator,
     ThreadParticipationTracker,
     convert_table_to_bullets,
@@ -514,10 +515,27 @@ class _DiscordNonConversationalMessageTracker:
     """Persistent bounded set of Discord message IDs that are status noise."""
 
     _MAX_TRACKED = 2000
+    # Coalescing window for the background persist.  ``mark_many`` runs on the
+    # outbound ``send`` coroutine, so it must never pay the fsync + rename
+    # inline; losing <= this many seconds of noise-ids on a hard crash only
+    # means a status message may be re-read as context once.
+    _PERSIST_INTERVAL_S = 2.0
 
-    def __init__(self, max_tracked: int = _MAX_TRACKED):
+    def __init__(
+        self,
+        max_tracked: int = _MAX_TRACKED,
+        persist_interval_s: float = _PERSIST_INTERVAL_S,
+    ):
         self._max_tracked = max_tracked
+        self._lock = threading.Lock()
         self._ids: dict[str, None] = dict.fromkeys(self._load())
+        self._writer = CoalescingJsonWriter(
+            self._state_path,
+            self._snapshot,
+            min_interval_s=persist_interval_s,
+            name="discord-nonconversational-writer",
+            indent=None,
+        )
 
     def _state_path(self) -> _Path:
         from hermes_constants import get_hermes_home
@@ -540,28 +558,38 @@ class _DiscordNonConversationalMessageTracker:
             logger.debug("[%s] Failed to load non-conversational Discord IDs", "Discord")
         return []
 
-    def _save(self) -> None:
-        ids = list(self._ids)
-        if len(ids) > self._max_tracked:
-            ids = ids[-self._max_tracked:]
-            self._ids = dict.fromkeys(ids)
+    def _snapshot(self) -> list[str]:
+        """JSON payload for the writer thread (called off-loop)."""
+        with self._lock:
+            return list(self._ids)
+
+    def flush(self) -> None:
+        """Synchronous durable write. Blocking: coroutines use ``asyncio.to_thread``."""
         try:
-            atomic_json_write(self._state_path(), ids, indent=None)
+            self._writer.flush()
         except Exception:
             logger.debug("[%s] Failed to save non-conversational Discord IDs", "Discord", exc_info=True)
 
     def mark_many(self, message_ids: List[str]) -> None:
+        """Record ids in memory now; persist on the coalescing writer thread.
+
+        Loop-safe: never touches the disk (see ``CoalescingJsonWriter``).
+        """
         changed = False
-        for message_id in message_ids:
-            key = str(message_id or "").strip()
-            if key and key not in self._ids:
-                self._ids[key] = None
-                changed = True
+        with self._lock:
+            for message_id in message_ids:
+                key = str(message_id or "").strip()
+                if key and key not in self._ids:
+                    self._ids[key] = None
+                    changed = True
+            if changed and len(self._ids) > self._max_tracked:
+                self._ids = dict.fromkeys(list(self._ids)[-self._max_tracked:])
         if changed:
-            self._save()
+            self._writer.schedule()
 
     def __contains__(self, message_id: str) -> bool:
-        return str(message_id or "") in self._ids
+        with self._lock:
+            return str(message_id or "") in self._ids
 
 
 class _DiscordRestartRecoveryState:
@@ -579,9 +607,13 @@ class _DiscordRestartRecoveryState:
     2. ``shutdown_ts``: float epoch written on graceful shutdown — the scan
        anchor for backfill-on-reconnect.
 
-    Persistence is DEBOUNCED (at most once per ``persist_interval_s`` on change)
-    so a hard crash keeps a recent map, plus an explicit ``flush()`` on graceful
-    shutdown. There is NO message-id cursor here — the dedup authority is the
+    Persistence is COALESCED and OFF-LOOP: ``mark_channel_active`` only updates
+    memory and wakes a ``CoalescingJsonWriter`` thread, which writes at most once
+    per ``persist_interval_s`` (so a hard crash keeps a recent map), plus an
+    explicit ``flush()`` on graceful shutdown.  ``mark_channel_active`` is called
+    from the outbound ``send`` coroutine; before 2026-09-24 it paid the
+    fsync + ``os.replace`` inline and blocked the gateway loop up to 20 s under
+    SSD contention (46 ``event_loop_blocked`` events in 40 min). There is NO message-id cursor here — the dedup authority is the
     session transcript (``has_platform_message_id``), not this file. This stores
     ONLY channel ids + timestamps (no message content, no message ids).
     """
@@ -598,8 +630,14 @@ class _DiscordRestartRecoveryState:
         self._lock = threading.Lock()
         self._active_channels: Dict[str, float] = {}
         self._shutdown_ts: Optional[float] = None
-        self._last_persist_at: float = 0.0
         self._load()
+        self._writer = CoalescingJsonWriter(
+            self._state_path,
+            self._snapshot,
+            min_interval_s=persist_interval_s,
+            name="discord-restart-recovery-writer",
+            indent=None,
+        )
 
     def _state_path(self) -> _Path:
         from hermes_constants import get_hermes_home
@@ -646,20 +684,21 @@ class _DiscordRestartRecoveryState:
         )[-self._max_channels:]
         self._active_channels = dict(kept)
 
-    def _persist_locked(self) -> None:
-        """Write state atomically. Caller holds the lock."""
-        payload = {
-            "active_channels": self._active_channels,
-            "shutdown_ts": self._shutdown_ts,
-        }
-        try:
-            atomic_json_write(self._state_path(), payload, indent=None)
-            self._last_persist_at = time.time()
-        except Exception:
-            logger.debug("[Discord] Failed to persist restart-recovery state", exc_info=True)
+    def _snapshot(self) -> Dict[str, Any]:
+        """JSON payload, copied under the lock (called on the writer thread)."""
+        with self._lock:
+            return {
+                "active_channels": dict(self._active_channels),
+                "shutdown_ts": self._shutdown_ts,
+            }
 
     def mark_channel_active(self, channel_id: Any, *, now: Optional[float] = None) -> None:
-        """Record channel activity (inbound or outbound). Debounced persist."""
+        """Record channel activity (inbound or outbound). Loop-safe.
+
+        Updates the in-memory map and schedules a coalesced background persist;
+        never touches the disk on the calling thread.  A hard crash loses at
+        most ``persist_interval_s`` of freshness (documented non-goal / R-4).
+        """
         key = str(channel_id or "").strip()
         if not key:
             return
@@ -667,22 +706,22 @@ class _DiscordRestartRecoveryState:
         with self._lock:
             self._active_channels[key] = ts
             self._bound_locked()
-            # Debounce: only hit disk at most once per interval on change. The
-            # in-memory map is always current; a hard crash loses at most
-            # ``persist_interval_s`` of freshness (documented non-goal / R-4).
-            if ts - self._last_persist_at >= self._persist_interval_s:
-                self._persist_locked()
+        self._writer.schedule()
 
     def flush(self, *, shutdown_ts: Optional[float] = None) -> None:
         """Force a durable write, optionally stamping the shutdown anchor.
 
         Called on graceful shutdown so the latest map + the shutdown_ts anchor
-        are on disk regardless of the debounce window.
+        are on disk regardless of the coalescing window.  BLOCKING (fsync +
+        rename): coroutines must call it via ``asyncio.to_thread``.
         """
         with self._lock:
             if shutdown_ts is not None:
                 self._shutdown_ts = shutdown_ts
-            self._persist_locked()
+        try:
+            self._writer.flush()
+        except Exception:
+            logger.debug("[Discord] Failed to persist restart-recovery state", exc_info=True)
 
     def recent_channels(self, lookback_s: float, *, now: Optional[float] = None) -> List[str]:
         """Channel ids active within ``lookback_s`` of ``now``, newest-first."""
@@ -2574,9 +2613,15 @@ class DiscordAdapter(BasePlatformAdapter):
         # latest activity map regardless of the debounce window. Fail-open — a
         # flush error must never block teardown.
         try:
-            self._restart_recovery.flush(shutdown_ts=time.time())
+            await asyncio.to_thread(
+                self._restart_recovery.flush, shutdown_ts=time.time()
+            )
         except Exception:
             logger.debug("[%s] restart-recovery shutdown flush failed", self.name, exc_info=True)
+        try:
+            await asyncio.to_thread(self._nonconversational_messages.flush)
+        except Exception:
+            logger.debug("[%s] non-conversational ids shutdown flush failed", self.name, exc_info=True)
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
@@ -3014,7 +3059,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if skip_reason:
                 logger.info("[%s] Skipping Discord slash command sync: %s", self.name, skip_reason)
                 return
-            self._record_command_sync_attempt(app_id, fingerprint)
+            # _record_command_sync_* end in atomic_json_write (fsync + rename):
+            # run them on a worker thread, never inline on the loop.
+            await asyncio.to_thread(self._record_command_sync_attempt, app_id, fingerprint)
 
             http = getattr(self._client, "http", None)
             has_ratelimit_timeout = http is not None and hasattr(http, "max_ratelimit_timeout")
@@ -3036,7 +3083,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     # Rate-limited but no retry-after signal — back off for a
                     # conservative default so we don't slam the bucket again.
                     retry_after = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
-                self._record_command_sync_rate_limit(app_id, fingerprint, retry_after)
+                await asyncio.to_thread(
+                    self._record_command_sync_rate_limit, app_id, fingerprint, retry_after
+                )
                 logger.warning(
                     "[%s] Discord rate-limited slash command sync; retrying after %.0fs",
                     self.name,
@@ -3052,7 +3101,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if has_ratelimit_timeout:
                     http.max_ratelimit_timeout = previous_ratelimit_timeout
 
-            self._record_command_sync_success(app_id, fingerprint, summary)
+            await asyncio.to_thread(self._record_command_sync_success, app_id, fingerprint, summary)
             logger.info(
                 "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
                 self.name,

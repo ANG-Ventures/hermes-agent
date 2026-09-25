@@ -46,6 +46,9 @@ from gateway.fork_ext.unclean_restart_notice import (
     get_restart_notice_ledger_path,
     read_last_event_loop_blocked_site,
     read_planned_restart,
+    read_planned_restart_for_sentinel,
+    prior_life_reference_at,
+    planned_restart_detail,
     PLANNED_RESTART_WINDOW_S,
 )
 from gateway.run import GatewayRunner
@@ -530,3 +533,144 @@ def test_unplanned_watchdog_exit_still_notifies():
     assert verdict.planned is False
     text = format_restart_notice(verdict)
     assert text and "shutdown watchdog" in text
+
+
+# --------------------------------------------------------------------------
+# SIGKILL at launchd ExitTimeOut: no prior_exited_at (2026-09-24 12:12)
+# --------------------------------------------------------------------------
+# Aegis full-reloaded Apollo (token f81667c9b917). The old pid never drained in
+# 60 s, launchd SIGKILLed it, so no exit path ran and the sentinel carried no
+# prior_exited_at. The reference fell back to prior_started_at -- the PREVIOUS
+# boot, 70 min before the kickstart row -- and every session was told
+# "Restarted -- UNPLANNED" for a restart the ledger fully explained.
+
+_PREV_BOOT = "2026-09-24T18:02:31+00:00"      # prior life began (11:02 PDT)
+_KICKSTART_EPOCH = datetime.fromisoformat("2026-09-24T19:11:12+00:00").timestamp()
+_THIS_BOOT = "2026-09-24T19:12:27+00:00"      # new life began (12:12 PDT)
+
+_SIGKILLED_AT_EXIT_TIMEOUT = {
+    "phase": "running",
+    "pid": 45339,
+    "started_at": _THIS_BOOT,
+    "prior_unclean_exit": True,
+    "prior_killer": "unattributed",
+    "prior_kill_attribution_reason": "probe_timeout",
+    "prior_started_at": _PREV_BOOT,
+}
+
+
+def _aegis_full_reload_rows(pid_before=99678):
+    common = {"target_profile": "default", "initiator_profile": "aegis",
+              "token": "f81667c9b917", "full_reload": True, "pid_before": pid_before}
+    return [
+        dict(common, event="intent", epoch=_KICKSTART_EPOCH - 94,
+             busy_policy="interrupt",
+             detail="origin_source=flags resolved_via=external"),
+        dict(common, event="kickstart", epoch=_KICKSTART_EPOCH, detail="full-reload"),
+        dict(common, event="reconnected", epoch=_KICKSTART_EPOCH + 67, pid_after=45339),
+    ]
+
+
+def test_sigkilled_prior_life_with_ledger_kickstart_is_planned(tmp_path, monkeypatch):
+    """AC(1): no prior_exited_at, kickstart 70 min after prior_started_at -> planned by aegis."""
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    _ledger(tmp_path, _aegis_full_reload_rows())
+    row = read_planned_restart_for_sentinel(_SIGKILLED_AT_EXIT_TIMEOUT, tmp_path)
+    assert row is not None and row["event"] == "kickstart"
+    verdict = classify_prior_life(_SIGKILLED_AT_EXIT_TIMEOUT, planned=row)
+    assert verdict.planned is True and verdict.planned_by == "aegis"
+    msg = format_restart_notice(verdict)
+    assert msg and "by aegis (full-reload)" in msg and "UNPLANNED" not in msg, msg
+
+
+def test_sigkilled_prior_life_without_ledger_row_stays_unplanned(tmp_path, monkeypatch):
+    """AC(2) negative control: nothing in the ledger -> still UNPLANNED."""
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    assert read_planned_restart_for_sentinel(_SIGKILLED_AT_EXIT_TIMEOUT, tmp_path) is None
+    _ledger(tmp_path, [])
+    row = read_planned_restart_for_sentinel(_SIGKILLED_AT_EXIT_TIMEOUT, tmp_path)
+    assert row is None
+    msg = format_restart_notice(classify_prior_life(_SIGKILLED_AT_EXIT_TIMEOUT, planned=row))
+    assert msg and "UNPLANNED" in msg
+
+
+def test_reference_never_falls_back_to_the_previous_boot_start():
+    assert prior_life_reference_at(_SIGKILLED_AT_EXIT_TIMEOUT) == _THIS_BOOT
+    hb = dict(_SIGKILLED_AT_EXIT_TIMEOUT, prior_last_heartbeat_at="2026-09-24T19:11:40+00:00")
+    assert prior_life_reference_at(hb) == "2026-09-24T19:11:40+00:00"
+    exited = dict(hb, prior_exited_at="2026-09-24T19:11:50+00:00")
+    assert prior_life_reference_at(exited) == "2026-09-24T19:11:50+00:00"
+
+
+def test_pid_identity_beats_the_time_window(tmp_path, monkeypatch):
+    """A row aimed at the dead pid explains it however long the drain took."""
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    far = [dict(r, epoch=r["epoch"] - 3600) for r in _aegis_full_reload_rows()]
+    _ledger(tmp_path, far)
+    sentinel = dict(_SIGKILLED_AT_EXIT_TIMEOUT, prior_pid=99678)
+    row = read_planned_restart_for_sentinel(sentinel, tmp_path)
+    assert row is not None and row["event"] == "kickstart"
+    # ...but only for THAT pid, and never a row written after this boot.
+    assert read_planned_restart_for_sentinel(dict(sentinel, prior_pid=11111), tmp_path) is None
+    late = [dict(r, epoch=_KICKSTART_EPOCH + 7200) for r in _aegis_full_reload_rows()]
+    _ledger(tmp_path, late)
+    assert read_planned_restart_for_sentinel(sentinel, tmp_path) is None
+
+
+def test_intent_resolver_plumbing_is_not_shown_as_the_cause():
+    intent = {"event": "intent", "initiator_profile": "aegis", "full_reload": True,
+              "detail": "origin_source=flags resolved_via=external"}
+    assert planned_restart_detail(intent) == "full-reload"
+    kick = {"event": "kickstart", "detail": "full-reload",
+            "reason": "ProcessType=Interactive plist fix"}
+    assert planned_restart_detail(kick) == "full-reload: ProcessType=Interactive plist fix"
+    msg = format_restart_notice(classify_prior_life(
+        _SIGKILLED_AT_EXIT_TIMEOUT, planned=dict(kick, initiator_profile="aegis")))
+    assert "by aegis (full-reload: ProcessType=Interactive plist fix)" in msg, msg
+
+
+def test_boot_claim_carries_prior_pid_and_heartbeat_for_a_sigkilled_life(tmp_path, monkeypatch):
+    """The sentinel the notice reads must carry the join key and the death time."""
+    from gateway import lifecycle_ledger as ll
+    from gateway.shutdown_watchdog import get_loop_heartbeat_path
+
+    ll._write_sentinel({"phase": "running", "pid": 99678, "start_time": 1.0,
+                        "started_at": _PREV_BOOT}, tmp_path)
+    hb = get_loop_heartbeat_path(tmp_path)
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    hb.write_text(json.dumps({"pid": 99678, "updated_at": "2026-09-24T19:11:40+00:00"}))
+    monkeypatch.setattr(ll, "_pid_alive_with_start_time", lambda *a, **k: False)
+    evidence = ll.detect_unclean_exit(tmp_path)
+    assert evidence is not None
+    ll._claim_sentinel(evidence, tmp_path)
+    sentinel = json.loads(ll.get_lifecycle_sentinel_path(tmp_path).read_text())
+    assert sentinel["prior_pid"] == 99678
+    assert sentinel["prior_last_heartbeat_at"] == "2026-09-24T19:11:40+00:00"
+
+
+@pytest.mark.asyncio
+async def test_runner_announces_the_sigkilled_safe_restart_as_planned(tmp_path, monkeypatch):
+    """End-to-end through GatewayRunner._prior_life_verdict (the site that regressed)."""
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    _ledger(tmp_path, _aegis_full_reload_rows())
+    runner, base_adapter = _resume_runner(tmp_path, _SIGKILLED_AT_EXIT_TIMEOUT)
+    adapter = _OrderRecordingAdapter(base_adapter)
+    await runner._run_startup_resume_event(
+        adapter, _resume_event(), _KEY, resume_reason="restart_interrupted"
+    )
+    assert len(adapter.sent) == 1, adapter.sent
+    assert "by aegis (full-reload)" in adapter.sent[0], adapter.sent[0]
+    assert "UNPLANNED" not in adapter.sent[0]
+
+
+def test_reason_on_the_intent_row_reaches_the_kickstart_banner(tmp_path, monkeypatch):
+    """Banners must NAME the cause: a reason recorded on the intent row of the
+    same token is shown next to the kickstart row's mechanism."""
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    rows = _aegis_full_reload_rows()
+    rows[0]["reason"] = "ProcessType=Interactive plist fix"
+    _ledger(tmp_path, rows)
+    row = read_planned_restart_for_sentinel(_SIGKILLED_AT_EXIT_TIMEOUT, tmp_path)
+    assert row["event"] == "kickstart"
+    msg = format_restart_notice(classify_prior_life(_SIGKILLED_AT_EXIT_TIMEOUT, planned=row))
+    assert "by aegis (full-reload: ProcessType=Interactive plist fix)" in msg, msg

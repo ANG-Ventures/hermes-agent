@@ -74,14 +74,24 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             tools TEXT,
             input_tokens INT,
             output_tokens INT,
+            output_tokens_unknown INT DEFAULT 0,
             cache_read INT,
             cache_write INT,
+            cache_write_5m INT,
+            cache_write_1h INT,
+            gap_prev_turn_s REAL,
+            first_call_cache_miss INT,
+            idle_compaction_fired INT,
+            compaction_tokens_before INT,
+            compaction_tokens_after INT,
+            compaction_cost_usd REAL,
             reasoning INT,
             context_used INT,
             context_length INT,
             last_cache_read INT,
             last_cache_write INT,
             last_uncached INT,
+            last_call_prompt_unknown INT DEFAULT 0,
             comp_sys_tokens INT,
             comp_tool_schema_tokens INT,
             comp_history_tokens INT,
@@ -105,7 +115,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             final_text TEXT,
             cli_invocation_id TEXT,
             served_subs_json TEXT,
-            attribution TEXT
+            attribution TEXT,
+            terminal_error TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -160,6 +171,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             output_tokens INT,
             cache_read INT,
             cache_write INT,
+            cache_write_5m INT,
+            cache_write_1h INT,
+            cache_ttl_requested TEXT,
+            lane_family TEXT,
             reasoning INT,
             attribution TEXT,
             http_status INT,
@@ -190,12 +205,46 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # partially-migrated DB (or a second writer that already added them)
     # never raises "duplicate column name".
     _existing = {row[1] for row in conn.execute("PRAGMA table_info(turns)").fetchall()}
+    for col, kind in (
+        ("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
+        ("gap_prev_turn_s", "REAL"), ("first_call_cache_miss", "INT"),
+        ("idle_compaction_fired", "INT"), ("compaction_tokens_before", "INT"),
+        ("compaction_tokens_after", "INT"), ("compaction_cost_usd", "REAL"),
+    ):
+        if col not in _existing:
+            try:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {kind}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+    _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
+    for col, kind in (("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
+                      ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT")):
+        if col not in _api_existing:
+            try:
+                conn.execute(f"ALTER TABLE turn_api_calls ADD COLUMN {col} {kind}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
     for _col in ("last_cache_read", "last_cache_write", "last_uncached"):
         if _col not in _existing:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} INT")
             except sqlite3.OperationalError:
                 pass  # raced with another writer; column now exists
+    # Last-CALL prompt discriminator (r6 finding 9). Deliberately NULLable with
+    # no DEFAULT on the migration path: NULL means "this row predates the
+    # column, so its final-call provenance was never recorded", and the
+    # renderer falls back to the absorbing turn-level flag for those rows —
+    # exactly the behaviour they have today. A DEFAULT 0 here would instead
+    # assert "the final call WAS measured" about every historical row,
+    # including genuinely unmeasured ones, and render their placeholder zeros
+    # as real window numbers. New rows always bind an explicit 0/1.
+    if "last_call_prompt_unknown" not in _existing:
+        try:
+            conn.execute("ALTER TABLE turns ADD COLUMN last_call_prompt_unknown INT")
+        except sqlite3.OperationalError:
+            pass  # raced with another writer; column now exists
     # Request-composition columns (fixed vs non-fixed breakdown of the final
     # call). Same guarded additive pattern. INT for the token buckets, TEXT for
     # the per-call composition JSON blob.
@@ -251,13 +300,120 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # `served_subs_json` is the cheap per-turn display rollup
     # ({"sub-vps-7": 3, ...}); `attribution` is the turn's dominant provenance.
     # ALTER is NOT idempotent, hence the PRAGMA-guarded per-column pattern.
-    for _col in ("served_subs_json", "attribution"):
+    # `terminal_error` (t_6c09f0c2): NULL for a turn that ended normally; the
+    # turn_exit_reason for one that ended failed (fallback chain exhausted,
+    # raised, ...). Lets turn-level surfaces count failed turns.
+    for _col in ("served_subs_json", "attribution", "terminal_error"):
         if _col not in _existing:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} TEXT")
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    # UNKNOWN != 0 discriminator columns. New rows default measured, but rows
+    # that PRE-DATE this schema can be ambiguous: old Hermes collapsed an
+    # omitted provider usage payload into integer zeroes and had no
+    # discriminator with which to distinguish that from a measured zero.
+    #
+    # The latch is therefore restricted to unpriced rows whose token counts are
+    # ALL ZERO — the only rows that are actually ambiguous. A blanket
+    # "unpriced" latch was wrong on both ends: `usage_unknown` is not a
+    # pricing-private column, it is the shared DISPLAY discriminator
+    # (`agent.usage_pricing.prompt_tokens_unknown`, `plugins/blackbox/
+    # last_turn.py`, `plugins/blackbox/card.py` all branch on it), and a row is
+    # routinely NULL-cost because pricing REFUSED (no catalog entry for the
+    # route) while carrying perfectly good provider-measured counts. Latching
+    # those rewrote real measurements as "unknown" on every user-facing card,
+    # irreversibly. Already-priced history is left untouched either way.
+    unknown_columns = {
+        "output_tokens_unknown",
+        "input_tokens_unknown",
+        "cache_read_tokens_unknown",
+        "cache_write_tokens_unknown",
+        "usage_unknown",
+    }
+    migrating_legacy_unknown_schema = not unknown_columns <= _existing
+    if "output_tokens_unknown" not in _existing:
+        try:
+            conn.execute(
+                "ALTER TABLE turns ADD COLUMN output_tokens_unknown INT DEFAULT 0"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+    for column in ("input_tokens_unknown", "cache_read_tokens_unknown",
+                   "cache_write_tokens_unknown", "usage_unknown"):
+        if column not in _existing:
+            try:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {column} INT DEFAULT 0")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+    if migrating_legacy_unknown_schema:
+        # Narrowed once more (r6 finding 6). "unpriced AND all counts zero" is
+        # still not a purely ambiguous population: a turn interrupted before
+        # any API call fired, a blackbox-off turn, or one whose first call
+        # failed genuinely consumed zero tokens and is a MEASURED zero. Latching
+        # those was irreversible and had two costs: `reprice_unpriced` now
+        # short-circuits on any unknown flag, so they could never again heal to
+        # `priced_zero` and were reported `still_unknown` on every future sweep;
+        # and every consumer that branches on `usage_unknown` rendered them
+        # `unknown in + unknown out` forever.
+        #
+        # `cost_status` is the discriminator the old schema DID carry: a row the
+        # pre-UNKNOWN code already labelled 'unknown' is one where that code
+        # could not account the call, which is exactly the ambiguous population.
+        # A row with any other status (including NULL, i.e. never accounted)
+        # keeps its measured zero. Already-priced history is untouched either
+        # way.
+        #
+        # The all-zero-counts guard may only name token columns this DB actually
+        # has. `turns` is created with them, but a table that already existed
+        # never gains them (CREATE TABLE IF NOT EXISTS is a no-op and no ALTER
+        # adds them), so a sufficiently old DB can reach here without e.g.
+        # `cache_write` — naming it unconditionally aborts the whole migration
+        # with "no such column". When a count column is absent the row cannot
+        # carry a measurement in it, which is exactly the zero the guard tests
+        # for, so omitting it from the sum preserves the condition's meaning.
+        _count_cols = [
+            c for c in ("input_tokens", "output_tokens", "cache_read", "cache_write")
+            if c in _existing
+        ]
+        _all_zero = (
+            " + ".join(f"COALESCE({c}, 0)" for c in _count_cols) + " = 0"
+            if _count_cols
+            else "1 = 1"
+        )
+        _status_guard = (
+            " AND cost_status = 'unknown'" if "cost_status" in _existing else ""
+        )
+        # All five columns, not just the aggregate (r6 round-4 finding 8). A
+        # migrated row IS the shape `CanonicalUsage.fully_unknown()` describes —
+        # the provider measured NO bucket — and that classmethod's docstring
+        # states why the aggregate alone is insufficient: consumers read these
+        # flags NARROWLY. `plugins/blackbox/card.py::_tokens_out_line` and the
+        # thin `/usage` card gate the output line on `output_tokens_unknown`
+        # ALONE, and `prompt_tokens_unknown` ORs only the three input flags.
+        # Setting `usage_unknown` by itself therefore left every migrated row
+        # still rendering `0 out` as a measurement on exactly the surfaces this
+        # latch exists to correct.
+        #
+        # Same `_existing` guard as the counts above: an old DB that never
+        # gained a column cannot be updated on it, and naming it would abort the
+        # whole migration with "no such column". Note `_existing` is the
+        # PRE-ALTER snapshot, so it CANNOT be used here — in the migration case
+        # it is precisely the set that lacks these columns. The ALTERs above run
+        # unconditionally for all five and re-raise anything other than
+        # "duplicate column", so reaching this line means all five exist.
+        _set_clause = ", ".join(f"{c} = 1" for c in sorted(unknown_columns))
+        conn.execute(
+            f"UPDATE turns SET {_set_clause} "
+            "WHERE cost_usd IS NULL "
+            "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
+            "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"
+            f"{_status_guard} "
+            f"AND {_all_zero}"
+        )
     _ensure_turn_indexes(conn)
     conn.commit()
 
@@ -271,8 +427,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 # be opened at all (t_71ae3a75). A column the table lacks simply gets no index.
 _TURN_INDEXES = (
     ("idx_blackbox_turns_chat_end", ("platform", "chat_id", "ts_end")),
+    ("idx_blackbox_turns_chat_start", ("chat_id", "ts_start")),
     ("idx_blackbox_turns_cost", ("cost_usd",)),
     ("idx_blackbox_turns_ts_start", ("ts_start",)),
+    # The skill-stats miner (skills-dashboard launchd, hourly) opens every
+    # ledger with `SELECT DISTINCT profile FROM turns`. Without an index on
+    # profile that is a full SCAN of the overflow-heavy table: measured 107 s on
+    # the 1.5 GB fleet ledger under I/O load (2026-09-23), past the miner's
+    # 180 s budget, so the Stats tab silently served last-good data.
+    ("idx_blackbox_turns_profile", ("profile",)),
 )
 
 
@@ -316,6 +479,76 @@ def _cost_float(value: Any) -> float | None:
     return float(value)
 
 
+def lane_family(provider: str) -> str:
+    p = str(provider or "").strip().lower()
+    for prefixes, family in (
+        (("claude-apx", "claude-apr", "claude-api-proxy"), "apx/apr"),
+        (("claude-bpx", "claude-bpr", "claude-bridge"), "bpx/bpr"),
+        (("claude-cpx", "claude-cpr"), "cpx/cpr"),
+        (("xai",), "xai"), (("openrouter",), "openrouter"),
+    ):
+        if p.startswith(prefixes):
+            return family
+    return "codex" if p == "openai-codex" else "other"
+
+
+def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
+    """Reconcile calls even when they arrive after the turn row."""
+    conn.execute("""
+        UPDATE turns SET
+            cache_write_5m = (SELECT SUM(cache_write_5m) FROM turn_api_calls
+                              WHERE turn_id = turns.turn_id),
+            cache_write_1h = (SELECT SUM(cache_write_1h) FROM turn_api_calls
+                              WHERE turn_id = turns.turn_id),
+            first_call_cache_miss = (
+                SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
+                                      OR cache_write IS NULL THEN NULL
+                            WHEN input_tokens + cache_read + cache_write <= 0 THEN NULL
+                            WHEN cache_write * 5 >= 4 *
+                                 (input_tokens + cache_read + cache_write) THEN 1
+                            ELSE 0 END
+                FROM turn_api_calls WHERE turn_id = turns.turn_id
+                  -- First SUCCESSFUL call: a 429/5xx/timeout attempt carries
+                  -- zero usage and would hide the cold write on the retry.
+                  AND (http_status IS NULL OR http_status BETWEEN 200 AND 299)
+                  AND COALESCE(input_tokens, 0) + COALESCE(cache_read, 0)
+                      + COALESCE(cache_write, 0) > 0
+                ORDER BY seq LIMIT 1)
+        WHERE turn_id = ?
+    """, (turn_id,))
+
+
+def backfill_cache_monitoring() -> None:
+    """Explicit historical fill; never infer cache tiers or compaction cost."""
+    with _connect() as conn:
+        for family, prefixes in (
+            ("apx/apr", ("claude-apx", "claude-apr", "claude-api-proxy")),
+            ("bpx/bpr", ("claude-bpx", "claude-bpr", "claude-bridge")),
+            ("cpx/cpr", ("claude-cpx", "claude-cpr")),
+            ("codex", ("openai-codex",)), ("xai", ("xai",)),
+            ("openrouter", ("openrouter",)),
+        ):
+            for prefix in prefixes:
+                conn.execute("UPDATE turn_api_calls SET lane_family=? "
+                             "WHERE lane_family IS NULL AND lower(provider) LIKE ?",
+                             (family, prefix + "%"))
+        conn.execute("UPDATE turn_api_calls SET lane_family='other' WHERE lane_family IS NULL")
+        conn.execute("""
+            UPDATE turns SET gap_prev_turn_s = ts_start - (
+                SELECT prev.ts_end FROM turns AS prev
+                WHERE prev.chat_id = turns.chat_id AND prev.chat_id != ''
+                  AND (prev.ts_start < turns.ts_start OR
+                       (prev.ts_start = turns.ts_start AND prev.turn_id < turns.turn_id))
+                ORDER BY prev.ts_start DESC, prev.turn_id DESC LIMIT 1)
+            WHERE gap_prev_turn_s IS NULL AND chat_id != ''
+        """)
+        for (turn_id,) in conn.execute(
+            "SELECT DISTINCT turn_id FROM turn_api_calls WHERE turn_id IN "
+            "(SELECT turn_id FROM turns WHERE first_call_cache_miss IS NULL)"
+        ).fetchall():
+            _refresh_cache_monitoring(conn, turn_id)
+
+
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -342,10 +575,9 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 # Columns insert_turn owns. The ORDER here IS the bind order of the value
 # tuple below — keep the two in lockstep. Columns NOT in this tuple
-# (served_subs_json, attribution) are owned by a later writer, so they are
-# deliberately excluded from the upsert's DO UPDATE: a re-finalize of the same
-# turn_id must refresh the record's own fields without erasing the rollup a
-# separate writer already populated. This is why the statement is an UPSERT and
+# (served_subs_json, attribution) are not owned by TurnRecord, so they are
+# excluded from the upsert's DO UPDATE: a re-finalize must not erase the
+# call-ledger rollup or another writer's attribution. This is an UPSERT and
 # not INSERT OR REPLACE — REPLACE deletes the whole row first, NULLing every
 # column absent from the insert list.
 _INSERT_TURN_COLUMNS = (
@@ -353,7 +585,10 @@ _INSERT_TURN_COLUMNS = (
     "profile", "provider", "model", "platform", "chat_id", "chat_name",
     "api_calls", "tools", "input_tokens", "output_tokens", "cache_read",
     "cache_write", "reasoning", "context_used", "context_length",
+    "idle_compaction_fired", "compaction_tokens_before",
+    "compaction_tokens_after", "compaction_cost_usd",
     "last_cache_read", "last_cache_write", "last_uncached",
+    "last_call_prompt_unknown",
     "comp_sys_tokens", "comp_tool_schema_tokens", "comp_history_tokens",
     "comp_history_message_count",
     "comp_tool_result_tokens", "comp_tool_arg_tokens", "comp_tool_result_count",
@@ -365,6 +600,10 @@ _INSERT_TURN_COLUMNS = (
     "cost_cache_write_usd", "cost_output_usd",
     "interrupted", "alerted", "user_text",
     "final_text", "cli_invocation_id",
+    "output_tokens_unknown",
+    "input_tokens_unknown", "cache_read_tokens_unknown",
+    "cache_write_tokens_unknown", "usage_unknown",
+    "terminal_error",
 )
 
 _INSERT_TURN_SQL = (
@@ -378,6 +617,20 @@ _INSERT_TURN_SQL = (
     )
 )
 
+
+def _refresh_served_subs(conn: sqlite3.Connection, turn_id: str) -> None:
+    """Aggregate known per-call subscription keys for an already stored turn."""
+    rows = conn.execute(
+        """SELECT sub_key, COUNT(*) FROM turn_api_calls
+           WHERE turn_id = ? AND sub_key IS NOT NULL AND sub_key != ''
+           GROUP BY sub_key ORDER BY sub_key""",
+        (turn_id,),
+    ).fetchall()
+    if rows:
+        conn.execute(
+            "UPDATE turns SET served_subs_json = ? WHERE turn_id = ?",
+            (json.dumps({sub: count for sub, count in rows}), turn_id),
+        )
 
 def insert_turn(record: TurnRecord) -> None:
     """Persist one turn. Telemetry failures are logged but never raised."""
@@ -407,9 +660,14 @@ def insert_turn(record: TurnRecord) -> None:
                     _int(record.reasoning_tokens),
                     _int(record.context_used),
                     _int(record.context_length),
+                    None if record.idle_compaction_fired is None else _bool_int(record.idle_compaction_fired),
+                    _int_or_none(record.compaction_tokens_before),
+                    _int_or_none(record.compaction_tokens_after),
+                    _cost_float(record.compaction_cost_usd),
                     _int_or_none(record.last_cache_read_tokens),
                     _int_or_none(record.last_cache_write_tokens),
                     _int_or_none(record.last_uncached_tokens),
+                    _bool_int(record.last_call_prompt_unknown),
                     _int_or_none(record.comp_sys_tokens),
                     _int_or_none(record.comp_tool_schema_tokens),
                     _int_or_none(record.comp_history_tokens),
@@ -432,8 +690,17 @@ def insert_turn(record: TurnRecord) -> None:
                     scrub_and_truncate(record.user_text),
                     scrub_and_truncate(record.final_text),
                     record.cli_invocation_id,
+                    _bool_int(record.output_tokens_unknown),
+                    _bool_int(record.input_tokens_unknown),
+                    _bool_int(record.cache_read_tokens_unknown),
+                    _bool_int(record.cache_write_tokens_unknown),
+                    _bool_int(record.usage_unknown),
+                    scrub_and_truncate(record.terminal_error, 300)
+                    if record.terminal_error
+                    else None,
                 ),
             )
+            _refresh_served_subs(conn, record.turn_id)
             conn.execute("DELETE FROM turn_tool_calls WHERE turn_id = ?", (record.turn_id,))
             for seq, call in enumerate(record.tool_calls or []):
                 conn.execute(
@@ -458,6 +725,17 @@ def insert_turn(record: TurnRecord) -> None:
                 """,
                 (record.platform or "", record.chat_id or "", record.turn_id),
             )
+            if record.chat_id:
+                conn.execute("""
+                    UPDATE turns SET gap_prev_turn_s = ts_start - (
+                        SELECT prev.ts_end FROM turns AS prev
+                        WHERE prev.chat_id = turns.chat_id
+                          AND (prev.ts_start < turns.ts_start OR
+                               (prev.ts_start = turns.ts_start AND prev.turn_id < turns.turn_id))
+                        ORDER BY prev.ts_start DESC, prev.turn_id DESC LIMIT 1)
+                    WHERE turn_id = ?
+                """, (record.turn_id,))
+            _refresh_cache_monitoring(conn, record.turn_id)
     except Exception:
         logger.warning("blackbox telemetry insert failed", exc_info=True)
 
@@ -467,6 +745,9 @@ def insert_api_call(
     usage: CanonicalUsage, sub_key: str | None, attribution: str,
     http_status: int | None = None, relay_synthetic: bool = False,
     route_id: str | None = None,
+    cache_write_5m: int | None = None,
+    cache_write_1h: int | None = None,
+    cache_ttl_requested: str | None = None,
 ) -> None:
     """Append one call, including zero-usage failures, without changing turn totals.
 
@@ -490,14 +771,19 @@ def insert_api_call(
             INSERT INTO turn_api_calls (
                 turn_id, seq, ts, provider, sub_key, model, input_tokens,
                 output_tokens, cache_read, cache_write, reasoning, attribution,
-                http_status, relay_synthetic, route_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                http_status, relay_synthetic, route_id, cache_write_5m,
+                cache_write_1h, cache_ttl_requested, lane_family
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (turn_id, seq, ts, provider, sub_key, model, usage.input_tokens,
              usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
              usage.reasoning_tokens, attribution, http_status,
-             _bool_int(relay_synthetic), route_id),
+             _bool_int(relay_synthetic), route_id, cache_write_5m,
+             cache_write_1h, cache_ttl_requested, lane_family(provider)),
         )
+        _refresh_cache_monitoring(conn, turn_id)
+        if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
+            _refresh_served_subs(conn, turn_id)
 
 
 def mark_alerted(turn_id: str) -> bool:
@@ -612,7 +898,12 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
         sel = (
             "SELECT turn_id, model, provider, "
             "COALESCE(input_tokens,0) AS i, COALESCE(output_tokens,0) AS o, "
-            "COALESCE(cache_read,0) AS cr, COALESCE(cache_write,0) AS cw "
+            "COALESCE(cache_read,0) AS cr, COALESCE(cache_write,0) AS cw, "
+            "COALESCE(output_tokens_unknown,0) AS ou, "
+            "COALESCE(input_tokens_unknown,0) AS iu, "
+            "COALESCE(cache_read_tokens_unknown,0) AS cru, "
+            "COALESCE(cache_write_tokens_unknown,0) AS cwu, "
+            "COALESCE(usage_unknown,0) AS uu "
             "FROM turns WHERE cost_usd IS NULL "
             "AND cost_uncached_usd IS NULL AND cost_cache_read_usd IS NULL "
             "AND cost_cache_write_usd IS NULL AND cost_output_usd IS NULL"
@@ -625,13 +916,25 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
         # (turn_id, cost, status, perclass, is_zero)
         candidates: list[tuple[str, float, str, dict, bool]] = []
         for r in rows:
+            route = resolve_billing_route(r["model"], provider=r["provider"])
+            usage_unknown = any(bool(r[key]) for key in ("ou", "iu", "cru", "cwu", "uu"))
+            if usage_unknown:
+                # Missing counts cannot be repriced from their integer-zero
+                # placeholders. The one exception is a route whose marginal
+                # cost is $0 independently of token counts. Either way, keep
+                # the row inside ``scanned`` so unresolved rows contribute to
+                # ``still_unknown`` instead of disappearing from the report.
+                if route.billing_mode == "subscription_included":
+                    candidates.append(
+                        (r["turn_id"], 0.0, "included", dict(_ZERO_PERCLASS), False)
+                    )
+                continue
             total = r["i"] + r["o"] + r["cr"] + r["cw"]
             if total == 0:
-                # Zero-token → costless → priced_zero, route-independent (M3 parity).
+                # Zero-token → costless → priced_zero, regardless of route.
                 candidates.append((r["turn_id"], 0.0, "priced_zero", dict(_ZERO_PERCLASS), True))
                 continue
             # Real-token: route-purity gate (INV-9 / RC-A).
-            route = resolve_billing_route(r["model"], provider=r["provider"])
             entry = get_pricing_entry(r["model"], provider=r["provider"])
             if route.billing_mode not in _PURE_BILLING_MODES:
                 # A notional relay (openai-codex → official_models_api) consults the

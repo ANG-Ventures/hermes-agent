@@ -1,7 +1,9 @@
 """Verify remote implementation evidence without requiring a workspace clone."""
 import json
+import os
 import re
 import subprocess
+import tempfile
 from urllib.parse import urlsplit
 
 from hermes_cli import kanban_db as kb
@@ -62,6 +64,44 @@ class AmbiguousRef(ValueError):
         super().__init__(f"{len(self.tips)} refs carry this sha")
 
 
+class Unverified(ValueError):
+    """The remote answered and the claim does not hold up -- with the reason.
+
+    ``None`` from ``verify_ref`` is the same verdict with the reason thrown
+    away, which left the operator with only "could not verify ... against the
+    remote" for a SHA the remote knows perfectly well but that is not on the
+    default branch (Argus r1 F4 on t_6d221fe6). Carry the branch tried and the
+    compare status instead. ``ValueError`` so an unhandled one still HOLDs.
+    """
+
+
+#: Git environment that must never leak from the caller into a survivor
+#: probe: they re-point repository discovery at a tree the probe did not name.
+_DISCOVERY_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+                  "GIT_NAMESPACE", "GIT_PREFIX")
+
+
+def neutral_cwd():
+    """A directory no repository discovery can resolve to the caller's tree.
+
+    A kanban worker's cwd is its scratch workspace, and since incident
+    t_82a5c853 ``kanban/workspaces/.git`` is a tripwire gitfile pointing at
+    ``/nonexistent``. Git runs repository discovery even for ``ls-remote
+    <url>``, so an inherited cwd made every remote verification exit 128 from
+    inside a worker while passing from ``/tmp`` (Argus r1 F1). Every
+    subprocess on the survivor path therefore passes an explicit ``cwd``.
+    """
+    return tempfile.gettempdir()
+
+
+def scrubbed_env(env=None):
+    """``env`` (default: the process env) minus the discovery overrides."""
+    base = dict(os.environ if env is None else env)
+    for key in _DISCOVERY_ENV:
+        base.pop(key, None)
+    return base
+
+
 class RemoteUnavailable(Exception):
     """The remote did not answer. This says NOTHING about the claim.
 
@@ -77,12 +117,14 @@ class RemoteUnavailable(Exception):
 
 
 def _query(args):
+    target = " ".join(args[:2]) + " " + redact(args[-1])
     try:
-        result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+        result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=15,
+                                cwd=neutral_cwd(), env=scrubbed_env())
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RemoteUnavailable(f"{args[0]} did not answer") from exc
+        raise RemoteUnavailable(f"{target} did not answer ({type(exc).__name__}: {redact(str(exc))})") from exc
     if result.returncode != 0:
-        raise RemoteUnavailable(f"{args[0]} exited {result.returncode}")
+        raise RemoteUnavailable(f"{target} exited {result.returncode}: {redact(result.stderr.decode(errors='replace')[:200])}")
     try:
         return result.stdout.decode()
     except UnicodeError as exc:
@@ -126,6 +168,10 @@ def verify_ref(claim, *, mined_for=None):
     if not sep or not re.fullmatch(_SHA, sha) or not _safe_url(url):
         return None
     output = _query(["git", "ls-remote", "--heads", "--tags", "--", url])
+    # ls-remote advertises tips, not ancestors: a squash/merge commit on
+    # default may cease to be a tip at the next push. GitHub's compare API
+    # proves ancestry without downloading an entire potentially huge tree.
+
     matches = {}
     for line in output.splitlines():
         oid, _, ref = line.partition("\t")
@@ -141,7 +187,27 @@ def verify_ref(claim, *, mined_for=None):
             # order. Keep every tip and decide over all of them.
             matches.setdefault(oid, []).append(ref)
     if len(matches) != 1:
-        return None  # unknown or ambiguous abbreviation
+        if matches or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return None  # unknown or ambiguous abbreviation
+        symref = _query(["git", "ls-remote", "--symref", "--", url, "HEAD"])
+        default = next((line.split("\t")[0].removeprefix("ref: ") for line in symref.splitlines()
+                        if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD")), None)
+        if not default:
+            raise Unverified(f"{redact(url)} advertises no default branch (ls-remote --symref HEAD)")
+        slug = re.fullmatch(rf"https://github\.com/({_SLUG})(?:\.git)?", url)
+        if not slug:
+            raise Unverified(f"{sha} is not a branch/tag tip of {redact(url)} and ancestry from "
+                             f"{default} can only be proven for github.com remotes")
+        branch = default.removeprefix("refs/heads/")
+        comparison = json.loads(_query(["gh", "api", f"repos/{slug[1].removesuffix('.git')}/compare/{sha}...{branch}"]))
+        status = comparison.get("status")
+        if status not in {"ahead", "identical"}:
+            raise Unverified(
+                f"{sha} is not reachable from default branch {default} of {redact(url)} "
+                f"(compare {sha[:12]}...{branch}: status={status}, "
+                f"ahead_by={comparison.get('ahead_by')}, behind_by={comparison.get('behind_by')})"
+            )
+        matches = {sha: [default]}
     oid, tips = next(iter(matches.items()))
     tips = sorted(tips)
     if mined_for:
@@ -168,6 +234,73 @@ def verify_ref(claim, *, mined_for=None):
     if len(tips) > 1:
         verified["tips"] = tips
     return dict(verified, corroborated_by="branch") if mined_for else verified
+
+
+def _merged_tree_matches(slug, number, head, merge):
+    """Prove the PR head's merge into its actual parent produced the landed tree.
+
+    A squash merge rewrites the SHA, so ancestry of the PR head is insufficient.
+    Fetch only shallow Git objects into a disposable bare repository; the
+    explicit merge base comes from GitHub's comparison of the real merge parent
+    and reviewed head. Never treat a fetch/merge failure as corroboration.
+    """
+    parent = json.loads(_query(["gh", "api", f"repos/{slug}/git/commits/{merge}"]))
+    parents = parent.get("parents") or []
+    if not parents or not re.fullmatch(r"[0-9a-f]{40}", parents[0].get("sha", "")):
+        return False
+    base_parent = parents[0]["sha"]
+    comparison = json.loads(_query(["gh", "api", f"repos/{slug}/compare/{base_parent}...{head}"]))
+    base = (comparison.get("merge_base_commit") or {}).get("sha")
+    if not base or not re.fullmatch(r"[0-9a-f]{40}", base):
+        return False
+    with tempfile.TemporaryDirectory(prefix="kanban-pr-tree-") as directory:
+        def git(*args, timeout=45):
+            command = ["git", "-C", directory, *args]
+            try:
+                result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                        timeout=timeout, cwd=neutral_cwd(), env=scrubbed_env())
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RemoteUnavailable(f"git {args[0]} did not answer ({type(exc).__name__}: {redact(str(exc))})") from exc
+            if result.returncode:
+                raise RemoteUnavailable(f"git {args[0]} exited {result.returncode} for {slug}")
+            return result.stdout.decode().strip()
+
+        git("init", "--bare", "-q")
+        url = f"https://github.com/{slug}.git"
+        # GitHub does not advertise every historical parent by raw SHA. Fetch
+        # the default line with bounded depth as well as the PR's reviewed head.
+        default = _query(["git", "ls-remote", "--symref", "--", url, "HEAD"])
+        branch = next((line.split("\t")[0].removeprefix("ref: ") for line in default.splitlines()
+                       if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD")), None)
+        if not branch:
+            return False
+        ancestry = json.loads(_query(["gh", "api", f"repos/{slug}/compare/{merge}...{branch.removeprefix('refs/heads/')}"]))
+        if ancestry.get("status") not in {"ahead", "identical"}:
+            return False
+        git("fetch", "-q", "--filter=blob:none", "--depth=100", url, branch,
+            f"refs/pull/{number}/head", timeout=90)
+        for sha in (base, base_parent, head, merge):
+            if subprocess.run(["git", "-C", directory, "cat-file", "-e", f"{sha}^{{commit}}"],
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=30,
+                              cwd=neutral_cwd(),
+                              env=scrubbed_env(dict(os.environ, GIT_NO_LAZY_FETCH="1"))).returncode:
+                git("fetch", "-q", "--filter=blob:none", "--depth=1", url, sha, timeout=90)
+        expected = git("merge-tree", "--write-tree", f"--merge-base={base}", base_parent, head,
+                       timeout=90).splitlines()[0]
+        return expected == git("rev-parse", f"{merge}^{{tree}}")
+
+
+def _landed(slug, number, head, merge):
+    """``_merged_tree_matches`` where a failed probe is "not corroborated".
+
+    The probe only ever UPGRADES a mention; it must not turn one into a
+    different verdict. Letting its parse/remote errors escape made
+    ``verify_pr`` answer "not live" for a PR that is live and names the card.
+    """
+    try:
+        return _merged_tree_matches(slug, number, head, merge)
+    except (RemoteUnavailable, ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return False
 
 
 def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
@@ -230,6 +363,12 @@ def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
                 return None
             if corroborated_by == "headRefName":
                 corroborated_by = "branch"
+            elif corroborated_by == "title" and state == "MERGED" and _landed(slug, number, head, merge):
+                # Only a TITLE mention is upgraded: the title is the PR's own
+                # claim about what it implements, a body routinely cites other
+                # cards ("follow-up to t_..."). Tree equality proves the PR
+                # landed, not whose it is (Argus r1 caveat).
+                corroborated_by = "landed-tree"
     except (ValueError, TypeError, KeyError, AttributeError):
         return None
     verified = {"remote": f"https://github.com/{slug}.git", "branch": f"refs/pull/{number}/head",
@@ -277,6 +416,8 @@ def discover(conn, task_id, metadata, evidence, urls):
             try:
                 verified = (verify_pr(claim, shas, mined_for=task_id) if kind == "pr"
                             else verify_ref(claim, mined_for=task_id))
+            except Unverified:
+                continue
             except AmbiguousRef:
                 # Several tips name the card and mining states no reason, so
                 # there is nothing to report and nothing to choose between.

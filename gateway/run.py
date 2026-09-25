@@ -43,7 +43,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextvars import Context, copy_context
+from contextvars import Context, ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
@@ -132,9 +132,20 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 # atexit-join would otherwise block interpreter finalization). Overridable via
 # HERMES_GATEWAY_EXECUTOR_DRAIN_TIMEOUT for ops tuning.
 _EXECUTOR_DRAIN_TIMEOUT_SECS_DEFAULT = 8.0
-# Size of the gateway-owned pool that runs agent TURN bodies (run_sync).
-# Overridable via HERMES_GATEWAY_EXECUTOR_MAX_WORKERS for ops tuning.
-_EXECUTOR_MAX_WORKERS_DEFAULT = 10
+# The gateway-owned pool that runs agent TURN bodies (run_sync) is UNBOUNDED
+# by default (Ace ruling 2026-09-23 08:47: "that limit is stupid ... completely
+# eliminate it"). History: 1011c07966 (upstream, 2026-06-04) replaced the loop
+# default executor (min(32, ncpu+4) = 36 on the Mac Studio) with an owned
+# ThreadPoolExecutor(max_workers=10); #807 (fork, 2026-09-21) moved
+# housekeeping off it and kept the 10. Neither had a measured reason for the
+# number. The effect was measured 2026-09-23: turn ADMISSION
+# (gateway.max_concurrent_turns=100) let turns start, and the 10-thread pool
+# silently re-queued them for 334-2356 s (PHASE=executor_wait pool=turn
+# inflight=10). A turn body blocks its thread on LLM/HTTP and subprocess I/O
+# for the whole turn, so a thread costs a stack, not CPU; admission is the
+# only concurrency control that should exist. HERMES_GATEWAY_EXECUTOR_MAX_WORKERS
+# remains as an explicit operator cap for a constrained host; unset = no cap.
+_EXECUTOR_MAX_WORKERS_DEFAULT = 0  # 0 = unbounded
 # Size of the separate pool that runs best-effort session HOUSEKEEPING
 # (finalize hooks, agent resource cleanup). Kept off the turn pool because
 # those callers ABANDON their worker on timeout — see
@@ -208,11 +219,31 @@ def _env_positive_int(name: str, default: int) -> int:
     return default
 
 
-def _executor_max_workers() -> int:
-    """Return the size of the turn-body executor."""
-    return _env_positive_int(
-        "HERMES_GATEWAY_EXECUTOR_MAX_WORKERS", _EXECUTOR_MAX_WORKERS_DEFAULT
-    )
+def _executor_max_workers(admission_cap: Optional[int] = None) -> Optional[int]:
+    """Return the size of the turn-body executor, or ``None`` for unbounded.
+
+    Default is unbounded: turn admission (``gateway.max_concurrent_turns``)
+    is the only concurrency control, and a pool narrower than admission
+    re-queues admitted turns invisibly. ``HERMES_GATEWAY_EXECUTOR_MAX_WORKERS``
+    is an explicit operator cap; when it is narrower than the admission cap it
+    is raised to the admission cap and a warning names both numbers, so a stale
+    knob cannot re-create the 2026-09-23 executor queue.
+    """
+    raw = os.getenv("HERMES_GATEWAY_EXECUTOR_MAX_WORKERS", "").strip()
+    if not raw:
+        return None
+    size = _env_positive_int("HERMES_GATEWAY_EXECUTOR_MAX_WORKERS", 0)
+    if size <= 0:
+        return None
+    if type(admission_cap) is int and admission_cap > size:
+        logger.warning(
+            "HERMES_GATEWAY_EXECUTOR_MAX_WORKERS=%d is narrower than "
+            "gateway.max_concurrent_turns=%d; using %d so admitted turns "
+            "cannot queue behind the pool",
+            size, admission_cap, admission_cap,
+        )
+        size = admission_cap
+    return size
 
 
 def _housekeeping_executor_max_workers() -> int:
@@ -223,9 +254,66 @@ def _housekeeping_executor_max_workers() -> int:
     )
 
 
+class _UnboundedThreadExecutor(concurrent.futures.Executor):
+    """One thread per submitted work item; no queue, no cap.
+
+    ``concurrent.futures.ThreadPoolExecutor(max_workers=None)`` is NOT
+    unbounded — it is ``min(32, ncpu + 4)`` (36 on the Mac Studio), which is
+    the same executor-queue failure at a different number. Turn bodies block
+    on LLM/HTTP and subprocess I/O, so the only cost of a thread is its stack.
+    Admission (``gateway.max_concurrent_turns``) is the concurrency control.
+    Exposes ``_threads``, ``_work_queue`` and ``_max_workers`` so the
+    ``PHASE=executor_wait`` reporter and the shutdown liveness scan keep
+    working unchanged (queue is always empty: nothing ever waits here).
+    """
+
+    def __init__(self, thread_name_prefix: str = ""):
+        self._prefix = thread_name_prefix
+        self._threads: set = set()
+        self._work_queue: "queue.Queue" = queue.Queue()
+        self._max_workers = None
+        self._shutdown = False
+        self._lock = threading.Lock()
+        self._n = 0
+
+    def submit(self, fn, /, *args, **kwargs):
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._n += 1
+            n = self._n
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _run():
+            try:
+                if not fut.set_running_or_notify_cancel():
+                    return
+                try:
+                    fut.set_result(fn(*args, **kwargs))
+                except BaseException as exc:  # noqa: BLE001 - mirror ThreadPoolExecutor
+                    fut.set_exception(exc)
+            finally:
+                with self._lock:
+                    self._threads.discard(threading.current_thread())
+
+        t = threading.Thread(target=_run, name=f"{self._prefix}_{n}", daemon=True)
+        with self._lock:
+            self._threads.add(t)
+        t.start()
+        return fut
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False):
+        with self._lock:
+            self._shutdown = True
+            threads = list(self._threads)
+        if wait:
+            for t in threads:
+                t.join()
+
+
 def _get_or_create_pool(
-    owner: Any, attr: str, prefix: str, max_workers: int
-) -> concurrent.futures.ThreadPoolExecutor:
+    owner: Any, attr: str, prefix: str, max_workers: Optional[int]
+) -> concurrent.futures.Executor:
     """Get-or-create one of the gateway-owned pools under the owner's shared lock.
 
     A module-level function, not a method: ``_get_executor`` is called unbound against
@@ -242,10 +330,13 @@ def _get_or_create_pool(
             raise RuntimeError("Gateway is shutting down; executor unavailable")
         executor = getattr(owner, attr, None)
         if executor is None or getattr(executor, "_shutdown", False):
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max_workers,
-                thread_name_prefix=prefix,
-            )
+            if max_workers is None:
+                executor = _UnboundedThreadExecutor(thread_name_prefix=prefix)
+            else:
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix=prefix,
+                )
             setattr(owner, attr, executor)
         return executor
 
@@ -3330,6 +3421,7 @@ from gateway.restart import (
     resolve_launchd_capped_drain,
     resolve_max_actionable_teardown_reserve_s,
     resolve_replace_takeover_grace_s,
+    resolve_stop_drain_deadline_s,
 )
 
 
@@ -3390,6 +3482,35 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+_CHECKOUT_GATE_UNSET = object()
+
+
+class _CronDispatchGate:
+    """In-process cron dispatch gate for the gateway.
+
+    ``__call__`` keeps the historical boolean contract (drain/shutdown).
+    ``admit()`` is the shared-checkout admission hook ``cron.scheduler.tick``
+    uses: it returns a release callable spanning the tick's dispatch window,
+    or None when the admission hold refuses new scheduled work.
+    """
+
+    def __init__(self, runner):
+        self._runner = runner
+
+    def __call__(self) -> bool:
+        runner = self._runner
+        return not (runner._draining or runner._external_drain_active)
+
+    def admit(self):
+        gate = self._runner._checkout_admission_gate()
+        if gate is None:
+            return lambda: None
+        from gateway.checkout_admission import AdmissionRefused
+
+        try:
+            return gate.admit("cron:tick", internal=False).release
+        except AdmissionRefused:
+            return None
 
 # Conversation-scoped per-session state registry (legacy contract).
 # The state itself now lives in ``SessionState.conversation`` (see
@@ -3886,6 +4007,61 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
     return None
 
 
+_EMPTY_CONTENT_PLACEHOLDER = "(The user sent a message with no text content)"
+# Chat id stamped on the ``stt: ...`` / ``stt FAILED: ...`` outcome lines. A
+# ContextVar (not a parameter) so the long-standing two-argument
+# ``_enrich_message_with_transcription`` contract, which tests and callers fake,
+# is unchanged.
+_STT_LOG_CHAT: "ContextVar[str]" = ContextVar(
+    "_STT_LOG_CHAT", default="unknown"
+)
+_VOICE_LOG_PROBE_TIMEOUT_S = 2.0
+
+
+def _duration_label_seconds(duration: Optional[str]) -> str:
+    """``"1:05"`` / ``"1:02:03"`` -> ``"65s"`` / ``"3723s"``; ``"?s"`` when unknown."""
+    if not duration:
+        return "?s"
+    try:
+        total = 0
+        for part in duration.split(":"):
+            total = total * 60 + int(part)
+        return f"{total}s"
+    except ValueError:
+        return "?s"
+
+
+async def _inbound_log_preview(event) -> str:
+    """Text for the ``inbound message: ... msg=%r`` log line.
+
+    A voice note arrives with no text (Telegram: ``''``; Discord: the
+    empty-content placeholder), so the inbound line used to be
+    indistinguishable from an empty message for anyone pairing inbound lines
+    with replies (ace-inbound-watch, journals). Voice renders as
+    ``[voice 12s]`` plus any real caption; the transcript outcome is logged
+    later as ``stt: chat=<c> ...`` / ``stt FAILED: chat=<c> ...``.
+    """
+    text = getattr(event, "text", None) or ""
+    media_urls = getattr(event, "media_urls", None) or []
+    voice_paths = [p for i, p in enumerate(media_urls) if _event_media_is_stt_input(event, i)]
+    if not voice_paths and getattr(event, "message_type", None) != MessageType.VOICE:
+        return text[:80].replace("\n", " ")
+    duration = None
+    if voice_paths:
+        try:
+            duration = await asyncio.wait_for(
+                _probe_audio_duration(os.path.abspath(voice_paths[0])),
+                timeout=_VOICE_LOG_PROBE_TIMEOUT_S,
+            )
+        except Exception:
+            duration = None
+    label = f"[voice {_duration_label_seconds(duration)}]"
+    caption = "" if text.strip() == _EMPTY_CONTENT_PLACEHOLDER else text
+    if caption.strip():
+        label = f"{label} {caption}"
+    return label[:80].replace("\n", " ")
+
+
 def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     """Consume and return the full pending event for a session.
 
@@ -4207,6 +4383,102 @@ def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None
     return slug, declared_name
 
 
+# slug -> [(declared_name, SKILL.md path)], built ONCE per set of skill roots.
+#
+# 2026-09-24 04:51 Apollo was killed by the loop-liveness watchdog because
+# _check_unavailable_skill rglob'd + read ~906 SKILL.md files on the event loop
+# for every unknown /command. The walk now happens once (off-loop, see
+# _check_unavailable_skill_async) and is reused until the roots change shape
+# (visible root children / first-level dir mtimes) or /reload-skills invalidates it.
+_SkillSlugIndex = Dict[str, List[Tuple[str, Path]]]
+_skill_slug_index_cache: Dict[Tuple[str, ...], Tuple[Tuple[Tuple[str, int], ...], _SkillSlugIndex]] = {}
+_skill_slug_index_lock = threading.Lock()
+
+# Upper bound an unknown /command waits for the "disabled / not installed"
+# hint. A cold index build on a saturated disk can take tens of seconds; past
+# this budget the user gets the generic unknown-command reply and the build
+# keeps warming in its worker thread for the next call.
+_UNAVAILABLE_SKILL_HINT_BUDGET_S = 0.75
+
+
+def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], ...]:
+    """Track visible root child names and immediate directory mtimes.
+
+    Category mtimes detect skill additions/removals within categories; child
+    names detect flat skill additions/removals. Hidden telemetry/curator files
+    and directories never invalidate the index. /reload-skills picks up deeper
+    edits such as a frontmatter rename.
+    """
+    out: List[Tuple[str, int]] = []
+    for root in roots:
+        try:
+            out.append((str(root), 0))
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if entry.name.startswith("."):
+                        continue
+                    try:
+                        mtime = entry.stat().st_mtime_ns if entry.is_dir() else -1
+                        out.append((entry.path, mtime))
+                    except OSError:
+                        continue
+        except OSError:
+            out.append((str(root), -1))
+    return tuple(sorted(out))
+
+
+def _skill_slug_index(roots: Tuple[Path, ...]) -> _SkillSlugIndex:
+    """Return the cached slug index for ``roots``; build it on first use.
+
+    Blocking (walks the trees on a miss) — call only off the event loop.
+    Single-flight: concurrent callers wait on the lock instead of walking twice.
+    """
+    from agent.skill_utils import is_excluded_skill_path
+
+    key = tuple(str(r) for r in roots)
+    with _skill_slug_index_lock:
+        fingerprint = _skill_roots_fingerprint(roots)
+        cached = _skill_slug_index_cache.get(key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        index: _SkillSlugIndex = {}
+        for root in roots:
+            if not root.exists():
+                continue
+            for skill_md in root.rglob("SKILL.md"):
+                if is_excluded_skill_path(skill_md):
+                    continue
+                slug, declared_name = _skill_slug_from_frontmatter(skill_md)
+                if not slug or not declared_name:
+                    continue
+                index.setdefault(slug, []).append((declared_name, skill_md))
+        _skill_slug_index_cache[key] = (fingerprint, index)
+        return index
+
+
+def _invalidate_skill_slug_index() -> None:
+    """Drop every cached slug index (called by /reload-skills)."""
+    with _skill_slug_index_lock:
+        _skill_slug_index_cache.clear()
+
+
+async def _check_unavailable_skill_async(command_name: str) -> str | None:
+    """Event-loop-safe :func:`_check_unavailable_skill`, bounded by a budget."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_check_unavailable_skill, command_name),
+            timeout=_UNAVAILABLE_SKILL_HINT_BUDGET_S,
+        )
+    except asyncio.TimeoutError:
+        logger.info(
+            "Unavailable-skill hint for /%s skipped: skill index still building "
+            "after %.2fs (continues off-loop)",
+            command_name,
+            _UNAVAILABLE_SKILL_HINT_BUDGET_S,
+        )
+        return None
+
+
 def _check_unavailable_skill(command_name: str) -> str | None:
     """Check if a command matches a known-but-inactive skill.
 
@@ -4225,47 +4497,36 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     normalized = command_name.lower().replace("_", "-")
     try:
         from tools.skills_tool import _get_disabled_skill_names
-        from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+        from agent.skill_utils import get_all_skills_dirs
         disabled = _get_disabled_skill_names()
 
-        # Check disabled skills across all dirs (local + external)
-        for skills_dir in get_all_skills_dirs():
-            if not skills_dir.exists():
-                continue
-            for skill_md in skills_dir.rglob("SKILL.md"):
-                if is_excluded_skill_path(skill_md):
-                    continue
-                slug, declared_name = _skill_slug_from_frontmatter(skill_md)
-                if not slug or not declared_name:
-                    continue
-                # disabled is keyed by the declared frontmatter name (what
-                # skills.disabled / skills.platform_disabled store).
-                if slug == normalized and declared_name in disabled:
-                    return (
-                        f"The **{command_name}** skill is installed but disabled.\n"
-                        f"Enable it with: `hermes skills config`"
-                    )
+        # Check disabled skills across all dirs (local + external). The slug
+        # index is built once and cached — see _skill_slug_index.
+        installed = _skill_slug_index(tuple(get_all_skills_dirs()))
+        for declared_name, _skill_md in installed.get(normalized, ()):
+            # disabled is keyed by the declared frontmatter name (what
+            # skills.disabled / skills.platform_disabled store).
+            if declared_name in disabled:
+                return (
+                    f"The **{command_name}** skill is installed but disabled.\n"
+                    f"Enable it with: `hermes skills config`"
+                )
 
         # Check optional skills (shipped with repo but not installed)
         from hermes_constants import get_optional_skills_dir
         repo_root = Path(__file__).resolve().parent.parent
         optional_dir = get_optional_skills_dir(repo_root / "optional-skills")
         if optional_dir.exists():
-            for skill_md in optional_dir.rglob("SKILL.md"):
-                if is_excluded_skill_path(skill_md):
-                    continue
-                slug, _declared = _skill_slug_from_frontmatter(skill_md)
-                if not slug:
-                    continue
-                if slug == normalized:
-                    # Build install path: official/<category>/<name>
-                    rel = skill_md.parent.relative_to(optional_dir)
-                    parts = list(rel.parts)
-                    install_path = f"official/{'/'.join(parts)}"
-                    return (
-                        f"The **{command_name}** skill is available but not installed.\n"
-                        f"Install it with: `hermes skills install {hint_value(install_path)}`"
-                    )
+            optional = _skill_slug_index((optional_dir,))
+            for _declared, skill_md in optional.get(normalized, ()):
+                # Build install path: official/<category>/<name>
+                rel = skill_md.parent.relative_to(optional_dir)
+                parts = list(rel.parts)
+                install_path = f"official/{'/'.join(parts)}"
+                return (
+                    f"The **{command_name}** skill is available but not installed.\n"
+                    f"Install it with: `hermes skills install {hint_value(install_path)}`"
+                )
     except Exception:
         pass
     return None
@@ -7468,7 +7729,34 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            # Stop-during-pre-flight gate (2026-09-24 incident, Discord
+            # #claude-bridge): a /stop that lands while this turn is still
+            # in pre-flight (agent not yet built, slot holds the PENDING
+            # sentinel) bumps the run generation but has no agent to
+            # interrupt. Without this check the turn then enters
+            # run_conversation anyway, acquires the durable turn lease and
+            # runs to completion — 87 API calls over an hour — with every
+            # result discarded as stale, while the user's replacement turn
+            # waits the full lease budget and dies with "Another Hermes
+            # process kept this session busy too long". Refuse to start.
+            if not ctx._run_still_current():
+                logger.warning(
+                    "Refusing to start stale turn for %s — generation %s was "
+                    "invalidated during pre-flight (stopped); no lease acquired, "
+                    "no API calls",
+                    ctx.session_key or "?",
+                    ctx.run_generation,
+                )
+                result = {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 0,
+                    "interrupted": True,
+                    "completed": False,
+                    "stale_run_generation": True,
+                }
+            else:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -7940,6 +8228,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _loop_liveness_watchdog: Optional[Any] = None
     _gateway_started_at: float = 0.0
     _shutdown_watchdog_done: Optional["threading.Event"] = None
+    # Deadline (seconds from the start of stop()) the shutdown watchdog was
+    # armed with, published by _stop_impl for the drain and cron-leash sites
+    # to CONSUME. None until stop() arms it (and on the PYTEST_CURRENT_TEST
+    # path, which never arms) — consumers fall back to recomputing it.
+    _armed_shutdown_deadline_s: Optional[float] = None
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
 
@@ -8876,6 +9169,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
+        # t_e253d9d5: cancel_background_tasks() clears _pending_messages into
+        # a non-replayable flush file; let it spool follow-ups for boot
+        # replay first (see BasePlatformAdapter.cancel_background_tasks).
+        try:
+            adapter._shutdown_pending_sink = self._spool_one_adapter_pending
+        except Exception:
+            logger.debug("pending-sink install failed%s", suffix, exc_info=True)
         try:
             cancelled = await self._await_adapter_cleanup_with_timeout(
                 adapter.cancel_background_tasks(), timeout
@@ -10086,6 +10386,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
+
+    def _checkout_admission_gate(self):
+        """This gateway's shared-checkout admission gate, or None if disabled.
+
+        Configured by ``checkout_admission`` in config.yaml (see
+        gateway/checkout_admission.py). The gate's authoritative work count is
+        ``_active_work_count()`` plus its own tickets; its serving signal is
+        published from the event loop by ``publish_forever``.
+        """
+        cached = getattr(self, "_checkout_gate_cache", _CHECKOUT_GATE_UNSET)
+        if cached is not _CHECKOUT_GATE_UNSET:
+            return cached
+        gate = None
+        try:
+            from gateway.checkout_admission import process_gate
+
+            gate = process_gate("gateway")
+            if gate is not None:
+                gate.set_active_work(lambda: {
+                    "agents": self._running_agent_count(),
+                    "cron": self._active_cron_job_count(),
+                    "api": self._active_api_run_count(),
+                    "compaction": self._active_compaction_count(),
+                })
+                gate.set_serving(lambda: {
+                    "ok": bool(getattr(self, "_running", False)),
+                    "draining": bool(getattr(self, "_draining", False)),
+                    "external_drain": bool(getattr(self, "_external_drain_active", False)),
+                    "adapters": len(getattr(self, "adapters", {}) or {}),
+                })
+        except Exception:
+            logger.error("checkout admission gate setup failed", exc_info=True)
+            gate = None
+        self._checkout_gate_cache = gate
+        return gate
 
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
@@ -11514,6 +11849,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 explicit_provider=provider,
                 user_providers=user_provs,
                 custom_providers=custom_provs,
+                # Credential re-resolution only: NO live /v1/models probe.
+                # This runs on the event loop (every /model persist and every
+                # lazy rehydrate); the probe is a sync urllib GET with a 5 s
+                # timeout that blocked Discord for 10 s on 2026-09-24.
+                probe_catalog=False,
             )
         except Exception:
             return None
@@ -14759,17 +15099,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        wait_started = loop.time()
+        deadline = wait_started + timeout
         last_status_at = 0.0
+        # busy_policy=interrupt (safe-restart intent row) means "restart now".
+        # Re-read every second: the intent usually lands MID-wait (2026-09-23:
+        # wait began 03:59, deploy-lane interrupt intent 04:05, gateway then sat
+        # out the rest of the 1800 s cap until 04:29).
+        next_intent_check = 0.0
+        interrupt_capped = False
         while self._awaitable_work_count() > 0:
             now = loop.time()
+            if not interrupt_capped and now >= next_intent_check:
+                next_intent_check = now + 1.0
+                intent_cap = await self._interrupt_restart_intent_cap()
+                if intent_cap is not None:
+                    interrupt_capped = True
+                    deadline = min(deadline, now + intent_cap)
             if now >= deadline:
                 logger.warning(
                     "Restart after-turn wait timed out after %.0fs with %d "
                     "still active; proceeding to stop()/drain which may "
-                    "interrupt remaining work (#77184)",
-                    timeout,
+                    "interrupt remaining work (#77184)%s",
+                    now - wait_started,
                     self._active_work_count(),
+                    " [busy_policy=interrupt]" if interrupt_capped else "",
                 )
                 return False
             if (now - last_status_at) >= 30.0:
@@ -14801,14 +15155,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return True
 
+    async def _interrupt_restart_intent_cap(self) -> Optional[float]:
+        """After-turn cap (<=60 s) from a fresh busy_policy=interrupt intent, else None."""
+        try:
+            from gateway.fork_ext.unclean_restart_notice import (
+                interrupt_drain_cap,
+                read_interrupt_restart_intent,
+            )
+
+            row = await asyncio.to_thread(read_interrupt_restart_intent)
+            if row is None:
+                return None
+            cap = interrupt_drain_cap(row)
+        except Exception:
+            logger.debug("interrupt restart intent read failed", exc_info=True)
+            return None
+        logger.warning(
+            "PHASE=restart_interrupt_intent busy_policy=interrupt token=%s "
+            "initiator=%s origin=%s: capping after-turn wait to %.0fs "
+            "(restart_after_turn_timeout=%.0fs); still-running turns are "
+            "interrupted by the drain and marked resume_pending",
+            row.get("token") or "-",
+            row.get("initiator_profile") or "-",
+            row.get("origin_mode") or "-",
+            cap,
+            float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0),
+        )
+        return cap
+
+    @staticmethod
+    def _describe_restart_requester(depth: int = 2) -> str:
+        """``func@file:line`` of whoever called request_restart()."""
+        try:
+            frame = sys._getframe(depth)
+            return (
+                f"{frame.f_code.co_name}@"
+                f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+            )
+        except Exception:
+            return "unknown"
+
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+        requester = self._describe_restart_requester()
         if self._restart_task_started:
+            logger.info(
+                "Restart request from %s ignored: a restart is already in progress",
+                requester,
+            )
             return False
+        session_key = ""
         try:
             from gateway.session_context import get_session_env
             session_key = get_session_env("HERMES_SESSION_KEY", "")
             if session_key:
                 self._session_initiated_restart[session_key] = True
+        except Exception:
+            pass
+        self._restart_requester = requester
+        # 2026-09-23: "Restart requested with 16 active work unit(s)" had no
+        # requester on it; the forensics had to eliminate SIGTERM/FGR by
+        # absence. Name the caller on the line that starts the restart.
+        try:
+            logger.warning(
+                "PHASE=restart_requested requester=%s detached=%s via_service=%s "
+                "session=%s active_work=%d",
+                requester,
+                detached,
+                via_service,
+                session_key or "-",
+                self._active_work_count(),
+            )
         except Exception:
             pass
         self._restart_requested = True
@@ -14831,6 +15247,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._launch_detached_restart_command()
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart helper: %s", e)
+            # Written HERE (not at request time) so the row lands inside the
+            # boot notice's planned-restart window of the death it explains.
+            try:
+                from gateway.fork_ext.unclean_restart_notice import record_in_band_restart
+
+                await asyncio.to_thread(
+                    record_in_band_restart,
+                    requester,
+                    detail=f"detached={detached} via_service={via_service}",
+                )
+            except Exception:
+                logger.debug("in-band restart ledger row failed", exc_info=True)
             await asyncio.sleep(0.05)
             await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
 
@@ -14887,7 +15315,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             PriorLifeVerdict,
             classify_prior_life,
             read_last_event_loop_blocked_site,
-            read_planned_restart,
+            read_planned_restart_for_sentinel,
         )
 
         home = getattr(self, "_unclean_restart_home", None)
@@ -14903,12 +15331,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             site = getattr(self, "_unclean_restart_site", None)
             if site is None:
                 site = read_last_event_loop_blocked_site(home)
-            planned = None
-            try:
-                _ended = (sentinel or {}).get("prior_exited_at") or (sentinel or {}).get("prior_started_at")
-                planned = read_planned_restart(_ended, home)
-            except Exception:
-                planned = None
+            # Reference time + pid identity live in ONE helper: a SIGKILLed prior
+            # life has no prior_exited_at, and the old fallback to
+            # prior_started_at (the PREVIOUS boot) read a requested restart as
+            # UNPLANNED (2026-09-24 12:12).
+            planned = read_planned_restart_for_sentinel(sentinel, home)
             verdict = classify_prior_life(sentinel, site=site, planned=planned)
         except Exception:
             logger.debug("Prior-life verdict unavailable", exc_info=True)
@@ -15569,6 +15996,240 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             prepared += 1
         return prepared
 
+    async def _preserve_followup_across_restart(
+        self,
+        session_key: Optional[str],
+        pending_event: Any,
+        pending: Any,
+        source: Any = None,
+    ) -> bool:
+        """Spool a follow-up the draining gateway cannot run; next boot replays it.
+
+        When ``pending_event`` exists the spooled record is that event itself
+        (original text plus every carried field: message_type, media,
+        internal, allow_gateway_control, metadata, reply/channel fields...),
+        not the derived ``pending`` string, so the boot replay is the same
+        event that was parked. An event with a field that cannot be stored
+        durably is refused and logged as lost by field name.
+        """
+        from gateway.fork_ext.restart_followups import (
+            admission_fields,
+            event_fields,
+            spool_followup,
+        )
+
+        fields = None
+        if pending_event is not None:
+            fields, bad_field = event_fields(pending_event)
+            if fields is None:
+                logger.error(
+                    "PHASE=restart_followup_lost session=%s action=%s field=%s: "
+                    "the pending event cannot be stored durably; it is DROPPED",
+                    session_key or "?",
+                    self._status_action_label(),
+                    bad_field,
+                )
+                return False
+            text = str(getattr(pending_event, "text", "") or "")
+            # The post-turn drain may already have transcribed the voice
+            # follow-up (``pending`` = transcript). Keep that text, and drop
+            # the transcribed audio from the carried media so the replay does
+            # not transcribe it a second time. A media placeholder is NOT an
+            # override: the carried media rebuilds it on replay.
+            if (
+                isinstance(pending, str)
+                and pending.strip()
+                and pending != text
+                and pending != _build_media_placeholder(pending_event)
+            ):
+                urls = list(fields.get("media_urls") or [])
+                types = list(fields.get("media_types") or [])
+                keep = [
+                    i for i in range(len(urls))
+                    if not _event_media_is_stt_input(pending_event, i)
+                ]
+                fields["media_urls"] = [urls[i] for i in keep]
+                fields["media_types"] = [types[i] for i in keep if i < len(types)]
+                if not fields["media_urls"] and fields.get("message_type") in (
+                    MessageType.VOICE.value,
+                    MessageType.AUDIO.value,
+                ):
+                    fields["message_type"] = MessageType.TEXT.value
+                text = pending
+        else:
+            text = pending if isinstance(pending, str) else ""
+        src = getattr(pending_event, "source", None) or source
+        src_dict = None
+        try:
+            src_dict = src.to_dict() if src is not None else None
+        except Exception:
+            src_dict = None
+        path = None
+        if src_dict:
+            try:
+                path = await asyncio.to_thread(
+                    spool_followup,
+                    session_key or "",
+                    text,
+                    src_dict,
+                    reason=self._status_action_label(),
+                    event=fields,
+                    # Adapter-granted admission (is_bot / role_authorized /
+                    # relay) that SessionSource.to_dict never serialises;
+                    # MAC-bound so a forged record cannot assert it (t_43e058b7).
+                    admission=admission_fields(src),
+                )
+            except Exception:
+                logger.debug("restart follow-up spool failed", exc_info=True)
+        if path is not None:
+            logger.warning(
+                "PHASE=restart_followup_spooled session=%s action=%s chars=%d: "
+                "pending follow-up preserved; it replays on the next boot",
+                session_key or "?",
+                self._status_action_label(),
+                len(text),
+            )
+            return True
+        logger.error(
+            "PHASE=restart_followup_lost session=%s action=%s: could not spool "
+            "the pending follow-up; it is DROPPED",
+            session_key or "?",
+            self._status_action_label(),
+        )
+        return False
+
+    async def _spool_adapter_pending_for_restart(self) -> int:
+        """Spool follow-ups still parked in adapter queues when stop() tears down.
+
+        A message that arrives for a busy session during the drain is queued
+        on the adapter ("queued for the next turn after it comes back"); if
+        that session is interrupted rather than finishing, the queue dies with
+        the process. Sweep it into the restart spool first.
+        """
+        spooled = 0
+        seen: set = set()
+        for adapter in list((getattr(self, "adapters", None) or {}).values()):
+            spooled += await self._spool_one_adapter_pending(adapter, seen)
+        overflow = getattr(self, "_queued_events", None)
+        # _queued_events is a SessionFieldView (a MutableMapping, NOT a dict);
+        # a dict-only check here silently skipped every overflow tail (r5).
+        from collections.abc import Mapping as _Mapping
+
+        if isinstance(overflow, _Mapping):
+            for key, events in list(overflow.items()):
+                for event in list(events or []):
+                    if event is None or id(event) in seen:
+                        continue
+                    seen.add(id(event))
+                    if await self._preserve_followup_across_restart(key, event, None):
+                        spooled += 1
+        return spooled
+
+    async def _spool_one_adapter_pending(self, adapter: Any, seen: Optional[set] = None) -> int:
+        """Spool one adapter's parked follow-ups (pending slot + debounce buffer).
+
+        Installed as the adapter's ``_shutdown_pending_sink`` by
+        ``_bounded_adapter_teardown`` so it runs inside
+        ``cancel_background_tasks()`` BEFORE that method drains the slot into
+        the non-replayable shutdown flush file.  An entry is removed only once
+        it is durably spooled; anything that fails to spool stays in the slot
+        and still reaches the #72680 flush file.
+        """
+        if seen is None:
+            seen = set()
+        spooled = 0
+        slot = getattr(adapter, "_pending_messages", None)
+        if isinstance(slot, dict):
+            for key, event in list(slot.items()):
+                if event is None or id(event) in seen:
+                    continue
+                seen.add(id(event))
+                if await self._preserve_followup_across_restart(key, event, None):
+                    spooled += 1
+                    if slot.get(key) is event:
+                        slot.pop(key, None)
+        store = getattr(adapter, "_text_debounce", None)
+        if isinstance(store, dict):
+            for key, state in list(store.items()):
+                event = getattr(state, "event", None)
+                if event is None or id(event) in seen:
+                    continue
+                seen.add(id(event))
+                if await self._preserve_followup_across_restart(key, event, None):
+                    spooled += 1
+                    if store.get(key) is state:
+                        store.pop(key, None)
+                        task = getattr(state, "task", None)
+                        if task is not None and not task.done():
+                            task.cancel()
+        return spooled
+
+    async def _load_restart_followups(self) -> int:
+        """Queue follow-ups spooled by the previous life into startup restore."""
+        try:
+            from gateway.fork_ext.restart_followups import (
+                event_kwargs,
+                restored_admission,
+                take_followups,
+            )
+
+            records, stale = await asyncio.to_thread(take_followups)
+        except Exception:
+            logger.debug("restart follow-up spool load failed", exc_info=True)
+            return 0
+        queued = 0
+        for record in records:
+            try:
+                carried = record.get("event")
+                kwargs = event_kwargs(carried) if isinstance(carried, dict) else {}
+                kwargs.setdefault("message_type", MessageType.TEXT)
+                source = SessionSource.from_dict(record["source"])
+                for flag, value in restored_admission(record).items():
+                    setattr(source, flag, value)
+                # In-process only: lets the intake report a replay it refuses
+                # as restart_followup_lost (the spool file is already acked).
+                source._restart_followup_session = record.get("session_key")
+                event = MessageEvent(
+                    text=record["text"],
+                    source=source,
+                    **kwargs,
+                )
+                event._hermes_restart_followup_path = record["_spool_path"]
+                self._queue_startup_restore_event(event)
+                queued += 1
+            except Exception:
+                logger.warning(
+                    "PHASE=restart_followup_replay_failed session=%s",
+                    record.get("session_key"),
+                    exc_info=True,
+                )
+        if queued or stale:
+            logger.warning(
+                "PHASE=restart_followups_replayed queued=%d stale_skipped=%d",
+                queued,
+                stale,
+            )
+        return queued
+
+    def _report_refused_restart_followup(self, source: Any, reason: str) -> None:
+        """A replayed restart follow-up refused at intake is LOST, never silent.
+
+        Its spool file was acknowledged when the adapter accepted the replay,
+        so this log line is the only remaining trace (t_43e058b7).
+        """
+        session = getattr(source, "_restart_followup_session", None)
+        if not session:
+            return
+        logger.error(
+            "PHASE=restart_followup_lost session=%s reason=%s platform=%s chat=%s "
+            "user=%s: replayed follow-up refused at intake; it is DROPPED",
+            session,
+            reason,
+            getattr(getattr(source, "platform", None), "value", "unknown"),
+            getattr(source, "chat_id", None),
+            getattr(source, "user_id", None),
+        )
+
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
@@ -15773,6 +16434,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 retry_delay = min(retry_delay * 2, 5.0)
                 continue
             queue.pop(0)
+            spool_path = getattr(event, "_hermes_restart_followup_path", None)
+            if spool_path:
+                from gateway.fork_ext.restart_followups import acknowledge_followup
+
+                await asyncio.to_thread(acknowledge_followup, spool_path)
             last_warning_at.pop(id(event), None)
             last_phase_warning_at.pop(id(event), None)
             logger.warning(
@@ -16554,15 +17220,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gateway import restart_loop_guard as _rlg
 
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                if not getattr(self, "_restart_loop_guard_recorded_this_boot", False):
-                    _tripped = _rlg.check_and_record(
-                        _max_restarts, _window, max_gap_seconds=_max_gap
-                    )
-                    self._restart_loop_guard_recorded_this_boot = True
-                else:
-                    _tripped = _rlg.is_restart_loop_tripped(
-                        _max_restarts, _window, max_gap_seconds=_max_gap
-                    )
+                # 2026-09-22: the per-runner ``_restart_loop_guard_recorded_this_boot``
+                # flag that used to gate this call lived on the GatewayRunner
+                # instance, so it only deduplicated scans routed through this one
+                # object and never reached the on-disk ledger. The guard itself now
+                # records at most once per process boot identity, which covers every
+                # caller and makes restart_loop.json forensically honest. Keeping the
+                # instance flag as well double-suppressed the scans: the module-layer
+                # dedupe became untestable through this path (removing it left the
+                # regression test green). Call the guard unconditionally and let it
+                # own the dedupe.
+                _tripped = _rlg.check_and_record(
+                    _max_restarts, _window, max_gap_seconds=_max_gap
+                )
                 if _tripped:
                     # F2 is armed whenever the per-session breaker is enabled,
                     # which (given the max(1, ...) clamp) it always is. The
@@ -16840,13 +17510,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pool = getattr(self, "_startup_resume_pool", None)
             if pool is None:
                 from gateway.turn_admission import StartupResumePool
-                concurrency = getattr(self.config, "startup_resume_concurrency", 3)
-                if type(concurrency) is not int or concurrency <= 0:
+                # Default UNBOUNDED (Ace ruling 2026-09-23 09:40): every
+                # restart-interrupted session resumes at once. #827 set 3 to
+                # pace resumes onto a 10-thread executor; #936 removed that
+                # executor cap, so the pacing has nothing left to protect and
+                # only delays the sessions Ace is waiting on. A positive
+                # gateway.startup_resume_concurrency is still honoured as an
+                # explicit operator throttle.
+                concurrency = getattr(self.config, "startup_resume_concurrency", None)
+                if concurrency is not None and (type(concurrency) is not int or concurrency <= 0):
                     logger.warning(
-                        "Invalid gateway.startup_resume_concurrency value %r; using 3",
+                        "Invalid gateway.startup_resume_concurrency value %r; using unbounded",
                         concurrency,
                     )
-                    concurrency = 3
+                    concurrency = None
                 pool = self._startup_resume_pool = StartupResumePool(
                     concurrency
                 )
@@ -17566,8 +18243,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+        # Reset the queue BEFORE loading the spool: the loader claims (deletes)
+        # the spool files, so a reset after it would drop every follow-up.
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        # Follow-ups the previous life could not run (spooled while draining)
+        # enter the restore queue FIRST, ahead of anything newer.
+        try:
+            await self._load_restart_followups()
+        except Exception:
+            logger.debug("restart follow-up replay failed", exc_info=True)
         self._startup_restore_watchdog_task = asyncio.create_task(
             self._startup_restore_gate_watchdog()
         )
@@ -18176,6 +18861,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is ignored via its instantiation epoch; only a current-epoch marker
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
+
+        # Shared-checkout admission acknowledgments (t_e8017c37): published
+        # from THIS loop so a fresh record also proves the loop is serving.
+        _checkout_gate = self._checkout_admission_gate()
+        if _checkout_gate is not None:
+            self._spawn_supervised(
+                _checkout_gate.publish_forever, "checkout_admission_publisher"
+            )
 
         logger.info("Press Ctrl+C to stop")
 
@@ -19816,6 +20509,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # delayed hard-exit in the worker.
             _watchdog_done = threading.Event()
             self._shutdown_watchdog_done = _watchdog_done
+            # Every watchdog event armed on this stop path. A re-arm disarms
+            # the previous thread and appends a fresh event, so the `finally`
+            # below must set ALL of them or a superseded thread keeps running
+            # to its own deadline and hard-exits a shutdown that completed.
+            _watchdog_events: list[threading.Event] = [_watchdog_done]
             _stop_started_at_box: dict[str, float] = {}
 
             def _shutdown_watchdog_snapshot() -> dict:
@@ -19830,15 +20528,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "effective_drain_timeout": effective_stop_drain_timeout(self),
                     "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
-                    "watchdog_delay_s": resolve_armed_shutdown_watchdog_delay(
-                        effective_stop_drain_timeout(self),
-                        getattr(self, "_launchd_exit_timeout_s", None),
-                        signal_driven=getattr(
-                            self, "_stop_requested_by_signal", False
-                        ),
-                        last_teardown_s=getattr(
-                            self, "_last_shutdown_teardown_s", None
-                        ),
+                    # The deadline CURRENTLY in force, read from what the
+                    # arming site published — not re-derived. A re-arm moves
+                    # it, and a forensic dump that recomputed the t=0 value
+                    # would report the superseded deadline for the very
+                    # hard-exit it is documenting.
+                    #
+                    # 🔴 FRAME: this is ABSOLUTE, measured from the start of
+                    # stop(). The dump's own top-level `delay_s`
+                    # (shutdown_watchdog._write_watchdog_dump) is RELATIVE to
+                    # the arming call. They coincide at the t=0 arming and
+                    # deliberately diverge after a re-arm (e.g. delay_s=249.1
+                    # alongside watchdog_delay_s=250.9); `phase_elapsed_s`
+                    # below is what reconciles them.
+                    "watchdog_delay_s": (
+                        getattr(self, "_armed_shutdown_deadline_s", None)
+                        if getattr(self, "_armed_shutdown_deadline_s", None)
+                        is not None
+                        else resolve_armed_shutdown_watchdog_delay(
+                            effective_stop_drain_timeout(self),
+                            getattr(self, "_launchd_exit_timeout_s", None),
+                            signal_driven=getattr(
+                                self, "_stop_requested_by_signal", False
+                            ),
+                            last_teardown_s=getattr(
+                                self, "_last_shutdown_teardown_s", None
+                            ),
+                        )
                     ),
                     "persistence_complete": False,
                     "phase_elapsed_s": (
@@ -19858,6 +20574,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     signal_driven=getattr(self, "_stop_requested_by_signal", False),
                     last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
                 )
+                # Publish the deadline the watchdog is ACTUALLY armed with so
+                # the drain and the cron leash below CONSUME it instead of
+                # re-deriving a variant. Re-derivation is the #838 defect
+                # class: the drain was fitted to `exit_timeout -
+                # hard_exit_reserve_s`, which equals the armed value only
+                # when the outer min() binds (the gui-clamped 60), and on a
+                # non-gui-clamped system-domain job the armed deadline is
+                # EARLIER — so the drain ran into the teardown window.
+                self._armed_shutdown_deadline_s = _watchdog_delay
                 arm_shutdown_watchdog(
                     _watchdog_delay,
                     done_event=_watchdog_done,
@@ -19865,15 +20590,221 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exit_code=1,
                 )
 
+            def _rearm_shutdown_watchdog(delay_s: float) -> None:
+                """Re-arm the hard-exit backstop to a LATER absolute deadline.
+
+                The watchdog is armed at the TOP of ``stop()`` from
+                ``effective_drain + max(grace, reserve)``, but that drain is
+                a RELATIVE budget that does not start until the pre-drain
+                phases finish. So the armed window silently absorbs the
+                pre-drain elapsed and the teardown reserve is what pays for
+                it — finding 4 of the #838 review, and the original 02:49
+                incident. Re-arming once the elapsed is KNOWN pushes
+                ``os._exit`` out by exactly that elapsed instead of charging
+                it to the teardown.
+
+                EXTEND-ONLY, and still bounded by the launchd SIGKILL wall
+                via ``resolve_launchd_shutdown_watchdog_delay`` inside
+                ``resolve_armed_shutdown_watchdog_delay`` — a re-arm can
+                never move the deadline earlier (which would hard-exit a
+                healthy shutdown sooner than promised) and can never push it
+                past ``exit_timeout - hard_exit_reserve_s`` (which launchd
+                would answer with SIGKILL anyway). When the wall already
+                binds there is nothing to extend and this is a no-op.
+
+                🔴 ONE exception to extend-only: a CURRENT deadline that is
+                itself past the wall is SHORTENED to the wall. That state is
+                reachable — see the ``_cur_past_wall`` comment below — and
+                extend-only was keeping a decorative ``os._exit`` armed
+                ~190s past an uncatchable SIGKILL. Shortening to the wall is
+                not "sooner than promised": launchd had already promised
+                less.
+
+                🔴 LAUNCHD-ONLY, because that bound only EXISTS there.
+                ``resolve_launchd_shutdown_watchdog_delay`` short-circuits
+                when there is no live ``ExitTimeOut`` (systemd, Docker/s6,
+                ``--external-supervisor``, foreground), so off launchd the
+                new deadline is a plainly uncapped
+                ``elapsed + drain + max(grace, reserve)`` and the re-arm
+                would push ``os._exit`` later on every SIGTERM that spends
+                >0.5s pre-drain, bounded by nothing. There is also nothing
+                to buy back there: ``resolve_stop_drain_deadline_s``
+                returns ``None`` without a launchd budget, so the drain and
+                the cron leash are never elapsed-charged in the first place
+                and finding 4's defect does not arise. Cost without
+                correctness — so the re-arm is gated to the path whose
+                invariant the docstring above actually states.
+
+                🔴 UNIT MISMATCH, handled here and nowhere else: ``delay_s``
+                and ``_armed_shutdown_deadline_s`` are ABSOLUTE, measured
+                from the start of ``stop()``, but ``arm_shutdown_watchdog``
+                takes a delay RELATIVE to the arming call
+                (``deadline = time.monotonic() + delay``). The top-of-stop()
+                arming happens at t=0, where the two coincide; a re-arm does
+                not. Handing the absolute value straight through charges the
+                pre-drain elapsed a SECOND time and schedules ``os._exit``
+                at ``elapsed + deadline`` — past launchd's SIGKILL whenever
+                the elapsed exceeds ``hard_exit_reserve_s``, which defeats
+                the backstop entirely (clamp 300 / drain 180 / teardown 70 /
+                elapsed 40: fires at 330 against a SIGKILL at 300). So the
+                absolute deadline is PUBLISHED for the drain and cron sites
+                and the REMAINING time is what gets armed.
+
+                🔴 FAIL-SAFE ORDERING. The replacement backstop is armed
+                BEFORE any shutdown state is committed and before the old
+                one is retired, and the whole body is contained: if arming
+                raises, ``stop()`` continues under the watchdog it already
+                had rather than unwinding at drain-fit — which would skip
+                drain, persist and teardown while the outer ``finally`` set
+                every event and disarmed the original too, leaving nothing
+                to ``os._exit`` before launchd's SIGKILL.
+
+                🔴 A SILENT arming failure is the reachable one, and it is
+                checked by RETURN VALUE, not by ``except``.
+                ``arm_shutdown_watchdog`` documents "Never raises" and wraps
+                its own ``Thread.start``, so the failure that actually
+                occurs — ``RuntimeError: can't start new thread`` under
+                thread/FD exhaustion, i.e. the very condition that wedges a
+                shutdown — used to walk the SUCCESS path: commit, then
+                ``_prev.set()`` retiring the live t=0 backstop in favour of a
+                thread that was never started. The process was then left with
+                no hard-exit at all. It now returns ``None`` in that case and
+                this bails out before committing anything.
+                """
+                if os.environ.get("PYTEST_CURRENT_TEST"):
+                    return
+                # No live ExitTimeOut => no wall => no cap and no benefit.
+                _budget = getattr(self, "_launchd_exit_timeout_s", None)
+                if not getattr(self, "_stop_requested_by_signal", False) or not _budget:
+                    return
+                try:
+                    _new = max(float(delay_s), 0.0)
+                except (TypeError, ValueError):
+                    return
+                _cur = getattr(self, "_armed_shutdown_deadline_s", None)
+                # Compare against the deadline already armed, measured from
+                # the same stop() start, so "later" is unambiguous.
+                #
+                # EXTEND-ONLY, with ONE exception: a deadline already PAST
+                # launchd's SIGKILL wall. `stop(restart=True)` arms with
+                # signal_driven=False, so resolve_launchd_shutdown_watchdog_
+                # delay short-circuits and publishes the RAW inner leash
+                # (drain 180 + grace 60 = 240 at clamp 60). If a supervisor
+                # SIGTERM then lands mid-stop, the re-arm's fresh value (50)
+                # is EARLIER and extend-only discarded it — leaving the real
+                # os._exit thread armed at stop()+240 against an uncatchable
+                # SIGKILL at 60. The watchdog was decorative on that path: a
+                # wedged teardown got SIGKILLed with no dump, no ledger entry
+                # and no ordered PID-file/runtime-lock release. Shortening is
+                # safe here precisely because the current deadline is one
+                # launchd will never honour, and the replacement is clamped
+                # to the wall rather than to anything the caller chose — so
+                # this can never hard-exit a healthy shutdown sooner than the
+                # supervisor would have killed it anyway.
+                _wall = resolve_max_actionable_teardown_reserve_s(_budget)
+                if _wall is None:
+                    # An unreadable budget has no actionable launchd wall;
+                    # the re-arm's launchd-only safety premise is absent.
+                    return
+                _cur_past_wall = _cur is not None and float(_cur) > _wall + 1e-9
+                if _cur_past_wall:
+                    _new = min(_new, _wall)
+                elif _cur is not None and _new <= float(_cur) + 0.5:
+                    return
+                # Absolute -> relative. Measured from the same stop() start
+                # the deadline is expressed in; if that start is unknown the
+                # elapsed is 0 and this degrades to the old behaviour rather
+                # than arming something shorter than intended.
+                _started = _stop_started_at_box.get("t")
+                _elapsed_now = (
+                    max(time.monotonic() - _started, 0.0)
+                    if _started is not None
+                    else 0.0
+                )
+                _remaining = max(_new - _elapsed_now, 0.0)
+                if _remaining <= 0.0:
+                    # The deadline has already passed; arming a zero delay is
+                    # a silent no-op in arm_shutdown_watchdog, and replacing
+                    # a live backstop with nothing is strictly worse than
+                    # leaving the current one in force.
+                    return
+                _prev = self._shutdown_watchdog_done
+                _fresh = threading.Event()
+                # Registered for cleanup BEFORE arming: if arming succeeds
+                # the outer finally must be able to retire the thread, and
+                # if it fails setting an event nothing waits on is a no-op.
+                _watchdog_events.append(_fresh)
+                try:
+                    # Arm the replacement FIRST. Nothing about the shutdown
+                    # state is committed and the old backstop is still in
+                    # force until this returns, so a failure here leaves
+                    # stop() exactly as it was.
+                    _armed_ev = arm_shutdown_watchdog(
+                        _remaining,
+                        done_event=_fresh,
+                        snapshot_fn=_shutdown_watchdog_snapshot,
+                        exit_code=1,
+                    )
+                except Exception:
+                    # Contained on purpose: propagating would unwind
+                    # _stop_impl_body at the drain fit — before drain,
+                    # persist and teardown — and the outer finally would
+                    # then set every event, disarming the ORIGINAL watchdog
+                    # too. That trades a missed deadline extension for an
+                    # unpersisted shutdown with no backstop at all.
+                    logger.warning(
+                        "Shutdown watchdog re-arm failed; continuing under "
+                        "the watchdog already armed at stop()+%.1fs",
+                        float(_cur) if _cur is not None else -1.0,
+                        exc_info=True,
+                    )
+                    return
+                if _armed_ev is None:
+                    # SILENT failure — the reachable one. The thread never
+                    # started, so committing here would retire a live
+                    # backstop for one that does not exist and advance the
+                    # published deadline to an instant nothing enforces.
+                    # Leave the t=0 watchdog in force; the drain and cron
+                    # leash keep consuming the deadline it was armed with.
+                    logger.warning(
+                        "Shutdown watchdog re-arm did not arm (thread start "
+                        "failed); continuing under the watchdog already armed "
+                        "at stop()+%.1fs",
+                        float(_cur) if _cur is not None else -1.0,
+                    )
+                    return
+                # Replacement is live — now commit, then retire the old one,
+                # so there is never an instant with no backstop at all.
+                self._shutdown_watchdog_done = _fresh
+                self._armed_shutdown_deadline_s = _new
+                if _prev is not None:
+                    _prev.set()
+                logger.info(
+                    "Shutdown watchdog re-armed to stop()+%.1fs (was "
+                    "stop()+%.1fs; %.1fs from now at elapsed %.1fs) — "
+                    "absorbing the measured pre-drain elapsed instead of "
+                    "charging it to the post-drain teardown reserve",
+                    _new,
+                    float(_cur) if _cur is not None else -1.0,
+                    _remaining,
+                    _elapsed_now,
+                )
+
             try:
                 await _stop_impl_body(
                     _kill_tool_subprocesses,
                     _stop_started_at_box,
+                    _rearm_shutdown_watchdog,
                 )
             finally:
-                _watchdog_done.set()
+                for _ev in _watchdog_events:
+                    _ev.set()
 
-        async def _stop_impl_body(_kill_tool_subprocesses, _stop_started_at_box) -> None:
+        async def _stop_impl_body(
+            _kill_tool_subprocesses,
+            _stop_started_at_box,
+            _rearm_shutdown_watchdog=None,
+        ) -> None:
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
@@ -19965,16 +20896,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the reserve. At the live geometry (clamp 60, drain 30, armed
             # 50) an 8s marking loop left a 12s window for a 15s reserve.
             # The cron branch below does the same thing for the same reason.
+            # THE ONE DEADLINE, resolved once here from the value the
+            # watchdog was ACTUALLY armed with, then consumed by BOTH the
+            # drain fit below and the cron leash further down. Two sites
+            # consuming one deadline is the whole point of #838's close-out;
+            # a site that re-derives it drifts from the instant os._exit
+            # really fires.
+            #
+            # Re-arm FIRST, with the elapsed now measured: the top-of-stop()
+            # arming could not know the pre-drain cost, so it charged it to
+            # the teardown reserve (finding 4). Extend-only and still capped
+            # by the launchd wall, so this either buys back exactly the
+            # elapsed or is a no-op. It must precede the deadline read below
+            # so the deadline reflects the watchdog now in force.
+            _drain_elapsed_at_fit = _phase_elapsed()
+            if callable(_rearm_shutdown_watchdog):
+                _rearm_shutdown_watchdog(
+                    resolve_armed_shutdown_watchdog_delay(
+                        effective_stop_drain_timeout(self),
+                        getattr(self, "_launchd_exit_timeout_s", None),
+                        signal_driven=getattr(
+                            self, "_stop_requested_by_signal", False
+                        ),
+                        last_teardown_s=getattr(
+                            self, "_last_shutdown_teardown_s", None
+                        ),
+                        elapsed_s=_drain_elapsed_at_fit,
+                    )
+                )
+            _stop_deadline_s = resolve_stop_drain_deadline_s(
+                effective_stop_drain_timeout(self),
+                getattr(self, "_launchd_exit_timeout_s", None),
+                signal_driven=getattr(self, "_stop_requested_by_signal", False),
+                last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+                armed_deadline_s=getattr(self, "_armed_shutdown_deadline_s", None),
+            )
             timeout = resolve_elapsed_adjusted_drain(
                 timeout,
                 getattr(self, "_launchd_exit_timeout_s", None),
                 signal_driven=getattr(self, "_stop_requested_by_signal", False),
-                elapsed_s=_phase_elapsed(),
+                elapsed_s=_drain_elapsed_at_fit,
                 # Same measured sample effective_stop_drain_timeout() fed the
                 # cap. Both derive the SAME deadline, so they must see the
                 # same teardown reserve or the drain is fitted against a
                 # window the watchdog does not actually grant.
                 last_teardown_s=getattr(self, "_last_shutdown_teardown_s", None),
+                # The deadline the watchdog was ACTUALLY armed with, captured
+                # at the arming site above. Not a re-derivation: `os._exit`
+                # fires at this instant, so the drain must end a teardown
+                # reserve before it.
+                armed_deadline_s=getattr(self, "_armed_shutdown_deadline_s", None),
             )
 
             _cron_at_start = self._active_cron_job_count()
@@ -19988,9 +20959,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cron_drain_cfg = getattr(
                 self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
             )
-            # Under launchd the real leash is launchd's own exit timeout, not
-            # our watchdog (drain + grace): a signal-driven stop that lets
-            # cron work push past it is SIGKILLed before cleanup runs.
+            # Under launchd the real leash is the ARMED watchdog deadline —
+            # the instant os._exit fires — minus the post-drain teardown
+            # reserve, i.e. THE ONE DEADLINE computed above. Clamping to the
+            # raw ExitTimeOut (launchd's SIGKILL wall) and holding back only
+            # CRON_DRAIN_CLEANUP_RESERVE_S was the #838 defect: it let the
+            # cron floor raise the budget back up to the hard-exit instant,
+            # silently undoing the elapsed adjustment made three statements
+            # earlier and consuming the whole teardown reserve.
             _cron_leash = resolve_shutdown_watchdog_delay(timeout)
             _launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
             if getattr(self, "_stop_requested_by_signal", False) and _launchd_budget:
@@ -19999,7 +20975,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout,
                 _cron_drain_cfg,
                 watchdog_delay=_cron_leash,
-                elapsed=_phase_elapsed(),
+                elapsed=_drain_elapsed_at_fit,
+                # Consumed, not re-derived. None off the launchd signal path
+                # (or in tests that never arm), where the watchdog_delay
+                # leash above remains the honest answer.
+                deadline_s=_stop_deadline_s,
             )
             if _cron_at_start and _cron_timeout > timeout:
                 logger.info(
@@ -20330,6 +21310,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _task.cancel()
             self._background_tasks.clear()
 
+            try:
+                await self._spool_adapter_pending_for_restart()
+            except Exception:
+                logger.debug("adapter follow-up spool sweep failed", exc_info=True)
             self.adapters.clear()
             for _session_key in list(self._running_agents):
                 self._release_running_agent_state(_session_key)
@@ -22135,6 +23119,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Dropping inbound message because its explicit profile route "
                 "targets an unserved profile"
             )
+            self._report_refused_restart_followup(source, "profile_route_rejected")
             return None
 
         # Internal events (e.g. background-process completion notifications)
@@ -22231,9 +23216,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized_for_source(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                self._report_refused_restart_followup(source, "unauthorized")
                 return None
         elif not self._is_user_authorized_for_source(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            self._report_refused_restart_followup(source, "unauthorized")
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
                 source.chat_type == "dm"
@@ -23585,7 +24572,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
                     # uninstalled skill and give actionable guidance.
-                    _unavail_msg = _check_unavailable_skill(command)
+                    _unavail_msg = await _check_unavailable_skill_async(command)
                     if _unavail_msg:
                         return _unavail_msg
                     # Genuinely unrecognized /command: not a built-in, not a
@@ -23646,6 +24633,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
+        # ── Shared-checkout admission hold (t_e8017c37) ───────────────
+        # Unlike the marker-polled external drain above, this re-reads the
+        # durable operator hold on EVERY admission, so a turn arriving right
+        # after an operator's last idle poll is refused (or, if it won the
+        # race, is counted by the next acknowledgment snapshot). Internal
+        # continuations are admitted+counted under ``drain`` and refused only
+        # under ``freeze``. The ticket spans the whole turn (finally below).
+        _checkout_ticket = None
+        _checkout_gate = self._checkout_admission_gate()
+        if _checkout_gate is not None:
+            from gateway.checkout_admission import AdmissionRefused
+
+            try:
+                _checkout_ticket = _checkout_gate.admit(
+                    f"message:{_quick_key}", internal=bool(is_internal)
+                )
+            except AdmissionRefused as exc:
+                logger.info(
+                    "Refusing turn for session %s — %s", _quick_key, exc.reason
+                )
+                return (
+                    "⏳ This agent is paused for a maintenance update and isn't "
+                    "accepting new turns right now. Please resend shortly."
+                )
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -23662,6 +24674,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Rejecting new active session %s: max_concurrent_sessions reached",
                 _quick_key,
             )
+            if _checkout_ticket is not None:
+                _checkout_ticket.release()
             return _limit_message
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -23740,6 +24754,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            if _checkout_ticket is not None:
+                _checkout_ticket.release()
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -23940,10 +24956,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
             if audio_paths:
-                message_text, _successful_transcripts = await self._enrich_message_with_transcription(
-                    message_text,
-                    audio_paths,
-                )
+                _stt_chat_token = _STT_LOG_CHAT.set(str(getattr(source, "chat_id", None) or "unknown"))
+                try:
+                    message_text, _successful_transcripts = await self._enrich_message_with_transcription(
+                        message_text,
+                        audio_paths,
+                    )
+                finally:
+                    _STT_LOG_CHAT.reset(_stt_chat_token)
                 # Echo each successful transcript back to the user immediately
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
@@ -24658,7 +25678,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # like normal work rather than cancel it.
         self._clear_pending_boot_resume(_quick_key)
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _msg_preview = await _inbound_log_preview(event)
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         # Internal/synthetic events (boot auto-resume, continuations) are not
@@ -24756,7 +25776,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # contract). Resolve its tri-state immediately after session lookup,
         # before any session hygiene, onboarding, media enrichment, global
         # provider resolution, or agent construction can run.
-        route_lookup = self._persisted_session_route_identity(session_key)
+        # Off the loop: the lookup takes SessionStore._lock (threading.Lock),
+        # which a worker thread can hold across a routing load or save. Measured
+        # 2026-09-24 06:58 on Apollo: a single on-loop wait here blocked the
+        # event loop for ~100 s (PHASE=event_loop_blocked at session.py
+        # _ensure_loaded). Contract: tests/gateway/test_no_agent_construction_on_event_loop.py.
+        route_lookup = await asyncio.to_thread(
+            self._persisted_session_route_identity, session_key
+        )
         if route_lookup.state == "unavailable":
             return (
                 "⚠️ Provider authentication failed: The persisted session model "
@@ -24926,7 +25953,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # miss (thread rename, /sethome, redact_pii flip, ...) re-renders
         # once — the only legitimate cache busts.
         context_prompt = self._pinned_session_context_prompt(
-            context, _redact_pii, session_key
+            context, _redact_pii, session_key,
+            internal=bool(getattr(event, "internal", False)),
         )
 
         # Per-turn must-deliver notes.  These used to be appended to
@@ -25535,20 +26563,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     ),
                                     default=False,
                                 )
-                                _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
-                                    model=_hyg_model,
-                                    max_iterations=4,
-                                    quiet_mode=True,
-                                    skip_memory=not _hyg_checkpoint_required,
-                                    enabled_toolsets=["memory"],
-                                    session_id=session_entry.session_id,
-                                    session_db=_hyg_session_db,
-                                )
-                                _seed_hygiene_system_prompt(
-                                    _hyg_agent,
-                                    _hyg_session_row,
-                                )
+                                # OFF the event loop (2026-09-24): AIAgent.__init__
+                                # loads the context engine under the process-global
+                                # _LOAD_LOCK — 20-60 s while worker turns hold it —
+                                # and that was the PHASE=event_loop_blocked site
+                                # that stalled Discord heartbeats past the ~41 s
+                                # ACK window (7 socket drops in 50 min). The
+                                # compression call below was already off-loop;
+                                # construction must be too.
+                                def _build_hyg_agent():
+                                    _a = AIAgent(
+                                        **_hyg_runtime,
+                                        model=_hyg_model,
+                                        max_iterations=4,
+                                        quiet_mode=True,
+                                        skip_memory=not _hyg_checkpoint_required,
+                                        enabled_toolsets=["memory"],
+                                        session_id=session_entry.session_id,
+                                        session_db=_hyg_session_db,
+                                    )
+                                    _seed_hygiene_system_prompt(_a, _hyg_session_row)
+                                    return _a
+
+                                _hyg_agent = await asyncio.to_thread(_build_hyg_agent)
                                 # If compression must rebuild instead of retaining
                                 # the cached prompt, make the persisted result
                                 # deliberately stale for every real gateway surface.
@@ -26457,17 +27494,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            # Same rule as the context-prompt pin: an internal event reuses
+            # the last human turn's channel_prompt / parent_chat_id, which
+            # its rebuilt source lacks, so combined_ephemeral cannot toggle.
+            _turn_channel_prompt, _turn_source = self._pinned_channel_inputs(
+                session_key, event, source,
+            )
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
                 history=history,
-                source=source,
+                source=_turn_source,
                 session_id=_run_start_session_id,
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
+                channel_prompt=_turn_channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -28226,7 +29269,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._warm_goals_session_db("loop wakeup")
 
                 now = time.time()
-                for sid, state in list_active_loops():
+                # OFF the event loop (Aegis, 2026-09-23). list_active_loops() reads state_meta
+                # through SessionDB._read_ctx, which past _READ_POOL_MAX falls back to the WRITER
+                # lock — so under 6+ live turns this sync call convoyed behind compaction-ingest
+                # transactions and blocked the loop for 10-50 s (16 of 19 PHASE=event_loop_blocked
+                # sites today). Every Discord interaction ack (3 s budget) and every platform
+                # read/write sat behind it: "/model: The application did not respond" and
+                # "Apollo is frozen again". tests/gateway/test_no_sync_db_on_loop.py pins the class.
+                for sid, state in await asyncio.to_thread(list_active_loops):
                     if state.awaiting_response or now < state.next_due_at:
                         continue
                     route = state.route or {}
@@ -28293,8 +29343,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Slash-command loops dispatch through the command
                         # path and never hit the post-turn completion hook —
                         # complete the tick immediately (caps + scheduling).
+                        # complete_tick runs the sync --until aux-LLM judge
+                        # (network) — keep it off the event loop, same as the
+                        # post-turn completion hook.
                         if wakeup.lstrip().startswith("/"):
-                            mgr.complete_tick("")
+                            await asyncio.to_thread(mgr.complete_tick, "")
                     except Exception as exc:
                         logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
                         try:
@@ -31367,9 +32420,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return await loop.run_in_executor(executor, _timed, *args)
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
-        """Return the gateway-owned executor for blocking agent work."""
+        """Return the gateway-owned executor for blocking agent work.
+
+        Sized against turn admission (see _executor_max_workers): the pool is
+        created lazily on the first turn, which is always AFTER that turn was
+        admitted, so the admission cap is known here.
+        """
+        _cap = None
+        try:
+            _cap = getattr(self._get_turn_admission(), "cap", None)
+        except Exception:
+            _cap = None
         return _get_or_create_pool(
-            self, "_executor", "hermes-gateway", _executor_max_workers()
+            self, "_executor", "hermes-gateway", _executor_max_workers(_cap)
         )
 
     def _get_housekeeping_executor(self) -> concurrent.futures.ThreadPoolExecutor:
@@ -31628,6 +32691,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_text:   The user's original caption / message text.
             audio_paths: List of local file paths to cached audio files.
 
+        Every clip logs one INFO outcome line keyed on the chat in
+        ``_STT_LOG_CHAT`` (set by the caller): ``stt: chat=<c> transcribed N
+        chars in Ts: '<head>'`` or ``stt FAILED: chat=<c> after Ts: <why>``.
+        These pair with the ``[voice Ns]`` inbound line for log readers.
+
         Returns:
             A tuple of ``(enriched_text, successful_transcripts)``:
               - ``enriched_text``: the message string with transcription wrappers
@@ -31639,7 +32707,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         seen = set()
         audio_paths = [p for p in audio_paths if p not in seen and not seen.add(p)]
+        _stt_chat = _STT_LOG_CHAT.get()
+
+        def _stt_failed(why: str, started: float) -> None:
+            logger.info(
+                "stt FAILED: chat=%s after %.1fs: %s",
+                _stt_chat, time.monotonic() - started, why,
+            )
+
         if not getattr(self.config, "stt_enabled", True):
+            for _ in audio_paths:
+                _stt_failed("stt disabled in config", time.monotonic())
             notes = []
             for path in audio_paths:
                 abs_path = os.path.abspath(path)
@@ -31667,6 +32745,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except ModuleNotFoundError as e:
             logger.error("Transcription module unavailable: %s", e)
+            for _ in audio_paths:
+                _stt_failed(f"transcription module unavailable: {e}", time.monotonic())
             unavailable_note = "[voice message could not be transcribed]"
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
@@ -31678,6 +32758,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enriched_parts = []
         successful_transcripts: List[str] = []
         for path in audio_paths:
+            _stt_started = time.monotonic()
             try:
                 logger.debug("Transcribing user voice: %s", path)
                 result = await asyncio.to_thread(
@@ -31702,6 +32783,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # agent reply to nothing and can loop, so that case gets a
                     # clear sentinel note instead (#41603).
                     if not (transcript or "").strip():
+                        _stt_failed("empty transcript (silence/inaudible)", _stt_started)
                         enriched_parts.append(
                             "[The user sent a voice message but it came through "
                             "empty or inaudible — speech-to-text returned no "
@@ -31710,6 +32792,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         continue
                     successful_transcripts.append(transcript)
+                    logger.info(
+                        "stt: chat=%s transcribed %d chars in %.1fs: %r",
+                        _stt_chat, len(transcript), time.monotonic() - _stt_started,
+                        transcript[:60].replace("\n", " "),
+                    )
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's
                     # what they said: ...") read as a meta-instruction and made
@@ -31728,6 +32815,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # logged for operator diagnosis but kept out of the
                     # LLM-visible prompt.
                     logger.info("Voice transcription failed for %s: %s", path, error)
+                    _stt_failed(str(error)[:200], _stt_started)
                     from tools.credential_files import to_agent_visible_cache_path
 
                     agent_path = to_agent_visible_cache_path(os.path.abspath(path))
@@ -31737,6 +32825,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             except Exception as e:
                 logger.error("Transcription error: %s", e)
+                _stt_failed(f"{type(e).__name__}: {e}"[:200], _stt_started)
                 from tools.credential_files import to_agent_visible_cache_path
 
                 agent_path = to_agent_visible_cache_path(os.path.abspath(path))
@@ -31788,10 +32877,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
 
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
-            text,
-            audio_paths,
+        _stt_chat_token = _STT_LOG_CHAT.set(
+            str(getattr(getattr(event, "source", None), "chat_id", None) or "unknown")
         )
+        try:
+            enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
+                text,
+                audio_paths,
+            )
+        finally:
+            _STT_LOG_CHAT.reset(_stt_chat_token)
         setattr(event, "_gateway_pending_stt_text", enriched_text)
         setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
         return enriched_text, successful_transcripts
@@ -34833,7 +35928,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return f"[Voice channel now: {vc_now}]"
 
     def _pinned_session_context_prompt(
-        self, context, redact_pii: bool, session_key: Optional[str]
+        self,
+        context,
+        redact_pii: bool,
+        session_key: Optional[str],
+        *,
+        internal: bool = False,
     ) -> str:
         """Return the session-context prompt, pinned per session.
 
@@ -34841,12 +35941,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         composed system prompt against renderer nondeterminism); key miss →
         re-render ``build_session_context_prompt`` and re-pin (a legitimate
         cache bust: rename, topic edit, /sethome, redact_pii flip, ...).
+
+        ``internal`` events (kanban wakes, delegation completions, watch
+        notifications) carry a source rebuilt from the persisted origin, which
+        lacks chat_name/user_name/message_id. Rendering from it produced
+        different bytes than the surrounding human turns, so every internal
+        turn re-keyed the pin and the next human turn re-keyed it back (A→B→A).
+        Each flip rewrote already-sent system bytes and collapsed the prompt
+        cache to the static prefix (t_064c65a9). An internal event is never a
+        real metadata change, so it reuses the existing pin verbatim and never
+        re-pins.
         """
-        _eph_key = self._ephemeral_change_key(context, redact_pii)
         _eph_pin = None
         if session_key:
             _pin_state = self._peek_session_state(session_key)
             _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
+        if internal:
+            if _eph_pin is not None:
+                return _eph_pin[1]
+            return build_session_context_prompt(context, redact_pii=redact_pii)
+        _eph_key = self._ephemeral_change_key(context, redact_pii)
         if _eph_pin is not None and _eph_pin[0] == _eph_key:
             return _eph_pin[1]
         text = build_session_context_prompt(context, redact_pii=redact_pii)
@@ -34856,6 +35970,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 text,
             )
         return text
+
+    def _pinned_channel_inputs(self, session_key, event, source):
+        """Return ``(channel_prompt, source)`` for this turn's agent run.
+
+        ``run_sync`` appends ``channel_prompt`` and the ``channel_overrides``
+        prompt (looked up by chat/thread/``parent_chat_id``) to the pinned
+        session context.  Internal events carry ``channel_prompt=None`` and a
+        source without ``parent_chat_id``, so without this they drop both
+        components and toggle the system prompt A->B->A exactly like the
+        context-prompt pin did (t_4bcd60ba C2).  Human turns record their
+        inputs; internal turns reuse them.
+        """
+        channel_prompt = getattr(event, "channel_prompt", None)
+        if not session_key:
+            return channel_prompt, source
+        if not getattr(event, "internal", False):
+            self._session_state(session_key).conversation.channel_pin = (
+                channel_prompt,
+                getattr(source, "parent_chat_id", None),
+            )
+            return channel_prompt, source
+        state = self._peek_session_state(session_key)
+        pin = state.conversation.channel_pin if state else None
+        if pin is None:
+            return channel_prompt, source
+        pinned_prompt, pinned_parent = pin
+        if pinned_parent and not getattr(source, "parent_chat_id", None):
+            source = dataclasses.replace(source, parent_chat_id=pinned_parent)
+        return pinned_prompt, source
 
     @staticmethod
     def _ephemeral_change_key(context, redact_pii: bool) -> str:
@@ -35966,25 +37109,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=event_message_id,
             )
 
+            # ONE kwargs dict for both branches, carrying every parameter of
+            # this signature. The two hand-copied call lists this replaces
+            # silently dropped ``persist_user_display_kind`` (internal wakes
+            # persisted as plain user bubbles, #82888) and ``message_type``
+            # (voice replies, #60671). A parameter added above must be added
+            # here; test_run_agent_wrapper_forwards_every_parameter enforces it.
+            inner_kwargs = dict(
+                session_key=session_key,
+                run_generation=run_generation,
+                _interrupt_depth=_interrupt_depth,
+                event_message_id=event_message_id,
+                channel_prompt=channel_prompt,
+                moa_config=moa_config,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                message_type=message_type,
+            )
             if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
                 return await self._run_agent_inner(
                     message, context_prompt, history, source, session_id,
-                    session_key=session_key, run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                    channel_prompt=channel_prompt, moa_config=moa_config,
-                    persist_user_message=persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
+                    **inner_kwargs,
                 )
 
             profile_home = self._resolve_profile_home_for_source(source)
             with _profile_runtime_scope(profile_home):
                 return await self._run_agent_inner(
                     message, context_prompt, history, source, session_id,
-                    session_key=session_key, run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                    channel_prompt=channel_prompt, moa_config=moa_config,
-                    persist_user_message=persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
+                    **inner_kwargs,
                 )
         finally:
             try:
@@ -36060,6 +37213,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event_message_id=event_message_id,
             channel_prompt=channel_prompt,
             message_type=message_type,
+            # A kanban wake / async-delegation completion that arrived while
+            # this session was busy is drained here instead of through
+            # _handle_message_with_agent; keep its row typed (#82888).
+            persist_user_display_kind=(
+                "internal_notification"
+                if getattr(queued_event, "internal", False)
+                else None
+            ),
         )
         return _preserve_queued_followup_history_offset(
             current_result, followup_result
@@ -37549,10 +38710,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
 
             if self._draining and (pending_event or pending):
-                logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
-                    session_key or "?",
-                    self._status_action_label(),
+                # Never silently drop it (2026-09-23: 4 follow-ups lost). The
+                # draining process may not start a new turn, so spool it for
+                # the next boot's startup-restore replay.
+                await self._preserve_followup_across_restart(
+                    session_key, pending_event, pending, source
                 )
                 pending_event = None
                 pending = None
@@ -37763,7 +38925,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if next_message is None:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
-                    next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_channel_prompt, next_source = self._pinned_channel_inputs(
+                        next_session_key, pending_event, next_source,
+                    )
                     next_message_type = getattr(pending_event, "message_type", None)
 
                 # Clear the completed streaming marker from the prior logical
@@ -39001,7 +40165,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _stderr_handler = logging.StreamHandler(_safe_stderr())
         _stderr_handler.setLevel(_stderr_level)
         _stderr_handler.setFormatter(_gateway_stderr_formatter())
-        logging.getLogger().addHandler(_stderr_handler)
+        # Under launchd, stderr IS a file on the data volume
+        # (logs/gateway.error.log, 60 MB on 2026-09-23). Attached directly,
+        # this handler makes every WARNING+ emitted on the event loop a
+        # synchronous disk write: PHASE=event_loop_blocked seconds=10
+        # site=adapter.py:2396 _liveness_loop -> logging.emit -> stream.write,
+        # which is exactly the Discord heartbeat path, so a disk stall became
+        # an ack_stale reconnect. Route it through the same async QueueListener
+        # the rotating file handlers already use, so no loop thread ever waits
+        # on a log write.
+        from hermes_logging import _register_queued_handler as _queue_handler
+        _queue_handler(_stderr_handler)
         # Lower root logger level if needed so DEBUG records can reach the handler
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
@@ -39409,9 +40583,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # in-process ticker polls local due jobs, so only it receives the local
     # external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active
-        )
+        cron_start_kwargs["can_dispatch"] = _CronDispatchGate(runner)
     cron_thread = threading.Thread(
         target=cron_provider.start,
         args=(cron_stop,),

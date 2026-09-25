@@ -30,6 +30,8 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
+from hermes_cli import provider_seam
+
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
@@ -149,10 +151,13 @@ def _normalize_route_base_url(base_url: Any) -> str:
 def _provider_default_routes(provider: str) -> set[str]:
     """Return known exact default routes for a canonical provider id."""
     routes: set[str] = set()
+    # One generation for both registries; a container whose owning module is
+    # first imported below falls back to its live facade.
+    g = provider_seam.snapshot()
     try:
         from hermes_cli.providers import HERMES_OVERLAYS, get_provider
 
-        overlay = HERMES_OVERLAYS.get(provider)
+        overlay = g.get("HERMES_OVERLAYS", HERMES_OVERLAYS).get(provider)
         provider_def = get_provider(provider, allow_network=False)
         for value in (
             getattr(overlay, "base_url_override", ""),
@@ -181,7 +186,7 @@ def _provider_default_routes(provider: str) -> set[str]:
         from hermes_cli.models import normalize_provider as normalize_model_provider
         from hermes_cli.providers import normalize_provider as normalize_registry_provider
 
-        for provider_id, config in PROVIDER_REGISTRY.items():
+        for provider_id, config in g.get("PROVIDER_REGISTRY", PROVIDER_REGISTRY).items():
             canonical_id = normalize_registry_provider(
                 normalize_model_provider(provider_id)
             )
@@ -1099,6 +1104,9 @@ def init_agent(
     # agent was doing when it was killed, and by the "still working"
     # notifications to show progress.
     agent._last_activity_ts: float = time.time()
+    # Last REAL progress (API call, stream chunk, tool call) — wait tickers
+    # refresh _last_activity_ts only. Read by the kanban stall detector.
+    agent._last_progress_ts: float = agent._last_activity_ts
     agent._last_activity_desc: str = "initializing"
     # Default / unmigrated paths and _touch_activity stamp unknown; named
     # provenances are stamped by compression writers (heartbeat / timeout / cooldown).
@@ -2181,6 +2189,30 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Pool-capacity retry policy (agent.capacity_retry_attempts /
+    # agent.capacity_retry_max_wait_s). A relay 503 "no eligible sub"
+    # (``FailoverReason.pool_exhausted``) stays on the SAME provider for up to
+    # ``attempts`` tries / ``max_wait_s`` seconds before the fallback chain
+    # (a host move that costs a full-history bridge replay). ``attempts: 0``
+    # restores the pre-policy behaviour (generic jitter, fallback at
+    # ``api_max_retries``). See agent/retry_utils.py::capacity_retry_wait.
+    from agent.retry_utils import (
+        CAPACITY_RETRY_DEFAULT_ATTEMPTS,
+        CAPACITY_RETRY_DEFAULT_MAX_WAIT_S,
+    )
+    try:
+        _cap_attempts = int(_agent_section.get("capacity_retry_attempts", CAPACITY_RETRY_DEFAULT_ATTEMPTS))
+        _cap_attempts = max(_cap_attempts, 0)
+    except (TypeError, ValueError):
+        _cap_attempts = CAPACITY_RETRY_DEFAULT_ATTEMPTS
+    try:
+        _cap_max_wait = float(_agent_section.get("capacity_retry_max_wait_s", CAPACITY_RETRY_DEFAULT_MAX_WAIT_S))
+        _cap_max_wait = max(_cap_max_wait, 0.0)
+    except (TypeError, ValueError):
+        _cap_max_wait = CAPACITY_RETRY_DEFAULT_MAX_WAIT_S
+    agent._capacity_retry_attempts = _cap_attempts
+    agent._capacity_retry_max_wait_s = _cap_max_wait
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)
@@ -3093,6 +3125,17 @@ def init_agent(
     agent.session_cache_read_tokens = 0
     agent.session_cache_write_tokens = 0
     agent.session_reasoning_tokens = 0
+    # ABSORBING per-bucket unknown latch for the five cumulative counters
+    # above. They are plain ints — an unmeasured call adds the canonical 0 and
+    # leaves no trace — so a session-total consumer has no other way to know
+    # the aggregate is missing a measurement. Set (never cleared) beside the
+    # increments in `agent/conversation_loop.py`; reset with the counters in
+    # `AIAgent.reset_session_state`. Per-bucket rather than one boolean
+    # because narrow readers gate on individual buckets.
+    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS as _USAGE_UNKNOWN_FIELDS
+
+    for _usage_flag in _USAGE_UNKNOWN_FIELDS:
+        setattr(agent, f"session_{_usage_flag}", False)
     # Per-call snapshot for the most recent successful provider response.
     # Cumulative session_* counters are still the source of truth for totals.
     agent.last_turn_usage = None

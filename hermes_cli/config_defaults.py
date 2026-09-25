@@ -462,6 +462,13 @@ DEFAULT_CONFIG = {
         # being truncated; lower it to force background discipline.
         # Bridged to TERMINAL_MAX_FOREGROUND_TIMEOUT for child processes.
         "max_foreground_timeout": 600,
+        # Tighter foreground cap for turns delivered over a human messaging
+        # channel (Discord, Telegram, Slack, ...). The chat session cannot
+        # answer new messages while a foreground call runs, so this holds even
+        # when max_foreground_timeout is raised for CLI work. Can only lower
+        # the general cap, never raise it. Bridged to
+        # TERMINAL_GATEWAY_MAX_FOREGROUND_TIMEOUT.
+        "gateway_max_foreground_timeout": 600,
         # Free-disk threshold (GB) below which terminal output carries a
         # low-disk warning. Bridged to TERMINAL_DISK_WARNING_GB.
         "disk_warning_gb": 500.0,
@@ -2793,7 +2800,9 @@ DEFAULT_CONFIG = {
     # command prompts the user for consent; subsequent runs reuse the
     # stored approval from ~/.hermes/shell-hooks-allowlist.json.
     # See `website/docs/user-guide/features/hooks.md` for schema + examples.
-    "hooks": {},
+    # missing_hook_policy: what a hook whose script (or a tracked sibling) is ABSENT does —
+    # restore_then_fail_closed | fail_closed | fail_open_and_page.
+    "hooks": {"missing_hook_policy": "restore_then_fail_closed"},
 
     # Auto-accept shell-hook registrations without a TTY prompt.  Also
     # toggleable per-invocation via --accept-hooks or HERMES_ACCEPT_HOOKS=1.
@@ -2853,6 +2862,22 @@ DEFAULT_CONFIG = {
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
+    },
+
+    # Shared-checkout admission hold (gateway/checkout_admission.py). Off by
+    # default. When several long-lived processes import ONE git checkout
+    # (e.g. two gateways + a serve backend), enabling this lets an operator
+    # hold new work, verify every process acknowledged and drained, and only
+    # then fetch/merge -- without idle-poll races or forced interrupts.
+    # Operator CLI: python -m gateway.checkout_admission --help.
+    "checkout_admission": {
+        "enabled": False,
+        # Shared directory; empty = <git-common-dir>/checkout-admission of the
+        # checkout this code runs from (the same for every consumer of it).
+        "dir": "",
+        # Consumer name per process kind in THIS profile, e.g.
+        # {"gateway": "gateway:default", "serve": "serve:clanker"}.
+        "consumers": {"gateway": "", "serve": ""},
     },
 
     "cron": {
@@ -2989,6 +3014,12 @@ DEFAULT_CONFIG = {
     "kanban": {
         "workspaces_root": None,
         "workspaces_root_require_mount": False,
+        # Let the dispatcher itself clear a scratch card stranded by mount
+        # loss (persisted path gone, root mounted + writable again) when the
+        # lost tree provably held nothing: no worker ever spawned into it, or
+        # a survivor pointer records its work on a remote. Off by default;
+        # the manual verb is ``hermes kanban workspace reset --all-stranded``.
+        "workspaces_auto_unstrand": False,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
@@ -3022,6 +3053,27 @@ DEFAULT_CONFIG = {
         "banned_worker_model_substrings": None,
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
+        # Implicit pre-spawn probe per claude relay FAMILY (used when
+        # provider_health_probes has no explicit entry). claude-apr / -bpr are
+        # held while their OWN relay reports fewer than
+        # provider_health_min_eligible eligible seats; pinned claude-apx-N /
+        # -bpx-N (one sub box each) are held only when that sub ("local" for
+        # N=0, else "sub-vps-N") is listed exhausted/capped_quota by the apx->apr
+        # / bpx->bpr relay. Unreachable/malformed probe fails OPEN. A partial
+        # map overrides only the named family; "" disables that family.
+        "pool_health_urls": {
+            "claude-apr": "http://127.0.0.1:18810/health",
+            "claude-bpr": "http://127.0.0.1:18811/health",
+        },
+        # Pinned claude-apx-N / -bpx-N lanes not listed by any relay are judged
+        # on their own sub box: GET <usage-registry bridge_route_base_url>/health
+        # and hold while a usage_limits window (five_hour / seven_day) reports
+        # "rejected" and has not reset. Unreachable/unregistered fails OPEN.
+        "pool_box_health": True,
+        # Per-pool circuit: this many rate_limited run closes on ONE pool within
+        # 10 min hold that pool's spawns for 10 min (one #logs line per trip).
+        # Non-pool providers never count. 0 disables.
+        "rate_limit_trip": 5,
         # CPU scheduling priority for dispatcher-spawned worker gateways, and
         # therefore for everything they spawn (terminal-tool children inherit
         # niceness). "background" (default) runs each worker at nice 19 — and,
@@ -3030,6 +3082,11 @@ DEFAULT_CONFIG = {
         # interactive responsiveness, not a throughput cap: an otherwise idle
         # machine still gives workers the whole CPU. Set "normal" to opt out
         # and leave workers at the dispatcher's inherited priority.
+        # On macOS "background" also clamps the worker tree to utility QoS
+        # (exec-form `taskpolicy -c utility`: lower CPU class AND disk I/O
+        # tier than an Interactive gateway); "idle" uses darwin background
+        # (`taskpolicy -b`: E-cores only, heavy I/O throttle — the gateway
+        # always wins, but worker throughput drops sharply under load).
         # (2026-09-20: a worker's runaway busy-loops drove the host to load
         # 538/32 cores and starved the resident gateway's event loop into two
         # watchdog hard-exits and a 12-minute boot.)
@@ -3071,6 +3128,29 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Pause dispatcher SPAWNS (reclaims still run) while the host's
+        # 1-minute load average is over `pause_above` (default: CPU count);
+        # resume once it drops below `resume_below` (default: 0.75 × CPU
+        # count). Hysteresis so a load that hovers at the bar doesn't flap
+        # spawns every tick. Set enabled: false to disable.
+        "dispatch_load_gate": {"enabled": True, "pause_above": None, "resume_below": None},
+        # Reviewer↔implementer round cap. A "round" is one changes_requested
+        # verdict; once a card has collected this many, the next request for
+        # review does NOT re-spawn the reviewer — the card is blocked
+        # (needs_input) for the orchestrator/human to take over. 0 disables.
+        "max_review_rounds": 3,
+        # "all" (default): every request_review routes to review_assignee.
+        # "milestone_only": only cards whose title/body carry "[milestone]"
+        # or "qa:required" get a reviewer session (being a task_links parent
+        # does NOT count — fan-in QA makes every slice a parent); every
+        # other card that asks for review is completed in place with a
+        # review_skipped event (CI is the gate for slice work) — even when
+        # the worker names a reviewer profile; only reviewer=human or
+        # --force bypasses it.
+        # "none": no card gets a reviewer session (same bypasses).
+        # A present-but-unknown/empty value fails to "none" (never "all")
+        # and logs review_policy_invalid.
+        "review_policy": "all",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
@@ -3086,6 +3166,17 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Wrapper heartbeats do not prove worker progress. Warn after 15 min
+        # without agent progress (heartbeat ``progress_at``: API call, stream
+        # chunk, tool call) and reclaim after 25 min (0 disables).
+        "stall_minutes": 15,
+        "stall_reclaim_minutes": 25,
+        # For configured provider_health_probes, prefer a healthy fallback
+        # if fewer than this many pool seats can serve the selected model.
+        "provider_health_min_eligible": 1,
+        # Per-tick pool admission budget: eligible relay subs * this value.
+        # Pinned apx/bpx lanes each spend one sub's budget. 0 = unlimited.
+        "pool_spawns_per_eligible": 2,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create
@@ -3409,7 +3500,8 @@ DEFAULT_CONFIG = {
         # value; raise it alongside a larger max_concurrent_turns. 0 disables
         # the reserve. Clamped to [0, max_concurrent_turns - 1].
         "user_turn_reserve": 2,
-        "startup_resume_concurrency": 3,
+        # None = unbounded boot-resume fan-out; a positive int throttles.
+        "startup_resume_concurrency": None,
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
@@ -3875,6 +3967,14 @@ DEFAULT_CONFIG = {
         # plus pipe FDs) as the agent moves across worktrees.  Set to 0
         # to disable idle reaping and keep servers for process lifetime.
         "idle_timeout": 600.0,
+
+        # Running language servers allowed per OS user across EVERY agent
+        # process on the box (each worker otherwise runs its own pyright,
+        # 200-950 MB apiece).  Past the cap a process runs without LSP
+        # (shell linter only), logs one line, and retries on a later edit
+        # once a slot frees.  Slots are flock'd files, released by the
+        # kernel when a holder dies.  0 = unlimited.
+        "max_servers_per_host": 3,
 
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,

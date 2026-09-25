@@ -576,6 +576,101 @@ def aux_progress_hook(hook):
 _aux_timing_hook = _aux_thread_local_hook
 
 
+# ── Engine-agnostic auxiliary cost sink ─────────────────────────────────
+# Context engines (builtin ContextCompressor, LCM, third-party plugins) all
+# reach the summarizer through ``call_llm``. A caller that needs the total
+# price of everything an operation spent (Blackbox compaction attribution)
+# opens a sink around that operation; every ``call_llm`` completing inside it
+# prices its observed usage and adds it here. A ContextVar holding a mutable
+# dict: ``propagate_context_to_thread`` copies the context into worker
+# threads, and the copy references the SAME dict, so worker-side calls land
+# in the caller's sink. Unpriceable calls (no usage, unknown model price,
+# streamed responses) mark the sink unknown so a partial sum is never
+# reported as the total.
+_aux_cost_sink: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "aux_cost_sink", default=None
+)
+
+
+def new_aux_cost_sink() -> Dict[str, Any]:
+    return {"usd": 0.0, "calls": 0, "unknown": False}
+
+
+@contextlib.contextmanager
+def aux_cost_sink(sink: Optional[Dict[str, Any]]):
+    """Accumulate the priced cost of every ``call_llm`` made inside the block."""
+    if sink is None:
+        yield None
+        return
+    token = _aux_cost_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _aux_cost_sink.reset(token)
+
+
+def aux_cost_sink_total(sink: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Sink total in USD, or None when no call was seen or any was unpriced."""
+    if not isinstance(sink, dict) or not sink.get("calls") or sink.get("unknown"):
+        return None
+    return round(float(sink.get("usd") or 0.0), 12)
+
+
+def _record_aux_call_cost(response: Any, route_info: Optional[Dict[str, str]],
+                          *, streamed: bool) -> None:
+    sink = _aux_cost_sink.get()
+    if sink is None:
+        return
+    try:
+        sink["calls"] = int(sink.get("calls") or 0) + 1
+        if streamed:
+            sink["unknown"] = True
+            return
+        raw = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+        route = route_info if isinstance(route_info, dict) else {}
+        provider = route.get("provider") or ""
+        model = route.get("model") or getattr(response, "model", None) or ""
+        if raw is None or not model:
+            sink["unknown"] = True
+            return
+        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+
+        def _has(key: str) -> bool:
+            val = raw.get(key) if isinstance(raw, dict) else getattr(raw, key, None)
+            return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+        # Pick the dialect from the usage object itself: auxiliary clients hand
+        # back OpenAI-shaped usage even for Anthropic-routed providers, and
+        # normalizing ``prompt_tokens`` as Anthropic reads every bucket as 0 —
+        # a fabricated $0.00 instead of a price.
+        if _has("prompt_tokens"):
+            api_mode = "chat_completions"
+        elif _has("input_tokens"):
+            api_mode = route.get("api_mode") or "anthropic_messages"
+        else:
+            sink["unknown"] = True
+            return
+        # normalize_usage reads provider "anthropic" as the Anthropic dialect
+        # regardless of api_mode; the shape decided above wins for normalizing,
+        # the provider still selects the price table.
+        norm_provider = "" if (api_mode == "chat_completions"
+                               and provider.strip().lower() == "anthropic") else provider
+        usage = normalize_usage(raw, provider=norm_provider, api_mode=api_mode)
+        if (usage.usage_unknown or usage.input_tokens_unknown or usage.output_tokens_unknown
+                or not (usage.input_tokens or usage.output_tokens or usage.cache_read_tokens
+                        or usage.cache_write_tokens)):
+            sink["unknown"] = True
+            return
+        price = estimate_usage_cost(model, usage, provider=provider)
+        if price.amount_usd is None:
+            sink["unknown"] = True
+            return
+        sink["usd"] = float(sink.get("usd") or 0.0) + float(price.amount_usd)
+    except Exception:
+        sink["unknown"] = True
+        logger.debug("auxiliary call cost unavailable", exc_info=True)
+
+
 def _run_protected_sync_provider_call(
     callback: Callable[[dict[str, Any]], Any],
     kwargs: dict[str, Any],
@@ -10011,8 +10106,10 @@ def call_llm(
             stream_semaphore = semaphore
             semaphore = None
             outcome = "streaming"
+            _record_aux_call_cost(response, route_info, streamed=True)
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         outcome = "ok"
+        _record_aux_call_cost(response, route_info, streamed=bool(stream))
         return response
     finally:
         if latency_info is not None:

@@ -140,3 +140,50 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     assert run is not None
     stored = run.summary or run.result if hasattr(run, "result") else run.summary or ""
     assert secret not in (stored or "")
+
+
+# ---------------------------------------------------------------------------
+# Metadata whose string leaf ENDS in an ENV-style secret (t_d59ca5db): the old
+# serialize-then-redact path ate the closing quote. kanban_complete swallowed
+# the JSONDecodeError and stored the UNREDACTED dict; request_review errored.
+# ---------------------------------------------------------------------------
+
+def test_kanban_complete_metadata_env_secret_masked_and_parseable(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = json.loads(kt._handle_complete({
+        "task_id": worker_env,
+        "summary": "done",
+        "metadata": {"x": "DB_PASSWORD=abcdef12", "n": 3},
+    }))
+    assert "error" not in out, out
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+    finally:
+        conn.close()
+    meta = run.metadata
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    assert meta["n"] == 3
+    assert meta["x"].startswith("DB_PASSWORD=")
+    assert "abcdef12" not in json.dumps(meta)
+
+
+def test_kanban_request_review_metadata_env_secret_masked(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+    finally:
+        conn.close()
+    # Worker ownership: request_review refuses a live claim without it.
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    out = json.loads(kt._handle_request_review({
+        "task_id": worker_env,
+        "summary": "impl done, tests pass",
+        "metadata": {"note": "PASS=174"},
+    }))
+    assert "error" not in out, out
+    assert "174" not in json.dumps(out)

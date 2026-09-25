@@ -137,6 +137,20 @@ def _stale_code_switch_guard_enabled() -> bool:
         return _STALE_CODE_SWITCH_GUARD_DEFAULT
 
 
+def _with_resolved_route(label: str, result: Any) -> str:
+    """Append the resolved ``provider/model`` pair to a /model confirmation.
+
+    The display label alone ("Claude BPX-5") hides a mis-split such as
+    ``claude-apr`` + ``name:claude-bpx-5/x``; the literal pair makes it
+    visible in the reply on every platform.
+    """
+    provider = str(getattr(result, "target_provider", "") or "").strip()
+    model = str(getattr(result, "new_model", "") or "").strip()
+    if not provider or not model:
+        return label
+    return f"{label} · `{provider}/{model}`"
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -202,6 +216,138 @@ def _home_thread_from_source(source) -> Optional[str]:
     ):
         return None
     return str(thread_id)
+
+
+_RESIDENT_UNKNOWN_FLAGS = (
+    "input_tokens_unknown",
+    "output_tokens_unknown",
+    "cache_read_tokens_unknown",
+    "cache_write_tokens_unknown",
+    "usage_unknown",
+)
+
+
+def _resident_thin_snapshot(agent, as_int=None) -> dict:
+    """The resident ``/usage`` lane's thin snapshot, WITH its UNKNOWN flags.
+
+    The five ``session_*`` counters are plain ints: an unmeasured call adds the
+    canonical ``0`` and leaves no trace. Handing the renderer those five keys
+    alone made every UNKNOWN branch dead code on this lane, so a session whose
+    provider returned no usage payload rendered ``Total (billed in+out): 0`` —
+    an unmeasured value presented as a measurement, the exact defect class this
+    work removes (r6 finding 8).
+
+    The discriminators come from the ABSORBING SESSION-LEVEL latch
+    (``agent.session_*_unknown``, set beside the counter increments in
+    ``agent/conversation_loop.py``), NOT from ``agent.last_turn_usage``.
+    ``last_turn_usage`` is rewritten on every provider call, so it carries the
+    last CALL's provenance; stamping it onto a cumulative total was wrong in
+    both directions (r6 round-4 finding 7):
+
+    1. earlier call unmeasured, final call measured → no flag → an exact-looking
+       ``Total (billed in+out): 412,338`` that silently omits real spend, which
+       is finding 8 displaced by one call; and
+    2. final call unmeasured, 99 earlier calls measured → every row collapses to
+       ``unknown``, discarding hundreds of thousands of measured tokens.
+
+    A flag describing an aggregate has to be latched over that same aggregate.
+    """
+    if as_int is None:
+        def _coerce(v):
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+        as_int = _coerce
+
+    snap = {
+        "input_tokens": as_int(getattr(agent, "session_input_tokens", 0)),
+        "output_tokens": as_int(getattr(agent, "session_output_tokens", 0)),
+        "cache_read_tokens": as_int(getattr(agent, "session_cache_read_tokens", 0)),
+        "cache_write_tokens": as_int(getattr(agent, "session_cache_write_tokens", 0)),
+        "reasoning_tokens": as_int(getattr(agent, "session_reasoning_tokens", 0)),
+    }
+    for flag in _RESIDENT_UNKNOWN_FLAGS:
+        # `is True`, not truthiness. The latch is written as a real bool by
+        # `agent/agent_init.py` (False) and `agent/conversation_loop.py` (True),
+        # so any OTHER value means the attribute was never initialised on this
+        # object — and the dominant such object is a test double. A bare
+        # `getattr(..., False)` reads a `MagicMock`'s auto-created child
+        # attribute as TRUTHY, which collapsed every measured session counter to
+        # `unknown` on the resident lane (tests/gateway/test_usage_command.py).
+        # The five counters above are coerced through `as_int` for the same
+        # reason; this is the flags' half of that contract.
+        if getattr(agent, f"session_{flag}", False) is True:
+            snap[flag] = True
+    return snap
+
+
+def render_thin_last_turn_lines(thin_snap, fallback_label=None) -> list:
+    """Render the degraded /usage last-turn card from a thin usage snapshot.
+
+    Module-level and callable so tests drive the SHIPPED renderer directly
+    instead of AST-lifting it out of the mixin method below (a source-text
+    anchor that both breaks on benign refactors and can go green against a
+    fixture no producer emits).
+
+    ``thin_snap`` is whatever the two real producers hand over:
+    ``HermesState.get_last_turn_usage`` (persisted, agent evicted) or the
+    resident agent's session counters.
+
+    The RESIDENT producer carries the UNKNOWN discriminators, so an unmeasured
+    bucket renders ``unknown`` here rather than presenting the stored 0 as a
+    measurement. The PERSISTED producer does NOT: the sessions schema has no
+    ``last_turn_*_unknown`` columns (``hermes_state_common.py``), and
+    ``get_last_turn_usage`` returns exactly five integer keys. Adding them is a
+    schema change owned by PR #797. What this lane guarantees instead is that
+    the persisted snapshot is never an unmeasured zero in the first place:
+    ``conversation_loop._last_turn_snapshot_kwargs`` writes ``None`` for an
+    unknown call, so ``COALESCE`` retains the last REAL split rather than
+    stamping a measured-looking 0 over it. This renderer therefore only ever
+    sees measured values on the persisted lane, and the flag lookups below are
+    a no-op there by construction, not by guarantee.
+    """
+    from agent.usage_pricing import format_token_count, prompt_tokens_unknown
+
+    def _as_int(v):
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+    lt_in = _as_int(thin_snap.get("input_tokens"))
+    lt_out = _as_int(thin_snap.get("output_tokens"))
+    lt_cr = _as_int(thin_snap.get("cache_read_tokens"))
+    lt_cw = _as_int(thin_snap.get("cache_write_tokens"))
+    lt_rsn = _as_int(thin_snap.get("reasoning_tokens"))
+    in_billed = lt_in + lt_cr + lt_cw
+    out_billed = lt_out + lt_rsn  # fold reasoning into the output total
+    out_label = fallback_label or "persisted; agent not resident"
+    out_lines = [f"📊 **Last turn** ({out_label})"]
+
+    # Route only the UNKNOWN case through the shared rule; keep this card's
+    # own comma formatting for measured values via ``formatter``.
+    def _tok(value: int, *, unknown: bool) -> str:
+        return format_token_count(value, unknown=unknown, formatter=lambda v: f"{v:,}")
+
+    input_unknown = prompt_tokens_unknown(thin_snap)
+    output_unknown = bool(thin_snap.get("output_tokens_unknown") or thin_snap.get("usage_unknown"))
+    total_unknown = bool(
+        input_unknown or output_unknown or thin_snap.get("total_tokens_unknown")
+    )
+    if input_unknown:
+        out_lines.append(f"• Tokens in: {_tok(in_billed, unknown=True)}")
+    elif in_billed:
+        out_lines.append(
+            f"• Tokens in: {in_billed:,} billed "
+            f"({lt_cr:,} cache-read + {lt_cw:,} cache-write + {lt_in:,} uncached)"
+        )
+    if out_billed or output_unknown:
+        out_lines.append(f"• Tokens out: {_tok(out_billed, unknown=output_unknown)} billed")
+    out_lines.append(
+        f"• Total (billed in+out): "
+        f"{_tok(in_billed + out_billed, unknown=total_unknown)}"
+    )
+    return out_lines
 
 
 class GatewaySlashCommandsMixin:
@@ -444,9 +590,16 @@ class GatewaySlashCommandsMixin:
         )
 
         if preserve_route_preferences:
-            self._rehydrate_manual_reset_route_preferences(session_key, new_entry)
+            # Off the loop: re-resolves the persisted route's credentials
+            # (config load + provider resolution; OAuth refresh can hit the
+            # network).
+            await asyncio.to_thread(
+                self._rehydrate_manual_reset_route_preferences, session_key, new_entry
+            )
         else:
-            self._set_session_model_override(session_key, None)
+            # Off the loop, same as the `/model reset` door: the setter does a
+            # synchronous session-store write.
+            await asyncio.to_thread(self._set_session_model_override, session_key, None)
             self._set_session_reasoning_override(session_key, None)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
@@ -540,7 +693,9 @@ class GatewaySlashCommandsMixin:
         preserved_preferences = []
         unavailable_model_preference = False
         if preserve_route_preferences and new_entry:
-            route_lookup = self._persisted_session_route_identity(session_key)
+            route_lookup = await asyncio.to_thread(
+                self._persisted_session_route_identity, session_key
+            )
             invalid_model_preference = route_lookup.state == "unavailable"
             if (
                 route_lookup.identity
@@ -751,8 +906,36 @@ class GatewaySlashCommandsMixin:
 
         is_create = action == "create"
 
+        # The invoking chat session, passed EXPLICITLY: create stamps it as the
+        # card's home and the home-session guard compares against it. Never
+        # read from env here -- os.environ is shared by every session.
+        # Read-only lookup through the ONE awaited store boundary (never a
+        # sync store call on the event loop, never get_or_create).
+        invoking_session_id = None
         try:
-            output = await asyncio.to_thread(run_slash, text)
+            _entry = await self.async_session_store.entry_for(
+                self._session_key_for_source(event.source)
+            )
+            invoking_session_id = getattr(_entry, "session_id", None) or None
+        except Exception as exc:
+            logger.warning(
+                "/kanban: could not resolve invoking session (%s); "
+                "running sessionless -- home-session guard skipped, create "
+                "leaves the card unstamped",
+                exc,
+            )
+            invoking_session_id = None
+
+        if action == "dashboard":
+            from gateway.kanban_dashboard_link import dashboard_link
+
+            link = dashboard_link(invoking_session_id)
+            return link or "Dashboard link unavailable: configure dashboard.public_url."
+
+        try:
+            output = await asyncio.to_thread(
+                run_slash, text, session_id=invoking_session_id
+            )
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
@@ -2590,7 +2773,10 @@ class GatewaySlashCommandsMixin:
                             f"(route {_cur_provider} -> {result.target_provider}). "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._set_session_model_override(_session_key, {
+                        # Off the loop: the persistability check re-resolves
+                        # credentials (config load + provider resolution, which
+                        # can refresh an OAuth token over the network).
+                        await asyncio.to_thread(_self._set_session_model_override, _session_key, {
                             "model": result.new_model,
                             "provider": result.target_provider,
                             "api_key": result.api_key,
@@ -2699,7 +2885,7 @@ class GatewaySlashCommandsMixin:
                         _fast_row = self._fast_unavailable_model_switch_row(result)
                         if _fast_row:
                             lines.append(_fast_row)
-                        lines.append(t("gateway.model.provider_label", provider=plabel))
+                        lines.append(t("gateway.model.provider_label", provider=_with_resolved_route(plabel, result)))
                         try:
                             # Read the ACTUAL post-switch effort off the agent
                             # (#467 rule 3) rather than re-resolving for the OLD
@@ -2789,7 +2975,9 @@ class GatewaySlashCommandsMixin:
                         return None  # Picker sent — adapter handles the response
 
             # Fallback: text list (for platforms without picker or if picker failed)
-            provider_label = get_label(current_provider)
+            # get_label can fall through to a synchronous models.dev fetch
+            # (requests.get) on a cold cache -- keep it off the loop.
+            provider_label = await asyncio.to_thread(get_label, current_provider)
             lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
 
             try:
@@ -3002,7 +3190,12 @@ class GatewaySlashCommandsMixin:
 
             # Store session override so next agent creation uses the new model
             # (single door — also persists the config-backed identity, RC-2/P3b).
-            self._set_session_model_override(session_key, {
+            # Off the loop: the persistability check re-resolves credentials
+            # (config load + provider resolution, which can refresh an OAuth
+            # token over the network). On-loop, this chain held Discord for
+            # 10 s on 2026-09-24 (PHASE=event_loop_blocked at
+            # open_credentialed_url) and expired /model interactions.
+            await asyncio.to_thread(self._set_session_model_override, session_key, {
                 "model": result.new_model,
                 "provider": result.target_provider,
                 "api_key": result.api_key,
@@ -3122,7 +3315,7 @@ class GatewaySlashCommandsMixin:
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
             lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
-            lines.append(t("gateway.model.provider_label", provider=provider_label))
+            lines.append(t("gateway.model.provider_label", provider=_with_resolved_route(provider_label, result)))
             _fast_row = self._fast_unavailable_model_switch_row(result)
             if _fast_row:
                 lines.append(_fast_row)
@@ -5069,7 +5262,9 @@ class GatewaySlashCommandsMixin:
 
         user_config = _load_gateway_config()
         session_key = self._session_key_for_source(event.source)
-        persisted_lookup = self._persisted_session_route_identity(session_key)
+        persisted_lookup = await asyncio.to_thread(
+            self._persisted_session_route_identity, session_key
+        )
         if persisted_lookup.state == "unavailable":
             return t("gateway.fast.preference_unavailable", route="<unreadable>")
         model, provider, api_mode = self._resolve_configured_session_route_identity(
@@ -5874,17 +6069,25 @@ class GatewaySlashCommandsMixin:
                 ),
                 default=False,
             )
-            tmp_agent = AIAgent(
-                **runtime_kwargs,
-                model=model,
-                max_iterations=4,
-                quiet_mode=True,
-                skip_memory=not _checkpoint_required,
-                enabled_toolsets=["memory"],
-                session_id=session_entry.session_id,
-                session_db=getattr(self._session_db, "_db", self._session_db),
-            )
-            _seed_hygiene_system_prompt(tmp_agent, session_row)
+            # OFF the event loop (2026-09-24): AIAgent.__init__ loads the
+            # context engine under the process-global _LOAD_LOCK (20-60 s while
+            # worker turns hold it) — a PHASE=event_loop_blocked site that
+            # stalled Discord heartbeats past the ~41 s ACK window.
+            def _build_tmp_agent():
+                _a = AIAgent(
+                    **runtime_kwargs,
+                    model=model,
+                    max_iterations=4,
+                    quiet_mode=True,
+                    skip_memory=not _checkpoint_required,
+                    enabled_toolsets=["memory"],
+                    session_id=session_entry.session_id,
+                    session_db=getattr(self._session_db, "_db", self._session_db),
+                )
+                _seed_hygiene_system_prompt(_a, session_row)
+                return _a
+
+            tmp_agent = await asyncio.to_thread(_build_tmp_agent)
             # Keep the real source platform during construction so external
             # context engines bind correctly. If compression has to rebuild the
             # prompt, stamp that provider-less fallback as stale for the next
@@ -7747,7 +7950,8 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.merge.fold_failed", error=exc)
 
         # --- Layer 2: durable .md record (self-purging). ---
-        record_path = self._write_merge_record(
+        record_path = await asyncio.to_thread(
+            self._write_merge_record,
             source_title, source_session_id, target_title, target_id,
             summary, source.platform.value if source.platform else "gateway",
         )
@@ -8082,30 +8286,7 @@ class GatewaySlashCommandsMixin:
         if not thin_snap:
             return []
         logger.warning("usage last-turn card: degraded to thin get_last_turn_usage snapshot")
-
-        def _as_int(v):
-            try:
-                return int(v or 0)
-            except (TypeError, ValueError):
-                return 0
-        lt_in = _as_int(thin_snap.get("input_tokens"))
-        lt_out = _as_int(thin_snap.get("output_tokens"))
-        lt_cr = _as_int(thin_snap.get("cache_read_tokens"))
-        lt_cw = _as_int(thin_snap.get("cache_write_tokens"))
-        lt_rsn = _as_int(thin_snap.get("reasoning_tokens"))
-        in_billed = lt_in + lt_cr + lt_cw
-        out_billed = lt_out + lt_rsn  # fold reasoning into the output total
-        out_label = fallback_label or "persisted; agent not resident"
-        out_lines = [f"📊 **Last turn** ({out_label})"]
-        if in_billed:
-            out_lines.append(
-                f"• Tokens in: {in_billed:,} billed "
-                f"({lt_cr:,} cache-read + {lt_cw:,} cache-write + {lt_in:,} uncached)"
-            )
-        if out_billed:
-            out_lines.append(f"• Tokens out: {out_billed:,} billed")
-        out_lines.append(f"• Total (billed in+out): {in_billed + out_billed:,}")
-        return out_lines
+        return render_thin_last_turn_lines(thin_snap, fallback_label)
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
@@ -8257,13 +8438,7 @@ class GatewaySlashCommandsMixin:
                     return int(v or 0)
                 except (TypeError, ValueError):
                     return 0
-            agent_thin = {
-                "input_tokens": _as_int(getattr(agent, "session_input_tokens", 0)),
-                "output_tokens": _as_int(getattr(agent, "session_output_tokens", 0)),
-                "cache_read_tokens": _as_int(getattr(agent, "session_cache_read_tokens", 0)),
-                "cache_write_tokens": _as_int(getattr(agent, "session_cache_write_tokens", 0)),
-                "reasoning_tokens": _as_int(getattr(agent, "session_reasoning_tokens", 0)),
-            }
+            agent_thin = _resident_thin_snapshot(agent, _as_int)
             ctx = agent.context_compressor
             _comp_count = _as_int(getattr(ctx, "compression_count", 0))
 
@@ -8514,6 +8689,12 @@ class GatewaySlashCommandsMixin:
             from agent.skill_commands import reload_skills
 
             result = await loop.run_in_executor(None, reload_skills)
+            try:
+                from gateway.run import _invalidate_skill_slug_index
+
+                _invalidate_skill_slug_index()
+            except Exception:
+                logger.debug("skill slug index invalidation failed", exc_info=True)
             added = result.get("added", [])      # [{"name", "description"}, ...]
             removed = result.get("removed", [])  # [{"name", "description"}, ...]
             total = result.get("total", 0)

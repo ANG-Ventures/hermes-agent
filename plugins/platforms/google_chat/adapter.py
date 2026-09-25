@@ -1407,9 +1407,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
             # default log configurations never surface it. Operators must
             # enable DEBUG logging AND set this env var to see the dump.
             try:
-                from agent.redact import redact_sensitive_text
+                from agent.redact import redact_sensitive_json
 
-                dump = redact_sensitive_text(json.dumps(envelope))
+                dump = json.dumps(redact_sensitive_json(envelope))
             except Exception:
                 dump = "<redact filter unavailable>"
             logger.debug("[GoogleChat] RAW envelope (redacted): %s", dump[:2000])

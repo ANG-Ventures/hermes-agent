@@ -277,6 +277,13 @@ export interface SessionUsageResponse {
   avg_latency_s?: number
   avg_tps?: number
   cache_hit_pct?: number
+  /**
+   * UNKNOWN != 0. Set when at least one call in the session declared a token
+   * term unmeasured, so the cumulative ratio would be fabricated. The server
+   * then omits `cache_hit_pct` entirely; render the shared unknown label, not
+   * a percentage.
+   */
+  cache_hit_unknown?: boolean
   cache_read?: number
   cache_write?: number
   calls?: number

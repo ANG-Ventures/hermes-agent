@@ -210,13 +210,13 @@ def test_mined_pr_corroborated_by_the_cards_own_metadata_is_accepted(board, remo
 # --- t_169d6e46: a swallowed git failure must be diagnosable ----------------
 
 def test_git_failure_logs_returncode_and_stderr_without_persisting_them(tmp_path, caplog):
-    """`survivor_unavailable: git inspection failed` discards WHY it failed.
+    """The hold names the Git operation and exit code without persisting stderr.
 
-    That message is identical for a real capture defect and for a purely
+    The old message was identical for a real capture defect and for a purely
     environmental fault (t_169d6e46: a concurrent pytest session deleting this
     repo's tmp_path, so git exits 128 `cannot change to '<path>'`). Telling them
     apart cost a full attribution pass per occurrence. The returncode and stderr
-    must reach the LOG; the raised message must stay constant and credential-free,
+    must reach the LOG; the raised message must stay credential-free,
     because it is persisted to held_reason, the event log and stderr.
     """
     import hermes_cli.kanban_survivor as survivor
@@ -226,8 +226,8 @@ def test_git_failure_logs_returncode_and_stderr_without_persisting_them(tmp_path
         with pytest.raises(survivor.SurvivorUnavailable) as excinfo:
             survivor._git(missing, "status", "--porcelain")
 
-    # The persisted surface is unchanged — 5 open PRs key on this string.
-    assert str(excinfo.value) == "survivor_unavailable: git inspection failed"
+    assert str(excinfo.value) == "survivor_unavailable: git status failed (rc=128)"
+    assert "No such file or directory" not in str(excinfo.value)
     # ...and the diagnostic that distinguishes environment from defect is logged.
     assert "rc=128" in caplog.text
     assert "status" in caplog.text
@@ -250,9 +250,11 @@ def test_git_failure_log_redacts_credentials_from_stderr(tmp_path, caplog, monke
         lambda *a, **k: sp.CompletedProcess(a[0], 128, b"", leaky.encode()),
     )
     with caplog.at_level("WARNING"):
-        with pytest.raises(survivor.SurvivorUnavailable):
+        with pytest.raises(survivor.SurvivorUnavailable) as excinfo:
             survivor._git(tmp_path, "fetch")
 
     assert SECRET not in caplog.text
+    assert SECRET not in str(excinfo.value)
+    assert str(excinfo.value) == "survivor_unavailable: git fetch failed (rc=128)"
     assert SECRET not in str(caplog.records[-1].getMessage())
     assert "rc=128" in caplog.text        # still diagnosable

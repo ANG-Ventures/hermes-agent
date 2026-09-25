@@ -53,28 +53,22 @@ def test_recent_channels_respects_lookback(tmp_path, monkeypatch):
 
 
 def test_debounced_persist_and_flush(tmp_path, monkeypatch):
-    """Debounce: rapid marks within the interval don't all hit disk, but flush
-    always writes."""
+    """Coalesced background persist: a burst of marks lands on disk once, off
+    the calling thread, and flush always writes synchronously."""
     cls = _load_state_class(tmp_path, monkeypatch)
     s = cls(persist_interval_s=10.0)
-    # First mark at t=0 persists (last_persist_at starts at 0, but 0-0 < 10 so
-    # it does NOT persist on the very first). Force via flush and re-read.
-    s.mark_channel_active("c1", now=1.0)   # 1 - 0 < 10 -> debounced, no disk
-    s2 = cls()
-    # Nothing durable yet (debounced) — fresh load sees empty.
-    assert s2.recent_channels(lookback_s=10_000, now=1.0) == []
+    s.mark_channel_active("c1", now=1.0)   # leading edge: written in background
+    assert s._writer.wait_idle()
+    assert "c1" in set(cls().recent_channels(lookback_s=10_000, now=1.0))
 
-    # A mark past the interval DOES persist.
-    s.mark_channel_active("c2", now=20.0)  # 20 - 0 >= 10 -> persists
-    s3 = cls()
-    got = set(s3.recent_channels(lookback_s=10_000, now=20.0))
-    assert "c2" in got  # c1 rode along in the same in-memory map that got written
+    # Inside the interval: in memory now, NOT on disk yet (trailing edge).
+    s.mark_channel_active("c2", now=2.0)
+    assert "c2" in s.recent_channels(lookback_s=10_000, now=2.0)
+    assert "c2" not in set(cls().recent_channels(lookback_s=10_000, now=2.0))
 
-    # flush always writes regardless of debounce.
-    s.mark_channel_active("c3", now=21.0)  # 21 - 20 < 10 -> debounced
+    # flush always writes regardless of the coalescing window.
     s.flush()
-    s4 = cls()
-    assert "c3" in set(s4.recent_channels(lookback_s=10_000, now=21.0))
+    assert "c2" in set(cls().recent_channels(lookback_s=10_000, now=2.0))
 
 
 def test_recovery_state_no_content(tmp_path, monkeypatch):

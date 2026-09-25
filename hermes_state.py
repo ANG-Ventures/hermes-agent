@@ -4072,6 +4072,19 @@ class RewindWouldOrphanError(ValueError):
 
 
 
+class TranscriptInvariantError(ValueError):
+    """A transcript rewrite would leave two ACTIVE result rows for one tool call.
+
+    Raised inside the write transaction (so it rolls back) by
+    :meth:`SessionDB.archive_and_compact`: the live set it publishes must hold
+    at most one ``role='tool'`` row per ``(session_id, tool_call_id)``, or the
+    next resume replays the same tool exchange twice. Keys that were ALREADY
+    duplicated in the pre-compaction live set (legacy rows, providers that
+    reuse index-style ids such as ``terminal:0``) are tolerated — the
+    invariant is that a compaction never INTRODUCES a duplicate.
+    """
+
+
 class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
@@ -9148,6 +9161,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
                 (system_prompt_hash, session_id),
             )
+            if system_prompt is None:
+                logger.warning(
+                    "Explicit system_prompt=NULL write for session %s via "
+                    "update_system_prompt", session_id, stack_info=True,
+                )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
@@ -9232,9 +9250,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
         (only filling in NULL), this unconditionally sets the model column
         so that the dashboard reflects the user's latest /model choice.
-        Also nulls ``system_prompt`` so stale ``Model:`` / ``Provider:``
-        footer metadata is rebuilt on the next turn. A successful /model
-        switch explicitly replaces any confirmed Browser runtime lock while
+        Retains the prior prompt until the next turn replaces it: the restore
+        path checks its runtime identity and rebuilds on a real change. A
+        successful /model switch replaces any confirmed Browser runtime lock while
         preserving unrelated lineage markers in ``model_config``.
 
         When *provider* is given, it is merged into ``model_config``
@@ -9267,12 +9285,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return
             conn.execute(
                 "UPDATE sessions SET "
-                "model = ?, model_config = ?, "
-                "system_prompt = NULL, system_prompt_hash = NULL "
+                "model = ?, model_config = ? "
                 "WHERE id = ?",
                 (model, merged, session_id),
             )
-            self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
     def _merge_model_config_json(
@@ -9379,8 +9395,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Persist a Browser / API client runtime lock without clobbering lineage markers.
 
         Merges ``browser_model_lock`` into the existing ``model_config`` JSON so
-        ``_branched_from`` / ``_delegate_from`` survive. Nulls ``system_prompt``
-        so cached ``Model:`` / ``Provider:`` footers cannot lie after a switch.
+        ``_branched_from`` / ``_delegate_from`` survive. The prior prompt is
+        retained until restore checks the runtime identity and replaces it.
         """
         lock = {
             "provider": provider or "",
@@ -9400,13 +9416,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """UPDATE sessions SET
                    model_config = ?,
-                   model = COALESCE(?, model),
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
+                   model = COALESCE(?, model)
                    WHERE id = ?""",
                 (merged, model, session_id),
             )
-            self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
     def set_session_yolo(self, session_id: str, enabled: bool) -> None:
@@ -9521,9 +9534,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (only filling in NULL), this unconditionally sets the billing fields so
         that the dashboard reflects the user's latest /model switch.
 
-        Also nulls ``system_prompt`` so the cached snapshot (which embeds a
-        stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
-        behavior of ``update_session_model`` (see #48173, #48248).
+        Retains the cached snapshot until restore compares its runtime identity;
+        a billing-only route update does not change the prompt bytes.
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
@@ -9533,13 +9545,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """UPDATE sessions SET
                    billing_provider = ?,
                    billing_base_url = ?,
-                   billing_mode = COALESCE(?, billing_mode),
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
+                   billing_mode = COALESCE(?, billing_mode)
                    WHERE id = ?""",
                 (provider, base_url, billing_mode, session_id),
             )
-            self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
     # ── Async token accounting ──
@@ -9564,6 +9573,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "cache_write_tokens", "reasoning_tokens", "api_call_count",
     )
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
+    # UNKNOWN != 0 discriminators (agent/usage_pricing.USAGE_UNKNOWN_FIELDS).
+    # Classified as ROUTE fields, i.e. they take part in the merge KEY: two
+    # adjacent deltas merge only when their unknown state is identical, and
+    # then the merged value equals each one so the resulting
+    # ``flag = MAX(flag, ?)`` write is byte-identical to applying them in
+    # sequence. Deltas that DISAGREE simply don't merge and are applied one by
+    # one, where the store's MAX() latches the flag (ABSORBING).
+    #
+    # Deliberately NOT a sum (a bool is not additive) and NOT a snapshot
+    # last-non-None-wins field: last-wins would CLEAR a latched unknown as soon
+    # as a measured call followed an unmeasured one, which is precisely the bug
+    # cumulative provenance exists to prevent.
+    _TOKEN_DELTA_FLAG_FIELDS = (
+        "input_tokens_unknown", "output_tokens_unknown",
+        "cache_read_tokens_unknown", "cache_write_tokens_unknown",
+        "usage_unknown",
+    )
     # Snapshot fields: NOT summed. These are "the last turn's usage", written
     # with COALESCE(?, existing) — last non-None wins. Upstream added them
     # (2026-08) after the fork's coalescer shipped; because they were in no
@@ -9574,11 +9600,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "last_turn_input_tokens", "last_turn_output_tokens",
         "last_turn_cache_read_tokens", "last_turn_cache_write_tokens",
         "last_turn_reasoning_tokens",
+        # Snapshot DISCRIMINATORS ride the same last-non-None-wins rule as the
+        # counters they qualify — the last turn's unknown state, not the
+        # session's absorbing one.
+        "last_turn_input_tokens_unknown", "last_turn_output_tokens_unknown",
+        "last_turn_cache_read_tokens_unknown",
+        "last_turn_cache_write_tokens_unknown", "last_turn_usage_unknown",
     )
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode",
-    )
+    ) + _TOKEN_DELTA_FLAG_FIELDS
 
     def queue_token_counts(self, session_id: str, **kwargs) -> None:
         """Enqueue a token/cost delta for the background writer.
@@ -9860,6 +9892,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         last_turn_cache_read_tokens: Optional[int] = None,
         last_turn_cache_write_tokens: Optional[int] = None,
         last_turn_reasoning_tokens: Optional[int] = None,
+        input_tokens_unknown: bool = False,
+        output_tokens_unknown: bool = False,
+        cache_read_tokens_unknown: bool = False,
+        cache_write_tokens_unknown: bool = False,
+        usage_unknown: bool = False,
+        last_turn_input_tokens_unknown: Optional[bool] = None,
+        last_turn_output_tokens_unknown: Optional[bool] = None,
+        last_turn_cache_read_tokens_unknown: Optional[bool] = None,
+        last_turn_cache_write_tokens_unknown: Optional[bool] = None,
+        last_turn_usage_unknown: Optional[bool] = None,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -9882,6 +9924,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    cache_read_tokens = ?,
                    cache_write_tokens = ?,
                    reasoning_tokens = ?,
+                   input_tokens_unknown = MAX(COALESCE(input_tokens_unknown, 0), ?),
+                   output_tokens_unknown = MAX(COALESCE(output_tokens_unknown, 0), ?),
+                   cache_read_tokens_unknown = MAX(COALESCE(cache_read_tokens_unknown, 0), ?),
+                   cache_write_tokens_unknown = MAX(COALESCE(cache_write_tokens_unknown, 0), ?),
+                   usage_unknown = MAX(COALESCE(usage_unknown, 0), ?),
+                   last_turn_input_tokens_unknown = COALESCE(?, last_turn_input_tokens_unknown),
+                   last_turn_output_tokens_unknown = COALESCE(?, last_turn_output_tokens_unknown),
+                   last_turn_cache_read_tokens_unknown = COALESCE(?, last_turn_cache_read_tokens_unknown),
+                   last_turn_cache_write_tokens_unknown = COALESCE(?, last_turn_cache_write_tokens_unknown),
+                   last_turn_usage_unknown = COALESCE(?, last_turn_usage_unknown),
                    last_turn_input_tokens = COALESCE(?, last_turn_input_tokens),
                    last_turn_output_tokens = COALESCE(?, last_turn_output_tokens),
                    last_turn_cache_read_tokens = COALESCE(?, last_turn_cache_read_tokens),
@@ -9892,7 +9944,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        WHEN ? IS NULL THEN actual_cost_usd
                        ELSE ?
                    END,
-                   cost_status = COALESCE(?, cost_status),
+                   cost_status = CASE
+                       WHEN ? IS NULL THEN cost_status
+                       WHEN ? IN ('unknown', 'partial') THEN (
+                           CASE WHEN COALESCE(?, 0) > 0
+                                     OR CASE WHEN ? IS NULL
+                                             THEN COALESCE(actual_cost_usd, 0)
+                                             ELSE ? END > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
+                       ELSE ?
+                   END,
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
                    billing_provider = COALESCE(billing_provider, ?),
@@ -9908,6 +9970,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    cache_read_tokens = cache_read_tokens + ?,
                    cache_write_tokens = cache_write_tokens + ?,
                    reasoning_tokens = reasoning_tokens + ?,
+                   input_tokens_unknown = MAX(COALESCE(input_tokens_unknown, 0), ?),
+                   output_tokens_unknown = MAX(COALESCE(output_tokens_unknown, 0), ?),
+                   cache_read_tokens_unknown = MAX(COALESCE(cache_read_tokens_unknown, 0), ?),
+                   cache_write_tokens_unknown = MAX(COALESCE(cache_write_tokens_unknown, 0), ?),
+                   usage_unknown = MAX(COALESCE(usage_unknown, 0), ?),
+                   last_turn_input_tokens_unknown = COALESCE(?, last_turn_input_tokens_unknown),
+                   last_turn_output_tokens_unknown = COALESCE(?, last_turn_output_tokens_unknown),
+                   last_turn_cache_read_tokens_unknown = COALESCE(?, last_turn_cache_read_tokens_unknown),
+                   last_turn_cache_write_tokens_unknown = COALESCE(?, last_turn_cache_write_tokens_unknown),
+                   last_turn_usage_unknown = COALESCE(?, last_turn_usage_unknown),
                    last_turn_input_tokens = COALESCE(?, last_turn_input_tokens),
                    last_turn_output_tokens = COALESCE(?, last_turn_output_tokens),
                    last_turn_cache_read_tokens = COALESCE(?, last_turn_cache_read_tokens),
@@ -9918,7 +9990,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        WHEN ? IS NULL THEN actual_cost_usd
                        ELSE COALESCE(actual_cost_usd, 0) + ?
                    END,
-                   cost_status = COALESCE(?, cost_status),
+                   cost_status = CASE
+                       WHEN ? IS NULL THEN cost_status
+                       WHEN ? IN ('unknown', 'partial') THEN (
+                           CASE WHEN COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0) > 0
+                                     OR CASE WHEN ? IS NULL
+                                             THEN COALESCE(actual_cost_usd, 0)
+                                             ELSE COALESCE(actual_cost_usd, 0) + ? END > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
+                       ELSE ?
+                   END,
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
                    billing_provider = COALESCE(billing_provider, ?),
@@ -9932,17 +10014,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             or cache_write_tokens or reasoning_tokens or api_call_count
             or estimated_cost_usd or actual_cost_usd
         )
+        def _flag(value) -> Optional[int]:
+            """Bool → the 0/1 the INTEGER columns store; None stays None."""
+            return None if value is None else (1 if value else 0)
+
         params = (
             input_tokens,
             output_tokens,
             cache_read_tokens,
             cache_write_tokens,
             reasoning_tokens,
+            _flag(bool(input_tokens_unknown)),
+            _flag(bool(output_tokens_unknown)),
+            _flag(bool(cache_read_tokens_unknown)),
+            _flag(bool(cache_write_tokens_unknown)),
+            _flag(bool(usage_unknown)),
+            _flag(last_turn_input_tokens_unknown),
+            _flag(last_turn_output_tokens_unknown),
+            _flag(last_turn_cache_read_tokens_unknown),
+            _flag(last_turn_cache_write_tokens_unknown),
+            _flag(last_turn_usage_unknown),
             last_turn_input_tokens,
             last_turn_output_tokens,
             last_turn_cache_read_tokens,
             last_turn_cache_write_tokens,
             last_turn_reasoning_tokens,
+            estimated_cost_usd,
+            actual_cost_usd,
+            actual_cost_usd,
+            # cost_status CASE: (is it NULL?), (is it incomplete?), the
+            # estimated dollars this write contributes, (is actual NULL?), the
+            # actual dollars this write contributes, and the value to store
+            # otherwise.
+            #
+            # Both incomplete labels are judged, and both are judged against the
+            # POST-update estimated AND actual (r6 round-4 finding 10). The old
+            # shape asked only `= 'unknown'` against incoming estimated + OLD
+            # actual, so: a NULL-keep write relabelled a row holding retained
+            # catalog spend as 'unknown' (stranding it — 'unknown' is outside
+            # the reprice allowlist); a first actual of $5 arriving with
+            # 'unknown' stayed 'unknown' because this statement's own actual was
+            # invisible to the test; and an incoming 'partial' fell to the ELSE
+            # arm and was stored verbatim even after a $0 replace left the row
+            # with no dollars to be partial about. Same rule the model-usage
+            # upsert below already applies.
+            cost_status,
+            cost_status,
             estimated_cost_usd,
             actual_cost_usd,
             actual_cost_usd,
@@ -10022,6 +10139,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     cost_status=cost_status,
                     cost_source=cost_source,
                     api_call_count=api_call_count,
+                    input_tokens_unknown=bool(input_tokens_unknown),
+                    output_tokens_unknown=bool(output_tokens_unknown),
+                    cache_read_tokens_unknown=bool(cache_read_tokens_unknown),
+                    cache_write_tokens_unknown=bool(cache_write_tokens_unknown),
+                    usage_unknown=bool(usage_unknown),
                 )
         self._execute_write(_do)
 
@@ -10037,13 +10159,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = conn.execute(
                 """SELECT last_turn_input_tokens, last_turn_output_tokens,
                           last_turn_cache_read_tokens, last_turn_cache_write_tokens,
-                          last_turn_reasoning_tokens
+                          last_turn_reasoning_tokens,
+                          last_turn_input_tokens_unknown,
+                          last_turn_output_tokens_unknown,
+                          last_turn_cache_read_tokens_unknown,
+                          last_turn_cache_write_tokens_unknown,
+                          last_turn_usage_unknown
                    FROM sessions WHERE id = ?""",
                 (session_id,),
             ).fetchone()
             if row is None:
                 return None
-            vals = tuple(row)
+            vals = tuple(row)[:5]
+            flags = tuple(row)[5:]
             # No turn recorded yet (all snapshot columns still NULL).
             if all(v is None for v in vals):
                 return None
@@ -10051,7 +10179,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "input_tokens", "output_tokens", "cache_read_tokens",
                 "cache_write_tokens", "reasoning_tokens",
             )
-            return {k: (v or 0) for k, v in zip(keys, vals)}
+            snapshot = {k: (v or 0) for k, v in zip(keys, vals)}
+            # UNKNOWN != 0: carry the discriminators back out so a consumer
+            # reading a persisted snapshot (post idle-sweep eviction) sees the
+            # same unmeasured state the live agent had.
+            #
+            # Added ONLY when something is actually unknown. Absent already
+            # means "measured" everywhere in this contract (every reader goes
+            # through ``_usage_get(usage, key, False)``), so a fully-measured
+            # turn — and every legacy row, whose flag columns are NULL — keeps
+            # returning the exact 5-key dict it always has.
+            flag_keys = (
+                "input_tokens_unknown", "output_tokens_unknown",
+                "cache_read_tokens_unknown", "cache_write_tokens_unknown",
+                "usage_unknown",
+            )
+            if any(flags):
+                snapshot.update({k: bool(v) for k, v in zip(flag_keys, flags)})
+            return snapshot
         with self._lock:
             return _do(self._conn)
 
@@ -10075,6 +10220,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cost_source: Optional[str],
         api_call_count: int,
         task: str = "",
+        input_tokens_unknown: bool = False,
+        output_tokens_unknown: bool = False,
+        cache_read_tokens_unknown: bool = False,
+        cache_write_tokens_unknown: bool = False,
+        usage_unknown: bool = False,
     ) -> None:
         """Accumulate a per-API-call usage delta into session_model_usage.
 
@@ -10119,9 +10269,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    session_id, model, billing_provider, billing_base_url, billing_mode,
                    task, api_call_count, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   input_tokens_unknown, output_tokens_unknown,
+                   cache_read_tokens_unknown, cache_write_tokens_unknown,
+                   usage_unknown,
                    estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
                    first_seen, last_seen
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
                DO UPDATE SET
                    api_call_count = api_call_count + excluded.api_call_count,
@@ -10130,9 +10283,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
                    cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
                    reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                   input_tokens_unknown = MAX(input_tokens_unknown, excluded.input_tokens_unknown),
+                   output_tokens_unknown = MAX(output_tokens_unknown, excluded.output_tokens_unknown),
+                   cache_read_tokens_unknown = MAX(cache_read_tokens_unknown, excluded.cache_read_tokens_unknown),
+                   cache_write_tokens_unknown = MAX(cache_write_tokens_unknown, excluded.cache_write_tokens_unknown),
+                   usage_unknown = MAX(usage_unknown, excluded.usage_unknown),
                    estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
                    actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
-                   cost_status = COALESCE(excluded.cost_status, cost_status),
+                   -- Same rule as the sessions row, but judged against THIS
+                   -- (model, provider, mode, task) row's own dollars. The
+                   -- incoming status is derived session-wide, so a wholly
+                   -- unpriced model must not inherit another model's spend and
+                   -- render "partial" on the Spend-by-model breakdown
+                   -- (r6 finding 1); conversely a row that does hold priced
+                   -- dollars must not be relabelled 'unknown' and stranded
+                   -- outside the reprice allowlist.
+                   cost_status = CASE
+                       WHEN excluded.cost_status IS NULL THEN cost_status
+                       WHEN excluded.cost_status IN ('unknown', 'partial') THEN (
+                           CASE WHEN estimated_cost_usd + excluded.estimated_cost_usd > 0
+                                     OR actual_cost_usd + excluded.actual_cost_usd > 0
+                                THEN 'partial' ELSE 'unknown' END
+                       )
+                       ELSE excluded.cost_status
+                   END,
                    cost_source = COALESCE(excluded.cost_source, cost_source),
                    last_seen = excluded.last_seen""",
             (
@@ -10148,9 +10322,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 cache_read_tokens or 0,
                 cache_write_tokens or 0,
                 reasoning_tokens or 0,
+                # Absorbing per bucket: MAX over the accumulated flag and this
+                # delta's, so one unmeasured call latches the bucket. UNKNOWN
+                # != 0 — the int columns above keep summing regardless.
+                1 if input_tokens_unknown else 0,
+                1 if output_tokens_unknown else 0,
+                1 if cache_read_tokens_unknown else 0,
+                1 if cache_write_tokens_unknown else 0,
+                1 if usage_unknown else 0,
                 float(estimated_cost_usd or 0.0),
                 float(actual_cost_usd or 0.0),
-                cost_status,
+                # A row's FIRST write cannot be "partial": there is no prior
+                # spend on this (model, provider, mode, task) to be partial
+                # about. The incoming status is session-scoped, so scope it to
+                # this row's own dollars (r6 finding 1).
+                (
+                    (
+                        "partial"
+                        if (float(estimated_cost_usd or 0.0) > 0
+                            or float(actual_cost_usd or 0.0) > 0)
+                        else "unknown"
+                    )
+                    if cost_status in ("unknown", "partial")
+                    else cost_status
+                ),
                 cost_source,
                 now,
                 now,
@@ -10183,6 +10378,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
         api_call_count: int = 1,
+        input_tokens_unknown: bool = False,
+        output_tokens_unknown: bool = False,
+        cache_read_tokens_unknown: bool = False,
+        cache_write_tokens_unknown: bool = False,
+        usage_unknown: bool = False,
     ) -> None:
         """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
 
@@ -10231,6 +10431,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     1 if api_call_count is None else int(api_call_count)
                 ),
                 task=task,
+                input_tokens_unknown=bool(input_tokens_unknown),
+                output_tokens_unknown=bool(output_tokens_unknown),
+                cache_read_tokens_unknown=bool(cache_read_tokens_unknown),
+                cache_write_tokens_unknown=bool(cache_write_tokens_unknown),
+                usage_unknown=bool(usage_unknown),
             )
         self._execute_write(_do)
 
@@ -13386,6 +13591,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return int(row[0]) if row else 0
 
+    @staticmethod
+    def _active_duplicate_tool_result_ids(conn, session_id: str) -> set:
+        """tool_call_ids with more than one ACTIVE ``role='tool'`` row in *session_id*."""
+        return {
+            row[0]
+            for row in conn.execute(
+                "SELECT tool_call_id FROM messages "
+                "WHERE session_id = ? AND active = 1 AND role = 'tool' "
+                "AND tool_call_id IS NOT NULL AND tool_call_id != '' "
+                "GROUP BY tool_call_id HAVING COUNT(*) > 1",
+                (session_id,),
+            ).fetchall()
+        }
+
     def archive_and_compact(
         self,
         session_id: str,
@@ -13493,6 +13712,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # the pre-compaction transcript stays discoverable; live-context
             # loads (active=1 only) still exclude them. Tail originals are
             # archived too — their clones (below) carry the live copy.
+            # One-result-per-tool-call invariant (t_aace5343): remember which
+            # keys were already duplicated in the live set so only a duplicate
+            # this compaction INTRODUCES fails the commit.
+            preexisting_dup_tool_results = self._active_duplicate_tool_result_ids(
+                conn, session_id
+            )
             conn.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
                 "WHERE session_id = ? AND active = 1",
@@ -13509,6 +13734,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._clone_message_tail_rows(conn, tail_ids, session_id)
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
+
+            introduced = (
+                self._active_duplicate_tool_result_ids(conn, session_id)
+                - preexisting_dup_tool_results
+            )
+            if introduced:
+                raise TranscriptInvariantError(
+                    f"archive_and_compact({session_id!r}) would publish "
+                    f"{len(introduced)} tool_call_id(s) with more than one active "
+                    f"result row (e.g. {sorted(introduced)[:3]}); rolled back"
+                )
 
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.

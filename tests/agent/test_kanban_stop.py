@@ -476,6 +476,115 @@ def test_conversation_loop_enforces_originating_run(worker_run, monkeypatch, han
         assert not any(message.get("_kanban_stop_synthetic") for message in result["messages"])
 
 
+def test_stop_guard_persists_candidate_but_not_nudge(worker_run, monkeypatch):
+    """t_4eeb0202: the pre-nudge assistant text is real model output and must
+    reach the durable transcript; only the synthetic nudge is stripped.
+
+    Before the fix both were flagged ``_kanban_stop_synthetic`` and dropped, so
+    state.db showed a bare kanban_block that seemed to answer nothing."""
+    from unittest.mock import MagicMock
+
+    from agent.kanban_stop import build_kanban_stop_nudge as _real_build
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            session_id="kanban-stop-persist", api_key="test-key",
+            base_url="https://example.invalid/v1", provider="openai-compat",
+            model="test/model", max_iterations=2, quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+        )
+    agent._cached_system_prompt = "stable test prompt"
+    agent.tools = [_tool_def("kanban_complete")]
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent._session_json_enabled = False
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+    agent._cleanup_task_resources = lambda *_a, **_kw: None
+    agent._save_trajectory = lambda *_a, **_kw: None
+
+    candidate = "I've stopped as you asked."
+    nudges = []
+
+    def spy_build(**kwargs):
+        text = _real_build(**kwargs)
+        if text:
+            nudges.append(text)
+        return text
+
+    monkeypatch.setattr("agent.kanban_stop.build_kanban_stop_nudge", spy_build)
+    # Two turns, like the incident: the narrated stop, then the model's reply
+    # to the nudge. Only the SECOND text can be re-added by the finalizer's
+    # "delivered final_response => assistant row" safety net, so the first
+    # candidate reaching the store proves the stop-guard itself persisted it.
+    replies = iter([candidate, "Still narrating instead of calling the tool."])
+    agent._interruptible_api_call = lambda _kwargs: SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=next(replies), tool_calls=None),
+            finish_reason="stop",
+        )],
+        model="test/model", usage=None,
+    )
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("work kanban task")
+
+    assert nudges, "stop guard must have fired for this test to mean anything"
+    assert getattr(agent, "_kanban_stop_nudges", 0) == 2
+
+    # In-memory: the candidate is not flagged; the nudge is.
+    cand_rows = [m for m in result["messages"]
+                 if m.get("role") == "assistant" and m.get("content") == candidate]
+    assert cand_rows and not any(m.get("_kanban_stop_synthetic") for m in cand_rows)
+    assert cand_rows[0].get("finish_reason") == "kanban_terminal_required"
+    nudge_rows = [m for m in result["messages"] if m.get("content") == nudges[0]]
+    assert nudge_rows and all(m.get("_kanban_stop_synthetic") for m in nudge_rows)
+
+    # Durable: what reached the session store.
+    persisted = [
+        msg
+        for _args, kwargs in agent._session_db.append_messages_batch.call_args_list
+        for msg in kwargs["messages"]
+    ]
+    persisted_text = [m.get("content") for m in persisted]
+    assert candidate in persisted_text
+    assert not set(nudges) & set(persisted_text)
+    assert not any(m.get("_kanban_stop_synthetic") for m in persisted)
+
+
+def test_resume_replay_collapses_kanban_candidate():
+    """With the nudge stripped, a resumed transcript has candidate -> next
+    assistant back to back. Replay must let the later turn supersede the
+    candidate (same as verify-on-stop), not union them into one message."""
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    later = {
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "kanban_block", "arguments": "{}"}}],
+    }
+    messages = [
+        {"role": "user", "content": "work kanban task"},
+        {"role": "assistant", "content": "I've stopped as you asked.",
+         "finish_reason": "kanban_terminal_required"},
+        later,
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ]
+    repair_message_sequence(SimpleNamespace(), messages)
+    assistants = [m for m in messages if m.get("role") == "assistant"]
+    assert len(assistants) == 1
+    assert assistants[0]["content"] == ""
+    assert assistants[0]["tool_calls"][0]["function"]["name"] == "kanban_block"
+
+
 
 
 

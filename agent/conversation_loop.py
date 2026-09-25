@@ -42,7 +42,7 @@ from agent.context_engine import (
     call_with_messages as _call_with_messages,
 )
 from agent.display import KawaiiSpinner
-from agent.confab_notice import CONFAB_NOTICE_TEXT, should_announce_notice
+from agent.confab_notice import TOOL_CALL_NOTICE_TEXT, confab_notice_status, is_metadata_only_tool_notice, should_announce_notice
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -101,6 +101,7 @@ from agent.prompt_caching import (
 from agent.provider_projection import splice_provider_projection
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    capacity_retry_wait,
     is_zai_coding_overload_error,
     jittered_backoff,
     resolve_retry_after,
@@ -111,7 +112,13 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    USAGE_UNKNOWN_FIELDS,
+    CanonicalUsage,
+    estimate_usage_cost,
+    normalize_usage,
+    resolve_billing_route,
+)
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -493,8 +500,11 @@ def _build_moa_pricing_calls(
     aggregator_base_url: str | None,
 ) -> list[dict[str, Any]]:
     """Return physical advisor + aggregator calls for Blackbox pricing."""
+    from agent.usage_pricing import USAGE_UNKNOWN_FIELDS
+
     calls = [dict(call) for call in advisor_calls if isinstance(call, dict)]
     calls.append({
+        **{key: bool(getattr(aggregator_usage, key, False)) for key in USAGE_UNKNOWN_FIELDS},
         "model": aggregator_model,
         "provider": aggregator_provider,
         "base_url": aggregator_base_url,
@@ -505,6 +515,384 @@ def _build_moa_pricing_calls(
         "reasoning_tokens": aggregator_usage.reasoning_tokens,
     })
     return calls
+
+
+def _compressor_usage_dict(usage: Any) -> dict[str, Any]:
+    """The context-occupancy payload for ``update_from_response``.
+
+    Only the three legacy aggregate keys the compressor actually reads
+    (``agent/context_compressor.py::update_from_response``). Built from ONE
+    usage object so the prompt/completion/total it stores cannot come from
+    different sources — which is the whole point at the MoA call site, where the
+    turn's REPORTED counts are the aggregator+advisor fold but the window
+    occupancy is the aggregator's alone (r6 round-4 finding 2).
+    """
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+
+
+def _canonical_usage_from_response(
+    response: Any, *, provider: str | None, api_mode: str | None
+) -> CanonicalUsage:
+    """Normalize a response's usage; omission is UNKNOWN, never measured zero.
+
+    An omitted payload leaves EVERY bucket unmeasured, so every discriminator
+    is set — not just the aggregate ``usage_unknown``. Consumers read these
+    flags narrowly (``output_tokens_unknown`` alone gates the ``out=`` log and
+    the thin card's output line; ``prompt_tokens_unknown`` ORs the three input
+    flags), so an aggregate-only UNKNOWN would still let a narrow reader print
+    this call's placeholder 0 as a measurement.
+    """
+    response_usage = getattr(response, "usage", None)
+    if not response_usage:
+        return CanonicalUsage.fully_unknown()
+    return normalize_usage(response_usage, provider=provider, api_mode=api_mode)
+
+
+def _bump_counter(agent: Any, name: str, delta: Any) -> None:
+    setattr(agent, name, int(getattr(agent, name, 0) or 0) + int(delta or 0))
+
+
+def _account_unaccepted_billed_call(
+    agent: Any,
+    entry: dict[str, Any],
+    turn_calls: Optional[list[dict[str, Any]]],
+    turn_id: Optional[str],
+) -> None:
+    """Fold ONE billed-but-unaccepted response into the session + turn totals.
+
+    Mirrors the accept-site commit (session_* counters, absorbing UNKNOWN
+    latches, cost, state.db delta, Blackbox ``_turn_calls``) but prices the
+    call at the route that actually served it (captured at the transport
+    chokepoint), not at the fallback the agent has since switched to. The
+    ``last_turn_usage`` snapshot and the context compressor are deliberately
+    NOT touched: a rejected response is spend, not the conversation's window.
+    """
+    provider = entry.get("provider") or None
+    model = entry.get("model") or ""
+    base_url = entry.get("base_url") or None
+    usage = _canonical_usage_from_response(
+        entry.get("response"), provider=provider, api_mode=entry.get("api_mode") or None
+    )
+    call_flags = {key: bool(getattr(usage, key)) for key in USAGE_UNKNOWN_FIELDS}
+    prior_api_calls = int(getattr(agent, "session_api_calls", 0) or 0)
+    _bump_counter(agent, "session_prompt_tokens", usage.prompt_tokens)
+    _bump_counter(agent, "session_completion_tokens", usage.output_tokens)
+    _bump_counter(agent, "session_total_tokens", usage.total_tokens)
+    _bump_counter(agent, "session_api_calls", 1)
+    _bump_counter(agent, "session_input_tokens", usage.input_tokens)
+    _bump_counter(agent, "session_output_tokens", usage.output_tokens)
+    _bump_counter(agent, "session_cache_read_tokens", usage.cache_read_tokens)
+    _bump_counter(agent, "session_cache_write_tokens", usage.cache_write_tokens)
+    _bump_counter(agent, "session_reasoning_tokens", usage.reasoning_tokens)
+    for flag, is_set in call_flags.items():
+        if is_set:
+            setattr(agent, f"session_{flag}", True)
+    if turn_calls is not None and entry.get("turn_id", "") == (turn_id or ""):
+        turn_calls.append({
+            **call_flags,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_read_tokens": usage.cache_read_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+            "output_tokens_unknown": bool(usage.output_tokens_unknown),
+            "latency_s": 0.0,
+            "composition": None,
+            # Price at the serving route (Blackbox cost.py reads these).
+            "provider": provider or "",
+            "model": model,
+            "base_url": base_url or "",
+            "accepted": False,
+        })
+    cost_result = estimate_usage_cost(
+        model, usage, provider=provider, base_url=base_url
+    )
+    cost_status = _session_cost_status_with_known_spend(
+        _moa_session_cost_status(cost_result, [], None),
+        session_cost_usd=getattr(agent, "session_estimated_cost_usd", 0.0),
+    )
+    if cost_result.amount_usd is not None:
+        agent.session_estimated_cost_usd = float(
+            getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0
+        ) + float(cost_result.amount_usd)
+    agent.session_cost_status = merge_session_cost_status(
+        getattr(agent, "session_cost_status", None),
+        cost_status,
+        prior_api_calls=prior_api_calls,
+    )
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db and session_id:
+        try:
+            if not getattr(agent, "_session_db_created", True):
+                agent._ensure_db_session()
+            session_db.queue_token_counts(
+                session_id,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
+                estimated_cost_usd=(
+                    float(cost_result.amount_usd)
+                    if cost_result.amount_usd is not None
+                    else None
+                ),
+                cost_status=cost_status,
+                cost_source=cost_result.source,
+                billing_provider=provider,
+                billing_base_url=base_url,
+                billing_mode="subscription_included"
+                if cost_result.status == "included" else None,
+                model=model,
+                api_call_count=1,
+                **call_flags,
+            )
+        except Exception as exc:
+            logger.debug("Unaccepted billed-call persistence failed: %s", exc)
+
+
+def _settle_unaccepted_billed_responses(
+    agent: Any,
+    turn_calls: Optional[list[dict[str, Any]]],
+    turn_id: Optional[str],
+    *,
+    committing: bool = False,
+) -> int:
+    """Account every billed response the loop did not accept; return the count.
+
+    ``agent._billed_unaccounted`` is filled by the transport chokepoint
+    (``chat_completion_helpers._note_billed_response``) once per billed
+    HTTP-200 — the same event that writes the per-call ledger row. Settling
+    it here keeps ``session_api_calls`` / the turn rollup equal to the ledger:
+
+    * ``committing=True`` (the accept site): the LATEST entry is the response
+      being committed and is accounted by the normal path, so it is dropped;
+      anything older was billed and rejected within this attempt.
+    * ``committing=False`` (start of a model attempt, turn start, turn end):
+      no response is being accepted, so every parked entry was rejected.
+
+    Telemetry must never break the conversation loop.
+    """
+    pending = getattr(agent, "_billed_unaccounted", None)
+    if not isinstance(pending, list) or not pending:
+        return 0
+    entries = list(pending)
+    del pending[:]
+    if committing:
+        entries = entries[:-1]
+    settled = 0
+    for entry in entries:
+        try:
+            _account_unaccepted_billed_call(agent, entry, turn_calls, turn_id)
+            settled += 1
+        except Exception:
+            logger.warning("Unaccepted billed-call accounting failed", exc_info=True)
+    if settled:
+        logger.info(
+            "Accounted %d billed provider response(s) the loop rejected "
+            "(turn=%s)", settled, turn_id or "",
+        )
+    return settled
+
+
+def _capture_measured_usage_anchor(usage: Any, messages: list[dict[str, Any]]) -> Any:
+    """Build an exact context anchor only from fully measured usage."""
+    if bool(getattr(usage, "total_tokens_unknown", False)):
+        return None
+    return capture_usage_anchor(usage.prompt_tokens, usage.output_tokens, messages)
+
+
+def _last_turn_snapshot_kwargs(usage: Any) -> dict[str, Any]:
+    """The five ``last_turn_*`` kwargs for ``queue_token_counts``.
+
+    These are SNAPSHOT columns, written ``COALESCE(?, existing)``
+    (``hermes_state._TOKEN_DELTA_SNAPSHOT_FIELDS``), and the sessions schema
+    has no per-bucket VALUE-preserving companion (the ``*_unknown`` flags record
+    provenance, not the value) — so a 0 written here is
+    indistinguishable from a measured 0 and, because ``COALESCE(0, existing)``
+    is ``0``, it also DESTROYS the previous turn's real persisted split. An
+    unmeasured call must therefore write ``None`` and leave the last real
+    snapshot standing, rather than stamping an unmeasured zero over it.
+
+    All five move together: the snapshot is one turn's coherent split, so
+    mixing this call's measured buckets with a prior turn's retained ones
+    would persist a blend of two different turns.
+    """
+    if bool(getattr(usage, "total_tokens_unknown", False)):
+        return {
+            "last_turn_input_tokens": None,
+            "last_turn_output_tokens": None,
+            "last_turn_cache_read_tokens": None,
+            "last_turn_cache_write_tokens": None,
+            "last_turn_reasoning_tokens": None,
+        }
+    return {
+        "last_turn_input_tokens": usage.input_tokens,
+        "last_turn_output_tokens": usage.output_tokens,
+        "last_turn_cache_read_tokens": usage.cache_read_tokens,
+        "last_turn_cache_write_tokens": usage.cache_write_tokens,
+        "last_turn_reasoning_tokens": usage.reasoning_tokens,
+    }
+
+
+def _session_cost_status_with_known_spend(
+    call_status: str, *, session_cost_usd: Any
+) -> str:
+    """Do not relabel a session that already holds priced dollars as unknown.
+
+    ``session_cost_status`` describes the SESSION, not one call. One
+    unpriceable call inside a session with real accumulated spend makes that
+    session's total incomplete — which the codebase spells ``partial`` — not
+    wholly unmeasured. Declaring ``unknown`` while
+    ``session_estimated_cost_usd`` still carries every previously priced
+    dollar both misreports the session in ``/cost`` and ``insights`` and
+    permanently strands it: ``unknown`` is outside the repricing allowlist,
+    so the mislabel never heals.
+    """
+    if call_status != "unknown":
+        return call_status
+    try:
+        has_known_spend = float(session_cost_usd or 0) > 0
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        has_known_spend = False
+    return "partial" if has_known_spend else "unknown"
+
+
+# Completeness ordering for a SESSION's cost label. Lower is more complete.
+# ``included`` is complete AND free; ``actual``/``estimated`` are complete but
+# priced; ``partial`` is a known-calls-only subtotal; ``unknown`` is nothing.
+_SESSION_STATUS_COMPLETENESS = {
+    "included": 0,
+    "actual": 1,
+    "estimated": 1,
+    "priced_zero": 1,
+    "partial": 2,
+    "unknown": 3,
+}
+
+
+def merge_session_cost_status(
+    previous: Any, incoming: str, *, prior_api_calls: Any = None
+) -> str:
+    """Worst-of merge: a session's label can never get MORE complete over time.
+
+    ``session_cost_status`` is a property of the whole session, but it is
+    written once per provider call from that call's own verdict, which makes
+    the last call's completeness the session's — in both directions.
+
+    The priced-then-unknown direction was already handled (by
+    ``_session_cost_status_with_known_spend``: an unpriceable call beside real
+    accumulated dollars is ``partial``). The mirror was not (r6 round-4
+    finding 13): an unpriceable call FOLLOWED by a priced one overwrote the
+    session back to ``estimated`` — a label that claims a complete total — even
+    though that total still omits the first call's unpriceable spend. Since
+    this PR now persists usage-less calls rather than dropping them, the
+    session really does know it is missing something, and must keep saying so.
+
+    The algebra: an incomplete session cannot become complete by spending more
+    money, so ``partial`` and ``unknown`` absorb. A prior ``unknown`` meeting a
+    later COMPLETE label degrades to ``partial``, not back to ``unknown``: the
+    session does now hold priced dollars, just not all of them. That is the
+    same rule ``_session_cost_status_with_known_spend`` applies within one
+    call, and it keeps the row inside the repricing allowlist instead of
+    stranding it (``unknown`` is filtered out of reprice forever).
+
+    ``prior_api_calls`` is the load-bearing discriminator, NOT a convenience.
+    A fresh agent initialises to ``session_cost_status = "unknown"``
+    (``agent/agent_init.py``) with zero calls accounted — that is *unstarted*,
+    not *incomplete*, and treating it as incomplete would permanently pin every
+    session's first priced call to ``partial``. When no call has been accounted
+    yet there is no previous session state to merge with, so ``incoming`` wins
+    outright. Callers pass the count taken BEFORE this call's increment.
+    """
+    try:
+        if prior_api_calls is not None and int(prior_api_calls or 0) <= 0:
+            return incoming
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        pass
+    prev = str(previous or "").strip()
+    if prev not in _SESSION_STATUS_COMPLETENESS:
+        return incoming
+    prev_rank = _SESSION_STATUS_COMPLETENESS[prev]
+    incoming_rank = _SESSION_STATUS_COMPLETENESS.get(incoming, 3)
+    if incoming_rank >= prev_rank:
+        return incoming
+    # Incoming claims MORE completeness than the session has earned.
+    if prev == "unknown" and incoming_rank <= 1:
+        return "partial"
+    return prev
+
+
+def _moa_session_cost_status(
+    cost_result: Any,
+    advisor_calls: list[dict[str, Any]],
+    advisor_cost: Any = None,
+) -> str:
+    """Reconcile the aggregator status with every physical MoA advisor.
+
+    A known-only advisor subtotal is not a complete cost when another advisor's
+    usage was unpriceable. Blackbox already reconciles physical calls worst-of;
+    the session lane must not downgrade the same turn back to ``estimated``.
+
+    The mirror case is reconciled here too: an unpriceable AGGREGATOR beside
+    priced advisors is ``partial``, not ``unknown`` — the turn really did
+    spend the advisor dollars that the advisor-cost addition below adds to the
+    session total. For a non-MoA turn (no advisor calls, no advisor cost)
+    ``any_known`` stays False, so the existing ``unknown`` is still returned.
+
+    UNPRICEABLE IS NOT THE SAME QUESTION AS UNMEASURED (r6 round-4 finding 1).
+    An advisor is just as commonly unpriceable with fully MEASURED usage: an
+    uncatalogued route makes ``estimate_usage_cost`` return
+    ``amount_usd=None, status="unknown"`` with every token count real and no
+    unknown FLAG set. ``moa_loop._run_reference`` already priced each advisor at
+    its own route and ``MoAChatCompletions`` sums only non-None advisor costs,
+    so those real dollars never enter ``advisor_cost`` — and skipping the
+    flagless advisors here let the session lane report ``estimated`` (a
+    COMPLETE label) for a total missing them, while ``plugins/blackbox/cost.py``
+    called the same turn ``partial``. So each advisor's OWN pricing verdict is
+    consulted, and the usage flags are only the fallback for an advisor that
+    carries no verdict at all.
+    """
+    any_unpriceable = cost_result.amount_usd is None
+    any_known = cost_result.amount_usd is not None or advisor_cost is not None
+    for call in advisor_calls:
+        if not isinstance(call, dict):
+            continue
+        if "cost_usd" in call or "cost_status" in call:
+            # This advisor's own verdict from its own route. `cost_usd is None`
+            # covers BOTH ways it can be unpriceable — unmeasured tokens and an
+            # uncatalogued route — so no separate flag/route check is needed.
+            # A subscription-included advisor prices at a real Decimal("0"), so
+            # it lands in `any_known` here exactly as it does below.
+            if call.get("cost_usd") is None or call.get("cost_status") == "unknown":
+                any_unpriceable = True
+            else:
+                any_known = True
+            continue
+        usage_unknown = any(bool(call.get(key)) for key in USAGE_UNKNOWN_FIELDS)
+        if not usage_unknown:
+            continue
+        route = resolve_billing_route(
+            call.get("model") or "",
+            provider=call.get("provider"),
+            base_url=call.get("base_url"),
+        )
+        # Included-route cost is known independently of missing token counts.
+        if route.billing_mode == "subscription_included":
+            any_known = True
+        else:
+            any_unpriceable = True
+    if any_unpriceable:
+        return "partial" if any_known else "unknown"
+    return cost_result.status
 
 
 def _is_auth_resolution_error(api_error: Exception) -> bool:
@@ -2124,6 +2512,16 @@ def run_conversation(
     # successful provider call appends a dict at the usage-commit site below;
     # folded into the on_session_end `turn_usage` kwarg at the end of the turn.
     _turn_calls: List[Dict[str, Any]] = []
+    # Published (same list object) for the run_agent forwarder's backstop
+    # (turn_finalizer.emit_unfinalized_session_end): early returns and raises
+    # below never reach finalize_turn but must still record their turn.
+    agent._blackbox_turn_calls = (turn_id, _turn_calls)
+    agent._turn_original_user_message = (turn_id, original_user_message)
+    # A previous turn that ended through an early ``return`` (not via
+    # finalize_turn) can leave billed-but-unaccepted responses parked. Their
+    # tokens were spent: count them in the session totals now (they carry the
+    # old turn id, so they are NOT added to this turn's rollup).
+    _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
     final_response = None
     interrupted = False
     failed = False
@@ -2440,6 +2838,10 @@ def run_conversation(
 
         api_messages = []
         for idx, msg in enumerate(messages):
+            # Metadata-only provider events are durable UI rows, never system
+            # instructions in the provider request.
+            if is_metadata_only_tool_notice(msg):
+                continue
 
             # Structural clone, NOT msg.copy(): every in-place transform
             # below (canonicalize/repair, surrogate + non-ASCII sanitizers,
@@ -3701,6 +4103,11 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                # Any billed response still parked here belongs to an EARLIER
+                # attempt the loop rejected (failover, retry, redirect) — the
+                # accept site would have consumed it. Settle before the next
+                # call so the per-turn totals match the per-call ledger.
+                _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -4618,10 +5025,14 @@ def run_conversation(
                             "error": "First response truncated due to output length limit"
                         }
                 
-                # Track actual token usage from response for context management
-                if hasattr(response, 'usage') and response.usage:
-                    canonical_usage = normalize_usage(
-                        response.usage,
+                # Track actual token usage from the response for context management.
+                # A successful provider response with no usage payload is not a
+                # measured zero: the provider gave us no counts. Feed an explicit
+                # aggregate UNKNOWN through the same accounting path so pricing,
+                # persistence, and renderers cannot silently invent zero usage.
+                if response is not None:
+                    canonical_usage = _canonical_usage_from_response(
+                        response,
                         provider=agent.provider,
                         api_mode=agent.api_mode,
                     )
@@ -4679,11 +5090,22 @@ def run_conversation(
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
+                    # UNKNOWN != 0: the provider explicitly declined to measure
+                    # this turn's output (see CanonicalUsage.output_tokens_unknown).
+                    # The int fields above stay 0 so arithmetic consumers keep
+                    # working; this flag rides alongside so every persistence and
+                    # display site can refuse to present the 0 as a measurement.
+                    output_unknown = bool(canonical_usage.output_tokens_unknown)
+                    from agent.usage_pricing import (
+                        USAGE_UNKNOWN_FIELDS, cache_stats_line, prompt_tokens_unknown,
+                    )
+                    usage_flags = {key: bool(getattr(canonical_usage, key)) for key in USAGE_UNKNOWN_FIELDS}
                     # Forward canonical token + cache buckets so context engines
                     # can make decisions on cache hit ratios / reasoning costs,
                     # not just legacy aggregate tokens. Legacy keys stay for
                     # back-compat with engines that only read prompt/completion/total.
                     usage_dict = {
+                        **usage_flags,
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,
@@ -4704,7 +5126,57 @@ def run_conversation(
                             False,
                         )
                     )
-                    agent.context_compressor.update_from_response(usage_dict)
+                    # UNKNOWN is not a context measurement. The compressor's
+                    # update_from_response() assigns last_prompt_tokens /
+                    # last_completion_tokens / last_total_tokens
+                    # unconditionally and no context-engine consumer reads the
+                    # UNKNOWN flags, so feeding it a usage-less response's
+                    # placeholder zeros overwrites the previous REAL reading
+                    # with a measured-looking 0 — which then propagates to the
+                    # status-bar context meter, turn_finalizer's
+                    # `last_prompt_tokens` / Blackbox `context_used`, and the
+                    # persisted session entry. Gate on a MEASURED prompt
+                    # count, not on the mere presence of a usage object: a
+                    # payload that carries `prompt_tokens: null` (or an
+                    # explicit `*_unavailable` flag) passes a presence test and
+                    # then stamps the compressor's occupancy reading to 0 just
+                    # the same (r6 finding 7). `prompt_tokens_unknown` is the
+                    # right predicate here rather than `total_tokens_unknown`:
+                    # what this call feeds the compressor is the PROMPT
+                    # occupancy, so an unmeasured OUTPUT bucket must not
+                    # discard a perfectly good prompt reading. Still consume
+                    # the pending compaction verdict either way so preflight
+                    # deferral cannot stay latched.
+                    #
+                    # MoA: read the PRE-FOLD aggregator usage, exactly as the
+                    # usage anchor immediately below already does (r6 round-4
+                    # finding 2). `canonical_usage` at this point is
+                    # `aggregator + advisor fan-out`, and `CanonicalUsage.__add__`
+                    # makes every unknown flag ABSORBING — so one advisor that
+                    # returned no payload (seeded `fully_unknown()` by
+                    # `moa_loop._run_reference`) set `input_tokens_unknown` on the
+                    # fold and blanked a complete, measured AGGREGATOR prompt
+                    # count. What this site feeds the compressor is THIS
+                    # conversation's window occupancy; advisor fan-out tokens were
+                    # never part of this prompt, so both the gate and the payload
+                    # have to be the aggregator's own numbers. On a non-MoA turn
+                    # `aggregator_usage is canonical_usage`, so nothing changes.
+                    _usage_payload = getattr(response, "usage", None)
+                    _prompt_measured = bool(_usage_payload) and not prompt_tokens_unknown(
+                        aggregator_usage
+                    )
+                    if _prompt_measured:
+                        agent.context_compressor.update_from_response(
+                            usage_dict
+                            if aggregator_usage is canonical_usage
+                            else _compressor_usage_dict(aggregator_usage)
+                        )
+                    elif getattr(
+                        agent.context_compressor,
+                        "awaiting_real_usage_after_compression",
+                        False,
+                    ):
+                        agent.context_compressor.update_from_response({})
                     # Usage-anchored context accounting: snapshot this
                     # response's exact provider-reported usage against the
                     # durable transcript. Later context-size checks anchor on
@@ -4717,10 +5189,14 @@ def run_conversation(
                     # MoA note: use the pre-fold aggregator usage — the folded
                     # canonical figure adds advisor fan-out tokens that were
                     # never part of THIS conversation's prompt.
-                    _new_anchor = capture_usage_anchor(
-                        aggregator_usage.prompt_tokens,
-                        aggregator_usage.output_tokens,
-                        messages,
+                    # An anchor is exact only when BOTH prompt and completion
+                    # are measured. Installing an UNKNOWN placeholder as zero
+                    # makes anchored_context_tokens skip the assistant reply as
+                    # "already counted", underestimating the next request by the
+                    # entire generated payload. Keep the prior anchor instead;
+                    # its delta estimator will count this response normally.
+                    _new_anchor = _capture_measured_usage_anchor(
+                        aggregator_usage, messages
                     )
                     if _new_anchor is not None:
                         agent._usage_anchor = _new_anchor
@@ -4776,11 +5252,29 @@ def run_conversation(
                     # does not remain latched indefinitely.
                     agent.context_compressor.update_from_response({})
 
-                if hasattr(response, 'usage') and response.usage:
+                # Commit per-call accounting for EVERY successful provider
+                # response, including one that carried no usage payload. The
+                # old `response.usage` truthiness guard silently dropped such a
+                # call out of session counters, the last-turn snapshot, the
+                # Blackbox `_turn_calls` accumulator, pricing and persistence —
+                # so an unpriceable call was reported as if it had never
+                # happened. `canonical_usage` is already an aggregate UNKNOWN
+                # in that case (see `_canonical_usage_from_response`), so every
+                # consumer below refuses to present its zeros as measurements.
+                if response is not None:
+                    # Consume this response's billed-response entry (it is
+                    # accounted right below) and settle any OLDER entry from
+                    # this attempt that the loop did not accept.
+                    _settle_unaccepted_billed_responses(
+                        agent, _turn_calls, turn_id, committing=True
+                    )
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
                     # from the error message), not guessed probe tiers.
-                    if getattr(agent.context_compressor, "_context_probed", False):
+                    if (
+                        getattr(response, "usage", None)
+                        and getattr(agent.context_compressor, "_context_probed", False)
+                    ):
                         ctx = agent.context_compressor.context_length
                         if getattr(agent.context_compressor, "_context_probe_persistable", False):
                             save_context_length(agent.model, agent.base_url, ctx)
@@ -4791,17 +5285,52 @@ def run_conversation(
                     agent.session_prompt_tokens += prompt_tokens
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
+                    # Taken BEFORE the increment: `merge_session_cost_status`
+                    # needs "had any call been accounted before this one?" to
+                    # tell an UNSTARTED session (fresh agent, initial
+                    # `session_cost_status = "unknown"`, zero calls) from a
+                    # genuinely INCOMPLETE one. Without it the first priced
+                    # call of every session would merge against that initial
+                    # placeholder and pin the session to `partial` forever.
+                    _prior_api_calls = agent.session_api_calls
                     agent.session_api_calls += 1
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                    # ABSORBING session-level unknown latch, incremented in
+                    # lockstep with the five counters above so it describes the
+                    # same aggregate they do.
+                    #
+                    # The counters are plain ints: an unmeasured call adds the
+                    # canonical 0 and leaves no trace. Before this latch the
+                    # only unknown signal any session-total consumer had was
+                    # `agent.last_turn_usage`, which — despite the name — is
+                    # rewritten on EVERY provider call a few lines below. A
+                    # per-call flag on a cumulative total is wrong in both
+                    # directions (r6 round-4 finding 7 / finding 4): an earlier
+                    # unmeasured call followed by a measured one renders an
+                    # exact-looking total that silently omits real spend, and a
+                    # measured session whose final call was unmeasured collapses
+                    # hundreds of thousands of genuinely measured tokens to
+                    # `unknown`.
+                    #
+                    # Per-BUCKET, not one boolean: narrow readers gate on
+                    # individual buckets (`output_tokens_unknown` alone drives
+                    # the thin card's out= line), so a single flag would leave
+                    # them reading a measured zero. Absorbing: once a session
+                    # has missed a measurement, no later call can restore it.
+                    # Cleared with the counters in `reset_session_state`.
+                    for _flag, _set in usage_flags.items():
+                        if _set:
+                            setattr(agent, f"session_{_flag}", True)
                     # Keep the final successful provider-call usage available for
                     # `/context` / `/usage` style surfaces. The session_* counters
                     # above are cumulative; this snapshot preserves the last turn's
                     # cache split without provider-specific payload parsing later.
                     agent.last_turn_usage = {
+                        **usage_flags,
                         "input_tokens": canonical_usage.input_tokens,
                         "output_tokens": canonical_usage.output_tokens,
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
@@ -4811,6 +5340,7 @@ def run_conversation(
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,
+                        "output_tokens_unknown": output_unknown,
                     }
                     # Blackbox per-TURN accumulator (separate from the per-CALL
                     # snapshot above). INVARIANT: this append lives INSIDE the
@@ -4824,6 +5354,7 @@ def run_conversation(
                     _turn_call = None
                     try:
                         _turn_calls.append({
+                            **usage_flags,
                             "input_tokens": canonical_usage.input_tokens,
                             "output_tokens": canonical_usage.output_tokens,
                             "cache_read_tokens": canonical_usage.cache_read_tokens,
@@ -4832,6 +5363,7 @@ def run_conversation(
                             "prompt_tokens": prompt_tokens,
                             "completion_tokens": completion_tokens,
                             "total_tokens": total_tokens,
+                            "output_tokens_unknown": output_unknown,
                             "latency_s": api_duration,
                             "composition": _call_composition,
                         })
@@ -4839,24 +5371,40 @@ def run_conversation(
                     except Exception:
                         pass  # telemetry must never break the conversation loop
                     # Rolling history for status-bar averages (last 10).
+                    # An unmeasured output is not 0 tok/s. The two deques are
+                    # appended together and consumers (cli.py status bar,
+                    # tui_gateway) divide sum(outputs)/sum(latencies) with no
+                    # UNKNOWN discriminator available, so appending a
+                    # placeholder 0 beside a real latency silently drags the
+                    # reported velocity down. Skip the pair entirely for an
+                    # unmeasured call — the average is then over the calls that
+                    # were actually measured, which is what it claims to be.
                     try:
+                        _output_measured = not (
+                            output_unknown or canonical_usage.usage_unknown
+                        )
                         hist = getattr(agent, "_api_latency_history", None)
-                        if hist is not None:
-                            hist.append(float(api_duration))
                         ohist = getattr(agent, "_api_output_history", None)
-                        if ohist is not None:
-                            ohist.append(int(canonical_usage.output_tokens or 0))
+                        if _output_measured:
+                            if hist is not None:
+                                hist.append(float(api_duration))
+                            if ohist is not None:
+                                ohist.append(int(canonical_usage.output_tokens or 0))
                     except Exception:
                         pass
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
-                    if canonical_usage.cache_read_tokens and prompt_tokens:
+                    if canonical_usage.cache_read_tokens and prompt_tokens and not prompt_tokens_unknown(canonical_usage):
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
                     logger.info(
-                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
+                        "API call #%d: model=%s provider=%s in=%s out=%s total=%s latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
-                        prompt_tokens, completion_tokens, total_tokens,
+                        "unknown" if prompt_tokens_unknown(canonical_usage) else prompt_tokens,
+                        # UNKNOWN != 0: an unmeasured output logged as `out=0`
+                        # reads as a dead round-trip. Say `out=unknown` instead.
+                        "unknown" if output_unknown else completion_tokens,
+                        "unknown" if canonical_usage.total_tokens_unknown else total_tokens,
                         api_duration, _cache_pct,
                     )
 
@@ -4905,6 +5453,12 @@ def run_conversation(
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
+                    _cost_status = _session_cost_status_with_known_spend(
+                        _moa_session_cost_status(
+                            cost_result, _moa_ref_pricing_calls, _moa_ref_cost
+                        ),
+                        session_cost_usd=agent.session_estimated_cost_usd,
+                    )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
@@ -4914,7 +5468,11 @@ def run_conversation(
                             agent.session_estimated_cost_usd += float(_moa_ref_cost)
                         except (TypeError, ValueError):  # pragma: no cover - defensive
                             pass
-                    agent.session_cost_status = cost_result.status
+                    agent.session_cost_status = merge_session_cost_status(
+                        getattr(agent, "session_cost_status", None),
+                        _cost_status,
+                        prior_api_calls=_prior_api_calls,
+                    )
                     agent.session_cost_source = cost_result.source
 
                     # Persist token counts to session DB for /insights.
@@ -4959,7 +5517,7 @@ def run_conversation(
                                 cache_write_tokens=canonical_usage.cache_write_tokens,
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
                                 estimated_cost_usd=_cost_delta,
-                                cost_status=cost_result.status,
+                                cost_status=_cost_status,
                                 cost_source=cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
@@ -4967,11 +5525,27 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
-                                last_turn_input_tokens=canonical_usage.input_tokens,
-                                last_turn_output_tokens=canonical_usage.output_tokens,
-                                last_turn_cache_read_tokens=canonical_usage.cache_read_tokens,
-                                last_turn_cache_write_tokens=canonical_usage.cache_write_tokens,
-                                last_turn_reasoning_tokens=canonical_usage.reasoning_tokens,
+                                **_last_turn_snapshot_kwargs(canonical_usage),
+                                # UNKNOWN != 0. The cumulative flags are
+                                # ABSORBING in the store (one unmeasured call
+                                # latches the session total); the last_turn_*
+                                # ones are last-write-wins, mirroring the
+                                # snapshot counters they discriminate.
+                                **usage_flags,
+                                # The last_turn_* discriminators move WITH the
+                                # snapshot they qualify: when the snapshot is
+                                # withheld (None -> COALESCE keeps the prior
+                                # real split), the flags are withheld too, or
+                                # they would stamp "unknown" over a measured
+                                # split that belongs to an earlier turn.
+                                **{
+                                    f"last_turn_{key}": (
+                                        None
+                                        if bool(getattr(canonical_usage, "total_tokens_unknown", False))
+                                        else value
+                                    )
+                                    for key, value in usage_flags.items()
+                                },
                             )
                         except Exception as e:
                             # Log token persistence failures so they're
@@ -4983,7 +5557,13 @@ def run_conversation(
                             )
                     
                     if agent.verbose_logging:
-                        logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
+                        from agent.usage_pricing import verbose_token_usage_log_args
+                        logging.debug(
+                            "Token usage: prompt=%s, completion=%s, total=%s",
+                            *verbose_token_usage_log_args(
+                                canonical_usage, prompt_tokens, completion_tokens, total_tokens
+                            ),
+                        )
                     
                     # Surface cache hit stats for any provider that reports
                     # them — not just those where we inject cache_control
@@ -4996,16 +5576,11 @@ def run_conversation(
                     # ``canonical_usage`` is already normalised from all
                     # three API shapes (Anthropic / Codex / OpenAI-chat)
                     # so we can rely on its values directly.
-                    cached = canonical_usage.cache_read_tokens
-                    written = canonical_usage.cache_write_tokens
-                    prompt = usage_dict["prompt_tokens"]
-                    if (cached or written) and not agent.quiet_mode:
-                        hit_pct = (cached / prompt * 100) if prompt > 0 else 0
-                        agent._vprint(
-                            f"{agent.log_prefix}   💾 Cache: "
-                            f"{cached:,}/{prompt:,} tokens "
-                            f"({hit_pct:.0f}% hit, {written:,} written)"
-                        )
+                    cache_line = cache_stats_line(
+                        canonical_usage, usage_dict["prompt_tokens"]
+                    )
+                    if cache_line and not agent.quiet_mode:
+                        agent._vprint(f"{agent.log_prefix}   {cache_line}")
                 
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
@@ -6209,6 +6784,52 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # ── Pool-capacity 503: wait for a seat before a host move ──
+                # A relay "no eligible sub" 503 (``pool_exhausted``) is a
+                # CAPACITY signal, not auth/transport. Leaving the provider
+                # here is a host move for a bridge-backed session — the next
+                # box has no CLI session and replays the whole history
+                # (2026-09-24: 168 replays on one sub in 10h). So: stay on
+                # the same provider for up to ``capacity_retry_attempts``
+                # tries / ``capacity_retry_max_wait_s`` seconds, honouring
+                # the relay's Retry-After, THEN walk the chain. Policy is
+                # the pure ``capacity_retry_wait``; this block only widens
+                # the retry ceiling and, when the budget is spent, hands the
+                # attempt to the existing "max retries → fallback" branch
+                # below so the failover announce/threading stays single-
+                # sourced. ``attempts: 0`` = pre-policy behaviour.
+                _is_pool_capacity = (
+                    classified.reason == FailoverReason.pool_exhausted
+                    and int(getattr(agent, "_capacity_retry_attempts", 0) or 0) > 0
+                )
+                _capacity_wait = None
+                if _is_pool_capacity:
+                    max_retries = max(max_retries, int(agent._capacity_retry_attempts))
+                    _cap_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                    _cap_ra_raw = None
+                    if _cap_headers and hasattr(_cap_headers, "get"):
+                        _cap_ra_raw = _cap_headers.get("retry-after") or _cap_headers.get("Retry-After")
+                    _capacity_wait = capacity_retry_wait(
+                        retry_count=retry_count,
+                        max_retries=max_retries,
+                        raw_retry_after=_cap_ra_raw,
+                        waited_s=_retry.capacity_waited_s,
+                        max_wait_s=float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),
+                    )
+                    if _capacity_wait is None:
+                        logger.warning(
+                            "capacity 503 on %s: budget exhausted after %.0fs / %d attempt(s) "
+                            "(limits attempts=%d max_wait=%.0fs, retry_after=%s) → fallback %s",
+                            getattr(agent, "provider", "?"),
+                            _retry.capacity_waited_s,
+                            retry_count,
+                            int(agent._capacity_retry_attempts),
+                            float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),
+                            _cap_ra_raw,
+                            agent._client_log_context(),
+                        )
+                        # Hand off to the retries-exhausted → fallback branch.
+                        retry_count = max_retries
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
@@ -7463,6 +8084,23 @@ def run_conversation(
                     )
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                if _is_pool_capacity and _capacity_wait is not None:
+                    # Pool-capacity policy wins over the generic jitter: the
+                    # wait was already bounded (attempts + wall-clock budget,
+                    # relay Retry-After honoured) by ``capacity_retry_wait``.
+                    wait_time = _capacity_wait
+                    _backoff_policy = "pool_capacity"
+                    _retry.capacity_waited_s += float(wait_time)
+                    logger.warning(
+                        "capacity 503 on %s: retry %d/%d in %.1fs (waited %.0fs of %.0fs budget) %s",
+                        getattr(agent, "provider", "?"),
+                        retry_count + 1,
+                        max_retries,
+                        wait_time,
+                        _retry.capacity_waited_s,
+                        float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),
+                        agent._client_log_context(),
+                    )
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
@@ -7486,6 +8124,14 @@ def run_conversation(
                         agent._emit_status(_rate_limit_status)
                     else:
                         agent._buffer_status(_rate_limit_status)
+                elif _backoff_policy == "pool_capacity":
+                    # Say what we are waiting FOR: a pooled seat on the same
+                    # provider, not a generic retry — so the trace reads
+                    # "capped → waited → served" rather than "flaky".
+                    agent._buffer_status(
+                        f"⏱️ Sub pool capped — waiting {wait_time:.1f}s for a seat before "
+                        f"switching providers (attempt {retry_count + 1}/{max_retries})..."
+                    )
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 logger.warning(
@@ -7668,10 +8314,11 @@ def run_conversation(
             # restarted provider request_id can never suppress a later turn's
             # genuine warning. See agent/confab_notice.py.
             _confab_notice = getattr(normalized, "confab_notice", None)
-            if _confab_notice and should_announce_notice(
+            _new_confab_notice = _confab_notice and should_announce_notice(
                 agent, _confab_notice, turn_id
-            ):
-                agent._emit_status(CONFAB_NOTICE_TEXT)
+            )
+            if _new_confab_notice:
+                agent._emit_status(confab_notice_status(_confab_notice["kind"]))
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -8598,11 +9245,7 @@ def run_conversation(
                 continue
             
             else:
-                # No tool calls - this is the final response.
-                # (Dropped tool-call recovery — finish_reason=="tool_calls" with
-                # an empty tool_calls array — is handled at the finalization
-                # chokepoint below, after final_msg is built, so it catches
-                # every path that reaches turn finalization, not just this one.)
+                # Recover dropped calls before the empty-content fallback.
                 final_response = assistant_message.content or ""
                 
                 # Fix: unmute output when entering the no-tool-call branch
@@ -8611,6 +9254,47 @@ def run_conversation(
                 # prior housekeeping tool turn and should not silence the
                 # final response path.
                 agent._mute_post_response = False
+
+                _tool_notice_nudge = TOOL_CALL_NOTICE_TEXT.get(
+                    _confab_notice["kind"] if _confab_notice else None
+                )
+                if _tool_notice_nudge and _new_confab_notice:
+                    # Durable metadata-only UI event, not a model instruction.
+                    _notice_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                    append_message(messages, {
+                        "role": "system", "content": "",
+                        "display_kind": _notice_msg["display_kind"],
+                        "display_metadata": _notice_msg["display_metadata"],
+                    })
+                if finish_reason == "tool_calls" or _tool_notice_nudge:
+                    if getattr(agent, "_dropped_toolcall_retries", 0) < 3:
+                        agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
+                        logger.warning(
+                            "Dropped tool call — re-prompting (retry %d/3, model=%s provider=%s)",
+                            agent._dropped_toolcall_retries, agent.model, agent.provider,
+                        )
+                        agent._emit_status(
+                            "↻ Model signaled a tool call but sent none — "
+                            f"re-prompting ({agent._dropped_toolcall_retries}/3)"
+                        )
+                        interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                        interim_msg["_dropped_toolcall_nudge"] = True
+                        append_message(messages, interim_msg)
+                        append_message(messages, {
+                            "role": "user",
+                            "content": _tool_notice_nudge or _DROPPED_TOOLCALL_NUDGE_CONTENT,
+                            "_dropped_toolcall_nudge": True,
+                        })
+                        agent._session_messages = messages
+                        final_response = None
+                        continue
+                    if _tool_notice_nudge:
+                        agent._emit_status("⚠️ Tool-call recovery exhausted after 3 retries.")
+                        _turn_exit_reason = "tool_call_recovery_exhausted"
+                        failed = True
+                        final_response = ""
+                        agent._dropped_toolcall_retries = 0
+                        break
                 
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
@@ -8931,9 +9615,18 @@ def run_conversation(
                     # core of the complaint.
                     _streak_cost = _empty_guard.streak_cost_usd(agent)
                     if _streak_cost is not None:
+                        # A floored figure is a LOWER BOUND (some bucket was
+                        # declared unmeasured and only the measured ones could
+                        # be priced). Say "at least" rather than present it as
+                        # the estimate of the whole.
+                        _cost_prefix = (
+                            "at least ~$"
+                            if _empty_guard.streak_cost_is_floor(agent)
+                            else "~$"
+                        )
                         agent._buffer_status(
                             f"ℹ️ Estimated cost of these empty attempts: "
-                            f"~${_streak_cost:.2f} (input tokens are billed "
+                            f"{_cost_prefix}{_streak_cost:.2f} (input tokens are billed "
                             f"per attempt even when no answer is produced)"
                         )
                     agent._flush_status_buffer()
@@ -9082,54 +9775,6 @@ def run_conversation(
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
-                # ── Dropped tool-call recovery (copilot/Claude) ────────
-                # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
-                # on GitHub Copilot, ~2026-07) return finish_reason="tool_calls"
-                # while the parsed tool_calls array is empty — the model
-                # signalled it wanted to act but the payload shipped no call.
-                # Reaching finalization with that mismatch means the turn is
-                # about to end with the task unstarted (the narration, which may
-                # be in content or only in the reasoning field, gets treated as
-                # the final answer). Re-prompt (bounded to 3 CONSECUTIVE stalls;
-                # the budget resets after any successful tool round) to make the
-                # model emit the call instead of exiting. finish_reason="stop"
-                # text finishes never enter this guard.
-                if (
-                    finish_reason == "tool_calls"
-                    and not assistant_message.tool_calls
-                    and getattr(agent, "_dropped_toolcall_retries", 0) < 3
-                ):
-                    agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
-                    logger.warning(
-                        "finish_reason=tool_calls with empty tool_calls array "
-                        "(narration only) — re-prompting to emit the call "
-                        "(retry %d/3, model=%s provider=%s)",
-                        agent._dropped_toolcall_retries, agent.model, agent.provider,
-                    )
-                    agent._emit_status(
-                        "↻ Model signaled a tool call but sent none — "
-                        f"re-prompting ({agent._dropped_toolcall_retries}/3)"
-                    )
-                    # Both halves of the re-prompt pair are ephemeral recovery
-                    # scaffolding (mirrors the empty-response nudge pattern):
-                    # the interim narration-only assistant turn exists solely to
-                    # keep role alternation valid for the nudge, and the nudge
-                    # exists solely to drive the retry. Flag both so the
-                    # persistence layer never writes them to the durable
-                    # transcript and the finalization pop below can strip an
-                    # unanswered tail pair. A recovered (answered) pair stays
-                    # buried mid-list in live memory but is skipped by the
-                    # flush regardless of position.
-                    final_msg["_dropped_toolcall_nudge"] = True
-                    append_message(messages, final_msg)
-                    append_message(messages, {
-                        "role": "user",
-                        "content": _DROPPED_TOOLCALL_NUDGE_CONTENT,
-                        "_dropped_toolcall_nudge": True,
-                    })
-                    agent._session_messages = messages
-                    final_response = None
-                    continue
 
                 # Reached finalization without the dropped-tool-call mismatch —
                 # a genuine turn end. Clear the consecutive-stall budget so the
@@ -9297,8 +9942,20 @@ def run_conversation(
                         getattr(agent, "_kanban_stop_nudges", 0) + 1
                     )
                     final_msg["finish_reason"] = "kanban_terminal_required"
-                    final_msg["_kanban_stop_synthetic"] = True
+                    # The assistant candidate is real model output — persist
+                    # it (same contract as verify-on-stop, #65919 §7). Only
+                    # the nudge below is flagged synthetic and stripped from
+                    # the durable transcript. Dropping the candidate left a
+                    # forensic hole in state.db: the next row (often a bare
+                    # kanban_block) appeared to answer nothing (t_4eeb0202).
+                    # On resume, repair_message_sequence collapses this
+                    # candidate into the following assistant turn, so model
+                    # replay is unchanged.
                     append_message(messages, final_msg)
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception:
+                        logger.debug("kanban stop-guard interim flush failed", exc_info=True)
                     append_message(messages, {
                         "role": "user",
                         "content": _kanban_nudge,
@@ -9512,6 +10169,9 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
+    # Turn end: a response billed after the last accepted one (e.g. rejected
+    # and then the loop broke out) is spent inside THIS turn.
+    _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
     return finalize_turn(
         agent,
         final_response=final_response,

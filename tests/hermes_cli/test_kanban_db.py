@@ -719,13 +719,35 @@ def test_delete_task_missing_returns_false_not_running_error(kanban_home):
 # A worker that redirected only HERMES_HOME believed it was sandboxed and
 # wrote six real cards to the production board.
 
+def _simulate_inherited_pin(monkeypatch, pin: Path, *, started_at: Path) -> None:
+    """Make the guard see an INHERITED pin under a later HERMES_HOME redirect.
+
+    The real shape is a dispatched worker: the dispatcher put
+    ``HERMES_KANBAN_DB`` in its env before the process started, and the worker
+    then moved ``HERMES_HOME`` to sandbox itself. Reproduce that by setting the
+    module's import-time snapshot to the pin plus the HERMES_HOME the process
+    "started" with, rather than relying on this test process's real startup env.
+    """
+    monkeypatch.setattr(kb, "_PIN_AT_IMPORT", str(pin))
+    monkeypatch.setattr(kb, "_HERMES_HOME_AT_IMPORT", str(started_at))
+
+
 def test_kanban_db_override_outranks_hermes_home_without_sandbox(tmp_path, monkeypatch):
-    """Documents the trap: HERMES_HOME alone does NOT sandbox kanban."""
+    """The trap is now closed: HERMES_HOME alone does not sandbox, so we refuse.
+
+    The pin still OUTRANKS ``HERMES_HOME`` — that precedence is unchanged and is
+    what the dispatcher→worker handoff depends on. What changed is that a caller
+    which stated an isolation intent and would have silently got the live board
+    gets an error instead of a path.
+    """
     live = tmp_path / "live" / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
-    assert kb.kanban_db_path() == live
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    _simulate_inherited_pin(monkeypatch, live, started_at=tmp_path / "live")
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path()
 
 
 def test_sandbox_flag_makes_hermes_home_win_over_every_path_pin(tmp_path, monkeypatch):
@@ -892,8 +914,13 @@ def test_sandboxed_worker_env_cannot_reach_live_board(tmp_path, monkeypatch):
     assert not live_board.exists()
 
 
-def test_override_escaping_hermes_home_warns_once(tmp_path, monkeypatch, caplog):
-    """The escape is loud, not silent — but only once per (root, target)."""
+def test_override_escaping_hermes_home_REFUSES(tmp_path, monkeypatch):
+    """The escape is REFUSED, not merely logged — every time, not once.
+
+    This is the t_d2b884e7 shape: the warning fired, verbatim and accurate,
+    and the probe wrote a junk card plus 17 events onto 16 production cards
+    anyway. A warning on a destructive path is fail-open.
+    """
     live = tmp_path / "live" / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -901,17 +928,84 @@ def test_override_escaping_hermes_home_warns_once(tmp_path, monkeypatch, caplog)
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    _simulate_inherited_pin(monkeypatch, live, started_at=tmp_path / "live")
 
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path() == live
-        assert kb.kanban_db_path() == live
-    warnings = [r for r in caplog.records if "did NOT" in r.getMessage()]
-    assert len(warnings) == 1
-    assert "HERMES_KANBAN_SANDBOX=1" in warnings[0].getMessage()
+    with pytest.raises(kb.KanbanPinDivergenceError) as first:
+        kb.kanban_db_path()
+    assert "did NOT" in str(first.value)
+    assert "HERMES_KANBAN_SANDBOX=1" in str(first.value)
+    # A second call must refuse too: a warn-once ledger here would let a
+    # caller simply retry its way onto the live board.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path()
+    # And the live DB was never created, because no path was ever handed back.
+    assert not live.exists()
 
 
-def test_no_warning_when_override_lives_inside_hermes_home(tmp_path, monkeypatch, caplog):
-    """The dispatcher's normal pin (inside the root) must not warn."""
+def test_diverged_pin_cannot_create_a_task_or_append_an_event(tmp_path, monkeypatch):
+    """The acceptance shape: no WRITE can reach the pinned live board.
+
+    The incident was not a bad path string, it was rows on production cards.
+    Drive the actual mutation entry points, not just the resolver.
+    """
+    live_root = tmp_path / "live"
+    live_root.mkdir()
+    live = live_root / "kanban.db"
+    # Build a REAL board at the pinned path first, with HERMES_HOME agreeing,
+    # so the refusal below cannot be confused with "the DB did not exist".
+    monkeypatch.setenv("HERMES_HOME", str(live_root))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    with kb.connect() as conn:
+        real_task = kb.create_task(conn, title="production card", assignee="alice")
+    before = _row_and_event_counts(live)
+    assert before["tasks"] == 1
+
+    # Now the incident: redirect HERMES_HOME to sandbox, pin still points live.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    _simulate_inherited_pin(monkeypatch, live, started_at=live_root)
+
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path()
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.connect()
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        with kb.connect_closing() as conn:
+            kb.create_task(conn, title="junk card")
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        with kb.connect_closing() as conn:
+            kb._append_event(conn, real_task, "review_stale_alerted", {})
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.init_db()
+
+    assert _row_and_event_counts(live) == before
+
+
+def _row_and_event_counts(db_path: Path) -> dict:
+    """Read tasks/events straight off disk, bypassing kanban_db entirely.
+
+    Deliberately NOT via ``kb.connect()``: the guard under test refuses that,
+    and a counting helper that the guard can block would make the assertion
+    vacuous.
+    """
+    import sqlite3 as _sqlite3
+
+    conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return {
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+
+def test_no_refusal_when_override_lives_inside_hermes_home(tmp_path, monkeypatch):
+    """The dispatcher's normal pin (inside the root) must resolve untouched."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
@@ -920,143 +1014,243 @@ def test_no_warning_when_override_lives_inside_hermes_home(tmp_path, monkeypatch
     monkeypatch.setenv("HERMES_KANBAN_DB", str(inside))
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
 
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path() == inside
-    assert [r for r in caplog.records if "did NOT" in r.getMessage()] == []
+    assert kb.kanban_db_path() == inside
+
+
+def test_pin_without_hermes_home_still_resolves(tmp_path, monkeypatch):
+    """The ordinary operator case: a pin and no HERMES_HOME at all.
+
+    Nobody claimed an isolation intent here, so there is no divergence to
+    refuse and the pin must keep working exactly as before.
+    """
+    live = tmp_path / "live" / "kanban.db"
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+
+    assert kb.kanban_db_path() == live
 
 
 # --- pin vs EXPLICIT board argument ----------------------------------------
 #
-# The other silent shape: the caller passes a board argument, the pin resolves
-# to a DIFFERENT board's DB, and the pin wins with no signal — so the caller
-# reads a board it did not ask for. Produced two wrong readings inside one task
-# (t_a1e6e877): a repro that wrote junk cards to the live default board, and a
-# review probe that nearly became a false BEHAVIOUR finding against correct
-# code. Resolution stays pin-wins (the dispatcher->worker handoff depends on
-# it); only the silence is fixed.
+# The other shape of the same class: the caller passes a board argument, the
+# pin resolves to a DIFFERENT board's DB, and the pin wins — so the caller
+# reads (and writes) a board it did not ask for. Produced two wrong readings
+# inside one task (t_a1e6e877): a repro that wrote junk cards to the live
+# default board, and a review probe that nearly became a false BEHAVIOUR
+# finding against correct code. Making it loud did not stop it (t_d2b884e7),
+# so the contradiction now REFUSES.
 
 _CONTRADICTION_MARKER = "outranks the board argument"
 
 
 @pytest.fixture
 def _pin_contradiction_env(tmp_path, monkeypatch):
-    """Worker-shaped env: a pin on one board, callers asking for another."""
+    """Worker-shaped env: an INHERITED pin on one board, callers asking another.
+
+    The pin is made to look inherited under a later ``HERMES_HOME`` redirect —
+    the dispatched-worker shape the guard exists for. A pin the process chose
+    itself is deliberately NOT a refusal (see
+    ``test_a_self_chosen_pin_outside_hermes_home_is_left_alone``).
+    """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
-    monkeypatch.setattr(kb, "_PIN_CONTRADICTION_WARNED", {})
     pinned = kb.board_dir("pinned-board") / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+    _simulate_inherited_pin(monkeypatch, pinned, started_at=tmp_path / "dispatcher-home")
     return pinned
 
 
-def test_pin_contradicting_explicit_board_arg_warns_once(
-    _pin_contradiction_env, caplog,
+def test_a_self_chosen_pin_outside_hermes_home_is_left_alone(tmp_path, monkeypatch):
+    """The narrowing, stated as a test: choosing your own pin is not the bug.
+
+    Every kanban test fixture, and any tool that deliberately opens a specific
+    DB, pins ``HERMES_KANBAN_DB`` itself while ``HERMES_HOME`` points somewhere
+    else entirely. Nobody is being silently un-sandboxed there — the caller
+    named the file. A blanket refusal broke 33 such tests across 9 files, so
+    this shape must keep resolving, for both guards.
+    """
+    chosen = tmp_path / "my-own" / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
+    # Nothing inherited: this process set the pin itself.
+    monkeypatch.setattr(kb, "_PIN_AT_IMPORT", "")
+    monkeypatch.setattr(kb, "_HERMES_HOME_AT_IMPORT", str(tmp_path / "hermes_test"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(chosen))
+
+    assert kb.kanban_db_path() == chosen          # escape guard: no refusal
+    assert kb.kanban_db_path("default") == chosen  # board guard: no refusal
+
+
+def test_a_pin_reaching_the_machines_real_hermes_home_always_refuses(
+    tmp_path, monkeypatch,
 ):
-    """The contradiction is loud, names both paths, and fires once."""
+    """Shape 2 of the hazard: no in-process change, but the pin IS production.
+
+    ``HERMES_HOME=$(mktemp -d) HERMES_KANBAN_DB=~/.hermes/kanban.db cmd`` sets
+    both at once, so there is no redirect to detect — and it is still the
+    incident. Refusal must not depend on provenance when the target is the
+    machine's live board.
+    """
+    from hermes_constants import _get_platform_default_hermes_home
+
+    live = _get_platform_default_hermes_home() / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
+    monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
+    # Deliberately NOT inherited — provenance must not excuse this.
+    monkeypatch.setattr(kb, "_PIN_AT_IMPORT", "")
+    monkeypatch.setattr(kb, "_HERMES_HOME_AT_IMPORT", str(tmp_path / "scratch"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
+
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path()
+
+
+def test_pin_contradicting_explicit_board_arg_REFUSES(_pin_contradiction_env):
+    """The contradiction raises, names both paths, and raises EVERY time."""
     pinned = _pin_contradiction_env
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        # Resolution is UNCHANGED: the pin still wins.
-        assert kb.kanban_db_path("other-board") == pinned
-        assert kb.kanban_db_path("other-board") == pinned
-    warnings = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
-    assert len(warnings) == 1
-    message = warnings[0].getMessage()
+    with pytest.raises(kb.KanbanPinDivergenceError) as first:
+        kb.kanban_db_path("other-board")
+    message = str(first.value)
+    assert _CONTRADICTION_MARKER in message
     # Must name the board asked for AND both paths, or it can't be acted on.
     assert "other-board" in message
     assert str(pinned) in message
     assert str(kb.board_dir("other-board") / "kanban.db") in message
     assert "HERMES_KANBAN_SANDBOX=1" in message
+    # Not warn-once: a retry must not succeed where the first call refused.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path("other-board")
+    # And the same refusal reaches a caller going through connect().
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.connect(board="other-board")
 
 
-def test_pin_contradiction_warns_without_hermes_home(
-    _pin_contradiction_env, monkeypatch, caplog,
+def test_pin_contradiction_refuses_without_hermes_home(
+    _pin_contradiction_env, monkeypatch,
 ):
-    """The gap shape: no HERMES_HOME, so the escape warning cannot fire.
+    """The gap shape: no HERMES_HOME, so the escape guard cannot fire.
 
-    ``_warn_if_override_escapes_hermes_home`` returns early with no
-    ``HERMES_HOME`` set. This case must still be loud, or the exact situation
-    that produced the two wrong readings stays silent.
+    ``_refuse_if_override_escapes_hermes_home`` returns early with no
+    ``HERMES_HOME`` set. This case must still refuse, or the exact situation
+    that produced the two wrong readings stays fail-open.
     """
     monkeypatch.delenv("HERMES_HOME", raising=False)
-    with caplog.at_level("WARNING", logger=kb.__name__):
+    with pytest.raises(kb.KanbanPinDivergenceError) as err:
         kb.kanban_db_path("other-board")
-    assert [r for r in caplog.records if "did NOT" in r.getMessage()] == []
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
+    assert _CONTRADICTION_MARKER in str(err.value)
+    assert "did NOT" not in str(err.value)
 
 
-def test_no_contradiction_warning_when_pin_matches_requested_board(
-    _pin_contradiction_env, caplog,
-):
-    """The normal worker case: pin and board argument agree. Must be silent."""
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path("pinned-board") == _pin_contradiction_env
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
+def test_no_refusal_when_pin_matches_requested_board(_pin_contradiction_env):
+    """The normal worker case: pin and board argument agree. Must resolve."""
+    assert kb.kanban_db_path("pinned-board") == _pin_contradiction_env
 
 
-def test_no_contradiction_warning_when_board_arg_is_none(
-    _pin_contradiction_env, caplog,
-):
+def test_uncreated_pin_agreement_requires_exact_missing_tail(tmp_path):
+    """A missing grandparent still permits identical pins, not lookalikes."""
+    board = tmp_path / "missing" / "boards" / "kanban.db"
+    assert kb._pin_file_agrees(board, board)
+    assert not kb._pin_file_agrees(board, board.with_name("other.db"))
+    assert not kb._pin_file_agrees(board, tmp_path / "MISSING" / "boards" / "kanban.db")
+
+
+def test_identical_pin_under_uncreated_home_does_not_refuse(tmp_path, monkeypatch):
+    home = tmp_path / "missing" / ".hermes"
+    pin = home / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    monkeypatch.setattr(kb, "_pin_divergence_is_a_hazard", lambda target: True)
+    kb._CHECKED_OVERRIDE_ESCAPES.clear()
+    try:
+        assert kb.kanban_db_path() == pin
+    finally:
+        kb._CHECKED_OVERRIDE_ESCAPES.clear()
+
+
+def test_missing_pin_agreement_is_shared_by_both_guards(tmp_path, monkeypatch):
+    """An uncreated home and an uncreated DB use the same exact-tail rule."""
+    home = tmp_path / "missing" / ".hermes"
+    pin = home / "boards" / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    monkeypatch.setattr(kb, "_pin_divergence_is_a_hazard", lambda target: True)
+    kb._CHECKED_OVERRIDE_ESCAPES.clear()
+    try:
+        assert kb.kanban_db_path() == pin
+        assert kb._pin_tree_agrees(pin, home)
+        assert not kb._pin_tree_agrees(tmp_path / "MISSING" / ".hermes" / "kanban.db", home)
+        assert not kb._pin_tree_agrees(tmp_path / "missing" / ".HERMES" / "kanban.db", home)
+        assert not kb._pin_tree_agrees(tmp_path / "missing" / "other" / "kanban.db", home)
+    finally:
+        kb._CHECKED_OVERRIDE_ESCAPES.clear()
+
+
+def test_no_refusal_when_board_arg_is_none(_pin_contradiction_env):
     """board=None means the pin IS the intended source of truth — no conflict."""
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path() == _pin_contradiction_env
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
+    assert kb.kanban_db_path() == _pin_contradiction_env
 
 
-def test_sandbox_flag_suppresses_contradiction_warning(
-    _pin_contradiction_env, monkeypatch, caplog,
+def test_sandbox_flag_neutralises_the_pin_so_nothing_refuses(
+    _pin_contradiction_env, monkeypatch,
 ):
-    """Under the sandbox the pin is neutralised, so there is nothing to warn about."""
+    """The documented escape hatch: HERMES_KANBAN_SANDBOX=1 still isolates.
+
+    Under the sandbox the pin is neutralised, so the divergence cannot arise
+    and the requested board resolves for real.
+    """
     monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        resolved = kb.kanban_db_path("other-board")
+    resolved = kb.kanban_db_path("other-board")
     assert resolved == kb.board_dir("other-board") / "kanban.db"
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
 
 
-def test_board_enumeration_does_not_spam_contradiction_warnings(
-    _pin_contradiction_env, caplog,
-):
-    """Bulk enumeration must stay quiet, or the guard gets trained away.
+def test_board_enumeration_does_not_trip_the_refusal(_pin_contradiction_env):
+    """Bulk enumeration must not refuse, or every sweep dies under a pin.
 
     ``read_board_metadata`` fills a display ``db_path`` for every board on
-    disk; under a pin every non-active slug trivially disagrees. Measured at
-    64 warnings on one dispatcher sweep before this was scoped out.
+    disk; under a pin every non-active slug trivially disagrees. With the
+    guard raising, an unscoped sweep would not merely be noisy — it would
+    break the dispatcher.
     """
     for slug in ("alpha-board", "beta-board", "gamma-board"):
         (kb.board_dir(slug)).mkdir(parents=True, exist_ok=True)
         (kb.board_dir(slug) / "board.json").write_text("{}", encoding="utf-8")
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        boards = kb.list_boards(include_archived=False)
-        kb.count_running_tasks_other_boards(board="pinned-board")
+    boards = kb.list_boards(include_archived=False)
+    kb.count_running_tasks_other_boards(board="pinned-board")
     assert len(boards) >= 4  # default + the three created above
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()] == []
 
 
-def test_no_board_enumerator_spams_contradiction_warnings(
-    _pin_contradiction_env, caplog,
-):
-    """Class gate, part 1: every REACHABLE board-enumerating entry point.
+def test_no_board_enumerator_trips_the_refusal(_pin_contradiction_env):
+    """Class gate: every REACHABLE board-enumerating entry point must survive.
 
     Discovery is derived from ``list_boards()`` rather than from a hand-written
     list of slugs, and each entry point is driven end-to-end so the nested
     ``connect()`` / ``connect_closing()`` resolutions are covered too. That
-    nesting is why the first cut failed review: it passed a per-call
-    ``warn_on_pin_contradiction=False`` flag at each ``kanban_db_path()`` site,
-    but ``_board_task_counts`` and ``_board_counts`` also open the board, and
-    ``connect()`` re-resolves the path internally with no flag to thread
-    through. Measured on that design, ``_board_task_counts`` still emitted 8
-    warnings over 8 boards despite its call site being flagged.
+    nesting is why a per-call flag cannot work: ``_board_task_counts`` and
+    ``_board_counts`` also open the board, and ``connect()`` re-resolves the
+    path internally with no flag to thread through.
+
+    Now that the guard RAISES, an unscoped enumerator is not a noise bug — it
+    is an outage. This gate is what proves the ``enumerating_boards`` extent
+    covers them all.
 
     DOES NOT COVER: enumerators that are nested closures inside a running
     coroutine (``gateway/kanban_watchers.py``'s ``_board_db_fingerprint``) are
-    not importable and cannot be driven from here. Those are bounded instead by
-    the per-process ceiling — see
-    ``test_pin_contradiction_warnings_are_capped_regardless_of_board_count``,
-    which is the part of this gate that does not require registration.
+    not importable and cannot be driven from here.
     """
     from hermes_cli import kanban as kc
     from plugins.kanban.dashboard import plugin_api
@@ -1073,7 +1267,7 @@ def test_no_board_enumerator_spams_contradiction_warnings(
     # for all of them, matching the live worker shape.
     with kb.enumerating_boards():
         kb.connect(board="pinned-board").close()
-    assert kb.kanban_db_path("alpha-board").exists()
+        assert kb.kanban_db_path("alpha-board").exists()
 
     def _slugs():
         return [b["slug"] for b in kb.list_boards(include_archived=False)]
@@ -1091,133 +1285,291 @@ def test_no_board_enumerator_spams_contradiction_warnings(
         ),
         # The enrich loops themselves, driven end-to-end. These are the
         # body-spanning extents; a half-applied one (resolve scoped, open not)
-        # shows up here as a non-zero count.
+        # shows up here as a refusal.
         "dashboard GET /boards (enrich loop)": (
             lambda: plugin_api.list_boards(include_archived=False)
         ),
     }
     offenders = {}
     for name, call in entry_points.items():
-        caplog.clear()
         kb._CHECKED_PIN_BOARD_CONTRADICTIONS.clear()
-        kb._PIN_CONTRADICTION_WARNED.clear()
-        with caplog.at_level("WARNING", logger=kb.__name__):
+        try:
             call()
-        hits = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
-        if hits:
-            offenders[name] = len(hits)
-    assert offenders == {}, f"board enumerators spamming the pin guard: {offenders}"
+        except kb.KanbanPinDivergenceError as exc:
+            offenders[name] = str(exc)
+    assert offenders == {}, f"board enumerators tripping the pin guard: {offenders}"
 
 
-def test_pin_contradiction_warnings_are_capped_regardless_of_board_count(
-    _pin_contradiction_env, caplog,
+def test_unscoped_sweep_refuses_on_the_FIRST_board_not_the_eightieth(
+    _pin_contradiction_env,
 ):
-    """Class gate, part 2: the ceiling holds for an UNREGISTERED enumerator.
+    """A forgetful enumerator fails fast and identically at any scale.
 
-    Part 1 can only drive enumerators a test can reach. The failure it cannot
-    prevent is the one that already happened twice: a new per-board loop lands
-    somewhere nobody registers, and at 65 live boards it burns 65 log lines per
-    process and trains operators to ignore the guard.
-
-    So the bound is structural rather than registered. This drives a
-    deliberately UNSCOPED sweep — exactly what a forgetful author would
-    write — over two board counts an order of magnitude apart, and asserts the
-    emitted volume is capped and SCALE-INVARIANT. No registration required for
-    a new site to be bounded; forgetting the extent costs a handful of lines,
-    never one per board.
+    The previous design bounded WARNINGS with a per-call-site budget, and that
+    budget was itself a fail-open surface: past the ceiling a genuine
+    single-board misreading went silent. A refusal has no budget to exhaust —
+    it stops at the first divergence, at 8 boards and at 80 alike.
     """
-    def _unscoped_sweep(n: int) -> int:
+    def _boards_reached_before_refusal(n: int) -> int:
         kb._CHECKED_PIN_BOARD_CONTRADICTIONS.clear()
-        kb._PIN_CONTRADICTION_WARNED.clear()
-        caplog.clear()
-        with caplog.at_level("WARNING", logger=kb.__name__):
-            for i in range(n):
+        reached = 0
+        for i in range(n):
+            try:
                 kb.kanban_db_path(f"sweep{n}-board-{i}")  # no enumerating_boards()
-        return len([
-            r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()
-        ])
+            except kb.KanbanPinDivergenceError:
+                break
+            reached += 1
+        return reached
 
-    small = _unscoped_sweep(8)
-    large = _unscoped_sweep(80)
-    assert small <= kb._PIN_CONTRADICTION_WARN_BUDGET
-    # Scale invariance is the property: 10x the boards must not mean 10x the
-    # noise. A per-board warning would make this 8 vs 80.
-    assert small == large, (
-        f"contradiction warnings scale with board count: {small} at 8 boards, "
-        f"{large} at 80 — the per-process ceiling is not holding"
-    )
+    assert _boards_reached_before_refusal(8) == 0
+    assert _boards_reached_before_refusal(80) == 0
 
 
-def test_enumeration_noise_cannot_silence_a_later_addressing_warning(
-    _pin_contradiction_env, caplog,
+def test_enumeration_cannot_exhaust_a_later_addressing_refusal(
+    _pin_contradiction_env,
 ):
-    """The ceiling must not reintroduce this card's own defect one level up.
+    """The refusal must not be spendable by prior enumeration.
 
-    With a PROCESS-GLOBAL budget, any per-board loop that forgot the extent
-    looked like N addressing calls, burned the whole budget, and the genuine
-    single-board misreading the guard exists to surface went SILENT afterwards.
-    Measured on that design: 8 unscoped ``connect(board=slug)`` calls emitted 5
-    warnings, then ``kanban_db_path('account-health')`` returned the pin path
-    with 0 warnings — run-1022's exact probe, silent again, in a process that
-    merely enumerated boards first.
-
-    The budget is therefore charged PER CALL SITE. This drives both the loud
-    and the silent shapes of enumeration noise and asserts a subsequent
-    addressing call still warns in every one.
+    With a per-call-site WARNING budget, any per-board loop that forgot the
+    extent burned the budget and the genuine single-board misreading the guard
+    exists to surface went SILENT afterwards. A refusal has to survive an
+    arbitrary amount of prior enumeration, scoped or not.
     """
-    def _addressing_is_loud(slug: str) -> bool:
-        caplog.clear()
-        with caplog.at_level("WARNING", logger=kb.__name__):
+    def _addressing_refuses(slug: str) -> bool:
+        try:
             kb.kanban_db_path(slug)
-        return bool([
-            r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()
-        ])
+        except kb.KanbanPinDivergenceError:
+            return True
+        return False
 
-    # (a) an UNSCOPED per-board sweep — the forgetful-author shape.
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        for i in range(kb._PIN_CONTRADICTION_WARN_BUDGET * 4):
-            kb.kanban_db_path(f"noisy-sweep-board-{i}")
-    assert _addressing_is_loud("addressed-after-unscoped"), (
-        "enumeration noise consumed the budget and silenced a genuine "
-        "single-board contradiction"
-    )
+    # (a) a correctly SCOPED sweep of many boards must not spend anything.
+    for i in range(40):
+        with kb.enumerating_boards():
+            kb.kanban_db_path(f"scoped-sweep-board-{i}")
+    assert _addressing_refuses("addressed-after-scoped")
 
-    # (b) a correctly SCOPED sweep must equally not spend anyone's budget.
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        for i in range(kb._PIN_CONTRADICTION_WARN_BUDGET * 4):
-            with kb.enumerating_boards():
-                kb.kanban_db_path(f"scoped-sweep-board-{i}")
-    assert _addressing_is_loud("addressed-after-scoped")
+    # (b) repeated refusals from unscoped calls must not become permissive.
+    for i in range(40):
+        assert _addressing_refuses(f"noisy-sweep-board-{i}")
+    assert _addressing_refuses("addressed-after-unscoped")
 
 
-def test_enumerating_each_scopes_the_whole_loop_body(
-    _pin_contradiction_env, caplog,
+def test_enumerated_slug_survives_the_extent_exiting_and_a_thread_hop(
+    _pin_contradiction_env,
 ):
+    """The extent is scoped to a THREAD and a MOMENT; enumerated slugs are not.
+
+    Round-1 review of this card found the notifier's board-scoped
+    ``asyncio.to_thread`` offloads landing outside the extent. Reproducing it
+    showed a second, wider axis the thread framing missed: the notifier's
+    ``_collect()`` sweeps boards, stores ``{"board": slug}`` in a delivery dict
+    and RETURNS — so the extent has already exited before the delivery leg
+    addresses that slug, even single-threaded.
+
+    Measured on the pre-fix commit, both refused; under a raising guard that is
+    an outage on the notifier, not noise. Provenance therefore rides on the
+    slug VALUE, which is the thing that actually travels.
+    """
+    collected = [
+        meta["slug"] for meta in kb.enumerating_each(kb.list_boards(include_archived=False))
+    ]
+    assert collected, "fixture must expose at least the default board"
+    # The extent is gone here. This is the notifier's delivery leg.
+    assert kb._enumeration_depth() == 0
+
+    for slug in collected:
+        # (a) same thread, later in time.
+        kb.kanban_db_path(board=slug)
+        # (b) another thread entirely — no extent could have propagated.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(kb.kanban_db_path, slug).result()
+            # The nested internal re-resolve inside connect() too.
+            pool.submit(lambda s=slug: kb.connect(board=s).close()).result()
+
+
+def test_enumerated_provenance_does_not_weaken_the_addressing_refusal(
+    _pin_contradiction_env,
+):
+    """The mark must exempt ENUMERATORS without disarming the guard.
+
+    A slug that merely looks the same is still a caller naming a board, so it
+    must refuse. In particular the mark must not survive serialization: a slug
+    that round-trips through JSON comes back a plain ``str`` and re-arms the
+    guard, which is the fail-CLOSED direction.
+    """
+    enumerated = [
+        meta["slug"]
+        for meta in kb.enumerating_each(kb.list_boards(include_archived=False))
+    ]
+    # An unmarked slug naming a different board than the pin: still refused.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path(board="other-board")
+
+    # Same VALUE as an enumerated slug, but stripped of provenance.
+    for slug in enumerated:
+        plain = json.loads(json.dumps(slug))
+        assert not isinstance(plain, kb.EnumeratedBoardSlug)
+        if kb.kanban_db_path(board=kb.enumerated_slug(slug)) == _pin_contradiction_env:
+            # This slug genuinely agrees with the pin; it cannot demonstrate
+            # the refusal either way. Skip rather than assert a false positive.
+            continue
+        with pytest.raises(kb.KanbanPinDivergenceError):
+            kb.kanban_db_path(board=plain)
+
+
+def test_the_discovery_FALLBACK_also_survives_the_refusal(_pin_contradiction_env):
+    """``read_board_metadata`` is the fallback EVERY board sweep degrades to.
+
+    Round-1 review asked for a sweep over every path that carries a board slug
+    into resolution from outside the extent. The sweep turned up a shape the
+    thread framing missed, and it is not an offload at all::
+
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+
+    (``gateway/kanban_watchers.py`` x4, ``tui_gateway/server.py``,
+    ``plugins/kanban/dashboard/plugin_api.py``.) That branch is evaluated
+    BEFORE ``enumerating_each()`` gets a chance to stamp anything, so neither
+    the extent nor the value-provenance mark covered it — and
+    ``read_board_metadata`` documents "Never raises", which the refusal broke.
+    It is also precisely the already-degraded path, where a second failure is
+    least survivable.
+
+    Measured under the pre-fix guard: REFUSED on both arms below.
+    """
+    # The bare fallback call itself.
+    meta = kb.read_board_metadata(kb.DEFAULT_BOARD)
+    assert meta["slug"] == kb.DEFAULT_BOARD
+    assert meta["db_path"]
+
+    # The fallback LIST driven through the sweep, exactly as the callers do.
+    for board_meta in kb.enumerating_each([kb.read_board_metadata(kb.DEFAULT_BOARD)]):
+        slug = board_meta.get("slug") or kb.DEFAULT_BOARD
+        kb.kanban_db_path(slug)
+        kb.connect(board=slug).close()
+
+    # The guard is still armed for a caller that NAMES a board: reporting a
+    # board's db_path is not permission to address it.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path(board="other-board")
+
+
+def test_collected_slugs_survive_an_asyncio_to_thread_offload(_pin_contradiction_env):
+    """The notifier's real shape: collect in the loop, write from a worker thread.
+
+    ``gateway/kanban_watchers.py`` offloads every board-scoped write through
+    ``_to_thread_process_service`` -> ``asyncio.to_thread(Context().run, ...)``,
+    which crosses BOTH a thread boundary and a fresh-``Context`` boundary
+    (``_run_in_fresh_context`` deliberately drops the caller's ContextVars).
+    Ten call sites do this. A ``threading.local()`` extent reaches none of
+    them, and a ``ContextVar`` would not have survived the Context scrub
+    either — which is why provenance rides on the slug VALUE.
+
+    This is the cross-thread arm the round-1 review asked for; without it the
+    enumerator gate is single-threaded and structurally cannot see this axis.
+    """
+    import asyncio
+    import contextvars
+
+    def _run_in_fresh_context(func, /, *args):
+        # Verbatim shape of gateway/kanban_watchers.py::_run_in_fresh_context.
+        return contextvars.Context().run(func, *args)
+
+    def _collect():
+        # The notifier's _collect(): sweep, stash slugs, RETURN (extent exits).
+        return [
+            {"board": m.get("slug") or kb.DEFAULT_BOARD}
+            for m in kb.enumerating_each(kb.list_boards(include_archived=False))
+        ]
+
+    async def _tick():
+        deliveries = await asyncio.to_thread(_collect)
+        assert deliveries, "fixture must expose at least the default board"
+        # The extent is gone by here — this is the delivery leg.
+        assert kb._enumeration_depth() == 0
+        for d in deliveries:
+            slug = d["board"]
+            # The write leg, offloaded exactly as the notifier offloads it.
+            await asyncio.to_thread(_run_in_fresh_context, kb.kanban_db_path, slug)
+            await asyncio.to_thread(
+                _run_in_fresh_context, lambda s=slug: kb.connect(board=s).close()
+            )
+
+    asyncio.run(_tick())
+
+    # Same offload, but a caller-NAMED slug: must still refuse. A thread hop
+    # is not a way to launder provenance.
+    async def _named():
+        return await asyncio.to_thread(
+            _run_in_fresh_context, kb.kanban_db_path, "other-board"
+        )
+
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        asyncio.run(_named())
+
+
+def test_list_boards_stamps_at_the_SOURCE_for_consumers_that_skip_the_helper(
+    _pin_contradiction_env,
+):
+    """``list_boards()`` must stamp its own entries, not rely on the iterator.
+
+    Not every consumer goes through :func:`enumerating_each`. Two real ones
+    take the list and index it directly::
+
+        hermes_cli/kanban.py:2032                  all_boards = kb.list_boards(...)
+        plugins/kanban/dashboard/plugin_api.py:2521 boards = kanban_db.list_boards(...)
+
+    Those never enter the extent and never get stamped by the iterator, so the
+    stamp has to happen at the SOURCE. Without this arm, removing the
+    ``list_boards`` stamp is a surviving mutant: the ``enumerating_each`` tests
+    all still pass because the helper re-stamps on the way past.
+    """
+    boards = kb.list_boards(include_archived=False)
+    assert boards, "fixture must expose at least the default board"
+    for meta in boards:
+        assert isinstance(meta["slug"], kb.EnumeratedBoardSlug), (
+            f"list_boards() returned an unstamped slug {meta['slug']!r}; a "
+            f"consumer that skips enumerating_each() would refuse on it"
+        )
+
+    # Consumed raw, with no extent anywhere: must resolve and open.
+    for meta in boards:
+        kb.kanban_db_path(meta["slug"])
+        kb.connect(board=meta["slug"]).close()
+
+    # Still armed for a caller-named board.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path(board="other-board")
+
+
+def test_enumerating_each_scopes_the_whole_loop_body(_pin_contradiction_env):
     """The extent must cover the OPEN, not just the path resolve.
 
     Wrapping only ``kanban_db_path`` inside a per-board loop half-applies: the
     body then calls ``connect(board=slug)`` / ``count_notify_subs(board=slug)``,
     which re-resolve internally and land outside the extent. That is what the
-    dispatcher tick shipped as, and it both spammed and then went silent.
-    ``enumerating_each`` wraps the body, which cannot half-apply.
+    dispatcher tick shipped as. ``enumerating_each`` wraps the body, which
+    cannot half-apply.
     """
     slugs = [f"body-board-{i}" for i in range(6)]
 
     def _sweep(iterator) -> int:
+        """Return how many boards completed a resolve AND an open."""
         kb._CHECKED_PIN_BOARD_CONTRADICTIONS.clear()
-        kb._PIN_CONTRADICTION_WARNED.clear()
-        caplog.clear()
-        with caplog.at_level("WARNING", logger=kb.__name__):
-            for slug in iterator:
-                # A resolve AND an open, the real per-board loop shape.
-                kb.kanban_db_path(slug)
-                kb.count_notify_subs(board=slug)
-        return len([
-            r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()
-        ])
+        completed = 0
+        for slug in iterator:
+            # A resolve AND an open, the real per-board loop shape.
+            kb.kanban_db_path(slug)
+            kb.count_notify_subs(board=slug)
+            completed += 1
+        return completed
 
-    assert _sweep(iter(slugs)) > 0  # control: unscoped really does warn
-    assert _sweep(kb.enumerating_each(slugs)) == 0
+    # control: unscoped really does refuse.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        _sweep(iter(slugs))
+    assert _sweep(kb.enumerating_each(slugs)) == len(slugs)
 
     # `break` must not leak the extent past the loop.
     for slug in kb.enumerating_each(slugs):
@@ -1229,29 +1581,6 @@ def test_enumerating_each_scopes_the_whole_loop_body(
         for slug in kb.enumerating_each(slugs):
             raise RuntimeError("body blew up")
     assert kb._enumeration_depth() == 0
-
-
-def test_pin_contradiction_ceiling_announces_itself_before_going_quiet(
-    _pin_contradiction_env, caplog,
-):
-    """Suppression must be visible, or the ceiling becomes a silent gap.
-
-    Going quiet without saying so would reintroduce this card's whole defect
-    class one level up: an operator reading 5 warnings on a 65-board host must
-    be able to tell that more were withheld.
-    """
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        for i in range(kb._PIN_CONTRADICTION_WARN_BUDGET + 4):
-            kb.kanban_db_path(f"ceiling-board-{i}")
-    per_board = [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
-    suppressed = [
-        r for r in caplog.records
-        if "suppressing further per-board contradiction warnings" in r.getMessage()
-    ]
-    assert len(per_board) == kb._PIN_CONTRADICTION_WARN_BUDGET
-    # Exactly one summary line, not one per suppressed board.
-    assert len(suppressed) == 1
-    assert "HERMES_KANBAN_SANDBOX=1" in suppressed[0].getMessage()
 
 
 def test_enumerating_boards_extent_is_thread_local(_pin_contradiction_env):
@@ -1312,32 +1641,35 @@ def test_enumerating_boards_is_reentrant_and_restores_depth(_pin_contradiction_e
     assert kb._enumeration_depth() == 0
 
 
-def test_dispatcher_worker_pin_handoff_still_wins_over_board_arg(
-    _pin_contradiction_env, caplog,
+def test_dispatcher_worker_pin_handoff_still_wins_when_the_board_AGREES(
+    _pin_contradiction_env,
 ):
-    """The contract option (b) would have broken: pin beats the board argument.
+    """The dispatcher→worker handoff must keep working under the refusal.
 
     ``_default_spawn`` injects ``HERMES_KANBAN_DB`` so a worker that re-resolves
     kanban paths (e.g. under a profile-rewritten HERMES_HOME) still converges on
-    the DB the dispatcher claimed its task from. Honouring the board argument
-    over the pin would silently undo that. This asserts the precedence the
-    warning is explicitly NOT changing — including through ``connect()``, which
-    is what a worker's board-scoped reads actually go through.
+    the DB the dispatcher claimed its task from. That handoff is the reason the
+    pin outranks everything, and it is untouched here: the worker's own board
+    argument AGREES with the pin, so nothing diverges and the pin resolves —
+    including through ``connect()``, which is what a worker's board-scoped reads
+    actually go through.
+
+    Asking for a DIFFERENT board is the divergence, and that now refuses rather
+    than silently handing back the pinned board.
     """
     pinned = _pin_contradiction_env
-    with caplog.at_level("WARNING", logger=kb.__name__):
-        assert kb.kanban_db_path("other-board") == pinned
-        # A worker asking for a different board still lands on the pinned DB.
-        kb.init_db()
-        with kb.connect(board="other-board") as conn:
-            task_id = kb.create_task(conn, title="handoff card", assignee="alice")
-        assert pinned.exists()
-        assert not (kb.board_dir("other-board") / "kanban.db").exists()
-        # And the card is readable back through the pin, board arg or not.
-        with kb.connect() as conn:
-            assert kb.get_task(conn, task_id) is not None
-    # The contradiction was still reported — pin-wins is not silent any more.
-    assert [r for r in caplog.records if _CONTRADICTION_MARKER in r.getMessage()]
+    assert kb.kanban_db_path("pinned-board") == pinned
+    kb.init_db()
+    with kb.connect(board="pinned-board") as conn:
+        task_id = kb.create_task(conn, title="handoff card", assignee="alice")
+    assert pinned.exists()
+    # And the card is readable back through the pin with no board arg at all.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id) is not None
+    # The divergent ask refuses instead of quietly returning `pinned`.
+    with pytest.raises(kb.KanbanPinDivergenceError):
+        kb.kanban_db_path("other-board")
+    assert not (kb.board_dir("other-board") / "kanban.db").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1631,10 +1963,14 @@ def test_respawn_guard_still_defers_open_pr_after_automatic_reclaim(
         worker = kb.claim_task(conn, task_id)
         assert worker is not None and worker.worker_pid is None
         assert worker.claim_expires is not None
+        kb._set_worker_pid(conn, task_id, 999999)  # worker has exited
         kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
 
+        def absent_process(_pid, _sig):
+            raise ProcessLookupError
+
         now = worker.claim_expires + 1
-        assert kb.release_stale_claims(conn) == 1
+        assert kb.release_stale_claims(conn, signal_fn=absent_process) == 1
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "ready"
         reclaimed = next(e for e in kb.list_events(conn, task_id) if e.kind == "reclaimed")
@@ -1652,10 +1988,14 @@ def test_respawn_guard_allows_open_pr_after_manual_reclaim(kanban_home, monkeypa
         worker = kb.claim_task(conn, task_id)
         assert worker is not None and worker.worker_pid is None
         assert worker.claim_expires is not None
+        kb._set_worker_pid(conn, task_id, 999999)  # worker has exited
         kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/1")
 
+        def absent_process(_pid, _sig):
+            raise ProcessLookupError
+
         now = worker.claim_expires + 1
-        assert kb.reclaim_task(conn, task_id, reason="Amend the existing PR")
+        assert kb.reclaim_task(conn, task_id, reason="Amend the existing PR", signal_fn=absent_process)
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "ready"
         reclaimed = next(e for e in kb.list_events(conn, task_id) if e.kind == "reclaimed")
@@ -3205,6 +3545,459 @@ def test_operator_requeue_verbs_all_override_active_pr(kanban_home, monkeypatch)
         assert kb.check_respawn_guard(conn, task_id) is None
 
 
+def test_dependency_wait_promoted_resumes_open_pr_once(kanban_home, all_assignees_spawnable, monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume then complete", kind="dependency")
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, child).status == "ready"
+        spawned = []
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
+        assert child in spawned
+        assert result.spawned
+        # A second crash/reclaim must not get the same one-shot exemption.
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=?", (child,))
+        conn.commit()
+        assert kb.check_respawn_guard(conn, child) == "active_pr"
+
+
+def test_dependency_wait_ordinary_comment_after_block_resumes_same_pr(kanban_home, all_assignees_spawnable, monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume", kind="dependency")
+        kb.add_comment(conn, child, "alice", "Waiting for parent; no new PR")
+        assert kb.complete_task(conn, parent)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
+        assert child in spawned
+
+
+def test_dependency_wait_before_newer_pr_comment_does_not_resume(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="operator", reason="rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume", kind="dependency")
+        kb.add_comment(conn, child, "alice", "newer https://github.com/o/r/pull/10")
+        assert kb.complete_task(conn, parent)
+        assert kb.check_respawn_guard(conn, child) == "active_pr"
+
+
+def test_requeue_ready_card_overrides_active_pr(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, int(time.time()))
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="resume")[0] is False
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="retry PR") == (True, None)
+        assert kb.list_events(conn, task_id)[-1].kind == "requeued"
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+@pytest.mark.parametrize("later_pr_second", [False, True])
+def test_requeue_intent_preceding_new_pr_is_not_reused(kanban_home, monkeypatch, later_pr_second):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue PR 9") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        if later_pr_second:
+            now += 1
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/10")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+@pytest.mark.parametrize("kind", kb._RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS)
+def test_every_operator_intent_is_ordered_and_consumed(kanban_home, monkeypatch, kind):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        kb._append_event(conn, task_id, kind, {"actor": "operator"})
+        intent = kb.list_events(conn, task_id)[-1]
+        assert intent.payload is not None
+        assert intent.payload["after_comment_id"] == conn.execute(
+            "SELECT MAX(id) FROM task_comments WHERE task_id=?", (task_id,),
+        ).fetchone()[0]
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb._append_event(conn, task_id, "spawned", {"pid": 99999999})
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        # Even an intent newer than PR 9 must not authorize PR 10.
+        kb._append_event(conn, task_id, kind, {"actor": "operator"})
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/10")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_reclaim_intent_only_if_manual_and_not_consumed(kanban_home, monkeypatch, manual):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        kb._append_event(conn, task_id, "reclaimed", {"manual": manual})
+        assert (kb.check_respawn_guard(conn, task_id) is None) is manual
+        kb._append_event(conn, task_id, "spawned", {"pid": 99999999})
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_requeue_intent_consumed_after_dispatch_and_crash(kanban_home, all_assignees_spawnable, monkeypatch):
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, int(time.time()))
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue PR 9") == (True, None)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 99999999))
+        assert task_id in spawned
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        assert task_id in kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        spawned.clear()
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 99999999))
+        assert task_id not in spawned
+
+
+def test_ready_requeue_after_inline_triage_comment_resumes_pr(kanban_home, all_assignees_spawnable, monkeypatch):
+    """An inline audit comment cannot shift the PR comment's causal event."""
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="triage PR", assignee="alice")
+        assert kb.claim_task(conn, task_id)
+        assert kb.block_task(conn, task_id, reason="ruling one", kind="needs_input")
+        assert kb.unblock_task(conn, task_id)
+        assert kb.claim_task(conn, task_id)
+        assert kb.block_task(conn, task_id, reason="ruling two", kind="needs_input")
+        assert kb.triage_resolve_task(conn, task_id, to="todo", reason="resume", actor="qa") == (True, None)
+        kb.add_comment(conn, task_id, "qa", "https://github.com/o/r/pull/9")
+        assert kb.requeue_task(conn, task_id, actor="qa", reason="continue PR 9") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 99999999))
+        assert task_id in spawned
+
+
+def test_dependency_intent_not_reused_after_second_automatic_promotion(kanban_home, all_assignees_spawnable, monkeypatch):
+    from plugins.kanban.dashboard import plugin_api
+
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        kb.add_comment(conn, child, "alice", "https://github.com/o/r/pull/9")
+        assert kb.reopen_task(conn, parent, actor="qa", reason="first parent rework") == (True, None)
+        assert kb.block_task(conn, child, reason="resume after parent", kind="dependency")
+        assert kb.complete_task(conn, parent)
+        first = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (first.append(task.id) or 99999999))
+        assert child in first
+        assert plugin_api._set_status_direct(conn, parent, "todo")
+        assert kb.recompute_ready(conn) >= 1
+        assert kb.complete_task(conn, parent)
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.check_respawn_guard(conn, child) == "active_pr"
+        second = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (second.append(task.id) or 99999999))
+        assert child not in second
+
+
+def test_inline_same_author_and_length_cannot_impersonate_pr_event(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="audit", assignee="alice")
+        pr = "https://github.com/o/r/pull/9"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "alice", "x" * len(pr), now),
+        )
+        conn.commit()
+        kb.add_comment(conn, task_id, "alice", pr)
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="resume") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/8")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_legacy_pr_event_with_inline_comment_still_requeues(kanban_home, monkeypatch):
+    """Existing boards have commented events without a comment_id payload."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy PR", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "audit", "old inline note", now),
+        )
+        conn.commit()
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/9")
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+            "WHERE task_id=? AND kind='commented'", (task_id,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_legacy_equal_length_inline_comment_does_not_block_requeue(kanban_home, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy equal length", assignee="alice")
+        pr = "https://github.com/o/r/pull/9"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "alice", "x" * len(pr), now),
+        )
+        conn.commit()
+        kb.add_comment(conn, task_id, "alice", pr)
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+            "WHERE task_id=? AND kind='commented'", (task_id,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="continue") == (True, None)
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(conn, task_id, "alice", "https://github.com/o/r/pull/8")
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+@pytest.mark.parametrize("inline_before", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_historical_pr_dependency_wait_resumes_despite_unmappable_comment_event(
+    kanban_home, all_assignees_spawnable, monkeypatch, inline_before, padded,
+):
+    """Old boards did not link commented events; trim/inline writes defeat correlation."""
+    now = int(time.time())
+    clock = {"now": now}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda repo, number: "OPEN")
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="child", assignee="alice", parents=[parent])
+        assert kb.claim_task(conn, child)
+        if inline_before:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (child, "alice", "x" * len("https://github.com/o/r/pull/9"), now),
+            )
+            conn.commit()
+        pr = "https://github.com/o/r/pull/9"
+        kb.add_comment(conn, child, "alice", f" {pr} " if padded else pr)
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.comment_id') "
+            "WHERE task_id=? AND kind='commented'", (child,),
+        )
+        conn.commit()
+        assert kb.reopen_task(conn, parent, actor="qa", reason="rework") == (True, None)
+        clock["now"] += 2
+        assert kb.block_task(conn, child, reason="resume then complete", kind="dependency")
+        assert kb.complete_task(conn, parent)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: (spawned.append(task.id) or 42))
+        assert child in spawned
+
+
+@pytest.mark.parametrize("later_second", [False, True])
+def test_preupgrade_intent_resumes_on_equal_second(kanban_home, monkeypatch, later_second):
+    now = int(time.time())
+    clock = {"now": now}
+    monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+    with kb.connect() as conn:
+        task_id, _ = _seed_task_with_open_pr(conn, kb, monkeypatch, now)
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        if later_second:
+            clock["now"] += 2
+        assert kb.requeue_task(conn, task_id, actor="operator", reason="legacy") == (True, None)
+        conn.execute(
+            "UPDATE task_events SET payload=json_remove(payload, '$.after_comment_id', '$.pr_comment_id') "
+            "WHERE task_id=? AND kind='requeued'", (task_id,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_pr_intent_has_one_event_id_ordering_seam():
+    """PR identity comes only from comments; no guessed comment/event join."""
+    import ast
+    import inspect
+    source = inspect.getsource(kb.check_respawn_guard)
+    intent = inspect.getsource(kb._unused_operator_intent_after_pr)
+    tree = ast.parse(source + "\n" + intent)
+    sql_literals = [node.value.lower() for node in ast.walk(tree)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+    assert source.count("_unused_operator_intent_after_pr(conn, task_id)") == 1
+    assert "after_comment_id" in intent and "s.id > i.id" in intent
+    assert "json_type(i.payload, '$.after_comment_id') IS NULL AND i.created_at >= ?" in intent
+    assert not any("kind = 'commented'" in value for value in sql_literals)
+    assert not any("join task_comments" in value or "join task_events" in value
+                   for value in sql_literals)
+
+
+def test_guard_stuck_age_survives_progress_comment_during_real_dispatch(kanban_home, monkeypatch):
+    import hermes_cli.profiles as profmod
+
+    now = int(time.time())
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name == "alice")
+    monkeypatch.setattr(kb, "_query_github_pr_state", lambda *args: "OPEN")
+    with kb.connect() as conn:
+        plain = kb.create_task(conn, title="no comment", assignee="alice")
+        noted = kb.create_task(conn, title="progress comment", assignee="alice")
+        for tid in (plain, noted):
+            kb.add_comment(conn, tid, "qa", "https://github.com/o/r/pull/9")
+        spawn = lambda *args, **kw: (_ for _ in ()).throw(AssertionError("guarded card spawned"))
+        first = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert {plain, noted} <= {tid for tid, reason in first.respawn_guarded if reason == "active_pr"}
+        conn.execute("UPDATE task_events SET created_at=? WHERE kind='respawn_guarded'", (now - 1861,))
+        conn.commit()
+        kb.add_comment(conn, noted, "qa", "Progress only; same PR")
+        second = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert {plain, noted} <= {tid for tid, reason in second.respawn_guarded if reason == "active_pr"}
+        stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
+        assert {plain, noted} == {row["task_id"] for row in stuck}
+        assert all(row["guarded_seconds"] >= 1861 for row in stuck)
+        assert kb.requeue_task(conn, noted, actor="operator", reason="resume") == (True, None)
+        assert {row["task_id"] for row in kb.respawn_guard_stuck_tasks(conn, now=now)} == {plain}
+
+
+def test_guard_stuck_recovery_command_runs_on_each_board(kanban_home, monkeypatch):
+    import shlex
+    kb.create_board("secondary")
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    now = int(time.time())
+    for board in ("default", "secondary"):
+        with kb.connect_closing(board=board) as conn:
+            tid = kb.create_task(conn, title="stuck", assignee="alice")
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+            conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1861, tid))
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+            item, = kb.respawn_guard_stuck_tasks(conn, board=board, now=now)
+            command = shlex.split(item["clear_verb"].replace("<reason>", "continue PR"))
+            assert command[:4] == ["hermes", "kanban", "--board", board]
+        result = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", *command[1:]],
+            cwd=Path(__file__).resolve().parents[2], env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        with kb.connect_closing(board=board) as conn:
+            assert kb.list_events(conn, tid)[-1].kind == "requeued"
+            assert kb.respawn_guard_stuck_tasks(conn, board=board, now=now) == []
+
+
+def test_guard_stuck_recovery_command_has_one_renderer():
+    import ast
+    import inspect
+    from gateway import kanban_watchers
+    for module in (kb, kanban_watchers):
+        tree = ast.parse(inspect.getsource(module))
+        builders = [node for node in ast.walk(tree) if isinstance(node, ast.JoinedStr)
+                    and node.values and isinstance(node.values[0], ast.Constant)
+                    and isinstance(node.values[0].value, str)
+                    and node.values[0].value.startswith("hermes kanban ")]
+        assert all(any(isinstance(parent, ast.FunctionDef) and parent.name == "render_operator_command"
+                       and node in ast.walk(parent) for parent in ast.walk(tree)
+                       if isinstance(parent, ast.FunctionDef)) for node in builders)
+
+
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_prior_worker_claim_rejections_page_after_continuous_15_minutes(kanban_home, status):
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="recycled PID", assignee="alice")
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        refusal = {"reason": "prior_worker_still_alive", "prev_pid": 42}
+        if status == "review":
+            refusal["source_status"] = "review"
+        kb._append_event(conn, tid, "claim_rejected", refusal)
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='claim_rejected'", (now - 901, tid))
+        kb._append_event(conn, tid, "claim_rejected", refusal)
+        assert not any(x["reason"] == "prior_worker_still_alive"
+                       for x in kb.respawn_guard_stuck_tasks(conn, now=now - 2))
+        stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
+        assert [(x["task_id"], x["reason"]) for x in stuck] == [(tid, "prior_worker_still_alive")]
+        assert stuck[0]["prev_pid"] == 42
+        assert stuck[0]["status"] == status  # drives the REVIEW/READY page wording
+        assert stuck[0]["clear_verb"] == kb.render_operator_command("default", "show", tid)
+        kb._append_event(conn, tid, "claimed", {"lock": "new"})
+        assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
+
+
+def test_prior_worker_page_requires_current_claim_door(kanban_home):
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="changed lane", assignee="alice")
+        kb._append_event(conn, tid, "claim_rejected", {"reason": "prior_worker_still_alive"})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='claim_rejected'", (now - 901, tid))
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
+        kb._append_event(conn, tid, "claim_rejected", {
+            "reason": "prior_worker_still_alive", "source_status": "review",
+        })
+        assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
+
+
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_active_pr_stuck_page_is_ready_lane_only(kanban_home, status):
+    """active_pr is a ready-door respawn guard; a review-lane card must not page it."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="guarded", assignee="alice")
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1860, tid))
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        stuck = [x for x in kb.respawn_guard_stuck_tasks(conn, now=now) if x["reason"] == "active_pr"]
+        assert [x["task_id"] for x in stuck] == ([tid] if status == "ready" else [])
+
+
+def test_respawn_guard_stuck_threshold_and_reset(kanban_home):
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stuck", assignee="alice")
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='respawn_guarded'", (now - 1860, tid))
+        kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+        assert kb.respawn_guard_stuck_tasks(conn, now=now - 120) == []
+        stuck = kb.respawn_guard_stuck_tasks(conn, now=now)
+        assert [x["task_id"] for x in stuck] == [tid]
+        assert stuck[0]["clear_verb"] == kb.render_operator_command("default", "requeue", tid, "<reason>")
+        kb._append_event(conn, tid, "requeued", {"actor": "operator", "reason": "retry"})
+        assert kb.respawn_guard_stuck_tasks(conn, now=now) == []
+
+
 def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
     """Every kind in the override set is actually emitted by kanban_db (no dead entries),
     and every operator requeue verb's event kind is in the set (no missing entries)."""
@@ -3219,6 +4012,7 @@ def test_operator_requeue_kinds_constant_matches_verbs_that_emit_them():
         "reopen_review_task": "review_reopened",
         "triage_resolve_task": "triage_resolved",
         "reopen_task": "reopened",
+        "requeue_task": "requeued",
     }
     for fn, kind in verb_kinds.items():
         assert hasattr(kb, fn), fn

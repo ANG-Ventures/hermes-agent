@@ -255,7 +255,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # a later /undo lands on as "your message (no text)". Drop it from
     # persistence; the resumed turn's assistant reply still persists. (2026-07-16)
     "_empty_resume_synthetic",
-    # kanban worker stop-guard: narrated exit without kanban_complete/block
+    # kanban worker stop-guard: the synthetic user nudge sent after a narrated
+    # exit without kanban_complete/block. Only the nudge carries this flag;
+    # the assistant candidate is real output and is persisted with
+    # finish_reason="kanban_terminal_required" (t_4eeb0202).
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
     # empty tool_calls array): the interim narration-only assistant turn
@@ -851,6 +854,15 @@ class AIAgent:
         self.session_cache_write_tokens = 0
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
+        # ABSORBING per-bucket unknown latch over the cumulative counters above
+        # (set beside the increments in agent/conversation_loop.py). It must be
+        # cleared HERE with them: a new/branched/resumed session's totals start
+        # at zero and are fully measured until proven otherwise — carrying the
+        # old session's latch forward would render the fresh totals `unknown`.
+        from agent.usage_pricing import USAGE_UNKNOWN_FIELDS as _USAGE_UNKNOWN_FIELDS
+
+        for _usage_flag in _USAGE_UNKNOWN_FIELDS:
+            setattr(self, f"session_{_usage_flag}", False)
         # Snapshot of the most recent successful provider call, normalized into
         # Hermes' canonical usage shape. Session counters above are cumulative;
         # this per-call record lets status/usage surfaces show the last turn's
@@ -1213,8 +1225,9 @@ class AIAgent:
           description, which the "⏳ Working — N min" heartbeat includes.
 
         Never raises — a wait notice must not break the API-call wait loop.
+        A wait notice is liveness, not progress (``progress=False``).
         """
-        self._touch_activity(text)
+        self._touch_activity(text, progress=False)
         _thinking_cb = getattr(self, "thinking_callback", None)
         if _thinking_cb:
             try:
@@ -4471,8 +4484,14 @@ class AIAgent:
         *,
         provenance: Optional[ActivityProvenance] = None,
         force_persist: bool = False,
+        progress: bool = True,
     ) -> None:
         """Update the last-activity timestamp and description (thread-safe).
+
+        ``progress=False`` marks a pure wait ticker (e.g. "still waiting on
+        the provider"): it refreshes liveness but not ``_last_progress_ts``,
+        which the kanban stall detector reads to tell a live wrapper from a
+        progressing loop (t_7d034e3b).
 
         Also bridges to the kanban board's heartbeat fields when this
         process is a dispatcher-spawned worker (HERMES_KANBAN_TASK set),
@@ -4498,6 +4517,8 @@ class AIAgent:
         )
 
         self._last_activity_ts = time.time()
+        if progress:
+            self._last_progress_ts = self._last_activity_ts
         self._last_activity_desc = bound_activity_description(desc)
         self._last_activity_provenance = normalize_activity_provenance(provenance)
         if os.environ.get("HERMES_KANBAN_TASK"):
@@ -4506,7 +4527,9 @@ class AIAgent:
                     heartbeat_current_worker_from_env,
                     inject_new_comments_from_env,
                 )
-                heartbeat_current_worker_from_env()
+                heartbeat_current_worker_from_env(
+                    progress_at=getattr(self, "_last_progress_ts", None),
+                )
                 # Fold any new operator notes into the running turn (OUT-OF-BAND
                 # steer) so the user can talk to a live task without a restart.
                 inject_new_comments_from_env(self)
@@ -6999,7 +7022,9 @@ class AIAgent:
             return False
         return pool.has_available()
 
-    def _anthropic_messages_create(self, api_kwargs: dict, *, client: Any = None):
+    def _anthropic_messages_create(
+        self, api_kwargs: dict, *, client: Any = None, on_response: Any = None
+    ):
         # When a request-local client is supplied it was already credential-
         # refreshed in ``_create_request_anthropic_client``; only the shared
         # fallback path refreshes here.
@@ -7017,7 +7042,10 @@ class AIAgent:
             # Rate-limit + credits state live in response headers, which the
             # parsed Message drops. No-ops on providers that don't send the
             # matching header families (x-ratelimit-* / x-nous-credits-*).
-            on_response=self._capture_anthropic_response_headers,
+            # A caller-supplied callback is call-scoped (it wraps this one);
+            # swapping a callback on the shared agent would race
+            # interrupt-abandoned workers and transpose two calls' headers.
+            on_response=on_response or self._capture_anthropic_response_headers,
         )
 
     def _rebuild_anthropic_client(self) -> None:
@@ -9004,6 +9032,9 @@ class AIAgent:
             background=(not _is_subagent),
             inherit_context=function_args.get("inherit_context"),
             skills=function_args.get("skills"),
+            model=function_args.get("model"),
+            provider=function_args.get("provider"),
+            allow_flagship_reason=function_args.get("allow_flagship_reason"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
@@ -9497,6 +9528,12 @@ class AIAgent:
                     # Interrupt clear is deferred to after thread join in the
                     # outer finally: a refresher firing between stop and join
                     # would otherwise set an interrupt that survives the clear.
+            # Early returns inside run_conversation bypass finalize_turn and
+            # with it the once-per-turn on_session_end hook; emit it here so
+            # every turn (and its Blackbox turn_api_calls) gets a turns row.
+            from agent.turn_finalizer import emit_unfinalized_session_end
+
+            emit_unfinalized_session_end(self, relay_turn_id, result=result)
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
@@ -9513,6 +9550,12 @@ class AIAgent:
                 finish_task_run(**task_context, result=result)
             return result
         except BaseException as exc:
+            try:
+                from agent.turn_finalizer import emit_unfinalized_session_end
+
+                emit_unfinalized_session_end(self, relay_turn_id, exc=exc)
+            except Exception:
+                pass
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
                 type(exc).__name__ == "CancelledError"
             ):

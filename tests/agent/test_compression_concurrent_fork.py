@@ -262,6 +262,32 @@ def test_failed_in_place_split_does_not_announce_compaction_complete(tmp_path: P
     assert db.get_compression_lock_holder(session_id) is None
 
 
+def test_failed_in_place_commit_rolls_back_live_transcript(tmp_path: Path) -> None:
+    """A raise from archive_and_compact leaves every pre-compaction row active.
+
+    The live transcript must roll back to match, or the next append-only flush
+    inserts the compacted list on top of the rows it was meant to replace and
+    the live set carries every tool exchange twice (t_aace5343).
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "FAILED_IN_PLACE_ROLLBACK_TEST"
+    db.create_session(session_id, source="discord")
+    agent = _build_agent_with_db(db, session_id)
+    setattr(agent, "compression_in_place", True)
+    db.archive_and_compact = MagicMock(side_effect=RuntimeError("archive boom"))
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    for msg in messages:
+        db.append_message(session_id, "user", content=msg["content"])
+    original = copy.deepcopy(messages)
+
+    returned, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000, force=True)
+
+    db.archive_and_compact.assert_called_once()
+    assert [m.get("content") for m in returned] == [m["content"] for m in original]
+    assert agent._last_compaction_persist_failed is True
+    assert db.get_compression_lock_holder(session_id) is None
+
+
 def test_compression_activity_heartbeat_stops_on_compress_exception(tmp_path: Path) -> None:
     """Exception paths must stop the heartbeat and release the compression lock."""
     db = SessionDB(db_path=tmp_path / "state.db")

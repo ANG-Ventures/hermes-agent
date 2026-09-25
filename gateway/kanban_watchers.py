@@ -305,6 +305,174 @@ _FAULT_FIELDS = (
 )
 
 
+def format_home_line(session_id: Optional[str], row: Optional[dict] = None) -> str:
+    """``home: <platform> #<channel> \u00b7 session <id>`` for a card's home
+    session, or ``""`` when the card has none. ``row`` is the state.db
+    ``sessions`` row (``origin_json`` / ``source`` / ``display_name``); when it
+    is missing only the session id is shown."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return ""
+    origin: dict = {}
+    if row:
+        raw = row.get("origin_json")
+        if raw:
+            try:
+                import json as _json
+
+                parsed = _json.loads(raw)
+                if isinstance(parsed, dict):
+                    origin = parsed
+            except (TypeError, ValueError):
+                origin = {}
+    platform = (origin.get("platform") or (row or {}).get("source") or "").strip()
+    channel = str(
+        origin.get("chat_name") or (row or {}).get("display_name")
+        or origin.get("chat_id") or ""
+    ).strip().lstrip("#")
+    where = platform
+    if channel:
+        where = f"{where} #{channel}" if where else f"#{channel}"
+    return f"home: {where} \u00b7 session {sid}" if where else f"home: session {sid}"
+
+
+def _resolve_home_line(session_id: Optional[str]) -> str:
+    """Blocking state.db lookup; call from a worker thread only."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return ""
+    row = None
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            row = db.get_session(sid)
+        finally:
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
+    except Exception:
+        row = None
+    return format_home_line(sid, row)
+
+
+class LoadGate:
+    """Hysteresis gate that pauses dispatcher SPAWNS while the host is over
+    its run-queue bar (``kanban.dispatch_load_gate``).
+
+    Measured 2026-09-24 on the Mac Studio (32 cores): load1 80-110 with the
+    dispatcher still spawning 9-14 workers a tick; the gateway took 15 min to
+    reach its first model call and its own shutdown watchdog force-exited a
+    planned restart because the drain never got CPU. Workers are separate
+    processes — but every one is more run-queue for the gateway to lose to.
+
+    Pure and clock-free: feed it ``load1`` + ``ncpu`` each tick, read
+    ``reason``. Pauses when ``load1 > pause_above`` (default ``ncpu``), resumes
+    only when ``load1 < resume_below`` (default ``0.75 * ncpu``) — the gap
+    stops a 60-second oscillation from flapping spawns every tick.
+    """
+
+    def __init__(self, cfg: Optional[dict], ncpu: int) -> None:
+        cfg = cfg if isinstance(cfg, dict) else {}
+        self.enabled = bool(cfg.get("enabled", True))
+        ncpu = max(1, int(ncpu or 1))
+        self.pause_above = self._num(cfg.get("pause_above"), float(ncpu))
+        self.resume_below = self._num(cfg.get("resume_below"), 0.75 * ncpu)
+        if self.resume_below >= self.pause_above:
+            # A degenerate band would flap; collapse to a sane one.
+            self.resume_below = 0.75 * self.pause_above
+        self.ncpu = ncpu
+        self.paused = False
+        self.reason: Optional[str] = None
+
+    @staticmethod
+    def _num(value, default: float) -> float:
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return f if f > 0 else float(default)
+
+    def update(self, load1: float) -> Optional[str]:
+        """Feed one sample; return the pause reason (None = spawning allowed)."""
+        if not self.enabled:
+            self.paused, self.reason = False, None
+            return None
+        try:
+            load1 = float(load1)
+        except (TypeError, ValueError):
+            return self.reason
+        if self.paused:
+            if load1 < self.resume_below:
+                self.paused, self.reason = False, None
+        elif load1 > self.pause_above:
+            self.paused = True
+        if self.paused:
+            self.reason = (
+                f"load1={load1:.1f} > pause_above={self.pause_above:.1f} "
+                f"(ncpu={self.ncpu}); resumes below {self.resume_below:.1f}"
+            )
+        return self.reason
+
+
+def _format_spawn_routes(routes, sources=None) -> str:
+    """Format provider/model and source for every spawned task."""
+
+    from hermes_cli.model_policy import route_kind
+
+    entries = dict(routes or {})
+    if not entries:
+        return "routes=-"
+    sources = dict(sources or {})
+    return "routes=" + "; ".join(
+        f"{task_id} route={route} source={sources.get(task_id, 'profile-default')} "
+        f"kind={route_kind(route)}"
+        for task_id, route in entries.items()
+    )
+
+
+def _format_lane_expiry(lane, route, successor="profile default") -> str:
+    return f"lane-model expired -> {successor} ({lane}: {route})"
+
+
+def _log_dispatch_tick(logger, slug, res) -> None:
+    """Log route choices and expiries, including ticks with no new workers."""
+    if res is None:
+        return
+    successors = getattr(res, "expired_lane_successors", None) or {}
+    for lane, route in (getattr(res, "expired_lane_models", None) or []):
+        logger.info(
+            "kanban dispatcher [%s]: %s",
+            slug,
+            _format_lane_expiry(lane, route, successors.get(lane, "profile default")),
+        )
+    spawned = getattr(res, "spawned", None)
+    guarded = getattr(res, "respawn_guarded", None)
+    parent_satisfied_sticky = getattr(res, "parent_satisfied_sticky", None)
+    if spawned or guarded or parent_satisfied_sticky:
+        # Quiet by default — log only actionable tick activity, including
+        # guarded tasks and satisfied dependency graphs still held by an
+        # explicit worker/operator block.
+        logger.info(
+            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s %s %s",
+            slug,
+            len(spawned or []),
+            res.reclaimed,
+            len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
+            len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
+            res.promoted,
+            len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+            _format_spawn_routes(
+                getattr(res, "spawn_routes", None),
+                getattr(res, "spawn_route_sources", None),
+            ),
+            _format_respawn_guarded_summary(guarded),
+            _format_parent_satisfied_sticky_summary(parent_satisfied_sticky),
+        )
+
+
 def _format_parent_satisfied_sticky_summary(task_ids) -> str:
     """Count and name explicit holds whose dependencies are already done."""
     ids = sorted(str(task_id) for task_id in (task_ids or []))
@@ -341,7 +509,12 @@ def _format_workspace_refused_summary(refused) -> str:
         f"{reason}: {', '.join(sorted(task_ids))}"
         for reason, task_ids in sorted(grouped.items())
     )
-    return f"workspace_refused={len(entries)} ({details})"
+    summary = f"workspace_refused={len(entries)} ({details})"
+    if "stranded_by_mount_loss" in grouped:
+        from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND
+
+        summary += f" | recover stranded scratch cards: {STRANDED_RECOVERY_COMMAND}"
+    return summary
 
 
 class _WorkspaceRefusalOutageNotifier:
@@ -418,7 +591,87 @@ def _observe_workspace_refusal_outages(notifier, results) -> int:
     return delivered
 
 
-def _stall_streak_is_bad(ready_pending, any_spawned, results) -> bool:
+def _guard_stuck_cards(results) -> tuple[list[tuple[str, dict]], set[str]]:
+    """Probe guarded cards; only successful board probes can prove recovery."""
+    from hermes_cli import kanban_db as kb
+
+    cards = []
+    observed_boards = set()
+    for board, result in results or []:
+        if result is None or getattr(result, "skipped_locked", False):
+            continue
+        try:
+            with kb.connect_closing(board=board) as conn:
+                cards.extend(
+                    (board, item)
+                    for item in kb.respawn_guard_stuck_tasks(conn, board=board)
+                )
+            observed_boards.add(board)
+        except Exception:
+            logger.exception("kanban dispatcher: guard-stuck probe failed on %s", board)
+    return cards, observed_boards
+
+
+class _GuardStuckNotifier:
+    """Page once per (board, card) until it recovers; retry failed sends."""
+
+    def __init__(self) -> None:
+        self._delivered: set[tuple[str, str]] = set()
+
+    def observe(self, cards, send, observed_boards=None) -> int:
+        current = {(board, item["task_id"]) for board, item in cards}
+        if observed_boards is None:
+            observed_boards = {board for board, _ in cards}
+        self._delivered = {
+            key for key in self._delivered
+            if key[0] not in observed_boards or key in current
+        }
+        delivered = 0
+        for board, item in cards:
+            key = board, item["task_id"]
+            if key not in self._delivered and send(board, item):
+                self._delivered.add(key)
+                delivered += 1
+        return delivered
+
+
+def _send_guard_stuck_alert(board: str, item: dict) -> bool:
+    """Best-effort #alerts page with the exact recovery verb."""
+    script = Path.home() / ".hermes" / "scripts" / "notify.py"
+    if not script.is_file():
+        logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
+        return False
+    if item.get("reason") == "prior_worker_still_alive":
+        # Both the ready and review claim doors refuse; name the card's lane.
+        lane = str(item.get("status") or "ready").upper()
+        detail = (
+            f"{lane} card: prior_worker_still_alive claim rejected >15 min\n"
+            f"Prior PID: `{item.get('prev_pid')}` · Inspect: `{item['clear_verb']}`\n"
+            "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
+        )
+    else:
+        detail = (
+            "READY card stuck behind active_pr (>30 min)\n"
+            f"Operator recovery: `{item['clear_verb']}`"
+        )
+    message = (
+        f"🛑 **Kanban dispatcher** · {detail}\n"
+        f"Board: `{board}` · Card: `{item['task_id']}`"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--send", message, "--channel", "discord",
+             "--profile", "default", "--sev", "error"],
+            check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=30,
+        )
+    except Exception:
+        logger.exception("kanban dispatcher: guard-stuck page failed")
+        return False
+    return proc.returncode == 0
+
+
+def _stall_streak_is_bad(ready_pending, any_spawned, results, *, guard_stuck=False) -> bool:
     """Decide whether a dispatcher tick counts toward the "stuck" streak.
 
     A tick is "bad" (stall-suspect) only when there is spawnable work,
@@ -432,6 +685,8 @@ def _stall_streak_is_bad(ready_pending, any_spawned, results) -> bool:
     credentials)" warning that fired for ~2h during a provider 429 window /
     large fan-out, when the dispatcher was healthy but throttled.
     """
+    if guard_stuck:
+        return True
     if not ready_pending or any_spawned:
         return False
     declined_benign = False
@@ -698,7 +953,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "stalled", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -928,6 +1183,13 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    # Ping carries the card's home so a session
+                                    # receiving a forwarded ping can tell whether
+                                    # the card is its own. Resolved here (worker
+                                    # thread), never on the event loop.
+                                    home_line = _resolve_home_line(
+                                        getattr(task, "session_id", None) if task else None
+                                    )
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -939,6 +1201,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "home": home_line,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -1037,10 +1300,26 @@ class GatewayKanbanWatchersMixin:
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
                                 wake_handoff = r
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                            superseded_by = (
+                                ev.payload.get("superseded_by") if ev.payload else None
                             )
+                            if superseded_by:
+                                # A card whose premise was already satisfied is
+                                # NOT the same shape as one whose work this
+                                # worker did. Name the evidence, and do not let
+                                # it read as a crash — before this disposition
+                                # existed the same situation arrived as
+                                # "gave up (retries exhausted)".
+                                msg = (
+                                    f"↩️ {board_tag}{tag}Kanban {sub['task_id']} closed"
+                                    f" — premise superseded by "
+                                    f"{str(superseded_by)[:160]} — {title}{handoff}"
+                                )
+                            else:
+                                msg = (
+                                    f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
+                                    f" — {title}{handoff}"
+                                )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
@@ -1050,10 +1329,25 @@ class GatewayKanbanWatchersMixin:
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
+                            if (ev.payload or {}).get("stopped_early") == "reproduced_clean_exit":
+                                # NOT a crash: the worker exited cleanly with
+                                # nothing to do, twice identically. "gave up
+                                # after repeated spawn failures" sent operators
+                                # hunting a failure that never happened.
+                                repeats = int((ev.payload or {}).get("identical_violations") or 2)
+                                msg = (
+                                    f"🧭 {board_tag}{tag}Kanban {sub['task_id']} needs input: "
+                                    f"its worker finished with NOTHING TO DO {repeats}x "
+                                    f"identically (no crash) — retrying reproduces it. If the "
+                                    f"card's premise was already satisfied, close it with "
+                                    f"`hermes kanban complete {sub['task_id']} --superseded-by "
+                                    f"<card|PR|sha>`; otherwise re-scope it.{err}"
+                                )
+                            else:
+                                msg = (
+                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
+                                    f"after repeated spawn failures{err}"
+                                )
                         elif kind == "crashed":
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
@@ -1066,6 +1360,13 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
+                            )
+                        elif kind == "stalled":
+                            age = int((ev.payload or {}).get("progress_age_seconds") or 0)
+                            msg = (
+                                f"⚠ {board_tag}{tag}Kanban {sub['task_id']} worker stalled "
+                                f"({age}s no progress despite heartbeats); "
+                                "dispatcher will reclaim if still idle"
                             )
                         elif kind == "status":
                             new_status = ""
@@ -1135,6 +1436,8 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
+                        if d.get("home"):
+                            msg += "\n" + d["home"]
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
@@ -1331,6 +1634,8 @@ class GatewayKanbanWatchersMixin:
                                 assignee=_assignee,
                                 board=board_slug,
                             )
+                            if d.get("home"):
+                                _synth += "\n" + d["home"]
                             # Graph-safe wake turn (#70752): carry the worker's
                             # completion handoff into the synthetic turn and
                             # label it as an automatic notification so the woken
@@ -2011,7 +2316,31 @@ class GatewayKanbanWatchersMixin:
         # / browser pool from being overwhelmed by a fan-out.
         raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
         max_in_progress_per_profile = None
-        if raw_per_profile is not None:
+        if isinstance(raw_per_profile, dict):
+            # Mapping shape {default: N, <profile>: M}: resolved per assignee
+            # by kanban_db.resolve_per_profile_cap at spawn time. Validate
+            # the values here so a typo is loud at boot, not silent forever.
+            _clean: dict[str, int] = {}
+            for _k, _v in raw_per_profile.items():
+                try:
+                    _iv = int(_v)
+                except (TypeError, ValueError):
+                    _iv = 0
+                if _iv >= 1:
+                    _clean[str(_k)] = _iv
+                else:
+                    logger.warning(
+                        "kanban dispatcher: kanban.max_in_progress_per_profile[%r]=%r "
+                        "is not a positive int; ignoring that entry",
+                        _k, _v,
+                    )
+            max_in_progress_per_profile = _clean or None
+            if max_in_progress_per_profile:
+                logger.info(
+                    "kanban dispatcher: max_in_progress_per_profile=%s",
+                    max_in_progress_per_profile,
+                )
+        elif raw_per_profile is not None:
             try:
                 max_in_progress_per_profile = int(raw_per_profile)
             except (TypeError, ValueError):
@@ -2033,6 +2362,39 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # kanban.dispatch_load_gate — pause SPAWNS (never reclaims) while the
+        # host's 1-minute load is over its core count; resume with hysteresis.
+        # See LoadGate for the 2026-09-24 incident this encodes.
+        try:
+            _ncpu = os.cpu_count() or 1
+        except Exception:
+            _ncpu = 1
+        load_gate = LoadGate(kanban_cfg.get("dispatch_load_gate"), _ncpu)
+        if load_gate.enabled:
+            logger.info(
+                "kanban dispatcher: load gate armed pause_above=%.1f resume_below=%.1f ncpu=%d",
+                load_gate.pause_above, load_gate.resume_below, load_gate.ncpu,
+            )
+        _load_gate_was_paused = False
+
+        def _sample_spawn_pause() -> "Optional[str]":
+            nonlocal _load_gate_was_paused
+            try:
+                load1 = os.getloadavg()[0]
+            except (AttributeError, OSError):
+                return None  # platform without loadavg: gate is inert
+            reason = load_gate.update(load1)
+            if bool(reason) != _load_gate_was_paused:
+                _load_gate_was_paused = bool(reason)
+                if reason:
+                    logger.warning("kanban dispatcher: spawns PAUSED — %s", reason)
+                else:
+                    logger.info(
+                        "kanban dispatcher: spawns RESUMED — load1=%.1f < resume_below=%.1f",
+                        load1, load_gate.resume_below,
+                    )
+            return reason
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -2050,6 +2412,7 @@ class GatewayKanbanWatchersMixin:
         last_stranded_warn_at: dict[str, int] = {}
         last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
         workspace_refusal_notifier = _WorkspaceRefusalOutageNotifier()
+        guard_stuck_notifier = _GuardStuckNotifier()
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -2086,7 +2449,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -2136,6 +2499,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    spawn_paused=spawn_paused,
                     reconcile_orphans=reconcile_orphans,
                     budget_cache=budget_cache,
                 )
@@ -2192,6 +2556,7 @@ class GatewayKanbanWatchersMixin:
             # turn ledgers are the same files for every board, so without this
             # an N-board host re-reads every ledger N times per tick.
             budget_cache: dict = {}
+            _spawn_paused = _sample_spawn_pause()
             # Enumeration extent spans the whole per-board tick body, not just
             # the fingerprint's path resolve: `_tick_once_for_board` also calls
             # `connect(board=slug)`, which re-resolves internally. Scoping only
@@ -2199,7 +2564,7 @@ class GatewayKanbanWatchersMixin:
             # warnings that then silenced later single-board misreadings.
             for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug, budget_cache)))
+                out.append((slug, _tick_once_for_board(slug, budget_cache, _spawn_paused)))
             return out
 
         def _ready_nonempty() -> bool:
@@ -2367,6 +2732,7 @@ class GatewayKanbanWatchersMixin:
                 # workers finish naturally; zombie reaping above still runs.
                 if not _kanban_dispatch_allowed():
                     ready_pending = False
+                    guard_stuck = []
                     bad_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live each tick so a user
@@ -2387,11 +2753,6 @@ class GatewayKanbanWatchersMixin:
                     any_spawned = False
                     for slug, res in (results or []):
                         spawned = getattr(res, "spawned", None) if res is not None else None
-                        guarded = getattr(res, "respawn_guarded", None) if res is not None else None
-                        parent_satisfied_sticky = (
-                            getattr(res, "parent_satisfied_sticky", None)
-                            if res is not None else None
-                        )
                         refused = getattr(res, "workspace_refused", None) if res is not None else None
                         if spawned:
                             any_spawned = True
@@ -2407,23 +2768,7 @@ class GatewayKanbanWatchersMixin:
                                     slug, summary,
                                 )
                                 last_workspace_refusal_warn[slug] = (summary, now_s)
-                        if res is not None and (spawned or guarded or parent_satisfied_sticky):
-                            # Quiet by default — log only actionable tick activity,
-                            # including guarded tasks and satisfied dependency graphs
-                            # still held by an explicit worker/operator block.
-                            logger.info(
-                                "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d %s %s",
-                                slug,
-                                len(spawned or []),
-                                res.reclaimed,
-                                len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                                len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                                res.promoted,
-                                len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
-                                _format_respawn_guarded_summary(guarded),
-                                _format_parent_satisfied_sticky_summary(parent_satisfied_sticky),
-                            )
+                        _log_dispatch_tick(logger, slug, res)
                         # Stranded subtrees: children held in ``todo`` behind a
                         # parent only a human can clear. This CANNOT reach the
                         # stall detector below — that gate requires a non-empty
@@ -2468,22 +2813,38 @@ class GatewayKanbanWatchersMixin:
                     # throttled, not broken). ``_stall_streak_is_bad`` consults the
                     # DispatchResult buckets so telemetry can tell "busy/throttled"
                     # from "genuinely stuck" instead of guessing.
+                    guard_stuck, observed_boards = await service(_guard_stuck_cards, results)
+                    guard_pages = await service(
+                        guard_stuck_notifier.observe, guard_stuck, _send_guard_stuck_alert,
+                        observed_boards,
+                    )
+                    if guard_pages:
+                        logger.error("kanban dispatcher: %d guarded card(s) STUCK; "
+                                     "#alerts paged with diagnostics", guard_pages)
                     ready_pending = await service(_ready_nonempty)
-                    if _stall_streak_is_bad(ready_pending, any_spawned, results):
+                    if _stall_streak_is_bad(ready_pending, any_spawned, results,
+                                            guard_stuck=bool(guard_stuck)):
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
-                        logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned, with no "
-                            "benign decline (cap/rate-limit/lock) to explain it. "
-                            "Check profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
-                            bad_ticks,
-                        )
+                        if guard_stuck:
+                            logger.warning(
+                                "kanban dispatcher STUCK: %d card(s) continuously "
+                                "guarded. See per-card diagnostics in #alerts.",
+                                len(guard_stuck),
+                            )
+                        else:
+                            logger.warning(
+                                "kanban dispatcher stuck: ready queue non-empty for "
+                                "%d consecutive ticks but 0 workers spawned, with no "
+                                "benign decline (cap/rate-limit/lock) to explain it. "
+                                "Check profile health (venv, PATH, credentials) and "
+                                "`hermes kanban list --status ready`.",
+                                bad_ticks,
+                            )
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")

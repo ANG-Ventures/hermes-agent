@@ -899,6 +899,15 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
+            if function_name == "cronjob":
+                from tools.cronjob_tools import _current_agent_model
+                token = _current_agent_model.set(
+                    (getattr(agent, "provider", None), getattr(agent, "model", None))
+                )
+                try:
+                    return execute(final_args)
+                finally:
+                    _current_agent_model.reset(token)
             return execute(final_args)
         finally:
             _hb_stop.set()

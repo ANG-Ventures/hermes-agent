@@ -258,6 +258,9 @@ class TestPreApiLockDeferDoesNotBurnBudget:
             should_compress=lambda t: t >= 100_000,
             should_defer_preflight_to_real_usage=lambda _t: False,
             get_active_compression_failure_cooldown=lambda: None,
+            # Abstract on ContextEngine, so every real engine has it. The loop
+            # now feeds usage-less successes through it as aggregate UNKNOWN.
+            update_from_response=lambda _usage: None,
         )
 
         agent.client.chat.completions.create.side_effect = [

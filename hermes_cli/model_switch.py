@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, List, NamedTuple, Optional
 
+from hermes_cli import provider_seam
 from hermes_cli.providers import (
     ProviderDef,
     custom_provider_aliases,
@@ -779,6 +780,18 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
             filtered.append(parts[i])
             i += 1
 
+    # Discord's native /model renders its option as ``name:<value>``; pasting
+    # that text into any other surface (Telegram, Slack, CLI, TUI) used to
+    # make ``name:claude-bpx-5/x`` the model id under the CURRENT provider.
+    # Strip a leading option label here, once, for every surface.
+    if filtered:
+        _opt = _re.match(r"(?i)^(?:name|model)[:=](.*)$", filtered[0])
+        if _opt is not None:
+            if _opt.group(1):
+                filtered[0] = _opt.group(1)
+            else:  # "name: <value>" — label token on its own
+                filtered.pop(0)
+
     model_input = " ".join(filtered).strip()
     return ModelFlagParseResult(
         model_input=model_input,
@@ -1313,6 +1326,8 @@ def resolve_startup_model_arg(
     raw = raw_model.strip()
     if not raw or raw.lower().startswith("moa:") or "://" in raw:
         return None, raw_model
+    _typed = re.split(r"[:/]", raw, maxsplit=1)
+    provider_seam.refresh("typed", _typed[0] if len(_typed) > 1 else None)
     try:
         inline = _parse_inline_provider_model(
             raw, current_provider or "", user_providers, custom_providers
@@ -1723,6 +1738,10 @@ def _resolve_named_custom_model_id(
 # Core model-switching pipeline
 # ---------------------------------------------------------------------------
 
+class _SkipCatalogProbe(Exception):
+    """Internal sentinel: ``switch_model(probe_catalog=False)`` skips validation."""
+
+
 def switch_model(
     raw_input: str,
     current_provider: str,
@@ -1733,8 +1752,19 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    *,
+    probe_catalog: bool = True,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
+
+    ``probe_catalog=False`` skips every NETWORK step (the live ``GET
+    /v1/models`` validation probe and the models.dev fetches) and returns the
+    credential/route resolution only.  Callers that merely RE-RESOLVE an
+    already-accepted route -- the gateway's persisted-override rehydrate and
+    persistability check -- must use it: the probe is a synchronous urllib GET
+    with a 5 s timeout, and those callers run on the gateway event loop
+    (2026-09-24: 33 Discord /model "application did not respond" + 10 s
+    PHASE=event_loop_blocked at ``open_credentialed_url``).
 
     Resolution chain:
 
@@ -1788,6 +1818,11 @@ def switch_model(
     target_provider = current_provider
     resolved_moa_preset = False
 
+    # Hot registration: publish a newly configured provider before any
+    # recognition below consults the registry (requested name only).
+    _typed = re.split(r"[:/]", new_model, maxsplit=1)
+    provider_seam.refresh("typed", explicit_provider or (_typed[0] if len(_typed) > 1 else None))
+
     inline_provider = None
     if not explicit_provider:
         inline_provider = _parse_inline_provider_model(
@@ -1798,6 +1833,25 @@ def switch_model(
         )
         if inline_provider is not None:
             target_provider, new_model = inline_provider
+
+    # ``X/model`` off an aggregator where X is neither a provider nor a vendor
+    # namespace: X is most likely a mistyped/unconfigured provider. Remember
+    # it so the switch is refused (below, after validation) instead of
+    # persisting ``<current>/X/model`` — unless the current endpoint lists or
+    # config declares the full slug (HF-style ids on private endpoints).
+    unknown_slash_prefix = ""
+    if not explicit_provider and inline_provider is None:
+        _raw_slug = raw_input.strip()
+        _head = _raw_slug.split("/", 1)[0].strip()
+        if (
+            "/" in _raw_slug
+            and _head
+            and "://" not in _raw_slug
+            and not is_aggregator(current_provider)
+            and not is_known_vendor_namespace(_head)
+            and not _user_provider_lists_model(_raw_slug, current_provider, user_providers)
+        ):
+            unknown_slash_prefix = _head
 
     # =================================================================
     # PATH A: Explicit --provider given OR inline provider qualification
@@ -2369,6 +2423,9 @@ def switch_model(
 
     # --- Validate ---
     try:
+        if not probe_catalog:
+            # Re-resolution of an already-accepted route: no live probe.
+            raise _SkipCatalogProbe
         validation = validate_requested_model(
             new_model,
             target_provider,
@@ -2392,6 +2449,13 @@ def switch_model(
                 )
             ),
         )
+    except _SkipCatalogProbe:
+        validation = {
+            "accepted": True,
+            "persist": True,
+            "recognized": False,
+            "message": None,
+        }
     except Exception as e:
         validation = {
             "accepted": False,
@@ -2450,6 +2514,40 @@ def switch_model(
                 error_message=msg,
             )
 
+    # Refuse ``unknown-provider/model`` rather than persisting a route whose
+    # model id silently embeds a provider name nothing can resolve. Only when
+    # the id survived resolution untouched AND the endpoint did not recognise
+    # it — a listed/declared slug is a real model id and passes.
+    if (
+        unknown_slash_prefix
+        and target_provider == current_provider
+        and new_model.strip().split("/", 1)[0].strip() == unknown_slash_prefix
+        and not validation.get("recognized")
+        and not validation.get("corrected_model")
+        and not any(
+            isinstance(_cp, dict)
+            and (
+                _cp.get("model") == new_model
+                or new_model in _declared_model_ids(_cp.get("models", {}))
+            )
+            for _cp in (custom_providers if isinstance(custom_providers, list) else [])
+        )
+    ):
+        return ModelSwitchResult(
+            success=False,
+            new_model=new_model,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=(
+                f"Unknown provider '{unknown_slash_prefix}' in "
+                f"'{new_model}'. No model switch was made. Use "
+                f"<provider>/<model> with a configured provider id "
+                f"(see 'hermes model'), or force the full id on the current "
+                f"provider with --provider {current_provider}."
+            ),
+        )
+
     # Apply auto-correction if validation found a closer match
     if validation.get("corrected_model"):
         new_model = validation["corrected_model"]
@@ -2495,10 +2593,12 @@ def switch_model(
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
     # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model, allow_network=True)
+    capabilities = get_model_capabilities(
+        target_provider, new_model, allow_network=probe_catalog
+    )
 
     # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model, allow_network=True)
+    model_info = get_model_info(target_provider, new_model, allow_network=probe_catalog)
 
     # --- Collect warnings ---
     warnings: list[str] = []
@@ -2769,6 +2869,7 @@ def _collect_authed_provider_slugs(
     from hermes_cli.auth import PROVIDER_REGISTRY, _load_auth_store
     from hermes_cli.providers import HERMES_OVERLAYS, ALIASES as _PROVIDER_ALIAS_TABLE
     from hermes_cli.models import _AGGREGATOR_PROVIDERS as _AGG_PROVIDERS, CANONICAL_PROVIDERS
+    g = provider_seam.snapshot()
 
     _excluded_set = {str(p).strip().lower() for p in excluded if p}
     slugs: list[str] = []
@@ -2800,7 +2901,7 @@ def _collect_authed_provider_slugs(
         pdata = models_dev_data.get(mdev_id)
         if not isinstance(pdata, dict):
             continue
-        pconfig = PROVIDER_REGISTRY.get(hermes_id)
+        pconfig = g.PROVIDER_REGISTRY.get(hermes_id)
         if pconfig and pconfig.auth_type != "api_key":
             continue
         from hermes_cli.auth import is_runtime_provider_routable
@@ -2831,7 +2932,7 @@ def _collect_authed_provider_slugs(
 
     # --- Section 2: Hermes-only providers (HERMES_OVERLAYS) ---
     _mdev_to_hermes = {v: k for k, v in PROVIDER_TO_MODELS_DEV.items()}
-    for pid, overlay in HERMES_OVERLAYS.items():
+    for pid, overlay in g.HERMES_OVERLAYS.items():
         if pid.lower() in seen:
             continue
         hermes_slug = _mdev_to_hermes.get(pid, pid)
@@ -2853,7 +2954,7 @@ def _collect_authed_provider_slugs(
             has_creds = any(_scoped_key_env(ev) for ev in overlay.extra_env_vars)
         if not has_creds and overlay.auth_type == "api_key":
             for _key in (pid, hermes_slug):
-                pcfg = PROVIDER_REGISTRY.get(_key)
+                pcfg = g.PROVIDER_REGISTRY.get(_key)
                 if pcfg and pcfg.api_key_env_vars:
                     if any(_scoped_key_env(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
@@ -2878,12 +2979,12 @@ def _collect_authed_provider_slugs(
             seen.add(hermes_slug.lower())
 
     # --- Section 2b: Canonical providers cross-check ---
-    for _cp in CANONICAL_PROVIDERS:
+    for _cp in g.CANONICAL_PROVIDERS:
         if _cp.slug.lower() in seen:
             continue
         if _cp.slug.lower() in _excluded_set:
             continue
-        _cp_config = PROVIDER_REGISTRY.get(_cp.slug)
+        _cp_config = g.PROVIDER_REGISTRY.get(_cp.slug)
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(_scoped_key_env(ev) for ev in _cp_config.api_key_env_vars)
@@ -3002,6 +3103,10 @@ def list_authenticated_providers(
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
         clear_provider_models_cache, get_curated_nous_model_ids,
     )
+    # Hot registration: give refresh callbacks a chance to publish missing
+    # names, then pin ONE generation for every surface this listing reads.
+    provider_seam.refresh("picker")
+    g = provider_seam.snapshot()
 
     # Explicit refresh: drop every provider's cached model-id list so the
     # cached_provider_model_ids() calls below all re-fetch live. Without this
@@ -3109,7 +3214,7 @@ def list_authenticated_providers(
     data = fetch_models_dev()
 
     # Build curated model lists keyed by hermes provider ID
-    curated: dict[str, list[str]] = dict(_PROVIDER_MODELS)
+    curated: dict[str, list[str]] = dict(g._PROVIDER_MODELS)
     curated["openrouter"] = [mid for mid, _ in OPENROUTER_MODELS]
     # "nous" pulls from the remote model-catalog manifest published at
     # https://hermes-agent.nousresearch.com/docs/api/model-catalog.json so
@@ -3226,7 +3331,7 @@ def list_authenticated_providers(
         # Prefer auth.py PROVIDER_REGISTRY for env var names — it's our
         # source of truth.  models.dev can have wrong mappings (e.g.
         # minimax-cn → MINIMAX_API_KEY instead of MINIMAX_CN_API_KEY).
-        pconfig = PROVIDER_REGISTRY.get(hermes_id)
+        pconfig = g.PROVIDER_REGISTRY.get(hermes_id)
         # Skip non-API-key auth providers here — they are handled in
         # section 2 (HERMES_OVERLAYS) with proper auth store checking.
         if pconfig and pconfig.auth_type != "api_key":
@@ -3314,7 +3419,7 @@ def list_authenticated_providers(
     # while _PROVIDER_MODELS and config.yaml use Hermes IDs ("copilot").
     _mdev_to_hermes = {v: k for k, v in PROVIDER_TO_MODELS_DEV.items()}
 
-    for pid, overlay in HERMES_OVERLAYS.items():
+    for pid, overlay in g.HERMES_OVERLAYS.items():
         if pid.lower() in seen_slugs:
             continue
 
@@ -3348,7 +3453,7 @@ def list_authenticated_providers(
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
         if not has_creds and overlay.auth_type == "api_key":
             for _key in (pid, hermes_slug):
-                pcfg = _auth_registry.get(_key)
+                pcfg = g.PROVIDER_REGISTRY.get(_key)
                 if pcfg and pcfg.api_key_env_vars:
                     if any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
@@ -3504,14 +3609,14 @@ def list_authenticated_providers(
     except ImportError:
         _canon_provs = []
 
-    for _cp in _canon_provs:
+    for _cp in g.CANONICAL_PROVIDERS:
         if _cp.slug.lower() in seen_slugs:
             continue
         if _cp.slug.lower() in _excluded:
             continue
 
         # Check credentials via PROVIDER_REGISTRY (auth.py)
-        _cp_config = _auth_registry.get(_cp.slug)
+        _cp_config = g.PROVIDER_REGISTRY.get(_cp.slug)
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)

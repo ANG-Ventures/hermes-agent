@@ -125,6 +125,20 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_requeue_cli_records_operator_intent_for_ready_card(kanban_home, capsys):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="resume", assignee="alice")
+    args = parser.parse_args(["kanban", "requeue", tid, "resume", "PR"])
+    assert kc.kanban_command(args) == 0
+    assert f"Requeued {tid}" in capsys.readouterr().out
+    with kb.connect_closing() as conn:
+        assert kb.list_events(conn, tid)[-1].kind == "requeued"
+        assert kb.list_events(conn, tid)[-1].payload["reason"] == "resume PR"
+    assert kc.kanban_command(parser.parse_args(["kanban", "requeue", tid, "again"])) == 0
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

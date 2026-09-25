@@ -46,6 +46,38 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
 
 
 class TestStoredPromptReuse:
+    def test_route_write_preserves_prompt_until_next_turn_rebuilds(self, tmp_path, caplog):
+        from hermes_state import SessionDB
+
+        old = "Model: old-model\nProvider: openrouter"
+        new = "Model: new-model\nProvider: openrouter"
+        history = [{"role": "user", "content": "continue"}]
+        with SessionDB(db_path=tmp_path / "state.db") as db:
+            db.create_session("test-session-id", "telegram", system_prompt=old)
+            db.update_session_billing_route(
+                "test-session-id", provider="openrouter", base_url="https://other.example/v1"
+            )
+            same = _make_agent(session_db=db)
+            same.model = "old-model"
+            with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+                _restore_or_build_system_prompt(same, None, history)
+            assert same._cached_system_prompt == old
+            same._build_system_prompt.assert_not_called()
+            assert "is null" not in caplog.text
+
+            db.update_session_model("test-session-id", "new-model", provider="openrouter")
+            changed = _make_agent(session_db=db, prebuilt_prompt=new)
+            changed.model = "new-model"
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+                _restore_or_build_system_prompt(changed, None, history)
+            changed._build_system_prompt.assert_called_once_with(None)
+            restored = db.get_session("test-session-id")
+            assert restored is not None
+            assert restored["system_prompt"] == new
+            assert "stale runtime identity" in caplog.text
+            assert "is null" not in caplog.text
+
     def test_present_row_is_reused_verbatim(self, caplog):
         """Continuing session with a stored prompt → reuse byte-for-byte."""
         stored = "Stored prompt from turn 1 — byte-identical reuse"

@@ -32,6 +32,37 @@ from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 
 
+def _rollup_turn_usage(turn_calls: list[dict]) -> dict:
+    """Aggregate physical-call usage into the turn record.
+
+    UNKNOWN flags are absorbing: if any call lacks a measured term, the sum is
+    not a measurement. Kept as a callable seam so tests execute the shipped
+    behavior rather than extracting an expression from this module's AST.
+    """
+    return {
+        "api_calls": len(turn_calls),
+        "input_tokens": sum(c["input_tokens"] for c in turn_calls),
+        "output_tokens": sum(c["output_tokens"] for c in turn_calls),
+        "output_tokens_unknown": any(
+            bool(c.get("output_tokens_unknown")) for c in turn_calls
+        ),
+        "input_tokens_unknown": any(
+            bool(c.get("input_tokens_unknown")) for c in turn_calls
+        ),
+        "cache_read_tokens_unknown": any(
+            bool(c.get("cache_read_tokens_unknown")) for c in turn_calls
+        ),
+        "cache_write_tokens_unknown": any(
+            bool(c.get("cache_write_tokens_unknown")) for c in turn_calls
+        ),
+        "usage_unknown": any(bool(c.get("usage_unknown")) for c in turn_calls),
+        "cache_read_tokens": sum(c["cache_read_tokens"] for c in turn_calls),
+        "cache_write_tokens": sum(c["cache_write_tokens"] for c in turn_calls),
+        "reasoning_tokens": sum(c["reasoning_tokens"] for c in turn_calls),
+        "total_tokens": sum(c["total_tokens"] for c in turn_calls),
+    }
+
+
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -299,6 +330,15 @@ def finalize_turn(
     # are surfaced on the result dict via ``cleanup_errors`` rather than
     # killing the turn.
     _cleanup_errors = []
+
+    # Recovery pairs can be buried behind durable notice events or tool
+    # rounds. Remove them from live history as well as the DB flush path.
+    _flushed = getattr(agent, "_last_flushed_db_idx", 0)
+    if isinstance(_flushed, int):
+        agent._last_flushed_db_idx = sum(
+            not m.get("_dropped_toolcall_nudge") for m in messages[:_flushed]
+        )
+    messages[:] = [m for m in messages if not m.get("_dropped_toolcall_nudge")]
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
@@ -851,6 +891,46 @@ def finalize_turn(
     # handled by the CLI (atexit / /reset) and gateway (session expiry /
     # _reset_session).
 
+    emit_session_end(
+        agent,
+        turn_id=turn_id,
+        effective_task_id=effective_task_id,
+        completed=completed,
+        failed=failed,
+        interrupted=interrupted,
+        turn_exit_reason=_turn_exit_reason,
+        original_user_message=original_user_message,
+        final_response=final_response,
+        turn_calls=_turn_calls,
+    )
+
+    agent._turn_preflight_display_snapshot = None
+    agent._turn_received_provider_response = False
+
+    return result
+
+
+def emit_session_end(
+    agent,
+    *,
+    turn_id,
+    effective_task_id,
+    completed,
+    failed,
+    interrupted,
+    turn_exit_reason,
+    original_user_message,
+    final_response,
+    turn_calls=None,
+):
+    """Fire the per-turn ``on_session_end`` plugin hook exactly once.
+
+    Shared by ``finalize_turn`` (the normal loop exit) and
+    ``emit_unfinalized_session_end`` (the backstop for the conversation loop's
+    early ``return``s and raised exceptions, which never reach the finalizer).
+    """
+    from agent.conversation_loop import logger
+
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call (i.e. once per TURN,
     # despite the name). Plugins can use this for cleanup, flushing buffers,
@@ -862,8 +942,11 @@ def finalize_turn(
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         # Fold the per-turn accumulator into a compact summary. Telemetry must
         # never break the turn, so guard the fold.
-        _turn_calls = _turn_calls or []
+        _turn_calls = turn_calls or []
         _turn_usage = None
+        _blackbox_compaction = getattr(agent, "_blackbox_compaction", None)
+        if not isinstance(_blackbox_compaction, dict):
+            _blackbox_compaction = {}
         try:
             if _turn_calls:
                 # Last-call cache split — the FINAL provider call's own
@@ -878,6 +961,17 @@ def finalize_turn(
                 _last_cache_read = int(_last_call.get("cache_read_tokens", 0) or 0)
                 _last_cache_write = int(_last_call.get("cache_write_tokens", 0) or 0)
                 _last_uncached = int(_last_call.get("input_tokens", 0) or 0)
+                # Discriminator for the four FINAL-call figures (the split above
+                # plus context_used). The turn-level flags in _rollup_turn_usage
+                # are absorbing across every call, so they answer "did ANY call
+                # go unmeasured", not "is this split real" — a turn whose call
+                # #2 returned no usage would otherwise blank a fully measured
+                # final call's window numbers (r6 finding 9).
+                _last_call_prompt_unknown = any(
+                    bool(_last_call.get(k))
+                    for k in ("input_tokens_unknown", "cache_read_tokens_unknown",
+                              "cache_write_tokens_unknown", "usage_unknown")
+                )
                 # Request composition of the FINAL call — the char/4 fixed vs
                 # non-fixed breakdown of the exact payload that produced the
                 # window occupancy (context_used). This is the authoritative
@@ -894,13 +988,7 @@ def finalize_turn(
                     for c in _turn_calls
                 ]
                 _turn_usage = {
-                    "api_calls": len(_turn_calls),
-                    "input_tokens": sum(c["input_tokens"] for c in _turn_calls),
-                    "output_tokens": sum(c["output_tokens"] for c in _turn_calls),
-                    "cache_read_tokens": sum(c["cache_read_tokens"] for c in _turn_calls),
-                    "cache_write_tokens": sum(c["cache_write_tokens"] for c in _turn_calls),
-                    "reasoning_tokens": sum(c["reasoning_tokens"] for c in _turn_calls),
-                    "total_tokens": sum(c["total_tokens"] for c in _turn_calls),
+                    **_rollup_turn_usage(_turn_calls),
                     "latency_s": sum(c.get("latency_s", 0.0) for c in _turn_calls),
                     # Per-call breakdown so the plugin can price each call
                     # against tiered pricing and reconcile cost_status worst-of.
@@ -913,6 +1001,7 @@ def finalize_turn(
                     "last_cache_read_tokens": _last_cache_read,
                     "last_cache_write_tokens": _last_cache_write,
                     "last_uncached_tokens": _last_uncached,
+                    "last_call_prompt_unknown": _last_call_prompt_unknown,
                     # Real request composition (fixed vs non-fixed, char/4) of
                     # the final call + per-call history. See compose_request_breakdown.
                     "last_composition": _last_composition,
@@ -926,9 +1015,16 @@ def finalize_turn(
                     # Depth tracking (B1): read from the agent attribute set at
                     # construction time (0 for parents, parent+1 for children).
                     "depth": getattr(agent, "_blackbox_depth", None),
+                    **_blackbox_compaction,
                 }
+            elif _blackbox_compaction:
+                _turn_usage = dict(_blackbox_compaction)
         except Exception:
             _turn_usage = None
+        # Mark BEFORE invoking: the run_agent forwarder's backstop
+        # (emit_unfinalized_session_end) must never fire a second hook for a
+        # turn whose finalizer already attempted one.
+        agent._session_end_emitted_turn_id = turn_id
         _invoke_hook(
             "on_session_end",
             session_id=agent.session_id,
@@ -937,7 +1033,7 @@ def finalize_turn(
             completed=completed,
             failed=failed,
             interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
+            turn_exit_reason=turn_exit_reason,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
             provider=getattr(agent, "provider", None) or "",
@@ -951,7 +1047,76 @@ def finalize_turn(
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 
-    agent._turn_preflight_display_snapshot = None
-    agent._turn_received_provider_response = False
 
-    return result
+def emit_unfinalized_session_end(agent, turn_id, *, result=None, exc=None):
+    """Backstop: fire ``on_session_end`` for a turn that bypassed ``finalize_turn``.
+
+    ``run_conversation`` has dozens of early ``return``s (fallback chain
+    exhausted, interrupt unwind, truncated tool args, billing/content-policy
+    blocks, ...) and can raise; none of them reach ``finalize_turn``, so the
+    hook documented as "fired once per turn" never fired and Blackbox wrote
+    ``turn_api_calls`` rows with no parent ``turns`` row. The ``run_agent``
+    forwarder calls this after every turn, successful or not; it is a no-op
+    when the finalizer already emitted for ``turn_id`` or the turn never
+    started. Returns True when it emitted. Never raises.
+    """
+    try:
+        if not turn_id or getattr(agent, "_current_turn_id", None) != turn_id:
+            return False
+        if getattr(agent, "_session_end_emitted_turn_id", None) == turn_id:
+            return False
+        # Both are (turn_id, value) pairs so a raise before the loop published
+        # them for THIS turn can never attribute the previous turn's data.
+        published = getattr(agent, "_blackbox_turn_calls", None)
+        turn_calls = []
+        if isinstance(published, tuple) and len(published) == 2 and published[0] == turn_id:
+            turn_calls = published[1] if isinstance(published[1], list) else []
+        published_msg = getattr(agent, "_turn_original_user_message", None)
+        user_message = None
+        if isinstance(published_msg, tuple) and len(published_msg) == 2 and published_msg[0] == turn_id:
+            user_message = published_msg[1]
+        try:
+            # Billed responses the loop rejected before bailing out belong to
+            # THIS turn; finalize_turn settles them the same way.
+            from agent.conversation_loop import _settle_unaccepted_billed_responses
+
+            _settle_unaccepted_billed_responses(agent, turn_calls, turn_id)
+        except Exception:
+            pass
+        res = result if isinstance(result, dict) else {}
+        final_response = ""
+        if exc is not None:
+            interrupted = isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
+                type(exc).__name__ == "CancelledError"
+            )
+            failed = not interrupted
+            reason = f"exception:{type(exc).__name__}"
+        else:
+            interrupted = res.get("interrupted") is True
+            failed = not interrupted and bool(res.get("failed") or res.get("error"))
+            if interrupted:
+                reason = "early_return:interrupted"
+            elif failed:
+                detail = str(res.get("error") or "failed").strip().splitlines()
+                reason = "early_return:" + (detail[0] if detail else "failed")[:200]
+            else:
+                reason = "early_return"
+                final_response = res.get("final_response") or ""
+        emit_session_end(
+            agent,
+            turn_id=turn_id,
+            effective_task_id=getattr(agent, "_current_task_id", None),
+            completed=bool(res.get("completed")) and not failed and not interrupted,
+            failed=failed,
+            interrupted=interrupted,
+            turn_exit_reason=reason,
+            original_user_message=user_message,
+            final_response=final_response,
+            turn_calls=turn_calls,
+        )
+        return True
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "unfinalized on_session_end backstop failed", exc_info=True
+        )
+        return False

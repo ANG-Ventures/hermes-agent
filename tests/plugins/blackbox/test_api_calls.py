@@ -1,16 +1,41 @@
 """Per-call ledger: additive migration, exact usage, and parent retention."""
+import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
 from agent.usage_pricing import CanonicalUsage
+from plugins import blackbox
 from plugins.blackbox import store
 from plugins.blackbox.record import TurnRecord
 
 
-@pytest.fixture
-def db(tmp_path, monkeypatch):
+# Earliest shipped `turns` shape (store.py @ e54eb50327): predates depth,
+# cli_invocation_id, the C1 served_subs_json/attribution columns, the
+# turn_api_calls table, and every turns index. A live ledger opened by this
+# PR's code can be this old, so every AC below also runs migrated-from-here.
+_LEGACY_TURNS_COLS = (
+    "turn_id TEXT PRIMARY KEY, parent_turn_id TEXT, is_subagent INT,"
+    " ts_start REAL, ts_end REAL, profile TEXT, provider TEXT, model TEXT,"
+    " platform TEXT, chat_id TEXT, chat_name TEXT, api_calls INT, tools TEXT,"
+    " input_tokens INT, output_tokens INT, cache_read INT, cache_write INT,"
+    " reasoning INT, context_used INT, context_length INT, cost_usd REAL,"
+    " cost_status TEXT, interrupted INT, alerted INT DEFAULT 0,"
+    " user_text TEXT, final_text TEXT"
+)
+
+
+@pytest.fixture(params=["fresh", "legacy"])
+def db(request, tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if request.param == "legacy":
+        path = store._db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = sqlite3.connect(str(path))
+        legacy.execute(f"CREATE TABLE turns ({_LEGACY_TURNS_COLS})")
+        legacy.commit()
+        legacy.close()
     conn = store._connect()
     conn.close()
     return store._db_path()
@@ -24,12 +49,68 @@ def append(turn_id, seq, **overrides):
     store.insert_api_call(turn_id, seq, **args)
 
 
+def test_plugin_end_hook_uses_call_ledger_turn_id(db, monkeypatch):
+    """The real plugin entry points must persist a joinable call and turn."""
+    monkeypatch.setattr(blackbox, '_config', lambda: {
+        'enabled': True, 'alerts_enabled': False, 'record_subagents': True,
+        'retention_days': 3650,
+    })
+    turn_id = 'session:task:12345678'
+    blackbox._on_session_start(session_id='session')
+    blackbox.record_api_call(
+        turn_id=turn_id, seq=0, ts=100., provider='claude-apr', model='test-model',
+        usage=CanonicalUsage(input_tokens=1000, output_tokens=50),
+        api_mode='anthropic_messages', sub_key='sub-vps-7', attribution='wire',
+        http_status=200, relay_synthetic=False, route_id=None,
+    )
+    blackbox._on_session_end(session_id='session', turn_id=turn_id,
+                             provider='claude-apr', model='test-model', platform='cli',
+                             turn_usage={'input_tokens': 1000, 'output_tokens': 50,
+                                         'api_calls': 1})
+    with sqlite3.connect(db) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM turn_api_calls a JOIN turns t USING (turn_id)').fetchone()[0] == 1
+        assert conn.execute('SELECT turn_id FROM turns').fetchone()[0] == turn_id
+
+def test_end_hook_rolls_up_distinct_served_subs(db, monkeypatch):
+    monkeypatch.setattr(blackbox, '_config', lambda: {
+        'enabled': True, 'alerts_enabled': False, 'record_subagents': True,
+        'retention_days': 3650,
+    })
+    turn_id = 'session:task:multi-sub'
+    blackbox._on_session_start(session_id='session')
+    for seq, sub in enumerate(('sub-vps-7', 'sub-vps-9', 'sub-vps-7', None)):
+        blackbox.record_api_call(
+            turn_id=turn_id, seq=seq, ts=100. + seq, provider='claude-apr',
+            model='test-model', usage=CanonicalUsage(input_tokens=1),
+            api_mode='anthropic_messages', sub_key=sub, attribution='wire',
+            http_status=200, relay_synthetic=False, route_id=None,
+        )
+    blackbox._on_session_end(session_id='session', turn_id=turn_id,
+                             provider='claude-apr', model='test-model', platform='cli',
+                             turn_usage={'input_tokens': 4, 'api_calls': 4})
+    with sqlite3.connect(db) as conn:
+        rollup = conn.execute('SELECT served_subs_json FROM turns WHERE turn_id = ?',
+                              (turn_id,)).fetchone()[0]
+        assert json.loads(rollup) == {'sub-vps-7': 2, 'sub-vps-9': 1}
+        assert conn.execute('SELECT COUNT(*) FROM turn_api_calls a JOIN turns t USING (turn_id)').fetchone()[0] == 4
+
+def test_late_call_refreshes_existing_turn_rollup(db):
+    store.insert_turn(TurnRecord(turn_id='late'))
+    append('late', 0, sub_key='sub-vps-7')
+    with sqlite3.connect(db) as conn:
+        assert conn.execute('SELECT served_subs_json FROM turns WHERE turn_id = ?',
+                            ('late',)).fetchone()[0] == '{"sub-vps-7": 1}'
+
+
 def test_api_call_exact_roundtrip_and_defaults(db):
     append("t", 0)
     append("t", 1, usage=CanonicalUsage(), sub_key=None,
            http_status=503, relay_synthetic=True, route_id="route-1")
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT * FROM turn_api_calls ORDER BY seq").fetchall() == [
+        assert conn.execute("SELECT turn_id,seq,ts,provider,sub_key,model,input_tokens,"
+                            "output_tokens,cache_read,cache_write,reasoning,attribution,"
+                            "http_status,relay_synthetic,route_id FROM turn_api_calls "
+                            "ORDER BY seq").fetchall() == [
             ("t", 0, 100.5, "claude-apr", "sub-vps-7", "test-model",
              1000, 50, 300, 20, 7, "wire", None, 0, None),
             ("t", 1, 100.5, "claude-apr", None, "test-model",
@@ -144,3 +225,78 @@ def test_reinsert_turn_preserves_rollup_columns(db):
             "SELECT model, served_subs_json, attribution FROM turns WHERE turn_id = ?",
             ("t",),
         ).fetchall() == [("second", '{"sub-vps-7": 3}', "wire")]
+
+
+def test_plugin_boundary_normalizes_success_and_zero_token_failure(db, monkeypatch):
+    monkeypatch.setattr(blackbox, "_config", lambda: {"enabled": True})
+    usage = SimpleNamespace(
+        input_tokens=1000,
+        output_tokens=50,
+        cache_read_input_tokens=300,
+        cache_creation_input_tokens=20,
+    )
+    blackbox.record_api_call(
+        turn_id="t",
+        seq=0,
+        ts=100.0,
+        provider="claude-apr",
+        model="test-model",
+        usage=None,
+        api_mode="anthropic_messages",
+        sub_key="sub-vps-2",
+        attribution="wire",
+        http_status=429,
+        relay_synthetic=True,
+        route_id="route-0",
+    )
+    blackbox.record_api_call(
+        turn_id="t",
+        seq=1,
+        ts=101.0,
+        provider="claude-apr",
+        model="test-model",
+        usage=usage,
+        api_mode="anthropic_messages",
+        sub_key="sub-vps-7",
+        attribution="wire",
+        http_status=200,
+        relay_synthetic=False,
+        route_id="route-1",
+    )
+    store.insert_turn(
+        TurnRecord(
+            turn_id="t",
+            input_tokens=1000,
+            output_tokens=50,
+            cache_read_tokens=300,
+            cache_write_tokens=20,
+        )
+    )
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            """
+            SELECT seq, sub_key, input_tokens, output_tokens, cache_read,
+                   cache_write, reasoning, http_status, relay_synthetic
+            FROM turn_api_calls ORDER BY seq
+            """
+        ).fetchall()
+        assert rows == [
+            (0, "sub-vps-2", 0, 0, 0, 0, 0, 429, 1),
+            (1, "sub-vps-7", 1000, 50, 300, 20, 0, 200, 0),
+        ]
+        mismatch_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT t.turn_id
+                FROM turns t JOIN turn_api_calls c ON c.turn_id = t.turn_id
+                GROUP BY t.turn_id
+                HAVING SUM(c.input_tokens) != t.input_tokens
+                    OR SUM(c.output_tokens) != t.output_tokens
+                    OR SUM(c.cache_read) != t.cache_read
+                    OR SUM(c.cache_write) != t.cache_write
+                    OR SUM(c.reasoning) != t.reasoning
+            )
+            """
+        ).fetchone()[0]
+        assert mismatch_count == 0

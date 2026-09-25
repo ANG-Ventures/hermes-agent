@@ -17,19 +17,101 @@ def test_turn_calls_initialized_local_not_agent_attr():
     assert "agent._turn_calls" not in src, "accumulator must not be an agent attribute (re-entrancy)"
 
 
-def test_append_inside_success_block_only():
-    """The append must sit with the session_*_tokens commit, not in retry/except."""
-    src = inspect.getsource(cl.run_conversation)
-    # The append and the session_api_calls increment must be in the same block.
-    assert "_turn_calls.append(" in src
-    i_append = src.index("_turn_calls.append(")
-    i_commit = src.index("agent.session_api_calls += 1")
-    # append comes shortly AFTER the cumulative commit (same success block)
-    assert 0 < (i_append - i_commit) < 3000, "append not adjacent to success commit block"
+def test_append_inside_success_block_only(tmp_path):
+    """The append must sit with the session_*_tokens commit, not in retry/except.
+
+    TEST-REPIN (r6 round-4). This asserted `0 < (i_append - i_commit) < 3000`
+    over `inspect.getsource(run_conversation)` — a CHARACTER-DISTANCE measure of
+    the source text. It is a change-detector twice over: it fails on any comment
+    or code added between the two statements with identical runtime behaviour
+    (this round's finding-4/7 latch and finding-13 merge pushed it from 2359 to
+    4116 and turned it red), and it passes whenever the two statements happen to
+    sit close together even if the append is in the WRONG block. `AGENTS.md`
+    bans reading source in tests for exactly this pair of failure modes.
+
+    The BEHAVIOUR the name claims is: a successful call contributes to both the
+    cumulative counters and the per-turn accumulator, and a FAILED call
+    contributes to neither. That is what is asserted here, by driving the real
+    `run_conversation` twice — once succeeding, once raising — and reading the
+    `turn_usage` the accumulator folds into `on_session_end`.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import hermes_cli.lifecycle as lifecycle
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    seen = {}
+
+    def _fake_invoke_hook(name, **kwargs):
+        if name == "on_session_end":
+            seen["turn_usage"] = kwargs.get("turn_usage")
+        return []
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch.object(lifecycle, "invoke_hook", _fake_invoke_hook),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=db,
+                session_id="accumulator-session",
+                platform="telegram",
+            )
+            agent.model = "gpt-4o"
+            agent.provider = "openai"
+            agent.base_url = None
+            agent.client = MagicMock()
+            agent.client.chat.completions.create.return_value = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                model="test/model",
+                usage=SimpleNamespace(
+                    prompt_tokens=100, completion_tokens=10, total_tokens=110
+                ),
+            )
+
+            agent.run_conversation("turn one")
+
+            # SUCCESS: both sinks saw exactly this one call.
+            assert agent.session_api_calls == 1
+            assert seen["turn_usage"]["api_calls"] == 1
+            assert seen["turn_usage"]["input_tokens"] == 100
+            assert seen["turn_usage"]["output_tokens"] == 10
+
+            # FAILURE: neither sink moves. A call that raised never committed to
+            # the cumulative counters, so it must not be in the accumulator
+            # either — the two have to agree on what "a call happened" means.
+            seen.clear()
+            agent.client.chat.completions.create.side_effect = RuntimeError("boom")
+            agent.run_conversation("turn two")
+
+            assert agent.session_api_calls == 1, "a failed call must not be counted"
+            assert (seen.get("turn_usage") or {}).get("api_calls", 0) == 0, (
+                "a failed call must not reach the per-turn accumulator either"
+            )
+    finally:
+        db.close()
 
 
 def test_on_session_end_carries_turn_usage_kwarg():
-    src = inspect.getsource(tf.finalize_turn)
+    # finalize_turn and the early-exit backstop share one emitter.
+    assert "emit_session_end(" in inspect.getsource(tf.finalize_turn)
+    assert "emit_session_end(" in inspect.getsource(tf.emit_unfinalized_session_end)
+    src = inspect.getsource(tf.emit_session_end)
     assert '"on_session_end",' in src
     # turn_usage kwarg present in the fire call
     fire = src[src.index('"on_session_end",'):]
@@ -64,7 +146,7 @@ def test_turn_usage_fold_sums_calls():
 
 def test_turn_usage_includes_last_call_split_keys():
     """The fold must surface the FINAL call's cache split (window decomposition)."""
-    src = inspect.getsource(tf.finalize_turn)
+    src = inspect.getsource(tf.emit_session_end)
     fire = src[src.index('"on_session_end",'):]
     # The payload assembled just above the fire carries the three last-call keys.
     block = src[:src.index('"on_session_end",')]

@@ -223,7 +223,12 @@ ensure_extension() {
   fi
 
   chmod +x "$asset"
-  gh extension install "$ext_dir"
+  # `gh extension install` treats ONLY "." as a local directory; any other
+  # argument -- including an absolute path -- is parsed as [HOST/]OWNER/REPO
+  # and fails with 'expected the "[HOST/]OWNER/REPO" format'. That broke every
+  # publish on a runner without a cached install (2026-09-23: 3 of the last 12
+  # main runs). Install from inside the directory.
+  (cd "$ext_dir" && gh extension install .)
 }
 
 

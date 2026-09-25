@@ -2416,6 +2416,52 @@ def _resolve_stored_model_pair(
         return model, provider
 
 
+# Sentinel the ``cronjob`` tool (and config ``cron.default_model``) use to mean
+# "pin to the CREATING agent's own model". It is an instruction, never a model
+# id: the scheduler has no "auto" handling, so a persisted "auto" fires against
+# a model that does not exist. Mirrors ``tools.cronjob_tools._AUTO_MODEL``.
+_AUTO_MODEL_SENTINEL = "auto"
+_AUTO_PIN_FLAGSHIP_REASON = "auto-pin: inherited creating agent's own elected model"
+
+
+def _is_auto_model_sentinel(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() == _AUTO_MODEL_SENTINEL
+
+
+def _resolve_auto_model_sentinel(
+    model: Any, provider: Any, no_agent: Any
+) -> Tuple[Any, Any, bool]:
+    """Store-level guarantee: the ``"auto"`` sentinel never reaches jobs.json.
+
+    ONE owner for the class, called by both ``create_job`` and ``update_job``
+    so no entry point (tool create/update, CLI, API, direct Python) can persist
+    it. Returns ``(model, provider, auto_pinned)``:
+
+    - not the sentinel: inputs unchanged, ``auto_pinned=False``;
+    - script-mode (``no_agent``) job: no LLM runs, so there is nothing to pin —
+      the sentinel AND the provider that rode along with it drop to None, so a
+      later ``no_agent=False`` flip yields a plain unpinned LLM job rather than
+      one pinned to the literal model "auto";
+    - LLM job: resolved via ``tools.cronjob_tools._resolve_cron_llm_model``
+      (the creating agent's published model, or unpinned when none is
+      published). ``auto_pinned`` is True when it resolved to a real model.
+    """
+    if not _is_auto_model_sentinel(model):
+        return model, provider, False
+    if bool(no_agent):
+        return None, None, False
+    try:
+        from tools.cronjob_tools import _resolve_cron_llm_model
+
+        resolved_model, resolved_provider = _resolve_cron_llm_model(model, provider)
+    except Exception:  # pragma: no cover - resolution must never write "auto"
+        logger.debug("cron auto-model resolution failed", exc_info=True)
+        resolved_model, resolved_provider = None, None
+    if not resolved_model or _is_auto_model_sentinel(resolved_model):
+        return None, None, False
+    return resolved_model, resolved_provider, True
+
+
 def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = False) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -2553,6 +2599,7 @@ def create_job(
     skills: Optional[List[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    allow_flagship_reason: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
@@ -2656,8 +2703,20 @@ def create_job(
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
+    normalized_model, normalized_provider, _auto_pinned = _resolve_auto_model_sentinel(
+        normalized_model, normalized_provider, no_agent
+    )
+    if _auto_pinned and not str(allow_flagship_reason or "").strip():
+        # An auto pin inherits the creating agent's elected primary; it is
+        # not a caller-chosen flagship route (same rule as the tool path).
+        allow_flagship_reason = _AUTO_PIN_FLAGSHIP_REASON
     normalized_model, normalized_provider = _resolve_stored_model_pair(
         normalized_model, normalized_provider
+    )
+    from hermes_cli.model_policy import validate_worker_model
+
+    flagship_reason = validate_worker_model(
+        normalized_model, allow_flagship_reason=allow_flagship_reason
     )
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
@@ -2790,6 +2849,8 @@ def create_job(
     # agent.reasoning_effort, the pre-existing behaviour).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    if flagship_reason:
+        job["allow_flagship_reason"] = flagship_reason
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2800,6 +2861,9 @@ def create_job(
         # append its removal FIRST, inverting the append order the guard reads
         # as causality and turning an intentional removal into a false alarm.
         _journal_created(job)
+
+    if flagship_reason:
+        logger.info("flagship override: cron create id=%s model=%s reason=%s", job_id, normalized_model, flagship_reason)
 
     return job
 
@@ -2946,6 +3010,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # alias (key == target model id) resolves the PROVIDER while
             # leaving the model byte-identical, and that write must land.
             # `--model ""` clears the pin and is deliberately untouched here.
+            # The "auto" sentinel is resolved (LLM job) or dropped (script job)
+            # against the EFFECTIVE no_agent of this update — never stored.
+            if "model" in updates and _is_auto_model_sentinel(updates["model"]):
+                _eff_no_agent = updates["no_agent"] if "no_agent" in updates else job.get("no_agent")
+                _am, _ap, _pinned = _resolve_auto_model_sentinel(
+                    updates["model"], updates.get("provider"), _eff_no_agent
+                )
+                updates["model"] = _am
+                updates["provider"] = _ap
+                if _pinned and not str(updates.get("allow_flagship_reason") or "").strip():
+                    updates["allow_flagship_reason"] = _AUTO_PIN_FLAGSHIP_REASON
             if "model" in updates and isinstance(updates["model"], str):
                 _raw_model = updates["model"].strip()
                 if _raw_model:
@@ -2955,9 +3030,44 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                     updates["model"] = _m
                     updates["provider"] = _p
+                    from hermes_cli.model_policy import validate_worker_model
+
+                    updates["allow_flagship_reason"] = validate_worker_model(
+                        _m, allow_flagship_reason=updates.get("allow_flagship_reason")
+                    )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            # A legacy row persisted before this guard may still hold "auto";
+            # any update of it heals the MERGED record so the write cannot
+            # carry the sentinel forward (e.g. a no_agent=False flip).
+            _legacy_auto_healed = False
+            if _is_auto_model_sentinel(updated.get("model")):
+                _am, _ap, _pinned = _resolve_auto_model_sentinel(
+                    updated.get("model"), updated.get("provider"), updated.get("no_agent")
+                )
+                _am, _ap = _resolve_stored_model_pair(_am, _ap)
+                from hermes_cli.model_policy import validate_worker_model
+
+                _reason = validate_worker_model(
+                    _am,
+                    allow_flagship_reason=(
+                        updated.get("allow_flagship_reason")
+                        or (_AUTO_PIN_FLAGSHIP_REASON if _pinned else None)
+                    ),
+                )
+                updated["model"] = _am
+                updated["provider"] = _ap
+                if _reason:
+                    updated["allow_flagship_reason"] = _reason
+                _legacy_auto_healed = True
+            if "allow_flagship_reason" in updates and "model" not in updates:
+                from hermes_cli.model_policy import validate_worker_model
+
+                validate_worker_model(
+                    updated.get("model"),
+                    allow_flagship_reason=updated.get("allow_flagship_reason"),
+                )
 
             if (
                 is_terminal_job(job)
@@ -2994,8 +3104,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if job_payload_is_empty(updated):
                     raise ValueError(EMPTY_PAYLOAD_ERROR)
             schedule_changed = "schedule" in updates
-            inference_fields_changed = bool(
-                {"provider", "model", "base_url", "no_agent"}.intersection(updates)
+            inference_fields_changed = (
+                bool({"provider", "model", "base_url", "no_agent"}.intersection(updates))
+                or _legacy_auto_healed
             ) and _normalized_inference_axes(updated) != previous_inference_axes
 
             if "skills" in updates or "skill" in updates:
@@ -3076,6 +3187,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             jobs[i] = updated
             save_jobs(jobs)
+            if updates.get("allow_flagship_reason"):
+                logger.info("flagship override: cron update id=%s model=%s reason=%s", job_id, updated.get("model"), updates["allow_flagship_reason"])
             return _normalize_job_record(jobs[i])
     return None
 

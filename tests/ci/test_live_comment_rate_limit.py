@@ -2761,3 +2761,469 @@ def test_the_final_retry_backoff_is_a_real_pause(monkeypatch):
         f"a retry paused {min(retry_sleeps)}s between attempts — that is a "
         f"busy loop against an API that just rate-limited us: {retry_sleeps}")
     assert len(attempts) >= 2, f"no retry was attempted: {attempts}"
+
+
+# ─── residual gates (t_a66612e1): constants and seams left ungated ────
+#
+# Every test below was RED-proved against its own single-behaviour mutant
+# of scripts/ci/live_comment.py, applied to the real file, with the tree
+# asserted byte-identical afterwards. Baseline before these tests: all ten
+# mutants ran the full tests/ci suite at 350 passed, i.e. nine of the ten
+# sites were completely unconstrained (the tenth,
+# _REVIEW_STATUS_ARTIFACT_PREFIX, was already gated by 8 tests).
+#
+# Expectations here are deliberate literals. They are NEVER read back from
+# the constant under test — a test that compares a constant to itself is
+# green in every possible world, which is exactly how _FINAL_RETRY_BACKOFF
+# went vacuous when it was first written.
+
+
+def test_a_deadline_cut_download_marks_the_cycle_partial(
+        monkeypatch, tmp_path):
+    """Site C: a shutdown-truncated read must not be reported as complete.
+
+    When a download is started inside the deadline but the deadline is
+    spent by the time it returns empty-handed, the group's state is
+    UNKNOWN-because-we-ran-out-of-time, not UNKNOWN-because-the-artifact-
+    does-not-exist. Only the first sets ``fetch_incomplete``, and only
+    that flag stops ``_publish_final_snapshot`` treating the result as
+    authoritative and deleting the section permanently.
+
+    Measured: the site was unconstrained in BOTH directions — deleting
+    the ``skipped = True`` assignment left 350 passed, and widening it to
+    fire on ANY failed download also left 350 passed.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": 1, "name": "review-status-lint", "archive_download_url": "u1"},
+    ])
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+
+    def download_that_overruns(token, repo, artifact, dest, deadline=None):
+        # Started while there was still room, returns after the cutoff.
+        clock["t"] = 120.0
+        return None
+
+    monkeypatch.setattr(_mod, "_download_artifact", download_that_overruns)
+
+    out = _mod.fetch_all_review_statuses("tok", "o/r", "77", deadline=30.0)
+
+    assert out == []
+    assert _mod.STATE.fetch_incomplete is True, (
+        "a download cut short by the shutdown deadline was reported as a "
+        "COMPLETE result; the final snapshot will republish it as "
+        "authoritative and delete that review section for good"
+    )
+
+
+def test_an_unavailable_artifact_is_not_blamed_on_the_deadline(
+        monkeypatch, tmp_path):
+    """Site C, the other direction: don't over-report partial either.
+
+    ``fetch_incomplete`` means \"we ran out of time to look\". A download
+    that fails while the deadline is still comfortably in the future is a
+    plain unavailable artifact, and marking the cycle partial there makes
+    the poller permanently refuse to publish on a run where one producer
+    never uploads. Widening the condition to any failed download was
+    measured at 350 passed, so nothing named this direction.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": 1, "name": "review-status-lint", "archive_download_url": "u1"},
+    ])
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    # Fails immediately, with the whole window still ahead of it.
+    monkeypatch.setattr(
+        _mod, "_download_artifact",
+        lambda token, repo, artifact, dest, deadline=None: None)
+
+    out = _mod.fetch_all_review_statuses("tok", "o/r", "77", deadline=600.0)
+
+    assert out == []
+    assert _mod.STATE.fetch_incomplete is False, (
+        "an artifact that simply is not available yet was reported as a "
+        "deadline-truncated read; the snapshot will then never treat any "
+        "cycle as authoritative on a run where one producer never uploads"
+    )
+
+
+def test_a_run_with_no_artifacts_clears_a_stale_partial_flag(monkeypatch):
+    """The no-artifacts branch must RESET ``fetch_incomplete``.
+
+    ``STATE`` outlives a cycle. A cycle that ends partial, followed by a
+    cycle whose listing legitimately returns no review-status artifacts,
+    leaves the stale flag set — and the snapshot then discards a perfectly
+    good empty result and republishes whatever it saw before. Measured:
+    deleting ``STATE.fetch_incomplete = False`` left 350 passed.
+    """
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": 1, "name": "some-other-artifact", "archive_download_url": "u"},
+    ])
+
+    _mod.STATE.fetch_incomplete = True        # residue of an earlier cycle
+
+    out = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+
+    assert out == []
+    assert _mod.STATE.fetch_incomplete is False, (
+        "a clean cycle with no review-status artifacts left the previous "
+        "cycle's partial flag set; every later snapshot is then treated as "
+        "non-authoritative forever"
+    )
+
+
+def test_two_artifact_names_carrying_one_source_render_once(
+        monkeypatch, tmp_path):
+    """The by-source dedupe must survive.
+
+    Distinct artifact NAMES can carry the same ``source`` — a producer
+    renamed across a rerun uploads under a new name while the old one has
+    not expired. Both groups are newest-of-their-name, so the name-level
+    selection cannot suppress either; only the by-source dedupe does.
+    Measured: returning ``all_statuses`` directly left 350 passed, because
+    every other artifact test uses one source per name.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": 20, "name": "review-status-lint-v2",
+         "archive_download_url": "u20"},
+        {"id": 10, "name": "review-status-lint", "archive_download_url": "u10"},
+    ])
+    monkeypatch.setattr(
+        _mod, "_download_artifact",
+        lambda token, repo, artifact, dest, deadline=None: Path(
+            f"/nonexistent/{artifact['id']}.json"))
+    monkeypatch.setattr(
+        _mod, "_parse_status_file",
+        lambda p: [{"source": "lint", "results": [
+            {"kind": "warning", "title": f"from-{p.stem}", "summary": "s"}]}])
+
+    out = _mod.fetch_all_review_statuses("tok", "o/r", "77")
+
+    sources = [s.get("source") for s in out]
+    assert sources == ["lint"], (
+        f"the same source was published {len(sources)} times ({sources}); a "
+        "renamed producer's old and new artifacts both rendered, so the "
+        "comment shows the section twice"
+    )
+
+
+def test_an_older_artifact_cannot_overwrite_a_newer_carry(
+        monkeypatch, tmp_path):
+    """The ``artifact_name_ids`` guard must be a real comparison.
+
+    ``artifacts_by_name`` is the value carried across a transient failure.
+    If an OLDER id may overwrite it, this sequence poisons the carry: the
+    newest artifact is read successfully, then it is deleted/expires, then
+    a later cycle reads the surviving older artifact and installs its
+    superseded result as the carried value. Measured: replacing the
+    ``prev_id is None or newest_id >= prev_id`` guard with ``if True`` left
+    350 passed.
+    """
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", tmp_path)
+    monkeypatch.setattr(
+        _mod, "_download_artifact",
+        lambda token, repo, artifact, dest, deadline=None: Path(
+            f"/nonexistent/{artifact['id']}.json"))
+
+    payloads = {
+        "20": [{"source": "lint", "results": [
+            {"kind": "ok", "title": "lint", "summary": "the rerun passed"}]}],
+        "10": [{"source": "lint", "results": [
+            {"kind": "failure", "title": "lint",
+             "summary": "the superseded attempt failed"}]}],
+    }
+    monkeypatch.setattr(_mod, "_parse_status_file", lambda p: payloads[p.stem])
+
+    listings = [
+        # Cycle 1: the rerun's artifact is present and readable.
+        [{"id": 20, "name": "review-status-lint", "archive_download_url": "u20"},
+         {"id": 10, "name": "review-status-lint", "archive_download_url": "u10"}],
+        # Cycle 2: id 20 is gone (deleted / expired); only the older one is
+        # listed, so it is the newest of its name and IS read.
+        [{"id": 10, "name": "review-status-lint", "archive_download_url": "u10"}],
+    ]
+    calls = {"n": 0}
+
+    def listing(*a, **k):
+        out = listings[min(calls["n"], len(listings) - 1)]
+        calls["n"] += 1
+        return list(out)
+
+    monkeypatch.setattr(_mod, "_list_artifacts", listing)
+
+    _mod.fetch_all_review_statuses("tok", "o/r", "77")
+    _mod.fetch_all_review_statuses("tok", "o/r", "77")
+
+    carried = _mod.STATE.artifacts_by_name.get("review-status-lint")
+    summaries = [r.get("summary")
+                 for s in (carried or []) for r in s.get("results", [])]
+    assert summaries == ["the rerun passed"], (
+        f"the carried value for the name is now {summaries}; an OLDER "
+        "artifact overwrote the newer attempt's result, so a later "
+        "transient failure would republish a superseded failure"
+    )
+    assert _mod.STATE.artifact_name_ids.get("review-status-lint") == 20, (
+        "the recorded id for the name moved BACKWARDS to the older artifact"
+    )
+
+
+def test_the_final_retry_never_starts_an_attempt_past_its_window(monkeypatch):
+    """Item 5: the post-sleep ``break`` is NOT behaviour-neutral.
+
+    The card recorded this mutation as measured-equivalent. Re-measured
+    here against the real module at the shipped constants (budget 1200s,
+    ``_PATCH_RESERVE_SECONDS`` 60, so ``retry_until`` is t=1140), driving
+    the loop with an attempt that costs wall-clock time:
+
+        attempt cost   shipped: last attempt   no break: last attempt
+        0.0s           t=1135.00               t=1140.00
+        0.3s           t=1138.50               t=1140.00 (ends 1140.30)
+        1.2s           t=1135.60               t=1140.00 (ends 1141.20)
+
+    Without the break the loop always starts one more PATCH at exactly
+    ``retry_until`` — the instant the PATCH reserve begins. That is the
+    whole point of the reserve: the retry window stops so the final write
+    has a window of its own. The equivalence claim only held because the
+    earlier measurement used a zero-cost attempt AND read the clock rather
+    than which attempts were started.
+
+    Expectations are literals: no attempt may begin at or after t=1140 of
+    a 1200s budget.
+    """
+    clock = {"t": 0.0}
+    phase = {"final": False}
+    attempts: list[float] = []
+
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        _mod.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+
+    def fetch(*a, **k):
+        # The snapshot path is the only caller passing a deadline.
+        if k.get("deadline") is not None:
+            phase["final"] = True
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", fetch)
+
+    def failing_upsert(t, r, p, body, comment_id=None):
+        if phase["final"]:
+            attempts.append(clock["t"])
+            clock["t"] += 1.2      # a real PATCH is not instantaneous
+            return 0
+        return 1
+
+    monkeypatch.setattr(_mod, "upsert_comment", failing_upsert)
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False, max_wall_seconds=1200)
+
+    assert len(attempts) >= 2, f"the snapshot was never retried: {attempts}"
+    assert attempts[-1] < 1140, (
+        f"a retry attempt started at t={attempts[-1]:.2f}s of a 1200s budget, "
+        "at or past the t=1140s cutoff that opens the 60s PATCH reserve — "
+        "the retry loop is spending the window the final write needs"
+    )
+
+
+def test_the_final_retry_pause_cannot_overrun_its_window(monkeypatch):
+    """Item 6: the ``min()`` clamp on the retry pause is NOT neutral.
+
+    Also recorded as measured-equivalent. Re-measured against the real
+    module at the shipped constants, with an attempt that costs 1.2s:
+
+        shipped:  59 attempts, last at t=1135.60, loop ends t=1140.00
+        no clamp: 59 attempts, last at t=1135.60, loop ends t=1141.80
+
+    Same attempts, but the unclamped final sleep runs 1.8s past
+    ``retry_until`` and eats that much of the PATCH reserve. The earlier
+    equivalence measurement used a zero-cost attempt, where the loop's
+    stride divides the window exactly and the last sleep happens to land
+    on the boundary; any non-zero attempt cost breaks the alignment.
+
+    Asserted as a literal: the loop must not still be sleeping after
+    t=1140 of a 1200s budget.
+    """
+    clock = {"t": 0.0}
+    phase = {"final": False}
+    sleep_ends: list[float] = []
+
+    monkeypatch.setattr(_mod.time, "time", lambda: clock["t"])
+
+    def fake_sleep(s):
+        clock["t"] += s
+        if phase["final"]:
+            sleep_ends.append(clock["t"])
+
+    monkeypatch.setattr(_mod.time, "sleep", fake_sleep)
+    monkeypatch.setattr(_mod, "collect_run_jobs", lambda *a, **k: (
+        [{"name": "Python tests", "status": "in_progress", "html_url": "u"}],
+        False))
+    monkeypatch.setattr(_mod, "pr_is_in_merge_queue", lambda *a, **k: False)
+
+    def fetch(*a, **k):
+        if k.get("deadline") is not None:
+            phase["final"] = True
+        return []
+
+    monkeypatch.setattr(_mod, "fetch_all_review_statuses", fetch)
+
+    def failing_upsert(t, r, p, body, comment_id=None):
+        if phase["final"]:
+            clock["t"] += 1.2
+            return 0
+        return 1
+
+    monkeypatch.setattr(_mod, "upsert_comment", failing_upsert)
+
+    _mod.run(token="t", repo="o/r", run_id="1", pr_number="5", run_url="u",
+             interval=45, timeout=100000, dry_run=False, max_wall_seconds=1200)
+
+    assert sleep_ends, "the retry loop never paused"
+    assert max(sleep_ends) <= 1140, (
+        f"a retry pause ran to t={max(sleep_ends):.2f}s of a 1200s budget, "
+        "past the t=1140s cutoff that opens the 60s PATCH reserve — the "
+        "pause is not clamped to the room left in the retry window"
+    )
+
+
+def test_the_redirect_hop_is_counted_against_the_budget(monkeypatch, tmp_path):
+    """Every charged request must appear in the budget accounting.
+
+    The per-cycle budget line printed by the poll loop is the only
+    instrument that diagnosed the original incident. The artifact
+    redirect hop IS a charged API request (it authenticates to
+    ``api.github.com`` and returns a 302), so a hop missing from the count
+    understates the cycle's real cost and hides the next storm. Measured:
+    dropping ``STATE.charged += 1`` from the 302 branch left 350 passed.
+    """
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise _http_error(302, {"Location": "https://blob/x"})
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: _Opener())
+    # The blob hop is not an API request and must NOT be charged.
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, *a, **k: _Resp({}, {}))
+
+    artifact = {"id": 1, "name": "review-status-lint",
+                "archive_download_url": "https://api/x"}
+    before = _mod.STATE.charged
+    _mod._download_artifact("tok", "o/r", artifact, tmp_path)
+
+    assert _mod.STATE.charged - before == 1, (
+        f"the artifact redirect hop charged "
+        f"{_mod.STATE.charged - before} requests against the budget, not 1; "
+        "the per-cycle budget line then understates the real cost and the "
+        "rate-limit incident it exists to diagnose stays invisible"
+    )
+
+
+def test_artifact_staging_is_confined_to_the_named_temp_base(
+        monkeypatch, tmp_path):
+    """Downloads must stage under ``_ARTIFACT_TEMP_BASE``, not anywhere.
+
+    Every artifact test redirects this constant, so none of them observes
+    where production actually writes. Measured: repointing it at a
+    different directory left 350 passed. The constant is load-bearing
+    twice over — it is the one seam that keeps the suite out of the real
+    shared ``/tmp``, and it is what makes the run-scoped subdirectory
+    predictable.
+    """
+    staged = tmp_path / "staging-base"
+    monkeypatch.setattr(_mod, "_ARTIFACT_TEMP_BASE", staged)
+    monkeypatch.setattr(_mod, "_list_artifacts", lambda *a, **k: [
+        {"id": 7, "name": "review-status-lint", "archive_download_url": "u7"},
+    ])
+
+    dests: list[Path] = []
+
+    def download(token, repo, artifact, dest, deadline=None):
+        dests.append(Path(dest))
+        return None
+
+    monkeypatch.setattr(_mod, "_download_artifact", download)
+
+    _mod.fetch_all_review_statuses("tok", "o/r", "77")
+
+    assert dests, "no artifact download was attempted"
+    # Deliberate literal for the run-scoped layer: <temp base>/<run id>.
+    assert dests[0] == staged / "77", (
+        f"artifacts were staged in {dests[0]} instead of "
+        f"{staged / '77'} — the download path ignores _ARTIFACT_TEMP_BASE, "
+        "so the tests write into the real shared /tmp"
+    )
+    assert staged.is_dir(), (
+        "the staging directory under _ARTIFACT_TEMP_BASE was never created"
+    )
+
+
+def test_the_artifact_staging_base_is_an_absolute_scratch_path():
+    """The shipped ``_ARTIFACT_TEMP_BASE`` value, not a redirected one.
+
+    The test above proves the download path ROUTES through the constant,
+    but it monkeypatches the value — as every artifact test does — so
+    nothing observes what production is actually configured with.
+    Measured: changing the constant to a RELATIVE path left 360 passed.
+    That is not cosmetic: the poller runs with its cwd inside the repo
+    checkout, so a relative base stages artifact zips into the working
+    tree, where they land in ``git status`` and in any path-walking gate.
+
+    Properties, not a frozen literal (AGENTS.md: behaviour contracts over
+    snapshots) — the directory may be renamed, but it must stay an
+    absolute scratch path with a segment of its own rather than a bare
+    system temp root shared with every other process.
+    """
+    base = _mod._ARTIFACT_TEMP_BASE
+
+    assert base.is_absolute(), (
+        f"_ARTIFACT_TEMP_BASE is {base!r}, a RELATIVE path — artifact zips "
+        "are staged inside the repo checkout the poller runs from"
+    )
+    # Deliberate literals: the scratch roots a CI runner actually provides.
+    assert base.parts[1] in ("tmp", "var", "private", "home", "runner"), (
+        f"_ARTIFACT_TEMP_BASE is {base!r}, which is not under a scratch "
+        "root; artifact staging must not write into a persistent location"
+    )
+    assert len(base.parts) >= 3, (
+        f"_ARTIFACT_TEMP_BASE is {base!r} — staging directly in a shared "
+        "temp root collides with every other process on the runner"
+    )
+
+
+def test_every_api_url_is_built_from_the_github_api_base():
+    """``API_BASE`` must be the real GitHub API host, used everywhere.
+
+    Measured: repointing ``API_BASE`` at another host left 350 passed —
+    every test that exercises a URL stubs the transport, so no test ever
+    observes the host that production actually talks to. A wrong or
+    partially-applied base sends an installation token to a host that is
+    not GitHub.
+
+    The expected host is a deliberate literal; the source is scanned so a
+    NEW hardcoded ``api.github.com`` call site cannot bypass the constant.
+    """
+    src = _PATH.read_text(encoding="utf-8")
+
+    assert 'API_BASE = "https://api.github.com"' in src, (
+        "API_BASE is no longer the GitHub API host; the poller's "
+        "installation token would be sent somewhere else"
+    )
+
+    # Exactly one occurrence of the literal host: the constant itself.
+    # Any other is a call site that bypasses the constant.
+    assert src.count("api.github.com") == 1, (
+        f"the literal API host appears {src.count('api.github.com')} times; "
+        "a call site is hardcoding it instead of using API_BASE, so the "
+        "constant no longer governs where requests go"
+    )

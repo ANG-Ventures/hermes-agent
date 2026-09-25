@@ -110,7 +110,7 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
                worker_pid           = NULL,
                current_run_id       = NULL,
                last_heartbeat_at    = NULL,
-               session_id           = NULL,
+               session_id           = 'unhomed',  -- kanban_db.UNHOMED_SESSION: never NULL
                project_id           = NULL,
                consecutive_failures = 0,
                last_failure_error   = NULL

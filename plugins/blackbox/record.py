@@ -34,8 +34,22 @@ class TurnRecord:
     tools: List[str] = field(default_factory=list)  # ["exec","exec","read"]
     input_tokens: int = 0
     output_tokens: int = 0
+    # UNKNOWN != 0. True when the provider explicitly declined to measure this
+    # turn's output (null count + discriminator flag — see
+    # agent.usage_pricing.CanonicalUsage.output_tokens_unknown). ``output_tokens``
+    # stays an int for arithmetic; renderers MUST consult this flag and show
+    # "unknown" rather than presenting the 0 as a measurement.
+    output_tokens_unknown: bool = False
+    input_tokens_unknown: bool = False
+    cache_read_tokens_unknown: bool = False
+    cache_write_tokens_unknown: bool = False
+    usage_unknown: bool = False
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    idle_compaction_fired: Optional[bool] = None
+    compaction_tokens_before: Optional[int] = None
+    compaction_tokens_after: Optional[int] = None
+    compaction_cost_usd: Optional[float] = None
     reasoning_tokens: int = 0
     context_used: int = 0
     context_length: int = 0
@@ -46,6 +60,13 @@ class TurnRecord:
     last_cache_read_tokens: Optional[int] = None
     last_cache_write_tokens: Optional[int] = None
     last_uncached_tokens: Optional[int] = None
+    # Discriminator for the three columns ABOVE and for ``context_used`` — all
+    # four describe the FINAL call only. The turn-level ``*_unknown`` flags are
+    # absorbing (`any()` across every call, agent/turn_finalizer.py), so they
+    # cannot answer "was the last call measured?": a 5-call turn whose call #2
+    # returned no usage sets them even when the final call is fully measured.
+    # Renderers of last-call data must gate on THIS flag (r6 finding 9).
+    last_call_prompt_unknown: bool = False
     # Request composition of the FINAL call (char/4 fixed vs non-fixed buckets).
     # Distinct from the cache split above: this decomposes the request PAYLOAD
     # by source (system / tool schemas / history / tool results / tool args),
@@ -85,6 +106,9 @@ class TurnRecord:
     # Enables deduplication: ccusage records with this invocation_id are already
     # counted in turns.db and should not be double-counted in the ccusage panel.
     cli_invocation_id: Optional[str] = None
+    # Terminal-error marker: the turn_exit_reason of a turn that ended FAILED
+    # (fallback chain exhausted, raised); None for a turn that ended normally.
+    terminal_error: Optional[str] = None
     # Not persisted on the main row — written to the side table:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # {name,args_preview,result_preview}
 

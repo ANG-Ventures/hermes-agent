@@ -207,7 +207,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
-    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
+    def mock_judge_goal(goal, last_response, **kwargs):
         # Match the real judge_goal contract:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
         return "continue", "missing verification evidence", False, None, False
@@ -230,6 +230,65 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         assert task.status == "running"  # Should still be running, not done
     finally:
         conn2.close()
+
+
+def test_goal_complete_first_call_uses_deliverables_not_completion_receipt(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+    monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
+
+    def judge(**kwargs):
+        assert kwargs["completion_handoff"] is True
+        assert "kanban_complete" not in kwargs["last_response"]
+        return ("done", "deliverable verified", False, None, False)
+
+    monkeypatch.setattr(kt, "judge_goal", judge)
+    result = json.loads(kt._handle_complete({"summary": "CANARY_PHASE1_NEW and CANARY_PHASE2_NEW; both exit 0"}))
+    assert result.get("ok") is True, result
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_goal_complete_judge_500_blocks_worker_transient(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+    monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
+    calls = []
+
+    def failing_judge(**kwargs):
+        calls.append(kwargs)
+        return ("continue", "judge error: InternalServerError", False, None, True)
+
+    monkeypatch.setattr(kt, "judge_goal", failing_judge)
+    out = json.loads(kt._handle_complete({"summary": "Verified output"}))
+    assert len(calls) == 2
+    assert "InternalServerError" in out["error"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "transient"
+
+
+def test_goal_complete_operator_judge_500_fails_open_with_event(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
+    monkeypatch.setattr(kt, "judge_goal", lambda **kw: ("continue", "judge error: InternalServerError", False, None, True))
+    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "Verified output"}))
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+        events = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ?", (tid,)).fetchall()
+        assert any(e["kind"] == "judge_error" and "InternalServerError" in e["payload"] for e in events)
 
 
 def test_block_happy_path(worker_env):
@@ -266,10 +325,12 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             conn, title="goal-mode-block-test", assignee="test-worker",
             body="Must achieve X.", goal_mode=True,
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return goal_task_id
 
 
@@ -438,6 +499,58 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def _pin_kanban_cfg(monkeypatch, kanban_cfg):
+    from hermes_cli import kanban_worker_policy as kwp
+    monkeypatch.setattr(kwp, "_load_config", lambda: {"kanban": kanban_cfg})
+
+
+def test_create_worker_default_assignee_remapped_to_knob(worker_env, monkeypatch):
+    """A worker's literal assignee='default' goes to kanban.default_assignee (t_4424c05d)."""
+    _pin_kanban_cfg(monkeypatch, {"default_assignee": "daedalus"})
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "derived", "assignee": "default"}))
+    assert d["ok"] is True
+    assert d["assignee_remapped"]["from"] == "default"
+    assert d["assignee_remapped"]["to"] == "daedalus"
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, d["task_id"]).assignee == "daedalus"
+        kinds = [
+            r[0] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (d["task_id"],)
+            )
+        ]
+        assert "assignee_remapped" in kinds
+    finally:
+        conn.close()
+
+
+def test_create_worker_default_assignee_refused_without_knob(worker_env, monkeypatch):
+    _pin_kanban_cfg(monkeypatch, {"default_assignee": ""})
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "derived", "assignee": "default"}))
+    assert "error" in d
+    assert "kanban.default_assignee" in d["error"]
+
+
+def test_create_operator_default_assignee_untouched(worker_env, monkeypatch):
+    """Operator/CLI creates (no worker marker) may still assign 'default'."""
+    from hermes_cli import kanban_worker_policy as kwp
+    _pin_kanban_cfg(monkeypatch, {"default_assignee": "daedalus"})
+    monkeypatch.delenv(kwp.WORKER_ENV_MARKER, raising=False)
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "mine", "assignee": "default"}))
+    assert d["ok"] is True
+    assert "assignee_remapped" not in d
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, d["task_id"]).assignee == "default"
+    finally:
+        conn.close()
+
+
 def test_create_persists_model_override(worker_env):
     """kanban_create accepts model_override and persists it (the read side
     at 327/372 already surfaces it)."""
@@ -452,6 +565,44 @@ def test_create_persists_model_override(worker_env):
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child.model_override == "claude-opus-4-8"
+    finally:
+        conn.close()
+
+
+def test_create_tool_stamps_session_and_origin(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    # A CHAT session's tool create (not a dispatched worker run): a worker
+    # run's per-run id is never a card's home (t_f59538cf item 1).
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260924_000000_toolsess")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "#ops")
+    d = json.loads(kt._handle_create({"title": "tool card", "assignee": "peer",
+                                      "body": "work"}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, d["task_id"])
+        assert t.session_id == "20260924_000000_toolsess"
+        assert t.body.splitlines()[0].startswith(
+            "origin: discord #ops \u00b7 session 20260924_000000_toolsess")
+    finally:
+        conn.close()
+
+
+def test_create_tool_without_session_is_unhomed(worker_env, monkeypatch):
+    """Cron/worker creates with no session env are born 'unhomed', never NULL."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    d = json.loads(kt._handle_create({"title": "orphan", "assignee": "peer"}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        raw = conn.execute("SELECT session_id FROM tasks WHERE id = ?",
+                           (d["task_id"],)).fetchone()
+        assert raw["session_id"] == kb.UNHOMED_SESSION
     finally:
         conn.close()
 
@@ -1258,6 +1409,186 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("payload", [
+    pytest.param(b"column     aligned       value\n" * 350, id="spaces"),
+    pytest.param(bytes(range(256)) * 32, id="binary"),
+])
+def test_attach_returns_verified_stored_digest(worker_env, payload):
+    import base64
+    import hashlib
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    digest = hashlib.sha256(payload).hexdigest()
+    result = json.loads(kt._handle_attach({
+        "task_id": worker_env, "filename": "artifact.bin",
+        "content_base64": base64.b64encode(payload).decode("ascii"),
+        "expected_sha256": digest,
+    }))
+    assert result.get("ok") is True, result
+    assert result["sha256"] == digest
+    conn = kb.connect()
+    try:
+        attachment = kb.get_attachment(conn, result["attachment_id"])
+        assert attachment is not None
+        assert hashlib.sha256(Path(attachment.stored_path).read_bytes()).hexdigest() == digest
+    finally:
+        conn.close()
+
+
+def test_attach_rejects_digest_mismatch_without_storing(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_attach({
+        "task_id": worker_env, "filename": "artifact.bin", "content_base64": "YWJj",
+        "expected_sha256": "0" * 64,
+    }))
+    assert result.get("ok") is not True, result
+    assert "sha256" in result["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_requires_source_digest(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_attach({
+        "task_id": worker_env, "filename": "artifact.bin", "content_base64": "YWJj",
+    }))
+    assert "expected_sha256" in out["error"]
+
+
+def test_attach_rejects_corrupt_disk_write_without_row(worker_env, monkeypatch):
+    import base64
+    import hashlib
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original_write = Path.write_bytes
+    def corrupt_write(path, data):
+        return original_write(path, data.replace(b"     ", b" "))
+
+    monkeypatch.setattr(Path, "write_bytes", corrupt_write)
+    payload = b"column     aligned\n" * 400
+    out = json.loads(kt._handle_attach({
+        "task_id": worker_env, "filename": "artifact.txt",
+        "content_base64": base64.b64encode(payload).decode("ascii"),
+        "expected_sha256": hashlib.sha256(payload).hexdigest(),
+    }))
+    assert "write verification failed" in out["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+        assert list(kb.task_attachments_dir(worker_env).glob("*")) == []
+    finally:
+        conn.close()
+
+
+# kanban_attach(path=...) — the bytes never pass through the model. A model
+# re-emitting a file as base64 transcribes it and alters long payloads
+# (t_31148bf8: 7,408 B in, 7,407 B stored, a digest inside gained a char).
+
+
+@pytest.mark.parametrize("payload", [
+    pytest.param(b"column     aligned       value\n" * 350, id="spaces"),
+    pytest.param(bytes(range(256)) * 32, id="binary"),
+    pytest.param(("5440c9aeaad7  \u2014 caf\u00e9\n" * 600).encode("utf-8"), id="utf8-hex"),
+])
+def test_attach_path_is_byte_exact_without_client_digest(worker_env, tmp_path, payload):
+    import hashlib
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    src = tmp_path / "evidence.bin"
+    src.write_bytes(payload)
+    result = json.loads(kt._handle_attach({"task_id": worker_env, "path": str(src)}))
+    assert result.get("ok") is True, result
+    assert result["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert result["size"] == len(payload)
+    conn = kb.connect()
+    try:
+        attachment = kb.get_attachment(conn, result["attachment_id"])
+        assert attachment.filename == "evidence.bin"
+        assert Path(attachment.stored_path).read_bytes() == payload
+    finally:
+        conn.close()
+
+
+def test_attach_path_checks_optional_digest_and_stores_nothing_on_mismatch(worker_env, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    src = tmp_path / "a.txt"
+    src.write_bytes(b"abc")
+    out = json.loads(kt._handle_attach({
+        "task_id": worker_env, "path": str(src), "expected_sha256": "0" * 64,
+    }))
+    assert "expected_sha256" in out["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("args", [
+    pytest.param({}, id="neither"),
+    pytest.param({"content_base64": "YWJj", "expected_sha256": "x"}, id="both"),
+])
+def test_attach_requires_exactly_one_source(worker_env, tmp_path, args):
+    from tools import kanban_tools as kt
+
+    src = tmp_path / "a.txt"
+    src.write_bytes(b"abc")
+    if args:
+        args = dict(args, path=str(src))
+    out = json.loads(kt._handle_attach(dict(args, task_id=worker_env, filename="a.txt")))
+    assert "exactly one of path" in out["error"]
+
+
+@pytest.mark.parametrize("make", [
+    pytest.param(lambda d: "relative/a.txt", id="relative"),
+    pytest.param(lambda d: str(d), id="directory"),
+    pytest.param(lambda d: str(d / "missing.txt"), id="missing"),
+])
+def test_attach_path_rejects_unreadable_sources(worker_env, tmp_path, make):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_attach({"task_id": worker_env, "path": make(tmp_path)}))
+    assert "cannot read path" in out["error"]
+
+
+def test_attach_path_enforces_size_cap_without_storing(worker_env, tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 16)
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 17)
+    out = json.loads(kt._handle_attach({"task_id": worker_env, "path": str(src)}))
+    assert "limit" in out["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_schema_offers_path_and_requires_no_inline_bytes():
+    from tools import kanban_tools as kt
+
+    params = kt.KANBAN_ATTACH_SCHEMA["parameters"]
+    assert "path" in params["properties"]
+    assert "content_base64" not in params["required"]
+
+
 @pytest.fixture
 def allow_private_urls(monkeypatch):
     """Opt the SSRF guard into private/loopback targets for local fixtures.
@@ -1412,3 +1743,46 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_complete_superseded_by_needs_no_summary(worker_env):
+    """The tool-level honest verb: pointer only, no work evidence, closes done."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env, "superseded_by": "t_0c5ac29a -> #889"})
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.outcome == "superseded"
+        assert run.metadata["superseded_by"] == "t_0c5ac29a -> #889"
+        assert kb.get_task(conn, worker_env).status == "done"
+    finally:
+        conn.close()
+
+
+def test_complete_superseded_by_empty_is_refused(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env, "superseded_by": "   "})
+    assert "superseded_by" in out
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_still_requires_evidence_without_superseded_by(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env})
+    assert "summary" in out and "superseded_by" in out
+
+
+def test_complete_schema_exposes_superseded_by():
+    from tools.kanban_tools import KANBAN_COMPLETE_SCHEMA
+    props = KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+    assert "superseded_by" in props
+    assert props["superseded_by"]["type"] == "string"

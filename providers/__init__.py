@@ -38,13 +38,14 @@ import logging
 import sys
 from pathlib import Path
 
+from hermes_cli import provider_seam
+from hermes_cli.provider_seam import GuardedDict
 from providers.base import OMIT_TEMPERATURE, ProviderProfile  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-_REGISTRY: dict[str, ProviderProfile] = {}
-_ALIASES: dict[str, str] = {}
-_PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
+_REGISTRY: dict[str, ProviderProfile] = GuardedDict(__name__, "_REGISTRY", {})
+_ALIASES: dict[str, str] = GuardedDict(__name__, "_ALIASES", {})
 _discovered = False
 # True only while _discover_providers() is importing plugin modules. A plugin
 # imported by that pass can read provider-derived state (CANONICAL_PROVIDERS,
@@ -70,11 +71,9 @@ def register_provider(profile: ProviderProfile) -> None:
     plugins under ``$HERMES_HOME/plugins/model-providers/`` can override
     bundled profiles without editing repo code.
     """
-    global _PROVIDER_LIST_CACHE
     _REGISTRY[profile.name] = profile
     for alias in profile.aliases:
         _ALIASES[alias] = profile.name
-    _PROVIDER_LIST_CACHE = None
 
 
 def _lint_provider_collisions() -> list[str]:
@@ -212,27 +211,31 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
     """
     if not _discovered:
         _discover_providers()
-    canonical = _ALIASES.get(name, name)
-    return _REGISTRY.get(canonical)
+    g = provider_seam.snapshot()
+    canonical = g._ALIASES.get(name, name)
+    return g._REGISTRY.get(canonical)
 
 
 def list_providers() -> list[ProviderProfile]:
     """Return all registered provider profiles (one per canonical name)."""
-    global _PROVIDER_LIST_CACHE
     if not _discovered:
         _discover_providers()
-    if _PROVIDER_LIST_CACHE is not None:
-        return list(_PROVIDER_LIST_CACHE)
+    g = provider_seam.snapshot()
+    if g.providers_list is not None:
+        return list(g.providers_list)
     # Deduplicate: _REGISTRY has canonical names; _ALIASES points to same objects
     seen: set[int] = set()
     result: list[ProviderProfile] = []
-    for profile in _REGISTRY.values():
+    for profile in g._REGISTRY.values():
         pid = id(profile)
         if pid not in seen:
             seen.add(pid)
             result.append(profile)
-    _PROVIDER_LIST_CACHE = result
-    return list(result)
+    # Per-generation memo, filled without the seam lock: a racing filler
+    # computes the same tuple from the same frozen generation, and any later
+    # registration swaps in a new generation whose memo starts empty.
+    g.providers_list = tuple(result)
+    return result
 
 
 def _user_plugins_dir() -> Path | None:
