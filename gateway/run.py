@@ -32246,22 +32246,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        # Profile attribution: a per-source profile wins (multiplexed serving
-        # binds each inbound to the profile that owns it), but when the source
-        # carries none, fall back to the profile THIS gateway was launched with
-        # rather than binding "". An empty profile made every subprocess/tool
-        # that reads HERMES_SESSION_PROFILE (papercut attribution, delegate_tool,
-        # kanban_tools) silently resolve to the default profile's identity even
-        # on a sibling gateway launched with --profile <name>. getattr keeps
-        # bare runners built via object.__new__ (tests) working.
-        _profile = getattr(source, "profile", "") or ""
-        if not _profile:
-            _resolve = getattr(self, "_active_profile_name", None)
-            if callable(_resolve):
-                try:
-                    _profile = _resolve() or ""
-                except Exception:
-                    _profile = ""
         return set_session_vars(
             platform=source.platform.value,
             chat_id=source.chat_id,
@@ -32285,7 +32269,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key or "",
             session_id=session_id or "",
             message_id=str(message_id) if message_id else "",
-            profile=_profile,
+            profile=getattr(source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
         )
