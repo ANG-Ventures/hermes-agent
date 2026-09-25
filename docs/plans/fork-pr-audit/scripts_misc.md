@@ -123,3 +123,9 @@ Log window for every 'fires' column: 2026-06-02..2026-09-25 (86 agent/gateway/er
 | #22 | apollo@daemonarchy.local unmapped in AUTHOR_MAP | n/a (fleet-only) | none | 0: last origin/main commit by apollo@daemonarchy.local is 2026-06-30; contributor-check only inspects new PR commits [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs +  | loc 1, cf 1(2) | **DROP** | audit/scripts_misc/revert-author-map-stale |
 | #847 | (empty diff — no content survives) | n/a | none | n/a (0 loc) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)] | loc 0, cf 0(0) | **DROP** | — |
 | #805 | (empty diff — no content survives) | n/a | none | n/a (0 loc) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)] | loc 0, cf 0(0) | **DROP** | — |
+
+## Run 2 addendum (branchless DROP/SUPERSEDED rows)
+- #272: branch `audit/scripts_misc/revert-livesync-probes` (deletes the 3 livesync scripts, which only reference each other; git grep rc=1 after).
+- #268: scripts part covered by the same branch. hermes_state/tui_gateway/config revert conflicts in 10 files and goes to the hermes_cli/gateway auditors.
+- #116/#118: git revert conflicts in agent/background_review.py, mem0 plugin and toolsets.py. Needs a hand revert by the agent/plugins auditor.
+- No branch needed: #189 (D9 desktop), #805/#847 (empty), nopr:1b8af38096 (nothing left), #307 (take upstream's on next sync).
