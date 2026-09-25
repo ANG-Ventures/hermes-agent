@@ -107,6 +107,40 @@
   "subsystem": "plugins/blackbox",
   "subject": "Blackbox Turn Telemetry \u2014 per-turn cost/token/tool telemetry + /cost (#6)"
  },
+ "#190": {
+  "verdict": "KEEP",
+  "problem": "Salient auto-capture A-lite: durable queue + gate + drain + wiring so every turn's salient facts reach mem0 without blocking the turn.",
+  "evidence": {
+   "original": "PR #190 body; spec ~/.hermes/plans/2026-07-03_mem0-salient-autocapture-queue-spec.md.",
+   "upstream_state": "read-only: upstream plugins/memory/mem0 (rewritten 2e779d11a0, 2026-06-22: v3 API, OSS mode, update/delete tools) has no capture pipeline \u2014 'capture' 1 hit in __init__.py, none of capture_queue/capture_drain/capture_pipeline exist. Fork-only product.",
+   "upstream_fix": "none",
+   "fires": "4,300 log lines / 10 files in the window (MEM0-CAPTURE-ALERT, drain requeue lines); live mem0.json capture=auto on the default gateway; 9 profile .env files set MEM0_CAPTURE=off (recall-only). Latest drain warning 2026-09-25 08:11.",
+   "cost": {
+    "loc": 2147,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_remember.py"
+    ],
+    "dependents": [
+     "#250",
+     "#251",
+     "#193",
+     "#320",
+     "#393",
+     "#407",
+     "#516",
+     "#652",
+     "#192",
+     "#824"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Fork-permanent product (Ace's memory pipeline). 2 conflict files (2 syncs) = mem0/__init__.py + a test; the plugin file is a permanent AA-style conflict against upstream's rewritten __init__.py. Structural recommendation for the lead (applies to every mem0 row): re-base the fork plugin on upstream's Mem0Backend ABC (_backend.py) and keep the fork-only modules on top \u2014 that converts the __init__.py conflict into an additive file set.",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): salient auto-capture A-lite (queue + gate + drain + wiring) (#190)"
+ },
  "#141": {
   "verdict": "KEEP",
   "problem": "/usage shows the rich last-turn card + per-category context breakdown.",
@@ -130,6 +164,56 @@
   "notes": "Measured in use. Cost is the highest of the blackbox rows: 24 files, gateway/slash_commands.py + locales/*.yaml conflict every sync (3/3). D4a/D7 already promoted this: move the card rendering INTO the plugin (plugin-registered slash command via the seam upstream now provides, 5943347a2a) so slash_commands.py carries zero blackbox lines. That is a fork_ext extraction card, not a drop.",
   "subsystem": "plugins/blackbox",
   "subject": "feat(gateway): /usage shows the rich /context last-turn card + per-category context breakdown (#141)"
+ },
+ "#294": {
+  "verdict": "KEEP",
+  "problem": "Guard builtin mem0 reranking (deadline + failure isolation) so a slow/failed reranker cannot stall recall.",
+  "evidence": {
+   "original": "PR #294 body.",
+   "upstream_state": "read-only: upstream rerank is platform-only (mem0/__init__.py:110/:234 'Platform-only'; SelfHostedBackend.search ignores rerank). The fork runs a builtin reranker on the self-hosted server (mem0.json rerank=builtin, rerank_deadline_ms=8647 adaptive) \u2014 no upstream counterpart.",
+   "upstream_fix": "none",
+   "fires": "519 log lines / 7 files in the window (daedalus-fable errors.log.1 / agent.log.1 top)",
+   "cost": {
+    "loc": 1309,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": [
+     "#219",
+     "#613",
+     "#102"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Fires. 1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(memory): guard builtin mem0 reranking (#294)"
+ },
+ "nopr:b9e00148c7": {
+  "verdict": "KEEP",
+  "problem": "Gated destructive tools mem0_forget + mem0_delete with a destructive ledger and scope resolution.",
+  "evidence": {
+   "original": "Commit body (2026-06-10).",
+   "upstream_state": "read-only, PARTIAL overlap: upstream 2e779d11a0 ships mem0_delete (by id, __init__.py:115) and mem0_update; no by-filter forget, no gate flag, no ledger.",
+   "upstream_fix": "2e779d11a0 (mem0_delete-by-id half)",
+   "fires": "~/.hermes/mem0-destructive-ledger.jsonl: 190 entries, last op 'forget' at 2026-09-20; mem0.json destructive_tools_enabled=true",
+   "cost": {
+    "loc": 1241,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": [
+     "#592"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Used. The by-id delete half converges on upstream's tool at the re-base; forget+ledger stays. scripts/mem0-destructive-e2e.py is gone from the fork (91 test symbols still present). 1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "mem0: add gated destructive tools (mem0_forget + mem0_delete)"
  },
  "#497": {
   "verdict": "KEEP",
@@ -159,6 +243,30 @@
   "subsystem": "plugins/context_engine",
   "subject": "fix(compaction): below-threshold compactions announce themselves and name the cause (#497)"
  },
+ "#146": {
+  "verdict": "DROP",
+  "problem": "QMD-in-mem0 unified recall (QMD leg alongside mem0 recall) + operator toggles.",
+  "evidence": {
+   "original": "PR #146 body (2026-07-01).",
+   "upstream_state": "read-only: no QMD leg upstream (fork-only).",
+   "upstream_fix": "none",
+   "fires": "0 hits for this row's log lines; loose substring 'qmd' = 5 lines vs 'gbrain' = 304 in the same agent/gateway logs. mem0.json has mem0_qmd enabled=true AND mem0_gbrain enabled=true; per #248 the gbrain leg REPLACES the QMD leg when enabled, so the QMD path is effectively dead in production.",
+   "cost": {
+    "loc": 1141,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": [
+     "#248"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Dead-by-replacement, not dead-by-bug. Revert branch NOT built this run: #248's gbrain leg shares the 'leg' plumbing #146 introduced, so a mechanical revert would take #248 with it \u2014 the drop is 'remove qmd_recall.py + the QMD toggle, keep the leg abstraction', a small authored change, not `git revert`. Adversary check: confirm no profile runs gbrain disabled + qmd enabled (all 11 mem0 profiles share ~/.hermes/mem0.json? \u2014 per-profile mem0.json not audited).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): QMD-in-mem0 unified recall + operator toggles (#146)"
+ },
  "#968": {
   "verdict": "KEEP",
   "problem": "kanban-home-cards plugin: open home cards once at session start (t_13a135f5).",
@@ -178,6 +286,31 @@
   "notes": "Fork-permanent plugin, 0 conflict files.",
   "subsystem": "plugins/kanban-home-cards",
   "subject": "feat(plugins): kanban-home-cards \u2014 open home cards once at session start (t_13a135f5) (#968)"
+ },
+ "#250": {
+  "verdict": "KEEP",
+  "problem": "Arm-B two-pass capture router: deterministic class routing with a codex-bridge primary and a fallback pass.",
+  "evidence": {
+   "original": "PR #250 body (2026-07-08).",
+   "upstream_state": "read-only: no capture router upstream (fork-only).",
+   "upstream_fix": "none",
+   "fires": "8,238 log lines / 8 files \u2014 BUT 6,125 of the 6,696 capture-router lines in gateway.error.log are 'primary (codex-bridge) pass failed, trying fallback: HTTP Error 503' and 392 are 'fallback (gemini-bridge) pass ALSO failed'. mem0.json mem0_capture_router enabled=true, model gpt-6-astra, fallback gemini-3.8-flash-low.",
+   "cost": {
+    "loc": 1035,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": [
+     "#407",
+     "#652"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "FINDING (not this audit's scope, for the lead): the router's primary is failing ~91% of the time in the window and the fallback also fails ~6% \u2014 the fire count is mostly error lines. The code is live and needed; its configured primary route is not. 1 conflict file (1).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): Arm-B two-pass capture router (deterministic class routing, codex-bridge primary) (#250)"
  },
  "#168": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -200,6 +333,28 @@
   "notes": "Verdict = ledger DD-1 (ADOPT-THEIRS): delete our three tail functions, adopt their fresh_tail.py, re-express target_ratio as a ~5-line fresh_tail_max_tokens computation at config load. Landmine: same-named defs, delete explicitly. Executes at the next vendor refresh, not as a standalone revert (the two scripts/ paths in this row are already gone from the fork).",
   "subsystem": "plugins/context_engine",
   "subject": "feat(lcm): honor compression.target_ratio via a token-budgeted fresh tail (#168)"
+ },
+ "#248": {
+  "verdict": "KEEP",
+  "problem": "Flag-gated gbrain document leg (replaces the QMD leg when enabled).",
+  "evidence": {
+   "original": "PR #248 body.",
+   "upstream_state": "read-only: fork-only (gbrain is Ace's brain repo).",
+   "upstream_fix": "none",
+   "fires": "mem0.json mem0_gbrain enabled=true; 'gbrain' 304 log lines in the window (this row's own literals 0 \u2014 the leg logs under a different prefix)",
+   "cost": {
+    "loc": 913,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Live leg. 1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): flag-gated gbrain document leg (replaces QMD leg when enabled) (#248)"
  },
  "#432": {
   "verdict": "KEEP",
@@ -441,6 +596,59 @@
   "subsystem": "plugins/context_engine",
   "subject": "fix(lcm): defer structural FTS rebuild off the engine-load thread; DROP works on a fresh connection (t_1e04c4bd, stacked on #971) (#1023)"
  },
+ "#212": {
+  "verdict": "KEEP",
+  "problem": "Prefetch relevance floor: specificity gate + weak-cosine floor so vague queries do not inject junk memories.",
+  "evidence": {
+   "original": "PR #212 body.",
+   "upstream_state": "read-only: upstream prefetch returns raw score items (__init__.py:338) with no floor/gate.",
+   "upstream_fix": "none",
+   "fires": "893 log lines / 21 files; mem0.json prefetch_relevance_floor enabled=true min_cosine=0.1",
+   "cost": {
+    "loc": 563,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": [
+     "#218",
+     "#448",
+     "#468",
+     "#613",
+     "#219"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Fires broadly. 1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): prefetch relevance floor \u2014 two-layer (specificity gate + weak cosine) (#212)"
+ },
+ "#102": {
+  "verdict": "KEEP",
+  "problem": "Wave-2 hybrid retrieval: search param-drop fix + rerank gate + temporal parse + prefetch ceiling.",
+  "evidence": {
+   "original": "PR #102 body (2026-06-24).",
+   "upstream_state": "read-only: upstream has rerank (platform-only) and top_k; temporal_parse = 0 hits; no prefetch ceiling.",
+   "upstream_fix": "none (rerank param exists upstream at __init__.py:244)",
+   "fires": "0 for this row's own log lines; the prefetch path it shaped fires via #212/#218/#448 (thousands of lines)",
+   "cost": {
+    "loc": 536,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_selfhost.py"
+    ],
+    "dependents": [
+     "#212"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "2 conflict files (2 syncs). Indirectly measured.",
+  "subsystem": "plugins/memory",
+  "subject": "mem0 plugin Wave-2: hybrid retrieval (param-drop fix + rerank gate + temporal + prefetch ceiling) (#102)"
+ },
  "nopr:6622f41055": {
   "verdict": "KEEP",
   "problem": "LCM fail-open degraded fallback: observable degraded state, structured warning events, rate counters, over-context path that tries ContextCompressor before raising.",
@@ -460,6 +668,79 @@
   "notes": "Ledger DC-1: keep behaviour, adopt their _compress_impl split at refresh to shed conflict hunks in engine.py; fix our-side 0.20 vs target_ratio inconsistency. 0 conflict files.",
   "subsystem": "plugins/context_engine",
   "subject": "Implement LCM fail-open degraded fallback"
+ },
+ "#251": {
+  "verdict": "KEEP",
+  "problem": "Bypass the salience gate for user corrections so 'no, X' statements always get captured.",
+  "evidence": {
+   "original": "PR #251 body.",
+   "upstream_state": "read-only: fork-only (no gate upstream).",
+   "upstream_fix": "none",
+   "fires": "0 for its own log lines; loose substring 'correction' 7 lines in the window",
+   "cost": {
+    "loc": 505,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Weakly measured; rides the capture pipeline. 1 conflict (1). Adversary may push to UNRESOLVED.",
+  "subsystem": "plugins/memory",
+  "subject": "mem0: bypass salience gate for corrections (#251)"
+ },
+ "nopr:8b332be03c": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Direct-REST self-host backend (mem0.MemoryClient is hardwired to the cloud) + B3/B4 scope hardening.",
+  "evidence": {
+   "original": "Commit body (D-8, 2026-06-14).",
+   "upstream_state": "GREEN by read: upstream _backend.py:64 SelfHostedBackend speaks the server's X-API-Key /memories /search contract over httpx with injectable transport (2e779d11a0, 2026-06-22 \u2014 8 days after ours).",
+   "upstream_fix": "2e779d11a0",
+   "fires": "the fork's REST path is the live path (mem0.json host set, graph container mem0-selfhost-mem0-1)",
+   "cost": {
+    "loc": 424,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_selfhost.py"
+    ],
+    "dependents": [
+     "nopr:59ed0e41a1",
+     "nopr:531f1e8c64",
+     "nopr:5ae50ce919",
+     "nopr:3087d451ce",
+     "#64"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "D3 converge: upstream independently built the same backend. At the re-base take their SelfHostedBackend and re-apply only the CA-bundle transport (59ed) and the scope contract tests. 2 conflict files (2 syncs).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): direct-REST self-host backend (D-8) + B3/B4 scope hardening"
+ },
+ "#824": {
+  "verdict": "KEEP",
+  "problem": "Retire idle per-agent memory workers (executor/thread leak across many short-lived agents).",
+  "evidence": {
+   "original": "PR #824 body (2026-09-21).",
+   "upstream_state": "read-only: upstream agent/memory_manager.py has a single _sync_executor (:357) + spawn_context_thread (:471) and no idle-retirement (0 hits for idle/retire); whether it leaks per-agent is untested here.",
+   "upstream_fix": "none found (git log upstream/main --grep=idle -- agent/memory_manager.py = 0)",
+   "fires": "245 log lines / 5 files",
+   "cost": {
+    "loc": 421,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fires. Touches agent/memory_manager.py (NousResearch seam) + capture_drain/pipeline. Generic half (idle retirement of the manager executor) is a contribute-back candidate once measured on upstream's shape \u2014 not proven RED there. 1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "fix(memory): retire idle per-agent workers (#824)"
  },
  "#444": {
   "verdict": "KEEP",
@@ -531,6 +812,30 @@
   "subsystem": "plugins/context_engine",
   "subject": "fix(compaction): don't burn a warm prompt cache to compact below threshold (#531)"
  },
+ "#219": {
+  "verdict": "KEEP",
+  "problem": "Rerank-score recall relevance gate (L2) + dynamic gap (L3).",
+  "evidence": {
+   "original": "PR #219 body.",
+   "upstream_state": "read-only: fork-only (upstream rerank is platform-only, no gate).",
+   "upstream_fix": "none",
+   "fires": "2 log lines; mem0.json prefetch_rerank_gate enabled=true (L2 live), prefetch_rerank_gap enabled=false (L3 OFF)",
+   "cost": {
+    "loc": 262,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": [
+     "#613"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "L3 (gap) is disabled in production \u2014 half-dormant. 1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): rerank-score recall relevance gate (L2) + dynamic gap (L3) (#219)"
+ },
  "#465": {
   "verdict": "KEEP",
   "problem": "Active-context assembly dropped tool rows but never merged the adjacent bare assistant rows left behind \u2014 strict-alternation violation every downstream load had to repair.",
@@ -550,6 +855,28 @@
   "notes": "Already pitched upstream. 0 conflict. Absorb signal 18/48 is shared scaffolding, not absorption.",
   "subsystem": "plugins/context_engine",
   "subject": "fix(lcm): merge adjacent assistant rows in active-context assembly (#465)"
+ },
+ "#434": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Route 6 Path.home()/'.hermes' bypass sites through get_hermes_home() (hermeticity).",
+  "evidence": {
+   "original": "PR #434 body (2026-07-26).",
+   "upstream_state": "GREEN by read for the class: upstream e7d9e07dbc (2026-09-12) 'HERMES_HOME resolves through get_hermes_home everywhere; no ~/.hermes fallbacks'; upstream plugins/memory/mem0 has 0 Path.home() hits (remaining hits are honcho/openviking's own config files).",
+   "upstream_fix": "e7d9e07dbc",
+   "fires": "n/a (path resolution; fork test tests/hermes_cli/test_kanban_worker_hermeticity_anchor.py gone from the fork tree)",
+   "cost": {
+    "loc": 233,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "hermes_cli/kanban_db.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Class fixed upstream; the 6 fork sites are in fork-only files (kanban_db.py, blackbox/routing.py, lcm diagnostics/engine, mem0 live_e2e, telegram adapter) so nothing to revert \u2014 take upstream's helper at sync and keep the fork sites pointed at it. 1 conflict (2).",
+  "subsystem": "plugins/memory",
+  "subject": "fix(hermeticity): route 6 Path.home()/\".hermes\" bypass sites through get_hermes_home() (#434)"
  },
  "nopr:051c2076e1": {
   "verdict": "KEEP",
@@ -611,6 +938,31 @@
   "subsystem": "plugins/context_engine",
   "subject": "test(lcm): regression layer for the boot-scan class + a loud signal when engine load stalls every turn (#903)"
  },
+ "#171": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Reuse mem0 background executors instead of creating a ThreadPoolExecutor per call.",
+  "evidence": {
+   "original": "PR #171 body (2026-07-04).",
+   "upstream_state": "GREEN by read (structural): upstream mem0/__init__.py has 0 ThreadPoolExecutor hits \u2014 background work goes through agent.memory_provider.spawn_context_thread / the manager's single _sync_executor (plugins/AGENTS.md rule).",
+   "upstream_fix": "2e779d11a0 + memory_manager _sync_executor",
+   "fires": "0 log lines (silent)",
+   "cost": {
+    "loc": 224,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_selfhost.py"
+    ],
+    "dependents": [
+     "#824"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "The leak class does not exist in upstream's shape. Converges at the re-base. 2 conflict (2).",
+  "subsystem": "plugins/memory",
+  "subject": "fix(memory): reuse mem0 background executors (#171)"
+ },
  "#509": {
   "verdict": "KEEP",
   "problem": "A '\ud83d\udce6 lcm maintenance compaction' banner with no '\ud83d\udddc\ufe0f Context compacted' after it: 4 of 21 compressions announced then did nothing (214->214 messages).",
@@ -632,6 +984,29 @@
   "notes": "1 conflict file but 3 syncs (agent/turn_context.py). Converges with #497 onto upstream's announce lifecycle at next sync.",
   "subsystem": "plugins/context_engine",
   "subject": "fix(compaction): only announce a compaction that actually compacts (#509)"
+ },
+ "#193": {
+  "verdict": "KEEP",
+  "problem": "Size-cap oversized capture turns + dead-letter deterministic provider rejects (stop infinite requeue).",
+  "evidence": {
+   "original": "PR #193 body.",
+   "upstream_state": "read-only: fork-only (capture pipeline).",
+   "upstream_fix": "none",
+   "fires": "0 for its own log lines; loose substring 'dead-letter' 2,793 lines in the window (mostly drain 'never dead-letter' requeue lines, which exercise the same classifier)",
+   "cost": {
+    "loc": 204,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_remember.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "2 conflict (2).",
+  "subsystem": "plugins/memory",
+  "subject": "fix(mem0): size-cap oversized turns + dead-letter deterministic provider rejects (#193)"
  },
  "#412": {
   "verdict": "UPSTREAM",
@@ -791,6 +1166,49 @@
   "subsystem": "plugins/cron_providers",
   "subject": "fix(cron): never arm a one-shot whose fire_at is already in the past (#580)"
  },
+ "#393": {
+  "verdict": "KEEP",
+  "problem": "Capture scrub catches natural-language credential disclosure ('my password is ...') before it reaches mem0 (re-land of #214).",
+  "evidence": {
+   "original": "PR #393 body.",
+   "upstream_state": "read-only: 'scrub' 0 hits upstream (no capture path).",
+   "upstream_fix": "none",
+   "fires": "0 log lines (scrub logs only on a hit; none in the window). Security gate on a live write path: needed-by-design, unmeasured.",
+   "cost": {
+    "loc": 182,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "0 conflict. Guard-class KEEP (same reasoning as #580): the absence of hits is the desired state, not evidence of deadness.",
+  "subsystem": "plugins/memory",
+  "subject": "fix(mem0-scrub): catch natural-language credential disclosure (re-land of #214) (#393)"
+ },
+ "nopr:531f1e8c64": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Harden mem0 client against fd leak (client pool).",
+  "evidence": {
+   "original": "Commit body (HANDOFF-fd-leak-client-pool.md).",
+   "upstream_state": "GREEN by read: upstream SelfHostedBackend owns ONE httpx.Client per backend (_backend.py:73) with close() (:93) \u2014 bounded by construction.",
+   "upstream_fix": "2e779d11a0",
+   "fires": "0 log lines",
+   "cost": {
+    "loc": 168,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_selfhost.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "2 conflict (2). Converges at the re-base.",
+  "subsystem": "plugins/memory",
+  "subject": "harden mem0 client against fd-leak (HANDOFF-fd-leak-client-pool.md)"
+ },
  "#9": {
   "verdict": "KEEP",
   "problem": "Card fixes: chat fields, cache %, alerts toggle, 3d price cache.",
@@ -817,6 +1235,70 @@
   "notes": "Chat fields + cache% live; the alerts toggle half is dormant (see #44). 4 conflict files x3 syncs, mostly agent/conversation_loop.py + model_metadata.py seams.",
   "subsystem": "plugins/blackbox",
   "subject": "Blackbox card fixes: chat fields, cache %, alerts toggle, 3d price cache (#9)"
+ },
+ "#613": {
+  "verdict": "KEEP",
+  "problem": "Specificity-tiered rerank-gate floor (strict 0.0 vague / -0.35 specific).",
+  "evidence": {
+   "original": "PR #613 body (2026-08-19).",
+   "upstream_state": "read-only: fork-only.",
+   "upstream_fix": "none",
+   "fires": "0 own log lines; mem0.json prefetch_rerank_gate min_rerank=0.0 / min_rerank_specific=-0.75 (retuned 2026-08-28 per mem0.json.bak-rerank-retune) \u2014 the tier is live with different numbers",
+   "cost": {
+    "loc": 149,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): specificity-tiered rerank-gate floor (strict 0.0 vague / -0.35 specific) (#613)"
+ },
+ "#407": {
+  "verdict": "KEEP",
+  "problem": "Transient-narration gate on world-fact staging + dropped-log (gbrain residue RC1).",
+  "evidence": {
+   "original": "PR #407 body.",
+   "upstream_state": "read-only: fork-only (capture_router.py).",
+   "upstream_fix": "none",
+   "fires": "0 own log lines; loose substring 'transient' 322 lines; mem0_capture_router staging_mode=false (the staging half is off)",
+   "cost": {
+    "loc": 144,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "0 conflict. Half-dormant (staging off).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(capture): transient-narration gate on world-fact staging + dropped-log (gbrain residue \u00a75.3/RC1/RC2) (#407)"
+ },
+ "nopr:a1a1a1065e": {
+  "verdict": "KEEP",
+  "problem": "Gated canonical user_id pinning with provenance.",
+  "evidence": {
+   "original": "Commit body.",
+   "upstream_state": "read-only: upstream resolves user_id from config/MEM0_USER_ID (__init__.py:232-233) with no pin/provenance.",
+   "upstream_fix": "none",
+   "fires": "mem0.json pin_user_id=true; mem0-mint-store.json present (2 entries)",
+   "cost": {
+    "loc": 137,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict (1). Live.",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): add gated canonical user_id pinning with provenance"
  },
  "#508": {
   "verdict": "KEEP",
@@ -902,6 +1384,28 @@
   "subsystem": "plugins/context_engine",
   "subject": "fix(lcm): toggleable Prong-A identifier fidelity \u2014 fixes baseline-repro loop"
  },
+ "#592": {
+  "verdict": "KEEP",
+  "problem": "Destructive by-filter resolution saw a 20-row page, not the full scope.",
+  "evidence": {
+   "original": "PR #592 body.",
+   "upstream_state": "read-only: fork-only (no by-filter forget upstream).",
+   "upstream_fix": "none",
+   "fires": "rides the destructive ledger (190 ops, last 2026-09-20)",
+   "cost": {
+    "loc": 102,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "fix(mem0): destructive by-filter resolution sees the full scope, not a 20-row page (#592)"
+ },
  "#905": {
   "verdict": "KEEP",
   "problem": "Index turns(ts_start) so rolling-window reads SEARCH not SCAN.",
@@ -921,6 +1425,51 @@
   "notes": "0 conflict.",
   "subsystem": "plugins/blackbox",
   "subject": "perf(blackbox): index turns(ts_start) so rolling-window reads SEARCH instead of SCAN (#905)"
+ },
+ "nopr:59ed0e41a1": {
+  "verdict": "UPSTREAM",
+  "problem": "Optional CA bundle for private-CA HTTPS to a self-hosted mem0 (mem0.ace cutover).",
+  "evidence": {
+   "original": "Commit body (2026-06-14).",
+   "upstream_state": "RED by read: upstream SelfHostedBackend builds httpx.Client(..., transport=transport or httpx.HTTPTransport(retries=2)) with no verify/CA option (_backend.py:73); a private-CA host fails TLS.",
+   "upstream_fix": "none",
+   "fires": "mem0.json ca_bundle=~/.hermes/certs/ace-local-root-ca.crt \u2014 on the live request path every call",
+   "cost": {
+    "loc": 87,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_selfhost.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic (any self-hosted mem0 behind a private CA). Re-author as a `ca_bundle` config key -> httpx.HTTPTransport(verify=...) in upstream's _backend.py \u2014 a ~10-line PR; not a rebase of the fork commit (different file). Upstream branch not built this run. 2 conflict (2).",
+  "subsystem": "plugins/memory",
+  "subject": "mem0 client: optional CA bundle for private-CA HTTPS (mem0.ace cutover fix)"
+ },
+ "#448": {
+  "verdict": "KEEP",
+  "problem": "floor_outcome reported an empty search when a gate emptied the candidates.",
+  "evidence": {
+   "original": "PR #448 body.",
+   "upstream_state": "read-only: fork-only telemetry.",
+   "upstream_fix": "none",
+   "fires": "1,339 log lines / 21 files",
+   "cost": {
+    "loc": 86,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "fix(mem0): floor_outcome reported an empty search when a gate emptied the candidates (#448)"
  },
  "nopr:dc4245ab4c": {
   "verdict": "UPSTREAM",
@@ -962,6 +1511,51 @@
   "subsystem": "plugins/context_engine",
   "subject": "fix(lcm): the ingested_at backfill was the SECOND full-table scan on every boot \u2014 gate one-time backfills behind lcm_migration_state (#902)"
  },
+ "#468": {
+  "verdict": "KEEP",
+  "problem": "Log full query text (qtext=) on prefetch telemetry lines.",
+  "evidence": {
+   "original": "PR #468 body.",
+   "upstream_state": "read-only: fork-only telemetry.",
+   "upstream_fix": "none",
+   "fires": "4 log lines / 3 files",
+   "cost": {
+    "loc": 76,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict (1). Low fire count for a telemetry line \u2014 check the prefetch logger level; may be effectively off.",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): log full query text (qtext=) on prefetch telemetry lines (#468)"
+ },
+ "#64": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "api_key optional in the mem0 config schema (self-host without key) + composition test env isolation.",
+  "evidence": {
+   "original": "PR #64 body.",
+   "upstream_state": "GREEN by read: upstream omits X-API-Key when empty (_backend.py:71 'key omitted only for AUTH_DISABLED servers') and OSS mode needs no key (2e779d11a0).",
+   "upstream_fix": "2e779d11a0",
+   "fires": "n/a (schema)",
+   "cost": {
+    "loc": 73,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_selfhost.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "2 conflict (2); tests/test_request_composition.py half is gone from the fork.",
+  "subsystem": "plugins/memory",
+  "subject": "fix(mem0): api_key optional in schema; harden composition test env isolation (#64)"
+ },
  "#915": {
   "verdict": "KEEP",
   "problem": "Create turns indexes after the column migration (index creation raced the ALTER).",
@@ -981,6 +1575,51 @@
   "notes": "0 conflict.",
   "subsystem": "plugins/blackbox",
   "subject": "fix(blackbox): create turns indexes after the column migration (t_71ae3a75) (#915)"
+ },
+ "#218": {
+  "verdict": "KEEP",
+  "problem": "Richer prefetch recall telemetry: cosine distribution + injected count.",
+  "evidence": {
+   "original": "PR #218 body.",
+   "upstream_state": "read-only: fork-only.",
+   "upstream_fix": "none",
+   "fires": "847 log lines / 19 files",
+   "cost": {
+    "loc": 65,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "feat(mem0): richer prefetch recall telemetry \u2014 cosine distribution + injected count (#218)"
+ },
+ "nopr:3087d451ce": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Reads scope to user_id only, writes scope both user_id+agent_id (cutover recall fix).",
+  "evidence": {
+   "original": "Commit body.",
+   "upstream_state": "GREEN by read: upstream _search filters={'user_id': self._user_id} (__init__.py:247) and add passes user_id+agent_id (_backend.py:10 _add_kwargs) \u2014 the identical contract; upstream 019103bfbc (2026-09-12) pins it with a test.",
+   "upstream_fix": "2e779d11a0 + 019103bfbc",
+   "fires": "live contract on every read",
+   "cost": {
+    "loc": 61,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_selfhost.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "2 conflict (2).",
+  "subsystem": "plugins/memory",
+  "subject": "mem0 client: reads scope to user_id only, writes scope both (cutover recall fix)"
  },
  "#972": {
   "verdict": "KEEP",
@@ -1021,6 +1660,51 @@
   "notes": "0 conflict.",
   "subsystem": "plugins/blackbox",
   "subject": "fix(blackbox): reprice_unpriced honors a snapshot-sourced entry on a notional codex route (#660)"
+ },
+ "#320": {
+  "verdict": "KEEP",
+  "problem": "Recover orphaned inflight capture rows on gateway startup.",
+  "evidence": {
+   "original": "PR #320 body; closeout ~/.hermes/plans/2026-07-13_mem0-capture-orphan-inflight-recovery-CLOSEOUT.md.",
+   "upstream_state": "read-only: fork-only (capture queue).",
+   "upstream_fix": "none",
+   "fires": "0 own log lines; loose substring 'orphan' 134 lines (shared with blackbox orphans)",
+   "cost": {
+    "loc": 43,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Startup repair path; 1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "fix(mem0): recover orphaned inflight capture rows on gateway startup (#320)"
+ },
+ "#192": {
+  "verdict": "KEEP",
+  "problem": "search_meta_filtered must send a non-empty query (live auto-capture 400).",
+  "evidence": {
+   "original": "PR #192 body.",
+   "upstream_state": "read-only: search_meta = 0 hits upstream (fork-only dedup search).",
+   "upstream_fix": "none",
+   "fires": "0 log lines (the 400 no longer occurs); capture dedup runs on every capture add",
+   "cost": {
+    "loc": 42,
+    "conflict_syncs": 2,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py",
+     "tests/plugins/memory/test_mem0_selfhost.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "2 conflict (2).",
+  "subsystem": "plugins/memory",
+  "subject": "fix(mem0): search_meta_filtered must send a non-empty query (live auto-capture 400) (#192)"
  },
  "#955": {
   "verdict": "KEEP",
@@ -1068,6 +1752,48 @@
   "subsystem": "plugins/blackbox",
   "subject": "fix(blackbox): alert card output -> finished/unfinished (#44)"
  },
+ "nopr:d4c0ea5a47": {
+  "verdict": "KEEP",
+  "problem": "SPEC-10: strengthen mem0_conclude save-guidance for the capture=off model (explicit when-to-save / when-not).",
+  "evidence": {
+   "original": "Commit body.",
+   "upstream_state": "read-only: prompt text for a fork-only tool.",
+   "upstream_fix": "none",
+   "fires": "9 profiles run MEM0_CAPTURE=off (this guidance is their save path); 4 log lines in dashboard.out.log",
+   "cost": {
+    "loc": 26,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict (1). Prompt text.",
+  "subsystem": "plugins/memory",
+  "subject": "SPEC-10: strengthen mem0_conclude save-guidance for capture=off model A (explicit when-to-save/when-not + proactive system-prompt block). Validated by holdout under-save eval: 24/25 recall LB 0.805, 0/25 false-save."
+ },
+ "#652": {
+  "verdict": "KEEP",
+  "problem": "Capture-router defaults: primary gpt-5.4-mini (retired) -> gpt-6-astra; fallback never inherits.",
+  "evidence": {
+   "original": "PR #652 body.",
+   "upstream_state": "read-only: fork-only.",
+   "upstream_fix": "none",
+   "fires": "mem0.json mem0_capture_router model=gpt-6-astra (matches); see #250 finding \u2014 that primary is failing",
+   "cost": {
+    "loc": 24,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "0 conflict.",
+  "subsystem": "plugins/memory",
+  "subject": "fix(mem0): capture-router defaults \u2014 primary gpt-5.4-mini (retired) -> gpt-6-astra; fallback never inherits the primary's model id (#652)"
+ },
  "#912": {
   "verdict": "KEEP",
   "problem": "Index turns(profile): skill-stats miner DISTINCT profile read was a 107s SCAN.",
@@ -1110,6 +1836,94 @@
   "notes": "agent/model_metadata.py hunk conflicts 3/3 syncs for a display count \u2014 candidate for the in-plugin extraction with #141/#40.",
   "subsystem": "plugins/blackbox",
   "subject": "feat(telemetry): show message count on conversation-history line (#30)"
+ },
+ "nopr:5ae50ce919": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Bound the httpx connection pool to stop an fd leak.",
+  "evidence": {
+   "original": "Commit body.",
+   "upstream_state": "GREEN by read: one httpx.Client per backend with default limits (_backend.py:73) \u2014 the per-call client pattern that leaked does not exist upstream.",
+   "upstream_fix": "2e779d11a0",
+   "fires": "0 log lines",
+   "cost": {
+    "loc": 19,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict (1). Rides nopr:531f1e8c64.",
+  "subsystem": "plugins/memory",
+  "subject": "mem0: bound httpx connection pool to stop fd leak"
+ },
+ "#516": {
+  "verdict": "KEEP",
+  "problem": "Gate bare status-pings ('status?') at Gate A \u2014 the recurring near-miss capture.",
+  "evidence": {
+   "original": "PR #516 body.",
+   "upstream_state": "read-only: fork-only.",
+   "upstream_fix": "none",
+   "fires": "2 own log lines; 'Gate A' 37 lines in the window",
+   "cost": {
+    "loc": 17,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict (1).",
+  "subsystem": "plugins/memory",
+  "subject": "fix(mem0): gate bare status-pings at Gate A (the recurring 'status?' near-miss) (#516)"
+ },
+ "nopr:bb54af8d6c": {
+  "verdict": "KEEP",
+  "problem": "MEM0_CAPTURE recall-only mode (skip per-turn auto-capture).",
+  "evidence": {
+   "original": "Commit body (2026-06-04).",
+   "upstream_state": "read-only: fork-only (no capture upstream).",
+   "upstream_fix": "none",
+   "fires": "9 of 11 mem0 profiles set MEM0_CAPTURE=off \u2014 the most-used toggle in the tranche",
+   "cost": {
+    "loc": 15,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "15 loc, 1 conflict (1). Note: this is a `MEM0_*` env toggle for non-secret behaviour \u2014 upstream's rubric would want it in config.yaml; the fork's __init__.py:699 also exposes it as a config key (`capture`), so the env var is the legacy path.",
+  "subsystem": "plugins/memory",
+  "subject": "mem0: add MEM0_CAPTURE recall-only mode (skip per-turn auto-capture)"
+ },
+ "#117": {
+  "verdict": "KEEP",
+  "problem": "Docs comment: why dedup search omits agent_id (server treats it as a result filter).",
+  "evidence": {
+   "original": "PR #117 body.",
+   "upstream_state": "read-only: comment in a fork-only code path.",
+   "upstream_fix": "none",
+   "fires": "n/a (comment)",
+   "cost": {
+    "loc": 8,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/memory/mem0/__init__.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "8 loc. Follows #192's verdict.",
+  "subsystem": "plugins/memory",
+  "subject": "docs(mem0): document why dedup search omits agent_id (server treats it as a result filter) (#117)"
  },
  "#149": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
