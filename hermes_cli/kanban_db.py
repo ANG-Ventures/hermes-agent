@@ -5776,9 +5776,13 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    from hermes_cli.model_policy import validate_route_provider
+
+    validate_route_provider(model_override, provider_override)
     model_override, provider_override = _resolve_stored_model_pair(
         model_override, provider_override
     )
+    validate_route_provider(model_override, provider_override)
     from hermes_cli.model_policy import validate_worker_model
 
     flagship_override_reason = validate_worker_model(
@@ -6449,7 +6453,11 @@ def _validate_model_override_args(
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
+    from hermes_cli.model_policy import validate_route_provider
+
+    validate_route_provider(model, provider)
     model, provider = _resolve_stored_model_pair(model, provider)
+    validate_route_provider(model, provider)
     # Main's flagship ban (model_policy) is the one predicate. A flagship
     # route is only writable together with the ``flagship override:`` comment
     # the dispatcher's flagship gate accepts, so a route this layer writes can
@@ -14181,9 +14189,11 @@ def set_task_model(
     ``task_id`` returns ``0`` (never a silent success), so callers can tell
     a real write from a no-op.
     """
-    resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
-    from hermes_cli.model_policy import validate_worker_model
+    from hermes_cli.model_policy import validate_route_provider, validate_worker_model
 
+    validate_route_provider(model, None)
+    resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
+    validate_route_provider(resolved_model, resolved_provider)
     validate_worker_model(resolved_model)
     if not resolved_model:
         resolved_provider = None
@@ -20258,6 +20268,9 @@ def set_lane_model_override(
     upsert, so an operator extending a window never stacks duplicate rows.
     """
 
+    from hermes_cli.model_policy import validate_route_provider
+
+    validate_route_provider(model, provider)
     created = int(time.time()) if now is None else int(now)
     key = (assignee or "").strip()
     with write_txn(conn):
