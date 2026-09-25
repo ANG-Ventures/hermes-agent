@@ -3407,6 +3407,11 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return
+    agent._cached_system_prompt = _rewrite_identity_lines(sp, model, provider)
+
+
+def _rewrite_identity_lines(sp: str, model: str, provider: str) -> str:
+    """Return ``sp`` with its LAST ``Model:``/``Provider:`` lines set."""
     for label, value in (("Model", model), ("Provider", provider)):
         if not value:
             continue
@@ -3414,7 +3419,30 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
         if matches:
             last = matches[-1]
             sp = f"{sp[:last.start()]}{label}: {value}{sp[last.end():]}"
-    agent._cached_system_prompt = sp
+    return sp
+
+
+def prompt_for_persistence(agent, prompt):
+    """Return the bytes of ``prompt`` that may be written to the session DB.
+
+    While a fallback is active the in-memory prompt names the fallback model
+    (see ``rewrite_prompt_model_identity``), but the stored row must keep the
+    PRIMARY runtime's ``Model:``/``Provider:`` labels: the next turn restores
+    the primary, and ``_stored_prompt_matches_runtime`` rejects a row whose
+    identity differs from it — a full rebuild and a cold prefix cache after
+    every compaction that ran on a fallback model. Identity when no fallback
+    is active.
+    """
+    if not isinstance(prompt, str) or not prompt:
+        return prompt
+    if not getattr(agent, "_fallback_activated", False):
+        return prompt
+    rt = getattr(agent, "_primary_runtime", None)
+    if not isinstance(rt, dict):
+        return prompt
+    return _rewrite_identity_lines(
+        prompt, str(rt.get("model") or ""), str(rt.get("provider") or "")
+    )
 
 
 def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
