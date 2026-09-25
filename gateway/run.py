@@ -845,6 +845,18 @@ def _non_conversational_metadata(
     return merged
 
 
+def _final_send_duplicate_risk(consumer: Any) -> bool:
+    """True when an unsuppressed normal final-send could DUPLICATE a reply.
+
+    Only a stream consumer that itself sent or edited response text
+    (``already_sent``) can have put a copy of the final reply in the chat.
+    Interim commentary deliberately never sets ``already_sent`` (#10454), so an
+    interim-only consumer (platform streaming off) cannot produce a duplicate:
+    the gateway's normal send is the only copy of the final text.
+    """
+    return consumer is not None and bool(getattr(consumer, "already_sent", False))
+
+
 def _interim_metadata(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -39287,17 +39299,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # ahead. Log the decision inputs so a recurrence can be pinned to
                 # "signal never set" vs "ack-pending race".
                 # See docs/rca-wecom-stream-final-ack-timeout-duplicate.md.
-                logger.warning(
+                #
+                # A duplicate is only possible when the consumer itself put
+                # response text in the chat (``already_sent``). An interim-only
+                # consumer (platform streaming off; commentary never sets
+                # already_sent) leaves the normal send as the ONLY copy of the
+                # final reply, so that shape is logged at DEBUG, not as a
+                # duplicate warning.
+                _dup_risk = _final_send_duplicate_risk(_sc)
+                (logger.warning if _dup_risk else logger.debug)(
                     "Normal final-send NOT suppressed despite active stream "
                     "consumer for session %s: streamed=%s previewed=%s "
-                    "content_delivered=%s transformed=%s final_len=%d — "
-                    "possible duplicate send (see wecom ack-timeout RCA).",
+                    "content_delivered=%s transformed=%s consumer_sent=%s "
+                    "final_len=%d — %s",
                     session_key or "?",
                     _streamed,
                     _previewed,
                     _content_delivered,
                     _transformed,
+                    _dup_risk,
                     len(_final),
+                    "possible duplicate send (see wecom ack-timeout RCA)."
+                    if _dup_risk
+                    else "consumer sent no response text; normal send is the only copy.",
                 )
 
         # Schedule deletion of tracked temporary progress bubbles after the
