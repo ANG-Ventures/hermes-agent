@@ -631,18 +631,6 @@ def _(rid, params: dict) -> dict:
             if session.get("agent") is None and _child_run_active(target):
                 payload["running"] = True
                 payload["status"] = "streaming"
-            # Fork: a completed desktop resume may need to re-arm the pending
-            # auto-resume turn. Lazy/watch records own no run loop, so they are
-            # excluded (the hook is a no-op without a live agent anyway).
-            if not session.get("lazy"):
-                payload = _maybe_trigger_desktop_auto_resume_after_resume(
-                    rid,
-                    target,
-                    sid,
-                    session,
-                    payload,
-                    db,
-                )
             return payload
 
         def _reuse_live_response(sid: str, session: dict) -> dict:
@@ -907,12 +895,7 @@ def _(rid, params: dict) -> dict:
             }
             if auto_continue is not None:
                 payload["auto_continue"] = auto_continue
-            return _ok(
-                rid,
-                _maybe_trigger_desktop_auto_resume_after_resume(
-                    rid, target, sid, record, _attach_todo_state(payload, record), db
-                ),
-            )
+            return _ok(rid, _attach_todo_state(payload, record))
 
         # Build the agent OUTSIDE the lock — _make_agent can block for seconds
         # (MCP discovery, prompt/skill build, AIAgent construction). Holding
@@ -1124,15 +1107,7 @@ def _(rid, params: dict) -> dict:
     }
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
-    # Both sides wrap this terminal resume payload: upstream attaches todo
-    # state, the fork may re-arm a pending desktop auto-resume turn. Compose
-    # them (todo state first, so the hook sees the complete payload).
-    return _ok(
-        rid,
-        _maybe_trigger_desktop_auto_resume_after_resume(
-            rid, target, sid, session, _attach_todo_state(payload, session), db
-        ),
-    )
+    return _ok(rid, _attach_todo_state(payload, session))
 
 
 @method("session.cwd.set")

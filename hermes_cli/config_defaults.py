@@ -1936,10 +1936,6 @@ DEFAULT_CONFIG = {
     # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
     # Re-homed here from hermes_cli/config.py when upstream extracted
     # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
-        # Dormant/default-off desktop/TUI backend restart continuation gate.
-        # Config.yaml only: no env override, so the reconnect path remains inert
-        # until an operator deliberately flips this key.
-        "desktop_auto_resume": False,
         "heavy_read_max_concurrency": 2,
         # Dormant/default-off rollout gate for the indexed session.list recency
         # path. Config.yaml only: no env override, so production stays on the
