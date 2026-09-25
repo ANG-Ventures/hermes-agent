@@ -4610,6 +4610,9 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    *,
+    timeout_seconds: Optional[int] = None,
+    job_name: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4701,7 +4704,17 @@ def _run_job_script(
             f"Skipped: cron scheduler is shutting down (not starting {path.name})"
         )
 
+    # The global cron.script_timeout_seconds is the hard cap; a per-job
+    # ceiling (resolve_job_script_timeout) may only LOWER it. A 15-min job
+    # with a 2 h ceiling otherwise piles up overlapping wedged instances.
     script_timeout = _get_script_timeout()
+    if timeout_seconds is not None:
+        try:
+            _job_timeout = int(timeout_seconds)
+        except (TypeError, ValueError):
+            _job_timeout = 0
+        if _job_timeout > 0:
+            script_timeout = min(script_timeout, _job_timeout)
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -4776,7 +4789,8 @@ def _run_job_script(
         with _script_procs_lock:
             _active_script_procs[_proc_key] = proc
         try:
-            deadline = time.monotonic() + script_timeout
+            _started = time.monotonic()
+            deadline = _started + script_timeout
             while True:
                 if cancel_event is not None and cancel_event.is_set():
                     # Same bug class as the timeout site below: a cancelled fire
@@ -4797,6 +4811,13 @@ def _run_job_script(
                     # layer's tree-kill (#85147, d6a5cb9725).
                     _terminate_cron_script_tree(proc)
                     _drain_script_pipes(proc)
+                    logger.warning(
+                        "PHASE=cron_script_timeout job=%s elapsed=%d timeout=%d script=%s",
+                        job_name or path.name,
+                        int(time.monotonic() - _started),
+                        script_timeout,
+                        path.name,
+                    )
                     return False, f"Script timed out after {script_timeout}s: {path}"
                 try:
                     stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
@@ -4837,6 +4858,15 @@ def _run_job_script(
         return False, f"Script execution failed: {exc}"
 
 
+def _job_script_kwargs(job: dict) -> dict[str, Any]:
+    """Per-job ceiling + name for ``_run_job_script`` (see resolve_job_script_timeout)."""
+    timeout, _source = scheduler_ext.resolve_job_script_timeout(
+        job, _get_script_timeout()
+    )
+    name = job.get("name") or job.get("id") if isinstance(job, dict) else None
+    return {"timeout_seconds": timeout, "job_name": str(name) if name else None}
+
+
 def _run_job_script_with_claim_heartbeat(
     job: dict,
     script_path: str,
@@ -4858,12 +4888,15 @@ def _run_job_script_with_claim_heartbeat(
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    script_kwargs = _job_script_kwargs(job)
     if not (
         isinstance(schedule, dict)
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event, **script_kwargs
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4894,10 +4927,14 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event, **script_kwargs
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event, **script_kwargs
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -4968,7 +5005,9 @@ def _build_job_prompt(
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path, **_job_script_kwargs(job)
+            )
         if success:
             if script_output:
                 prompt = (
