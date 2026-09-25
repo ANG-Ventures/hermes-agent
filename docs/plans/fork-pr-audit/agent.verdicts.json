@@ -186,7 +186,7 @@
   "verdict": "KEEP"
  },
  "#1052": {
-  "branch": null,
+  "branch": "audit/agent/upstream-1052",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -198,7 +198,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): no per-leaf JSON redaction in ../up/agent/redact.py (grep 'leaf' 0)"
   },
-  "notes": "Generic correctness bug in shared code. No branch produced this run.",
+  "notes": "Generic correctness bug in shared code. No branch produced this run. [t_712c13f2] Rebased on upstream/main 7262ab2d9a; not opened upstream. CMD: git cherry-pick 0c21d3c63c onto upstream/main conflicts in 5 files -> re-authored on upstream/main: redact_sensitive_json added to agent/redact.py; switched tools/kanban_tools._redact_metadata, agent_runtime_helpers request dump, google_chat envelope dump, and (new vs fork) agent/trace_upload tool-args (upstream-only 4th site the AST guard caught); ported tests/agent/test_redact_json_leaf.py + 2 kanban handler tests. PR body: bodies/1052.md == commit message (no fork mentions). TESTS: upstream RED repro: 5/5 corrupting leaves produce unparseable JSON on upstream/main. RED arm (helper kept, kanban_tools.py + trace_upload.py reverted): 3 failed (2 kanban handler tests + AST guard). Fixed: test-gate pytest tests/tools/test_kanban_redaction.py tests/agent/test_redact_json_leaf.py tests/agent/test_trace_upload.py -> 41 passed, 1 skipped. STAT: 7 files changed, 296 insertions(+), 16 deletions(-) HEAD 6cd058391b.",
   "problem": "Redacting JSON as text let a masked ENV value eat the closing quote; redact per leaf.",
   "verdict": "UPSTREAM"
  },
@@ -567,7 +567,7 @@
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#186": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr186",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -579,7 +579,7 @@
    "upstream_fix": "n/a",
    "upstream_state": "n/a (D9)"
   },
-  "notes": "Mixed desktop row; server half only backs the desktop pin UI. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in 14 files incl. apps/desktop/*, hermes_cli/web_server.py, hermes_state.py, tui_gateway/server.py; hand-build handed to t_712c13f2.",
+  "notes": "Mixed desktop row; server half only backs the desktop pin UI. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in 14 files incl. apps/desktop/*, hermes_cli/web_server.py, hermes_state.py, tui_gateway/server.py; hand-build handed to t_712c13f2. [t_712c13f2] CMD: git apply -R --3way of the server-half diff of 0df54d76f9 failed (tests/test_hermes_state.py gone; 5 files conflict) -> hand-built: removed the fork-only tui_gateway session.pin RPC + 3 tests; hermes_state.set_session_pinned/include_pinned and the web_server pinned PATCH are upstream's own now (upstream/main hermes_state_sessions.py:952, web_routers/sessions.py:755) with fork callers (sessions_cmd, web_routers/profiles, api_server, prune tests) so that half is SUPERSEDED-BY-UPSTREAM, not reverted; _session_live_pinned kept (session.info 'pinned' is in upstream's contract, tui_gateway/contracts/common.py:122) TESTS: test-gate pytest tests/test_tui_gateway_server.py -> 669 passed STAT: 2 files changed, 2 insertions(+), 96 deletions(-) HEAD 6821bb71f0.",
   "problem": "Server-side pinned sessions (desktop).",
   "verdict": "DROP"
  },
@@ -786,7 +786,7 @@
    "upstream_fix": "none (c2088efe9e adds last_activity_at for a different consumer)",
    "upstream_state": "RED (read-only): list_sessions_rich@../up/hermes_state_sessions.py:1296-1331 still runs the WITH RECURSIVE chain/chain_max CTE per list call (order_by_last_active=True, used by tui_gateway/methods_session.py:139). Upstream's sessions.last_activity_at (c2088efe9e) serves the activity watchdog and list_recent_sessions_bounded (session_search), not the sidebar list."
   },
-  "notes": "Family #213/#217/#220/#443/#418/#216 = ~5.5k loc on hermes_state.py, which upstream has dissolved into ~30 state_*.py modules (upstream hermes_state.py is 1,737 lines vs the fork's 17,575). Generic (any large DB), measured, unfixed upstream => UPSTREAM as ONE consolidated port onto hermes_state_sessions.py (last_activity_at could be the column). Not a rebase: 5.5k lines against a split file needs its own card; no upstream branch produced in this run. Live code is #220's re-land, not #213's.",
+  "notes": "Family #213/#217/#220/#443/#418/#216 = ~5.5k loc on hermes_state.py, which upstream has dissolved into ~30 state_*.py modules (upstream hermes_state.py is 1,737 lines vs the fork's 17,575). Generic (any large DB), measured, unfixed upstream => UPSTREAM as ONE consolidated port onto hermes_state_sessions.py (last_activity_at could be the column). Not a rebase: 5.5k lines against a split file needs its own card; no upstream branch produced in this run. Live code is #220's re-land, not #213's. [t_712c13f2] NO BRANCH (infeasible in this card): still needed upstream - upstream/main ac2ffe60d0 list_sessions_rich (hermes_state_sessions.py) still runs WITH RECURSIVE chain per list call; no effective_last_active column. The family is ~5.5k fork loc (#220 alone +1186 incl. 595-line test; #443 1112 loc across import/flush write paths) against a 17,575-line fork hermes_state.py; upstream split it into ~30 hermes_state_*.py modules (hermes_state_sessions.py 1,727 lines). A correct port must re-derive every write path that must bump the denorm column on upstream's split modules, add the migration/backfill with VERSION marker, and a byte-diff ordering oracle vs the CTE - a multi-day re-author, not a rebase. Needs its own card (lead).",
   "problem": "Dashboard/desktop session.list walked a recursive CTE per call: 2263ms on the live 3.2GB state.db; denormalized effective_last_active + two-stage indexed query brought it to 135ms (17x).",
   "verdict": "UPSTREAM"
  },
@@ -805,7 +805,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED by inheritance (see #443)"
   },
-  "notes": "Trivial; rides with the family.",
+  "notes": "Trivial; rides with the family. [t_712c13f2] NO BRANCH (infeasible in this card): still needed upstream - upstream/main ac2ffe60d0 list_sessions_rich (hermes_state_sessions.py) still runs WITH RECURSIVE chain per list call; no effective_last_active column. The family is ~5.5k fork loc (#220 alone +1186 incl. 595-line test; #443 1112 loc across import/flush write paths) against a 17,575-line fork hermes_state.py; upstream split it into ~30 hermes_state_*.py modules (hermes_state_sessions.py 1,727 lines). A correct port must re-derive every write path that must bump the denorm column on upstream's split modules, add the migration/backfill with VERSION marker, and a byte-diff ordering oracle vs the CTE - a multi-day re-author, not a rebase. Needs its own card (lead).",
   "problem": "Force recency backfill marker v3 so already-migrated DBs re-run the denorm backfill.",
   "verdict": "UPSTREAM"
  },
@@ -844,7 +844,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): see #213 \u2014 list_sessions_rich@../up/hermes_state_sessions.py:1296-1331 recursive CTE per call."
   },
-  "notes": "This is the live implementation of the #213 family. Same consolidated-port recommendation as #213.",
+  "notes": "This is the live implementation of the #213 family. Same consolidated-port recommendation as #213. [t_712c13f2] NO BRANCH (infeasible in this card): still needed upstream - upstream/main ac2ffe60d0 list_sessions_rich (hermes_state_sessions.py) still runs WITH RECURSIVE chain per list call; no effective_last_active column. The family is ~5.5k fork loc (#220 alone +1186 incl. 595-line test; #443 1112 loc across import/flush write paths) against a 17,575-line fork hermes_state.py; upstream split it into ~30 hermes_state_*.py modules (hermes_state_sessions.py 1,727 lines). A correct port must re-derive every write path that must bump the denorm column on upstream's split modules, add the migration/backfill with VERSION marker, and a byte-diff ordering oracle vs the CTE - a multi-day re-author, not a rebase. Needs its own card (lead).",
   "problem": "Re-land of the session.list denorm behind dashboard.session_list_denorm (default off), with the backfill VERSION bumped past a poisoned marker on the live DB.",
   "verdict": "UPSTREAM"
  },
@@ -959,7 +959,7 @@
   "verdict": "KEEP"
  },
  "#236": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr236",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -971,7 +971,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): 'auto_recovery' 0 hits in ../up/agent"
   },
-  "notes": "Knob nobody sets; the sticky-refusal cooldown is the only live half and upstream treats content_policy_blocked as non-retryable already. REVERT: `git revert` off origin/main CONFLICTS in agent/chat_completion_helpers.py, tests/run_agent/test_primary_runtime_restore.py; no branch, needs a hand-built revert.",
+  "notes": "Knob nobody sets; the sticky-refusal cooldown is the only live half and upstream treats content_policy_blocked as non-retryable already. REVERT: `git revert` off origin/main CONFLICTS in agent/chat_completion_helpers.py, tests/run_agent/test_primary_runtime_restore.py; no branch, needs a hand-built revert. [t_712c13f2] CMD: git revert 2f523176b2 off origin/main 59102f4a05; hand-resolved chat_completion_helpers.py (keep _resolve_failover_reason backfill, narrow cooldown set) + test_primary_runtime_restore.py (drop #236 block, keep TestSwitchModelRequestOverridesSnapshot); also dropped blocked_by=auto_recovery parametrization in tests/gateway/test_route_change_turn_contract.py (undeclared dependent) TESTS: test-gate pytest tests/gateway/test_route_change_turn_contract.py tests/agent/test_fallback_announce.py tests/run_agent/test_primary_runtime_restore.py -> 112 passed in 55.63s STAT: 5 files changed, 4 insertions(+), 173 deletions(-) HEAD bb4986b845.",
   "problem": "model.auto_recovery toggle + sticky cooldown on safety refusal.",
   "verdict": "DROP"
  },
@@ -1061,12 +1061,12 @@
    },
    "fires": "in use: ~/.hermes/config.yaml:211 per_model_threshold: (live)",
    "original": "PR #25.",
-   "upstream_fix": "none",
+   "upstream_fix": "5f2fdf66bf + f944e84858 (#63020): compression.model_thresholds",
    "upstream_state": "RED (read-only): 'per_model_threshold' 0 hits in ../up/agent (fork agent_init.py has 8)"
   },
-  "notes": "Small generic config knob; upstream-able as-is. No branch produced this run (time).",
+  "notes": "Small generic config knob; upstream-able as-is. No branch produced this run (time). [t_712c13f2] NO BRANCH: upstream/main ac2ffe60d0 already ships the capability as compression.model_thresholds (agent/agent_init.py:1555, ContextCompressor(model_thresholds=...), resolve_model_threshold longest-key match @ agent/context_compressor.py:1894), from 5f2fdf66bf feat: per-model compression threshold overrides + f944e84858 (#63020), both ancestors of upstream/main. Probe on clean upstream/main: resolve_model_threshold('claude-opus-4-8', {'opus':0.6,'gpt-5':0.9}, 0.8)=0.6, ('gpt-5.6',..)=0.9, ('kimi',{'opus':0.6},0.8)=0.8. Fork key is compression.per_model_threshold; at sync, rename to model_thresholds in ~/.hermes/config.yaml:211 and drop ours.",
   "problem": "Per-model compression threshold as a config knob (compression.per_model_threshold).",
-  "verdict": "UPSTREAM"
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#253": {
   "branch": null,
@@ -1089,7 +1089,7 @@
   "verdict": "KEEP"
  },
  "#257": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr257",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -1103,7 +1103,7 @@
    "upstream_fix": "n/a",
    "upstream_state": "n/a (D9, see #303)"
   },
-  "notes": "Commits apps/*/node_modules paths \u2014 also a hygiene problem. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in apps/desktop sidebar, hermes_cli/web_server.py, hermes_state.py + 3 tests; hand-build handed to t_712c13f2.",
+  "notes": "Commits apps/*/node_modules paths \u2014 also a hygiene problem. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in apps/desktop sidebar, hermes_cli/web_server.py, hermes_state.py + 3 tests; hand-build handed to t_712c13f2. [t_712c13f2] CMD: git revert of 8c1ff6e1ab / 6979a12af5 off origin/main 59102f4a05 conflicts (hermes_state.py moved on, tests/test_hermes_state.py gone) -> hand-built ONE combined server-half branch for #257+#303: removed SessionDB.search_sessions_by_title, hermes_state_ext _PLATFORM_SEARCH_ALIASES + 3 _session_title_search_* helpers (extracted there by nopr:7ac18ba0de), the title lane in web_routers/sessions.py + dead web_server._read_session_search, TestSearchSessionsByTitle, _FakeTitleSessionDB test, 7 title_search golden cases (corpus+golden+runner), title_search arm of test_state_ext_runner_writes_are_guarded. apps/desktop untouched (D9). TESTS: test-gate pytest tests/test_hermes_state_core.py tests/hermes_cli/test_web_server_session_search.py tests/scripts/test_refactor_equiv.py -> 157 passed STAT: 10 files changed, 982 deletions(-) HEAD 0555adca52.",
   "problem": "Rank session-title matches above content hits (desktop search).",
   "verdict": "DROP"
  },
@@ -1248,12 +1248,12 @@
    },
    "fires": "every git env in tool output",
    "original": "PR #3.",
-   "upstream_fix": "none",
+   "upstream_fix": "b41eee450b (2026-07-19) fix(redact): stop masking prose words that embed a secret keyword (Secretary, tokenizer, author=) - _key_has_secret_keyword requires a word-bounded keyword, so AUTHOR no longer matches AUTH.",
    "upstream_state": "RED (read-only): 'GIT_AUTHOR' 0 hits in ../up/agent/redact.py"
   },
-  "notes": "42 loc, generic.",
+  "notes": "42 loc, generic. [t_712c13f2] NO BRANCH: No port: the defect does not reproduce upstream (verdict row said RED by grep for 'GIT_AUTHOR'; behavior probe shows GREEN). Fork's _GIT_IDENTITY_ALLOWLIST + _GIT_IDENTITY_NAMES are redundant with upstream's word-boundary check; drop ours at next sync. PROBE: upstream/main 7262ab2d9a has no GIT_AUTHOR allowlist, but probe on a clean upstream/main worktree: redact_sensitive_text('GIT_AUTHOR_NAME=Jane Doe GIT_AUTHOR_EMAIL=jane@example.com git commit --amend') and 'export GIT_COMMITTER_EMAIL=...' pass through unchanged, while OPENAI_API_KEY=sk-... and MY_AUTH_TOKEN=... still mask to ***.",
   "problem": "GIT_AUTHOR_*/GIT_COMMITTER_* redacted by the ENV-assignment rule.",
-  "verdict": "UPSTREAM"
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#300": {
   "branch": null,
@@ -1273,7 +1273,7 @@
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#303": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr257",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -1287,7 +1287,7 @@
    "upstream_fix": "n/a",
    "upstream_state": "n/a \u2014 D9: apps/desktop is upstream-owned; the server half (web_server.py + hermes_state search) only serves the desktop UI this row edits"
   },
-  "notes": "Mixed desktop row. Adversary: confirm no non-desktop client calls the extended search endpoint. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in apps/desktop session-search*, types, hermes_state.py, tests; hand-build handed to t_712c13f2.",
+  "notes": "Mixed desktop row. Adversary: confirm no non-desktop client calls the extended search endpoint. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in apps/desktop session-search*, types, hermes_state.py, tests; hand-build handed to t_712c13f2. [t_712c13f2] CMD: combined with #257 on audit/agent/revert-pr257 (#303 extends #257's method). git revert of 8c1ff6e1ab / 6979a12af5 off origin/main 59102f4a05 conflicts (hermes_state.py moved on, tests/test_hermes_state.py gone) -> hand-built ONE combined server-half branch for #257+#303: removed SessionDB.search_sessions_by_title, hermes_state_ext _PLATFORM_SEARCH_ALIASES + 3 _session_title_search_* helpers (extracted there by nopr:7ac18ba0de), the title lane in web_routers/sessions.py + dead web_server._read_session_search, TestSearchSessionsByTitle, _FakeTitleSessionDB test, 7 title_search golden cases (corpus+golden+runner), title_search arm of test_state_ext_runner_writes_are_guarded. apps/desktop untouched (D9). TESTS: test-gate pytest tests/test_hermes_state_core.py tests/hermes_cli/test_web_server_session_search.py tests/scripts/test_refactor_equiv.py -> 157 passed STAT: see #257 ADVERSARY: Non-desktop client found: web dashboard web/src/lib/api.ts:829 calls GET /api/sessions/search; after the revert its results lose title/channel/platform hits (id + FTS lanes remain, upstream's). HEAD 0555adca52.",
   "problem": "Session search matches platform + channel/thread names (desktop).",
   "verdict": "DROP"
  },
@@ -1511,7 +1511,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): fork-only blackbox cost.py; upstream has no MoA cost split"
   },
-  "notes": "MoA is not used by the fleet in the window; 300 loc on conversation_loop.py/moa_loop.py (3/3 syncs). REVERT: `git revert` off origin/main CONFLICTS in agent/conversation_loop.py, agent/moa_loop.py, plugins/blackbox/cost.py + 3 tests; no branch, needs a hand-built revert.",
+  "notes": "MoA is not used by the fleet in the window; 300 loc on conversation_loop.py/moa_loop.py (3/3 syncs). REVERT: `git revert` off origin/main CONFLICTS in agent/conversation_loop.py, agent/moa_loop.py, plugins/blackbox/cost.py + 3 tests; no branch, needs a hand-built revert. [t_712c13f2] NO BRANCH (infeasible): Standalone revert is infeasible: #787 (5139318cef, verdict KEEP, 5,589 loc) built on #342's seam \u2014 conversation_loop._moa_session_cost_status(cost_result, _moa_ref_pricing_calls, _moa_ref_cost) reads per-advisor cost_usd/cost_status from the list #342 deposits (moa_loop._pending_reference_pricing_calls / consume_reference_pricing_calls), and cost.py's _usage_unknown filter (#787) iterates #342's pricing_calls. pricing_calls is also asserted by tests from #787 (test_usage_unknown_r6_findings/contract/consumers, test_usageless_response_accounting), #343 (test_moa_seam_integration) and af978ecb17 (test_model_cost_guard). Removing #342 alone leaves #787's MoA reconciliation with an empty advisor list (regresses r6 round-4 finding 1). Census dependents listed only #913; real blocker is #787. Lead decision: either DROP #342 together with the MoA half of #787, or downgrade #342 to KEEP-by-dependency. CMD: git revert 86498dfc09 off origin/main 59102f4a05 -> 6 conflicts (conversation_loop.py, moa_loop.py, blackbox/cost.py, 3 tests); aborted TESTS: n/a STAT: n/a",
   "problem": "Price MoA turns by physical model routes.",
   "verdict": "DROP"
  },
@@ -1659,7 +1659,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED by inheritance (see #443)"
   },
-  "notes": "Fold into the consolidated port.",
+  "notes": "Fold into the consolidated port. [t_712c13f2] NO BRANCH (infeasible in this card): still needed upstream - upstream/main ac2ffe60d0 list_sessions_rich (hermes_state_sessions.py) still runs WITH RECURSIVE chain per list call; no effective_last_active column. The family is ~5.5k fork loc (#220 alone +1186 incl. 595-line test; #443 1112 loc across import/flush write paths) against a 17,575-line fork hermes_state.py; upstream split it into ~30 hermes_state_*.py modules (hermes_state_sessions.py 1,727 lines). A correct port must re-derive every write path that must bump the denorm column on upstream's split modules, add the migration/backfill with VERSION marker, and a byte-diff ordering oracle vs the CTE - a multi-day re-author, not a rebase. Needs its own card (lead).",
   "problem": "Denorm maintenance across parent_session_id rewrites.",
   "verdict": "UPSTREAM"
  },
@@ -1714,7 +1714,7 @@
    "upstream_fix": "none",
    "upstream_state": "RED by inheritance (upstream has no effective_last_active column; the defect class = 'denorm maintained on all write paths' only exists once the port lands)"
   },
-  "notes": "Fold into the #213/#220 consolidated port; not separable.",
+  "notes": "Fold into the #213/#220 consolidated port; not separable. [t_712c13f2] NO BRANCH (infeasible in this card): still needed upstream - upstream/main ac2ffe60d0 list_sessions_rich (hermes_state_sessions.py) still runs WITH RECURSIVE chain per list call; no effective_last_active column. The family is ~5.5k fork loc (#220 alone +1186 incl. 595-line test; #443 1112 loc across import/flush write paths) against a 17,575-line fork hermes_state.py; upstream split it into ~30 hermes_state_*.py modules (hermes_state_sessions.py 1,727 lines). A correct port must re-derive every write path that must bump the denorm column on upstream's split modules, add the migration/backfill with VERSION marker, and a byte-diff ordering oracle vs the CTE - a multi-day re-author, not a rebase. Needs its own card (lead).",
   "problem": "Denorm maintenance gap: effective_last_active not maintained across session import and message-flush paths (stale ordering).",
   "verdict": "UPSTREAM"
  },
@@ -2681,7 +2681,7 @@
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#621": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr621",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -2695,12 +2695,12 @@
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): 'tailscale' 0 hits in ../up/agent except redact/model_metadata comments"
   },
-  "notes": "796 loc on 3/3-sync files (chat_completion_helpers, conversation_loop, error_classifier) + shared_transport_guard.py for a condition seen once in 4 months of logs. REVERT: `git revert` off origin/main CONFLICTS in chat_completion_helpers.py, conversation_loop.py, shared_transport_guard.py, hermes_cli/model_switch.py + 4 tests; no branch, needs a hand-built revert.",
+  "notes": "796 loc on 3/3-sync files (chat_completion_helpers, conversation_loop, error_classifier) + shared_transport_guard.py for a condition seen once in 4 months of logs. REVERT: `git revert` off origin/main CONFLICTS in chat_completion_helpers.py, conversation_loop.py, shared_transport_guard.py, hermes_cli/model_switch.py + 4 tests; no branch, needs a hand-built revert. [t_712c13f2] CMD: git checkout -b audit/agent/revert-pr621 origin/audit/agent/revert-pr622 (6c344e319a); git revert 7a4455f7dd -> 3 conflicts (chat_completion_helpers.py, conversation_loop.py, tests/agent/test_error_classifier.py) resolved toward removal; inlined _POOLED_PROVIDERS frozenset (#913 imported _TAILSCALE_RELAY_PROVIDERS from the deleted module); kept pool_stalled in the enum test. Combined branch = #622 + #621 reverts. TESTS: test-gate pytest tests/agent/test_error_classifier.py tests/agent/test_fallback_reason_surfacing.py tests/agent/test_fallback_reason_threading.py -> 166 passed; tests/hermes_cli/test_user_providers_model_switch.py tests/run_agent/test_primary_runtime_restore.py -> 63 passed, 2 failed (test_list_authenticated_providers_enumerates_dict_format_models, test_section3_probes_no_key_endpoint_with_singular_default_model: same 2 fail on clean origin/main 59102f4a05, inherited) STAT: 12 files changed, 18 insertions(+), 788 deletions(-) HEAD 2fd68703fd.",
   "problem": "Bound Tailscale transport outages in failover.",
   "verdict": "DROP"
  },
  "#622": {
-  "branch": "audit/agent/revert-pr622",
+  "branch": "audit/agent/revert-pr621",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -2714,7 +2714,7 @@
    "upstream_fix": "none",
    "upstream_state": "see #621"
   },
-  "notes": "Rides with #621 revert. REVERT: git revert 738c5bb699 clean; `pytest -q tests/agent/test_shared_transport_guard.py tests/run_agent/test_shared_transport_fallback.py` -> 23 passed. Only meaningful together with #621, whose revert conflicts (8 files) and needs a hand-built branch.",
+  "notes": "Rides with #621 revert. REVERT: git revert 738c5bb699 clean; `pytest -q tests/agent/test_shared_transport_guard.py tests/run_agent/test_shared_transport_fallback.py` -> 23 passed. Only meaningful together with #621, whose revert conflicts (8 files) and needs a hand-built branch. [t_712c13f2] Combined: audit/agent/revert-pr621 is the #621 revert stacked on audit/agent/revert-pr622 @ 6c344e319a (both reverts on one branch). HEAD 2fd68703fd.",
   "problem": "Keep Tailscale errors terse.",
   "verdict": "DROP"
  },
@@ -3385,7 +3385,7 @@
   "verdict": "KEEP"
  },
  "#806": {
-  "branch": null,
+  "branch": "audit/agent/revert-pr806",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -3397,7 +3397,7 @@
    "upstream_fix": "n/a",
    "upstream_state": "RED (no notice backoff upstream) but upstream has no repeated notice to back off \u2014 its lease wait logs only on timeout (../up/hermes_state_compression.py:563-585 debug callbacks)"
   },
-  "notes": "Log-volume fix on a 3/3-sync file (hermes_state.py) with no measured volume problem. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in tests/state/test_session_turn_lease.py; hand-build handed to t_712c13f2.",
+  "notes": "Log-volume fix on a 3/3-sync file (hermes_state.py) with no measured volume problem. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in tests/state/test_session_turn_lease.py; hand-build handed to t_712c13f2. [t_712c13f2] CMD: git revert 809e46b3dc off origin/main 59102f4a05; conflict in tests/state/test_session_turn_lease.py (the #806 block carried a later real-SessionDB fixture edit) resolved by dropping the block; no other callers of wait_notice_backoff/wait_notice_max_interval_seconds TESTS: test-gate pytest tests/state/test_session_turn_lease.py -> 19 passed STAT: 2 files changed, 3 insertions(+), 99 deletions(-) HEAD 0e043fe038.",
   "problem": "Back off cross-process turn-lease wait notices.",
   "verdict": "DROP"
  },
@@ -3474,7 +3474,7 @@
   "verdict": "KEEP"
  },
  "#878": {
-  "branch": null,
+  "branch": "audit/agent/upstream-878",
   "evidence": {
    "cost": {
     "conflict_syncs": 3,
@@ -3488,7 +3488,7 @@
    "upstream_fix": "none yet",
    "upstream_state": "RED (read-only): 'grok-4.7' 0 hits in ../up/agent, ../up/hermes_cli (upstream main 2026-09-24 predates its own add)"
   },
-  "notes": "Generic catalog add; upstream will want it. No branch produced this run (time) \u2014 a 3-file port (model_metadata, reasoning_timeouts, models_catalog_static) minus the notional pricing tuple.",
+  "notes": "Generic catalog add; upstream will want it. No branch produced this run (time) \u2014 a 3-file port (model_metadata, reasoning_timeouts, models_catalog_static) minus the notional pricing tuple. [t_712c13f2] Rebased on upstream/main ac2ffe60d0; not opened upstream. CMD: re-authored on upstream/main (fork's hermes_cli/models.py surfaces live in hermes_cli/models_catalog_static.py upstream; x-ai/grok-4.7 OpenRouter row already upstream): model_metadata DEFAULT_CONTEXT_LENGTHS + _PRE_CATALOG_STALE_KEYS, reasoning_timeouts 300s floor, _XAI_STATIC_FALLBACK/_XAI_CURATED_EXTRAS/_XAI_TOP_MODEL -> grok-4.7; no pricing tuple; new tests/agent/test_grok_47_catalog.py (5). PR body bodies/878.md == commit message. TESTS: RED on upstream/main (new test only): 5 failed. Fixed: 5 passed; test_xai_curated_models + test_xai_model_flow + test_xai_retirement -> 15 passed; test_model_metadata + test_model_catalog + new -> 136 passed (TEST_GATE_NO_CACHE=1). STAT: 4 files changed, 67 insertions(+), 7 deletions(-) HEAD f44c6425f3.",
   "problem": "grok-4.7 (GA 2026-09-21) as xAI flagship: catalog, pricing, 500K window.",
   "verdict": "UPSTREAM"
  },
@@ -3723,7 +3723,7 @@
    "upstream_fix": "none",
    "upstream_state": "n/a (fork-only helper in agent/compaction_stats.py; no upstream counterpart)"
   },
-  "notes": "Problem unproven by the PR's own admission. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in tests/agent/test_compaction_stats_reconcile.py; hand-build handed to t_712c13f2.",
+  "notes": "Problem unproven by the PR's own admission. REVERT: `git revert` off origin/main (2026-09-25) CONFLICTS in tests/agent/test_compaction_stats_reconcile.py; hand-build handed to t_712c13f2. [t_712c13f2] NO BRANCH (infeasible): Standalone revert regresses 3 later KEEP-row tests that pin #99's extractor shape: test_regex_miss_fixture_tag_detects_regex_misses (#100 f452d89166, KEEP: its INV-5 fixture relies on the '\\n' part join not synthesizing a split marker; pre-#99 ' ' join detects it), test_text_part_type_sets_agree_across_sites (#101 f8563ec844, KEEP: imports agent.compaction_stats._TEXT_PART_TYPES as the 4-site drift guard), test_list_content_parts_keep_line_anchoring (#406 136deef4d3, KEEP: part-initial marker must anchor after the join). #99's 'forward defense' became the substrate of #100/#101/#406. Lead decision: KEEP-by-dependency (recommended; fork-only file, 0 sync conflicts per census) or drop with the family. CMD: git revert 86faf2ef36 off origin/main 59102f4a05 -> conflict in tests/agent/test_compaction_stats_reconcile.py (resolved: dropped the 162-line #99 block, kept 526 later lines); compaction_stats.py reverted clean (+21/-58); aborted after tests TESTS: test-gate pytest tests/agent/test_compaction_stats_reconcile.py tests/agent/test_compaction_announce.py tests/agent/test_inturn_compaction_stats_replay.py -> 3 failed, 172 passed, 2 skipped",
   "problem": "Forward-defense hardening of _content_to_text for structured summary content.",
   "verdict": "DROP"
  },
@@ -4203,12 +4203,12 @@
    },
    "fires": "every fallback re-resolves (1,897 fallbacks in window)",
    "original": "commit a8e443aad1 (Phase B).",
-   "upstream_fix": "none",
+   "upstream_fix": "af0be164c1 (one trigger derivation for update_model), on top of #63020",
    "upstream_state": "RED by inheritance of #25 (knob absent upstream)"
   },
-  "notes": "Rides with #25.",
+  "notes": "Rides with #25. [t_712c13f2] NO BRANCH: upstream's update_model re-derives the trigger per model via _derive_trigger -> resolve_model_threshold(model, self.model_thresholds, self._config_threshold_percent, provider) from the RAW config value (af0be164c1, agent/context_compressor.py:2523-2563), so a fallback no longer inherits the source model's percent. Rides with #25.",
   "problem": "update_model re-derived the trigger from the old model's threshold_percent after a fallback.",
-  "verdict": "UPSTREAM"
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "nopr:ad8de4f275": {
   "branch": null,
