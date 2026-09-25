@@ -357,63 +357,9 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     return format_home_line(sid, row)
 
 
-class LoadGate:
-    """Hysteresis gate that pauses dispatcher SPAWNS while the host is over
-    its run-queue bar (``kanban.dispatch_load_gate``).
-
-    Measured 2026-09-24 on the Mac Studio (32 cores): load1 80-110 with the
-    dispatcher still spawning 9-14 workers a tick; the gateway took 15 min to
-    reach its first model call and its own shutdown watchdog force-exited a
-    planned restart because the drain never got CPU. Workers are separate
-    processes — but every one is more run-queue for the gateway to lose to.
-
-    Pure and clock-free: feed it ``load1`` + ``ncpu`` each tick, read
-    ``reason``. Pauses when ``load1 > pause_above`` (default ``ncpu``), resumes
-    only when ``load1 < resume_below`` (default ``0.75 * ncpu``) — the gap
-    stops a 60-second oscillation from flapping spawns every tick.
-    """
-
-    def __init__(self, cfg: Optional[dict], ncpu: int) -> None:
-        cfg = cfg if isinstance(cfg, dict) else {}
-        self.enabled = bool(cfg.get("enabled", True))
-        ncpu = max(1, int(ncpu or 1))
-        self.pause_above = self._num(cfg.get("pause_above"), float(ncpu))
-        self.resume_below = self._num(cfg.get("resume_below"), 0.75 * ncpu)
-        if self.resume_below >= self.pause_above:
-            # A degenerate band would flap; collapse to a sane one.
-            self.resume_below = 0.75 * self.pause_above
-        self.ncpu = ncpu
-        self.paused = False
-        self.reason: Optional[str] = None
-
-    @staticmethod
-    def _num(value, default: float) -> float:
-        try:
-            f = float(value)
-        except (TypeError, ValueError):
-            return float(default)
-        return f if f > 0 else float(default)
-
-    def update(self, load1: float) -> Optional[str]:
-        """Feed one sample; return the pause reason (None = spawning allowed)."""
-        if not self.enabled:
-            self.paused, self.reason = False, None
-            return None
-        try:
-            load1 = float(load1)
-        except (TypeError, ValueError):
-            return self.reason
-        if self.paused:
-            if load1 < self.resume_below:
-                self.paused, self.reason = False, None
-        elif load1 > self.pause_above:
-            self.paused = True
-        if self.paused:
-            self.reason = (
-                f"load1={load1:.1f} > pause_above={self.pause_above:.1f} "
-                f"(ncpu={self.ncpu}); resumes below {self.resume_below:.1f}"
-            )
-        return self.reason
+# LoadGate moved to hermes_cli.kanban_load_gate (shared with the standalone
+# `hermes kanban daemon` loop); re-exported here for existing importers.
+from hermes_cli.kanban_load_gate import LoadGate  # noqa: E402,F401
 
 
 def _format_spawn_routes(routes, sources=None) -> str:
@@ -2372,28 +2318,19 @@ class GatewayKanbanWatchersMixin:
         load_gate = LoadGate(kanban_cfg.get("dispatch_load_gate"), _ncpu)
         if load_gate.enabled:
             logger.info(
-                "kanban dispatcher: load gate armed pause_above=%.1f resume_below=%.1f ncpu=%d",
+                "kanban dispatcher: load gate armed pause_above=%.1f resume_below=%.1f "
+                "ncpu=%d worker_load_cost=%.1f ramp_seconds=%.0f max_spawn_per_tick=%d "
+                "load5_floor=%s",
                 load_gate.pause_above, load_gate.resume_below, load_gate.ncpu,
+                load_gate.worker_load_cost, load_gate.ramp_seconds,
+                load_gate.max_spawn_per_tick, load_gate.load5_floor,
             )
-        _load_gate_was_paused = False
+        def _sample_spawn_pause() -> "tuple[Optional[int], Optional[str]]":
+            """(allowance, reason) for this tick; (None, None) = no limit."""
+            return load_gate.admit_now()
 
-        def _sample_spawn_pause() -> "Optional[str]":
-            nonlocal _load_gate_was_paused
-            try:
-                load1 = os.getloadavg()[0]
-            except (AttributeError, OSError):
-                return None  # platform without loadavg: gate is inert
-            reason = load_gate.update(load1)
-            if bool(reason) != _load_gate_was_paused:
-                _load_gate_was_paused = bool(reason)
-                if reason:
-                    logger.warning("kanban dispatcher: spawns PAUSED — %s", reason)
-                else:
-                    logger.info(
-                        "kanban dispatcher: spawns RESUMED — load1=%.1f < resume_below=%.1f",
-                        load1, load_gate.resume_below,
-                    )
-            return reason
+        def _finish_gate_tick(spawned: int) -> None:
+            load_gate.finish_tick(spawned, logger=logger)
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
@@ -2449,7 +2386,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -2500,6 +2437,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     spawn_paused=spawn_paused,
+                    spawn_limit=spawn_limit,
                     reconcile_orphans=reconcile_orphans,
                     budget_cache=budget_cache,
                 )
@@ -2556,7 +2494,12 @@ class GatewayKanbanWatchersMixin:
             # turn ledgers are the same files for every board, so without this
             # an N-board host re-reads every ledger N times per tick.
             budget_cache: dict = {}
-            _spawn_paused = _sample_spawn_pause()
+            # Load gate: ONE allowance per tick, shared across every board —
+            # the host's run queue is one resource no matter which board the
+            # worker came from.
+            _allowance, _spawn_paused = _sample_spawn_pause()
+            _remaining = _allowance
+            _tick_spawned = 0
             # Enumeration extent spans the whole per-board tick body, not just
             # the fingerprint's path resolve: `_tick_once_for_board` also calls
             # `connect(board=slug)`, which re-resolves internally. Scoping only
@@ -2564,7 +2507,22 @@ class GatewayKanbanWatchersMixin:
             # warnings that then silenced later single-board misreadings.
             for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug, budget_cache, _spawn_paused)))
+                _paused = _spawn_paused
+                if _paused is None and _remaining is not None and _remaining <= 0:
+                    _paused = (
+                        f"load gate: this tick's allowance of {_allowance} "
+                        f"spawn(s) is used"
+                    )
+                res = _tick_once_for_board(
+                    slug, budget_cache, _paused,
+                    None if _paused else _remaining,
+                )
+                out.append((slug, res))
+                _n = len(getattr(res, "spawned", None) or []) if res is not None else 0
+                _tick_spawned += _n
+                if _remaining is not None:
+                    _remaining -= _n
+            _finish_gate_tick(_tick_spawned)
             return out
 
         def _ready_nonempty() -> bool:

@@ -3695,6 +3695,15 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         print(json.dumps(out_json, indent=2, ensure_ascii=False))
         return 0
 
+    # Host-level dispatcher load gate (kanban.dispatch_load_gate), published
+    # each tick by the gated dispatcher loop (gateway or `kanban daemon`).
+    try:
+        from hermes_cli import kanban_load_gate as _klg
+
+        print(_klg.format_state_line(_klg.read_state()))
+    except Exception:
+        pass
+
     if not diags_by_task:
         print("No active diagnostics on this board.")
         return 0
@@ -5061,11 +5070,14 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return False
 
     try:
+        from hermes_cli.kanban_load_gate import gate_from_config
+
         kb.run_daemon(
             interval=args.interval,
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             on_tick=_on_tick,
+            load_gate=gate_from_config(),
         )
     finally:
         if pidfile:

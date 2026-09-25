@@ -3126,7 +3126,21 @@ DEFAULT_CONFIG = {
         # resume once it drops below `resume_below` (default: 0.75 × CPU
         # count). Hysteresis so a load that hovers at the bar doesn't flap
         # spawns every tick. Set enabled: false to disable.
-        "dispatch_load_gate": {"enabled": True, "pause_above": None, "resume_below": None},
+        # Projected-load admission (load1 lags a spawn burst by 60-90 s):
+        # each worker spawned in the last `ramp_seconds` counts as
+        # `worker_load_cost` of not-yet-visible load; a tick admits at most
+        # ceil((pause_above - load1 - pending) / worker_load_cost) and never
+        # more than `max_spawn_per_tick`. `load5_floor`: resuming from a
+        # pause also needs load5 < pause_above. See kanban_load_gate.py.
+        "dispatch_load_gate": {
+            "enabled": True,
+            "pause_above": None,
+            "resume_below": None,
+            "worker_load_cost": 2.0,
+            "ramp_seconds": 120,
+            "max_spawn_per_tick": 4,
+            "load5_floor": True,
+        },
         # Reviewer↔implementer round cap. A "round" is one changes_requested
         # verdict; once a card has collected this many, the next request for
         # review does NOT re-spawn the reviewer — the card is blocked
