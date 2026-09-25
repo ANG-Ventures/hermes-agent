@@ -402,3 +402,47 @@ def test_reserve_refuses_unapproved_label():
     assert isinstance(r, Refusal) and r.incident == "invalid-plan"
     assert api.writes == 0
     assert isinstance(ledger(api).reserve(key(2), proposed("a")), Reservation)
+
+
+def _terminal_row(admitted, terminal, minutes=35, released=False):
+    job = {"job_id": "a", "labels": ["ubuntu-latest"], "reason": "cloud-overflow",
+           "reserved_minutes": minutes, "released_unemitted": released}
+    if released:
+        job["release_receipt_sha256"] = "0" * 64
+    planned = {k: job[k] for k in ("job_id", "labels", "reserved_minutes", "reason")}
+    return {"admitted_on": admitted, "terminal_on": terminal, "jobs": [job],
+            "plan": {"jobs": [planned], "incidents": [], "summary": {"mode": "overflow", "pad": "p" * 6000}}}
+
+
+def test_compaction_folds_terminal_rows_without_changing_todays_charge():
+    """Spec 5.3a amendment (t_e3d085c1): a terminal row folds as soon as folding is charge-exact,
+    not after 30 days; today's consumption is identical before and after the fold."""
+    today = "2026-09-25"
+    attempts = {
+        "1:1:1": _terminal_row("2026-09-24", "2026-09-24"),          # stopped carrying: folds
+        "1:2:1": _terminal_row("2026-09-23", "2026-09-24"),          # stopped carrying: folds
+        "1:3:1": _terminal_row(today, today),                        # charged today only: folds into today
+        "1:4:1": _terminal_row(today, today, released=True),         # released: folds at 0
+        "1:5:1": _terminal_row("2026-09-24", today),                 # carries through today: KEPT
+        "1:6:1": _terminal_row("2026-09-24", None),                  # outstanding: KEPT
+        "1:7:1": _terminal_row(today, None),                         # outstanding today: KEPT
+    }
+    state = {"version": 1, "attempts": json.loads(json.dumps(attempts)), "daily_totals": {}}
+    before = {d: Ledger._consumed(state, d) for d in (today, "2026-09-26", "2026-10-30")}
+    Ledger._compact(state, today)
+    assert sorted(state["attempts"]) == ["1:5:1", "1:6:1", "1:7:1"]
+    assert state["daily_totals"] == {"2026-09-24": 35, "2026-09-23": 35, today: 35}
+    assert {d: Ledger._consumed(state, d) for d in before} == before
+
+
+def test_merge_queue_volume_stays_under_hard_limit():
+    """The measured failure: ~100 terminal attempts/day at ~6.2 KB each. With same-day folding the
+    live state holds only outstanding rows, so admission never hits state-capacity."""
+    api = Contents()
+    for run in range(1, 301):                       # 3 days of traffic, well past HARD_LIMIT unfolded
+        day = f"2026-09-{23 + (run - 1) // 100}"
+        result = ledger(api, day=day, limit=0).reserve(key(run), Plan(
+            [JobPlacement("a", POOL.copy(), "local-queue", 0)], [], {"mode": "self-only", "pad": "p" * 6000}))
+        assert isinstance(result, Reservation), (run, result)
+        api.state["attempts"][f"123:{run}:1"]["terminal_on"] = day
+    assert len(json.dumps(api.state)) < 400 * 1024
