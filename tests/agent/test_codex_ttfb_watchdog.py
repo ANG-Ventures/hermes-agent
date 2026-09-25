@@ -325,7 +325,7 @@ def test_idle_phase_policy_is_narrow_and_preserves_operator_overrides(
     assert watchdogs.est_tokens == input_chars // 4
     assert watchdogs.idle_enabled is idle_enabled
     assert watchdogs.idle_requires_progress is requires_progress
-    assert (watchdogs.progress_timeout > 0) is requires_progress
+    assert (watchdogs.progress_timeout == h.CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS) is requires_progress
 
 
 def test_lifecycle_event_does_not_restart_first_progress_deadline():
@@ -364,6 +364,85 @@ def test_large_codex_lifecycle_only_stream_hits_attempt_progress_budget(tmp_path
 
     assert time.monotonic() - started < 1.5
     assert "codex_progress_kill" in closes
+
+
+def _keepalive_only_stream(agent, *, progress_after=None):
+    """Lifecycle frames every 0.1s; optionally a real delta + completion after ``progress_after`` s."""
+    def stream_attempt():
+        started = time.monotonic()
+        yield SimpleNamespace(type="response.created")
+        while getattr(agent, "_active_codex_stream_request_token", None) is not None:
+            if progress_after is not None and time.monotonic() - started >= progress_after:
+                yield SimpleNamespace(type="response.output_text.delta", delta="done")
+                yield SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(status="completed", id="resp-ka", usage=None),
+                )
+                return
+            time.sleep(0.1)
+            yield SimpleNamespace(type="response.in_progress")
+        raise ConnectionError("retired keepalive-only stream")
+
+    return stream_attempt
+
+
+def test_small_codex_keepalive_only_stream_is_killed_before_stale_timeout(tmp_path, monkeypatch):
+    """A backend that keeps the socket alive with lifecycle frames but never produces a delta must
+    reconnect at the first-progress budget, not ride the wall-clock stale timeout: the idle watchdog
+    is refreshed by every keepalive and the TTFB watchdog is satisfied by the first frame."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 6.0)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.9")
+    closes: list = []
+    _install_codex_event_stream(agent, monkeypatch, _keepalive_only_stream(agent), closes)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="no substantive model progress"):
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+
+    assert time.monotonic() - started < 3.0
+    assert "codex_progress_kill" in closes
+    assert "stale_call_kill" not in closes
+
+
+def test_small_codex_stream_with_progress_is_not_killed_by_progress_budget(tmp_path, monkeypatch):
+    """Real progress before the budget expires disarms it; the stream completes normally."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1.5")
+    closes: list = []
+    _install_codex_event_stream(agent, monkeypatch, _keepalive_only_stream(agent, progress_after=0.6), closes)
+
+    response = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+
+    assert response is not None
+    assert "codex_progress_kill" not in closes
+
+
+def test_small_request_progress_budget_stays_below_stale_timeout(tmp_path, monkeypatch):
+    """The keepalive-only budget reuses the first-event cutoff but is clamped strictly below the
+    stale timer (else it could never win); TTFB=0 disables it, and local servers are exempt."""
+    from agent import chat_completion_helpers as h
+
+    kwargs = {"model": "gpt-5.5", "input": "hi"}
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 90.0)
+    watchdogs = h._resolve_nonstream_watchdogs(agent, kwargs)
+    assert watchdogs.ttfb_timeout == 120.0
+    assert 0 < watchdogs.progress_timeout < watchdogs.stale_timeout
+
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "30")
+    assert h._resolve_nonstream_watchdogs(agent, kwargs).progress_timeout == 30.0
+
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0")
+    assert h._resolve_nonstream_watchdogs(agent, kwargs).progress_timeout == 0.0
+
+    monkeypatch.delenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS")
+    local = _make_codex_agent(tmp_path, monkeypatch, provider="custom", base_url="http://127.0.0.1:11434/v1")
+    assert h._resolve_nonstream_watchdogs(local, kwargs).progress_timeout == 0.0
 
 
 @pytest.mark.parametrize(

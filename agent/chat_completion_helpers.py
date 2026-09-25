@@ -1161,6 +1161,10 @@ HIGH_EFFORT_SILENCE_FLOOR_SECONDS = 300.0
 # retune the other.
 CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS = 300.0
 
+# Headroom between the keepalive-only progress budget and the stale timer on requests outside
+# the official large-context policy, so a lifecycle-only stall reconnects before the stale kill.
+_PROGRESS_STALE_MARGIN_SECONDS = 10.0
+
 
 def _high_effort_silence_floor(agent) -> float:
     """``HIGH_EFFORT_SILENCE_FLOOR_SECONDS`` when the wire reasoning config is enabled at ``high`` or any
@@ -1270,12 +1274,22 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     idle_explicit = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", -1.0) != -1.0
     idle_timeout = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
     progress_gated = codex and openai_codex_backend and codex_floor > 0 and not idle_explicit
+    progress_timeout = CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS if progress_gated else 0.0
+    if codex and not local and not progress_gated and ttfb_enabled:
+        # Keepalive-only stall: the backend sends lifecycle frames (response.created /
+        # in_progress) but never a delta. The first frame satisfies TTFB and every frame
+        # refreshes the idle watchdog, so the call otherwise rides the wall-clock stale
+        # timeout and trips the stale breaker. Give substantive progress the first-event
+        # budget, strictly below the stale timer so it can win (TTFB=0 disables both).
+        progress_timeout = ttfb_timeout
+        if math.isfinite(stale_timeout):
+            progress_timeout = min(progress_timeout, max(stale_timeout - _PROGRESS_STALE_MARGIN_SECONDS, 5.0))
     return _NonStreamWatchdogs(stale_timeout=stale_timeout, codex=codex, est_tokens=est_tokens,
         ttfb_enabled=ttfb_enabled, ttfb_timeout=ttfb_timeout, idle_enabled=codex and idle_timeout > 0,
         idle_timeout=idle_timeout, idle_requires_progress=progress_gated,
         # A lifecycle frame proves transport liveness, not model progress. Bound that phase
         # from the physical-attempt start; events cannot restart the grace period.
-        progress_timeout=CODEX_FIRST_PROGRESS_TIMEOUT_SECONDS if progress_gated else 0.0)
+        progress_timeout=progress_timeout)
 
 
 def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
