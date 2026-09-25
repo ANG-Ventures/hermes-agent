@@ -33,7 +33,7 @@ import logging
 import os
 from typing import Any, Optional
 
-from agent.redact import redact_sensitive_text
+from agent.redact import redact_sensitive_json, redact_sensitive_text
 from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.goals import judge_goal
 from hermes_cli.kanban_identity import safe_comment_provenance
@@ -768,12 +768,9 @@ def _handle_complete(args: dict, **kw) -> str:
     if result:
         result = redact_sensitive_text(str(result), force=True)
     if metadata is not None and isinstance(metadata, dict):
-        meta_json = json.dumps(metadata)
-        meta_json = redact_sensitive_text(meta_json, force=True)
-        try:
-            metadata = json.loads(meta_json)
-        except json.JSONDecodeError:
-            pass
+        # Per-leaf: masking the serialized string can eat a closing quote
+        # and leave the stored metadata unparseable (t_d59ca5db).
+        metadata = redact_sensitive_json(metadata, force=True)
     superseded_by = args.get("superseded_by")
     if superseded_by is not None:
         if not isinstance(superseded_by, str):
@@ -1074,11 +1071,8 @@ def _handle_request_review(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     if metadata is not None:
-        metadata_json = redact_sensitive_text(json.dumps(metadata), force=True)
-        try:
-            metadata = json.loads(metadata_json)
-        except json.JSONDecodeError:
-            return tool_error("metadata could not be safely serialized")
+        # Per-leaf redaction; see kanban_complete (t_d59ca5db).
+        metadata = redact_sensitive_json(metadata, force=True)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     reviewer = args.get("reviewer") or None
     if reviewer:
