@@ -28,7 +28,6 @@ _REPRESENTATIVE_NOTIONAL = [
     "claude-bridge",
     "claude-apr",
     "claude-bpr",
-    "yunwu",
     "claude-apx-1",
     "claude-apx-2",
     "claude-apx-5",
@@ -199,33 +198,15 @@ def test_notional_anthropic_route_resolves_to_anthropic_billing():
         assert route.model == "claude-opus-4-8", provider
 
 
-def test_yunwu_prices_claude_models_at_anthropic_snapshot():
-    """Yunwu (云雾) is a real-cash Anthropic-compatible reseller, but by request
-    its claude-* turns price at the SAME official Anthropic snapshot the rest of
-    the fleet's Claude rows use — no bespoke Yunwu rate table. Every model in
-    Ace's starting set must (a) route to provider='anthropic' and (b) yield the
-    identical dollar amount a direct 'anthropic' route would, labelled
-    'estimated'. Covers both the bare 'claude-haiku-4-5' shown in the picker and
-    the dated 'claude-haiku-4-5-20251001' Yunwu actually bills on the wire."""
-    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000)
-    for model in (
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-fable-5",
-        "claude-haiku-4-5",
-        "claude-haiku-4-5-20251001",
-    ):
-        route = resolve_billing_route(model, provider="yunwu")
-        assert route.provider == "anthropic", model
-        assert route.billing_mode == "official_docs_snapshot", model
-
-        yunwu_cost = estimate_usage_cost(model, usage, provider="yunwu")
-        anthropic_cost = estimate_usage_cost(model, usage, provider="anthropic")
-        assert yunwu_cost.status == "estimated", model
-        assert yunwu_cost.amount_usd is not None, model
-        assert yunwu_cost.amount_usd == anthropic_cost.amount_usd, (
-            f"{model}: yunwu={yunwu_cost.amount_usd} anthropic={anthropic_cost.amount_usd}"
-        )
+def test_yunwu_is_not_a_notional_anthropic_provider():
+    """Fork-PR audit DROP of #226: Yunwu (云雾) is a real-cash reseller with 0
+    turns in 30d; it must not ride the notional Anthropic docs-snapshot route.
+    Its claude-* turns fall through to the generic resolver (no bespoke rate)."""
+    assert "yunwu" not in NOTIONAL_ANTHROPIC_PROVIDERS
+    assert not is_notional_anthropic_provider("yunwu")
+    route = resolve_billing_route("claude-opus-4-8", provider="yunwu")
+    assert route.provider != "anthropic"
+    assert route.billing_mode != "official_docs_snapshot"
 
 
 def test_notional_anthropic_accepts_dot_notation_and_prefixed_model():
