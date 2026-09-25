@@ -43,7 +43,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextvars import Context, copy_context
+from contextvars import Context, ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
@@ -3976,6 +3976,61 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
         pass
 
     return None
+
+
+_EMPTY_CONTENT_PLACEHOLDER = "(The user sent a message with no text content)"
+# Chat id stamped on the ``stt: ...`` / ``stt FAILED: ...`` outcome lines. A
+# ContextVar (not a parameter) so the long-standing two-argument
+# ``_enrich_message_with_transcription`` contract, which tests and callers fake,
+# is unchanged.
+_STT_LOG_CHAT: "ContextVar[str]" = ContextVar(
+    "_STT_LOG_CHAT", default="unknown"
+)
+_VOICE_LOG_PROBE_TIMEOUT_S = 2.0
+
+
+def _duration_label_seconds(duration: Optional[str]) -> str:
+    """``"1:05"`` / ``"1:02:03"`` -> ``"65s"`` / ``"3723s"``; ``"?s"`` when unknown."""
+    if not duration:
+        return "?s"
+    try:
+        total = 0
+        for part in duration.split(":"):
+            total = total * 60 + int(part)
+        return f"{total}s"
+    except ValueError:
+        return "?s"
+
+
+async def _inbound_log_preview(event) -> str:
+    """Text for the ``inbound message: ... msg=%r`` log line.
+
+    A voice note arrives with no text (Telegram: ``''``; Discord: the
+    empty-content placeholder), so the inbound line used to be
+    indistinguishable from an empty message for anyone pairing inbound lines
+    with replies (ace-inbound-watch, journals). Voice renders as
+    ``[voice 12s]`` plus any real caption; the transcript outcome is logged
+    later as ``stt: chat=<c> ...`` / ``stt FAILED: chat=<c> ...``.
+    """
+    text = getattr(event, "text", None) or ""
+    media_urls = getattr(event, "media_urls", None) or []
+    voice_paths = [p for i, p in enumerate(media_urls) if _event_media_is_stt_input(event, i)]
+    if not voice_paths and getattr(event, "message_type", None) != MessageType.VOICE:
+        return text[:80].replace("\n", " ")
+    duration = None
+    if voice_paths:
+        try:
+            duration = await asyncio.wait_for(
+                _probe_audio_duration(os.path.abspath(voice_paths[0])),
+                timeout=_VOICE_LOG_PROBE_TIMEOUT_S,
+            )
+        except Exception:
+            duration = None
+    label = f"[voice {_duration_label_seconds(duration)}]"
+    caption = "" if text.strip() == _EMPTY_CONTENT_PLACEHOLDER else text
+    if caption.strip():
+        label = f"{label} {caption}"
+    return label[:80].replace("\n", " ")
 
 
 def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
@@ -24717,10 +24772,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
             if audio_paths:
-                message_text, _successful_transcripts = await self._enrich_message_with_transcription(
-                    message_text,
-                    audio_paths,
-                )
+                _stt_chat_token = _STT_LOG_CHAT.set(str(getattr(source, "chat_id", None) or "unknown"))
+                try:
+                    message_text, _successful_transcripts = await self._enrich_message_with_transcription(
+                        message_text,
+                        audio_paths,
+                    )
+                finally:
+                    _STT_LOG_CHAT.reset(_stt_chat_token)
                 # Echo each successful transcript back to the user immediately
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
@@ -25435,7 +25494,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # like normal work rather than cancel it.
         self._clear_pending_boot_resume(_quick_key)
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _msg_preview = await _inbound_log_preview(event)
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         # Internal/synthetic events (boot auto-resume, continuations) are not
@@ -32442,6 +32501,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_text:   The user's original caption / message text.
             audio_paths: List of local file paths to cached audio files.
 
+        Every clip logs one INFO outcome line keyed on the chat in
+        ``_STT_LOG_CHAT`` (set by the caller): ``stt: chat=<c> transcribed N
+        chars in Ts: '<head>'`` or ``stt FAILED: chat=<c> after Ts: <why>``.
+        These pair with the ``[voice Ns]`` inbound line for log readers.
+
         Returns:
             A tuple of ``(enriched_text, successful_transcripts)``:
               - ``enriched_text``: the message string with transcription wrappers
@@ -32453,7 +32517,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         seen = set()
         audio_paths = [p for p in audio_paths if p not in seen and not seen.add(p)]
+        _stt_chat = _STT_LOG_CHAT.get()
+
+        def _stt_failed(why: str, started: float) -> None:
+            logger.info(
+                "stt FAILED: chat=%s after %.1fs: %s",
+                _stt_chat, time.monotonic() - started, why,
+            )
+
         if not getattr(self.config, "stt_enabled", True):
+            for _ in audio_paths:
+                _stt_failed("stt disabled in config", time.monotonic())
             notes = []
             for path in audio_paths:
                 abs_path = os.path.abspath(path)
@@ -32481,6 +32555,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except ModuleNotFoundError as e:
             logger.error("Transcription module unavailable: %s", e)
+            for _ in audio_paths:
+                _stt_failed(f"transcription module unavailable: {e}", time.monotonic())
             unavailable_note = "[voice message could not be transcribed]"
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
@@ -32492,6 +32568,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enriched_parts = []
         successful_transcripts: List[str] = []
         for path in audio_paths:
+            _stt_started = time.monotonic()
             try:
                 logger.debug("Transcribing user voice: %s", path)
                 result = await asyncio.to_thread(
@@ -32516,6 +32593,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # agent reply to nothing and can loop, so that case gets a
                     # clear sentinel note instead (#41603).
                     if not (transcript or "").strip():
+                        _stt_failed("empty transcript (silence/inaudible)", _stt_started)
                         enriched_parts.append(
                             "[The user sent a voice message but it came through "
                             "empty or inaudible — speech-to-text returned no "
@@ -32524,6 +32602,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         continue
                     successful_transcripts.append(transcript)
+                    logger.info(
+                        "stt: chat=%s transcribed %d chars in %.1fs: %r",
+                        _stt_chat, len(transcript), time.monotonic() - _stt_started,
+                        transcript[:60].replace("\n", " "),
+                    )
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's
                     # what they said: ...") read as a meta-instruction and made
@@ -32542,6 +32625,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # logged for operator diagnosis but kept out of the
                     # LLM-visible prompt.
                     logger.info("Voice transcription failed for %s: %s", path, error)
+                    _stt_failed(str(error)[:200], _stt_started)
                     from tools.credential_files import to_agent_visible_cache_path
 
                     agent_path = to_agent_visible_cache_path(os.path.abspath(path))
@@ -32551,6 +32635,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             except Exception as e:
                 logger.error("Transcription error: %s", e)
+                _stt_failed(f"{type(e).__name__}: {e}"[:200], _stt_started)
                 from tools.credential_files import to_agent_visible_cache_path
 
                 agent_path = to_agent_visible_cache_path(os.path.abspath(path))
@@ -32602,10 +32687,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return user_text if user_text is not None else (getattr(event, "text", None) or None), []
 
         text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-        enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
-            text,
-            audio_paths,
+        _stt_chat_token = _STT_LOG_CHAT.set(
+            str(getattr(getattr(event, "source", None), "chat_id", None) or "unknown")
         )
+        try:
+            enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
+                text,
+                audio_paths,
+            )
+        finally:
+            _STT_LOG_CHAT.reset(_stt_chat_token)
         setattr(event, "_gateway_pending_stt_text", enriched_text)
         setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
         return enriched_text, successful_transcripts
