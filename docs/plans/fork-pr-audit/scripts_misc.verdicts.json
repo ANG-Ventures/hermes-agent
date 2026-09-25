@@ -92,7 +92,7 @@
     "verdict": "KEEP"
   },
   "#116": {
-    "branch": null,
+    "branch": "audit/scripts_misc/revert-mem0-bgr",
     "evidence": {
       "cost": {
         "conflict_files": 4,
@@ -105,12 +105,12 @@
       "upstream_fix": "none",
       "upstream_state": "n/a (fleet-only)"
     },
-    "notes": "Dark since merge (#118 already reported 0 production rows); still dark after #118. eval/ files have no reader. Revert branch attempted via git revert; see branch field. | branch NOT built: reverse-apply leaves conflicts in ['toolsets.py']; #118: apply -R --3way rc=1 Applied patch to 'toolsets.py' with conflicts.\nApplied patch to 'tests/plugins/memory/test_mem0_remember.py' cleanly.\nU toolsets.py | #116: apply -R --3way rc=1 conflicts.\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nApplied patch to 'agent/background_review.py' with conflicts. | run 2: git revert on origin/main conflicts (#116: agent/background_review.py, plugins/memory/mem0/__init__.py + 3 tests; #118: toolsets.py). mem0_remember is still resident at toolsets.py:68. Reverting #118 alone would be a half-revert, so no branch. Hand-revert is for the agent/plugins auditor.",
+    "notes": "Dark since merge (#118 already reported 0 production rows); still dark after #118. eval/ files have no reader. Revert branch attempted via git revert; see branch field. | branch NOT built: reverse-apply leaves conflicts in ['toolsets.py']; #118: apply -R --3way rc=1 Applied patch to 'toolsets.py' with conflicts.\nApplied patch to 'tests/plugins/memory/test_mem0_remember.py' cleanly.\nU toolsets.py | #116: apply -R --3way rc=1 conflicts.\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nApplied patch to 'agent/background_review.py' with conflicts. | run 2: git revert on origin/main conflicts (#116: agent/background_review.py, plugins/memory/mem0/__init__.py + 3 tests; #118: toolsets.py). mem0_remember is still resident at toolsets.py:68. Reverting #118 alone would be a half-revert, so no branch. Hand-revert is for the agent/plugins auditor. | run 3 (t_4f1b06ad): branch audit/scripts_misc/revert-mem0-bgr @ 9c09f9e1d8. hand revert off origin/main a09ec2ea99 (15 files, +7/-1764): removed tools/mem0_remember_tool.py, mem0_remember from toolsets.py _HERMES_CORE_TOOLS, agent/background_review.py hooks (_MEMORY_REVIEW_MEM0_CLAUSE, whitelist add, flag-on tool reminder, summary branch), mem0 plugin REMEMBER_SCHEMA/_dedup_norm_hash/_dedup_cosine_band/_dedup_then_write/_auto_capture_active/handle_tool_call branch, eval/, tests/plugins/memory/test_mem0_remember.py, tests/run_agent/test_background_review_mem0_e2e.py and the flag-only tests in test_background_review{,_summary,_toolset_restriction}.py. KEPT _dedup_candidate_k/_dedup_embed/_dedup_cos (recall rerank + contradiction lookup) and search_meta_filtered (capture_idem reconcile). `pytest -o addopts='' tests/plugins/memory tests/run_agent/test_background_review.py tests/run_agent/test_background_review_summary.py tests/run_agent/test_background_review_toolset_restriction.py tests/run_agent/test_background_review_cache_parity.py` -> 570 passed in 54.69s; `pytest tests/test_toolsets.py` -> 25 passed in 2.76s. memory.background_review_mem0_write in ~/.hermes/config.yaml left alone (live-tree state, out of scope)",
     "problem": "background-review fork can persist user facts to mem0 via mem0_remember (+eval/ artifacts)",
     "verdict": "DROP"
   },
   "#118": {
-    "branch": null,
+    "branch": "audit/scripts_misc/revert-mem0-bgr",
     "evidence": {
       "cost": {
         "conflict_files": 1,
@@ -123,7 +123,7 @@
       "upstream_fix": "none",
       "upstream_state": "n/a (fleet-only)"
     },
-    "notes": "branch NOT built: reverse-apply leaves conflicts in ['toolsets.py']; #118: apply -R --3way rc=1 Applied patch to 'toolsets.py' with conflicts.\nApplied patch to 'tests/plugins/memory/test_mem0_remember.py' cleanly.\nU toolsets.py | #116: apply -R --3way rc=1 conflicts.\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nApplied patch to 'agent/background_review.py' with conflicts. | run 2: git revert on origin/main conflicts (#116: agent/background_review.py, plugins/memory/mem0/__init__.py + 3 tests; #118: toolsets.py). mem0_remember is still resident at toolsets.py:68. Reverting #118 alone would be a half-revert, so no branch. Hand-revert is for the agent/plugins auditor.",
+    "notes": "branch NOT built: reverse-apply leaves conflicts in ['toolsets.py']; #118: apply -R --3way rc=1 Applied patch to 'toolsets.py' with conflicts.\nApplied patch to 'tests/plugins/memory/test_mem0_remember.py' cleanly.\nU toolsets.py | #116: apply -R --3way rc=1 conflicts.\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nApplied patch to 'agent/background_review.py' with conflicts. | run 2: git revert on origin/main conflicts (#116: agent/background_review.py, plugins/memory/mem0/__init__.py + 3 tests; #118: toolsets.py). mem0_remember is still resident at toolsets.py:68. Reverting #118 alone would be a half-revert, so no branch. Hand-revert is for the agent/plugins auditor. | run 3 (t_4f1b06ad): branch audit/scripts_misc/revert-mem0-bgr @ 9c09f9e1d8. hand revert off origin/main a09ec2ea99 (15 files, +7/-1764): removed tools/mem0_remember_tool.py, mem0_remember from toolsets.py _HERMES_CORE_TOOLS, agent/background_review.py hooks (_MEMORY_REVIEW_MEM0_CLAUSE, whitelist add, flag-on tool reminder, summary branch), mem0 plugin REMEMBER_SCHEMA/_dedup_norm_hash/_dedup_cosine_band/_dedup_then_write/_auto_capture_active/handle_tool_call branch, eval/, tests/plugins/memory/test_mem0_remember.py, tests/run_agent/test_background_review_mem0_e2e.py and the flag-only tests in test_background_review{,_summary,_toolset_restriction}.py. KEPT _dedup_candidate_k/_dedup_embed/_dedup_cos (recall rerank + contradiction lookup) and search_meta_filtered (capture_idem reconcile). `pytest -o addopts='' tests/plugins/memory tests/run_agent/test_background_review.py tests/run_agent/test_background_review_summary.py tests/run_agent/test_background_review_toolset_restriction.py tests/run_agent/test_background_review_cache_parity.py` -> 570 passed in 54.69s; `pytest tests/test_toolsets.py` -> 25 passed in 2.76s. memory.background_review_mem0_write in ~/.hermes/config.yaml left alone (live-tree state, out of scope)",
     "problem": "mem0_remember not resident in tools[] so background review could never call it",
     "verdict": "DROP"
   },
@@ -295,7 +295,7 @@
     "verdict": "DROP"
   },
   "#268": {
-    "branch": null,
+    "branch": "audit/scripts_misc/revert-livesync",
     "evidence": {
       "cost": {
         "conflict_files": 6,
@@ -310,12 +310,12 @@
       "upstream_fix": "none",
       "upstream_state": "n/a: upstream has no session.changes method and upstream desktop has no consumer"
     },
-    "notes": "Largest-cost DROP in the tranche (6 conflict files, 3 syncs: hermes_state.py, tui_gateway/server.py, web_server.py, config.py). | branch NOT built: reverse-apply leaves conflicts in ['hermes_cli/config.py', 'hermes_state.py', 'tui_gateway/server.py']; #268: apply -R --3way rc=1 Applied patch to 'tui_gateway/server.py' with conflicts.\nApplied patch to 'hermes_state.py' with conflicts.\nApplied patch to 'hermes_cli/web_server.py' cleanly.\nApplied patch to 'hermes_cli/config.py' with conflicts.\nU hermes_cli/config.py\nU hermes_state.py\nU tui_gateway/server.py | run 2: scripts part is covered by audit/scripts_misc/revert-livesync-probes. The rest (hermes_state.py, tui_gateway/server.py, hermes_cli/config.py, desktop D9) conflicts in 10 files on git revert and is product code. Hand-revert belongs to the hermes_cli/gateway auditors; no branch here.",
+    "notes": "Largest-cost DROP in the tranche (6 conflict files, 3 syncs: hermes_state.py, tui_gateway/server.py, web_server.py, config.py). | branch NOT built: reverse-apply leaves conflicts in ['hermes_cli/config.py', 'hermes_state.py', 'tui_gateway/server.py']; #268: apply -R --3way rc=1 Applied patch to 'tui_gateway/server.py' with conflicts.\nApplied patch to 'hermes_state.py' with conflicts.\nApplied patch to 'hermes_cli/web_server.py' cleanly.\nApplied patch to 'hermes_cli/config.py' with conflicts.\nU hermes_cli/config.py\nU hermes_state.py\nU tui_gateway/server.py | run 2: scripts part is covered by audit/scripts_misc/revert-livesync-probes. The rest (hermes_state.py, tui_gateway/server.py, hermes_cli/config.py, desktop D9) conflicts in 10 files on git revert and is product code. Hand-revert belongs to the hermes_cli/gateway auditors; no branch here. | run 3 (t_4f1b06ad): branch audit/scripts_misc/revert-livesync @ b0c914c479. hand revert off origin/main a09ec2ea99 (9 files, +21/-841): removed session.changes RPC, _load_session_sync_config, _SESSION_* consts, dashboard.session_sync default (hermes_cli/config_defaults.py), /api/status capabilities+session_sync block with _coerce_status_float/_dashboard_session_sync_status_config, SessionDB.get_messages_after, tests/tui_gateway/test_session_changes.py, scripts/livesync-{a1-watch,derive-tsilence,rc1-probe}.py. KEPT idx_messages_session_id (other users: get_messages_around, session_lifecycle_statuses, tests/test_hermes_state_{messages,search}.py, upstream hermes_state_messages.py), the id/tool_call_id fields in _history_to_messages (general resume payload; tests/test_tui_gateway_server.py asserts tool_call_id), and _log_dashboard_state_db_path (its test moved to tests/hermes_cli/test_dashboard_state_db_log.py). `git grep -e session_sync -e 'session\\.changes' -e get_messages_after -- ':!docs' ':!website' ':!native'` -> rc=1; `pytest -o addopts='' tests/test_hermes_state_messages.py tests/test_hermes_state_search.py tests/hermes_cli/test_dashboard_state_db_log.py` -> 293 passed in 46.61s; `pytest tests/test_tui_gateway_server.py -k history_to_messages` -> 14 passed, 658 deselected",
     "problem": "cross-surface live session sync phase 1: server session.changes polling + desktop consumer",
     "verdict": "DROP"
   },
   "#272": {
-    "branch": "audit/scripts_misc/revert-livesync-probes",
+    "branch": "audit/scripts_misc/revert-livesync",
     "evidence": {
       "cost": {
         "conflict_files": 0,
@@ -330,7 +330,7 @@
       "upstream_fix": "none",
       "upstream_state": "n/a (fleet-only)"
     },
-    "notes": "branch NOT built: reverse-apply leaves conflicts in ['hermes_cli/config.py', 'hermes_state.py', 'tui_gateway/server.py']; #268: apply -R --3way rc=1 Applied patch to 'tui_gateway/server.py' with conflicts.\nApplied patch to 'hermes_state.py' with conflicts.\nApplied patch to 'hermes_cli/web_server.py' cleanly.\nApplied patch to 'hermes_cli/config.py' with conflicts.\nU hermes_cli/config.py\nU hermes_state.py\nU tui_gateway/server.py | run 2: branch built by deleting the 3 scripts (git revert conflicts because later edits touched rc1-probe). Verify: `git grep -e livesync-a1-watch -e livesync-derive-tsilence -e livesync-rc1-probe` on branch -> rc=1 (no refs left); commit 3 files, -444.",
+    "notes": "branch NOT built: reverse-apply leaves conflicts in ['hermes_cli/config.py', 'hermes_state.py', 'tui_gateway/server.py']; #268: apply -R --3way rc=1 Applied patch to 'tui_gateway/server.py' with conflicts.\nApplied patch to 'hermes_state.py' with conflicts.\nApplied patch to 'hermes_cli/web_server.py' cleanly.\nApplied patch to 'hermes_cli/config.py' with conflicts.\nU hermes_cli/config.py\nU hermes_state.py\nU tui_gateway/server.py | run 2: branch built by deleting the 3 scripts (git revert conflicts because later edits touched rc1-probe). Verify: `git grep -e livesync-a1-watch -e livesync-derive-tsilence -e livesync-rc1-probe` on branch -> rc=1 (no refs left); commit 3 files, -444. | run 3 (t_4f1b06ad): branch audit/scripts_misc/revert-livesync @ b0c914c479. server/state/config parts now reverted too (scripts also on revert-livesync-probes). hand revert off origin/main a09ec2ea99 (9 files, +21/-841): removed session.changes RPC, _load_session_sync_config, _SESSION_* consts, dashboard.session_sync default (hermes_cli/config_defaults.py), /api/status capabilities+session_sync block with _coerce_status_float/_dashboard_session_sync_status_config, SessionDB.get_messages_after, tests/tui_gateway/test_session_changes.py, scripts/livesync-{a1-watch,derive-tsilence,rc1-probe}.py. KEPT idx_messages_session_id (other users: get_messages_around, session_lifecycle_statuses, tests/test_hermes_state_{messages,search}.py, upstream hermes_state_messages.py), the id/tool_call_id fields in _history_to_messages (general resume payload; tests/test_tui_gateway_server.py asserts tool_call_id), and _log_dashboard_state_db_path (its test moved to tests/hermes_cli/test_dashboard_state_db_log.py). `git grep -e session_sync -e 'session\\.changes' -e get_messages_after -- ':!docs' ':!website' ':!native'` -> rc=1; `pytest -o addopts='' tests/test_hermes_state_messages.py tests/test_hermes_state_search.py tests/hermes_cli/test_dashboard_state_db_log.py` -> 293 passed in 46.61s; `pytest tests/test_tui_gateway_server.py -k history_to_messages` -> 14 passed, 658 deselected",
     "problem": "livesync RC-1 probe + t_silence derivation scripts",
     "verdict": "DROP"
   },
@@ -498,7 +498,7 @@
     "verdict": "DROP"
   },
   "#695": {
-    "branch": null,
+    "branch": "audit/scripts_misc/upstream-695",
     "evidence": {
       "cost": {
         "conflict_files": 0,
@@ -511,7 +511,7 @@
       "upstream_fix": "none",
       "upstream_state": "read-only: ../up/ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts lacks the act()/IS_REACT_ACT_ENVIRONMENT settle (fork diff +57/-33)"
     },
-    "notes": "branch NOT built: cherry-pick of #695 conflicts on upstream/main in ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts (fork file carries other fork deltas); needs a hand port + vitest run with ui-tui node_modules",
+    "notes": "branch NOT built: cherry-pick of #695 conflicts on upstream/main in ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts (fork file carries other fork deltas); needs a hand port + vitest run with ui-tui node_modules | run 3 (t_4f1b06ad): branch audit/scripts_misc/upstream-695 @ 830f68a5dc. hand port off upstream/main 5307e93252 (1 file, +57/-33): act()/IS_REACT_ACT_ENVIRONMENT settle for 'ignores stale unmount measurement...' and 'corrects and compensates a same-layout row measured at unmount'. Upstream still has the flaky shape (wall-clock delay(50)/delay(400) settle, 'Generous settle windows' comment), so NOT superseded. ui-tui deps via `npm ci -w ui-tui -w ui-tui/packages/hermes-ink`, hermes-ink built with esbuild. `vitest run src/__tests__/virtualHistoryOffsetCache.test.ts`: pristine upstream -> 17 passed x3 sequential + 6/6 under 6x concurrency; ported -> 17 passed x3 sequential + 6/6 under 6x concurrency. The merge-queue red was NOT reproduced locally on either tree, so the port removes the timing dependency rather than a locally reproduced failure. No upstream PR opened; the commit message does not mention the fork",
     "problem": "virtualHistoryOffsetCache unmount-compensation test flaky in merge queue (act()/deferred rows)",
     "verdict": "UPSTREAM"
   },
