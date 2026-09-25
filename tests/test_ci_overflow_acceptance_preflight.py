@@ -103,6 +103,6 @@ def test_host_errors_do_not_pass(monkeypatch):
 
 def test_unimplemented_subcommands_exit_two():
     import subprocess
-    for action in ("integration", "caches", "verify-run"):
+    for action in ("caches", "verify-run"):
         proc = subprocess.run(["python3", str(MODULE), action], capture_output=True, text=True)
         assert proc.returncode == 2 and "not implemented" in proc.stderr

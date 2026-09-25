@@ -1,0 +1,254 @@
+{
+  "checks": [
+    {
+      "evidence": {
+        "e2e_if": "always() && !cancelled() && needs.generate.result == 'success'",
+        "problems": [],
+        "test_if": "always() && !cancelled() && needs.generate.result == 'success'"
+      },
+      "name": "fallback_predicate_static",
+      "reason": "",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "unbound_consumers": [
+          "test.strategy.matrix",
+          "e2e.runs-on"
+        ]
+      },
+      "name": "ac3_plan_bound_to_current_attempt",
+      "reason": "placement outputs consumed without a github.run_attempt binding: ['test.strategy.matrix', 'e2e.runs-on']",
+      "status": "BLOCK"
+    },
+    {
+      "evidence": {
+        "attempt2_request_artifacts": [],
+        "executed": [
+          "Python tests / Run tests b"
+        ],
+        "head_sha": "20669cff7ec172aaff35d1be184a194af5d8b7c9",
+        "planners_reused": [
+          "Python tests / Generate slices",
+          "Python tests / Placement"
+        ],
+        "reused": [
+          "Python tests / Generate slices",
+          "Python tests / Run tests a",
+          "Python tests / Placement"
+        ],
+        "run_url": "https://github.com/ANG-Ventures/hermes-agent/actions/runs/35966312383",
+        "stale_executions": [
+          {
+            "executing_attempt": 2,
+            "job": "Python tests / Run tests b",
+            "planned_attempt": 1
+          }
+        ]
+      },
+      "name": "ac3_selective_rerun_stale_plan",
+      "reason": "BLOCK ACTIVATION: selective re-run executed hosted work under the prior attempt's plan; generate/placement were reused, so no fresh request/reservation exists for the new attempt",
+      "status": "BLOCK"
+    },
+    {
+      "evidence": {
+        "controller_path": "cioc/service.py admit(): producer ok -> no artifact -> no-request",
+        "producer_listed_in_rerun": true,
+        "request_artifact_for_rerun_attempt": false
+      },
+      "name": "ac3_selective_rerun_fresh_reservation",
+      "reason": "re-run attempt lists a reused producer success but can never carry its own request artifact: the controller cannot reserve for it and reconciliation never sees it",
+      "status": "BLOCK"
+    },
+    {
+      "evidence": {
+        "attempt": 3,
+        "note": "GitHub-side half only: controller fresh reservation is exercised under ac3_live_*",
+        "slices": [
+          {
+            "executing": 3,
+            "job": "Python tests / Run tests a",
+            "planned": 3
+          },
+          {
+            "executing": 3,
+            "job": "Python tests / Run tests b",
+            "planned": 3
+          }
+        ]
+      },
+      "name": "ac3_full_rerun_regenerates_plan",
+      "reason": "",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "http": 200,
+        "total_count": 15
+      },
+      "name": "ac2_app_reads_runners",
+      "reason": "",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "patch_http": {
+          "CI_SELF_HOSTED_SLOTS": 403,
+          "CI_SELF_HOSTED_SLOTS_BASELINE": 403
+        }
+      },
+      "name": "ac3_no_k_baseline_writes_identity",
+      "reason": "",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "disposable_branch_deleted": true,
+        "writer_http": {
+          "A": 200,
+          "B": 409
+        }
+      },
+      "name": "ac2_cas_two_writers",
+      "reason": "",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "ledger_head_after": "2fc08d73e93ad533675382f92ce9af19bab1745e",
+        "ledger_head_before": "2fc08d73e93ad533675382f92ce9af19bab1745e",
+        "push_rejected_by_ruleset": true,
+        "rest_patch_http": 422,
+        "run_url": "https://github.com/ANG-Ventures/hermes-agent/actions/runs/35966644254"
+      },
+      "name": "ac2_ledger_rejects_github_token",
+      "reason": "",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "managed_lane_secret_refs": {
+          "ci.yaml": [],
+          "tests.yml": []
+        },
+        "ref": "a3cee86280784c55c15d8f9b6847265d92bef74f",
+        "run_hits": [],
+        "scanned": {
+          "artifact_files": 2,
+          "log_files": 499
+        },
+        "scanned_run": 35964456275,
+        "secret_stores": {
+          "environments": {
+            "gh-image": [],
+            "trusted-automation": []
+          },
+          "org": 0,
+          "repo": [
+            "AUTOFIX_BOT_PAT",
+            "CI_FAIL_WEBHOOK_SECRET"
+          ]
+        },
+        "unexpected_secrets": [],
+        "workflow_hits": []
+      },
+      "name": "ac2_controller_identity_absent_from_actions",
+      "reason": "",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "event": "pull_request",
+        "jobs_on_forced_local_labels": [],
+        "label_sets": [
+          "self-hosted,hermes-ci",
+          "ubuntu-24.04-arm",
+          "ubuntu-latest"
+        ],
+        "placement": [
+          "skipped"
+        ],
+        "run_url": "https://github.com/ANG-Ventures/hermes-agent/actions/runs/35964456275",
+        "test_jobs": 16
+      },
+      "name": "fallback_pr_ci_original_matrix",
+      "reason": "",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "needs": "two real merge_group runs contending for a disposable allowance"
+      },
+      "name": "ac3_live_contention_ceiling",
+      "reason": "P2b placement wiring is not on main (no merge_group run can carry a plan) and the controller service is disabled; re-run on the amended build",
+      "status": "UNVERIFIABLE"
+    },
+    {
+      "evidence": {
+        "needs": "cancel after admission + retry, ledger shows one charge"
+      },
+      "name": "ac3_live_cancel_retry_no_double_charge",
+      "reason": "P2b placement wiring is not on main (no merge_group run can carry a plan) and the controller service is disabled; re-run on the amended build",
+      "status": "UNVERIFIABLE"
+    },
+    {
+      "evidence": {
+        "needs": "outstanding admission carried across a UTC date"
+      },
+      "name": "ac3_live_utc_rollover_carry",
+      "reason": "P2b placement wiring is not on main (no merge_group run can carry a plan) and the controller service is disabled; re-run on the amended build",
+      "status": "UNVERIFIABLE"
+    },
+    {
+      "evidence": {
+        "needs": "controller writes a new attempt row on full re-run"
+      },
+      "name": "ac3_live_full_rerun_fresh_reservation",
+      "reason": "P2b placement wiring is not on main (no merge_group run can carry a plan) and the controller service is disabled; re-run on the amended build",
+      "status": "UNVERIFIABLE"
+    },
+    {
+      "evidence": {
+        "needs": "forced placement timeout -> terminal -> \u00a75.3a release <= 5 min"
+      },
+      "name": "ac3_live_timeout_terminal_release",
+      "reason": "P2b placement wiring is not on main (no merge_group run can carry a plan) and the controller service is disabled; re-run on the amended build",
+      "status": "UNVERIFIABLE"
+    },
+    {
+      "evidence": {
+        "needs": "executed/delayed/ambiguous hosted jobs stay charged"
+      },
+      "name": "ac3_live_executed_delayed_ambiguous_charged",
+      "reason": "P2b placement wiring is not on main (no merge_group run can carry a plan) and the controller service is disabled; re-run on the amended build",
+      "status": "UNVERIFIABLE"
+    },
+    {
+      "evidence": {
+        "needs": "missing/corrupt ledger -> no cloud + page"
+      },
+      "name": "ac3_live_missing_corrupt_ledger",
+      "reason": "P2b placement wiring is not on main (no merge_group run can carry a plan) and the controller service is disabled; re-run on the amended build",
+      "status": "UNVERIFIABLE"
+    },
+    {
+      "evidence": {
+        "needs": "pool-offline + budget-exhausted delivered to #alerts, retry, dedupe, #logs recovery"
+      },
+      "name": "ac4_pages_delivered",
+      "reason": "P2b placement wiring is not on main (no merge_group run can carry a plan) and the controller service is disabled; re-run on the amended build",
+      "status": "UNVERIFIABLE"
+    },
+    {
+      "evidence": {
+        "needs": "placement exception/timeout/cancel + controller outage -> all local on a real merge_group"
+      },
+      "name": "fallback_live_placement_failures",
+      "reason": "P2b placement wiring is not on main (no merge_group run can carry a plan) and the controller service is disabled; re-run on the amended build",
+      "status": "UNVERIFIABLE"
+    }
+  ],
+  "observed_at_utc": "2026-09-24T07:09:38.496817+00:00",
+  "repo": "ANG-Ventures/hermes-agent",
+  "schema_version": 1
+}
