@@ -874,7 +874,7 @@ VISION_ANALYZE_SCHEMA = {
         "properties": {
             "image_url": {
                 "type": "string",
-                "description": "Image URL (http/https), local file path, or data: URL to load."
+                "description": "Image URL (http/https), local file path, or data: URL to load. Pass a local file path here directly (aliases path/image_path/file_path are also accepted)."
             },
             "question": {
                 "type": "string",
@@ -912,7 +912,17 @@ def _configured_aux_model(sections: tuple, env_vars: tuple) -> Optional[str]:
 
 
 async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
-    image_url, question, region = args.get("image_url", ""), args.get("question", ""), args.get("region")
+    # ``image_url`` also accepts local file paths and data: URLs, so a model
+    # passing ``path`` / ``image_path`` / ``file_path`` for a local screenshot
+    # is not wrong. Accept those aliases; the canonical name wins if both are set.
+    image_url = (
+        args.get("image_url")
+        or args.get("path")
+        or args.get("image_path")
+        or args.get("file_path")
+        or ""
+    )
+    question, region = args.get("question", ""), args.get("region")
     task_id = kw.get("task_id")
     # No concurrency gate around the whole analysis — the CPU burst is bounded inside the
     # encode/resize step, so multi-image fan-out keeps full request concurrency.
