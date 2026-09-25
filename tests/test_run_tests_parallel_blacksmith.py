@@ -124,3 +124,17 @@ def test_workflow_binds_variable_event_and_same_repo():
         assert flag in step["run"]
     # Membership never changes: every slice still takes its label from the matrix.
     assert jobs["test"]["runs-on"] == "${{ fromJSON(matrix.slice.runs_on) }}"
+
+
+def test_blacksmith_is_reachable_only_through_tests_yml():
+    """The host controller and spend monitor (hermes-home scripts/ci-placement.py
+    BS_WORKFLOWS) scan only ci.yaml runs for Blacksmith minutes, because tests.yml
+    (called from ci.yaml) is the one place a blacksmith label can come from. A new use
+    site must add its caller workflow to BS_WORKFLOWS, or spend goes uncounted."""
+    wf = ROOT / ".github/workflows"
+    users = sorted(p.name for p in wf.glob("*.y*ml")
+                   if "blacksmith" in p.read_text(encoding="utf-8").lower())
+    assert users == ["tests.yml"]
+    callers = sorted(p.name for p in wf.glob("*.y*ml")
+                     if "./.github/workflows/tests.yml" in p.read_text(encoding="utf-8"))
+    assert callers == ["ci.yaml"]
