@@ -522,8 +522,46 @@ def _resolve_self_hosted_slots(raw: str | None) -> int | None:
     return value
 
 
-def _route_arm_slices(matrix: dict, raw_count: str | None, repo_root: Path) -> None:
-    """Opt in the lightest non-core slices; invalid counts leave routing alone."""
+def _resolve_x64_hosted_min(raw: str | None) -> int | None:
+    """Normalize ``--x64-hosted-min``; ``None`` keeps the legacy ARM trial.
+
+    Empty/unset, non-integer and negative all mean "no floor" and fall back to
+    the legacy lightest-N selection, so ``CI_X64_HOSTED_MIN=off`` is the
+    rollback for arm-first routing.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        value = -1
+    if value < 0:
+        print(
+            f"warning: --x64-hosted-min {raw!r} is not a non-negative integer; "
+            "using the legacy --arm-hosted-slices selection",
+            file=sys.stderr,
+        )
+        return None
+    return value
+
+
+def _route_arm_slices(
+    matrix: dict,
+    raw_count: str | None,
+    repo_root: Path,
+    raw_x64_min: str | None = None,
+) -> None:
+    """Route eligible slices to ``ubuntu-24.04-arm``.
+
+    ``raw_count`` unset/0/invalid disables ARM entirely (the kill switch).
+    Without an x64 floor, the N lightest non-core slices move to ARM from
+    either venue (the original trial). With ``raw_x64_min`` = M, routing is
+    arm-first: every GitHub-hosted non-core slice moves to ARM except that at
+    least M hosted slices stay x64 as arch canaries — the count is taken after
+    the self-hosted cap, so no ``CI_SELF_HOSTED_SLOTS`` value the placement
+    controller writes can remove them. Self-hosted slices are never moved.
+    The heaviest hosted slices go to ARM (faster there); the lightest stay x64.
+    """
     try:
         count = int(raw_count or 0)
     except ValueError:
@@ -542,7 +580,15 @@ def _route_arm_slices(matrix: dict, raw_count: str | None, repo_root: Path) -> N
             continue
         weight = sum(durations.get(f, 2.0) for f in files)
         candidates.append((weight, slice_["index"], slice_))
-    for _, _, slice_ in sorted(candidates, key=lambda item: item[:2])[:count]:
+    x64_min = _resolve_x64_hosted_min(raw_x64_min)
+    if x64_min is None:
+        chosen = sorted(candidates, key=lambda item: item[:2])[:count]
+    else:
+        hosted = [s for s in matrix["slice"] if s["runs_on"] == _HOSTED_RUNNER_LABELS]
+        budget = max(0, len(hosted) - x64_min)
+        eligible = [c for c in candidates if c[2]["runs_on"] == _HOSTED_RUNNER_LABELS]
+        chosen = sorted(eligible, key=lambda item: (-item[0], item[1]))[:budget]
+    for _, _, slice_ in chosen:
         slice_["runs_on"] = '["ubuntu-24.04-arm"]'
 
 
@@ -1411,6 +1457,17 @@ def main() -> int:
         help="Route the N lightest non-core slices to ubuntu-24.04-arm (default 0).",
     )
     parser.add_argument(
+        "--x64-hosted-min",
+        metavar="M",
+        default=None,
+        help=(
+            "Arm-first routing: with --arm-hosted-slices > 0, move every "
+            "GitHub-hosted non-core slice to ubuntu-24.04-arm except M, which "
+            "stay x64 as canaries. Unset/invalid keeps the lightest-N trial. "
+            "Env/CI source: vars.CI_X64_HOSTED_MIN (workflow default 2)."
+        ),
+    )
+    parser.add_argument(
         "--self-hosted-labels",
         metavar="JSON",
         default=_HOSTED_RUNNER_LABELS,
@@ -1503,6 +1560,7 @@ def main() -> int:
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
+        "--x64-hosted-min",
         "--min-tests", "--strict-noop", "--no-strict-noop",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -1656,7 +1714,9 @@ def main() -> int:
             args.test_scope, repo_root, self_hosted_slots, self_hosted_labels
         )
         if scoped_matrix is not None:
-            _route_arm_slices(scoped_matrix, args.arm_hosted_slices, repo_root)
+            _route_arm_slices(
+                scoped_matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
+            )
             print(
                 f"Test scope: {args.test_scope} + core smoke"
                 f" ({len(scoped_matrix['slice'])} slices)",
@@ -1735,7 +1795,9 @@ def main() -> int:
             f"Test scope: full ({args.generate_slices} slices)",
             file=sys.stderr,
         )
-        _route_arm_slices(matrix, args.arm_hosted_slices, repo_root)
+        _route_arm_slices(
+            matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
+        )
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))
         return 0
