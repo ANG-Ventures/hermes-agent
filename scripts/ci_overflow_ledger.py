@@ -163,9 +163,14 @@ class Ledger:
 
     @staticmethod
     def _compact(state, day):
+        # Fold a terminal row into daily_totals[admitted_on] as soon as that is charge-exact for every
+        # day >= today (_consumed): it stopped carrying (terminal before today), or it only ever
+        # charged its admission day (terminal on admitted_on). Retaining 30 days of ~6 KB rows cannot
+        # fit HARD_LIMIT at merge-queue volume (spec 5.3a amendment, t_e3d085c1). Branch history keeps
+        # the full rows; a terminal attempt is never re-admitted (discovery lists in-progress runs only).
         for key, row in list(state["attempts"].items()):
             terminal = row["terminal_on"]
-            if terminal and (datetime.fromisoformat(day).date() - datetime.fromisoformat(terminal).date()).days >= 30:
+            if terminal and (terminal < day or terminal == row["admitted_on"]):
                 amount = sum(j["reserved_minutes"] for j in row["jobs"] if not j.get("released_unemitted", False))
                 state["daily_totals"][row["admitted_on"]] = state["daily_totals"].get(row["admitted_on"], 0) + amount
                 del state["attempts"][key]
