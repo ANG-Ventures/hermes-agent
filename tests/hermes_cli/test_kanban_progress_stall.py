@@ -3,26 +3,24 @@
 The stall decision rides on the agent's own ``progress_at`` timestamp (stamped
 onto heartbeat events by the worker bridge). The process probe is a veto only.
 
-Probe determinism (t_5457397a): the reclaim/stall POLICY tests still run a REAL
-worker process (so reclaim really terminates it) but feed the probe a
-deterministic ``ps`` table through the ``kb._process_cpu_table`` seam. Waiting
-for the real ``ps`` to read a fresh child as 0.0% is scheduler-dependent -- on
-Linux procps ``pcpu`` is lifetime cputime/elapsed, so a child whose startup
-burned 30 ms needs ~30 s before it rounds to 0.0, far longer on a loaded
-runner -- and it ejected unrelated PRs from the merge queue. The table is still
-parsed by the production ``_cpu_active_in_table``, so the children-never-veto
-rule is exercised for real. The real probe keeps its own integration tests:
-busy process -> active (fail-safe direction, load-immune) and in-flight process
--> idle (skips with the measured reason when the host cannot show idle).
+Probe determinism (t_5457397a, t_46a2f8a1): the reclaim/stall POLICY tests
+still run a REAL worker process (so reclaim really terminates it) but inject a
+deterministic CPU-seconds sampler through the ``kb._process_cpu_seconds`` seam;
+the production delta logic in ``_worker_cpu_active`` still decides. The real
+probe is a delta of psutil ``cpu_times()`` over a short window, NOT procps
+``pcpu`` (lifetime cputime/elapsed on Linux, which read a once-busy stalled
+worker as busy for minutes and a fresh idle child as busy for ~1 s per 1 ms of
+startup CPU). Real-probe integration tests rotate the fault: fresh idle child,
+once-busy-now-blocked child, genuinely busy child.
 """
 import json
-import os
 import socket
 import subprocess
 import sys
 import threading
 import time
 
+import psutil
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -52,63 +50,37 @@ def _reap_in_background(proc):
     return proc
 
 
-class _FakePs:
-    """Deterministic ``ps`` table: every registered pid reads 0.0% CPU."""
+class _FakeCpu:
+    """Deterministic CPU-seconds sampler: registered pids are idle (constant)
+    or busy (advance on every read); anything else is NoSuchProcess."""
 
     def __init__(self):
-        self.rows = []  # (pid, ppid, pcpu)
+        self.pids = {}  # pid -> [cpu_seconds, busy]
         self.reads = 0
 
-    def add(self, pid, ppid=None, pcpu=0.0):
-        self.rows.append((int(pid), int(ppid if ppid is not None else os.getpid()), pcpu))
+    def add(self, pid, busy=False):
+        self.pids[int(pid)] = [1.0, busy]
 
-    def __call__(self):
+    def __call__(self, pid):
         self.reads += 1
-        return "".join(f"{p:>7} {pp:>7} {c:4.1f}\n" for p, pp, c in self.rows)
+        entry = self.pids.get(int(pid))
+        if entry is None:
+            raise psutil.NoSuchProcess(int(pid))
+        if entry[1]:
+            entry[0] += 0.01
+        return entry[0]
 
 
 @pytest.fixture
-def fake_ps(monkeypatch):
-    fake = _FakePs()
-    monkeypatch.setattr(kb, "_process_cpu_table", fake)
+def fake_cpu(monkeypatch):
+    fake = _FakeCpu()
+    monkeypatch.setattr(kb, "_process_cpu_seconds", fake)
+    monkeypatch.setattr(kb, "_CPU_SAMPLE_SECONDS", 0.0)
     return fake
 
 
-def _wait_idle_real(pid, timeout=60.0):
-    """Wait until the REAL probe reads idle on 6 consecutive samples.
-
-    Only the real-probe integration test uses this. A miss caused by the host
-    (``ps`` failing/timing out, or load above the core count) is a SKIP with
-    the measured reason; a miss on an unloaded host with a working ``ps`` is a
-    genuine FAIL (e.g. the probe regressed to always-active).
-    """
-    deadline, streak, probe_errors = time.monotonic() + timeout, 0, []
-    while time.monotonic() < deadline:
-        try:
-            active = kb._cpu_active_in_table(kb._process_cpu_table(), pid)
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            probe_errors.append(type(exc).__name__)
-            active = True
-        streak = 0 if active else streak + 1
-        if streak >= 6:
-            return
-        time.sleep(0.25)
-    load = os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0
-    cores = os.cpu_count() or 1
-    if probe_errors or load > cores:
-        pytest.skip(
-            f"host could not show pid {pid} idle within {timeout:.0f}s: "
-            f"probe errors={sorted(set(probe_errors)) or 'none'} "
-            f"({len(probe_errors)}x), loadavg1={load:.1f} on {cores} cores"
-        )
-    pytest.fail(
-        f"pid {pid} never read idle to the real probe on an unloaded host "
-        f"(loadavg1={load:.1f}, {cores} cores, no probe errors)"
-    )
-
-
-def _in_flight_worker(server, fake_ps=None):
-    """Real process blocked on an in-flight request: 0% CPU, no children."""
+def _in_flight_worker(server, fake_cpu=None):
+    """Real process blocked on an in-flight request: no CPU now, no children."""
     code = (
         "import socket,sys;s=socket.create_connection(('127.0.0.1',int(sys.argv[1])));"
         "s.sendall(b'POST /v1/messages HTTP/1.1\\r\\n\\r\\n');s.recv(1)"
@@ -119,10 +91,8 @@ def _in_flight_worker(server, fake_ps=None):
     conn, _ = server.accept()  # the request is now in flight and never answered
     conn.recv(64)
     _in_flight_worker.conns.append(conn)
-    if fake_ps is None:
-        _wait_idle_real(proc.pid)
-    else:
-        fake_ps.add(proc.pid)
+    if fake_cpu is not None:
+        fake_cpu.add(proc.pid)
     return proc
 
 
@@ -151,10 +121,10 @@ def _count(board, tid, kind):
     ).fetchone()[0]
 
 
-def test_run_7914_shape_stalls_at_15_reclaims_at_25_escalates_after_two(board, monkeypatch, silent_server, fake_ps):
+def test_run_7914_shape_stalls_at_15_reclaims_at_25_escalates_after_two(board, monkeypatch, silent_server, fake_cpu):
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
-    proc = _in_flight_worker(silent_server, fake_ps)
+    proc = _in_flight_worker(silent_server, fake_cpu)
     # Last real progress = the API call start 15 min ago; the wrapper keeps
     # heartbeating (fresh last_heartbeat_at) with that same progress_at.
     tid = _running(board, now, proc.pid, progress_at=now - 900)
@@ -176,7 +146,7 @@ def test_run_7914_shape_stalls_at_15_reclaims_at_25_escalates_after_two(board, m
     assert kb.get_task(board, tid).status == "ready"
     proc.wait(timeout=10)  # the real worker was terminated
     for _ in range(2):
-        again = _in_flight_worker(silent_server, fake_ps)
+        again = _in_flight_worker(silent_server, fake_cpu)
         claimed = kb.claim_task(board, tid)
         board.execute("UPDATE task_runs SET started_at=? WHERE id=?", (now - 1500, claimed.current_run_id))
         board.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (again.pid, tid))
@@ -188,25 +158,62 @@ def test_run_7914_shape_stalls_at_15_reclaims_at_25_escalates_after_two(board, m
     assert board.execute(
         "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND outcome='stalled'", (tid,)
     ).fetchone()[0] == 3
-    assert fake_ps.reads >= 5  # every stall decision consulted the probe veto
+    assert fake_cpu.reads >= 10  # every stall decision consulted the probe veto (2 samples each)
 
 
-def test_real_probe_reads_in_flight_worker_as_idle(silent_server):
-    """Integration proof for the REAL ``ps`` probe: a process blocked on an
-    unanswered request reads idle, exactly like a dead socket. This is why
-    the probe may only veto, never authorize, a reclaim."""
-    proc = _in_flight_worker(silent_server)  # waits on the real probe
+def _real_reads(pid, n=4):
+    return [kb._worker_cpu_active(pid) for _ in range(n)]
+
+
+def test_real_probe_reads_fresh_in_flight_worker_as_idle_at_once(silent_server):
+    """Fault 1, fresh idle child: a just-started process blocked on an
+    unanswered request reads idle immediately -- no waiting out its startup
+    CPU, which lifetime ``pcpu`` needed ~30 s (far more on a loaded runner)
+    to forget. Idle like a dead socket, which is why the probe may only veto."""
+    proc = _in_flight_worker(silent_server)
     try:
+        reads = _real_reads(proc.pid)
+        assert reads[1:] == [False, False, False], reads  # 1st window may catch the send
         assert proc.poll() is None
     finally:
         proc.kill()
 
 
-def test_healthy_in_flight_wait_with_advancing_progress_is_never_reclaimed(board, monkeypatch, silent_server, fake_ps):
+def test_real_probe_reads_once_busy_now_blocked_worker_as_idle(silent_server):
+    """Fault 2, once-busy-now-blocked (the production bug): a worker that
+    burned ~1 s of CPU and then stalled reads idle at once. Lifetime ``pcpu``
+    read this busy for ~1000 s, so it vetoed its own reclaim."""
+    code = (
+        "import socket,sys,time;t=time.process_time()\n"
+        "while time.process_time()-t<1.0: pass\n"
+        "s=socket.create_connection(('127.0.0.1',int(sys.argv[1])))\n"
+        "s.sendall(b'POST /v1/messages HTTP/1.1\\r\\n\\r\\n');s.recv(1)"
+    )
+    port = silent_server.getsockname()[1]
+    proc = _reap_in_background(subprocess.Popen([sys.executable, "-c", code, str(port)]))
+    try:
+        silent_server.settimeout(90)
+        conn, _ = silent_server.accept()  # the burn is over; the child is blocking
+        conn.recv(64)
+        _in_flight_worker.conns.append(conn)
+        assert kb._process_cpu_seconds(proc.pid) >= 0.9  # real CPU history
+        reads = _real_reads(proc.pid)
+        assert reads[1:] == [False, False, False], reads
+    finally:
+        proc.kill()
+
+
+def test_real_probe_exited_pid_reads_idle():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+    assert kb._worker_cpu_active(proc.pid) is False  # NoSuchProcess: nothing to veto
+
+
+def test_healthy_in_flight_wait_with_advancing_progress_is_never_reclaimed(board, monkeypatch, silent_server, fake_cpu):
     """Argus repro: idle-but-in-flight process + advancing progress_at."""
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
-    proc = _in_flight_worker(silent_server, fake_ps)
+    proc = _in_flight_worker(silent_server, fake_cpu)
     try:
         # The probe cannot tell this from a dead socket...
         assert kb._worker_cpu_active(proc.pid) is False
@@ -223,8 +230,8 @@ def test_healthy_in_flight_wait_with_advancing_progress_is_never_reclaimed(board
         proc.kill()
 
 
-def _stalled_worker_with_persistent_child(server, fake_ps):
-    """7914 shape + one persistent idle child (execute_code kernel / LSP server)."""
+def _stalled_worker_with_persistent_child(server, fake_cpu):
+    """7914 shape + one persistent child (execute_code kernel / LSP server)."""
     code = (
         "import socket,subprocess,sys;"
         "d=subprocess.DEVNULL;subprocess.Popen([sys.executable,'-c','import time;time.sleep(600)'],"
@@ -244,18 +251,18 @@ def _stalled_worker_with_persistent_child(server, fake_ps):
         kids = [int(p) for p, pp in (l.split() for l in ps.splitlines()) if int(pp) == proc.pid]
         time.sleep(0.1)
     assert kids  # the persistent idle child really exists
-    fake_ps.add(proc.pid)
-    for kid in kids:  # the child is in the table, parented to the worker
-        fake_ps.add(kid, ppid=proc.pid)
+    fake_cpu.add(proc.pid)
+    for kid in kids:  # even a BUSY child never vetoes: only the worker pid is sampled
+        fake_cpu.add(kid, busy=True)
     return proc, kids
 
 
-def test_persistent_idle_child_does_not_hide_a_stall(board, monkeypatch, silent_server, fake_ps):
+def test_persistent_idle_child_does_not_hide_a_stall(board, monkeypatch, silent_server, fake_cpu):
     """Argus round 2: an any-child veto blinded the detector to every worker
     holding a kernel/LSP child. Stale progress + idle child -> reclaimed at T+25."""
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
-    proc, kids = _stalled_worker_with_persistent_child(silent_server, fake_ps)
+    proc, kids = _stalled_worker_with_persistent_child(silent_server, fake_cpu)
     try:
         tid = _running(board, now, proc.pid, progress_at=now - 900)
         assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == []
@@ -272,7 +279,8 @@ def test_persistent_idle_child_does_not_hide_a_stall(board, monkeypatch, silent_
 
 
 def test_cpu_active_worker_vetoes_stale_progress(board, monkeypatch):
-    """A worker burning CPU (real process) is never flagged on one stale window."""
+    """Fault 3, genuinely busy: a worker burning CPU (real process, real probe)
+    is never flagged on one stale window."""
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
     busy = _reap_in_background(subprocess.Popen([sys.executable, "-c", "while True: pass"]))
@@ -290,20 +298,23 @@ def test_cpu_active_worker_vetoes_stale_progress(board, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", [
-    OSError("ps missing"),
-    subprocess.CalledProcessError(1, ["ps"]),
-    subprocess.TimeoutExpired(["ps"], 2),
+    psutil.AccessDenied(1),
+    OSError("proc unreadable"),
+    RuntimeError("probe broke"),
+    "psutil-missing",
 ])
 def test_process_probe_failure_never_authorizes_reclaim(board, monkeypatch, silent_server, failure):
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
-    # An UNINSTALLED table: skips the real-idle wait, but the probe itself stays
-    # real so it runs into the broken ``ps`` below.
-    proc = _in_flight_worker(silent_server, _FakePs())
+    monkeypatch.setattr(kb, "_CPU_SAMPLE_SECONDS", 0.0)
+    proc = _in_flight_worker(silent_server)  # the probe itself stays real
     try:
-        def broken(*_a, **_kw):
-            raise failure
-        monkeypatch.setattr(subprocess, "run", broken)
+        if failure == "psutil-missing":
+            monkeypatch.setitem(sys.modules, "psutil", None)
+        else:
+            def broken(*_a, **_kw):
+                raise failure
+            monkeypatch.setattr(psutil.Process, "cpu_times", broken)
         assert kb._worker_cpu_active(proc.pid) is True
         tid = _running(board, now, proc.pid, progress_at=now - 1600)
         assert kb.detect_progress_stalls(board, stall_seconds=900, reclaim_seconds=1500) == []
@@ -313,10 +324,18 @@ def test_process_probe_failure_never_authorizes_reclaim(board, monkeypatch, sile
         proc.kill()
 
 
-def test_run_without_progress_signal_is_unknown_and_never_reclaimed(board, monkeypatch, silent_server, fake_ps):
+def test_injected_sampler_drives_the_delta(fake_cpu):
+    fake_cpu.add(101)
+    fake_cpu.add(102, busy=True)
+    assert kb._worker_cpu_active(101) is False
+    assert kb._worker_cpu_active(102) is True
+    assert kb._worker_cpu_active(103) is False  # NoSuchProcess -> idle
+
+
+def test_run_without_progress_signal_is_unknown_and_never_reclaimed(board, monkeypatch, silent_server, fake_cpu):
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
-    proc = _in_flight_worker(silent_server, fake_ps)
+    proc = _in_flight_worker(silent_server, fake_cpu)
     try:
         tid = _running(board, now, proc.pid, progress_at=None)
         rid = kb.get_task(board, tid).current_run_id
@@ -327,10 +346,10 @@ def test_run_without_progress_signal_is_unknown_and_never_reclaimed(board, monke
         proc.kill()
 
 
-def test_dispatch_tick_observes_progress_despite_fresh_heartbeats(board, monkeypatch, silent_server, fake_ps):
+def test_dispatch_tick_observes_progress_despite_fresh_heartbeats(board, monkeypatch, silent_server, fake_cpu):
     now = int(time.time())
     monkeypatch.setattr(kb.time, "time", lambda: now)
-    proc = _in_flight_worker(silent_server, fake_ps)
+    proc = _in_flight_worker(silent_server, fake_cpu)
     try:
         tid = _running(board, now, proc.pid, progress_at=now - 901)
         kb.dispatch_once(board, max_spawn=1, spawn_fn=lambda *args: 123)
