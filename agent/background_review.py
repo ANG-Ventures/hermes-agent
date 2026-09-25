@@ -1132,6 +1132,11 @@ def _log_review_completion(usage: Dict[str, Any], result: str) -> None:
     )
 
 
+# Above any live registry generation; see the same-model tools[] copy in
+# build_cache_parity_fork.
+_FROZEN_TOOL_SNAPSHOT_GENERATION: int = 2_147_483_647
+
+
 def build_cache_parity_fork(
     agent: Any,
     task_cfg: Optional[Dict[str, Any]] = None,
@@ -1272,6 +1277,24 @@ def build_cache_parity_fork(
     )
     review_agent._memory_write_origin = write_origin
     review_agent._memory_write_context = write_origin
+    if not _routed:
+        # The constructor skips external memory providers to keep the review
+        # isolated, so its freshly assembled tool list omits provider-injected
+        # schemas (e.g. mem0_*). Copy the parent's final request snapshot,
+        # not just its toolset config: tools[] precedes system/messages in the
+        # cached prefix. Dispatch remains restricted by the thread whitelist.
+        review_agent.tools = copy.deepcopy(agent.tools)
+        review_agent.valid_tool_names = {
+            tool["function"]["name"] for tool in review_agent.tools
+        }
+        # Freeze the snapshot generation above any live registry generation:
+        # a mid-review compaction boundary runs
+        # refresh_agent_mcp_tools(content_aware=True), which rebuilds tools[]
+        # from the registry and re-injects provider tools via the (absent)
+        # memory manager — dropping the inherited mem0_* schemas again. The
+        # refresh's stale-generation guard refuses the rebuild (upstream
+        # #103579).
+        review_agent._tool_snapshot_generation = _FROZEN_TOOL_SNAPSHOT_GENERATION
     # The review fork pins the parent's cached system prompt and keeps
     # ``tools[]`` byte-identical to the parent so its outbound request
     # hits the same provider cache prefix (see the toolset-parity note

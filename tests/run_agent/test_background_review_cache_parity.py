@@ -11,7 +11,115 @@ roughly the full uncached system-prompt cost per nudge (~26% end-to-end on
 Sonnet 4.5 per the contributor's measurement).
 """
 
+import json
+from types import SimpleNamespace
 from unittest.mock import patch
+
+
+def test_same_model_review_reuses_exact_parent_tools_without_memory_provider():
+    """Provider-added mem0 schemas belong in the cache key, not the review's dispatch rights."""
+    from agent.background_review import build_cache_parity_fork
+
+    parent_tools = [
+        {"type": "function", "function": {"name": "skill_view", "parameters": {}}},
+        {"type": "function", "function": {"name": "mem0_search", "parameters": {"type": "object"}}},
+    ]
+    parent = SimpleNamespace(
+        model="test-model", provider="openai", platform="cli", session_id="parent",
+        tools=parent_tools, valid_tool_names={"skill_view", "mem0_search"},
+        _cached_system_prompt="unchanged system", session_start=object(),
+        _memory_store=None, _memory_enabled=False, _user_profile_enabled=False,
+        enabled_toolsets=["skills", "memory"], disabled_toolsets=None,
+        request_overrides={},
+    )
+    captured = {}
+
+    class Fork:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.tools = [parent_tools[0]]  # skip_memory=True omitted provider tools
+            self.valid_tool_names = {"skill_view"}
+            self._memory_manager = None
+            self.context_compressor = None
+
+    runtime = {"model": "test-model", "provider": "openai", "routed": False}
+    with patch("run_agent.AIAgent", Fork), patch(
+        "agent.background_review._resolve_review_runtime", return_value=runtime
+    ):
+        fork, _, routed = build_cache_parity_fork(parent, max_iterations=3)
+
+    assert not routed
+    assert captured["skip_memory"] is True
+    assert fork._memory_manager is None  # never initialize external provider on review
+    assert fork._cached_system_prompt == parent._cached_system_prompt
+    assert json.dumps(fork.tools, separators=(",", ":")) == json.dumps(
+        parent.tools, separators=(",", ":")
+    )
+    assert fork.valid_tool_names == parent.valid_tool_names
+    assert fork.tools is not parent.tools  # fork cannot mutate the parent's schema list
+    from hermes_cli.plugins import (
+        clear_thread_tool_whitelist,
+        get_pre_tool_call_block_message,
+        set_thread_tool_whitelist,
+    )
+    # The mem0 schema is advertised for cache parity, but a real dispatch
+    # through the review's existing gate must still refuse it.
+    set_thread_tool_whitelist({"skill_view"})
+    try:
+        assert get_pre_tool_call_block_message("mem0_search", {"query": "x"})
+        assert get_pre_tool_call_block_message("skill_view", {"name": "x"}) is None
+    finally:
+        clear_thread_tool_whitelist()
+
+
+def test_review_fork_inherited_tools_survive_compaction_refresh():
+    """A mid-review compaction boundary runs refresh_agent_mcp_tools(content_aware=True).
+    The fork has no memory manager (skip_memory), so an unguarded rebuild would drop the
+    inherited mem0_* schemas and re-break the cache prefix; the frozen generation refuses it."""
+    import copy as _copy
+    from agent.background_review import build_cache_parity_fork
+    from tools.mcp_tool import refresh_agent_mcp_tools
+
+    parent_tools = [
+        {"type": "function", "function": {"name": "skill_view", "parameters": {}}},
+        {"type": "function", "function": {"name": "mem0_search", "parameters": {"type": "object"}}},
+    ]
+    parent = SimpleNamespace(
+        model="test-model", provider="openai", platform="cli", session_id="parent",
+        tools=parent_tools, valid_tool_names={"skill_view", "mem0_search"},
+        _cached_system_prompt="unchanged system", session_start=object(),
+        _memory_store=None, _memory_enabled=False, _user_profile_enabled=False,
+        enabled_toolsets=["skills"], disabled_toolsets=None, request_overrides={},
+    )
+
+    class Fork:
+        def __init__(self, **kwargs):
+            self.enabled_toolsets = kwargs.get("enabled_toolsets")
+            self.disabled_toolsets = kwargs.get("disabled_toolsets")
+            self.tools = [parent_tools[0]]
+            self.valid_tool_names = {"skill_view"}
+            self._tool_snapshot_generation = 0
+            self._memory_manager = None
+            self.context_compressor = None
+
+    runtime = {"model": "test-model", "provider": "openai", "routed": False}
+    with patch("run_agent.AIAgent", Fork), patch(
+        "agent.background_review._resolve_review_runtime", return_value=runtime
+    ):
+        fork, _, routed = build_cache_parity_fork(parent, max_iterations=3)
+    assert not routed
+    before = _copy.deepcopy(fork.tools)
+
+    # Control: an unfrozen copy IS rewritten by the refresh (mem0 dropped), so the
+    # assertion below gates the freeze rather than a no-op refresh.
+    control = SimpleNamespace(**{k: _copy.deepcopy(v) for k, v in vars(fork).items()})
+    control._tool_snapshot_generation = 0
+    refresh_agent_mcp_tools(control, content_aware=True)
+    assert "mem0_search" not in control.valid_tool_names
+
+    assert refresh_agent_mcp_tools(fork, content_aware=True) == set()
+    assert fork.tools == before
+    assert fork.valid_tool_names == {"skill_view", "mem0_search"}
 
 
 def _make_agent_stub(agent_cls):
@@ -44,6 +152,7 @@ def _make_agent_stub(agent_cls):
     # Non-None so the test catches a missing-kwarg regression.
     agent.enabled_toolsets = ["memory", "skills", "terminal"]
     agent.disabled_toolsets = ["spotify", "feishu_doc"]
+    agent.tools = []
     # Chat context the review fork must inherit so its blackbox row is attributable.
     agent._chat_id = "571820863"
     agent._chat_name = "Daemonarchy / #aegis"
