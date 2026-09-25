@@ -205,6 +205,10 @@ def _runner(tmp_path, monkeypatch, runtime: dict, model: str):
     import gateway.session as gs
 
     monkeypatch.setattr(gs, "_discord_tools_loaded", lambda: True)
+    # gateway.run snapshots the home at import and reads config.yaml through
+    # it; without this the scratch model.default is never seen (CI: "No model
+    # configured" -> every turn reads as fallback -> evict).
+    monkeypatch.setattr(gr, "_hermes_home", home)
     monkeypatch.setattr(gr, "_resolve_runtime_agent_kwargs", lambda: dict(runtime))
     monkeypatch.setattr(mm, "get_model_context_length", lambda *a, **k: 200_000)
 
