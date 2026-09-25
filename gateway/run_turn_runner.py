@@ -1719,6 +1719,16 @@ class TurnRunner:
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            if not ctx._run_still_current():
+                # /stop (or /new) landed during pre-flight: the slot held only the PENDING sentinel,
+                # so nothing was interrupted and only the generation was bumped. Starting now would
+                # run the whole turn (API calls, tools) with every result discarded as stale.
+                logger.warning(
+                    "Refusing to start stale turn for %s — generation %s was invalidated during pre-flight",
+                    session_key or "?", ctx.run_generation,
+                )
+                return {"final_response": "", "messages": [], "api_calls": 0, "tools": [],
+                        "interrupted": True, "completed": False}
             from agent.notification_presentation import notification_turn
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)
