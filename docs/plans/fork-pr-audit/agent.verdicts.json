@@ -27,14 +27,14 @@
     "dependents": [],
     "loc": 784
    },
-   "fires": "'shell hook self-heal' / 'missing shell hook' / 'infrastructure failure' 0 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
-   "original": "PR #1000.",
+   "fires": "0 \u2014 and structurally cannot fire on this fleet. Run 10180 (2026-09-25 05:54:56) was blocked by the missing script drain_timer_stop_policy.py under the installed-hooks dir (~/.hermes/hooks-installed/current). (1) The healer was not deployed: live runtime ~/.hermes/hermes-agent HEAD 439eb0395e (2026-09-21) predates f16b128f40 and is 1,229 commits behind origin/main; `grep -c shell_hooks_missing` in the runtime's agent/shell_hooks.py = 0. (2) It could not have helped anyway: every profile config points hooks at the hooks-installed/current install (config.yaml:619 + 4 profiles); hooks-installed is gitignored in ~/.hermes (.gitignore:3) and `git ls-files hooks-installed` = 0, so shell_hooks_missing.py's `git ls-tree HEAD` listing (:85) has no tracked entry \u2192 'not tracked in HEAD' (:150) \u2192 restore refused. Root cause of 10180 was install drift: the two 04:12 installs (d-6a4d9952e27b, d-bc9cf69ae29e) lack drain_timer_stop_policy.py in their MANIFEST; the install that has it (t-a3ea2c3607c2) was created 06:56:17, an hour after the run started.",
+   "original": "PR #1000 (f16b128f40, 2026-09-24 20:11 UTC; incident t_82a5c853 2026-09-24 03:44 'stray git sparse-checkout removed the hook dir').",
    "upstream_fix": "none",
-   "upstream_state": "RED (read-only): ../up/agent/shell_hooks.py (645 lines) maps FileNotFoundError to 'command not found' (:285) and fails closed; no self-heal"
+   "upstream_state": "RED (read-only): ../up/agent/shell_hooks.py maps FileNotFoundError to 'command not found' (:285) and fails closed; no self-heal"
   },
-  "notes": "Counter-evidence from this very card: run 10180 (2026-09-25) was hard-blocked by a fail-closed pre_tool_call hook whose script (drain_timer_stop_policy.py) was missing \u2014 the exact case \u2014 and the self-heal did not fire (0 lines). Either the hook lives outside a git checkout the healer recognises or the path is dead. Lead: decide after reading why it did not engage.",
+  "notes": "The self-heal only covers hook scripts that are HEAD-tracked in a git checkout; the fleet's hook layout (untracked hooks-installed/<id> dirs behind a `current` symlink, switched by the installer) is outside it, so the 784-line patch is dead in production. If the incident class is worth guarding, the guard belongs in the hooks installer (MANIFEST completeness check), not the agent. Revert branch audit/agent/revert-1000 not built this run (3/3-sync files).",
   "problem": "Absent shell-hook files treated as infrastructure failure with absence-only self-heal (restore from HEAD) + page.",
-  "verdict": "UNRESOLVED"
+  "verdict": "DROP"
  },
  "#1001": {
   "branch": null,
@@ -210,14 +210,14 @@
     "dependents": [],
     "loc": 208
    },
-   "fires": "no marker",
-   "original": "PR #1054.",
-   "upstream_fix": "unknown",
-   "upstream_state": "partial (read-only): ../up/hermes_state_compression.py:102-106 marks superseded rows; whether duplicate active results per tool_call_id survive concurrent fork+compaction needs tests/\u2026/test_compression_concurrent_fork.py on ../up"
+   "fires": "no marker (guard raises only on the introduced-duplicate path; 0 'would publish' lines in the window)",
+   "original": "PR #1054 (e27200c5d4, 2026-09-25, t_aace5343): two halves \u2014 hermes_state.TranscriptInvariantError raised inside the archive_and_compact txn, and the in-place rollback in conversation_compression.",
+   "upstream_fix": "ecdbcef7af fix(compression): roll the live transcript back when an in-place compaction commit fails (#99477) \u2014 covers the rollback half only",
+   "upstream_state": "split: rollback half GREEN \u2014 ../up/agent/conversation_compression.py:3794-3818 rolls the live transcript back when in_place and split_status != 'in_place_committed' (ecdbcef7af #99477, same doubling symptom: '~15 real turns stored as 3,814 rows'); fork probe test_failed_in_place_commit_rolls_back_live_transcript passed its content-rollback assertion and failed only on the fork-only attribute agent._last_compaction_persist_failed (AttributeError, belongs to the #3461 persist-failed row, not this one). Invariant half RED \u2014 TranscriptInvariantError / _active_duplicate_tool_result_ids absent from ../up/hermes_state*.py (grep 0); fork tests/state/test_archive_compact_tool_result_invariant.py fails collection on ../up: ImportError cannot import name 'TranscriptInvariantError' from 'hermes_state'."
   },
-  "notes": "Transcript-integrity class; do not drop on zero fires.",
-  "problem": "One active tool result per tool_call_id across in-place compaction.",
-  "verdict": "UNRESOLVED"
+  "notes": "Recommendation: take upstream's rollback (drop the fork's conversation_compression.py hunk, incl. _in_place_originals_still_active) and offer the 44-line archive_and_compact invariant + its 4 tests upstream as a standalone transcript-integrity guard. Output: '3 failed, 60 passed in 116.94s' for the whole fork file (other 2 failures are other rows' attributes); invariant file '1 error in 1.87s' (collection ImportError).",
+  "problem": "A failed in-place compaction commit handed back the compacted list while every original row stayed active, so the next flush re-inserted it (tool exchanges doubled); plus a DB-side invariant that archive_and_compact never publishes two active result rows for one tool_call_id.",
+  "verdict": "UPSTREAM"
  },
  "#106": {
   "branch": null,
@@ -558,13 +558,13 @@
     "loc": 120
    },
    "fires": "dashboard-only; no marker",
-   "original": "PR #179.",
-   "upstream_fix": "unknown",
-   "upstream_state": "not settled: upstream moved web_server out of gateway/ (../up/gateway/web_server.py absent); needs the relocated file located and read"
+   "original": "PR #179 (828e04b965): replaced the per-session hydrate with a SessionDB GROUP BY helper and moved the read to the default executor; measured stats max 1.314s post-fix.",
+   "upstream_fix": "011ec4513e (routes \u2192 APIRouter modules) + 4fd970c62f/4d9007cd17 (router simplification); session_count_by_source guarded by 76cfc7b257",
+   "upstream_state": "GREEN (read-only, relocated): upstream moved the route to ../up/hermes_cli/web_routers/sessions.py \u2014 get_session_stats@491-507 builds by_source via db.session_count_by_source(include_archived=True, exclude_children=True) (hermes_state_sessions.py:1490, GROUP BY helper) and runs the whole read under `await asyncio.to_thread(_with_db, profile, _stats, read_only=True)` \u2014 the same two changes the fork made."
   },
-  "notes": "Relocation != fixed (README \u00a70).",
-  "problem": "Dashboard session-stats hot read blocked the event loop.",
-  "verdict": "UNRESOLVED"
+  "notes": "Relocation located (README \u00a70): gateway/web_server.py \u2192 hermes_cli/web_server.py + web_routers/*. Fork's hermes_state.py helper duplicates upstream's session_count_by_source.",
+  "problem": "Dashboard /api/sessions/stats by_source hydrate ran a blocking hot read on the event loop.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#186": {
   "branch": null,
@@ -856,14 +856,14 @@
     "dependents": [],
     "loc": 203
    },
-   "fires": "not measurable from gateway/agent logs (acp_adapter has its own process); no acp log under ~/.hermes/logs",
-   "original": "PR #222.",
+   "fires": "no caller: `claude-agent-acp` / acp command configuration appears in 0 of ~/.hermes/config.yaml + 10 profile configs (only chiron sets platform_toolsets.acp); copilot_acp_client emits no log line on patch, and no ACP log exists under ~/.hermes/logs. Relay itself is up (127.0.0.1:18810 /health ok, 11 main-tier subs) but nothing launches a Claude ACP adapter through it.",
+   "original": "PR #222 (f768e0645c): _claude_relay_env_patch@fork/agent/copilot_acp_client.py:237 fires only when (command,args) is a Claude ACP adapter (_is_claude_acp) AND the relay /health answers.",
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): upstream ACP adapter has no relay routing"
   },
-  "notes": "Needs the ACP owner: is any ACP client still launched with the relay route? 2 syncs, 203 loc.",
-  "problem": "Route Claude ACP adapters through the Claude Relay pool.",
-  "verdict": "UNRESOLVED"
+  "notes": "ACP-owner question answered by config: no ACP client is launched with the relay route in this deployment. The PR also touched .gitleaks.toml + .github/workflows/fleet-secret-scan.yml (placeholder pool key allowlist) \u2014 a revert must keep those if other rows rely on them. Revert branch not built this run.",
+  "problem": "Route Claude ACP adapters (claude-agent-acp) through the Claude Relay pool by patching ANTHROPIC_BASE_URL at spawn.",
+  "verdict": "DROP"
  },
  "#223": {
   "branch": null,
@@ -1434,14 +1434,14 @@
     ],
     "loc": 110
    },
-   "fires": "no marker",
-   "original": "PR #324.",
-   "upstream_fix": "unknown",
-   "upstream_state": "not settled read-only: ../up/agent/verification_evidence.py handles && chains (:176,217,231) but a cd-prefix root rebinding was not found by grep"
+   "fires": "no marker (silent classifier path); the false banner is user-visible, not logged",
+   "original": "PR #324 body (e4eadd8c4f): recorder resolved the root from the terminal tool's cwd only; `cd /repo && pytest` classified against root=None and the passing event was dropped while the edit kept the root stale.",
+   "upstream_fix": "none (git log upstream/main -- agent/verification_evidence.py: 5195c13873, 35accdbc30, 576accd92b, 06dc51d62d \u2014 interpreter/ad-hoc/sqlite/inert changes, no cd-prefix handling)",
+   "upstream_state": "RED (ran): fork tests/agent/test_verification_evidence.py replayed on ../up @7262ab2d9a with HERMES_VERIFY_ON_STOP=1 (upstream's ledger is inert otherwise, 06dc51d62d) \u2014 test_cd_prefixed_pytest_credits_the_repo_root_and_clears_stale FAILED `assert event is not None` (record_terminal_result returned None), plus 6 test_classifier_unwraps_cd_and_env_prefixes[cd \u2026] cases; _effective_cwd absent from ../up/agent/verification_evidence.py (classify_verification_command@424 calls _project_facts(cwd) with the raw tool cwd)."
   },
-  "notes": "Run the fork test on ../up.",
-  "problem": "Verification evidence ignored a leading `cd <dir> &&` when keying to a root.",
-  "verdict": "UNRESOLVED"
+  "notes": "Generic bug, still present upstream, 43-line fix + tests. Needs the HERMES_VERIFY_ON_STOP=1 autouse fixture upstream uses (up/tests/agent/test_verification_evidence.py:16) when porting. Output: 7 failed, 3 passed, 23 deselected in 2.58s (-k 'cd_prefixed or unwraps_cd'). Upstream PR branch not built this run.",
+  "problem": "Verification evidence ignored a leading `cd <dir> &&` when keying to a root, so a proven-green `cd repo && pytest` never cleared the '[System: \u2026 no fresh passing verification evidence]' banner.",
+  "verdict": "UPSTREAM"
  },
  "#327": {
   "branch": null,
@@ -1470,14 +1470,14 @@
     "dependents": [],
     "loc": 435
    },
-   "fires": "'Stopping' 3,623 / '/stop' 605 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
-   "original": "PR #337.",
-   "upstream_fix": "unknown",
-   "upstream_state": "not settled read-only: upstream fallback loop has interrupt handling (chat_completion_helpers.py:85-96 join-after-interrupt; conversation_loop.py:1469 'interrupt' exit) but whether a /stop during a chained fallback wait returns promptly needs a live repro on ../up"
+   "fires": "'Stopping' 3,623 / '/stop' 605 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25)",
+   "original": "PR #337 (a0adf9db4c): 435 loc incl. 20 locale files.",
+   "upstream_fix": "upstream interrupt handling in the fallback loop (chat_completion_helpers.py:85-96)",
+   "upstream_state": "GREEN (ran): fork tests/run_agent/test_fallback_interrupt_checkpoint.py replayed on ../up @7262ab2d9a \u2014 4/4 PASSED (test_stop_halts_fallback_looping_turn, test_checkpoint_runs_without_error, test_stop_suppresses_fallback_row_writes, test_stop_cleans_up_task_resources): upstream's fallback loop honours the interrupt (chat_completion_helpers.py:85-96 join-after-interrupt; conversation_loop.py:1469 'interrupt' exit). Only tests/gateway/test_stop_honest_wording.py::test_english_stop_string_is_present_progressive_not_completed FAILED: upstream says '\u26a1 Stopped. You can continue this session.'"
   },
-  "notes": "435 loc incl. 20 locale files (3/3 syncs). Repro: start a turn on a dead primary with a chain, /stop during the wait, on ../up.",
-  "problem": "/stop ignored inside the fallback retry loop; 'Stopping' wording.",
-  "verdict": "UNRESOLVED"
+  "notes": "Output: '1 failed, 5 passed, 3 warnings in 5.54s'. The behavioural half is upstream; what remains is a 'Stopping\u2026' vs 'Stopped.' wording preference spread over 20 locale files on 3/3-sync paths \u2014 not worth the conflict cost. If Ace wants the honest wording, it is a 1-string upstream PR (locales/en.yaml), not a fork carry.",
+  "problem": "/stop ignored inside the fallback retry loop; 'Stopped' wording claimed completion before the turn had actually stopped.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#341": {
   "branch": null,
@@ -1542,14 +1542,14 @@
     "dependents": [],
     "loc": 492
    },
-   "fires": "no log marker for a lockout; 'grace turn' 0",
-   "original": "PR #37.",
+   "fires": "0 measured: the refusal is delivered to the model as a role=tool result (grace_block_result@fork/agent/budget_grace_gate.py:94, text 'the iteration budget is exhausted and this is the final grace turn'), and ~/.hermes/blackbox/turns.db turn_tool_calls.result_preview (555,617 rows, 100% populated, 2026-06-11..2026-09-25, 47,271 turns) contains that text 0 times (`like '%final grace turn%'` \u2192 0; the 139 'iteration budget' hits are skill-doc text).",
+   "original": "PR #37 (2258d375d9).",
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): upstream has the grace call (_budget_grace_call@../up/agent/agent_init.py:562, conversation_loop.py:1595, turn_iteration_prep.py:389) but no lockout (budget_grace_gate.py absent)"
   },
-  "notes": "Safety guard with no counter \u2014 cannot show it ever denied a tool. Add a counter or accept as policy KEEP.",
+  "notes": "The 'no denial counter' gap is closed by the blackbox tool-result mirror: the gate never denied a tool in 3.5 months of production. 492 loc on 3/3-sync files (agent_init, conversation_loop, tool_executor) for a guard that has never fired. Revert branch not built this run.",
   "problem": "Deny-by-default side-effect lockout on the budget grace turn (Guard D-core).",
-  "verdict": "UNRESOLVED"
+  "verdict": "DROP"
  },
  "#38": {
   "branch": null,
@@ -1726,14 +1726,14 @@
     "dependents": [],
     "loc": 629
    },
-   "fires": "'hygiene' 233 in 54 rotated gateway/agent logs; main gateway.log.1 from 2026-09-21, oldest profile log 2026-06-02; repeated-failure alert lines not sampled",
-   "original": "PR #445.",
-   "upstream_fix": "none",
-   "upstream_state": "could not settle read-only: upstream still runs pre-agent hygiene (_is_hygiene_preagent_only_cooldown@../up/agent/context_compressor.py:131) but 'hygiene_timeout' has 0 hits in ../up/gateway/run.py; whether a tighter guard exists needs a code read of the hygiene call path"
+   "fires": "'hygiene' 233 in 54 rotated gateway/agent logs (window as above)",
+   "original": "PR #445 (6d3236d41c): 4 timeouts/60 min at ~1,040 messages / ~650K tokens; 30s outer guard vs 300s inner floor.",
+   "upstream_fix": "5ae06d38d3 fix(gateway): bound the model payload when hygiene has not landed (#111988) + a6057ccbea (host inactivity budget as outer cap)",
+   "upstream_state": "GREEN-equivalent (read-only): the 30s is no longer a wall-clock kill \u2014 _hmwa_hygiene_wait_for_summary@../up/gateway/run_turn.py:814-861 charges an IDLE window (hs.timeout_seconds=30, reset by the commit fence on every streamed token: 'Charge the idle budget from the LAST PROGRESS event') under a hard ceiling hs.total_ceiling_seconds=600 with an extension loop (hygiene_wait_should_extend@:859) and a turn-hold cap; all three are config knobs (hygiene_timeout_seconds / hygiene_total_ceiling_seconds / hygiene_max_turn_hold_seconds @:669-673, defaults @:687)."
   },
-  "notes": "Needs 20 min of reading ../up/gateway/run.py hygiene path; out of this run's budget.",
-  "problem": "Pre-agent hygiene compression wrapped in a hardcoded 30s wait_for while the summariser is budgeted 300s.",
-  "verdict": "UNRESOLVED"
+  "notes": "Fork's agent/hygiene_timeout.py (derive outer deadline from auxiliary.compression.timeout) is a different mechanism for the same symptom; upstream's progress-aware idle+ceiling design is strictly better for a streaming summariser. Drop ours, take theirs.",
+  "problem": "Pre-agent hygiene compression wrapped in a hardcoded 30s asyncio.wait_for while the summariser is budgeted 300s, so large-context hygiene could never land.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#446": {
   "branch": null,
@@ -2430,14 +2430,14 @@
     "dependents": [],
     "loc": 246
    },
-   "fires": "'No space left on device' 75 real disk-full lines in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (channel_directory); misattribution count not separable",
-   "original": "PR #573.",
-   "upstream_fix": "none",
-   "upstream_state": "RED (read-only): shutdown_forensics absent upstream"
+   "fires": "'No space left on device' 75 real disk-full lines in window; a misfired blame is not separable in logs",
+   "original": "PR #573 (261c7ed47c): gateway/shutdown_forensics.py shutdown_signal_seen_at/shutdown_landed_within + cause-keyed explainer.",
+   "upstream_fix": "cause-keyed _PERSISTENCE_EXPLANATIONS + hedged _PERSISTENCE_DEFAULT_EXPLANATION (agent/turn_explainers.py; #97794 fts_index)",
+   "upstream_state": "GREEN-equivalent for the misattribution (ran + read): fork tests/run_agent/test_session_persistence_cause.py 8/8 FAILED on ../up @7262ab2d9a, but on shape, not substance \u2014 `module 'gateway.shutdown_forensics' has no attribute 'shutdown_signal_seen_at'/'shutdown_landed_within'` and `assert 'session storage could not be written' in \"\u26a0\ufe0f No reply: Hermes couldn't save this conversation ... Possible causes: the drive is out of room, or another Hermes process is holding the database...\"`. Upstream keys the explanation by cause (_PERSISTENCE_EXPLANATIONS 'disk' / 'fts_index' / corruption @../up/agent/turn_explainers.py:138-166) and the unclassified default (:168-172) hedges instead of blaming the disk. What upstream lacks is the positive 'a restart interrupted this turn' attribution."
   },
-  "notes": "Disk-full did happen in the window, so the discriminator has something to discriminate; unmeasured whether the blame ever misfired.",
-  "problem": "Restart-interrupted turn was blamed on a full disk.",
-  "verdict": "UNRESOLVED"
+  "notes": "Output: '8 failed in 1.75s' (attribute/shape failures, see upstream_state). The defect as stated ('blamed on a full disk') is gone upstream; the restart-naming is a residual UX nicety on 3/3-sync files (conversation_loop, turn_finalizer, run_agent). Lead may file it as a small upstream PR instead.",
+  "problem": "A restart-interrupted turn's session_persistence_failed was explained to the user as 'the disk is probably full'.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#576": {
   "branch": null,
@@ -2556,14 +2556,14 @@
     "dependents": [],
     "loc": 470
    },
-   "fires": "silent path; 'multimodal' 1 line",
-   "original": "PR #602.",
+   "fires": "measured via ~/.hermes/blackbox/turns.db (30d to 2026-09-25): 585 vision_analyze calls in 195 turns; those turns average 32 api_calls (6,192 total, $1,760 cost_usd). Without expiry each image rides every later call of its turn (~16 on average \u2192 ~9,400 within-turn image resends/30d, \u224814M tokens at ~1.5K tokens/image, mostly cache-read priced \u2248 $3-6/30d) plus every later turn of the same session (unmeasurable here: the fork already expires, so blackbox has no counterfactual). vision-turn context is already 3.2x other turns (avg input+cache_read 9.2M vs 2.85M).",
+   "original": "PR #602 (cac08dc274).",
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): no prior-turn multimodal expiry in ../up/agent (grep 0)"
   },
-  "notes": "Cost-relevant if images recur in long sessions; measurable via blackbox comp_tool_result_tokens on image sessions. Not measured this run.",
-  "problem": "Expire prior-turn multimodal payloads (stop resending images).",
-  "verdict": "UNRESOLVED"
+  "notes": "Dollar benefit within-turn is modest; the real value is context-window pressure in long image-heavy sessions (cross-turn), which is generic to every upstream user pasting screenshots. 13 files / 3 syncs is a heavy carry for the fork alone \u2192 propose upstream. Branch not built this run.",
+  "problem": "Prior-turn multimodal payloads (vision_analyze images) were resent on every subsequent API call; fork expires them after the turn that consumed them.",
+  "verdict": "UPSTREAM"
  },
  "#604": {
   "branch": null,
@@ -2745,14 +2745,14 @@
     "dependents": [],
     "loc": 319
    },
-   "fires": "no marker",
-   "original": "PR #625.",
-   "upstream_fix": "unknown",
-   "upstream_state": "not settled read-only: upstream reopened the writer (_open_writer_conn@../up/hermes_state.py:755) and has a readpool module (hermes_state_readpool.py); whether reads still share the writer conn needs tests/\u2026/test_writer_conn_thread_safety.py on ../up"
+   "fires": "no marker (the SystemError it prevented is the symptom; 'session_persistence_failed' not re-sampled this run)",
+   "original": "PR #625 (5e6a5d9196, 2026-08-20): four read-only methods (get_compression_lock_holder on the gateway interrupt/busy probe, pending-handoff read, activity-label fast path, ...) executed on the writer conn without self._lock; SystemError under concurrent writers.",
+   "upstream_fix": "6623ee9bb2 perf(state): read-path split \u2014 per-thread read-only connections (+ 182dc4b313 hermes_state_readpool extraction)",
+   "upstream_state": "GREEN-equivalent (ran): fork tests/state/test_writer_conn_thread_safety.py replayed on ../up @7262ab2d9a \u2014 the 3 live race tests (test_compression_lock_holder_reads_race_free, test_pending_handoff_reads_race_free, test_activity_label_noop_fast_path_race_free) PASSED because upstream routes reads through a pooled read-only connection (_read_ctx@../up/hermes_state.py:889, hermes_state_readpool.py). 2 failed: test_unlocked_writer_conn_use_is_enumerated (AST allowlist is fork-shaped; the 8 flagged sites are lifecycle/_locked helpers: _open_writer:677, _open_read_only:697/707, _reopen_after_close_locked:952, _ensure_db_file_generation:1138, _record_db_file_identity:1181, _disable_close_time_checkpoint:1329, _settle_lost_generation_locked:1374 \u2014 all reached from __init__/close/under-lock callers) and test_transient_system_error_is_retried_to_success (fork's SystemError retry net in _execute_write absent upstream)."
   },
-  "notes": "Data-loss class \u2014 do not drop on zero fires.",
-  "problem": "Unlocked reads on the shared writer connection destroyed turns as session_persist raced.",
-  "verdict": "UNRESOLVED"
+  "notes": "Output: '2 failed, 5 passed in 11.66s'. Residual for the lead: the SystemError retry net (TestSystemErrorRetryNet, 2/3 pass upstream) is belt-and-braces once reads no longer share the writer conn; not worth 3-sync conflict cost on hermes_state.py. Revert branch not built this run.",
+  "problem": "Unlocked reads on the shared SessionDB writer connection raced session_persist and destroyed turns as session_persistence_failed.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#629": {
   "branch": null,
@@ -2966,14 +2966,14 @@
     "dependents": [],
     "loc": 1047
    },
-   "fires": "0 fork log lines in window",
-   "original": "PR #671.",
-   "upstream_fix": "none",
-   "upstream_state": "partial (read-only): upstream _seed_anthropic_singletons@../up/agent/credential_pool.py:2541 seeds without a producer stamp (grep 'producer' 0)"
+   "fires": "0 refuse/adopt log lines in window (guard logs only on refusal; the race needs two writers rotating the same singleton)",
+   "original": "PR #671 (a034e62a70): credential-pool freshness family; tests test_credential_pool_seed_freshness.py + test_credential_pool_anthropic_seed_freshness.py.",
+   "upstream_fix": "none for the seed path (#106705 _singleton_predates_entry covers runtime adopt only)",
+   "upstream_state": "RED (ran): replayed on ../up @7262ab2d9a \u2014 20/21 seed_freshness FAILED (test_seed_refuses_stale_pair[openai-codex|xai-oauth|nous]: `assert 'synthetic-store-refresh' == 'synthetic-pool-refresh'` \u2014 the stale store pair overwrote the fresher pool row at load) and 12/15 anthropic_seed_freshness FAILED (writer stamp absent: `last_refresh` None; _SINGLETON_FRESHNESS_GROUPS / _drop_stale_singleton_token_material ImportError). Upstream's _singleton_predates_entry@../up/agent/credential_pool.py:427 gates only the runtime adopt path (:1363); the load-time seed path (_Seeder.upsert \u2192 _upsert_entry@2426) has no freshness gate (grep predates/stale in _upsert_entry: 0)."
   },
-  "notes": "Credential-pool freshness family (#669,#670,#671,#730,#673): upstream grew its own singleton-freshness logic (_singleton_predates_entry@../up/agent/credential_pool.py:427, _codex_entry_tracks_singleton@:346 'whether a Codex pool entry may adopt the auth.json singleton's token pair', _SINGLE_USE_REFRESH_PROVIDERS@:963 incl. xai-oauth). None of the fork's refuse/adopt log lines fired in the window (sample 'credential pool: .*(stale|refus|adopt|singleton|owner|producer)' = 0). Adversary: replay tests/agent/test_credential_pool_singleton_freshness.py and test_credential_pool_adopt_rotated_entry.py against ../up. Needs the fork test on ../up to decide.",
-  "problem": "Gate singleton seeding and stamp the Anthropic producer.",
-  "verdict": "UNRESOLVED"
+  "notes": "Generic (any pool + singleton multi-writer install; this fleet has 10 profiles sharing auth.json). Output: '35 failed, 34 passed in 8.95s' across the three probe files (#730's file included). Not KEEP-measured: 0 refusals in window. Upstream PR branch not built this run.",
+  "problem": "Load-time singleton seeding adopted an OLDER auth.json pair over a fresher pool row (replaying a consumed refresh token); Anthropic writer never stamped a refresh instant so the gate had nothing to compare.",
+  "verdict": "UPSTREAM"
  },
  "#673": {
   "branch": null,
@@ -2983,14 +2983,14 @@
     "dependents": [],
     "loc": 2078
    },
-   "fires": "its own lines ('Codex owner row unavailable', 'deferred refresh unavailable') 0 in window; openai-codex 1,883 turns in 30d exercise the path silently",
+   "fires": "its own lines ('Codex owner row unavailable', 'deferred refresh unavailable') 0 in window; openai-codex 1,883 turns in 30d exercise the owner path silently; the fleet's topology (10 profiles inheriting one Codex singleton) is exactly the failing case",
    "original": "PR #673 body (adversarial-review blockers addressed; docs/codex-owner-original-red.json).",
    "upstream_fix": "none",
-   "upstream_state": "partial (read-only): upstream _codex_entry_tracks_singleton@../up/agent/credential_pool.py:346 addresses singleton adoption but has no owner store / generation receipt (codex_owner.py absent upstream)"
+   "upstream_state": "RED (ran): fork tests/agent/test_codex_owner_multiprocess.py (real child interpreters via scripts/probe_codex_profile_refresh.py, copied into ../up) on ../up @7262ab2d9a \u2014 6/9 cases FAILED with `assert 2 == 1` POSTs: every inherited/singleton/serialized case double-refreshes (kwargs2..5, 7, 8); the 3 passes are same_profile and the two cases that EXPECT 2 posts ({} and independent). Upstream _codex_entry_tracks_singleton@../up/agent/credential_pool.py:346 addresses singleton adoption, not cross-process ownership (codex_owner.py absent)."
   },
-  "notes": "2,078 loc. Cannot settle without running tests/agent/test_codex_owner_multiprocess.py against ../up (multiprocess refresh race). The guard only logs on failure, so 0 fires != unused.",
-  "problem": "Codex refresh ownership + quarantine generations across profiles (owner lock, durable receipts).",
-  "verdict": "UNRESOLVED"
+  "notes": "Output: '6 failed, 3 passed in 7.79s'. KEEP rather than UPSTREAM because the 2,078-loc owner store is shaped around the fleet's inherited-profile layout; a slimmer upstream port is possible but not a drop-in. Lead may re-tag UPSTREAM.",
+  "problem": "Two processes sharing one Codex singleton (profile inheriting the root auth.json) both refresh the single-use token \u2192 refresh_token_reused lockout; fork adds a cross-process owner lock + durable generation receipts.",
+  "verdict": "KEEP"
  },
  "#674": {
   "branch": null,
@@ -3273,13 +3273,13 @@
     "loc": 344
    },
    "fires": "0 fork log lines in window",
-   "original": "PR #730.",
-   "upstream_fix": "unknown",
-   "upstream_state": "not settled read-only: upstream CredentialPool._adopt@../up/agent/credential_pool.py:1149 exists; whether the stale-key/no-match path adopts needs the fork test on ../up"
+   "original": "PR #730 (def909cae3): tests/agent/test_credential_pool_adopt_rotated_entry.py.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (ran): 3/3 FAILED on ../up @7262ab2d9a \u2014 test_unmatched_stale_key_adopts_lone_entry_once_then_bounds (`assert None is not None`: no adoption), test_stale_id_bound_key_adopts_without_refresh ('refresh must not run for a rotated entry'), test_xai_pool_resyncs_from_auth_store_before_adopting (`assert None is not None`). Upstream CredentialPool._adopt@../up/agent/credential_pool.py:1149 requires a matching entry; the no-match path still refreshes."
   },
-  "notes": "Credential-pool freshness family (#669,#670,#671,#730,#673): upstream grew its own singleton-freshness logic (_singleton_predates_entry@../up/agent/credential_pool.py:427, _codex_entry_tracks_singleton@:346 'whether a Codex pool entry may adopt the auth.json singleton's token pair', _SINGLE_USE_REFRESH_PROVIDERS@:963 incl. xai-oauth). None of the fork's refuse/adopt log lines fired in the window (sample 'credential pool: .*(stale|refus|adopt|singleton|owner|producer)' = 0). Adversary: replay tests/agent/test_credential_pool_singleton_freshness.py and test_credential_pool_adopt_rotated_entry.py against ../up. 0 syncs (no conflict cost).",
-  "problem": "Adopt the rotated token when the agent's stale key matches no pool entry.",
-  "verdict": "UNRESOLVED"
+  "notes": "0 syncs (no conflict cost), generic, RED on up. Upstream PR branch not built this run.",
+  "problem": "When the agent's stale key matched no pool entry after another process rotated it, the pool refreshed (burning the single-use refresh token) instead of adopting the rotated entry.",
+  "verdict": "UPSTREAM"
  },
  "#739": {
   "branch": null,
@@ -3342,11 +3342,11 @@
     "loc": 1015
    },
    "fires": "see #942",
-   "original": "PR #764.",
+   "original": "PR #764 (a2a1a5cbdb).",
    "upstream_fix": "none",
    "upstream_state": "RED (see #942)"
   },
-  "notes": "Rides with #942.",
+  "notes": "Rides with #942; same measurement gap (relay emission is logged only on the per-sub VPS bridges).",
   "problem": "Consume the out-of-band hermes_confab_notice response extension.",
   "verdict": "UNRESOLVED"
  },
@@ -3448,13 +3448,13 @@
     "loc": 435
    },
    "fires": "security guard; no marker",
-   "original": "PR #841.",
-   "upstream_fix": "unknown",
-   "upstream_state": "not settled read-only: needs the fork's tests/agent/test_shell_hooks.py disclosure cases run against ../up"
+   "original": "PR #841 (51aba3316f, 2026-09-22): reproduced on real paths before fixing (qa-output/round13); P1-a agent/shell_hooks.py str(exc) producers, P1-b hermes_cli/plugins.py _callback_label.",
+   "upstream_fix": "none (git log upstream/main -- agent/shell_hooks.py: 30b38d139b approval escalation only)",
+   "upstream_state": "RED (ran): fork tests/agent/test_shell_hooks.py::TestErrorChannelSplit on ../up @7262ab2d9a \u2014 4/4 FAILED: test_spawn_enoexec_detail_distinguishes_errno got `[Errno 8] Exec format error: '/tmp/.../hook-with-s3cr3t-in-argv.sh'` as the model-facing error (../up/agent/shell_hooks.py:350,361 `return failed(str(exc))`); error_detail channel absent (KeyError). plugins half: ../up/hermes_cli/plugins_dispatch.py:63,258,276 still `getattr(cb, \"__name__\", repr(cb))` (partial repr \u2192 bound args in the block directive at :64-65)."
   },
-  "notes": "Security fix \u2014 do not DROP on a zero-fire count. 1 sync.",
-  "problem": "Two residual secret-disclosure channels to the model (outbound webhooks, shell hooks).",
-  "verdict": "UNRESOLVED"
+  "notes": "Output: '4 failed, 76 deselected in 0.87s'. Security, generic, 1 sync. Upstream PR branch not built this run; when porting, plugins.py sites moved to hermes_cli/plugins_dispatch.py upstream.",
+  "problem": "Two residual secret-disclosure channels to the model: shell-hook spawn/parse exceptions rendered argv (incl. inline credentials) into the model-facing fail-closed reason; plugin callback labels fell through to repr() which renders functools.partial bound args.",
+  "verdict": "UPSTREAM"
  },
  "#876": {
   "branch": null,
@@ -3591,14 +3591,14 @@
     "dependents": [],
     "loc": 327
    },
-   "fires": "30d: claude-opus-5-5 537 turns (all via relays)",
-   "original": "PR #917.",
-   "upstream_fix": "unknown",
-   "upstream_state": "not settled read-only: 'opus-5-5' 0 hits in ../up/agent/anthropic_adapter.py; whether upstream's adapter already emits the 5.5-compatible shape needs the fork's tests/agent/test_anthropic_opus_5_5_contract.py run against ../up"
+   "fires": "30d: claude-opus-5-5 537 turns (all via relays, which shape the wire themselves) \u2014 the native-adapter guard is exercised only when a native anthropic route serves 5.5",
+   "original": "PR #917 body (43877abf96): Anthropic Opus 5.5 migration guide names the two request-shape breaking changes; fork adds _OPUS_5_5_FAMILY_SUBSTRINGS read by both guards.",
+   "upstream_fix": "none ('opus-5-5' 0 hits in ../up/agent/anthropic_adapter.py; git log upstream/main -S'opus-5-5' -- agent/anthropic_adapter.py empty; upstream knows the model only in usage_pricing.py:196, model_metadata.py:401 fast-mode set)",
+   "upstream_state": "RED (ran): fork tests/agent/test_anthropic_opus_5_5_contract.py replayed on ../up @7262ab2d9a (family-helper class dropped; helpers absent upstream) \u2014 21 failed, 49 passed: test_required_downgrades_to_auto / test_named_tool_downgrades_to_auto for all 7 NO_FORCED_TOOLS ids, and test_disable_is_not_sent sends {'thinking': {'type': 'disabled'}} for claude-opus-5-5, anthropic/claude-opus-5.5, claude-opus-5-5-fast, claude-mythos-5-1 (claude-fable-5-1 passes the disable case only via the pre-existing _MANDATORY_THINKING_CLAUDE_SUBSTRINGS=('claude-fable',)@../up/agent/anthropic_adapter.py:103)."
   },
-  "notes": "20-minute check: run the contract test on ../up; RED \u21d2 UPSTREAM, GREEN \u21d2 SUPERSEDED.",
-  "problem": "Guard the two Opus 5.5 request-shape breaking changes.",
-  "verdict": "UNRESOLVED"
+  "notes": "Generic: any upstream user routing claude-opus-5-5 natively with reasoning disabled or a forced tool gets a 400. Upstream PR branch not built this run.",
+  "problem": "Opus 5.5 / Fable 5.1 / Mythos 5.1 reject thinking:{type:disabled} and forced tool_choice (any/tool) with HTTP 400; the adapter still sends both shapes.",
+  "verdict": "UPSTREAM"
  },
  "#942": {
   "branch": null,
@@ -3610,12 +3610,12 @@
     ],
     "loc": 1387
    },
-   "fires": "no agent-side marker; 'confab' 4 incidental lines in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (incl. Ace: 'Confab-OOB lane live on all N subs')",
-   "original": "PR #942.",
+   "fires": "relay-side rate NOT measurable from this host: the field is emitted by the per-sub claude-bridge (deploy/claude-bpx-0/bridge/src/server.js:5630 logs 'confab notice emitted out-of-band (scope=\u2026 grammar=\u2026)', :5867 'tool-call notice emitted out-of-band'), and 99.8% of routes go to VPS subs (claude-bpr.log 2026-09-17..09-25: 'chosen' sub-vps-* \u224871K vs local 143) whose bridge logs are remote. The pool router (claude_pool_relay.py, 370,599 log lines) does not log the field at all (0 'confab'). Local bridge claude-bpx.log (4.1 MB, to 09-25 09:01): 0 OOB emissions, 0 'gate armed but no capability signal', 10 in-band 'confab marker appended' \u2014 i.e. the OOB lane was not armed on the local sub during that window. Agent side surfaces the notice as a chat status (conversation_loop.py:8321 _emit_status), not a log line; 1 incidental 'confab notice out-of-band' line in gateway/agent logs.",
+   "original": "PR #942 (f1ba8e40cf).",
    "upstream_fix": "none",
    "upstream_state": "RED (read-only): 'confab_notice' / 'hermes_confab_notice' 0 hits in ../up/agent"
   },
-  "notes": "Needed only while the relay emits the out-of-band confab extension. Measure on the relay side (notice count per day) before deciding KEEP vs DROP. 1,387 loc on 3/3-sync files.",
+  "notes": "Sharper question for the lead: run `grep -c 'confab notice emitted out-of-band' <bridge log>` and `grep -c 'tool-call notice emitted out-of-band'` on each sub-vps host (bridge = deploy/claude-bpx-*/bridge) over one week. 0 across the fleet \u21d2 the OOB lane is not armed and #764+#942 (2,402 loc on 3/3-sync files) are dead \u2192 DROP; >0 \u21d2 KEEP (the agent must strip the extension before empty-response handling or the turn is misclassified). Not settled read-only from this host.",
   "problem": "Recover tool-call notices (confab notice) before empty-response handling.",
   "verdict": "UNRESOLVED"
  },
@@ -3848,14 +3848,14 @@
     "dependents": [],
     "loc": 13
    },
-   "fires": "unknown",
+   "fires": "unknown (no marker)",
    "original": "commit 1a633f7cdd (2026-05-12).",
-   "upstream_fix": "none",
-   "upstream_state": "not checked (13 loc; needs a read of ../up/agent/auxiliary_client.py _get_cached_client)"
+   "upstream_fix": "a714ff9823 fix(aux): stop probe stubs poisoning the client cache (introduces _compat_model); d1a13ae244 normalize model on auto cache miss",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/auxiliary_client.py:5975 (cache hit) and :6012 (cache miss) both return `_compat_model(client, model, default_model)`; _compat_model@5935-5945 returns the resolver's already-normalized default whenever the caller model carries a '/' and the client is not OpenRouter/slash-accepting \u2014 the namespaced-id leak the fork patched cannot reach the wire. Only the probe path (:5998, _aux_probe_active) still returns the raw model, deliberately (#87654)."
   },
-  "notes": "13 loc; lead may fold into the aux-resolver SUPERSEDED group if the read confirms.",
-  "problem": "_get_cached_client returned the raw caller model, bypassing normalize_resolved_model.",
-  "verdict": "UNRESOLVED"
+  "notes": "Fold into the aux-resolver SUPERSEDED group. Fork still carries both: _compat_model@fork/agent/auxiliary_client.py:8425 and the normalized_caller_model line @8557.",
+  "problem": "_get_cached_client returned the raw caller-passed model, bypassing normalize_resolved_model (namespaced 'anthropic/claude-\u2026' leaked to the Anthropic wire \u2192 404).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "nopr:1b028678e1": {
   "branch": null,
