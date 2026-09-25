@@ -822,5 +822,311 @@
   },
   "branch": null,
   "notes": "Follows #920."
+ },
+ "#348": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "cron store froze HERMES_HOME paths at import time.",
+  "evidence": {
+   "original": "PR #348 body.",
+   "upstream_state": "GREEN: own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['2 passed, 6 deselected in 3.25s', '2 passed in 3.08s'] FM:['2 passed, 6 deselected in 0.83s', '2 passed in 1.49s']; upstream _current_cron_store@cron/jobs.py:153 resolves live",
+   "upstream_fix": "upstream _current_cron_store 4-level precedence (absorbed ~2026-07-25; exact sha deferred to adversary)",
+   "fires": "no log marker; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 122,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Own tests pass unchanged on upstream."
+ },
+ "#351": {
+  "verdict": "DROP",
+  "problem": "Fail loud when a test context writes a NON-TEMP (live) cron store.",
+  "evidence": {
+   "original": "PR #351 body (junk-fixture leak into live jobs.json).",
+   "upstream_state": "read-only: no equivalent guard upstream; own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['3 failed, 3 passed in 3.66s'] FM:['6 passed in 2.46s'] (3 fail = the guard is absent, not a live bug)",
+   "upstream_fix": "partial: upstream live store resolution (#348 row) removes the import-freeze vector",
+   "fires": "0 in logs (guard message never logged); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 151,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": "audit/cron_tools/revert-351",
+  "notes": "Never fires in production (raises only inside a test harness pointed at the live home). Test-hermeticity belongs in conftest, not the store write path. Low confidence DROP — adversary: check whether any fleet harness still relies on it."
+ },
+ "#830": {
+  "verdict": "UPSTREAM",
+  "problem": "Orphaned zero-byte .fire-<hash>.lock files accumulate in cron dir.",
+  "evidence": {
+   "original": "PR #830 body, card t_f6ffdba4 (02:49 fleet-SIGTERM forensics census).",
+   "upstream_state": "RED: own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 failed, 3 passed, 110 deselected in 4.78s'] FM:['4 passed, 110 deselected in 3.66s']; upstream creates .fire-*.lock @cron/jobs.py:352 and prunes only the registry entry (:2241), never the file",
+   "upstream_fix": "none",
+   "fires": "no log marker (reaper silent); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 145,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic, 145 loc."
+ },
+ "#632": {
+  "verdict": "UPSTREAM",
+  "problem": "schedule_display echoed the raw cron expression for every job.",
+  "evidence": {
+   "original": "PR #632 body, greenhouse t_ef14a609 (211/211 jobs).",
+   "upstream_state": "RED: own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['15 failed in 8.36s'] FM:['15 passed in 3.85s']; upstream _schedule_display_for_job@cron/jobs.py:477 returns schedule.display/expr verbatim",
+   "upstream_fix": "none",
+   "fires": "every `cron list` render; live stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 217,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic UX, stdlib-only humanizer."
+ },
+ "#791": {
+  "verdict": "KEEP",
+  "problem": "Stale writer under degraded flock overwrote sibling jobs' fields (3 jobs vanished / lost run state 2026-09-20); adds by-id field merge + vanished-job journal/warning.",
+  "evidence": {
+   "original": "PR #791 body (incident 2026-09-20, '16:10:59 Timed out after 30s waiting for the cron jobs lock').",
+   "upstream_state": "partial GREEN: upstream _merge_unexpected_disk_jobs@cron/jobs.py:1449 preserves whole missing jobs (concurrent creates); no field-level merge for EXISTING jobs, no vanished-job journal. own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 error in 2.17s', '1 error in 2.45s'] FM:['1 failed, 13 passed in 6.94s', '14 passed in 10.29s']",
+   "upstream_fix": "4d84aa2a63 (2026-08-07 preserve concurrent creates) — covers the vanished-create half only",
+   "fires": "field-merge log lines 'fields this writer did not modify kept...' 1 + \"sibling's values instead of being reverted\" 1; 'Preserved N cron job(s)' 2; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 1082,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "#815"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Measured but rare (2 fires). The create-preservation half duplicates upstream — trim to field merge + journal at next sync; field merge is an UPSTREAM candidate. 1082 loc; #815 depends."
+ },
+ "#815": {
+  "verdict": "KEEP",
+  "problem": "7 P1 races/false-greens in #791's vanished-job guard.",
+  "evidence": {
+   "original": "PR #815 body (FleetReview findings).",
+   "upstream_state": "read-only: cron/lifecycle_journal.py is fork-only (absent upstream). own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 error in 2.56s', '1 failed, 14 deselected in 8.59s'] FM:['34 passed in 10.54s', '1 passed, 14 deselected in 2.16s']",
+   "upstream_fix": "n/a",
+   "fires": "no distinct log marker; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 566,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": [
+     "#791"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #791."
+ },
+ "#532": {
+  "verdict": "UPSTREAM",
+  "problem": "Interrupted run (outcome lost to restart) stored last_status=error instead of unknown.",
+  "evidence": {
+   "original": "PR #532 body.",
+   "upstream_state": "RED: own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 failed, 5 passed in 5.59s'] FM:['6 passed in 4.20s']; upstream executions ledger has 'unknown' (cron/executions.py:33) but jobs.json last_status via mark_job_run stays ok/error",
+   "upstream_fix": "none",
+   "fires": "no marker; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 170,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "#521"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Generic, small."
+ },
+ "#521": {
+  "verdict": "UPSTREAM",
+  "problem": "Owner dies mid-run -> jobs.json keeps previous run's timestamp forever (only executions ledger reconciled).",
+  "evidence": {
+   "original": "PR #521 body.",
+   "upstream_state": "RED: own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 failed, 2 passed in 8.36s'] FM:['3 passed in 3.13s']; upstream recover_interrupted@cron/scheduler_provider.py:149 -> recover_interrupted_executions only (ledger), no jobs.json reconcile",
+   "upstream_fix": "none",
+   "fires": "'lost to a scheduler restart' 57 log lines; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 205,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": [
+     "#532"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Measured, generic."
+ },
+ "#462": {
+  "verdict": "KEEP",
+  "problem": "Gateway shutdown drain waited on in-flight cron scripts but could not cancel them.",
+  "evidence": {
+   "original": "PR #462 body.",
+   "upstream_state": "read-only: upstream shutdown calls mark_running_jobs_interrupted@cron/scheduler.py:1054 after process_registry.kill_all (marks, does not kill scripts); script termination exists only on timeout (_terminate_cron_script_process@cron/scheduler_script.py:163). own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['8 errors in 5.36s'] FM:['8 passed in 3.30s'] (errors = fork-only symbols)",
+   "upstream_fix": "none found",
+   "fires": "'Cron scheduler shutdown signalled:' 517 log lines (every gateway stop); 'Script exited with code' 12; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 404,
+    "conflict_syncs": 3,
+    "conflict_files": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fires on every restart. UPSTREAM candidate once re-homed onto scheduler_script.py; adversary should confirm upstream really leaves no_agent scripts running through the drain."
+ },
+ "#323": {
+  "verdict": "KEEP",
+  "problem": "Recurring job paged a raw relay 503 ('no eligible sub') on a momentary blip.",
+  "evidence": {
+   "original": "PR #323 body (skill-patch-applier).",
+   "upstream_state": "RED: own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['22 failed, 1 passed in 15.04s'] FM:['23 passed in 3.39s']; upstream classifies only resolve-time transient net errors (_is_transient_provider_resolve_error@cron/scheduler_preflight.py:41)",
+   "upstream_fix": "none",
+   "fires": "0 log lines (suppression silent; not measurable from logs); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 350,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fleet-specific (claude relay 503 shape). WEAK: unmeasured firing — lead may downgrade to DROP if relay 503s no longer occur."
+ },
+ "#1027": {
+  "verdict": "UPSTREAM",
+  "problem": "No per-job script ceiling: a 15-min job ran 95 min, holding cron-parallel slots.",
+  "evidence": {
+   "original": "PR #1027 body, card t_0deada39 (gemini-usage-refresh).",
+   "upstream_state": "RED: own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['1 error in 2.55s'] FM:['16 passed in 7.81s']; upstream _get_script_timeout@cron/scheduler_script.py:66 is global only; no timeout_s",
+   "upstream_fix": "none",
+   "fires": "PHASE=cron_script_timeout 6 log lines (merged 09-25); 1 job sets timeout_s; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 294,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "nopr:e77a87d63a"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Measured, generic. Lives in fork-only cron/fork_ext/scheduler_ext.py."
+ },
+ "nopr:e77a87d63a": {
+  "verdict": "KEEP",
+  "problem": "Extract fork-only scheduler helpers into cron/fork_ext/ to shrink scheduler.py conflicts.",
+  "evidence": {
+   "original": "commit (refactor, no incident).",
+   "upstream_state": "n/a (fork structure; cron/fork_ext absent upstream)",
+   "upstream_fix": "n/a",
+   "fires": "n/a (refactor)",
+   "cost": {
+    "loc": 114,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "#1027",
+     "#126"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Structural cost-reducer, not a behavior patch. Follows the fate of the helpers it hosts (#1027, reasoning helper = #126)."
+ },
+ "#922": {
+  "verdict": "KEEP",
+  "problem": "Delegate + cron flagship-model admission re-ported onto the landed validate_worker_model policy; logs 'flagship override:'.",
+  "evidence": {
+   "original": "PR #922 body (#812/#823).",
+   "upstream_state": "read-only: fleet model policy (validate_worker_model, --allow-flagship) has no upstream counterpart. own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['20 failed in 14.49s'] FM:['20 passed in 16.00s']",
+   "upstream_fix": "none",
+   "fires": "'flagship override: cron create id=' 4 + 'auto-pin' 4 log lines; 6 jobs carry allow_flagship_reason; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 412,
+    "conflict_syncs": 3,
+    "conflict_files": 6,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fleet policy (fleet-model-governance). 412 loc on 6 ledger files x3 — high conflict cost; lead may ask whether the policy can move to a plugin hook."
+ },
+ "#126": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Per-job reasoning_effort override for cron.",
+  "evidence": {
+   "original": "PR #126 body (Siftly briefs).",
+   "upstream_state": "GREEN (read-only): upstream per-job reasoning_effort: _normalize_reasoning_effort@cron/jobs.py:1646 + scheduler.py:515-524 'using per-job reasoning_effort'",
+   "upstream_fix": "upstream per-job reasoning_effort (same field name; sha deferred to adversary)",
+   "fires": "5 scheduled jobs set reasoning_effort — same key upstream reads; live stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 170,
+    "conflict_syncs": 3,
+    "conflict_files": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Drop ours; the 5 live jobs keep working on upstream's field."
+ },
+ "#388": {
+  "verdict": "KEEP",
+  "problem": "model='auto' pins a new LLM cron to the creating agent's own model (stop unpinned crons inheriting Opus).",
+  "evidence": {
+   "original": "PR #388 body (cron-config-lint recurring pages).",
+   "upstream_state": "read-only: no 'auto' model handling in upstream tools/cronjob_tools.py / cron/jobs.py (grep 0)",
+   "upstream_fix": "none",
+   "fires": "\"auto-pin: inherited creating agent's own elected model\" 4 log lines; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 556,
+    "conflict_syncs": 3,
+    "conflict_files": 5,
+    "dependents": [
+     "#1032",
+     "#922"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Fleet cost policy; #1032 depends."
+ },
+ "#1032": {
+  "verdict": "KEEP",
+  "problem": "'auto' sentinel persisted verbatim for script-mode jobs.",
+  "evidence": {
+   "original": "PR #1032 body, card t_2f1ca8d4.",
+   "upstream_state": "read-only: fork-only sentinel (#388). own tests (data/runtests.py: the row's added test fns copied into the tree, run with repo venv, PYTHONPATH=tree): UP:['8 errors in 5.83s'] FM:['8 passed in 7.32s']",
+   "upstream_fix": "n/a",
+   "fires": "0 model='auto' rows in live stores (the fix holds); live stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 209,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": [
+     "#388"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #388."
  }
 }
