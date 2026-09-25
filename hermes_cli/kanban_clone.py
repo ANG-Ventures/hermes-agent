@@ -34,6 +34,13 @@ Mirrors are therefore created with:
 
 hermes-home's ``scripts/mirrors-never-prune-lint.py`` checks both the mirror
 configs and every tracked script for that.
+
+LOCAL SOURCES (card t_e122e9cd): ``git clone <local path>`` takes git's local
+shortcut and HARD-LINKS the source's packs into the clone. On 2026-09-25 one
+~/.hermes pack had 135 links; every git "freshen" (utime) of it emitted ~135
+FSEvents, and fseventsd/mds paid for each. A local-path source is therefore
+cloned with ``--no-local`` (real pack transport, no links), borrowing from the
+fleet mirror when the source's ``remote.origin.url`` is a fleet repo.
 """
 from __future__ import annotations
 
@@ -310,6 +317,22 @@ def ensure_mirror(url: str, owner: str, repo: str) -> Path:
     return mirror
 
 
+def local_source(url: str) -> Optional[Path]:
+    """The directory *url* names when git would take its hard-linking local
+    shortcut for it, else ``None``. ``file://`` URLs already use the pack
+    transport (git never hard-links them), so they are not "local" here."""
+    url = (url or "").strip()
+    if not url or "://" in url or parse_fleet_repo(url) is not None:
+        return None
+    path = Path(url).expanduser()
+    return path if path.is_dir() else None
+
+
+def _source_origin(path: Path) -> str:
+    res = _git("-C", str(path), "config", "--get", "remote.origin.url")
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
 def clone(url: str, dest: Optional[str] = None, git_opts: Sequence[str] = ()) -> int:
     """Clone *url* into *dest*, borrowing objects from a fleet mirror if any.
 
@@ -323,11 +346,17 @@ def clone(url: str, dest: Optional[str] = None, git_opts: Sequence[str] = ()) ->
     dest = dest or default_dest(url)
     cmd = ["git", "clone"]
     opts = list(git_opts)
-    fleet = parse_fleet_repo(url)
+    mirror_url = url
+    local = local_source(url)
+    if local is not None:
+        # Never hard-link a local source's packs (see module docstring).
+        cmd.append("--no-local")
+        mirror_url = _source_origin(local)
+    fleet = parse_fleet_repo(mirror_url)
     if fleet is not None:
         owner, repo = fleet
         try:
-            mirror = ensure_mirror(url, owner, repo)
+            mirror = ensure_mirror(mirror_url, owner, repo)
             cmd += ["--reference-if-able", str(mirror)]
             # A partial clone ignores the reference: git fetches every object
             # the filter keeps instead of borrowing it. Measured on hermes-home:
