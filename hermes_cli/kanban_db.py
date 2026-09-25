@@ -9383,11 +9383,30 @@ def complete_task(
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
+    # A reviewer approval (the active run was claimed from ``review``) that
+    # names the reviewed PR head writes the APPROVE review_coverage record
+    # card-sourced land requests read as the review of record (t_7fee0f83).
+    # Validated here, before any mutation; an implementer run never writes one.
+    approve_head_sha: Optional[str] = None
+    if (
+        isinstance(metadata, dict)
+        and metadata.get("head_sha") is not None
+        and candidate.status == "running"
+        and candidate.current_run_id is not None
+        and _retry_status_for_run(conn, task_id, candidate.current_run_id) == "review"
+    ):
+        approve_head_sha = str(metadata["head_sha"]).strip()
+        if not _REVIEW_HEAD_SHA_RE.fullmatch(approve_head_sha):
+            raise ValueError(
+                "head_sha must be the reviewed PR head (7-40 hex characters)"
+            )
     # A completion whose evidence names a still-OPEN PR is a review handoff,
     # not ``done``: done releases dependants, and an unmerged PR has no owner
     # once the card is terminal (t_1bd02e0b, 2026-09-25). A card already in
-    # ``review`` is a reviewer/human approval and is left alone.
-    if candidate.status != 'review':
+    # ``review`` is a reviewer/human approval and is left alone; so is a
+    # claimed reviewer run approving with ``head_sha`` -- the PR it approved
+    # is OPEN by definition and the land queue merges it from that record.
+    if candidate.status != 'review' and not approve_head_sha:
         from hermes_cli import kanban_open_pr as _open_pr
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
@@ -9528,6 +9547,14 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if approve_head_sha:
+            add_comment(
+                conn, task_id, candidate.assignee or "reviewer",
+                "review_coverage: " + json.dumps(
+                    {"verdict": "approve", "head_sha": approve_head_sha}
+                ),
+                run_id=int(candidate.current_run_id),
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -12198,6 +12225,9 @@ def request_review(
 import unicodedata  # noqa: E402
 
 from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LENSES  # noqa: E402
+from hermes_cli.kanban_review_schema import HEAD_SHA_PATTERN as _HEAD_SHA_PATTERN  # noqa: E402
+
+_REVIEW_HEAD_SHA_RE = re.compile(_HEAD_SHA_PATTERN)
 # An ``n/a: <reason>`` lens value certifies the lens does not APPLY to the
 # deliverable. A reason that reports an INABILITY anywhere in it ("skipped",
 # "the reviewer could not run it", "mutmut missing on host", "budget
@@ -12352,6 +12382,10 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     batch = coverage.get("batch_id")
     if not isinstance(batch, str) or not batch.strip():
         return "batch_id must identify the single delegate_task batch in this comment"
+    head = coverage.get("head_sha")
+    if not (isinstance(head, str) and (_REVIEW_HEAD_SHA_RE.fullmatch(head.strip())
+                                        or _review_na_reason_ok(head))):
+        return "head_sha must be the reviewed PR head (7-40 hex) or 'n/a: <reason>' for a card with no PR"
     return None
 
 
