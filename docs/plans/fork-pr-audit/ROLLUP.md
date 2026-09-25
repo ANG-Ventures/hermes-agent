@@ -194,3 +194,23 @@ revert branch or one upstream port, each row still has its own card, and the car
 shared branch. Only two spec-sanctioned exceptions share a card: `auto` tests/docs rows join the card of the code they test
 (step 3: "a tests-only row whose code got DROP joins that revert"), and the 37 `auto-desktop-retired` rows share one card
 t_899f0539 for the single combined branch `audit/final-revert-desktop-retired` (step 3).
+
+## 9. Card reconciliation and the 24 UNRESOLVED rows
+
+Arithmetic (from `lead/rows.json`, checked in `render.py`):
+- DROP 161 + UPSTREAM 93 = 254 rows need a card.
+- 254 = 202 non-auto rows + 37 `auto-desktop-retired` rows + 15 `auto` tests/docs rows.
+- The 202 non-auto rows map to 202 distinct cards, one row per card.
+- The 37 desktop rows map to 1 card, t_899f0539. The card spec (step 3) orders "one combined revert branch
+  `audit/final/revert-desktop-retired`"; one branch means one card. The branch had to be renamed
+  `audit/final-revert-desktop-retired` because a ref under `audit/final/` is blocked by the `audit/final` branch.
+- The 15 auto rows ride the card of the code row they test or document (step 3: "joins that revert").
+- Total: 202 + 1 = **203 slice cards**, plus 1 follow-up card for the UNRESOLVED rows (t_63023f77) = 204 created.
+
+UNRESOLVED (24): these rows are not KEEP. Step 2 says that when a verdict's evidence cannot be measured, the row is re-opened as
+UNRESOLVED instead. None of them carries a DROP/UPSTREAM verdict, so step 7 gives them no per-row card.
+All 24 are handed to t_63023f77, which names the measurement each row needs:
+hermes_cli ×16 (#907 #879 #858 #798 #620 #579 #441 #326 #291 #215 #166 #135 #33 nopr:8a8b81638c #18 #17: silent
+guards and display fixes with no log, event or DB signal), gateway ×2 (#356 empty-resume guard, #358 empty prompt.submit),
+scripts+misc ×5 (#780 needs a bridge-side counter; nopr:7c3d5cdd0f, #894 and nopr:8dcc69611c are product code that belongs to other
+tranches; #695 merge-queue flake not reproduced), auto ×1 (nopr:08fc3aff65 follows nopr:8dcc69611c).
