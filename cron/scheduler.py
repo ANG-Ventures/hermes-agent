@@ -307,6 +307,76 @@ def _failure_streak_nudge(job: dict) -> str:
     )
 
 
+# A no_agent job whose script fails with the byte-identical error this many
+# ticks in a row is stuck, not flaky: page ONCE with the full cause and a fix
+# hint, then stay quiet until the error changes or the job recovers
+# (t_04822736 — agent-browser-gc failed identically for 19 hourly ticks and
+# every per-tick alert was a truncated one-liner that never named the cause).
+_REPEATED_ERROR_PAGE_TICKS = 3
+
+_REPEATED_ERROR_FIX_HINTS = (
+    (
+        "blocked: script path resolves outside the scripts directory",
+        "The job's script (or a symlink to it) resolves outside this "
+        "profile's scripts/ dir. Put the file in the profile's scripts/, or "
+        "symlink it from there into the shared <hermes root>/scripts/ (the "
+        "only escape the guard admits).",
+    ),
+    (
+        "script not found",
+        "The script file is missing — restore it, or point the job at the "
+        "right file with `hermes cron edit {job_id} --script <file>`.",
+    ),
+    (
+        "script timed out",
+        "The script hangs every tick — fix the hang, or raise the job's "
+        "timeout if the work is genuinely slow.",
+    ),
+)
+
+
+def _repeated_script_error_page(job: dict, error: str | None) -> str | None:
+    """Alert-once gate for a no_agent job stuck on the same error.
+
+    Returns ``None`` to leave normal per-run failure delivery untouched, the
+    one-time page text when this run is the Nth consecutive identical failure
+    (N = ``_REPEATED_ERROR_PAGE_TICKS``), or ``""`` (suppress) for every
+    identical failure after that. Any change of error string, or a success,
+    resets ``error_repeat_streak`` in ``mark_job_run`` so the next distinct
+    failure alerts normally again. Read before ``mark_job_run`` records this
+    run, hence the prospective +1.
+    """
+    if not job.get("no_agent") or not error:
+        return None
+    if job.get("last_status") == "error" and job.get("last_error") == error:
+        streak = int(job.get("error_repeat_streak") or 0) + 1
+    else:
+        streak = 1
+    if streak < _REPEATED_ERROR_PAGE_TICKS:
+        return None
+    if streak > _REPEATED_ERROR_PAGE_TICKS:
+        return ""
+    job_id = job.get("id") or "<job_id>"
+    job_name = job.get("name") or job_id
+    cause = str(error).strip()
+    if len(cause) > 1500:
+        cause = cause[:1500] + " …"
+    lower = cause.lower()
+    hint = next(
+        (h for needle, h in _REPEATED_ERROR_FIX_HINTS if needle in lower),
+        "Fix the script, then verify with `hermes cron run {job_id}`; or "
+        "pause it with `hermes cron pause {job_id}`.",
+    ).format(job_id=job_id)
+    return (
+        f"🚨 Cron '{job_name}' ({job_id}) is stuck: its script has failed "
+        f"with the same error {streak} runs in a row.\n\n"
+        f"Cause: {cause}\n\n"
+        f"Fix: {hint}\n\n"
+        "Further identical failures are not paged; you will hear again "
+        "when the error changes."
+    )
+
+
 def _detect_gateway_code_skew() -> tuple[str, str] | None:
     """Boot-vs-disk revision skew for THIS process, or None.
 
@@ -4753,6 +4823,56 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _shared_scripts_dir(home: Path) -> Optional[Path]:
+    """Resolved ``<root>/scripts`` when *home* is a named profile, else None.
+
+    A named profile home is ``<root>/profiles/<name>``; its fleet-shared
+    scripts dir is the default root's ``scripts/``. The default (root) home
+    has no separate shared dir — its own scripts dir already is the shared one.
+    """
+    try:
+        from hermes_constants import named_profile_home
+
+        resolved = home.resolve()
+        if named_profile_home(resolved) != resolved:
+            return None
+        return (resolved.parent.parent / "scripts").resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _script_path_admitted(
+    path: Path, lexical: Path, scripts_dir: Path, home: Path
+) -> bool:
+    """Whether a resolved cron script path passes the scripts-dir guard.
+
+    *path* is the fully resolved target, *lexical* the absolute, ``..``
+    normalised but NOT symlink-resolved path. Admitted when the realpath is
+    inside the profile's own scripts dir, or when the entry sits lexically in
+    that dir and resolves (via symlink) into the fleet-shared
+    ``<root>/scripts``. ``..`` traversal, absolute paths and symlinks
+    pointing anywhere else stay refused.
+    """
+    scripts_dir_resolved = scripts_dir.resolve()
+    if _path_within(path, scripts_dir_resolved):
+        return True
+    shared = _shared_scripts_dir(home)
+    if shared is None or shared == scripts_dir_resolved:
+        return False
+    lexically_in_profile = _path_within(
+        lexical, Path(os.path.abspath(scripts_dir))
+    ) or _path_within(lexical, scripts_dir_resolved)
+    return lexically_in_profile and _path_within(path, shared)
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -4824,15 +4944,19 @@ def _run_job_script(
         # the scheduler with an unhandled exception.
         return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
     if raw.is_absolute():
+        lexical = Path(os.path.abspath(raw))
         path = raw.resolve()
     else:
+        lexical = Path(os.path.abspath(scripts_dir / raw))
         path = (scripts_dir / raw).resolve()
 
     # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
+    # escape — scripts MUST reside within HERMES_HOME/scripts/. One exception:
+    # an entry that lives (lexically) in a named profile's scripts dir and is
+    # a symlink into the fleet-shared <root>/scripts is admitted — profiles
+    # legitimately share scripts, and refusing that symlink left a job failing
+    # identically every tick for 19 h (t_04822736).
+    if not _script_path_admitted(path, lexical, scripts_dir, _get_hermes_home()):
         return False, (
             f"Blocked: script path resolves outside the scripts directory "
             f"({scripts_dir_resolved}): {script_path!r}"
@@ -8337,10 +8461,14 @@ def _run_one_job_body(
                     if incident_acked and not drift_skip:
                         deliver_content = ""
                     else:
-                        deliver_content = (
-                            _summarize_cron_failure_for_delivery(job, error)
-                            + _failure_streak_nudge(job)
-                        )
+                        _stuck_page = _repeated_script_error_page(job, error)
+                        if _stuck_page is not None:
+                            deliver_content = _stuck_page
+                        else:
+                            deliver_content = (
+                                _summarize_cron_failure_for_delivery(job, error)
+                                + _failure_streak_nudge(job)
+                            )
                 if drift_skip and not success:
                     # Drift-skip alert: bypass the generic summarizer's
                     # 180-char truncation (it would eat the remediation
@@ -8555,8 +8683,12 @@ def _run_one_job_body(
             incident_acked, failure_incident_id = _upsert_incident_for_failure(
                 job, _err_text
             )
+            _stuck_page = _repeated_script_error_page(job, _err_text)
             if incident_acked:
                 delivery_outcome = "suppressed_acked"
+            elif _stuck_page == "":
+                # Same alert-once gate as the normal failure path above.
+                pass
             else:
                 try:
                     delivery_attempted = True
@@ -8568,8 +8700,11 @@ def _run_one_job_body(
                         # run body every tick builds a streak nobody is ever told
                         # about: its alerts only ever leave through here, and the
                         # nudge only ever left through there (#88655).
-                        _summarize_cron_failure_for_delivery(job, _err_text)
-                        + _failure_streak_nudge(job),
+                        _stuck_page
+                        or (
+                            _summarize_cron_failure_for_delivery(job, _err_text)
+                            + _failure_streak_nudge(job)
+                        ),
                         adapters=adapters,
                         loop=loop,
                     )

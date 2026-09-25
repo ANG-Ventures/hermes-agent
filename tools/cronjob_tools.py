@@ -1254,6 +1254,23 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     scripts_dir.mkdir(parents=True, exist_ok=True)
     containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
     if containment_error:
+        # Same exception as the fire-time guard: an in-dir symlink into the
+        # fleet-shared <root>/scripts is a legitimate shared script.
+        import os
+
+        from cron.scheduler import _script_path_admitted
+
+        try:
+            if _script_path_admitted(
+                (scripts_dir / raw).resolve(),
+                Path(os.path.abspath(scripts_dir / raw)),
+                scripts_dir,
+                get_hermes_home(),
+            ):
+                containment_error = None
+        except (OSError, RuntimeError, ValueError):
+            pass
+    if containment_error:
         return (
             f"Script path escapes the scripts directory via traversal: {raw!r}"
         )
