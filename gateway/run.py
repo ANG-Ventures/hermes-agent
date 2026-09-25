@@ -17220,19 +17220,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gateway import restart_loop_guard as _rlg
 
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                # 2026-09-22: the per-runner ``_restart_loop_guard_recorded_this_boot``
-                # flag that used to gate this call lived on the GatewayRunner
-                # instance, so it only deduplicated scans routed through this one
-                # object and never reached the on-disk ledger. The guard itself now
-                # records at most once per process boot identity, which covers every
-                # caller and makes restart_loop.json forensically honest. Keeping the
-                # instance flag as well double-suppressed the scans: the module-layer
-                # dedupe became untestable through this path (removing it left the
-                # regression test green). Call the guard unconditionally and let it
-                # own the dedupe.
-                _tripped = _rlg.check_and_record(
-                    _max_restarts, _window, max_gap_seconds=_max_gap
-                )
+                if not getattr(self, "_restart_loop_guard_recorded_this_boot", False):
+                    _tripped = _rlg.check_and_record(
+                        _max_restarts, _window, max_gap_seconds=_max_gap
+                    )
+                    self._restart_loop_guard_recorded_this_boot = True
+                else:
+                    _tripped = _rlg.is_restart_loop_tripped(
+                        _max_restarts, _window, max_gap_seconds=_max_gap
+                    )
                 if _tripped:
                     # F2 is armed whenever the per-session breaker is enabled,
                     # which (given the max(1, ...) clamp) it always is. The
