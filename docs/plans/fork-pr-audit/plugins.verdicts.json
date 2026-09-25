@@ -263,7 +263,7 @@
    }
   },
   "branch": null,
-  "notes": "Dead-by-replacement, not dead-by-bug. Revert branch NOT built this run: #248's gbrain leg shares the 'leg' plumbing #146 introduced, so a mechanical revert would take #248 with it \u2014 the drop is 'remove qmd_recall.py + the QMD toggle, keep the leg abstraction', a small authored change, not `git revert`. Adversary check: confirm no profile runs gbrain disabled + qmd enabled (all 11 mem0 profiles share ~/.hermes/mem0.json? \u2014 per-profile mem0.json not audited).",
+  "notes": "Dead-by-replacement, not dead-by-bug: 'qmd' = 0 lines in agent.log/.1 (5 anywhere) vs 'gbrain' 304; mem0.json has both legs enabled and __init__.py:1309-1314 makes gbrain supersede QMD per lane. NO revert branch, two reasons: (1) D8 \u2014 the fork comment at __init__.py:1309 says 'QMD stays configured + untouched for instant rollback', i.e. the dormancy is a deliberate rollback path, not neglect; (2) gbrain_recall.py reuses qmd_recall.is_lookup_intent/join_blocks (gbrain_recall.py:60,:251), so `git revert` or deleting qmd_recall.py breaks #248. The honest drop is an authored removal (~35 QMD references in __init__.py + 3 test files + testdata, keeping the two shared helpers) landed only after Ace retires the rollback intent. Adversary: overturn to KEEP if the rollback path is still wanted; otherwise this is a plugin-cleanup card, not a revert.",
   "subsystem": "plugins/memory",
   "subject": "feat(mem0): QMD-in-mem0 unified recall + operator toggles (#146)"
  },
@@ -1013,7 +1013,7 @@
   "problem": "Plugin loaders set sys.modules[name]=mod BEFORE exec_module; concurrent child agents in a shared ThreadPoolExecutor could grab a half-initialized module (no register()/engine class yet).",
   "evidence": {
    "original": "PR #412 body (2026-07-21).",
-   "upstream_state": "RED by read: NousResearch ../up/plugins/plugin_loader.py:75 `sys.modules[name] = mod` then :85 `exec_module(mod)` with no lock in that module (b54cc716c7 2026-09-02 'shared path-based plugin loader'); only plugins/memory/__init__.py:381 gained a `_discovery_lock` (684a2cfbd7) and it guards discovery, not the exec window for context_engine/cron_providers.",
+   "upstream_state": "RED (live): fork test re-targeted at upstream's shared loader (tests/plugins/test_plugin_loader_import_race.py) on upstream/main 59004a6235 -> 2 failed ('thread B observed a half-initialized module and fell back'; plugin_loader has no _LOAD_LOCK). Root: ../up/plugins/plugin_loader.py:75 sys.modules[name]=mod, :85 exec_module, :102-105 cached fast-path returns any entry with __file__ \u2014 no lock (b54cc716c7 2026-09-02 shared loader); memory/__init__.py:381 _discovery_lock (684a2cfbd7) guards discovery only.",
    "upstream_fix": "none (684a2cfbd7 partial, memory only)",
    "fires": "0 log lines (a race; the fork's fix is silent). Structural proof only: delegation.max_concurrent_children: 32 live.",
    "cost": {
@@ -1023,8 +1023,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Generic. Re-port target is upstream's single plugin_loader.py (one lock), not the fork's three per-loader locks. Upstream branch to be built in the branch pass (audit/plugins/upstream-412) \u2014 needs re-authoring against plugin_loader.py, not a rebase. 0 conflict.",
+  "branch": "audit/plugins/upstream-412",
+  "notes": "Generic. Re-authored (not rebased) against upstream's single plugin_loader.py: one RLock around load_plugin_module, cached fast path inside it. Branch audit/plugins/upstream-412 @ 7db59423ba on upstream/main. Verified: `pytest tests/plugins/test_plugin_loader_import_race.py tests/plugins/test_plugin_loader.py tests/plugins/test_plugin_loader_unreadable.py -q -o addopts=''` -> 5 passed (race file alone: 2 failed before, 2 passed after). 0 conflict.",
   "subsystem": "plugins/context_engine",
   "subject": "fix(plugins): serialize plugin loader import critical-section to close partial-import race (#412)"
  },
@@ -1161,8 +1161,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "CORRECTED mid-run: first draft said SUPERSEDED because a probe misattributed the fork's guard lines to the upstream file. Generic fix (no fleet-private concept; _is_past fails open on unparseable timestamps). Upstream branch audit/plugins/upstream-580 to be built in the branch pass; the fork commit is a clean 2-file diff (chronos/__init__.py + tests) with no fork-only symbols.",
+  "branch": "audit/plugins/upstream-580",
+  "notes": "CORRECTED mid-run: first draft said SUPERSEDED because a probe misattributed the fork's guard lines to the upstream file. Generic fix (no fleet-private concept; _is_past fails open on unparseable timestamps). Upstream branch audit/plugins/upstream-580 @ 1213721a34 on upstream/main 59004a6235 (cherry-pick c9b0c3b826 with 4 hunks re-threaded onto upstream's reshaped chronos: identity_rejected early-return, compact reconcile(); upstream's newer tests hardcoded 2026-06-18 fire times which the guard now correctly refuses -> future fixtures). Verified: `pytest tests/plugins/test_chronos_cron.py -q -o addopts=''` -> 20 passed in 2.84s (pristine upstream same file: 15 passed). PR body written without fork references.",
   "subsystem": "plugins/cron_providers",
   "subject": "fix(cron): never arm a one-shot whose fire_at is already in the past (#580)"
  },
@@ -1444,8 +1444,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Generic (any self-hosted mem0 behind a private CA). Re-author as a `ca_bundle` config key -> httpx.HTTPTransport(verify=...) in upstream's _backend.py \u2014 a ~10-line PR; not a rebase of the fork commit (different file). Upstream branch not built this run. 2 conflict (2).",
+  "branch": "audit/plugins/upstream-59ed0e41a1",
+  "notes": "Generic (any self-hosted mem0 behind a private CA). Re-authored against upstream's _backend.py (not a rebase): `ca_bundle` mem0.json key -> httpx.HTTPTransport(retries=2, verify=path); empty keeps default verification; injectable transport unchanged. Branch audit/plugins/upstream-59ed0e41a1 @ 680607f9c9 on upstream/main 59004a6235. Verified: `pytest tests/plugins/memory/test_mem0_backend.py tests/plugins/memory/test_mem0_providers.py -q -o addopts=''` -> 20 passed (pristine: 19); new test RED on main (unexpected keyword 'ca_bundle'); ruff clean. 2 conflict (2).",
   "subsystem": "plugins/memory",
   "subject": "mem0 client: optional CA bundle for private-CA HTTPS (mem0.ace cutover fix)"
  },
@@ -1486,8 +1486,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Generic defensive fix on upstream's own tool. Upstream branch audit/plugins/upstream-dc4245ab4c in the branch pass (small: one guard + one test). 0 conflict.",
+  "branch": "audit/plugins/upstream-dc4245ab4c (Kyzcreig/hermes-lcm)",
+  "notes": "Generic defensive fix on upstream's own tool. Branch audit/plugins/upstream-dc4245ab4c @ 15590f0 on Kyzcreig/hermes-lcm, based on 8d1b1e6: _ExpansionSynthesisError + guarded choices access in tools.py, caught at the lcm_expand_query call site next to the existing TimeoutError degrade. Test added beside upstream's own degrade tests: tests/test_lcm_engine.py::TestEngineTools::test_handle_expand_query_malformed_synthesis_response_is_degraded \u2014 RED on pristine tools.py = `TypeError: 'NoneType' object is not subscriptable` (the live symptom), GREEN with the guard; 3 passed with the adjacent timeout/unexpected-error tests; ruff clean. 0 conflict.",
   "subsystem": "plugins/context_engine",
   "subject": "fix(lcm): lcm_expand_query degrades on malformed aux-LLM response (concurrency)"
  },
@@ -1506,8 +1506,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Generic, small, upstream's own line. Upstream branch audit/plugins/upstream-902 in the branch pass. 0 conflict.",
+  "branch": "audit/plugins/upstream-902 (Kyzcreig/hermes-lcm)",
+  "notes": "Generic, upstream's own line. Branch audit/plugins/upstream-902 @ d3c7af1 on Kyzcreig/hermes-lcm, based on stephenschoettler/hermes-lcm 8d1b1e6 (D1a): gate the UPDATE behind their existing lcm_migration_state marker (+ is_migration_step_complete helper, 6 lines) + tests/test_ingested_at_backfill_once.py. Verified in the LCM CI shape (agent/ stub, /tmp/lcm-venv py3.11): RED with the gate removed = 2/3 fail ('UPDATE messages SET ingested_at ...' re-issued on second open; step not marked), GREEN 3 passed; tests/test_db_bootstrap_fts.py 45 passed with it; ruff clean. PR body in their Summary/Why/Validation template, no fork references. 0 conflict.",
   "subsystem": "plugins/context_engine",
   "subject": "fix(lcm): the ingested_at backfill was the SECOND full-table scan on every boot \u2014 gate one-time backfills behind lcm_migration_state (#902)"
  },
