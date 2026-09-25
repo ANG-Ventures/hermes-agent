@@ -278,33 +278,6 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
-# Benign-decline buckets on a ``DispatchResult``: the dispatcher looked at the
-# board and chose NOT to spawn for a self-clearing reason (a concurrency cap is
-# saturated, a worker bounced off a provider rate-limit / quota wall, another
-# process holds the board lock, or a respawn guard is cooling a task down).
-# None of these are operator-actionable — the work resumes on a later tick — so
-# a zero-spawn tick explained by any of them must NOT count toward the "stuck"
-# streak. See the field docstrings on ``kanban_db.DispatchResult``.
-_BENIGN_DECLINE_FIELDS = (
-    "skipped_per_profile_capped",
-    "rate_limited",
-    "respawn_guarded",
-    "skipped_locked",
-)
-# Genuine-fault buckets: the dispatcher TRIED to spawn and the attempt failed.
-# ``spawn_failed`` is populated on EVERY spawn failure this tick (workspace
-# resolution or worker launch), so an early, pre-circuit-breaker failure on one
-# board is a fault immediately — it can't be masked by a benign decline on a
-# different board and silently reset the streak. ``auto_blocked`` is the subset
-# that additionally tripped the circuit breaker (broken venv / PATH / credential
-# loss → repeated spawn_failed). Either forces the tick to count.
-_FAULT_FIELDS = (
-    "workspace_refused",
-    "spawn_failed",
-    "auto_blocked",
-)
-
-
 def format_home_line(session_id: Optional[str], row: Optional[dict] = None) -> str:
     """``home: <platform> #<channel> \u00b7 session <id>`` for a card's home
     session, or ``""`` when the card has none. ``row`` is the state.db
@@ -615,38 +588,6 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
         logger.exception("kanban dispatcher: guard-stuck page failed")
         return False
     return proc.returncode == 0
-
-
-def _stall_streak_is_bad(ready_pending, any_spawned, results, *, guard_stuck=False) -> bool:
-    """Decide whether a dispatcher tick counts toward the "stuck" streak.
-
-    A tick is "bad" (stall-suspect) only when there is spawnable work,
-    nothing was spawned, AND the zero-spawn is not explained by a benign,
-    self-clearing decline (concurrency cap saturated / provider rate-limit /
-    board lock held / respawn guard). A genuine hard fault (circuit-breaker
-    ``auto_blocked``) always counts even if a benign decline co-occurs on
-    another board.
-
-    This is the fix for the false "check profile health (venv, PATH,
-    credentials)" warning that fired for ~2h during a provider 429 window /
-    large fan-out, when the dispatcher was healthy but throttled.
-    """
-    if guard_stuck:
-        return True
-    if not ready_pending or any_spawned:
-        return False
-    declined_benign = False
-    fault_seen = False
-    for _slug, res in (results or []):
-        if res is None:
-            continue
-        for name in _FAULT_FIELDS:
-            if getattr(res, name, None):
-                fault_seen = True
-        for name in _BENIGN_DECLINE_FIELDS:
-            if getattr(res, name, None):
-                declined_benign = True
-    return fault_seen or not declined_benign
 
 
 def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
@@ -2755,23 +2696,7 @@ class GatewayKanbanWatchersMixin:
                                     ", ".join(parents), ", ".join(children),
                                 )
                                 last_stranded_warn_at[slug] = now_s
-                    # Health telemetry (aggregate across boards).
-                    #
-                    # A tick with ready work but zero spawns is only a REAL stall
-                    # when the dispatcher tried and FAILED (broken venv/PATH/creds
-                    # → spawn_failed / circuit-breaker auto_block). It is NOT a
-                    # stall when the dispatcher DECLINED for a benign, self-clearing
-                    # reason: every eligible profile is at its concurrency cap, a
-                    # worker bailed on a provider rate-limit / quota wall (released
-                    # to ``ready`` without counting a failure), or another process
-                    # holds the board's dispatch lock. Those "declined" states look
-                    # identical to a hard failure through the ``not any_spawned``
-                    # lens, which historically mis-fired the "check profile health
-                    # (venv, PATH, credentials)" warning for hours during a large
-                    # fan-out or a provider-side 429 window (the assignee was simply
-                    # throttled, not broken). ``_stall_streak_is_bad`` consults the
-                    # DispatchResult buckets so telemetry can tell "busy/throttled"
-                    # from "genuinely stuck" instead of guessing.
+                    # Health telemetry (aggregate across boards)
                     guard_stuck, observed_boards = await service(_guard_stuck_cards, results)
                     guard_pages = await service(
                         guard_stuck_notifier.observe, guard_stuck, _send_guard_stuck_alert,
@@ -2781,8 +2706,7 @@ class GatewayKanbanWatchersMixin:
                         logger.error("kanban dispatcher: %d guarded card(s) STUCK; "
                                      "#alerts paged with diagnostics", guard_pages)
                     ready_pending = await service(_ready_nonempty)
-                    if _stall_streak_is_bad(ready_pending, any_spawned, results,
-                                            guard_stuck=bool(guard_stuck)):
+                    if guard_stuck or (ready_pending and not any_spawned):
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
@@ -2798,9 +2722,8 @@ class GatewayKanbanWatchersMixin:
                         else:
                             logger.warning(
                                 "kanban dispatcher stuck: ready queue non-empty for "
-                                "%d consecutive ticks but 0 workers spawned, with no "
-                                "benign decline (cap/rate-limit/lock) to explain it. "
-                                "Check profile health (venv, PATH, credentials) and "
+                                "%d consecutive ticks but 0 workers spawned. Check "
+                                "profile health (venv, PATH, credentials) and "
                                 "`hermes kanban list --status ready`.",
                                 bad_ticks,
                             )
