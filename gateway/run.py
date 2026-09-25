@@ -7560,7 +7560,34 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            # Stop-during-pre-flight gate (2026-09-24 incident, Discord
+            # #claude-bridge): a /stop that lands while this turn is still
+            # in pre-flight (agent not yet built, slot holds the PENDING
+            # sentinel) bumps the run generation but has no agent to
+            # interrupt. Without this check the turn then enters
+            # run_conversation anyway, acquires the durable turn lease and
+            # runs to completion — 87 API calls over an hour — with every
+            # result discarded as stale, while the user's replacement turn
+            # waits the full lease budget and dies with "Another Hermes
+            # process kept this session busy too long". Refuse to start.
+            if not ctx._run_still_current():
+                logger.warning(
+                    "Refusing to start stale turn for %s — generation %s was "
+                    "invalidated during pre-flight (stopped); no lease acquired, "
+                    "no API calls",
+                    ctx.session_key or "?",
+                    ctx.run_generation,
+                )
+                result = {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 0,
+                    "interrupted": True,
+                    "completed": False,
+                    "stale_run_generation": True,
+                }
+            else:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -15079,7 +15106,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             PriorLifeVerdict,
             classify_prior_life,
             read_last_event_loop_blocked_site,
-            read_planned_restart,
+            read_planned_restart_for_sentinel,
         )
 
         home = getattr(self, "_unclean_restart_home", None)
@@ -15095,12 +15122,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             site = getattr(self, "_unclean_restart_site", None)
             if site is None:
                 site = read_last_event_loop_blocked_site(home)
-            planned = None
-            try:
-                _ended = (sentinel or {}).get("prior_exited_at") or (sentinel or {}).get("prior_started_at")
-                planned = read_planned_restart(_ended, home)
-            except Exception:
-                planned = None
+            # Reference time + pid identity live in ONE helper: a SIGKILLed prior
+            # life has no prior_exited_at, and the old fallback to
+            # prior_started_at (the PREVIOUS boot) read a requested restart as
+            # UNPLANNED (2026-09-24 12:12).
+            planned = read_planned_restart_for_sentinel(sentinel, home)
             verdict = classify_prior_life(sentinel, site=site, planned=planned)
         except Exception:
             logger.debug("Prior-life verdict unavailable", exc_info=True)

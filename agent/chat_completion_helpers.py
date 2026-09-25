@@ -40,6 +40,7 @@ from agent.confab_notice import (
     CONFAB_NOTICE_FIELD,
     CONFAB_NOTICE_KEY,
     extract_confab_notice,
+    is_metadata_only_tool_notice,
 )
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint, _ceil_chars_to_tokens
@@ -175,12 +176,34 @@ def _note_api_call_recording_failure(agent: Any) -> None:
 
 
 
+def _requested_cache_ttl(api_kwargs: dict | None) -> str | None:
+    """Read outbound cache markers, not the potentially clamped config tier."""
+    if not isinstance(api_kwargs, dict):
+        return None
+    found = set()
+    def walk(node):
+        if isinstance(node, dict):
+            marker = node.get("cache_control")
+            if isinstance(marker, dict) and marker.get("type") == "ephemeral":
+                found.add("1h" if marker.get("ttl") == "1h" else "5m")
+            for value in node.values():
+                if isinstance(value, (list, dict)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+    for key in ("system", "messages", "tools"):
+        walk(api_kwargs.get(key))
+    return "1h" if "1h" in found else "5m" if "5m" in found else None
+
+
 def _emit_api_call_record(
     agent: Any,
     *,
     usage: Any,
     headers: Optional[dict[str, str]] = None,
     http_status: Optional[int] = None,
+    api_kwargs: Optional[dict] = None,
 ) -> None:
     """Fail-open bridge from the inference chokepoint to Blackbox.
 
@@ -212,6 +235,7 @@ def _emit_api_call_record(
             http_status=http_status,
             relay_synthetic="x-pool-unreachable" in pool_headers,
             route_id=pool_headers.get("x-pool-route-id"),
+            cache_ttl_requested=_requested_cache_ttl(api_kwargs),
         )
     except Exception:
         _note_api_call_recording_failure(agent)
@@ -219,9 +243,47 @@ def _emit_api_call_record(
 
 
 
-def _record_successful_api_call(agent: Any, response: Any) -> None:
+def _note_billed_response(agent: Any, response: Any) -> None:
+    """Register a transport-accepted (billed) response for loop accounting.
+
+    The per-call ledger row is written HERE, at the transport chokepoint, for
+    every HTTP-200 the provider returns. The conversation loop's session
+    counters and Blackbox ``_turn_calls`` only commit the response the loop
+    ACCEPTS; one it rejects afterwards (content-filter refusal, invalid shape,
+    length/empty retry, redirect crossing) and fails over from was still
+    billed, and used to vanish from the turn totals (I4 class 2).
+
+    Every billed response is therefore parked in ``agent._billed_unaccounted``
+    together with the route that produced it (the provider/model change on
+    failover, so they must be captured now). The loop's accept site consumes
+    the entry it commits; anything still parked at the next attempt, or at
+    turn end, is settled by
+    ``conversation_loop._settle_unaccepted_billed_responses``.
+    Fail-open: accounting must never break the call.
+    """
+    try:
+        pending = getattr(agent, "_billed_unaccounted", None)
+        if not isinstance(pending, list):
+            pending = []
+            agent._billed_unaccounted = pending
+        pending.append({
+            "response": response,
+            "provider": str(getattr(agent, "provider", "") or ""),
+            "model": str(getattr(agent, "model", "") or ""),
+            "base_url": str(getattr(agent, "base_url", "") or ""),
+            "api_mode": str(getattr(agent, "api_mode", "") or ""),
+            "turn_id": str(getattr(agent, "_current_turn_id", "") or ""),
+        })
+    except Exception:
+        logger.debug("billed-response registration failed", exc_info=True)
+
+
+def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[dict] = None) -> None:
     if response is None or getattr(response, "_api_call_failure_recorded", False):
         return
+    # Registered BEFORE the pooled-header guard below: a response whose ledger
+    # row cannot be attributed was still billed and must still be counted.
+    _note_billed_response(agent, response)
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
     if provider in _POOLED_PROVIDERS and not hasattr(response, "pool_headers"):
         _note_api_call_recording_failure(agent)
@@ -238,11 +300,12 @@ def _record_successful_api_call(agent: Any, response: Any) -> None:
         usage=getattr(response, "usage", None),
         headers=headers if isinstance(headers, dict) else {},
         http_status=200,
+        api_kwargs=api_kwargs,
     )
 
 
 
-def _record_failed_api_call(agent: Any, error: BaseException) -> None:
+def _record_failed_api_call(agent: Any, error: BaseException, api_kwargs: Optional[dict] = None) -> None:
     response = getattr(error, "response", None)
     status = getattr(error, "status_code", None)
     if status is None:
@@ -252,6 +315,7 @@ def _record_failed_api_call(agent: Any, error: BaseException) -> None:
         usage=None,
         headers=_snapshot_pool_headers(response),
         http_status=int(status) if isinstance(status, int) else None,
+        api_kwargs=api_kwargs,
     )
 
 
@@ -1629,9 +1693,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
         try:
             response = direct_api_call(agent, api_kwargs)
         except Exception as exc:
-            _record_failed_api_call(agent, exc)
+            _record_failed_api_call(agent, exc, api_kwargs)
             raise
-        _record_successful_api_call(agent, response)
+        _record_successful_api_call(agent, response, api_kwargs)
         return response
 
     result = {"response": None, "error": None}
@@ -2219,13 +2283,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _join_worker_for_relay_teardown(t, label="Non-streaming")
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
-        _record_failed_api_call(agent, result["error"])
+        _record_failed_api_call(agent, result["error"], api_kwargs)
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
-        _record_successful_api_call(agent, result["response"])
+        _record_successful_api_call(agent, result["response"], api_kwargs)
     return result["response"]
 
 
@@ -4227,6 +4291,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
         for msg in messages:
+            if is_metadata_only_tool_notice(msg):
+                continue
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason"):
@@ -4251,7 +4317,29 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # here, diverging the summary request's prefix at the EARLIEST
             # sidecar-carrying message and re-prefilling the whole transcript
             # at exactly the moment the context is largest.
-            substitute_api_content(api_msg)
+            _api_content = substitute_api_content(api_msg)
+            # Display-only timeline metadata (#764 confab notice, model-switch
+            # / typed event rows, hidden redirect placeholders). Never a
+            # provider field — mirror the main loop's api_msg builder, which
+            # pops both from every outgoing copy. Without this a DB-reloaded
+            # confab row sends display_kind + display_metadata (bridge
+            # request_id, detector grammar label) on the summary request, and
+            # strict Chat Completions gateways reject the unknown keys.
+            _display_kind = api_msg.pop("display_kind", None)
+            api_msg.pop("display_metadata", None)
+            # Same legacy hidden-placeholder heal as the main loop (#88955):
+            # once display_kind is stripped, an empty hidden assistant row
+            # with no sidecar would otherwise go out as empty assistant text.
+            if (
+                _display_kind == "hidden"
+                and api_msg.get("role") == "assistant"
+                and not _api_content
+                and not (api_msg.get("content") or "").strip()
+                and not api_msg.get("tool_calls")
+            ):
+                from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+
+                api_msg["content"] = _INTERRUPTED_PLACEHOLDER
             if _needs_sanitize:
                 # In MoA mode, agent.model is the virtual preset name,
                 # not the actual aggregator model.  Resolve the real
@@ -6271,7 +6359,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # The transport made a real attempt. Append its zero-token
                     # row before retry/failover classification; interrupt-forced
                     # closes returned above are deliberately excluded.
-                    _record_failed_api_call(agent, e)
+                    _record_failed_api_call(agent, e, api_kwargs)
                     result["failure_recorded"] = True
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
@@ -6922,7 +7010,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # pending stream-error reason so it can't leak a stale "(connection
         # dropped)" rider onto an unrelated later failover.
         agent._pending_stream_error_reason = None
-        _record_successful_api_call(agent, result["response"])
+        _record_successful_api_call(agent, result["response"], api_kwargs)
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────

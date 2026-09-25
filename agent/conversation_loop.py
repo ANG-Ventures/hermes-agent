@@ -42,7 +42,7 @@ from agent.context_engine import (
     call_with_messages as _call_with_messages,
 )
 from agent.display import KawaiiSpinner
-from agent.confab_notice import CONFAB_NOTICE_TEXT, should_announce_notice
+from agent.confab_notice import TOOL_CALL_NOTICE_TEXT, confab_notice_status, is_metadata_only_tool_notice, should_announce_notice
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -101,6 +101,7 @@ from agent.prompt_caching import (
 from agent.provider_projection import splice_provider_projection
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    capacity_retry_wait,
     is_zai_coding_overload_error,
     jittered_backoff,
     resolve_retry_after,
@@ -549,6 +550,157 @@ def _canonical_usage_from_response(
     if not response_usage:
         return CanonicalUsage.fully_unknown()
     return normalize_usage(response_usage, provider=provider, api_mode=api_mode)
+
+
+def _bump_counter(agent: Any, name: str, delta: Any) -> None:
+    setattr(agent, name, int(getattr(agent, name, 0) or 0) + int(delta or 0))
+
+
+def _account_unaccepted_billed_call(
+    agent: Any,
+    entry: dict[str, Any],
+    turn_calls: Optional[list[dict[str, Any]]],
+    turn_id: Optional[str],
+) -> None:
+    """Fold ONE billed-but-unaccepted response into the session + turn totals.
+
+    Mirrors the accept-site commit (session_* counters, absorbing UNKNOWN
+    latches, cost, state.db delta, Blackbox ``_turn_calls``) but prices the
+    call at the route that actually served it (captured at the transport
+    chokepoint), not at the fallback the agent has since switched to. The
+    ``last_turn_usage`` snapshot and the context compressor are deliberately
+    NOT touched: a rejected response is spend, not the conversation's window.
+    """
+    provider = entry.get("provider") or None
+    model = entry.get("model") or ""
+    base_url = entry.get("base_url") or None
+    usage = _canonical_usage_from_response(
+        entry.get("response"), provider=provider, api_mode=entry.get("api_mode") or None
+    )
+    call_flags = {key: bool(getattr(usage, key)) for key in USAGE_UNKNOWN_FIELDS}
+    prior_api_calls = int(getattr(agent, "session_api_calls", 0) or 0)
+    _bump_counter(agent, "session_prompt_tokens", usage.prompt_tokens)
+    _bump_counter(agent, "session_completion_tokens", usage.output_tokens)
+    _bump_counter(agent, "session_total_tokens", usage.total_tokens)
+    _bump_counter(agent, "session_api_calls", 1)
+    _bump_counter(agent, "session_input_tokens", usage.input_tokens)
+    _bump_counter(agent, "session_output_tokens", usage.output_tokens)
+    _bump_counter(agent, "session_cache_read_tokens", usage.cache_read_tokens)
+    _bump_counter(agent, "session_cache_write_tokens", usage.cache_write_tokens)
+    _bump_counter(agent, "session_reasoning_tokens", usage.reasoning_tokens)
+    for flag, is_set in call_flags.items():
+        if is_set:
+            setattr(agent, f"session_{flag}", True)
+    if turn_calls is not None and entry.get("turn_id", "") == (turn_id or ""):
+        turn_calls.append({
+            **call_flags,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_read_tokens": usage.cache_read_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+            "output_tokens_unknown": bool(usage.output_tokens_unknown),
+            "latency_s": 0.0,
+            "composition": None,
+            # Price at the serving route (Blackbox cost.py reads these).
+            "provider": provider or "",
+            "model": model,
+            "base_url": base_url or "",
+            "accepted": False,
+        })
+    cost_result = estimate_usage_cost(
+        model, usage, provider=provider, base_url=base_url
+    )
+    cost_status = _session_cost_status_with_known_spend(
+        _moa_session_cost_status(cost_result, [], None),
+        session_cost_usd=getattr(agent, "session_estimated_cost_usd", 0.0),
+    )
+    if cost_result.amount_usd is not None:
+        agent.session_estimated_cost_usd = float(
+            getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0
+        ) + float(cost_result.amount_usd)
+    agent.session_cost_status = merge_session_cost_status(
+        getattr(agent, "session_cost_status", None),
+        cost_status,
+        prior_api_calls=prior_api_calls,
+    )
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db and session_id:
+        try:
+            if not getattr(agent, "_session_db_created", True):
+                agent._ensure_db_session()
+            session_db.queue_token_counts(
+                session_id,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
+                estimated_cost_usd=(
+                    float(cost_result.amount_usd)
+                    if cost_result.amount_usd is not None
+                    else None
+                ),
+                cost_status=cost_status,
+                cost_source=cost_result.source,
+                billing_provider=provider,
+                billing_base_url=base_url,
+                billing_mode="subscription_included"
+                if cost_result.status == "included" else None,
+                model=model,
+                api_call_count=1,
+                **call_flags,
+            )
+        except Exception as exc:
+            logger.debug("Unaccepted billed-call persistence failed: %s", exc)
+
+
+def _settle_unaccepted_billed_responses(
+    agent: Any,
+    turn_calls: Optional[list[dict[str, Any]]],
+    turn_id: Optional[str],
+    *,
+    committing: bool = False,
+) -> int:
+    """Account every billed response the loop did not accept; return the count.
+
+    ``agent._billed_unaccounted`` is filled by the transport chokepoint
+    (``chat_completion_helpers._note_billed_response``) once per billed
+    HTTP-200 — the same event that writes the per-call ledger row. Settling
+    it here keeps ``session_api_calls`` / the turn rollup equal to the ledger:
+
+    * ``committing=True`` (the accept site): the LATEST entry is the response
+      being committed and is accounted by the normal path, so it is dropped;
+      anything older was billed and rejected within this attempt.
+    * ``committing=False`` (start of a model attempt, turn start, turn end):
+      no response is being accepted, so every parked entry was rejected.
+
+    Telemetry must never break the conversation loop.
+    """
+    pending = getattr(agent, "_billed_unaccounted", None)
+    if not isinstance(pending, list) or not pending:
+        return 0
+    entries = list(pending)
+    del pending[:]
+    if committing:
+        entries = entries[:-1]
+    settled = 0
+    for entry in entries:
+        try:
+            _account_unaccepted_billed_call(agent, entry, turn_calls, turn_id)
+            settled += 1
+        except Exception:
+            logger.warning("Unaccepted billed-call accounting failed", exc_info=True)
+    if settled:
+        logger.info(
+            "Accounted %d billed provider response(s) the loop rejected "
+            "(turn=%s)", settled, turn_id or "",
+        )
+    return settled
 
 
 def _capture_measured_usage_anchor(usage: Any, messages: list[dict[str, Any]]) -> Any:
@@ -2360,6 +2512,11 @@ def run_conversation(
     # successful provider call appends a dict at the usage-commit site below;
     # folded into the on_session_end `turn_usage` kwarg at the end of the turn.
     _turn_calls: List[Dict[str, Any]] = []
+    # A previous turn that ended through an early ``return`` (not via
+    # finalize_turn) can leave billed-but-unaccepted responses parked. Their
+    # tokens were spent: count them in the session totals now (they carry the
+    # old turn id, so they are NOT added to this turn's rollup).
+    _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
     final_response = None
     interrupted = False
     failed = False
@@ -2676,6 +2833,10 @@ def run_conversation(
 
         api_messages = []
         for idx, msg in enumerate(messages):
+            # Metadata-only provider events are durable UI rows, never system
+            # instructions in the provider request.
+            if is_metadata_only_tool_notice(msg):
+                continue
 
             # Structural clone, NOT msg.copy(): every in-place transform
             # below (canonicalize/repair, surrogate + non-ASCII sanitizers,
@@ -3937,6 +4098,11 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                # Any billed response still parked here belongs to an EARLIER
+                # attempt the loop rejected (failover, retry, redirect) — the
+                # accept site would have consumed it. Settle before the next
+                # call so the per-turn totals match the per-call ledger.
+                _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -5091,6 +5257,12 @@ def run_conversation(
                 # in that case (see `_canonical_usage_from_response`), so every
                 # consumer below refuses to present its zeros as measurements.
                 if response is not None:
+                    # Consume this response's billed-response entry (it is
+                    # accounted right below) and settle any OLDER entry from
+                    # this attempt that the loop did not accept.
+                    _settle_unaccepted_billed_responses(
+                        agent, _turn_calls, turn_id, committing=True
+                    )
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
                     # from the error message), not guessed probe tiers.
@@ -6607,6 +6779,52 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # ── Pool-capacity 503: wait for a seat before a host move ──
+                # A relay "no eligible sub" 503 (``pool_exhausted``) is a
+                # CAPACITY signal, not auth/transport. Leaving the provider
+                # here is a host move for a bridge-backed session — the next
+                # box has no CLI session and replays the whole history
+                # (2026-09-24: 168 replays on one sub in 10h). So: stay on
+                # the same provider for up to ``capacity_retry_attempts``
+                # tries / ``capacity_retry_max_wait_s`` seconds, honouring
+                # the relay's Retry-After, THEN walk the chain. Policy is
+                # the pure ``capacity_retry_wait``; this block only widens
+                # the retry ceiling and, when the budget is spent, hands the
+                # attempt to the existing "max retries → fallback" branch
+                # below so the failover announce/threading stays single-
+                # sourced. ``attempts: 0`` = pre-policy behaviour.
+                _is_pool_capacity = (
+                    classified.reason == FailoverReason.pool_exhausted
+                    and int(getattr(agent, "_capacity_retry_attempts", 0) or 0) > 0
+                )
+                _capacity_wait = None
+                if _is_pool_capacity:
+                    max_retries = max(max_retries, int(agent._capacity_retry_attempts))
+                    _cap_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                    _cap_ra_raw = None
+                    if _cap_headers and hasattr(_cap_headers, "get"):
+                        _cap_ra_raw = _cap_headers.get("retry-after") or _cap_headers.get("Retry-After")
+                    _capacity_wait = capacity_retry_wait(
+                        retry_count=retry_count,
+                        max_retries=max_retries,
+                        raw_retry_after=_cap_ra_raw,
+                        waited_s=_retry.capacity_waited_s,
+                        max_wait_s=float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),
+                    )
+                    if _capacity_wait is None:
+                        logger.warning(
+                            "capacity 503 on %s: budget exhausted after %.0fs / %d attempt(s) "
+                            "(limits attempts=%d max_wait=%.0fs, retry_after=%s) → fallback %s",
+                            getattr(agent, "provider", "?"),
+                            _retry.capacity_waited_s,
+                            retry_count,
+                            int(agent._capacity_retry_attempts),
+                            float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),
+                            _cap_ra_raw,
+                            agent._client_log_context(),
+                        )
+                        # Hand off to the retries-exhausted → fallback branch.
+                        retry_count = max_retries
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
@@ -7861,6 +8079,23 @@ def run_conversation(
                     )
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                if _is_pool_capacity and _capacity_wait is not None:
+                    # Pool-capacity policy wins over the generic jitter: the
+                    # wait was already bounded (attempts + wall-clock budget,
+                    # relay Retry-After honoured) by ``capacity_retry_wait``.
+                    wait_time = _capacity_wait
+                    _backoff_policy = "pool_capacity"
+                    _retry.capacity_waited_s += float(wait_time)
+                    logger.warning(
+                        "capacity 503 on %s: retry %d/%d in %.1fs (waited %.0fs of %.0fs budget) %s",
+                        getattr(agent, "provider", "?"),
+                        retry_count + 1,
+                        max_retries,
+                        wait_time,
+                        _retry.capacity_waited_s,
+                        float(getattr(agent, "_capacity_retry_max_wait_s", 0.0) or 0.0),
+                        agent._client_log_context(),
+                    )
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
@@ -7884,6 +8119,14 @@ def run_conversation(
                         agent._emit_status(_rate_limit_status)
                     else:
                         agent._buffer_status(_rate_limit_status)
+                elif _backoff_policy == "pool_capacity":
+                    # Say what we are waiting FOR: a pooled seat on the same
+                    # provider, not a generic retry — so the trace reads
+                    # "capped → waited → served" rather than "flaky".
+                    agent._buffer_status(
+                        f"⏱️ Sub pool capped — waiting {wait_time:.1f}s for a seat before "
+                        f"switching providers (attempt {retry_count + 1}/{max_retries})..."
+                    )
                 else:
                     agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                 logger.warning(
@@ -8066,10 +8309,11 @@ def run_conversation(
             # restarted provider request_id can never suppress a later turn's
             # genuine warning. See agent/confab_notice.py.
             _confab_notice = getattr(normalized, "confab_notice", None)
-            if _confab_notice and should_announce_notice(
+            _new_confab_notice = _confab_notice and should_announce_notice(
                 agent, _confab_notice, turn_id
-            ):
-                agent._emit_status(CONFAB_NOTICE_TEXT)
+            )
+            if _new_confab_notice:
+                agent._emit_status(confab_notice_status(_confab_notice["kind"]))
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -8996,11 +9240,7 @@ def run_conversation(
                 continue
             
             else:
-                # No tool calls - this is the final response.
-                # (Dropped tool-call recovery — finish_reason=="tool_calls" with
-                # an empty tool_calls array — is handled at the finalization
-                # chokepoint below, after final_msg is built, so it catches
-                # every path that reaches turn finalization, not just this one.)
+                # Recover dropped calls before the empty-content fallback.
                 final_response = assistant_message.content or ""
                 
                 # Fix: unmute output when entering the no-tool-call branch
@@ -9009,6 +9249,47 @@ def run_conversation(
                 # prior housekeeping tool turn and should not silence the
                 # final response path.
                 agent._mute_post_response = False
+
+                _tool_notice_nudge = TOOL_CALL_NOTICE_TEXT.get(
+                    _confab_notice["kind"] if _confab_notice else None
+                )
+                if _tool_notice_nudge and _new_confab_notice:
+                    # Durable metadata-only UI event, not a model instruction.
+                    _notice_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                    append_message(messages, {
+                        "role": "system", "content": "",
+                        "display_kind": _notice_msg["display_kind"],
+                        "display_metadata": _notice_msg["display_metadata"],
+                    })
+                if finish_reason == "tool_calls" or _tool_notice_nudge:
+                    if getattr(agent, "_dropped_toolcall_retries", 0) < 3:
+                        agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
+                        logger.warning(
+                            "Dropped tool call — re-prompting (retry %d/3, model=%s provider=%s)",
+                            agent._dropped_toolcall_retries, agent.model, agent.provider,
+                        )
+                        agent._emit_status(
+                            "↻ Model signaled a tool call but sent none — "
+                            f"re-prompting ({agent._dropped_toolcall_retries}/3)"
+                        )
+                        interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                        interim_msg["_dropped_toolcall_nudge"] = True
+                        append_message(messages, interim_msg)
+                        append_message(messages, {
+                            "role": "user",
+                            "content": _tool_notice_nudge or _DROPPED_TOOLCALL_NUDGE_CONTENT,
+                            "_dropped_toolcall_nudge": True,
+                        })
+                        agent._session_messages = messages
+                        final_response = None
+                        continue
+                    if _tool_notice_nudge:
+                        agent._emit_status("⚠️ Tool-call recovery exhausted after 3 retries.")
+                        _turn_exit_reason = "tool_call_recovery_exhausted"
+                        failed = True
+                        final_response = ""
+                        agent._dropped_toolcall_retries = 0
+                        break
                 
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
@@ -9489,54 +9770,6 @@ def run_conversation(
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
-                # ── Dropped tool-call recovery (copilot/Claude) ────────
-                # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
-                # on GitHub Copilot, ~2026-07) return finish_reason="tool_calls"
-                # while the parsed tool_calls array is empty — the model
-                # signalled it wanted to act but the payload shipped no call.
-                # Reaching finalization with that mismatch means the turn is
-                # about to end with the task unstarted (the narration, which may
-                # be in content or only in the reasoning field, gets treated as
-                # the final answer). Re-prompt (bounded to 3 CONSECUTIVE stalls;
-                # the budget resets after any successful tool round) to make the
-                # model emit the call instead of exiting. finish_reason="stop"
-                # text finishes never enter this guard.
-                if (
-                    finish_reason == "tool_calls"
-                    and not assistant_message.tool_calls
-                    and getattr(agent, "_dropped_toolcall_retries", 0) < 3
-                ):
-                    agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
-                    logger.warning(
-                        "finish_reason=tool_calls with empty tool_calls array "
-                        "(narration only) — re-prompting to emit the call "
-                        "(retry %d/3, model=%s provider=%s)",
-                        agent._dropped_toolcall_retries, agent.model, agent.provider,
-                    )
-                    agent._emit_status(
-                        "↻ Model signaled a tool call but sent none — "
-                        f"re-prompting ({agent._dropped_toolcall_retries}/3)"
-                    )
-                    # Both halves of the re-prompt pair are ephemeral recovery
-                    # scaffolding (mirrors the empty-response nudge pattern):
-                    # the interim narration-only assistant turn exists solely to
-                    # keep role alternation valid for the nudge, and the nudge
-                    # exists solely to drive the retry. Flag both so the
-                    # persistence layer never writes them to the durable
-                    # transcript and the finalization pop below can strip an
-                    # unanswered tail pair. A recovered (answered) pair stays
-                    # buried mid-list in live memory but is skipped by the
-                    # flush regardless of position.
-                    final_msg["_dropped_toolcall_nudge"] = True
-                    append_message(messages, final_msg)
-                    append_message(messages, {
-                        "role": "user",
-                        "content": _DROPPED_TOOLCALL_NUDGE_CONTENT,
-                        "_dropped_toolcall_nudge": True,
-                    })
-                    agent._session_messages = messages
-                    final_response = None
-                    continue
 
                 # Reached finalization without the dropped-tool-call mismatch —
                 # a genuine turn end. Clear the consecutive-stall budget so the
@@ -9919,6 +10152,9 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
+    # Turn end: a response billed after the last accepted one (e.g. rejected
+    # and then the loop broke out) is spent inside THIS turn.
+    _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
     return finalize_turn(
         agent,
         final_response=final_response,

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -291,8 +293,13 @@ def test_model_reread_on_retry_spawn(kanban_home, monkeypatch, all_assignees_spa
         if task.model_override:
             argv += ["-m", task.model_override]
         spawns.append(argv)
-        # Return a pid that is already dead so the next dispatch reclaims it.
-        return 2  # init; effectively never our child → treated as crashed
+        # Return the PID of a child that has already exited and been reaped,
+        # so the "crashed" worker is genuinely dead on every OS. A fixed low
+        # PID is not: PID 2 is Linux's kthreadd (always alive), and the
+        # second-claim guard correctly refuses to start a retry beside it.
+        child = subprocess.Popen([sys.executable, "-c", ""])
+        child.wait()
+        return child.pid
 
     conn = kb.connect()
     try:

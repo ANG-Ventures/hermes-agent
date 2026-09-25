@@ -106,7 +106,7 @@ def test_set_model_reclaim_only_reclaims_selected_running_cards(
                     "UPDATE tasks SET status='running', claim_lock=?, worker_pid=? WHERE id=?",
                     (f"host:{pid}", pid, task_id),
                 )
-    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda pid, lock, signal_fn=None: signaled.append(pid) or {})
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda pid, lock, **_kw: signaled.append(pid) or {})
 
     out = kc.run_slash(
         "set-model model-a --provider batch-provider --reclaim "
@@ -144,7 +144,7 @@ def test_set_model_reclaim_leaves_non_running_selected_cards_alone(
             )
     monkeypatch.setattr(
         kb, "_terminate_reclaimed_worker",
-        lambda pid, lock, signal_fn=None: signaled.append(pid) or {},
+        lambda pid, lock, **_kw: signaled.append(pid) or {},
     )
 
     out = kc.run_slash(

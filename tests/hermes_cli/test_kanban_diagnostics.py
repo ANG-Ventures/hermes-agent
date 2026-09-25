@@ -630,3 +630,94 @@ def test_stale_quantity_threshold_covers_the_real_incident_age():
     )
     diags = kd.compute_task_diagnostics(task, [], [], now=now, config=kd.DEFAULT_CONFIG)
     assert "stale_quantity_in_body" in [d.kind for d in diags]
+
+
+# ---------------------------------------------------------------------------
+# claim_refused_live_owner
+#
+# The second-claim guard fails CLOSED while a prior worker is alive. That
+# refusal must be operator-visible for READY and REVIEW cards alike, not only
+# in the raw event log.
+# ---------------------------------------------------------------------------
+
+
+def _refused(ts, pid=4242, run_id=7, identity="verified"):
+    return _event("claim_rejected", ts=ts, reason="prior_worker_still_alive",
+                  prev_pid=pid, prev_run_id=run_id, owner_identity=identity)
+
+
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_claim_refused_live_owner_fires_for_ready_and_review(status):
+    now = 100_000
+    task = _task(status=status, claim_lock=None)
+    events = [_refused(now - 600), _refused(now - 60)]
+    diags = [d for d in kd.compute_task_diagnostics(task, events, [], now=now)
+             if d.kind == "claim_refused_live_owner"]
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.severity == "error"
+    assert d.count == 2
+    assert d.data["prev_pid"] == 4242 and d.data["status"] == status
+    assert d.data["owner_identity"] == "verified"
+    assert "4242" in d.title
+
+
+def test_claim_refused_live_owner_quiet_within_grace():
+    now = 100_000
+    task = _task(status="ready", claim_lock=None)
+    diags = kd.compute_task_diagnostics(task, [_refused(now - 60)], [], now=now)
+    assert not [d for d in diags if d.kind == "claim_refused_live_owner"]
+
+
+def test_claim_refused_live_owner_clears_on_later_claim():
+    now = 100_000
+    task = _task(status="ready", claim_lock=None)
+    events = [_refused(now - 900), _event("claimed", ts=now - 800)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert not [d for d in diags if d.kind == "claim_refused_live_owner"]
+
+
+def test_claim_refused_live_owner_ignores_other_rejections():
+    now = 100_000
+    task = _task(status="ready", claim_lock=None)
+    events = [_event("claim_rejected", ts=now - 900, reason="something_else")]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert not [d for d in diags if d.kind == "claim_refused_live_owner"]
+
+
+def test_claim_refused_live_owner_escalates_to_critical():
+    now = 100_000
+    task = _task(status="review", claim_lock=None)
+    diags = [d for d in kd.compute_task_diagnostics(
+        task, [_refused(now - 3 * 3600)], [], now=now)
+        if d.kind == "claim_refused_live_owner"]
+    assert diags and diags[0].severity == "critical"
+
+
+def test_claim_refused_live_owner_from_real_review_refusal(kanban_home, monkeypatch):
+    """Round-trip: a REAL claim_review_task refusal on sqlite rows surfaces."""
+    import hermes_cli.profiles as _profiles
+    monkeypatch.setattr(_profiles, "profile_exists", lambda name: True)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="held review", assignee="builder")
+        run = kb.claim_task(conn, tid)
+        assert run is not None
+        kb._set_worker_pid(conn, tid, 515151)
+        assert kb.request_review(conn, tid, summary="done", reviewer="argus",
+                                 expected_run_id=run.current_run_id)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 515151)
+        monkeypatch.setattr(kb, "_pid_create_time", lambda pid: None)
+        assert kb.claim_review_task(conn, tid) is None
+        task = kb.get_task(conn, tid)
+        events = conn.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,)
+        ).fetchall()
+        diags = [d for d in kd.compute_task_diagnostics(
+            task, events, [], now=int(time.time()) + 3600)
+            if d.kind == "claim_refused_live_owner"]
+        assert len(diags) == 1
+        assert diags[0].data["prev_pid"] == 515151
+        assert diags[0].data["status"] == "review"
+    finally:
+        conn.close()

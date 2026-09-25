@@ -1167,6 +1167,7 @@ def _set_status_direct(
     if held["status"] == "running" and new_status != "running":
         termination = kanban_db._terminate_reclaimed_worker(
             held["worker_pid"], held["claim_lock"],
+            conn=conn, task_id=task_id,
         )
         if kanban_db._worker_survived_termination(termination):
             kanban_db._refuse_reclaim_unproven_death(

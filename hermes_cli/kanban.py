@@ -123,6 +123,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "provider_override": t.provider_override,
         "reasoning_effort": t.reasoning_effort,
         "session_id": t.session_id,
+        "unhomed": bool(getattr(t, "unhomed", False)),
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
@@ -555,9 +556,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_list.add_argument("--session", default=None,
                         help="Filter by originating chat/agent session id "
                              "(set on tasks created from inside an ACP loop)")
-    p_list.add_argument("--home", action="store_true",
+    p_list.add_argument("--home", "--this-session", action="store_true",
+                        dest="home",
                         help="Only cards whose home session is this session "
                              "(== --session $HERMES_SESSION_ID)")
+    p_list.add_argument("--all", action="store_true", dest="flat_all",
+                        help="Flat board-wide view (no THIS SESSION / OTHER "
+                             "SESSIONS grouping)")
     p_list.add_argument("--archived", action="store_true",
                         help="Include archived tasks")
     p_list.add_argument("--json", action="store_true")
@@ -845,6 +850,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                  "refuses the completion (see --survivor-unbound). Repeatable: "
                                  "qualify each claim as <workspace-relative-repo>=<claim> when "
                                  "more than one recorded repository vanished.")
+    p_complete.add_argument("--survivor-none", action="store_true",
+                            help="Record work deployed outside a repository; requires --reason "
+                                 "naming an existing follow-up card; never authorizes workspace deletion.")
+    p_complete.add_argument("--reason", default=None,
+                            help="Why --survivor-none has no remote ref; include the follow-up card id.")
     p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
                                  "gh pr view (state OPEN or MERGED) AND required to name this "
@@ -1424,6 +1434,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     _add_clone_arguments(p_clone)
 
+    # --- home-lint ---
+    p_hl = sub.add_parser(
+        "home-lint",
+        help="Report open cards with no home session (exit 1); "
+             "--backfill stamps them 'unhomed'",
+    )
+    p_hl.add_argument("--backfill", action="store_true",
+                      help="Stamp each homeless open card 'unhomed' + comment")
+    p_hl.add_argument("--dry-run", action="store_true",
+                      help="With --backfill: list what would be stamped")
+    p_hl.add_argument("--json", action="store_true")
+
     # --- repair ---
     p_repair = sub.add_parser(
         "repair",
@@ -1454,12 +1476,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         _p = sub.choices.get(_name)
         if _p is not None and "foreign_ok" not in {a.dest for a in _p._actions}:
             _p.add_argument(
+                "--takeover",
                 "--foreign-ok",
                 dest="foreign_ok",
                 default=None,
                 metavar="REASON",
-                help="Act on a card whose home session is another session; "
-                     "REASON is posted as a comment the home session sees.",
+                help="Act on a card whose home session is another session "
+                     "(or an unhomed card); records a takeover event and "
+                     "posts REASON as a comment the home session sees.",
             )
     return kanban_parser
 
@@ -1610,6 +1634,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "home-lint": _cmd_home_lint,
         }
         handler = handlers.get(action)
         if not handler:
@@ -1701,7 +1726,9 @@ def _resolve_session_flag(value: Optional[str]) -> Optional[str]:
     return None if value.lower() in ("", "none") else value
 
 
-def _home_label(session_id: Optional[str]) -> str:
+def _home_label(session_id: Optional[str], *, unhomed: bool = False) -> str:
+    if unhomed:
+        return "unhomed (no session owns it; --takeover to act)"
     if not session_id:
         return "unstamped"
     caller = _caller_session_id()
@@ -2392,9 +2419,65 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
-    for t in tasks:
-        print(_fmt_task_line(t))
+    caller = None
+    if not (getattr(args, "flat_all", False) or args.session
+            or home_session_ids is not None):
+        caller = _caller_session_id()
+    if not caller:
+        for t in tasks:
+            print(_fmt_task_line(t))
+        return 0
+    print(_format_session_grouped(tasks, kb.home_ids(caller)))
     return 0
+
+
+def _cmd_home_lint(args: argparse.Namespace) -> int:
+    """Silent + exit 0 when every open card has a home; else list ids, exit 1.
+
+    Designed for a no_agent cron (empty stdout = nothing delivered). With
+    ``--backfill`` stamps the stragglers ``unhomed`` and exits 0.
+    """
+    with kb.connect_closing() as conn:
+        if getattr(args, "backfill", False):
+            ids = kb.backfill_unhomed(conn, dry_run=bool(args.dry_run))
+            verb = "would stamp" if args.dry_run else "stamped"
+            if args.json:
+                print(json.dumps({"action": verb, "ids": ids}))
+            elif ids:
+                print(f"home-lint: {verb} {len(ids)} card(s) unhomed: {', '.join(ids)}")
+            return 0
+        ids = kb.find_homeless_open_tasks(conn)
+    if args.json:
+        print(json.dumps({"homeless_open": ids}))
+    elif ids:
+        print(
+            f"kanban home-lint: {len(ids)} open card(s) have NO home session "
+            f"(a create path is not stamping): {', '.join(ids)} -- "
+            "fix the path; `hermes kanban home-lint --backfill` stamps them unhomed"
+        )
+    return 1 if ids else 0
+
+
+def _format_session_grouped(tasks, home: "frozenset[str]") -> str:
+    """Session-first listing: this session's cards in full, every other
+    session's cards collapsed to one ``id · status · title`` line each.
+
+    A session sees its OWN work first; foreign cards stay visible (for
+    mentions/comments) but read as someone else's. ``--all`` = flat view.
+    """
+    mine = [t for t in tasks if t.session_id and t.session_id in home]
+    others = [t for t in tasks if not (t.session_id and t.session_id in home)]
+    lines = [f"THIS SESSION ({len(mine)})"]
+    lines += [_fmt_task_line(t) for t in mine] or ["  (none)"]
+    lines.append("")
+    lines.append(
+        f"OTHER SESSIONS ({len(others)}) -- not yours: comment, don't act "
+        "(--takeover REASON to act; --all for the flat view)"
+    )
+    for t in others:
+        tag = " [unhomed]" if t.unhomed else ""
+        lines.append(f"  {t.id} \u00b7 {t.status} \u00b7 {t.title}{tag}")
+    return "\n".join(lines)
 
 
 def _print_triage_banner(triage_ids, stranded) -> None:
@@ -2457,7 +2540,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
-            "home": _home_label(task.session_id),
+            "home": _home_label(task.session_id, unhomed=task.unhomed),
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -2512,8 +2595,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
-    print(f"  session:   {task.session_id or '-'}")
-    print(f"  home:      {_home_label(task.session_id)}")
+    print(f"  session:   {task.session_id or (kb.UNHOMED_SESSION if task.unhomed else '-')}")
+    print(f"  home:      {_home_label(task.session_id, unhomed=task.unhomed)}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
@@ -3846,16 +3929,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_ref = getattr(args, "survivor_ref", None)
     survivor_pr = getattr(args, "survivor_pr", None)
     survivor_unbound = getattr(args, "survivor_unbound", None) or None
+    survivor_none = getattr(args, "survivor_none", False)
+    survivor_reason = getattr(args, "reason", None)
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
-                         or survivor_unbound or superseded_by):
+                         or survivor_unbound or survivor_none or survivor_reason or superseded_by):
         print(
             "kanban: --summary / --metadata / --superseded-by / --survivor-ref / "
-            "--survivor-pr / --survivor-unbound are per-task "
+            "--survivor-pr / --survivor-unbound / --survivor-none / --reason are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
         )
+        return 2
+    if survivor_none != bool(survivor_reason) or (survivor_none and (survivor_ref or survivor_pr or survivor_unbound)):
+        print("kanban: --survivor-none requires --reason and cannot combine with survivor claims", file=sys.stderr)
         return 2
     if survivor_unbound and not (survivor_ref or survivor_pr):
         print(
@@ -3906,6 +3994,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     survivor_ref=survivor_ref,
                     survivor_pr=survivor_pr,
                     survivor_unbound=survivor_unbound,
+                    survivor_none=survivor_none,
+                    survivor_reason=survivor_reason,
                     superseded_by=superseded_by,
                 )
             except kb.EmptySupersedeError as supersede_err:
@@ -4183,6 +4273,12 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        if ok and reason:
+            # Success with a diagnostic = the review was resolved WITHOUT a
+            # reviewer session (kanban.review_policy=milestone_only). Say so;
+            # "Requested review" would be a lie the worker then reasons from.
+            print(f"{tid}: {reason}")
+            return 0
         persisted_run = kb.latest_run(conn, tid)
         display_summary = persisted_run.summary if persisted_run else None
         print(
@@ -4399,9 +4495,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 return None
             return ival if ival >= 1 else None
 
-        max_in_progress_per_profile = _coerce_positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile")
-        )
+        _raw_per_profile = _kanban_cfg.get("max_in_progress_per_profile")
+        if isinstance(_raw_per_profile, dict):
+            # {default: N, <profile>: M} — resolved per assignee in the
+            # dispatcher (kanban_db.resolve_per_profile_cap).
+            max_in_progress_per_profile = _raw_per_profile
+        else:
+            max_in_progress_per_profile = _coerce_positive_int(_raw_per_profile)
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # Memory-derived default when unset (OOF-30/OOF-77) — same
         # fallback the gateway-embedded dispatcher applies, so behaviour

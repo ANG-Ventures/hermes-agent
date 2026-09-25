@@ -5627,59 +5627,62 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # the already-stored fresh tail is accounted for by the cursor itself, so
         # the stored-tail overlap guard (the fallback for a *scaffold-only* advance)
         # must be suppressed to avoid double-counting (Greptile #107 P1, 3rd).
-        reconcile_consumed_durable_tail = False
-        if self._ingest_cursor_needs_reconcile:
-            reconcile_messages = [
-                original_msg
-                if (
-                    (
-                        str(original_msg.get("role") or "") == "tool"
-                        and _is_hermes_persisted_output_marker(
-                            normalize_content_value(original_msg.get("content")) or ""
+        # Turn-start cost contract (t_49c1f7d7): memoise replay identities for
+        # the reconcile + cached-prefix checks, which re-identify the same rows.
+        with self._replay_identity_memo_scope():
+            reconcile_consumed_durable_tail = False
+            if self._ingest_cursor_needs_reconcile:
+                reconcile_messages = [
+                    original_msg
+                    if (
+                        (
+                            str(original_msg.get("role") or "") == "tool"
+                            and _is_hermes_persisted_output_marker(
+                                normalize_content_value(original_msg.get("content")) or ""
+                            )
+                            and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
                         )
-                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
+                        or (
+                            self._compiled_ignore_message_patterns
+                            and ignored_original_messages[idx]
+                        )
                     )
-                    or (
-                        self._compiled_ignore_message_patterns
-                        and ignored_original_messages[idx]
-                    )
-                )
-                else replay_msg
-                for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
-            ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
-            self._ingest_cursor_needs_reconcile = False
-            # Did the reconcile advance the cursor PAST durable (non-scaffold)
-            # rows? If so the already-stored fresh tail is ALREADY accounted for
-            # by the cursor, and the stored-tail overlap guard below — which is
-            # only the fallback for a *scaffold-only* cursor advance — must NOT
-            # run, or it double-counts and strips a genuinely-new row that
-            # coincidentally repeats the last stored identity (Greptile #107 P1,
-            # 3rd). When the reconcile only skipped the scaffold head
-            # (no durable rows consumed), the guard is still needed.
-            reconcile_consumed_durable_tail = bool(self._ingest_cursor) and bool(
-                self._effective_replay_identities(reconcile_messages[: self._ingest_cursor])
-            )
-        cursor = min(max(self._ingest_cursor, 0), n)
-        if cursor > 0:
-            cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
-            cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
-            if (
-                cached_source_identities is not None
-                and cached_active_replay_messages is not None
-                and len(cached_source_identities) >= cursor
-                and len(cached_active_replay_messages) >= cursor
-            ):
-                current_prefix_identities = [
-                    self._message_replay_identity(message) for message in messages[:cursor]
+                    else replay_msg
+                    for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
                 ]
-                if current_prefix_identities == cached_source_identities[:cursor]:
-                    replay_messages = (
-                        self._copy_active_replay_messages_preserving_generated_ids(
-                            cached_active_replay_messages[:cursor]
+                self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+                self._ingest_cursor_needs_reconcile = False
+                # Did the reconcile advance the cursor PAST durable (non-scaffold)
+                # rows? If so the already-stored fresh tail is ALREADY accounted for
+                # by the cursor, and the stored-tail overlap guard below — which is
+                # only the fallback for a *scaffold-only* cursor advance — must NOT
+                # run, or it double-counts and strips a genuinely-new row that
+                # coincidentally repeats the last stored identity (Greptile #107 P1,
+                # 3rd). When the reconcile only skipped the scaffold head
+                # (no durable rows consumed), the guard is still needed.
+                reconcile_consumed_durable_tail = bool(self._ingest_cursor) and bool(
+                    self._effective_replay_identities(reconcile_messages[: self._ingest_cursor])
+                )
+            cursor = min(max(self._ingest_cursor, 0), n)
+            if cursor > 0:
+                cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
+                cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
+                if (
+                    cached_source_identities is not None
+                    and cached_active_replay_messages is not None
+                    and len(cached_source_identities) >= cursor
+                    and len(cached_active_replay_messages) >= cursor
+                ):
+                    current_prefix_identities = [
+                        self._message_replay_identity(message) for message in messages[:cursor]
+                    ]
+                    if current_prefix_identities == cached_source_identities[:cursor]:
+                        replay_messages = (
+                            self._copy_active_replay_messages_preserving_generated_ids(
+                                cached_active_replay_messages[:cursor]
+                            )
+                            + replay_messages[cursor:]
                         )
-                        + replay_messages[cursor:]
-                    )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,

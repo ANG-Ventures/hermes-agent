@@ -9,6 +9,7 @@ from io import StringIO
 from unittest.mock import MagicMock, patch
 
 import cli as cli_mod
+import pytest
 
 
 
@@ -133,6 +134,21 @@ class TestDisplayResumedHistory:
         assert "What is Python?" in output
         assert "Python is a high-level programming language." in output
         assert "How do I install it?" in output
+
+    @pytest.mark.parametrize("kind", ["tool_call_unparseable", "tool_call_as_text"])
+    def test_tool_notice_is_not_misattributed_to_scaffold(self, kind):
+        cli = _make_cli()
+        cli.conversation_history = [{
+            "role": "system", "content": "", "display_kind": "confab_notice",
+            "display_metadata": {"confab_notice": {
+                "version": 1, "kind": kind, "request_id": "rid",
+                "scope": "visible", "grammar": "inbound",
+            }},
+        }]
+        output = self._capture_display(cli)
+        assert "Tool call not executed" in output
+        assert "scaffold" not in output
+        assert ("JSON" in output) == (kind == "tool_call_unparseable")
 
 
     def test_timeline_markers_render_as_events_not_user_input(self):

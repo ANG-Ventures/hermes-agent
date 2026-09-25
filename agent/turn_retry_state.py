@@ -75,6 +75,13 @@ class TurnRetryState:
     # don't loop on the same auth failover within one attempt.
     auth_failover_attempted: bool = False
 
+    # ── Pool-capacity retry budget (``FailoverReason.pool_exhausted``) ───
+    # Cumulative seconds this attempt block has already slept waiting for a
+    # pooled seat. ``capacity_retry_wait`` reads it against
+    # ``agent.capacity_retry_max_wait_s`` so the same-provider wait is bounded
+    # by wall-clock, not only by attempt count.
+    capacity_waited_s: float = 0.0
+
     # ── Restart signals (read by the outer loop after the attempt) ───────
     restart_with_compressed_messages: bool = False
     restart_with_length_continuation: bool = False

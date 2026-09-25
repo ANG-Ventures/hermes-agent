@@ -2793,7 +2793,9 @@ DEFAULT_CONFIG = {
     # command prompts the user for consent; subsequent runs reuse the
     # stored approval from ~/.hermes/shell-hooks-allowlist.json.
     # See `website/docs/user-guide/features/hooks.md` for schema + examples.
-    "hooks": {},
+    # missing_hook_policy: what a hook whose script (or a tracked sibling) is ABSENT does —
+    # restore_then_fail_closed | fail_closed | fail_open_and_page.
+    "hooks": {"missing_hook_policy": "restore_then_fail_closed"},
 
     # Auto-accept shell-hook registrations without a TTY prompt.  Also
     # toggleable per-invocation via --accept-hooks or HERMES_ACCEPT_HOOKS=1.
@@ -3051,6 +3053,11 @@ DEFAULT_CONFIG = {
         # interactive responsiveness, not a throughput cap: an otherwise idle
         # machine still gives workers the whole CPU. Set "normal" to opt out
         # and leave workers at the dispatcher's inherited priority.
+        # On macOS "background" also clamps the worker tree to utility QoS
+        # (exec-form `taskpolicy -c utility`: lower CPU class AND disk I/O
+        # tier than an Interactive gateway); "idle" uses darwin background
+        # (`taskpolicy -b`: E-cores only, heavy I/O throttle — the gateway
+        # always wins, but worker throughput drops sharply under load).
         # (2026-09-20: a worker's runaway busy-loops drove the host to load
         # 538/32 cores and starved the resident gateway's event loop into two
         # watchdog hard-exits and a 12-minute boot.)
@@ -3092,6 +3099,25 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Pause dispatcher SPAWNS (reclaims still run) while the host's
+        # 1-minute load average is over `pause_above` (default: CPU count);
+        # resume once it drops below `resume_below` (default: 0.75 × CPU
+        # count). Hysteresis so a load that hovers at the bar doesn't flap
+        # spawns every tick. Set enabled: false to disable.
+        "dispatch_load_gate": {"enabled": True, "pause_above": None, "resume_below": None},
+        # Reviewer↔implementer round cap. A "round" is one changes_requested
+        # verdict; once a card has collected this many, the next request for
+        # review does NOT re-spawn the reviewer — the card is blocked
+        # (needs_input) for the orchestrator/human to take over. 0 disables.
+        "max_review_rounds": 3,
+        # "all" (default): every request_review routes to review_assignee.
+        # "milestone_only": only cards whose title/body carry "[milestone]"
+        # or that are parents in task_links get a reviewer session; every
+        # other card that asks for review is completed in place with a
+        # review_skipped event (CI is the gate for slice work) — even when
+        # the worker names a reviewer profile; only reviewer=human or
+        # --force bypasses it.
+        "review_policy": "all",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
@@ -3115,6 +3141,9 @@ DEFAULT_CONFIG = {
         # For configured provider_health_probes, prefer a healthy fallback
         # if fewer than this many pool seats can serve the selected model.
         "provider_health_min_eligible": 1,
+        # Per-tick pool admission budget: eligible relay subs * this value.
+        # Pinned apx/bpx lanes each spend one sub's budget. 0 = unlimited.
+        "pool_spawns_per_eligible": 2,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create
@@ -3905,6 +3934,14 @@ DEFAULT_CONFIG = {
         # plus pipe FDs) as the agent moves across worktrees.  Set to 0
         # to disable idle reaping and keep servers for process lifetime.
         "idle_timeout": 600.0,
+
+        # Running language servers allowed per OS user across EVERY agent
+        # process on the box (each worker otherwise runs its own pyright,
+        # 200-950 MB apiece).  Past the cap a process runs without LSP
+        # (shell linter only), logs one line, and retries on a later edit
+        # once a slot frees.  Slots are flock'd files, released by the
+        # kernel when a holder dies.  0 = unlimited.
+        "max_servers_per_host": 3,
 
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,

@@ -1,4 +1,5 @@
 """Per-call ledger: additive migration, exact usage, and parent retention."""
+import json
 import sqlite3
 from types import SimpleNamespace
 
@@ -70,13 +71,46 @@ def test_plugin_end_hook_uses_call_ledger_turn_id(db, monkeypatch):
         assert conn.execute('SELECT COUNT(*) FROM turn_api_calls a JOIN turns t USING (turn_id)').fetchone()[0] == 1
         assert conn.execute('SELECT turn_id FROM turns').fetchone()[0] == turn_id
 
+def test_end_hook_rolls_up_distinct_served_subs(db, monkeypatch):
+    monkeypatch.setattr(blackbox, '_config', lambda: {
+        'enabled': True, 'alerts_enabled': False, 'record_subagents': True,
+        'retention_days': 3650,
+    })
+    turn_id = 'session:task:multi-sub'
+    blackbox._on_session_start(session_id='session')
+    for seq, sub in enumerate(('sub-vps-7', 'sub-vps-9', 'sub-vps-7', None)):
+        blackbox.record_api_call(
+            turn_id=turn_id, seq=seq, ts=100. + seq, provider='claude-apr',
+            model='test-model', usage=CanonicalUsage(input_tokens=1),
+            api_mode='anthropic_messages', sub_key=sub, attribution='wire',
+            http_status=200, relay_synthetic=False, route_id=None,
+        )
+    blackbox._on_session_end(session_id='session', turn_id=turn_id,
+                             provider='claude-apr', model='test-model', platform='cli',
+                             turn_usage={'input_tokens': 4, 'api_calls': 4})
+    with sqlite3.connect(db) as conn:
+        rollup = conn.execute('SELECT served_subs_json FROM turns WHERE turn_id = ?',
+                              (turn_id,)).fetchone()[0]
+        assert json.loads(rollup) == {'sub-vps-7': 2, 'sub-vps-9': 1}
+        assert conn.execute('SELECT COUNT(*) FROM turn_api_calls a JOIN turns t USING (turn_id)').fetchone()[0] == 4
+
+def test_late_call_refreshes_existing_turn_rollup(db):
+    store.insert_turn(TurnRecord(turn_id='late'))
+    append('late', 0, sub_key='sub-vps-7')
+    with sqlite3.connect(db) as conn:
+        assert conn.execute('SELECT served_subs_json FROM turns WHERE turn_id = ?',
+                            ('late',)).fetchone()[0] == '{"sub-vps-7": 1}'
+
 
 def test_api_call_exact_roundtrip_and_defaults(db):
     append("t", 0)
     append("t", 1, usage=CanonicalUsage(), sub_key=None,
            http_status=503, relay_synthetic=True, route_id="route-1")
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT * FROM turn_api_calls ORDER BY seq").fetchall() == [
+        assert conn.execute("SELECT turn_id,seq,ts,provider,sub_key,model,input_tokens,"
+                            "output_tokens,cache_read,cache_write,reasoning,attribution,"
+                            "http_status,relay_synthetic,route_id FROM turn_api_calls "
+                            "ORDER BY seq").fetchall() == [
             ("t", 0, 100.5, "claude-apr", "sub-vps-7", "test-model",
              1000, 50, 300, 20, 7, "wire", None, 0, None),
             ("t", 1, 100.5, "claude-apr", None, "test-model",

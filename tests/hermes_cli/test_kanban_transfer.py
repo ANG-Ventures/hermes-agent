@@ -126,7 +126,9 @@ def test_round_trip_preserves_content(kanban_root, tmp_path):
 
     tasks = _tasks_by_title(result["board"])
     assert set(tasks) == {"scratch task", "worktree task"}
-    assert tasks["scratch task"]["body"] == "body"
+    # create_task prepends an origin line; the authored body travels intact.
+    assert tasks["scratch task"]["body"].startswith("origin: ")
+    assert tasks["scratch task"]["body"].endswith("\n\nbody")
     assert tasks["scratch task"]["assignee"] == "coder"
 
 
@@ -198,7 +200,9 @@ def test_claimed_task_arrives_unclaimed_and_queued(kanban_root, tmp_path):
     assert task["worker_pid"] is None
     assert task["last_heartbeat_at"] is None
     assert task["current_run_id"] is None
-    assert task["session_id"] is None
+    # Another machine's session ids mean nothing here: imported cards are
+    # homeless -- stamped 'unhomed' (never NULL, see kanban_db.UNHOMED_SESSION).
+    assert task["session_id"] == "unhomed"
     assert task["consecutive_failures"] == 0
 
 

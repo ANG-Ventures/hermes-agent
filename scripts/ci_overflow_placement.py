@@ -100,7 +100,8 @@ def validate_record(state, *, repository_id: int, run_id: int, run_attempt: int,
     placed = copy.deepcopy(matrix)
     for row_ in placed["slice"]:
         row_["runs_on"] = json.dumps(labels[row_["name"]], separators=(",", ":"))
-    return {"matrix": placed, "e2e_runs_on": labels[E2E_JOB_ID], "plan": plan, "admitted_on": row.get("admitted_on")}
+    return {"matrix": placed, "e2e_runs_on": labels[E2E_JOB_ID], "plan": plan, "admitted_on": row.get("admitted_on"),
+            "plan_attempt": run_attempt}
 
 
 def fetch_state(repo: str, token: str) -> dict:
@@ -167,6 +168,10 @@ def write_outputs(path: str, placement) -> None:
             return
         fh.write(f"matrix={json.dumps(placement['matrix'], separators=(',', ':'))}\n")
         fh.write(f"e2e_runs_on={json.dumps(placement['e2e_runs_on'], separators=(',', ':'))}\n")
+        # Consumers take the plan ONLY when this equals the executing github.run_attempt:
+        # "Re-run failed jobs" reuses these outputs in attempt N+1 without re-running
+        # placement, so an unbound plan would run hosted work with no reservation.
+        fh.write(f"plan_attempt={int(placement['plan_attempt'])}\n")
         fh.write("plan_valid=true\n")
 
 

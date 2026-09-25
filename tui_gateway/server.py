@@ -2978,12 +2978,15 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     # drivers (desktop app) can show an explicit "Summarizing…" indicator —
     # otherwise a mid-turn compaction looks like the transcript reset itself.
     if out_kind == "lifecycle":
-        from agent.confab_notice import CONFAB_NOTICE_TEXT
+        from agent.confab_notice import CONFAB_NOTICE_TEXT, TOOL_CALL_NOTICE_TEXT, confab_notice_status
         from agent.conversation_compression import COMPACTION_STATUS_MARKER
 
         if COMPACTION_STATUS_MARKER in body:
             out_kind = "compacting"
-        elif CONFAB_NOTICE_TEXT in body:
+        elif CONFAB_NOTICE_TEXT in body or any(
+            confab_notice_status(notice_kind) in body
+            for notice_kind in TOOL_CALL_NOTICE_TEXT
+        ):
             # Same reason: the confab notice also arrives as a generic
             # "lifecycle" status, and the desktop status handler renders
             # nothing for lifecycle text — so the live half of the triage
@@ -10136,6 +10139,20 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             continue
         role = m.get("role")
         if role not in {"user", "assistant", "tool", "system"}:
+            continue
+        from agent.confab_notice import confab_notice_status, is_metadata_only_tool_notice, notice_from_display_row
+        if is_metadata_only_tool_notice(m):
+
+            notice = notice_from_display_row(
+                role, m.get("display_kind"), m.get("display_metadata")
+            )
+            if notice:
+                messages.append({
+                    "role": "system",
+                    "text": confab_notice_status(notice["kind"]),
+                    "display_kind": "confab_notice",
+                    "display_metadata": m["display_metadata"],
+                })
             continue
         # An explicit display_kind="hidden" row is model-facing scaffolding
         # (compaction references, interrupted-turn checkpoints). The string
