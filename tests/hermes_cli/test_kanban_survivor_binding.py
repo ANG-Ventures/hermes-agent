@@ -267,7 +267,14 @@ def flaky(monkeypatch):
     fixed by construction: the branch names the card, so the honest outcome is
     ACCEPT. ``fail`` holds the 1-based call ordinals that exit non-zero, which
     is exactly what an ordinary rate limit or auth hiccup looks like.
+
+    RE-PIN (t_47199870): ``_query`` now retries a non-answer up to
+    ``_QUERY_ATTEMPTS`` (3) times, so ONE failed round-trip is a blip the gate
+    absorbs, and a claim whose three attempts all fail is what "the remote
+    did not answer" means. Backoff is zeroed so the arms stay fast.
     """
+    from hermes_cli import kanban_external_survivor as ext
+    monkeypatch.setattr(ext, "_QUERY_BACKOFF", 0)
     state = {"fail": set(), "calls": 0, "branch": None}
     real = subprocess.run
 
@@ -290,8 +297,9 @@ def flaky(monkeypatch):
 
 @pytest.mark.parametrize("fail,expect_bound", [
     (set(), True),          # control A: nothing injected -> the claim is ACCEPTED
-    ({1}, False),           # the defect: the BOUND call blips
-    ({1, 2}, False),        # control C: nothing answers at all
+    ({1}, True),            # one blip is retried and ACCEPTED (t_47199870 AC1)
+    ({1, 2, 3}, False),     # the defect: every attempt of the BOUND call fails
+    (set(range(1, 100)), False),  # control C: nothing answers at all
 ])
 def test_a_transient_remote_failure_is_never_reported_as_irrelevance(
         board, flaky, fail, expect_bound):
@@ -343,7 +351,7 @@ def test_a_transient_failure_on_a_ref_claim_is_reported_as_unverifiable(board, f
     """Same seam on the other claim shape: ``--survivor-ref`` / git ls-remote."""
     tid = _claimed_card(board)
     flaky["branch"] = f"kanban/{tid}-fix"
-    flaky["fail"] = {1}
+    flaky["fail"] = {1, 2, 3}
 
     with pytest.raises(ValueError) as excinfo:
         kb.complete_task(board, tid, survivor_ref=f"{URL}#{HEAD}",
@@ -373,7 +381,7 @@ def test_the_override_also_distinguishes_a_blip_from_a_verdict(board, flaky):
     """``--survivor-unbound`` makes ONE round-trip; it must report it honestly."""
     tid = _claimed_card(board)
     flaky["branch"] = "someone-elses/unrelated-work"
-    flaky["fail"] = {1}
+    flaky["fail"] = {1, 2, 3}
 
     with pytest.raises(ValueError, match="could not verify"):
         kb.complete_task(board, tid, survivor_pr=PR, survivor_unbound=True,
