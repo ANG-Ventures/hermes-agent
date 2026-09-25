@@ -74,7 +74,11 @@ _PATTERNS: List[Tuple[str, str, str]] = [
     # benign vars, and every real secret it caught ($OPENAI_API_KEY) already ends in KEY/TOKEN.
     (rf'curl\s+[^\n]{{0,2048}}{_SECRET_VAR}', "exfil_curl", "all"),
     (rf'wget\s+[^\n]{{0,2048}}{_SECRET_VAR}', "exfil_wget", "all"),
-    (r'cat\s+[^\n]{0,2048}(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets", "all"),
+    # `cat` needs a word boundary and a same-line gap. Without `\b`, any word
+    # ending in "cat" (pipecat, concat, tomcat) matches; with `\s+` the gap can
+    # cross a newline, so an unrelated `.env` fixture path on the next line
+    # completes a fake "read secrets" hit and blocks the whole file.
+    (r'\bcat[ \t]+[^\n]{0,2048}(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets", "all"),
     (r'(send|post|upload|transmit)\s+[^\n]{0,2048}\s+(to|at)\s+https?://', "send_to_url", "strict"),
     (rf'(include|output|print|share)\s+{_FILLER}(conversation|chat\s+history|previous\s+messages|full\s+context|entire\s+context)', "context_exfil", "strict"),
 
