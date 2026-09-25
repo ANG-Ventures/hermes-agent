@@ -695,6 +695,8 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         return m.get("finish_reason") in {
             "verification_required",
             "verify_hook_continue",
+            # kanban worker stop-guard candidate (persisted, nudge stripped)
+            "kanban_terminal_required",
         }
 
     collapsed: List[Dict] = []
