@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from hermes_cli import provider_seam
+
 # Auth types that authenticate via an account / sign-in flow rather than a
 # pasted API key.  These route to the desktop "Accounts" tab; everything else
 # (api_key, and aws_sdk which is configured via AWS_REGION/AWS_PROFILE) routes
@@ -120,12 +122,13 @@ def provider_catalog() -> list[ProviderDescriptor]:
     except Exception:
         HERMES_OVERLAYS = {}
 
+    g = provider_seam.snapshot()
     out: list[ProviderDescriptor] = []
-    for order, entry in enumerate(CANONICAL_PROVIDERS):
+    for order, entry in enumerate(g.CANONICAL_PROVIDERS):
         slug = entry.slug
-        cfg = PROVIDER_REGISTRY.get(slug)
+        cfg = g.get("PROVIDER_REGISTRY", PROVIDER_REGISTRY).get(slug)
         prof = profiles.get(slug)
-        overlay = HERMES_OVERLAYS.get(slug)
+        overlay = g.get("HERMES_OVERLAYS", HERMES_OVERLAYS).get(slug)
 
         # auth_type: registry is authoritative; fall back to profile, then the
         # Hermes overlay (e.g. moa → "virtual"), then api_key.

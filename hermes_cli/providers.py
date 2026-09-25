@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import base_url_host_matches, base_url_hostname
+from hermes_cli.provider_seam import GuardedDict
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class HermesOverlay:
     keyless: bool = False                 # served anonymously — no credential exists to configure
 
 
-HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
+HERMES_OVERLAYS: Dict[str, HermesOverlay] = GuardedDict(__name__, "HERMES_OVERLAYS", {
     "moa": HermesOverlay(
         transport="openai_chat",
         auth_type="virtual",
@@ -263,7 +264,7 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         auth_type="vertex",
     ),
-}
+})
 
 
 # -- Resolved provider -------------------------------------------------------

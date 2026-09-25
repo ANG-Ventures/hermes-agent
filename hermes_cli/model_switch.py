@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, List, NamedTuple, Optional
 
+from hermes_cli import provider_seam
 from hermes_cli.providers import (
     ProviderDef,
     custom_provider_aliases,
@@ -1815,6 +1816,11 @@ def switch_model(
     target_provider = current_provider
     resolved_moa_preset = False
 
+    # Hot registration: publish a newly configured provider before any
+    # recognition below consults the registry (requested name only).
+    _typed = re.split(r"[:/]", new_model, maxsplit=1)
+    provider_seam.refresh("typed", explicit_provider or (_typed[0] if len(_typed) > 1 else None))
+
     inline_provider = None
     if not explicit_provider:
         inline_provider = _parse_inline_provider_model(
@@ -2861,6 +2867,7 @@ def _collect_authed_provider_slugs(
     from hermes_cli.auth import PROVIDER_REGISTRY, _load_auth_store
     from hermes_cli.providers import HERMES_OVERLAYS, ALIASES as _PROVIDER_ALIAS_TABLE
     from hermes_cli.models import _AGGREGATOR_PROVIDERS as _AGG_PROVIDERS, CANONICAL_PROVIDERS
+    g = provider_seam.snapshot()
 
     _excluded_set = {str(p).strip().lower() for p in excluded if p}
     slugs: list[str] = []
@@ -2892,7 +2899,7 @@ def _collect_authed_provider_slugs(
         pdata = models_dev_data.get(mdev_id)
         if not isinstance(pdata, dict):
             continue
-        pconfig = PROVIDER_REGISTRY.get(hermes_id)
+        pconfig = g.PROVIDER_REGISTRY.get(hermes_id)
         if pconfig and pconfig.auth_type != "api_key":
             continue
         from hermes_cli.auth import is_runtime_provider_routable
@@ -2923,7 +2930,7 @@ def _collect_authed_provider_slugs(
 
     # --- Section 2: Hermes-only providers (HERMES_OVERLAYS) ---
     _mdev_to_hermes = {v: k for k, v in PROVIDER_TO_MODELS_DEV.items()}
-    for pid, overlay in HERMES_OVERLAYS.items():
+    for pid, overlay in g.HERMES_OVERLAYS.items():
         if pid.lower() in seen:
             continue
         hermes_slug = _mdev_to_hermes.get(pid, pid)
@@ -2945,7 +2952,7 @@ def _collect_authed_provider_slugs(
             has_creds = any(_scoped_key_env(ev) for ev in overlay.extra_env_vars)
         if not has_creds and overlay.auth_type == "api_key":
             for _key in (pid, hermes_slug):
-                pcfg = PROVIDER_REGISTRY.get(_key)
+                pcfg = g.PROVIDER_REGISTRY.get(_key)
                 if pcfg and pcfg.api_key_env_vars:
                     if any(_scoped_key_env(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
@@ -2970,12 +2977,12 @@ def _collect_authed_provider_slugs(
             seen.add(hermes_slug.lower())
 
     # --- Section 2b: Canonical providers cross-check ---
-    for _cp in CANONICAL_PROVIDERS:
+    for _cp in g.CANONICAL_PROVIDERS:
         if _cp.slug.lower() in seen:
             continue
         if _cp.slug.lower() in _excluded_set:
             continue
-        _cp_config = PROVIDER_REGISTRY.get(_cp.slug)
+        _cp_config = g.PROVIDER_REGISTRY.get(_cp.slug)
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(_scoped_key_env(ev) for ev in _cp_config.api_key_env_vars)
@@ -3094,6 +3101,10 @@ def list_authenticated_providers(
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
         clear_provider_models_cache, get_curated_nous_model_ids,
     )
+    # Hot registration: give refresh callbacks a chance to publish missing
+    # names, then pin ONE generation for every surface this listing reads.
+    provider_seam.refresh("picker")
+    g = provider_seam.snapshot()
 
     # Explicit refresh: drop every provider's cached model-id list so the
     # cached_provider_model_ids() calls below all re-fetch live. Without this
@@ -3201,7 +3212,7 @@ def list_authenticated_providers(
     data = fetch_models_dev()
 
     # Build curated model lists keyed by hermes provider ID
-    curated: dict[str, list[str]] = dict(_PROVIDER_MODELS)
+    curated: dict[str, list[str]] = dict(g._PROVIDER_MODELS)
     curated["openrouter"] = [mid for mid, _ in OPENROUTER_MODELS]
     # "nous" pulls from the remote model-catalog manifest published at
     # https://hermes-agent.nousresearch.com/docs/api/model-catalog.json so
@@ -3318,7 +3329,7 @@ def list_authenticated_providers(
         # Prefer auth.py PROVIDER_REGISTRY for env var names — it's our
         # source of truth.  models.dev can have wrong mappings (e.g.
         # minimax-cn → MINIMAX_API_KEY instead of MINIMAX_CN_API_KEY).
-        pconfig = PROVIDER_REGISTRY.get(hermes_id)
+        pconfig = g.PROVIDER_REGISTRY.get(hermes_id)
         # Skip non-API-key auth providers here — they are handled in
         # section 2 (HERMES_OVERLAYS) with proper auth store checking.
         if pconfig and pconfig.auth_type != "api_key":
@@ -3406,7 +3417,7 @@ def list_authenticated_providers(
     # while _PROVIDER_MODELS and config.yaml use Hermes IDs ("copilot").
     _mdev_to_hermes = {v: k for k, v in PROVIDER_TO_MODELS_DEV.items()}
 
-    for pid, overlay in HERMES_OVERLAYS.items():
+    for pid, overlay in g.HERMES_OVERLAYS.items():
         if pid.lower() in seen_slugs:
             continue
 
@@ -3440,7 +3451,7 @@ def list_authenticated_providers(
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
         if not has_creds and overlay.auth_type == "api_key":
             for _key in (pid, hermes_slug):
-                pcfg = _auth_registry.get(_key)
+                pcfg = g.PROVIDER_REGISTRY.get(_key)
                 if pcfg and pcfg.api_key_env_vars:
                     if any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
@@ -3596,14 +3607,14 @@ def list_authenticated_providers(
     except ImportError:
         _canon_provs = []
 
-    for _cp in _canon_provs:
+    for _cp in g.CANONICAL_PROVIDERS:
         if _cp.slug.lower() in seen_slugs:
             continue
         if _cp.slug.lower() in _excluded:
             continue
 
         # Check credentials via PROVIDER_REGISTRY (auth.py)
-        _cp_config = _auth_registry.get(_cp.slug)
+        _cp_config = g.PROVIDER_REGISTRY.get(_cp.slug)
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
