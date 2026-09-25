@@ -2399,7 +2399,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 f"({str(registered[0].relative_to(workspace))})"
             )
         stage = "_repos workspace scan"
-        repos = _repos(workspace, prune)
+        repos = _repos(workspace, prune) if prune else _repos(workspace)
         if foreign:
             repos = [repo for repo in repos if not foreign.foreign(repo)]
             if foreign.skipped:
@@ -2622,7 +2622,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # Nothing in-tree to capture: the survivor must live elsewhere. An
             # inferred one vouches only for the repositories it came from, so
             # files beside them make the inference worthless -- HOLD instead.
-            loose = _loose_files(workspace, repos, prune)
+            loose = _loose_files(workspace, repos, prune) if prune else _loose_files(workspace, repos)
             external = _external(conn, task_id, metadata, evidence, _remote_urls(repos), explicit,
                                  discover=not loose, cleanup=cleanup, previous=None if loose else previous)
             if external:
