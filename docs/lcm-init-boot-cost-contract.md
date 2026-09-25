@@ -143,6 +143,44 @@ inter-statement wall time.
    lock only when there is something to delete, and runs at most once per
    `empty_lifecycle_gc_interval_hours` (default 6 h) per process.
 
+## An FTS repair is one transaction (freeze #3, third defect)
+
+`repair_external_content_fts` issues DROP TABLE / CREATE VIRTUAL TABLE / `'rebuild'` /
+DROP+CREATE TRIGGER. Python's legacy sqlite3 isolation opens **no implicit transaction for
+DDL**. Before t_d3963974's follow-up, each of those statements autocommitted on its own. For
+the whole O(rows) rebuild (13–28 min on the fleet store), other connections saw the index
+missing (`LCM ingest failed: no such table: main.messages_fts`, live 05:10) or empty
+(docsize=0 vs 2.79 M, captured on disk), and a dropped trigger let concurrent inserts skip
+the index. Any repair now runs under `BEGIN IMMEDIATE` with one COMMIT and rolls back on any
+error. A no-op load still takes no write lock. The explicit-repair path was atomic only by
+accident: #966's parity-marker write opened a transaction first. The engine-load
+structural path was not. Gate: `test_lcm_fts_atomic_rebuild.py` (observer connection sees
+no torn state; a failed rebuild leaves the old index), RED on dc228d5810.
+
+## A structural rebuild never runs on the load thread (t_1e04c4bd)
+
+With genuine structural damage (missing shadow table, non-FTS5 table, missing indexed
+column), the load path (`throttle=True`) does only O(1) work. It drops the FTS triggers,
+because a broken index makes every trigger-firing ingest raise. It sets
+`fts_integrity_failed:<table>` and starts a daemon thread (`lcm-fts-rebuild-<table>`, own
+connection). That thread runs the same one-transaction rebuild and recreates the triggers
+before the single COMMIT, so rows ingested during the window get indexed. MATCH raises
+until then, and search falls back to LIKE.
+
+- Inline still applies when the content table has ≤ `INLINE_STRUCTURAL_REBUILD_MAX_ROWS`
+  (1000) rows (bounded `LIMIT` probe). This covers a fresh DB with no FTS table yet. It
+  also applies with `LCM_FTS_INTEGRITY_BACKGROUND=false`, and for an in-memory DB.
+- Explicit `/lcm doctor repair apply` (`throttle=False`) stays synchronous.
+- Not removed: the rebuild still holds the SQLite **write** lock for its whole duration
+  (atomicity requires it), so ingests contend on the write lock for that time. Turns and
+  engine loads no longer wait behind `_LOAD_LOCK`.
+- `_drop_fts_table` restores stub shadow tables when `DROP` fails. A missing
+  `<fts>_config` makes the FTS5 constructor, and so any DROP on a *fresh* connection, fail
+  with `vtable constructor failed`, so before this every restart hit an unrepairable index.
+
+Gate: `test_lcm_fts_deferred_structural_rebuild.py`. On #971's head all 3 tests are RED
+(`vtable constructor failed`). With the deferral disabled, the load-thread test is RED.
+
 ## Adding a new column with a legacy backfill — the recipe
 
 ```python
