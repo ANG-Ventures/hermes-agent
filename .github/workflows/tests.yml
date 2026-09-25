@@ -50,11 +50,13 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: test_durations.json
-          key: test-durations
-          # Saves use test-durations-${run_id}, so the exact key above never
-          # matches — without this prefix fallback the cache ALWAYS missed,
-          # LPT slicing ran on no data, and unbalanced slices pushed heavy
-          # files toward the per-file timeout under load.
+          # Per-run primary key so it can NEVER exact-hit. A legacy 3.5 KB entry
+          # saved under the bare key `test-durations` (2026-06-02) exact-matched
+          # every run, so the prefix fallback below never fired and LPT sliced
+          # ~4,000 files on ~40 stale durations (the rest defaulted to 2.0 s ->
+          # path order; heavy files started last and set the slice tail).
+          # Restore = the newest `test-durations-<run_id>` saved by save-durations.
+          key: test-durations-restore-${{ github.run_id }}
           restore-keys: |
             test-durations-
 
@@ -302,7 +304,10 @@ jobs:
   # (including PRs) get balanced slicing.
   save-durations:
     needs: test
-    if: needs.test.result == 'success' && github.ref == 'refs/heads/main'
+    # !cancelled() replaces the implicit success(), which also failed on the
+    # always-skipped `placement` ancestor of `test` and skipped this job on
+    # every push:main run since #938 (last cache written 2026-09-24T15:30Z).
+    if: "!cancelled() && needs.test.result == 'success' && github.ref == 'refs/heads/main'"
     # Artifact/cache plumbing needs no LAN or self-hosted test slot.
     runs-on: ubuntu-latest
     timeout-minutes: 10
