@@ -1,3 +1,4 @@
+# throwaway repro t_bc0052b9 — DO NOT MERGE (comment-only; trips the Review label gate)
 name: Label rerun
 
 # When the ``ci-reviewed`` label is added to a PR, rerun all failed jobs in
