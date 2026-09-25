@@ -1,7 +1,8 @@
 name: Label rerun
 
 # When the ``ci-reviewed`` label is added to a PR, rerun all failed jobs in
-# the latest CI run. This re-evaluates ``review-labels`` (which now sees the
+# the latest CI run, then verify the new attempt started (a startup_failure
+# attempt is healed with a full rerun, see the step). This re-evaluates ``review-labels`` (which now sees the
 # label) and GitHub reruns the dependent ``all-checks-pass`` gate.
 #
 # ``gh run rerun`` only works on a completed run. Thus this waits when the
@@ -87,6 +88,38 @@ jobs:
             fi
           fi
 
-          echo "Run completed. Rerunning all failed jobs..."
+          ATT0=$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq '.run_attempt' 2>/dev/null || echo 0)
+          echo "Run completed (attempt $ATT0). Rerunning all failed jobs..."
           gh run rerun "$RUN_ID" --repo "$REPO" --failed || true
+
+          # VERIFY the new attempt actually started (t_bc0052b9). About 1 in 12
+          # `--failed` re-runs of ci.yaml died at GitHub startup with 0 jobs and
+          # "An unexpected error has occurred" (runs 35898441649, 36070097433,
+          # 36145913460, 36170775010, 09-23..09-25). Such an attempt RESETS the
+          # check suite: attempt 1's check runs, the required "All required checks
+          # pass" included, drop out of the head's latest checks, and an armed
+          # auto-merge waits for a check that never comes (#1086, 3 h). No content
+          # or timing difference separated those 4 from the ~45 good re-runs, and a
+          # FULL rerun of the same run started normally 34 s later (36170775010
+          # attempt 3). So: on startup_failure, full rerun (not --failed), twice at
+          # most, then fail this job loudly.
+          for try in 1 2 3; do
+            ATT="$ATT0"; ST=""; CONC="none"
+            for _ in $(seq 1 24); do
+              sleep 5
+              read -r ATT ST CONC < <(gh api "repos/$REPO/actions/runs/$RUN_ID" \
+                --jq '"\(.run_attempt) \(.status) \(.conclusion // "none")"' 2>/dev/null || echo "$ATT0 unknown none")
+              # A new attempt that is running (or already concluded) is the answer.
+              if [ "$ATT" -gt "$ATT0" ] && { [ "$ST" != "queued" ] || [ "$CONC" != "none" ]; }; then break; fi
+            done
+            echo "Attempt $ATT: status=$ST conclusion=$CONC"
+            [ "$CONC" = "startup_failure" ] || break
+            if [ "$try" -ge 3 ]; then
+              echo "::error::CI run $RUN_ID attempt $ATT died at startup_failure 3 times — the head has NO required check runs; re-run the whole workflow by hand."
+              exit 1
+            fi
+            echo "::warning::CI run $RUN_ID attempt $ATT died at startup_failure (0 jobs). Full rerun $try/2."
+            ATT0="$ATT"
+            gh run rerun "$RUN_ID" --repo "$REPO" || true
+          done
           echo "Done. GitHub will rerun review-labels and all dependent jobs."
