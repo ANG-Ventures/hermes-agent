@@ -9,8 +9,11 @@ past the window, host asleep, hand-edited jobs.json). That fired a
 wall-clock one-shot late, contradicting the "will never fire" contract.
 
 These tests pin the due-scan grace gate:
-  - beyond grace  -> not due; record retired with a diagnostic
+  - beyond the catch-up window (cron.oneshot_catchup_s, default 6h)
+                  -> not due; record retired with a diagnostic
   - within grace  -> still due (legitimate catch-up)
+  (between 120s and the catch-up window a one-shot fires late — see
+  test_oneshot_restart_catchup.py)
   - beyond grace + claim -> not due, but the record is kept (a run may be
     in flight in another process; its mark_job_run must still land)
   - re-triggered  -> due again (the Run button still works)
@@ -61,7 +64,7 @@ def _oneshot(jid, run_at_dt, *, completed=0, run_claim=None, fire_claim=None):
 
 class TestOneShotGraceDueScan:
     def test_stale_beyond_grace_not_due_and_retired_with_diagnostic(self, cron_store):
-        stale = _oneshot("stale", FIXED_NOW - timedelta(hours=3))
+        stale = _oneshot("stale", FIXED_NOW - timedelta(hours=7))
         save_jobs([stale])
 
         due = get_due_jobs()
@@ -90,9 +93,9 @@ class TestOneShotGraceDueScan:
         # so mark_job_run can still land.
         claimed = _oneshot(
             "claimed",
-            FIXED_NOW - timedelta(hours=3),
+            FIXED_NOW - timedelta(hours=7),
             completed=1,
-            run_claim={"at": (FIXED_NOW - timedelta(hours=3)).isoformat(), "by": "other"},
+            run_claim={"at": (FIXED_NOW - timedelta(hours=7)).isoformat(), "by": "other"},
         )
         save_jobs([claimed])
 
@@ -104,7 +107,7 @@ class TestOneShotGraceDueScan:
     def test_retriggered_stale_oneshot_is_due(self, cron_store):
         # A user can still explicitly re-run a stale one-shot: trigger_job
         # sets next_run_at=now, which is inside the grace window -> due.
-        stale = _oneshot("stale", FIXED_NOW - timedelta(hours=3))
+        stale = _oneshot("stale", FIXED_NOW - timedelta(hours=7))
         save_jobs([stale])
         trigger_job("stale")
 

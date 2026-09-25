@@ -509,20 +509,24 @@ def fire_overdue_jobs(
         # (create/update/resume/recovery and, since #89571, the due-scan all
         # enforce it). The misfire backstop must not resurrect them hours
         # late after downtime — that's #93526.
+        # t_9bfdd7e3: the window is the restart catch-up window
+        # (cron.oneshot_catchup_s), same as the built-in due-scan.
         schedule = job.get("schedule") or {}
-        if str(schedule.get("kind") or "") == "once":
-            from cron.jobs import ONESHOT_GRACE_SECONDS
+        is_oneshot = str(schedule.get("kind") or "") == "once"
+        if is_oneshot:
+            from cron.jobs import _oneshot_catchup_seconds
 
-            if overdue_seconds > ONESHOT_GRACE_SECONDS:
+            catchup_s = _oneshot_catchup_seconds()
+            if overdue_seconds > catchup_s:
                 logger.warning(
                     "Misfire catch-up: one-shot job %s (%s) was due %s "
-                    "(%.0f min overdue) — outside the %ss one-shot grace "
+                    "(%.0f min overdue) — outside the %ss one-shot catch-up "
                     "window, not firing.",
                     job_id,
                     job.get("name") or "unnamed",
                     next_run_at,
                     overdue_seconds / 60,
-                    ONESHOT_GRACE_SECONDS,
+                    int(catchup_s),
                 )
                 continue
         logger.warning(
@@ -541,6 +545,11 @@ def fire_overdue_jobs(
             claimed = provider.claim_fire(job_id)
             if claimed is None:
                 continue
+            if is_oneshot and isinstance(claimed, dict):
+                from cron.jobs import LATE_FIRE_KEY, ONESHOT_GRACE_SECONDS
+
+                if overdue_seconds > ONESHOT_GRACE_SECONDS:
+                    claimed[LATE_FIRE_KEY] = int(overdue_seconds)
             threading.Thread(
                 target=provider.fire_claimed,
                 args=(claimed,),

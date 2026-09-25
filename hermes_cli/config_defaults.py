@@ -2972,6 +2972,12 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Restart catch-up window (seconds) for one-shot jobs. A one-shot whose
+        # run time fell inside a gateway restart fires late on boot (with a
+        # "fired late by N min" note prepended to its prompt) when it is past
+        # due by at most this much; beyond it the job is removed and a loud
+        # MISSED notice is delivered. 0 = the old 120s grace only. Default 6h.
+        "oneshot_catchup_s": 21600,
         # Timeout (seconds) for a no-agent cron script. Also overridable via
         # HERMES_CRON_SCRIPT_TIMEOUT. Keep this in sync with
         # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
