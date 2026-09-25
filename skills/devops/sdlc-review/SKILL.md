@@ -40,9 +40,9 @@ Do not use it for a separate downstream review card. A downstream card is ordina
 This skill is loaded automatically by the review dispatcher. Start with `kanban_show` before inspecting files or choosing a verdict.
 
 1. Read the task specification and the latest `review_requested` handoff.
-2. Inspect the actual deliverable and run relevant verification.
+2. Dispatch four independent lenses in ONE delegate_task batch, inspect their raw evidence and verify decisive findings yourself.
 3. Choose exactly one verdict: approve, request changes, or escalate.
-4. Record concrete evidence in the terminal Kanban transition.
+4. Record ALL findings and the batch id in a current-run comment before the terminal Kanban transition.
 
 ## Quick Reference
 
@@ -54,19 +54,31 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
 
-## Review Lenses
+## Review Lenses — all four on every round
 
-Vary how you look at the work on each round instead of repeating the same inspection. Decorrelated lenses catch different defect classes: a cold read of the artifact surfaces design and correctness problems that the implementer's narrative would have framed away, execution surfaces claims that do not reproduce, and a strict contract audit surfaces quiet scope drift. Repeating the round-1 lens on round 3 mostly re-finds what round 1 already found.
+Launch ONE `delegate_task(tasks=[...])` batch with four independent briefs:
+contract + cold artifact, execution + base/head differential, cross-vendor +
+aliases/entry points, mutation + test-of-test. Inspect raw traces and reconcile
+ALL findings before one verdict; never serialize lenses across review rounds.
+Record the actual delegate batch id in a card comment. If delegation itself is
+unavailable, do all four personally in the same round and name the limitation.
 
-Determine the current round from the history the task record already gives you: count the `changes_requested` entries in the "Prior attempts on this task" section of your worker context (also visible as prior runs in `kanban_show`). The current review round is that count plus one. Round 1 therefore shows zero `changes_requested` attempts; round 2 shows one; and so on.
+Before EVERY `kanban_request_changes`, post a current-run comment containing
+a single JSON line:
 
-| Round | Lens | How to apply it |
-|---|---|---|
-| 1 | Artifact | Read the diff or deliverable cold, before the implementer's summary. Form an independent judgment, then compare it against the handoff narrative and investigate every mismatch. |
-| 2 | Execution | Check out the work and actually run it via `terminal`: build, test, and exercise the reported behavior yourself. Verify each handoff claim empirically instead of re-reading the artifact. |
-| 3+ | Contract | Re-read the ORIGINAL task body and acceptance criteria, then audit the deliverable strictly against them. Also verify that every item from every prior `kanban_request_changes` round actually landed. |
+`review_coverage: {"lenses":{"contract":"done","execution":"done","cross-vendor":"done","mutation":"done"},"findings":1,"items":["BEHAVIOUR: reproducible finding"],"review_minutes":12,"battery":"battery-v1.zip","batch_id":"delegate batch id"}`
 
-The baseline duties in the Procedure section still apply on every round; the lens sets which inspection you lead with and weight most heavily.
+Each lens is `done` or `n/a: <applicability reason>`; inability to run a lens
+requires `kanban_block(kind=capability)`, not n/a. An n/a reason containing an
+inability word anywhere (skipped, could not, cannot, unable, missing, not
+available, no … tool, exhausted, timed out) is refused — phrase applicability
+as "does not apply / do not differ". `findings` must equal the number of items
+and be at least one; each item names the finding (3+ visible characters with a
+letter or digit, not "F1" or "-"). `review_minutes` is 0–1440. Lens keys and
+states are case-insensitive; the newest current-run comment that parses is
+the record. `battery` is optional (CI owns
+suites); when given it must be a nonempty string. The required lens list lives
+in `hermes_cli/kanban_review_schema.py`. Approval is unaffected by this gate.
 
 ### Lens variation for ad-hoc review fan-outs
 
