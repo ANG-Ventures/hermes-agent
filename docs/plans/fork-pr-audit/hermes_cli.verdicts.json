@@ -18,7 +18,13 @@
   },
   "branch": null,
   "notes": "D9: the hermes_cli hunk (5 lines, web_server ready file) exists only for the desktop Electron backend-ready.cjs; the apps/ part is already D9 DROP. dashboard.out.log prints the line but nothing non-desktop reads it. | branch NOT built (conflicts; needs hand build): revert 53cce7f872 conflicts: UU apps/desktop/electron/backend-ready.test.ts UU apps/desktop/electron/backend-ready.ts DU apps/desktop/electron/main.cjs UU apps/desktop/package.json",
-  "subject": "feat(desktop): backend runs from runtime deploy tree by default (+ config override) (#158)"
+  "subject": "feat(desktop): backend runs from runtime deploy tree by default (+ config override) (#158)",
+  "adversary": {
+   "result": "OVERTURNED",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "../up/hermes_cli/web_server.py:1355 _write_dashboard_ready_file(actual_port); :1359 ready_token HERMES_DASHBOARD_READY; reader ../up/apps/desktop/electron/backend-ready.ts:145 (D9); no non-desktop reader in fork, ~/.hermes/scripts, launchd",
+   "notes": "auditor upstream_state was wrong (upstream writes the ready file); same action (drop ours/take theirs), dissolves the unbuilt revert"
+  }
  },
  "nopr:b5d533baa7": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -39,7 +45,12 @@
   },
   "branch": null,
   "notes": "Zero net fork delta on hermes_cli after this row; nothing to revert.",
-  "subject": "fix(sync): CI round-1 fixes \u2014 dead import of upstream-deleted module + keychain-guard false anchor"
+  "subject": "fix(sync): CI round-1 fixes \u2014 dead import of upstream-deleted module + keychain-guard false anchor",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "zero net fork delta (sync residue)"
+  }
  },
  "#1059": {
   "verdict": "KEEP",
@@ -452,7 +463,12 @@
   },
   "branch": null,
   "notes": "1 real '/model name:' line in agent/gateway logs. Generic \u2014 upstream-able later.",
-  "subject": "fix(model): accept Discord 'name:provider/model' on every surface; refuse unknown provider (#980)"
+  "subject": "fix(model): accept Discord 'name:provider/model' on every surface; refuse unknown provider (#980)",
+  "adversary": {
+   "result": "KEEP-UNPROVEN",
+   "new_verdict": "KEEP",
+   "evidence": "fires=0 in evidence vs \"1 real /model name: line\" in notes; one hit in 5 months; generic -> measure or UPSTREAM"
+  }
  },
  "#965": {
   "verdict": "KEEP",
@@ -1049,7 +1065,13 @@
   },
   "branch": null,
   "notes": "Never fires: the warning literal has 0 hits across 1,741 log files (2026-05-10..09-25). Test-harness-only path. | branch NOT built (conflicts; needs hand build): revert 23af01e58b conflicts: UU hermes_cli/kanban_db.py",
-  "subject": "fix(kanban): SANDBOX=1 neutralising an explicit path pin is no longer silent (#890)"
+  "subject": "fix(kanban): SANDBOX=1 neutralising an explicit path pin is no longer silent (#890)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "DROP",
+   "evidence": "warning literal 0 hits (1,741 files, 0 since 09-23); class fixed at source by ~/.hermes/scripts/git-hooks/pre-commit.d/99-kanban-env-scrub.sh (t_84deb81f) + explicit SANDBOX unsets in kanban-diagnostics-watch.sh:15, shell_suite_sweep.py:65, diagnostics/zombie_block_repro.py:10, kanban-gc-dry-run.sh:12; incidents t_58601147/t_651a97f0 (09-21) predate both and did not recur",
+   "notes": "no consumer; revert is a hand-build in kanban_db.py (UU) \u2014 lead may prefer drop-at-kanban-convergence"
+  }
  },
  "#889": {
   "verdict": "KEEP",
@@ -1726,7 +1748,13 @@
   },
   "branch": "audit/hermes_cli/revert-802",
   "notes": "Dead hook: zero consumers \u2014 no caller of register_chain_source/registered_chain_sources outside fallback_config.py in the fork tree or ~/.hermes/plugins, and no `source:` fallback entry in ~/.hermes/config.yaml. Speculative infrastructure. | revert branch off origin/main; tests: `python -m pytest -q -x tests/hermes_cli/test_fallback_config.py` -> rc=0 5 passed in 1.25s",
-  "subject": "feat(fallback): let a chain entry derive its rungs from a registered source (#802)"
+  "subject": "feat(fallback): let a chain entry derive its rungs from a registered source (#802)",
+  "adversary": {
+   "result": "OVERTURNED",
+   "new_verdict": "KEEP",
+   "evidence": "~/.hermes/plugins/fallback_chain_pool_source/__init__.py:245-247 imports+calls register_chain_source (card t_fb31680e); upstream PR NousResearch#118012 OPEN",
+   "notes": "live fleet plugin consumer; no {source:} rung in any config yet; becomes SUPERSEDED when #118012 merges"
+  }
  },
  "#800": {
   "verdict": "KEEP",
@@ -2009,7 +2037,13 @@
   },
   "branch": "audit/hermes_cli/revert-760",
   "notes": "Trigger gone: ~/.hermes/cache/forensic-native-snapshot-control-20260913 was moved (only a .MOVED.txt remains) and `find ~/.hermes/cache -name '*.db'` returns nothing. | revert branch off origin/main; tests: `python -m pytest -q -x tests/hermes_cli/test_backup.py` -> rc=0 80 passed in 19.11s",
-  "subject": "fix(backup): exclude cache/forensic-*/ and cache/**/*.db from the backup walk (#760)"
+  "subject": "fix(backup): exclude cache/forensic-*/ and cache/**/*.db from the backup walk (#760)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "DROP",
+   "evidence": "cache/forensic-* gone (.MOVED.txt only); find ~/.hermes/cache -name *.db empty; revert-760 vs merge-base ee374d6a6d touches own files only",
+   "notes": "trigger gone; recurrence guard belongs in the forensics skill, not the fork"
+  }
  },
  "#720": {
   "verdict": "KEEP",
@@ -2081,7 +2115,13 @@
   },
   "branch": "audit/hermes_cli/revert-712",
   "notes": "Never configured: `model_catalog.excluded_providers` appears in no config.yaml (root or any profile). The filter can never fire on this fleet. | revert branch off origin/main; tests: `python -m pytest -q -x tests/hermes_cli/test_inventory.py` -> rc=0 23 passed in 6.98s",
-  "subject": "fix(model): honour excluded_providers for user-defined and injected rows (#712)"
+  "subject": "fix(model): honour excluded_providers for user-defined and injected rows (#712)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "DROP",
+   "evidence": "excluded_providers absent from root+10 profile configs and ~/.hermes/plugins; upstream ALSO filters overlay/custom rows: ../up/hermes_cli/model_switch_providers.py:651,659,891,927 + main_provider_setup.py:883",
+   "notes": "auditor upstream_state corrected (not only inventory.py:54); effectively SUPERSEDED, same action"
+  }
  },
  "#711": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2102,7 +2142,12 @@
   },
   "branch": null,
   "notes": "Upstream's forwarder factory returns cron_command's exit status.",
-  "subject": "fix(cron): propagate `hermes cron run --wait` failure exit status (#711)"
+  "subject": "fix(cron): propagate `hermes cron run --wait` failure exit status (#711)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "40230dcca7 ancestor of upstream/main; ../up/hermes_cli/main.py:1930 cmd_cron = _forward_command(..., forward_return=True)"
+  }
  },
  "#707": {
   "verdict": "KEEP",
@@ -2339,7 +2384,13 @@
   },
   "branch": null,
   "notes": "18-loc CI/container-hermetic fix; upstream restructured doctor into doctor_tools/doctor_platform.",
-  "subject": "fix(ci): make 3 tests container-hermetic + stop doctor skipping backend sections in containers (#638)"
+  "subject": "fix(ci): make 3 tests container-hermetic + stop doctor skipping backend sections in containers (#638)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "a36221ed91 ancestor; ../up/hermes_cli/doctor_tools.py:202 _check_docker_backend(terminal_env, running_in_container, ...), :311",
+   "notes": "take upstream tests/hermes_cli/test_gateway_service.py with it"
+  }
  },
  "#637": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -2360,7 +2411,12 @@
   },
   "branch": null,
   "notes": "Upstream landed the same fix under the same title (2026-08-24). Drop ours at next sync, take theirs.",
-  "subject": "fix(auth): defer hermes_cli.config import until after PROVIDER_REGISTRY exists (#637)"
+  "subject": "fix(auth): defer hermes_cli.config import until after PROVIDER_REGISTRY exists (#637)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "30b0958a69 ancestor (same title, same day); ../up/hermes_cli/auth.py:249 PROVIDER_REGISTRY, :259 deferred config import"
+  }
  },
  "#636": {
   "verdict": "KEEP",
@@ -2427,7 +2483,13 @@
   },
   "branch": "audit/hermes_cli/revert-619",
   "notes": "Never measured in use (papercut pc-bf39c22e only); 0 conflict files, so the drop is cheap either way. `hermes doctor` is not run by any script in ~/.hermes/scripts. | revert branch off origin/main; tests: `python -m pytest -q -x tests/hermes_cli/test_doctor.py` -> rc=0 65 passed, 1 warning in 31.09s",
-  "subject": "feat(doctor): surface the absolute runtime interpreter path (#619)"
+  "subject": "feat(doctor): surface the absolute runtime interpreter path (#619)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "DROP",
+   "evidence": "0 readers of \"Interpreter:\" in ~/.hermes/scripts, cron, launchd, skills; upstream doctor*.py has no sys.executable line; revert-619 own files only",
+   "notes": "UPSTREAM-eligible 7-line doctor improvement if wanted; unmeasured as a fork patch"
+  }
  },
  "#617": {
   "verdict": "UPSTREAM",
@@ -2887,7 +2949,12 @@
   },
   "branch": null,
   "notes": "Anthropic-wire relay providers are live.",
-  "subject": "fix(models): dots->hyphens only for Anthropic MODELS, not Anthropic-wire relays (#492)"
+  "subject": "fix(models): dots->hyphens only for Anthropic MODELS, not Anthropic-wire relays (#492)",
+  "adversary": {
+   "result": "KEEP-UNPROVEN",
+   "new_verdict": "KEEP",
+   "evidence": "no fleet Anthropic-wire model id contains a dot (claude-opus-5-5, claude-fable-5-1); guarded rewrite has no live input"
+  }
  },
  "#491": {
   "verdict": "KEEP",
@@ -2958,7 +3025,13 @@
   },
   "branch": null,
   "notes": "377 fork tasks carry reasoning_effort (used). Fork's extra CLI/tool exposure is upstream PRs 79405/80167 (both still open upstream). Fork kanban is a divergent subsystem (fork hermes_cli/kanban_db.py 21,887 lines vs upstream's split kanban_db*.py, kanban_db.py 4,580 lines; 260 upstream kanban commits since the 08-07 merge-base). Taking upstream's version of this behavior is only realizable as part of a kanban convergence project; no standalone revert.",
-  "subject": "feat(kanban): per-task reasoning effort (DB + dispatcher + CLI + tool) (#486)"
+  "subject": "feat(kanban): per-task reasoning effort (DB + dispatcher + CLI + tool) (#486)",
+  "adversary": {
+   "result": "OVERTURNED",
+   "new_verdict": "KEEP",
+   "evidence": "commit 1 = upstream 0b69a6ac02 (ancestor; ../up kanban_db.py:729 column) but CLI+tool exposure absent upstream: git grep reasoning_effort -- tools/kanban_tools.py hermes_cli/kanban.py on ../up = 0 hits (fork tools/kanban_tools.py:547,594,1641); upstream PRs 79405 + 80167 both OPEN (REST 2026-09-25); kanban_create(reasoning_effort=) is a documented fleet tool param",
+   "notes": "1/3 superseded (column), 2/3 fork-only pending open upstream PRs; SUPERSEDED when they merge; D2b registry write owed"
+  }
  },
  "#479": {
   "verdict": "KEEP",
@@ -3068,7 +3141,12 @@
   },
   "branch": null,
   "notes": "Upstream skips board workspaces in its walk. The fork's 535 '[Errno 2]' hits are generic ENOENT lines, not this row's.",
-  "subject": "fix(backup): skip ephemeral kanban board workspaces in the full-zip walk (#455)"
+  "subject": "fix(backup): skip ephemeral kanban board workspaces in the full-zip walk (#455)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "9ef49cd78f ancestor; ../up/hermes_cli/backup.py:1027 + :1271 skip /workspaces/ and /attachments/"
+  }
  },
  "#441": {
   "verdict": "UNRESOLVED",
@@ -3169,7 +3247,13 @@
   },
   "branch": null,
   "notes": "885 fork tasks carry provider_override, so the behavior is used; upstream carries provider alongside model natively. Fork kanban is a divergent subsystem (fork hermes_cli/kanban_db.py 21,887 lines vs upstream's split kanban_db*.py, kanban_db.py 4,580 lines; 260 upstream kanban commits since the 08-07 merge-base). Taking upstream's version of this behavior is only realizable as part of a kanban convergence project; no standalone revert.",
-  "subject": "fix(kanban): preserve provider in model overrides (#400)"
+  "subject": "fix(kanban): preserve provider in model overrides (#400)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "c1b0f6f3c1 ancestor; ../up/hermes_cli/kanban_db.py:728,934 provider_override; kanban.py:580 _cmd_set_model, :1322 set-model",
+   "notes": "convergence-only (no standalone revert on fork kanban_db.py)"
+  }
  },
  "#386": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3190,7 +3274,12 @@
   },
   "branch": null,
   "notes": "Upstream reloads aliases from config per call; the once-only DIRECT_ALIASES population is gone.",
-  "subject": "fix(model): hot-reload model.aliases without a gateway restart (#386)"
+  "subject": "fix(model): hot-reload model.aliases without a gateway restart (#386)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "../up/hermes_cli/model_switch.py:203 _load_direct_aliases reads load_config() (:217) with path/mtime cache key (:257); :282 _ensure_direct_aliases no longer once-only"
+  }
  },
  "#384": {
   "verdict": "KEEP",
@@ -3311,7 +3400,13 @@
   },
   "branch": null,
   "notes": "The bug class (threading.local whitelist leaking onto later foreground turns) cannot occur in upstream's structure. Fork's ContextVar block (fork plugins.py:6738) goes away when the fork takes upstream's background_review.",
-  "subject": "fix(plugins): isolate background-review tool whitelist per-task (threading.local -> ContextVar) (#313)"
+  "subject": "fix(plugins): isolate background-review tool whitelist per-task (threading.local -> ContextVar) (#313)",
+  "adversary": {
+   "result": "NEEDS-LEAD",
+   "new_verdict": "KEEP (standalone); SUPERSEDED-BY-UPSTREAM only with agent-tranche background_review convergence",
+   "evidence": "fork agent/background_review.py:1590-1591 imports set_thread_tool_whitelist/clear_thread_tool_whitelist whose storage is the ContextVar this row added (hermes_cli/plugins.py:6744-6754 _tool_whitelist_var); upstream _review_tool_whitelist@agent/background_review.py:1078 is a different design (c408601937 ancestor); denied-literal 0 hits since the fix",
+   "notes": "reverting alone re-opens the leak on the fork's own review path; cross-tranche coupling"
+  }
  },
  "#308": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3339,7 +3434,13 @@
   },
   "branch": null,
   "notes": "Desktop-program row (D9); `_do` helper already dead on fork. Converge on upstream's routers.",
-  "subject": "fix(dashboard): offload 10 blocking SessionDB calls off the event loop (#308)"
+  "subject": "fix(dashboard): offload 10 blocking SessionDB calls off the event loop (#308)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "011ec4513e ancestor; upstream web_routers/sessions.py offloads; fork web_server.py ~20k lines; gui.log 2026-09-24 still logs \"event loop stalled 60.1s/5.4s/9.2s (GIL pressure suspected)\"; census dependents import nothing #308 added (SessionDBHeavyReadBusy is session_db_heavy_gate.py, rows #215/#441)",
+   "notes": "convergence-only; stalls persist on the fork regardless \u2014 for the web_server convergence owner"
+  }
  },
  "#291": {
   "verdict": "UNRESOLVED",
@@ -3526,7 +3627,13 @@
   },
   "branch": null,
   "notes": "Desktop-program row (D9). 3 of its symbols (_read_session_detail, _read_sessions_page, _rename_session_record) are already gone from fork web_server.py. Converge on upstream's routers.",
-  "subject": "fix(dashboard): offload session read endpoints (#182)"
+  "subject": "fix(dashboard): offload session read endpoints (#182)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "same as #308 (011ec4513e); 3 symbols already gone from fork web_server.py",
+   "notes": "rides with #308"
+  }
  },
  "#166": {
   "verdict": "UNRESOLVED",
@@ -3615,7 +3722,13 @@
   },
   "branch": null,
   "notes": "Per-task model write-path exists upstream (per-task model dropdown, set/override worker model+provider). Fork kanban is a divergent subsystem (fork hermes_cli/kanban_db.py 21,887 lines vs upstream's split kanban_db*.py, kanban_db.py 4,580 lines; 260 upstream kanban commits since the 08-07 merge-base). Taking upstream's version of this behavior is only realizable as part of a kanban convergence project; no standalone revert.",
-  "subject": "feat(kanban): per-task model override write-path (#39)"
+  "subject": "feat(kanban): per-task model override write-path (#39)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "c1b0f6f3c1 ancestor; set-model + model_override/provider_override on ../up (see #400)",
+   "notes": "convergence-only"
+  }
  },
  "#35": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3637,7 +3750,13 @@
   },
   "branch": null,
   "notes": "Upstream parks initial_status=blocked cards with a sticky block event. Fork kanban is a divergent subsystem (fork hermes_cli/kanban_db.py 21,887 lines vs upstream's split kanban_db*.py, kanban_db.py 4,580 lines; 260 upstream kanban commits since the 08-07 merge-base). Taking upstream's version of this behavior is only realizable as part of a kanban convergence project; no standalone revert.",
-  "subject": "fix(kanban): make --initial-status blocked sticky against recompute_ready (#35)"
+  "subject": "fix(kanban): make --initial-status blocked sticky against recompute_ready (#35)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "34120a0ae2 ancestor; ../up/hermes_cli/kanban_db_graph.py:45 initial_status==blocked -> blocked; kanban_db.py:2076 _has_sticky_block, :2157; fleet: 139 blocked events with initial_status in kanban.db; ang-swarm-plan/ang-closeout document --initial-status blocked",
+   "notes": "convergence-only"
+  }
  },
  "#33": {
   "verdict": "UNRESOLVED",
@@ -3675,7 +3794,12 @@
   },
   "branch": null,
   "notes": "Fork-kanban behavior, measured live. Not named in docs/sync/fork-features.json: verdict carries a registry write (fork-parity-doctrine D2b) \u2014 add under a 'fork kanban subsystem' entry with lifecycle fork-permanent, or upstream-intended where an upstream PR is cited.",
-  "subject": "fix(kanban): a COUNT in a card body is a timestamped claim, not current state"
+  "subject": "fix(kanban): a COUNT in a card body is a timestamped claim, not current state",
+  "adversary": {
+   "result": "KEEP-UNPROVEN",
+   "new_verdict": "KEEP",
+   "evidence": "runner is live (kanban-diagnostics-watch.sh) but only 2 cancelled events on 2026-07-27 measured, no diagnostic emission counted; D2b registry write owed"
+  }
  },
  "nopr:36134d8944": {
   "verdict": "DROP",
@@ -3696,7 +3820,13 @@
   },
   "branch": "audit/hermes_cli/revert-36134d8944",
   "notes": "Stale model: fleet aliases are now gpt-6-* (config model.aliases gpt/astra/sol); 0 `/model gpt-5.5` lines in agent logs. | revert branch off origin/main; tests: no surviving test file for the touched module after revert (row's own tests are removed by the revert); post-revert check `python -m pytest -q -x tests/hermes_cli/test_model_switch_configured_provider_routing.py tests/hermes_cli/test_model_switch_confirm_thread.py` -> 4 passed in 3.46s",
-  "subject": "fix(model): route bare gpt-5.5 to Codex OAuth"
+  "subject": "fix(model): route bare gpt-5.5 to Codex OAuth",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "DROP",
+   "evidence": "0 bare gpt-5.5 pins in config.yaml+10 profiles, cron jobs.json (all profiles), kanban model_override, launchd; model-fallback-check.py:103 keeps gpt-5.5 only as historical normaliser; codex_models.py:62-65 ladder is typed openai-codex; row test fails on ../up as expected",
+   "notes": "stale model; nothing on the fleet types bare gpt-5.5"
+  }
  },
  "nopr:7cb39d1319": {
   "verdict": "KEEP",
@@ -3762,7 +3892,13 @@
   },
   "branch": null,
   "notes": "Warning-text cosmetics; 0 log hits for the row's literals; superseded in spirit by #595's classifier. | branch NOT built (conflicts; needs hand build): revert 8f7823887e conflicts: UU hermes_cli/models.py UD tests/hermes_cli/test_anthropic_messages_warning_clarity.py",
-  "subject": "fix(models): name provider + endpoint in anthropic_messages fallback warning + fix provider_label shadowing"
+  "subject": "fix(models): name provider + endpoint in anthropic_messages fallback warning + fix provider_label shadowing",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "DROP",
+   "evidence": "git grep 'could not verify' -- hermes_cli -> only kanban_survivor files; warning text already replaced by #595 d750c1f90f (KEEP); revert conflicts (UU models.py) because #595 rewrote the site",
+   "notes": "DROP-absorbed-by-#595: do not hand-build a revert (would re-introduce the provider_label rebinding); no branch, no card"
+  }
  },
  "nopr:9c6214b9c5": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3784,7 +3920,13 @@
   },
   "branch": null,
   "notes": "27-loc parse tweak for openai-codex slash switches; upstream's switch path routes a typed model to the declaring provider.",
-  "subject": "fix: parse openai-codex slash model switches"
+  "subject": "fix: parse openai-codex slash model switches",
+  "adversary": {
+   "result": "OVERTURNED",
+   "new_verdict": "KEEP",
+   "evidence": "parse_model_input(\"openai-codex/gpt-6-sol\", \"claude-bpr\") on ../up -> (\"claude-bpr\", \"openai-codex/gpt-6-sol\"); on fork -> (\"openai-codex\", \"gpt-6-sol\"); colon form handled on both; fleet worker spawns pass -m provider/model (#374: 322 lines)",
+   "notes": "not superseded; generalised by fork #713 (KEEP); UPSTREAM-eligible"
+  }
  },
  "nopr:9f9bf61409": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3805,7 +3947,13 @@
   },
   "branch": null,
   "notes": "Inline provider syntax is handled upstream; fork helpers _parse_inline_provider_model etc. duplicate it.",
-  "subject": "fix(model-switch): support inline provider syntax"
+  "subject": "fix(model-switch): support inline provider syntax",
+  "adversary": {
+   "result": "OVERTURNED",
+   "new_verdict": "KEEP",
+   "evidence": "fork tests/hermes_cli/test_model_switch_inline_provider_syntax.py on ../up: 4 failed 2 passed (colon-switch, colon-not-normalized, slash-from-non-aggregator FAIL); unmocked probe on ../up: switch_model('openai-codex:gpt-6-sol', current_provider='claude-api-proxy') -> stays claude-api-proxy model 'openai-codex/gpt-6-sol'; 'openai-codex/gpt-6-sol' from claude-bpr -> stays claude-bpr; same probe on fork 3 passed; upstream _convert_vendor_colon_slug model_switch.py:1287-1305 only rewrites to a slug",
+   "notes": "upstream RED for the fleet's daily case (plugin provider -> /model provider/model); UPSTREAM-eligible for the non-aggregator case"
+  }
  },
  "nopr:a184062e7b": {
   "verdict": "KEEP",
@@ -3867,7 +4015,13 @@
   },
   "branch": null,
   "notes": "Upstream bounds the SQLite backup copy. See #778 for the fork-specific SIZE of that bound (kept).",
-  "subject": "fix(backup): bound _safe_copy_db so a live 1GB+ DB can't deadlock the full backup"
+  "subject": "fix(backup): bound _safe_copy_db so a live 1GB+ DB can't deadlock the full backup",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "../up/hermes_cli/backup_sqlite.py:31 _safe_copy_db(..., timeout_seconds=10.0), :57 busy_deadline",
+   "notes": "size of the bound is #778 (KEEP)"
+  }
  },
  "nopr:d68a4b0fcc": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
@@ -3888,7 +4042,13 @@
   },
   "branch": null,
   "notes": "Upstream resolves plugin providers natively; fork _resolve_plugin_provider is redundant. The 'Unknown provider' literal (47 hits) is upstream's own message.",
-  "subject": "fix(model-switch): resolve provider-module plugin providers in switch path"
+  "subject": "fix(model-switch): resolve provider-module plugin providers in switch path",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "fork _resolve_plugin_provider and ../up _plugin_profile_pdef@hermes_cli/providers.py:223 both read providers.get_provider_profile (providers/__init__.py:208 fork / :158 up); fleet plugins register via ProviderProfile/register_provider",
+   "notes": "same registry shape"
+  }
  },
  "#797": {
   "verdict": "KEEP",
@@ -4000,7 +4160,12 @@
   },
   "branch": null,
   "notes": "Row aligned non-desktop surfaces to the constant; upstream already derives from it. 50 files / 14 conflict files (3 syncs) \u2014 high cost for zero fork delta.",
-  "subject": "fix(reasoning): align non-desktop max parity (#359)"
+  "subject": "fix(reasoning): align non-desktop max parity (#359)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "../up/hermes_constants.py:991 VALID_REASONING_EFFORTS includes max/ultra; consumers read the constant"
+  }
  },
  "#335": {
   "verdict": "KEEP",
@@ -4197,6 +4362,11 @@
   },
   "branch": null,
   "notes": "Fork still carries the explicit py-modules list (fork pyproject.toml:441). Take upstream's derivation; hermes_state_ext/hermes_undo then ship by construction.",
-  "subject": "fix(packaging): declare hermes_state_ext + hermes_undo in py-modules (#391)"
+  "subject": "fix(packaging): declare hermes_state_ext + hermes_undo in py-modules (#391)",
+  "adversary": {
+   "result": "STANDS",
+   "new_verdict": "SUPERSEDED-BY-UPSTREAM",
+   "evidence": "283c4f058c ancestor; ../up/setup.py:87 _root_py_modules() -> :99 py_modules=; pyproject.toml:796 forbids the list"
+  }
  }
 }
