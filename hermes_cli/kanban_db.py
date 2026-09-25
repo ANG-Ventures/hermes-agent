@@ -13534,8 +13534,9 @@ def rate_limit_circuits(
     A close is charged to the pool that SERVED the run: a dispatch-time
     route change (capped-pool fallback rung, lane override) is recorded as a
     run-scoped ``dispatch_provider_fallback`` / ``dispatch_lane_route`` event
-    and wins; otherwise the route is re-derived from the card's pin + the
-    run's profile (Argus r2 G1: fallback-rung 429s charged to the primary).
+    and wins, and a worker-side swap (``worker_route_substituted``, written by
+    the worker after spawn) wins over both; otherwise the route is re-derived
+    from the card's pin + the run's profile (Argus r2 G1: fallback-rung 429s charged to the primary).
 
     Derived from ``task_runs`` alone (no in-memory latch), so it survives a
     gateway restart: a pool trips at the latest close that completes ``trip``
@@ -13560,14 +13561,15 @@ def rate_limit_circuits(
         for ev in conn.execute(
             "SELECT run_id, kind, payload FROM task_events WHERE run_id IN ("
             + ",".join("?" * len(chunk)) + ") AND kind IN "
-            "('dispatch_lane_route', 'dispatch_provider_fallback') ORDER BY id",
+            "('dispatch_lane_route', 'dispatch_provider_fallback', "
+            "'worker_route_substituted') ORDER BY id",
             chunk,
         ):
             try:
                 payload = json.loads(ev["payload"] or "{}")
             except (TypeError, ValueError):
                 continue
-            field = "to_provider" if ev["kind"] == "dispatch_provider_fallback" else "provider"
+            field = "provider" if ev["kind"] == "dispatch_lane_route" else "to_provider"
             if isinstance(payload, dict) and isinstance(payload.get(field), str):
                 served[int(ev["run_id"])] = payload[field]  # later event wins
     keys: dict[tuple, Optional[str]] = {}

@@ -4191,6 +4191,16 @@ def try_activate_fallback(
                 "failover", old_provider, old_model, fb_provider, fb_model,
                 old_effort=_old_eff, new_effort=_new_eff,
             )
+            # Kanban worker: put the swap on the card's run (t_4fe0700a) so
+            # a pinned route that ended up elsewhere is visible on the board.
+            from hermes_cli.kanban_worker_route import (
+                record_worker_route_substitution,
+            )
+            record_worker_route_substitution(
+                stage="runtime", from_provider=old_provider, from_model=old_model,
+                to_provider=fb_provider, to_model=fb_model,
+                reason=getattr(reason, "value", reason),
+            )
             # Chat announce — gated on model.announce_route_change (default on).
             _announce_on = True
             try:
