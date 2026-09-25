@@ -184,46 +184,6 @@ class TestShouldExclude:
         # a FILE literally named "workspaces" is not a directory — keep it
         assert not _should_exclude(Path("kanban/boards/slug/workspaces"))
 
-    def test_excludes_cache_forensic_artifacts(self):
-        """cache/forensic-*/ holds DELIBERATELY TORN forensic specimens — they are
-        expected to fail PRAGMA integrity_check forever, by construction.
-
-        2026-09-20: the 7.3 GB cache/forensic-native-snapshot-control-20260913/state.db
-        (control snapshot from the 09-12 state.db incident) rode into the Sunday full
-        tier and restore-verify correctly reported "sqlite integrity FAILED" on it,
-        failing the whole apollo backup (exit 1) on every run. The fix is to keep the
-        artifact OUT of the archive — NOT to teach the verifier to ignore integrity
-        failures, which would blind the check that exists to refuse a corrupt blob.
-
-        Scoped to the ROOT cache/ dir so an unrelated nested "cache" dir a user keeps
-        elsewhere in the tree is still backed up.
-        """
-        from hermes_cli.backup import _should_exclude
-        # the exact artifact from the incident → excluded
-        assert _should_exclude(
-            Path("cache/forensic-native-snapshot-control-20260913/state.db")
-        )
-        assert _should_exclude(
-            Path("cache/forensic-native-snapshot-control-20260913/notes/readme.md")
-        )
-        # any *.db under the cache root is regenerable scratch → excluded
-        assert _should_exclude(Path("cache/some-tool/index.db"))
-        assert _should_exclude(Path("cache/fastembed/models.db"))
-
-        # 🔴 over-reach controls — all of these MUST survive.
-        # A nested "cache" dir that is not the root cache/ is untouched.
-        assert not _should_exclude(Path("skills/x/cache/forensic-thing/state.db"))
-        assert not _should_exclude(Path("workspace/cache/notes.db"))
-        # Docs ABOUT the lane, and the breadcrumb left when an artifact is
-        # relocated, are ordinary FILES — the prefix matches ancestors only.
-        assert not _should_exclude(
-            Path("cache/forensic-native-snapshot-control-20260913.MOVED.txt")
-        )
-        # Non-db content under the cache root is still archived.
-        assert not _should_exclude(Path("cache/claude-usage/summary.json"))
-        # A top-level forensics tree outside cache/ is NOT in scope of this rule.
-        assert not _should_exclude(Path("forensics-archive/box-1/report.md"))
-
     def test_excludes_state_snapshots_dir(self):
         """state-snapshots/ is excluded for the same reason as backups/: every
         quick / pre-update snapshot holds its own copy of state.db, so zipping

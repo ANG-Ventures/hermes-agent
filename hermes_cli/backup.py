@@ -155,49 +155,6 @@ _EXCLUDED_PATH_GLOBS = (
     ("kanban", "boards", None, "workspaces"),   # ephemeral per-task scratch checkouts
 )
 
-# Root-anchored ``cache/`` rules. ``$HERMES_HOME/cache/`` is the fleet's REGENERABLE
-# scratch root (tool caches, telemetry cuts, per-incident capture dirs) — not agent
-# state. Anchored to the FIRST path component so an unrelated nested ``cache`` dir a
-# user keeps elsewhere in the tree is still backed up (same discipline as
-# _EXCLUDED_PARENT_CHILD).
-#
-# Two rules, both learned the same way the ``state-snapshots`` exclusion was:
-#
-# 1. ``cache/forensic-*/`` — FORENSIC ARTIFACTS ARE NOT BACKUP MATERIAL. A forensic
-#    capture is a DELIBERATELY TORN specimen preserved for analysis; it is expected to
-#    fail ``PRAGMA integrity_check`` forever, by construction. 2026-09-20: the 7.3 GB
-#    ``cache/forensic-native-snapshot-control-20260913/state.db`` (control snapshot from
-#    the 09-12 state.db incident) rode into the Sunday full tier, and restore-verify
-#    correctly reported ``sqlite integrity FAILED`` on it — failing the whole apollo
-#    backup (exit 1) every single run. Measured on the real specimen: valid
-#    ``SQLite format 3\0`` header, ``quick_check`` -> "2nd reference to page 598992".
-#    The header is intact, so a magic-number bypass would NOT have caught it and a
-#    damaged OPERATIONAL db must still fail. Excluding the artifact is the root fix;
-#    an "ignore integrity failures" allowlist would blind the check that exists
-#    precisely to refuse a corrupt blob.
-#
-# 2. ``cache/**/*.db`` — a SQLite DB living under the cache root is by definition
-#    regenerable, and each one costs a full integrity_check on every restore-verify.
-#    (Measured 2026-09-20: 0 such files present, so this is a forward guard against
-#    the next capture dir, not a behavior change today.)
-_CACHE_ROOT = "cache"
-_FORENSIC_DIR_PREFIX = "forensic-"
-
-
-def _is_excluded_cache_path(parts: tuple[str, ...]) -> bool:
-    """Return True for paths under the root ``cache/`` dir that must not be archived.
-
-    *parts* is a path relative to the hermes root. As with _EXCLUDED_DIR_PREFIXES, the
-    ``forensic-`` prefix is matched on ANCESTOR components only, so a regular FILE whose
-    own name starts with ``forensic-`` (e.g. the ``*.MOVED.txt`` breadcrumb left when an
-    artifact is relocated) is preserved.
-    """
-    if not parts or parts[0] != _CACHE_ROOT:
-        return False
-    if any(part.startswith(_FORENSIC_DIR_PREFIX) for part in parts[1:-1]):
-        return True
-    return parts[-1].endswith(".db")
-
 # Directory-NAME prefixes to skip anywhere in the tree. Browser-automation debug
 # profiles (browser-access / CDP) are transient junk: they hold dozens of Chrome
 # SQLite DBs (first_party_sets.db, History, Cookies, …) that a LIVE Chrome keeps
@@ -543,12 +500,6 @@ def _should_exclude(rel_path: Path) -> bool:
     # components are considered, so a FILE whose name coincides with the final
     # component is never dropped by this rule.
     if _matches_path_glob(parts):
-        return True
-
-    # Root-anchored cache/ excludes: forensic capture dirs (intentionally-corrupt
-    # specimens) and any regenerable *.db under the cache root. See
-    # _is_excluded_cache_path.
-    if _is_excluded_cache_path(parts):
         return True
 
     name = rel_path.name
@@ -1101,13 +1052,6 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
             # kanban reaper deletes those workspaces concurrently, so every
             # enumerated-then-vanished file raises a benign ENOENT warning.
             and not _matches_path_glob((*(rel_dir / d).parts, "_"))
-            # Prune forensic capture dirs under cache/ HERE too, for the same
-            # reason as the globs above: the 09-13 specimen dir is 7.3 GB and
-            # enumerating it costs the walk real time before the file-level
-            # filter would drop every member anyway. The trailing "_" sentinel
-            # makes ``d`` an ANCESTOR component, matching the ancestor-only
-            # prefix discipline.
-            and not _is_excluded_cache_path((*(rel_dir / d).parts, "_"))
         ]
         for removed in set(orig_dirnames) - set(dirnames):
             skipped_dirs.add(str(rel_dir / removed))
@@ -2374,7 +2318,6 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                 if d not in _EXCLUDED_DIRS
                 and not d.startswith(_EXCLUDED_DIR_PREFIXES)
                 and not _matches_path_glob((*(rel_dir_full / d).parts, "_"))
-                and not _is_excluded_cache_path((*(rel_dir_full / d).parts, "_"))
             ]
 
             for fname in filenames:
