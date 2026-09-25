@@ -1,0 +1,205 @@
+{
+ "#285": {
+  "verdict": "KEEP",
+  "problem": "Background delegate_task jobs silently died on gateway restart with no resume; fork persists dispatch + boot-scan auto-redispatch.",
+  "evidence": {
+   "original": "PR #285 body: two live incidents 2026-07-10 (35-min research delegate killed by deploy restart; its redispatch killed by a second restart).",
+   "upstream_state": "read-only: upstream policy = no resume of a running child ('A Hermes process restart does **not** resume a running child. Its attempt becomes unknown') @ website/docs/user-guide/features/delegation.md:425 (af250d8494 2026-07-13); recover_abandoned_delegations@tools/async_delegation.py:258 reports only",
+   "upstream_fix": "none (upstream deliberately chose notify-with-partial-results: c5594ec4b3, 021530a69e; not redispatch)",
+   "fires": "async_delegation_redispatched 7 + recovery_claimed 7 (09-23..09-25), async_delegation_persisted 24 (09-09..09-25); logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25",
+   "cost": {
+    "loc": 3499,
+    "conflict_syncs": 3,
+    "conflict_files": 9,
+    "dependents": [
+     "#693",
+     "#690",
+     "#733",
+     "#688",
+     "#321",
+     "#487",
+     "nopr:8d20d24ed0"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Deliberate divergence from upstream policy (upstream docs say restart does not resume). Fires: 7 real auto-redispatches in 3 days. Largest cost row in tranche (3499 loc, 9 ledger files x3 syncs) and root of the fork-only tools/async_delegation_store.py (1579 lines) family: #693 #690 #733 #688 #321 #487 nopr:8d20d24ed0 depend on it. Recommend lead consider re-basing redispatch as a thin layer on upstream recover_abandoned_delegations to cut conflict cost."
+ },
+ "#693": {
+  "verdict": "KEEP",
+  "problem": "Accepted delegation completions replayed after restart / crossed producer profiles; one corrupt record poisoned recovery.",
+  "evidence": {
+   "original": "PR #693 body (scope-frozen RC, 1108 tests); log: async_delegation_registry_invalid reason=integrity 635x 09-01..09-14, zero after merge 09-14.",
+   "upstream_state": "read-only: fork-only store tools/async_delegation_store.py absent on upstream; upstream SQLite path has no JSON registry to poison",
+   "upstream_fix": "none (problem lives in fork-only #285 store)",
+   "fires": "registry_invalid 635 (09-01→09-14, stops at merge date); 'Async delegation' log lines 844; logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25",
+   "cost": {
+    "loc": 3041,
+    "conflict_syncs": 3,
+    "conflict_files": 3,
+    "dependents": [
+     "#285"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #285. Measured: the integrity-error storm ended the day it merged. DROP only if #285 is dropped."
+ },
+ "#690": {
+  "verdict": "KEEP",
+  "problem": "Stale legacy SQLite mirror let owner-loss recovery resurrect already-accepted results.",
+  "evidence": {
+   "original": "PR #690 body; commit test tests/tools/test_async_delegation_terminal_receipts.py",
+   "upstream_state": "read-only: canonical outbox/terminal evidence is fork-only (#285 store); upstream recover path @tools/async_delegation.py:258 has no canonical JSON evidence",
+   "upstream_fix": "none",
+   "fires": "'Could not claim canonical completion' 12 on 2026-09-24; logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25",
+   "cost": {
+    "loc": 944,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#285"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #285."
+ },
+ "#733": {
+  "verdict": "KEEP",
+  "problem": "One-shot `hermes -z` exit durably cancelled every delegation the live gateway owned (cancel_matching all_active with no owner check).",
+  "evidence": {
+   "original": "PR #733 body: three completed workers' results discarded 2026-09-19 (async_delegation_stale_finalize state=cancelled).",
+   "upstream_state": "read-only: cancel_matching/registry are fork-only (#285); upstream interrupt_all is in-memory only",
+   "upstream_fix": "none",
+   "fires": "async_delegation_cancel_skipped_foreign_boot 5 (09-24..09-25) = the guard saving live delegations; logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25",
+   "cost": {
+    "loc": 279,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#285"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #285; measured firing."
+ },
+ "#688": {
+  "verdict": "KEEP",
+  "problem": "Fork JSON outbox replayed completions older than 48h after restart.",
+  "evidence": {
+   "original": "PR #688 body: 20 transcript messages with one completion id after 03:09 restart.",
+   "upstream_state": "read-only: upstream already caps its SQLite replay at 48h (_MAX_COMPLETION_REPLAY_AGE_S@tools/async_delegation.py:49); fork JSON outbox is fork-only",
+   "upstream_fix": "n/a for JSON outbox (upstream analogue 6a7cf19302 for SQLite)",
+   "fires": "async_delegation_outbox_dropped 136 (09-13..09-24); logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25",
+   "cost": {
+    "loc": 109,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#285"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #285; fires heavily."
+ },
+ "#321": {
+  "verdict": "KEEP",
+  "problem": "Silent background-worker cancels had no WHO/WHY/WHEN attribution.",
+  "evidence": {
+   "original": "PR #321 body; spec 2026-07-13_subagent-survive-parent-interrupt-SPEC v0.2.",
+   "upstream_state": "read-only: registry is fork-only (#285)",
+   "upstream_fix": "none",
+   "fires": "async_delegation_cancelled 3 in logs; cancel_attribution present in 15 live registry records (~/.hermes/state + aegis + athena async-delegations.json); caller= attribution also appears in #733's cancel_skipped log line",
+   "cost": {
+    "loc": 586,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#285",
+     "#733"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #285. Observation-only instrumentation; cheap (586 loc incl. tests, 1 ledger file). Drop together with #285 only."
+ },
+ "#487": {
+  "verdict": "KEEP",
+  "problem": "Tombstones did not distinguish never-started attempts from mid-flight losses.",
+  "evidence": {
+   "original": "PR #487 body.",
+   "upstream_state": "read-only: fork-only store (#285)",
+   "upstream_fix": "none",
+   "fires": "died_before_start=true in 2 live registry records (~/.hermes/state/async-delegations.json); 0 log lines (payload field, not logged)",
+   "cost": {
+    "loc": 253,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": [
+     "#285"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #285; 0 conflict files. Weakly measured (2 records)."
+ },
+ "#689": {
+  "verdict": "KEEP",
+  "problem": "Removes unused unclaimed mark_completion_delivered helper (cleanup).",
+  "evidence": {
+   "original": "PR #689 body: zero production callers.",
+   "upstream_state": "read-only: upstream still ships mark_completion_delivered@tools/async_delegation.py:426",
+   "upstream_fix": "none",
+   "fires": "n/a (deletion; nothing to fire)",
+   "cost": {
+    "loc": 77,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Net-negative fork divergence: the helper still exists upstream, so this deletion is a recurring conflict hunk (1 ledger file x3). Neutral-to-DROP; lead may prefer DROP (re-adopt upstream's helper) to shrink the diff. Low stakes either way."
+ },
+ "nopr:8d20d24ed0": {
+  "verdict": "KEEP",
+  "problem": "Sync CI fix: thread origin_session_id onto the fork's durable background spec so api_server background batches keep their wake target.",
+  "evidence": {
+   "original": "commit body: satisfies upstream-new test_apiserver_session_with_id_dispatches_background.",
+   "upstream_state": "read-only: durable spec is fork-only (#285)",
+   "upstream_fix": "none",
+   "fires": "n/a (glue, no log line)",
+   "cost": {
+    "loc": 53,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#285"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #285 (compat glue for upstream test). Contributor-email half is scripts+misc territory."
+ },
+ "#408": {
+  "verdict": "KEEP",
+  "problem": "(1) delivery-exhausted orphan async completions cycled forever; (2) webhook invalid-signature WARNING spammed per request.",
+  "evidence": {
+   "original": "PR #408 body: weekly debug-log report 2026-07-20; 3 rows stuck pending with 8 attempts.",
+   "upstream_state": "part1 GREEN (upstream parks at _MAX_DELIVERY_ATTEMPTS=8 @tools/async_delegation.py:46,390); part2 RED: upstream logs every rejection @gateway/platforms/webhook.py:465",
+   "upstream_fix": "part1 b1201213b7 (2026-07-22 honest durable ack semantics); part2 none",
+   "fires": "webhook 'Invalid signature for route' 191 + throttle notice 181; logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25",
+   "cost": {
+    "loc": 243,
+    "conflict_syncs": 3,
+    "conflict_files": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Mixed row: part 1 SUPERSEDED-BY-UPSTREAM (trim to upstream's parking), part 2 (webhook throttle) still fires and is generic -> UPSTREAM candidate. Kept whole here; lead should split."
+ }
+}
