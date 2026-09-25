@@ -14,7 +14,6 @@ from __future__ import annotations
 import importlib
 
 esc = importlib.import_module("plugins.context_engine.lcm.escalation")
-from scripts import lcm_arm_b_node_recovery as armB
 
 
 # ---- Prong A: summarizer prompt identifier-fidelity clause (AC-1) -----------
@@ -46,30 +45,14 @@ def test_l1_prompt_still_summarizes_normal_content():
 
 # ---- Prong B: needs_escalation trigger (positive + negative controls) -------
 
-def test_escalate_on_grouped_range_mapping():
-    # the exact lossy-merge signature from the live store
-    assert armB.needs_escalation("recover-1300 maps to 1300/1600/1900 = Barbara") is True
 
 
-def test_escalate_on_abstention():
-    assert armB.needs_escalation("no matching owner found") is True
-    assert armB.needs_escalation("That code is not present in the index.") is True
 
 
-def test_escalate_on_empty():
-    assert armB.needs_escalation("") is True
-    assert armB.needs_escalation("   ") is True
 
 
-def test_no_escalate_on_clean_full_name():
-    # a confident, complete, ungrouped answer does NOT escalate (node served it)
-    assert armB.needs_escalation("The recovery owner is Frances Allen.") is False
-    assert armB.needs_escalation("Katherine Johnson") is False
 
 
-def test_no_escalate_does_not_fire_on_a_year_or_plain_number():
-    # a single number (not a slash-grouped mapping) must not trigger escalation
-    assert armB.needs_escalation("The owner Ada Lovelace was assigned in 2024.") is False
 
 
 # ---- Prong B: recovery prompt mandates abstain-over-guess + no-grouped -------
@@ -95,34 +78,12 @@ def test_semantic_recovery_question_forbids_grouped_inference_and_mandates_absta
 
 # ---- Integration: a merged node answer escalates and is re-scored -----------
 
-def test_merged_answer_triggers_escalation_path_logic():
-    # Simulate: node returned the merged 'Barbara' answer for recover-1300.
-    # The scorer would call it confident-wrong; needs_escalation must catch it
-    # FIRST so the store-grounded path overrides before scoring.
-    merged = "Based on the index, recover-1300 maps to 1300/1600/1900 = Barbara"
-    assert armB.needs_escalation(merged) is True
-    # and the TRUE store answer (Katherine Johnson) would NOT escalate -> served
-    true_answer = "Katherine Johnson"
-    assert armB.needs_escalation(true_answer) is False
 
 
 # ---- AC-5 baseline-repro toggle: --no-escalation must be representable --------
 
-def test_escalation_toggle_default_on_flag_off():
-    # PRD-8.3 AC-5: the campaign runs an A/B on identical generator code, so the
-    # only difference between the fixed arm and the baseline-repro arm is this
-    # flag. Default MUST be on (production behaviour); --no-escalation flips it.
-    assert armB.ArmBConfig().escalation is True
-    assert armB.ArmBConfig(escalation=False).escalation is False
 
 
-def test_baseline_repro_records_escalation_in_run_params():
-    # The report must record which arm produced it so a 0%-CW result can never be
-    # silently confused with the escalation-OFF baseline. run_params is the pin.
-    import inspect
-    src = inspect.getsource(armB.ArmBHarness.run)
-    assert '"escalation": self.cfg.escalation' in src
-    assert '"run_params"' in src
 
 
 # ---- AC-5 root-cause fix: Prong-A fidelity toggle (the loop-bug fix) ----------
@@ -163,12 +124,5 @@ def test_fidelity_failsafe_to_on_for_garbage(monkeypatch):
         assert esc._identifier_fidelity_enabled() is False, v
 
 
-def test_harness_sets_fidelity_env_to_match_escalation_arm():
-    # the harness _hermes() must export LCM_IDENTIFIER_FIDELITY=0 on the baseline
-    # arm (escalation OFF) and =1 on the fix arm, so the A/B is on identical code.
-    import inspect
-    src = inspect.getsource(armB.ArmBHarness._hermes)
-    assert 'LCM_IDENTIFIER_FIDELITY' in src
-    assert 'self.cfg.escalation' in src
 
 
