@@ -856,8 +856,8 @@
     "dependents": []
    }
   },
-  "branch": "audit/cron_tools/revert-351",
-  "notes": "Never fires in production (raises only inside a test harness pointed at the live home). Test-hermeticity belongs in conftest, not the store write path. Low confidence DROP — adversary: check whether any fleet harness still relies on it."
+  "branch": "audit/cron_tools/revert-351 @ b01df7bfba",
+  "notes": "Never fires in production (raises only inside a test harness pointed at the live home). Test-hermeticity belongs in conftest, not the store write path. Low confidence DROP — adversary: check whether any fleet harness still relies on it. Revert: hand-applied inverse of e49c23dac2 (textual revert conflicted; cron/jobs.py drifted around the guard) — exact -151/+0. Verified via test-gate on ace-ai: `pytest tests/cron/test_jobs.py tests/cron/test_cron_store_concurrency.py tests/cron/test_store_resolves_live_home.py` → 130 passed in 6.20s."
  },
  "#830": {
   "verdict": "UPSTREAM",
@@ -1720,8 +1720,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "1,123 loc of default-OFF code that no fleet config turns on and no log line ever shows. Dead on this fleet. Revert branch pending (see branch field). If upstream merges #58144 (#209's yt-dlp ingestion) this becomes the natural security companion — re-offer it there, not here."
+  "branch": "audit/cron_tools/revert-211 @ b378986496",
+  "notes": "1,123 loc of default-OFF code that no fleet config turns on and no log line ever shows. Dead on this fleet. If upstream merges #58144 (#209's yt-dlp ingestion) this becomes the natural security companion — re-offer it there, not here. Revert: git revert d080d1df1a; one conflict in tests/tools/test_url_safety.py resolved to HEAD minus the TestIpIsBlocked class; 6 files, +20/-1103. Verified via test-gate: `pytest tests/tools/test_url_safety.py tests/tools/test_video_analyze.py` → 80 passed in 12.75s."
  },
  "#209": {
   "verdict": "UPSTREAM",
@@ -1798,8 +1798,8 @@
     ]
    }
   },
-  "branch": null,
-  "notes": "720 loc + 2 conflict files (3 syncs) carrying two toolsets nobody has called in 3 months. DROP both. Config cleanup needed with the revert: 'messaging'/'moa' toolset names appear in ~/.hermes/config.yaml and argus/momus/aegis profile config.yamls (+ cron/scheduler.py disables 'messaging' by name) — those lines become unknown-toolset warnings, not failures. The 'moa' provider preset (agent/moa_loop.py, hermes_cli/inventory.py) is a different thing and stays. send_message routing rows (#71/#83 lineage) judged separately; they concern the send path the gateway still uses, not the agent-callable toolset."
+  "branch": "audit/cron_tools/revert-f504b1c928 @ b4a8d24b1e",
+  "notes": "720 loc + 2 conflict files (3 syncs) carrying two toolsets nobody has called in 3 months. DROP both. Config cleanup needed with the revert: 'messaging'/'moa' toolset names appear in ~/.hermes/config.yaml and argus/momus/aegis profile config.yamls (+ cron/scheduler.py disables 'messaging' by name) — those lines become unknown-toolset warnings, not failures. The 'moa' provider preset (agent/moa_loop.py, hermes_cli/inventory.py) is a different thing and stays. send_message routing rows (#71/#83 lineage) judged separately; they concern the send path the gateway still uses, not the agent-callable toolset. Revert branch reverts 7e505547a7 + 091b3f915d + f504b1c928 (3 commits); conflicts in hermes_cli/config.py (hunk moved to config_defaults, already free of mixture_of_agents) and tools_config.py (_DEFAULT_OFF_TOOLSETS minus 'moa') resolved; 8 files, +3/-735. Verified via test-gate: `pytest tests/test_toolsets.py tests/hermes_cli/test_tools_config.py` → 70 passed, 6 skipped in 12.38s. send_message tool + its tests stay (only the agent-callable toolset entry goes)."
  },
  "nopr:091b3f915d": {
   "verdict": "DROP",
@@ -1818,7 +1818,7 @@
     ]
    }
   },
-  "branch": null,
+  "branch": "audit/cron_tools/revert-f504b1c928 @ b4a8d24b1e (combined)",
   "notes": "Follows nopr:f504b1c928 (the moa tool); goes with its revert."
  },
  "nopr:7e505547a7": {
@@ -1838,7 +1838,7 @@
     ]
    }
   },
-  "branch": null,
+  "branch": "audit/cron_tools/revert-f504b1c928 @ b4a8d24b1e (combined)",
   "notes": "Follows nopr:f504b1c928 (the moa tool); goes with its revert."
  },
  "#203": {
@@ -2007,8 +2007,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Never used since it landed. 186 loc, 0 conflict files — cheap to carry, but dead code is dead code. Revert branch pending."
+  "branch": "audit/cron_tools/revert-387 @ aa36356eeb",
+  "notes": "Never used since it landed. 186 loc, 0 conflict files — cheap to carry, but dead code is dead code. Revert: git revert 1fa21ac599; conflicts in discord_tool.py (auto_archive_duration default drift) + test_discord_tool.py resolved to HEAD minus the react bits; +1/-177. Verified via test-gate: `pytest tests/tools/test_discord_tool.py` → 45 passed in 8.98s."
  },
  "#5": {
   "verdict": "SUPERSEDED-BY-UPSTREAM",
