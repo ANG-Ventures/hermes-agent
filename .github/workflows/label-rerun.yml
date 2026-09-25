@@ -37,6 +37,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
+      # The re-run helper comes from the BASE commit, not the PR head: this
+      # job holds an actions:write token and must not execute PR-edited code.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci/rerun_failed.py
+          sparse-checkout-cone-mode: false
       - name: Wait for CI run to finish, then rerun failed jobs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -87,6 +95,14 @@ jobs:
             fi
           fi
 
+          # A failed-jobs re-run can come back startup_failure with 0 jobs
+          # (GitHub-side "unexpected error"; docs/ci/rerun-failed.md). The
+          # helper detects that and falls back to one full re-run.
           echo "Run completed. Rerunning all failed jobs..."
-          gh run rerun "$RUN_ID" --repo "$REPO" --failed || true
+          if [ -f scripts/ci/rerun_failed.py ]; then
+            python3 scripts/ci/rerun_failed.py --repo "$REPO" "$RUN_ID" || true
+          else
+            # Bootstrap only: a base commit older than the helper.
+            gh run rerun "$RUN_ID" --repo "$REPO" --failed || true
+          fi
           echo "Done. GitHub will rerun review-labels and all dependent jobs."
