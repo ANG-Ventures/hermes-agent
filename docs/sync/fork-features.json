@@ -523,5 +523,25 @@
     "upstream_ref": null,
     "absorbed_date": null,
     "surfaces": ["gateway", "discord", "telegram", "cli", "cron"]
+  },
+  {
+    "feature": "model-provider plugin discovery never runs at import (lazy _PROVIDER_PREFIXES / URL map / CANONICAL_PROVIDERS / _PROVIDER_LABELS / _KNOWN_PROVIDER_NAMES)",
+    "tests": [
+      "tests/providers/test_fork_canary_plugin_discovery_not_at_import.py"
+    ],
+    "paths": [
+      "agent/model_metadata.py",
+      "hermes_cli/models.py",
+      "providers/__init__.py"
+    ],
+    "why": "e8249c38cb (#816) made these lazy. Upstream kept eager forms: d143bf7a3b's _PROVIDER_PREFIXES plus the URL auto-extend in agent/model_metadata.py, and sync_plugin_provider_catalog() at import in hermes_cli/models_catalog_static.py. The 2026-09 parity tree (upstream main 439eb0395e) took those forms. On a fleet home, a process whose FIRST import is hermes_cli.models then registered 0/52 claude-apx/bpx providers, with 56 circular-import failures (t_39f3a794). Parity-merge rule: resolve both files so that no module body calls list_providers()/sync_plugin_provider_catalog(). Take upstream #122138 if it has merged; otherwise keep the fork's lazy classes. RED-proven 2026-09-25: an eager _PROVIDER_PREFIXES fails both cases, and an import-time _extend_canonical_from_plugins() fails the hermes_cli.models case.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/122138",
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ]
   }
 ]
