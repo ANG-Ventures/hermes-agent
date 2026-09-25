@@ -282,13 +282,21 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     / ``name_set`` (never the live agent attributes), mirroring ``agent_init``'s post-build
     injection. Idempotent and fail-soft. Returns the context-engine routing names THIS rebuild
     appended: a name already owned by a registry/plugin tool is not claimed, matching agent_init."""
-    def _add(schema) -> bool:
-        name = schema.get("name", "") if isinstance(schema, dict) else ""
+    # Normalize through the same helper agent_init uses: context engines and memory
+    # providers may return entries already in OpenAI tool form ({"type": "function",
+    # "function": {...}}), whose wrapper has no top-level "name". Reading the raw
+    # entry dropped every such tool on the first between-turns refresh.
+    from agent.memory_manager import normalize_tool_schema
+
+    def _add(schema) -> str:
+        """Append ``schema`` (bare or wrapped); return its name if appended, else ""."""
+        normalized = normalize_tool_schema(schema) if isinstance(schema, dict) else None
+        name = normalized.get("name", "") if normalized else ""
         if not name or name in name_set:
-            return False
-        tools_list.append({"type": "function", "function": schema})
+            return ""
+        tools_list.append({"type": "function", "function": normalized})
         name_set.add(name)
-        return True
+        return name
 
     def _schema_getter(attr: str, method: str):
         getter = getattr(getattr(agent, attr, None) or None, method, None)
@@ -315,7 +323,7 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
         get_schemas = _schema_getter("context_compressor", "get_tool_schemas")
         if (enabled is None or "context_engine" in enabled) and get_schemas is not None:
             # Claim the routing name only when WE appended the schema.
-            staged_engine_names.update(s["name"] for s in get_schemas() if _add(s))
+            staged_engine_names.update(n for n in (_add(s) for s in get_schemas()) if n)
     except Exception:
         logger.debug("Context-engine tool re-injection skipped", exc_info=True)
     return staged_engine_names
