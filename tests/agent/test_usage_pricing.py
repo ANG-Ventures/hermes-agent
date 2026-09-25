@@ -89,29 +89,6 @@ def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():
     assert normalized.output_tokens == 200
 
 
-def test_gpt_55_official_rate_and_long_context_tier():
-    # OpenAI model docs and models.dev/openai agree: $5/$0.50/$30,
-    # >272K prompt $10/$1/$45 for the entire request.
-    entry = get_pricing_entry('gpt-5.5', provider='openai')
-    assert entry is not None
-    assert entry.source_url == 'https://developers.openai.com/api/docs/models/gpt-5.5'
-    assert entry.tier_threshold_tokens == 272_000
-    for provider in ('openai', 'openai-codex'):
-        short = estimate_usage_cost('gpt-5.5', CanonicalUsage(
-            input_tokens=100_000, cache_read_tokens=100_000, output_tokens=100_000),
-            provider=provider)
-        long = estimate_usage_cost('gpt-5.5', CanonicalUsage(
-            input_tokens=200_000, cache_read_tokens=100_000, output_tokens=100_000),
-            provider=provider)
-        assert short.status == 'estimated'
-        assert short.cost_input_usd == Decimal('0.50')
-        assert short.cost_cache_read_usd == Decimal('0.05')
-        assert short.cost_output_usd == Decimal('3.00')
-        assert long.cost_input_usd == Decimal('2.00')
-        assert long.cost_cache_read_usd == Decimal('0.10')
-        assert long.cost_output_usd == Decimal('4.50')
-
-
 def test_estimate_usage_cost_marks_true_subscription_routes_included(monkeypatch):
     """The included short-circuit must still fire for any route whose
     billing_mode is 'subscription_included'. (Codex is no longer such a route —
@@ -458,9 +435,12 @@ def test_openai_codex_route_resolves_to_notional_openrouter():
     assert route.model == "gpt-5.5"
 
 
-def test_openai_codex_priced_from_official_snapshot(monkeypatch):
-    """A curated official rate takes precedence over a live catalog stub."""
-    # Pin the external source to OpenRouter to prove static pricing still wins.
+def test_openai_codex_priced_from_openrouter_catalog(monkeypatch):
+    """A codex turn is priced at the underlying OpenAI model's live OpenRouter
+    rate and labelled 'estimated'."""
+    # Pin the external source to OpenRouter so this test exercises the OpenRouter
+    # catalog path it names (the default is now models.dev, which would answer
+    # gpt-5.5 first and ignore the stub).
     monkeypatch.setattr(
         "agent.usage_pricing._pricing_source_order", lambda: ("openrouter",)
     )
@@ -472,7 +452,7 @@ def test_openai_codex_priced_from_official_snapshot(monkeypatch):
     result = estimate_usage_cost("gpt-5.5", usage, provider="openai-codex")
     assert result.status == "estimated"
     assert result.amount_usd is not None and float(result.amount_usd) == 0.84  # type: ignore[arg-type]
-    assert result.source == "official_docs_snapshot"
+    assert result.source == "provider_models_api"
 
 
 def test_openai_codex_minus_codex_suffix_falls_back_to_base_model(monkeypatch):
@@ -577,7 +557,7 @@ def test_estimate_usage_cost_prices_cache_write_at_input_rate_when_no_cache_writ
         CanonicalUsage(
             input_tokens=6,
             output_tokens=3104,
-            cache_read_tokens=106366,
+            cache_read_tokens=206366,
             cache_write_tokens=114435,
         ),
         provider="openai-codex",
@@ -586,7 +566,7 @@ def test_estimate_usage_cost_prices_cache_write_at_input_rate_when_no_cache_writ
     assert result.status == "estimated"
     assert result.amount_usd is not None
     # cache-write billed at the $5/M input rate, not dropped.
-    expected = (6 * 5 + 3104 * 30 + 106366 * 0.5 + 114435 * 5) / 1_000_000
+    expected = (6 * 5 + 3104 * 30 + 206366 * 0.5 + 114435 * 5) / 1_000_000
     assert abs(float(result.amount_usd) - expected) < 1e-4
     assert any("input rate" in n for n in result.notes)
 
