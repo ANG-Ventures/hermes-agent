@@ -442,6 +442,7 @@ def test_single_tick_pool_budget_across_ready_and_review(home, apr, reviews):
                 assert _events(conn, tid, "deferred")[-1] == {
                     "reason": "pool_budget", "provider": "claude-apr",
                     "pool": "claude-apr", "eligible": 1, "admitted": 2,
+                    "in_flight": 0,
                 }
         assert apr.hits == 1
 
@@ -476,6 +477,7 @@ def test_pool_budget_is_per_tick_across_boards_with_shared_tick_cache(home, apr)
                 assert _events(conn, tid, "deferred")[-1] == {
                     "reason": "pool_budget", "provider": "claude-apr",
                     "pool": "claude-apr", "eligible": 1, "admitted": 2,
+                    "in_flight": 0,
                 }
     # One probe per tick, not one per board.
     assert apr.hits == 1
@@ -500,8 +502,165 @@ def test_pool_budget_single_call_without_tick_cache_is_per_call(home, apr):
         seen: list = []
         kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert len(seen) == 2
+        # Per-tick counter resets per call, but the 2 running workers still
+        # hold the pool's concurrency ceiling (t_38be6b10).
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert len(seen) == 2
+        _end_runs(conn, seen)
         kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
         assert len(seen) == 4
+
+
+# --- t_38be6b10: the pool budget is a CONCURRENCY ceiling ------------------
+
+
+def _end_runs(conn, task_ids):
+    """Close the open runs of ``task_ids`` as if their workers exited."""
+    now = int(time.time())
+    conn.executemany(
+        "UPDATE task_runs SET status='done', outcome='completed', ended_at=? "
+        "WHERE task_id=? AND ended_at IS NULL", [(now, t) for t in task_ids])
+    conn.executemany("UPDATE tasks SET status='done' WHERE id=?", [(t,) for t in task_ids])
+    conn.commit()
+
+
+def _running_run(conn, tid, metadata):
+    """An open run whose worker is alive (this pid) and whose claim is fresh,
+    so the dispatcher's reclaim/reconcile passes leave it running."""
+    import os
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, claim_lock, claim_expires, "
+        "worker_pid, started_at, metadata) VALUES (?, 'a', 'running', 'test:1', ?, ?, ?, ?)",
+        (tid, now + 3600, os.getpid(), now - 600,
+         None if metadata is None else json.dumps(metadata)))
+    conn.execute(
+        "UPDATE tasks SET status='running', claim_lock='test:1', claim_expires=?, "
+        "worker_pid=?, current_run_id=?, started_at=? WHERE id=?",
+        (now + 3600, os.getpid(), cur.lastrowid, now - 600, tid))
+    conn.commit()
+
+
+def test_spawn_records_charged_pool_on_run_and_spawned_event(home, apr):
+    apr.eligible = 3
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="stamp", assignee="argus")
+        seen: list = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen))
+        assert seen == [tid]
+        assert _events(conn, tid, "spawned")[-1]["pool"] == "claude-apr"
+        meta = conn.execute("SELECT metadata FROM task_runs WHERE task_id=?",
+                            (tid,)).fetchone()[0]
+        assert json.loads(meta)["pool"] == "claude-apr"
+        assert kb._pool_in_flight(conn) == {"claude-apr": 1}
+
+
+def test_in_flight_workers_fill_the_pool_ceiling(home, apr):
+    """(1) eligible=1, 5 workers already running on the pool -> 0 admitted."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    with kb.connect_closing() as conn:
+        for i in range(5):
+            _running_run(conn, kb.create_task(conn, title=f"r-{i}", assignee="argus"),
+                         {"pool": "claude-apr"})
+        ids = [kb.create_task(conn, title=f"new-{i}", assignee="argus") for i in range(3)]
+        seen: list = []
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+                               max_in_progress=100)
+        assert seen == []
+        for tid in ids:
+            assert (tid, "pool_budget") in res.respawn_guarded
+            assert _events(conn, tid, "deferred")[-1] == {
+                "reason": "pool_budget", "provider": "claude-apr",
+                "pool": "claude-apr", "eligible": 1, "admitted": 0, "in_flight": 5,
+            }
+
+
+def test_in_flight_on_one_pool_does_not_consume_another(home, apr, bpr):
+    """(2) workers running on apr leave bpr's ceiling untouched."""
+    apr.eligible = bpr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url, bpr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "a", "claude-apr")
+    _profile(home, "b", "claude-bpr")
+    with kb.connect_closing() as conn:
+        for i in range(4):
+            _running_run(conn, kb.create_task(conn, title=f"r-{i}", assignee="a"),
+                         {"pool": "claude-apr"})
+        a_new = kb.create_task(conn, title="a-new", assignee="a")
+        b_new = [kb.create_task(conn, title=f"b-{i}", assignee="b") for i in range(3)]
+        seen: list = []
+        res = kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100,
+                               max_in_progress=100)
+        assert seen == b_new[:2]
+        assert (a_new, "pool_budget") in res.respawn_guarded
+        assert _events(conn, b_new[2], "deferred")[-1]["in_flight"] == 0
+
+
+def test_ended_run_frees_its_slot_next_tick(home, apr):
+    """(3) a run that ended no longer counts on the next tick."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    with kb.connect_closing() as conn:
+        running = [kb.create_task(conn, title=f"r-{i}", assignee="argus") for i in range(2)]
+        for tid in running:
+            _running_run(conn, tid, {"pool": "claude-apr"})
+        new = kb.create_task(conn, title="new", assignee="argus")
+        seen: list = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert seen == []
+        _end_runs(conn, running[:1])
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert seen == [new]
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {"changed_files": ["x"]}, "not-a-dict"])
+def test_legacy_runs_without_pool_count_as_zero(home, apr, metadata):
+    """(4) pre-deploy runs carry no ``pool``: they fail open (count 0)."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    with kb.connect_closing() as conn:
+        for i in range(5):
+            _running_run(conn, kb.create_task(conn, title=f"legacy-{i}", assignee="argus"),
+                         metadata)
+        ids = [kb.create_task(conn, title=f"new-{i}", assignee="argus") for i in range(3)]
+        seen: list = []
+        kb.dispatch_once(conn, spawn_fn=_spawner(seen), max_spawn=100, max_in_progress=100)
+        assert seen == ids[:2]
+        assert kb._pool_in_flight(conn) == {"claude-apr": 2}
+
+
+def test_in_flight_spans_boards_within_one_tick(home, apr):
+    """Board A's running workers count against board B in the same tick."""
+    apr.eligible = 1
+    _config(home, pool_health_urls=_urls(apr.url), pool_box_health=False,
+            pool_spawns_per_eligible=2)
+    _profile(home, "argus", "claude-apr")
+    kb.create_board("b2")
+    with kb.connect_closing(board="default") as conn:
+        for i in range(2):
+            _running_run(conn, kb.create_task(conn, title=f"r-{i}", assignee="argus"),
+                         {"pool": "claude-apr"})
+    with kb.connect_closing(board="b2") as conn:
+        b2 = kb.create_task(conn, title="b2", assignee="argus")
+    tick_cache: dict = {}
+    seen: list = []
+    for b in ("default", "b2"):
+        with kb.connect_closing(board=b) as conn:
+            kb.dispatch_once(conn, board=b, spawn_fn=_spawner(seen), max_spawn=100,
+                             max_in_progress=100, budget_cache=tick_cache)
+    assert seen == []
+    with kb.connect_closing(board="b2") as conn:
+        assert _events(conn, b2, "deferred")[-1]["in_flight"] == 2
 
 
 def test_gateway_tick_threads_one_budget_cache_through_every_board():

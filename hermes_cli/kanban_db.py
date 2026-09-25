@@ -16508,12 +16508,67 @@ def _unusable_workspace_reason(exc: BaseException) -> Optional[str]:
     )
 
 
+def _stamp_run_pool(conn: sqlite3.Connection, run_id: int, pool: str) -> None:
+    """Record the relay pool a spawn was charged to on ``task_runs.metadata``
+    (key ``pool``) so the dispatcher's in-flight count is one query and never
+    re-resolves routes for running tasks (t_38be6b10). Best-effort."""
+    try:
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            except (TypeError, ValueError):
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["pool"] = pool
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(meta, ensure_ascii=False), run_id),
+            )
+    except Exception as exc:
+        _log.warning("kanban run pool stamp failed for run %s (%s: %s)",
+                     run_id, type(exc).__name__, exc)
+
+
+def _pool_in_flight(conn: sqlite3.Connection) -> dict[str, int]:
+    """Open runs per charged relay pool (``task_runs.metadata.pool``).
+
+    Runs without a ``pool`` key (legacy, non-pool routes, or unparseable
+    metadata) count as 0: the concurrency ceiling fails OPEN, never closed.
+    """
+    counts: dict[str, int] = {}
+    try:
+        rows = conn.execute(
+            "SELECT metadata FROM task_runs "
+            "WHERE status = 'running' AND ended_at IS NULL "
+            "AND metadata IS NOT NULL",
+        ).fetchall()
+    except Exception as exc:
+        _log.warning("kanban pool in-flight query failed (%s: %s)", type(exc).__name__, exc)
+        return counts
+    for row in rows:
+        try:
+            meta = json.loads(row["metadata"])
+        except (TypeError, ValueError):
+            continue
+        pool = meta.get("pool") if isinstance(meta, dict) else None
+        if isinstance(pool, str) and pool:
+            counts[pool] = counts.get(pool, 0) + 1
+    return counts
+
+
 def _set_worker_pid(
     conn: sqlite3.Connection,
     task_id: str,
     pid: int,
     *,
     run_id: Optional[int] = None,
+    pool: Optional[str] = None,
 ) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -16539,6 +16594,9 @@ def _set_worker_pid(
     start_token = _pid_start_token(int(pid))
     if start_token is not None:
         spawn_payload["start_token"] = start_token
+    if pool is not None:
+        # The relay pool this spawn was charged to (t_38be6b10).
+        spawn_payload["pool"] = pool
     with write_txn(conn):
         if run_id is not None:
             held = conn.execute(
@@ -18192,6 +18250,24 @@ def _dispatch_once_locked(
         health_cache = {}
         admitted_this_tick = {}
     admitted_routes: dict[str, str | None] = {}
+    # The budget is a CONCURRENCY ceiling (t_38be6b10): workers already
+    # running on a pool count against it, not just this tick's admissions.
+    # Measured 09-24: 80% of residual 429s hit mid-run with 28-32 workers in
+    # flight on 1-9 eligible subs, because every tick re-granted eligible*N.
+    # ``pool`` is stamped on the run at spawn (charge_pool), so this is one
+    # query per board per tick; legacy runs without it count as 0 (fail
+    # open). Snapshot taken BEFORE this board spawns anything, so the tick's
+    # own spawns are counted once, via ``admitted_this_tick``. Per-board
+    # snapshots share the tick cache so later boards see earlier boards'.
+    in_flight_by_board: dict[str, dict[str, int]] = (
+        budget_cache.setdefault(("_pool_in_flight_by_board",), {})
+        if budget_cache is not None else {}
+    )
+    if pool_spawns_per_eligible:
+        in_flight_by_board[board or DEFAULT_BOARD] = _pool_in_flight(conn)
+
+    def pool_in_flight(pool):
+        return sum(m.get(pool, 0) for m in in_flight_by_board.values())
 
     def pool_budget(provider):
         pool = pool_key(provider)
@@ -18202,15 +18278,19 @@ def _dispatch_once_locked(
         if eligible is None:
             return None  # Unknown probe: fail open.
         admitted = admitted_this_tick.get(pool, 0)
-        if admitted < eligible * pool_spawns_per_eligible:
+        in_flight = pool_in_flight(pool)
+        if in_flight + admitted < eligible * pool_spawns_per_eligible:
             return None
         return {"reason": "pool_budget", "provider": provider,
-                "pool": pool, "eligible": eligible, "admitted": admitted}
+                "pool": pool, "eligible": eligible, "admitted": admitted,
+                "in_flight": in_flight}
 
-    def charge_pool(task_id):
+    def charge_pool(task_id, run_id=None):
         pool = admitted_routes.pop(task_id, None)
         if pool is not None:
             admitted_this_tick[pool] = admitted_this_tick.get(pool, 0) + 1
+            if run_id is not None:
+                _stamp_run_pool(conn, int(run_id), pool)
 
     circuits: dict[str, int] = {}
     try:
@@ -18692,6 +18772,7 @@ def _dispatch_once_locked(
                 pid = _spawn(claimed, str(workspace))
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
+                pool=admitted_routes.get(claimed.id),
             ):
                 _abort_lost_claim_spawn(conn, claimed, int(pid))
                 continue
@@ -18712,7 +18793,7 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = route_source
-            charge_pool(claimed.id)
+            charge_pool(claimed.id, claimed.current_run_id)
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
@@ -18894,6 +18975,7 @@ def _dispatch_once_locked(
                 pid = _spawn(claimed, str(workspace))
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
+                pool=admitted_routes.get(claimed.id),
             ):
                 _abort_lost_claim_spawn(conn, claimed, int(pid))
                 continue
@@ -18905,7 +18987,7 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             result.spawn_routes[claimed.id] = effective_worker_route(claimed)
             result.spawn_route_sources[claimed.id] = review_route_source
-            charge_pool(claimed.id)
+            charge_pool(claimed.id, claimed.current_run_id)
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
