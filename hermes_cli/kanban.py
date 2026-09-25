@@ -1459,7 +1459,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Kyzcreig/* GitHub URLs the clone uses --reference-if-able "
             "against a bare mirror under <hermes root>/mirrors/, created "
             "lazily, so the checkout stores only objects the mirror lacks. "
-            "Other URLs are cloned normally. Common git-clone options "
+            "A local-path source is cloned with --no-local (never "
+            "hard-linked), borrowing from its origin's mirror when that is a "
+            "fleet repo. Other URLs are cloned normally. Common git-clone options "
             "(-q, -b, --depth, --filter, --no-checkout, --single-branch, "
             "--no-tags, --origin, ...) are forwarded."
         ),
