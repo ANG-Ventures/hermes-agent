@@ -111,14 +111,30 @@ def test_gateway_tick_summary_counts_and_names_parent_satisfied_sticky_cards():
 
 
 def test_gateway_workspace_refused_summary_names_reason_and_tasks():
+    from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND
+
     summary = _format_workspace_refused_summary([
         ("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch/kanban-workspaces"),
         ("t_stranded", "stranded_by_mount_loss: /Volumes/ramscratch/kanban-workspaces/t_stranded"),
     ])
     assert summary == (
         "workspace_refused=2 (stranded_by_mount_loss: t_stranded; "
-        "workspaces_root_unmounted: t_missing)"
+        "workspaces_root_unmounted: t_missing) "
+        f"| recover stranded scratch cards: {STRANDED_RECOVERY_COMMAND}"
     )
+
+
+def test_workspace_refused_summary_names_recovery_only_when_stranded():
+    from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND as cmd
+
+    unmounted = _format_workspace_refused_summary([
+        ("t_missing", "workspaces_root_unmounted: /Volumes/ramscratch/kanban-workspaces"),
+    ])
+    assert cmd not in unmounted
+    stranded = _format_workspace_refused_summary([
+        ("t_a", "stranded_by_mount_loss: /x/t_a"),
+    ])
+    assert stranded.endswith(cmd)
 
 
 def test_workspace_refusal_notifier_delivers_once_per_outage_and_rearms():

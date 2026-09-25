@@ -8,8 +8,21 @@ import secrets
 from pathlib import Path
 
 
+# The operator verb that clears a stranded scratch card's dead persisted path.
+# Every surface that reports ``stranded_by_mount_loss`` (dispatcher log line,
+# task event, #alerts page) names it, so nobody has to reach for SQL again.
+STRANDED_RECOVERY_COMMAND = "hermes kanban workspace reset --all-stranded"
+
+
 class WorkspaceUnavailable(ValueError):
     """Workspace admission refused without charging a worker failure."""
+
+
+def auto_unstrand_enabled():
+    """``kanban.workspaces_auto_unstrand`` (default off; only a real ``true`` enables)."""
+    from hermes_cli.config import load_config_readonly
+
+    return load_config_readonly().get("kanban", {}).get("workspaces_auto_unstrand") is True
 
 
 def configured_root():

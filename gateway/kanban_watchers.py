@@ -509,7 +509,12 @@ def _format_workspace_refused_summary(refused) -> str:
         f"{reason}: {', '.join(sorted(task_ids))}"
         for reason, task_ids in sorted(grouped.items())
     )
-    return f"workspace_refused={len(entries)} ({details})"
+    summary = f"workspace_refused={len(entries)} ({details})"
+    if "stranded_by_mount_loss" in grouped:
+        from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND
+
+        summary += f" | recover stranded scratch cards: {STRANDED_RECOVERY_COMMAND}"
+    return summary
 
 
 class _WorkspaceRefusalOutageNotifier:
