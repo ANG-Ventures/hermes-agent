@@ -276,6 +276,8 @@ def test_failed_in_place_commit_rolls_back_live_transcript(tmp_path: Path) -> No
     setattr(agent, "compression_in_place", True)
     db.archive_and_compact = MagicMock(side_effect=RuntimeError("archive boom"))
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    for msg in messages:
+        db.append_message(session_id, "user", content=msg["content"])
     original = copy.deepcopy(messages)
 
     returned, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000, force=True)
