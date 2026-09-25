@@ -538,6 +538,7 @@ class GatewaySessionCommandsMixin:
             # Context lives in the server-side thread of the LIVE cached agent; a temporary agent
             # has none (and finally-eviction would destroy the real context).
             return await self._compress_codex_app_server_session(session_key, session_entry.session_id)
+        model, runtime_kwargs = self._inherit_resident_live_route(session_key, model, runtime_kwargs)
         if not runtime_kwargs.get("api_key"):
             return t("gateway.compress.no_provider")
         # FULL transcript (tool results included), like auto-compress: user/assistant-only starves
@@ -573,6 +574,48 @@ class GatewaySessionCommandsMixin:
             # Off-loop + bounded: teardown can block on subprocess/network/SQLite.
             await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
         return "\n".join(_manual_compression_reply_lines(summary, compressor, request.focus_topic))
+
+    def _inherit_resident_live_route(self, session_key: str, model, runtime_kwargs: dict):
+        """Route the manual-/compress temporary agent onto the resident agent's LIVE runtime.
+
+        The resolver returns the configured (or /model) route, but the resident agent may be serving on a
+        fallback provider after the primary failed; building from config sends the summarizer back to the
+        failing primary. Provider, model, key and endpoint move as one unit; an absent, unreadable or
+        incomplete live snapshot keeps the resolved route untouched. Rebuilt, not merged: requested_provider,
+        ACP command/args and credential pools belong to the configured route."""
+        resident = (getattr(self, "_running_agents", None) or {}).get(session_key)
+        if not callable(getattr(resident, "_current_main_runtime", None)):
+            resident = self._cached_agent_for(session_key)
+        current_runtime = getattr(resident, "_current_main_runtime", None)
+        if not callable(current_runtime):
+            return model, runtime_kwargs
+        try:
+            live = current_runtime()
+        except Exception:
+            return model, runtime_kwargs
+        live = live if isinstance(live, dict) else {}
+        live_provider = str(live.get("provider") or "").strip()
+        live_model = str(live.get("model") or "").strip()
+        live_api_key = live.get("api_key")
+        if isinstance(live_api_key, str):
+            live_api_key = live_api_key.strip()
+        if not (live_provider and live_model and live_api_key):
+            return model, runtime_kwargs
+        if str(live.get("api_mode") or "").lower() == "codex_app_server":
+            return model, runtime_kwargs  # its context lives in the server thread; never a temporary agent
+        inherited = {"provider": live_provider, "api_key": live_api_key}
+        for field in ("base_url", "api_mode"):
+            value = live.get(field)
+            if isinstance(value, str):
+                value = value.strip()
+            if value not in (None, ""):
+                inherited[field] = value
+        live_max_tokens = getattr(resident, "max_tokens", None)
+        if live_max_tokens is not None:
+            inherited["max_tokens"] = live_max_tokens
+        logger.info("Manual /compress inheriting resident runtime: session=%s provider=%s model=%s",
+                    session_key, live_provider, live_model)
+        return live_model, inherited
 
     async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""
