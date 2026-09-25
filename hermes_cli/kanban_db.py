@@ -7393,18 +7393,21 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
     candidates = []
     for spawned in spawns:
         try:
-            pid = int(json.loads(spawned["payload"] or "{}")["pid"])
+            payload = json.loads(spawned["payload"] or "{}")
+            pid = int(payload["pid"])
         except (TypeError, ValueError, KeyError):
             continue
+        token = payload.get("start_token") if isinstance(payload, dict) else None
         candidates.append((pid, spawned["run_id"] is None,
-                           spawned["created_at"]))
-    for pid, late, spawned_at in candidates:
+                           spawned["created_at"], token))
+    for pid, late, spawned_at, token in candidates:
         if not _pid_alive(pid):
             continue
         # Liveness is not identity: the PID may now belong to an unrelated
         # process (recycled PID). The owner is the process at this PID only
-        # if it was created inside this run's causal window.
-        identity = _owner_identity(pid, claimed_at, spawned_at)
+        # if its start token matches the one recorded at spawn (legacy rows:
+        # if it was created inside this run's causal window).
+        identity = _owner_identity(pid, claimed_at, spawned_at, token)
         if identity == "recycled":
             continue
         return {"prev_pid": pid, "prev_lock": lock,
@@ -7425,8 +7428,40 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
 # creation by up to the busy timeout (measured -7.5 s / -19.6 s on genuine
 # workers). A symmetric +/-N s window around ``spawned_at`` would call those
 # genuine workers dead and let a second worker onto the card.
+#
+# The window compares an EPOCH create time with wall-clock event stamps, so a
+# wall-clock step between spawn and probe shifts one side and not the other
+# (psutil's epoch create_time moves with the clock: Linux re-reads btime,
+# macOS applies ``adjust_proc_create_time``). It is kept ONLY for legacy
+# ``spawned`` rows that carry no ``start_token``.
 _OWNER_CREATE_LEAD_SECONDS = 1.0
 _OWNER_CREATE_LAG_SECONDS = 2.0
+
+# Start-token match tolerance, in seconds. Both readings come from the same
+# kernel field of the same process (Linux: /proc starttime ticks since boot,
+# 0.01 s resolution; macOS: the raw kinfo start timeval), so a genuine owner
+# matches EXACTLY; the tolerance only absorbs float round-trips through JSON.
+# psutil's own PID-reuse identity uses exact equality on the same value.
+_OWNER_START_TOKEN_TOLERANCE_SECONDS = 0.05
+
+
+def _pid_start_token(pid: int) -> Optional[float]:
+    """Clock-step-immune start stamp of ``pid``, or None if unreadable.
+
+    psutil's ``create_time(monotonic=True)`` -- the value psutil itself uses
+    for PID-reuse identity on Linux/macOS/NetBSD -- is read straight from the
+    kernel and never re-based on the current wall clock, so two readings of
+    one process agree across any clock step, and across processes. Other
+    platforms (and a missing psutil) return None, which keeps the legacy
+    causal-window check.
+    """
+    try:
+        import psutil
+        if not (psutil.LINUX or psutil.MACOS or psutil.NETBSD):
+            return None
+        return float(psutil.Process(int(pid))._proc.create_time(monotonic=True))
+    except Exception:  # optional psutil, private-API drift, or process gone
+        return None
 
 
 def _pid_create_time(pid: int) -> Optional[float]:
@@ -7453,14 +7488,31 @@ def _pid_create_time(pid: int) -> Optional[float]:
     return None
 
 
-def _real_pid_started_in_claim(pid, claimed_at, spawned_at) -> Optional[bool]:
-    """Whether a live ``pid`` was created inside the run's causal window.
+def _real_pid_started_in_claim(pid, claimed_at, spawned_at,
+                               start_token=None) -> Optional[bool]:
+    """Whether a live ``pid`` is the process the run recorded.
 
-    ``True``: created inside ``[claimed_at - 1 s, spawned_at + 2 s]``.
-    ``False``: created outside it -- provably not the recorded worker.
-    ``None``: create time unreadable. A missing bound is simply not applied,
-    so missing evidence never proves a PID recycled.
+    With a recorded ``start_token`` (every spawn since t_21dfa673): ``True``
+    iff the PID's current start token matches it. No wall-clock value is
+    involved, so a clock step or DB lock lag cannot flip the verdict.
+
+    Legacy rows (no token): whether ``pid`` was created inside the causal
+    window ``[claimed_at - 1 s, spawned_at + 2 s]``.
+
+    ``False``: provably not the recorded worker. ``None``: the needed reading
+    is unreadable. A missing bound is simply not applied, so missing evidence
+    never proves a PID recycled.
     """
+    if start_token is not None:
+        try:
+            recorded = float(start_token)
+        except (TypeError, ValueError):
+            recorded = None
+        if recorded is not None:
+            current = _pid_start_token(pid)
+            if current is None:
+                return None
+            return abs(current - recorded) <= _OWNER_START_TOKEN_TOLERANCE_SECONDS
     created = _pid_create_time(pid)
     if created is None:
         return None
@@ -7475,14 +7527,14 @@ def _real_pid_started_in_claim(pid, claimed_at, spawned_at) -> Optional[bool]:
 _pid_started_in_claim = _real_pid_started_in_claim
 
 
-def _owner_identity(pid, claimed_at, spawned_at) -> str:
+def _owner_identity(pid, claimed_at, spawned_at, start_token=None) -> str:
     """Classify a LIVE pid against the run that recorded it.
 
     Returns ``"verified"``, ``"recycled"`` (provably not the recorded
-    worker), or ``"unverified"`` (create time unreadable -- fail CLOSED, the
-    caller treats it as the owner).
+    worker), or ``"unverified"`` (start evidence unreadable -- fail CLOSED,
+    the caller treats it as the owner).
     """
-    started = _pid_started_in_claim(pid, claimed_at, spawned_at)
+    started = _pid_started_in_claim(pid, claimed_at, spawned_at, start_token)
     if started is None:
         return "unverified"
     return "verified" if started else "recycled"
@@ -15650,7 +15702,17 @@ def _set_worker_pid(
     the caller terminates the orphan. The ``spawned`` event is still recorded
     against the launching run so liveness checks can see the process.
     Measured on t_09180e10: the spawn landed 5 s after a reclaim.
+
+    The payload also records the process's clock-step-immune start token
+    (``start_token``, see :func:`_pid_start_token`), read BEFORE the write
+    txn so neither DB lock lag nor a later wall-clock step can blur it. The
+    claim guard matches a live PID against it to tell the genuine worker
+    from a recycled PID. Omitted when unreadable (legacy window applies).
     """
+    spawn_payload: dict[str, Any] = {"pid": int(pid)}
+    start_token = _pid_start_token(int(pid))
+    if start_token is not None:
+        spawn_payload["start_token"] = start_token
     with write_txn(conn):
         if run_id is not None:
             held = conn.execute(
@@ -15661,7 +15723,7 @@ def _set_worker_pid(
             if held is None:
                 _append_event(
                     conn, task_id, "spawned",
-                    {"pid": int(pid), "late_spawn": True,
+                    {**spawn_payload, "late_spawn": True,
                      "claim_lost": True},
                     run_id=int(run_id),
                 )
@@ -15676,7 +15738,7 @@ def _set_worker_pid(
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _append_event(conn, task_id, "spawned", spawn_payload, run_id=run_id)
     return True
 
 
