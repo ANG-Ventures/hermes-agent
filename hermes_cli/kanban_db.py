@@ -1447,7 +1447,7 @@ def _board_db_path_ignoring_pin(slug: str) -> Path:
     return board_dir(slug) / "kanban.db"
 
 
-def workspaces_root(board: Optional[str] = None) -> Path:
+def workspaces_root(board: Optional[str] = None, *, stale_pin_ok: bool = False) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
     Anchored per-board so workspaces don't leak between projects.
@@ -1461,6 +1461,11 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     ``default`` keeps the legacy path ``<root>/kanban/workspaces/`` so
     that existing scratch workspaces from before the boards feature are
     preserved. Other boards use ``<root>/kanban/boards/<slug>/workspaces/``.
+
+    ``stale_pin_ok`` is for NON-placement readers (gc, audits): a worker
+    spawned before ``kanban.workspaces_root`` changed still carries the old
+    pin, and refusing there only breaks the reader. Config wins; placement
+    callers keep the default fail-closed raise.
     """
     from hermes_cli.kanban_workspace_policy import (
         WorkspaceUnavailable, configured_root, validate_mount,
@@ -1475,7 +1480,7 @@ def workspaces_root(board: Optional[str] = None) -> Path:
         if require_mount:
             validate_mount(root)
         resolved = root / slug
-        if override and Path(override).expanduser() != resolved:
+        if override and Path(override).expanduser() != resolved and not stale_pin_ok:
             raise WorkspaceUnavailable("workspaces_root_invalid: board pin disagrees with config")
         return resolved
     if override:
@@ -1483,6 +1488,37 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "workspaces"
     return board_dir(slug) / "workspaces"
+
+
+def workspace_root_candidates(board: Optional[str] = None) -> list[Path]:
+    """Every root a scratch workspace of *board* may live under. Never raises.
+
+    The UNION of the env pin, the configured ``kanban.workspaces_root/<board>``
+    and the legacy per-board root, without the fail-closed pin/config
+    disagreement check or mount validation of :func:`workspaces_root`. For
+    exclusion/containment readers only (survivor durability): excluding more
+    is the conservative direction there. Never use it for placement.
+    """
+    from hermes_cli.kanban_workspace_policy import configured_root
+
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    roots: list[Path] = []
+    override = _kanban_path_override("HERMES_KANBAN_WORKSPACES_ROOT")
+    if override:
+        roots.append(Path(override).expanduser())
+    try:
+        root, _require_mount = configured_root()
+    except ValueError:
+        root = None
+    if root is not None:
+        roots.append(root / slug)
+    if slug == DEFAULT_BOARD:
+        roots.append(kanban_home() / "kanban" / "workspaces")
+    else:
+        roots.append(board_dir(slug) / "workspaces")
+    return list(dict.fromkeys(roots))
 
 
 def attachments_root(board: Optional[str] = None) -> Path:

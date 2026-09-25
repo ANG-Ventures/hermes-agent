@@ -573,7 +573,10 @@ def _temporary_roots():
 
 def _excluded_roots(workspace):
     """Roots a repo must NOT live under to count as durable/canonical."""
-    return [workspace, kb.workspaces_root(), kb.kanban_home() / "kanban" / "workspaces",
+    # Never the fail-closed resolver: a worker spawned before
+    # kanban.workspaces_root changed carries a stale pin, and raising here
+    # turned every in-flight completion into survivor_unavailable (HELD).
+    return [workspace, *kb.workspace_root_candidates(), kb.kanban_home() / "kanban" / "workspaces",
             kb.kanban_home() / "kanban" / "boards", *_temporary_roots()]
 
 

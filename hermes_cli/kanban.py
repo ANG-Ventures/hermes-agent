@@ -5696,7 +5696,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of archived tasks, prune old events, and
     delete old worker logs."""
 
-    scratch_root = kb.workspaces_root()
+    # Not placement: a stale worker-shell pin must not break gc (config wins).
+    scratch_root = kb.workspaces_root(stale_pin_ok=True)
     dry_run = bool(getattr(args, "dry_run", False))
     done_days = getattr(args, "done_retention_days", 3)
     # DONE cards are swept too once they have been finished for done_days:
