@@ -462,6 +462,13 @@ DEFAULT_CONFIG = {
         # being truncated; lower it to force background discipline.
         # Bridged to TERMINAL_MAX_FOREGROUND_TIMEOUT for child processes.
         "max_foreground_timeout": 600,
+        # Tighter foreground cap for turns delivered over a human messaging
+        # channel (Discord, Telegram, Slack, ...). The chat session cannot
+        # answer new messages while a foreground call runs, so this holds even
+        # when max_foreground_timeout is raised for CLI work. Can only lower
+        # the general cap, never raise it. Bridged to
+        # TERMINAL_GATEWAY_MAX_FOREGROUND_TIMEOUT.
+        "gateway_max_foreground_timeout": 600,
         # Free-disk threshold (GB) below which terminal output carries a
         # low-disk warning. Bridged to TERMINAL_DISK_WARNING_GB.
         "disk_warning_gb": 500.0,
