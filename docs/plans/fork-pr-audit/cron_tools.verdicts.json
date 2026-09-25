@@ -1254,5 +1254,106 @@
   },
   "branch": null,
   "notes": "2-line generic fix. Strong UPSTREAM."
+ },
+ "#1024": {
+  "verdict": "UPSTREAM",
+  "problem": "kanban_attach forced the model to re-type base64; corrupt attachments (7,408 B incident) came from the model, not transport. Adds path= (byte-exact host read).",
+  "evidence": {
+   "original": "PR #1024 body: card t_31148bf8; argus state.db session 20260923_024624_b94239 msg 107301 decoded to the corrupt 7,407 B sha ce8837437fe8 == stored file.",
+   "upstream_state": "RED: own tests (data/runtests_clean.py: the row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP:['10 failed, 1 passed, 63 deselected'] FM:['11 passed, 63 deselected']; ../up tools/kanban_tools.py:906 _handle_attach has no path source",
+   "upstream_fix": "none merged; upstream PR NousResearch/hermes-agent#122057 OPEN (this patch, opened 09-24 by t_54470116)",
+   "fires": "kanban.db task_events: 104 payloads mention expected_sha256 or attach…path (the path=/digest surface in use); 'content_base64 is not valid base64:' 11 in logs (the failure mode path= avoids); logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25",
+   "cost": {
+    "loc": 216,
+    "conflict_syncs": 3,
+    "conflict_files": 3,
+    "dependents": [
+     "#927"
+    ]
+   }
+  },
+  "branch": "upstream PR NousResearch/hermes-agent#122057 (open)",
+  "notes": "Generic, needed, already proposed upstream as #122057 — no new branch; the lead tracks the upstream PR. Fork copy stays until #122057 merges, then SUPERSEDED."
+ },
+ "#927": {
+  "verdict": "UPSTREAM",
+  "problem": "kanban_attach stored silently corrupt bytes; adds required caller SHA-256 + stored-byte readback; terminal diff hook preserved the native diff exit code ahead of RTK rewriting.",
+  "evidence": {
+   "original": "PR #927 body: card t_757191ff (corrupt attachment), re-port of destructive #923; upstream contribution NousResearch#120185.",
+   "upstream_state": "RED: own tests (data/runtests_clean.py: the row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP:['4 failed, 1 passed, 53 deselected', '2 failed (diff hook)'] FM:['5 passed', '2 passed']; ../up _store_attachment@tools/kanban_tools.py:896 takes no digest",
+   "upstream_fix": "none merged; upstream PR NousResearch/hermes-agent#120185 OPEN",
+   "fires": "'expected_sha256 does not match decoded attachment bytes' 4 in gateway/agent logs (the guard catching real corruption); logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25; kanban.db read-only 2026-09-25",
+   "cost": {
+    "loc": 152,
+    "conflict_syncs": 3,
+    "conflict_files": 4,
+    "dependents": [
+     "#1024"
+    ]
+   }
+  },
+  "branch": "upstream PR NousResearch/hermes-agent#120185 (open)",
+  "notes": "Generic integrity guard, already proposed upstream (#120185 open). Keep the fork copy until it lands; #1024 (path=) supersedes the base64 path in practice."
+ },
+ "#839": {
+  "verdict": "KEEP",
+  "problem": "preserve() refused completions naming --survivor-pr/--survivor-ref, but the kanban_complete TOOL (where workers read the refusal) could not pass them.",
+  "evidence": {
+   "original": "PR #839 body: card t_52abef50; Argus measured 0 'survivor' occurrences in tools/kanban_tools.py at #837 head a26f2700bd; a worker hit survivor_unavailable with no reachable remedy.",
+   "upstream_state": "read-only: upstream has NO survivor mechanism at all (0 'survivor' hits in ../up hermes_cli/kanban_db.py and tools/kanban_tools.py); own tests (data/runtests_clean.py: the row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP:['6 failed'] FM:['2 failed, 4 passed'] (2 FM fails re-run 2026-09-25: test_tool_schema_exposes_both_survivor_arguments = schema widened to list by #875; test_tool_survivor_pr_completes_a_stale_bases_card = later fork hardening 'survivor-pr is live but does not name t_…' — the original test fixture is obsolete, not a regression)",
+   "upstream_fix": "n/a — fork-only feature (preserve()/task_workspace_survivors is a fork kanban_db feature)",
+   "fires": "kanban.db task_events: 742 survivor_unavailable refusals since 09-21, 489 events carrying survivor_pr/survivor_ref 09-15→09-25 14:06; task_workspace_survivors 1277 rows; logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25; kanban.db read-only 2026-09-25",
+   "cost": {
+    "loc": 222,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#875",
+     "#837(cli tranche)"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows the fork kanban_db survivor feature (hermes_cli tranche). Measured in daily use. Not upstreamable alone (upstream has no preserve() guard)."
+ },
+ "#875": {
+  "verdict": "KEEP",
+  "problem": "kanban_complete TOOL rejected the repository-qualified multi-claim survivor_pr list that its own refusal text told the operator to supply.",
+  "evidence": {
+   "original": "PR #875 body: stacked on #842 (CLI/library widened); the tool schema still said type:string and returned 'survivor_pr must be a string'.",
+   "upstream_state": "read-only: upstream has no survivor surface (0 hits ../up); own tests (data/runtests_clean.py: the row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP:['5 failed, 11 deselected'] FM:['5 passed, 11 deselected']",
+   "upstream_fix": "n/a — fork-only feature",
+   "fires": "kanban.db: 489 survivor_pr/survivor_ref events 09-15→09-25 (multi-claim shape included); logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25; kanban.db read-only 2026-09-25",
+   "cost": {
+    "loc": 212,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#839"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #839/#842. Measured."
+ },
+ "#684": {
+  "verdict": "KEEP",
+  "problem": "kanban_notify_subs rows were WRITTEN with the raw envelope chat_type ('channel'); a Discord guild chat is keyed 'group', so the wake could not find its routing identity and replied as a phantom bare group session.",
+  "evidence": {
+   "original": "PR #684 body: four drifted rows t_fbb694f7/t_adcfcad8/t_fbab3644/t_efcc229b at 2026-09-12 18:55:51, two minutes after reader-only fix #682 deployed.",
+   "upstream_state": "read-only: ../up tools/kanban_tools.py:1090 stores chat_type = env(HERMES_SESSION_CHAT_TYPE) raw, no canonical_chat_type (gateway/routing_identity.py absent on ../up — verified ls); own tests (data/runtests_clean.py: the row's added test fns copied into the tree, repo venv, PYTHONPATH=tree): UP:['1 error (import routing_identity)'] FM:['10 passed']",
+   "upstream_fix": "none (git log upstream/main -S'canonical_chat_type' -- tools/kanban_tools.py: 0)",
+   "fires": "live kanban.db kanban_notify_subs 2026-09-25: discord dm 20 / group 479 / thread 112, telegram dm 46, 0 rows with chat_type='channel' → the write canonicalization holds; logs 685 files: ~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25; profile logs 06-02→09-25; kanban.db read-only 2026-09-25",
+   "cost": {
+    "loc": 134,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "#682(gateway)"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows gateway/routing_identity (gateway tranche #682). Measured by the absence of drift rows since 09-12. UPSTREAM candidate only together with routing_identity; alone it is fork glue."
  }
 }
