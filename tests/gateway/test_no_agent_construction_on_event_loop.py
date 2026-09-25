@@ -131,8 +131,6 @@ KNOWN_ONE_HOP_STORE_CALLS = {
     ("_defer_goal_status_notice_after_delivery", "_session_key_for_source"),
     ("_handle_message", "_session_key_for_source"),
     ("_handle_message_with_agent_admitted", "_apply_post_turn_resume_gate"),
-    ("_handle_message_with_agent_admitted", "_is_telegram_boot_redelivered_duplicate"),
-    ("_handle_message_with_agent_admitted", "_persist_telegram_aggregate_constituents"),
     ("_handle_message_with_agent_admitted", "_session_key_for_source"),
     ("_handler", "_session_key_for_source"),
     ("_loop_wakeup_watcher", "_build_process_event_source"),

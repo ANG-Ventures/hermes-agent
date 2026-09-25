@@ -101,15 +101,14 @@ def _repo_root() -> Path:
 REACHABLE_BASELINE = frozenset({
     "gateway/run.py _finalize_shutdown_agents -> atomic_json_write",
     "gateway/run.py _handle_message -> atomic_replace",
-    # Re-keyed, NOT introduced, by the transcript-spool fix: this coroutine's
-    # first reported sink used to be the spool's atomic_json_write via
-    # append_to_transcript>.._serialized>spool_dropped_transcript_message.
-    # With the spool off-loop, the DFS (which reports only the FIRST sink per
-    # coroutine) now surfaces the checkpoint rename that was always behind it:
-    # _is_telegram_boot_redelivered_duplicate>maybe_checkpoint>_write.
-    # Verified pre-existing on pristine fork/main by masking
-    # spool_dropped_transcript_message and re-running the walk.
-    "gateway/run.py _handle_message_with_agent_admitted -> os.replace",
+    # Re-keyed, NOT introduced, twice. The transcript-spool fix moved the first
+    # reported sink from the spool's atomic_json_write to the #160 redelivery
+    # checkpoint rename (_is_telegram_boot_redelivered_duplicate>
+    # maybe_checkpoint>_write -> os.replace). Reverting #160 removed that chain,
+    # so the DFS (FIRST sink per coroutine only) now surfaces the resume-gate
+    # fsync that was always behind it:
+    # _apply_post_turn_resume_gate>clear_session_attempts>_persist>_write>_write_json.
+    "gateway/run.py _handle_message_with_agent_admitted -> os.fsync",
     # Unmasked by the status-write fix, NOT introduced by it: the DFS reports
     # only the FIRST sink per coroutine, so the
     # _schedule_resume_pending_sessions>..>_persist>_write chain was shadowed
