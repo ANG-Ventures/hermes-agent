@@ -11302,6 +11302,73 @@ def spawnable_reviewer_profiles() -> list[str]:
         return []
 
 
+def _board_home_kanban_cfg() -> dict:
+    """The ``kanban`` section of ``kanban_home()/config.yaml`` — the board's owner.
+
+    Presence-sensitive read: only keys actually written in the board home's
+    file count (a DEFAULT_CONFIG merge would make every key "present" and
+    mask the profile fallback). ``${VAR}`` expansion and the managed-scope
+    overlay are applied like the gateway's presence-sensitive bridges.
+    Missing file -> ``{}``; unparseable YAML raises (callers fail closed).
+    """
+    from hermes_cli.config import _expand_env_vars, read_user_config_raw
+
+    cfg = _expand_env_vars(read_user_config_raw(kanban_home() / "config.yaml"))
+    if not isinstance(cfg, dict):
+        cfg = {}
+    try:
+        from hermes_cli import managed_scope
+
+        cfg = managed_scope.apply_managed_overlay(cfg)
+    except Exception:
+        pass
+    section = cfg.get("kanban")
+    return section if isinstance(section, dict) else {}
+
+
+def _profile_config_sets_kanban_key(key: str) -> bool:
+    """True when the ACTIVE profile's config.yaml literally writes ``kanban.<key>``
+    (used only to label the DEBUG source; never raises)."""
+    try:
+        from hermes_cli.config import get_config_path, read_user_config_raw
+
+        section = read_user_config_raw(get_config_path()).get("kanban")
+        return isinstance(section, dict) and key in section
+    except Exception:
+        return False
+
+
+_REVIEW_SETTING_MISSING = object()
+
+
+def _kanban_review_setting(key: str, default: Any) -> tuple[Any, str]:
+    """Resolve a board-scoped ``kanban.<key>`` review setting -> ``(value, source)``.
+
+    The review policy is a BOARD property: the board is shared across profiles
+    by design (see :func:`kanban_home`), so a worker running under
+    ``HERMES_HOME=<root>/profiles/<p>`` must see the same policy as the
+    dispatcher. Precedence: the board home's ``config.yaml`` when it writes the
+    key (``board_home``); else the active profile's ``load_config()`` value
+    (``profile``, or ``default`` when only DEFAULT_CONFIG supplies it); else
+    ``default``. The winning source is logged at DEBUG. Raises when a config
+    file is unreadable — each caller keeps its own fail-closed fallback.
+    """
+    board = _board_home_kanban_cfg()
+    if key in board:
+        value, source = board[key], "board_home"
+    else:
+        from hermes_cli.config import load_config
+
+        profile_cfg = (load_config() or {}).get("kanban", {}) or {}
+        if key in profile_cfg:
+            value = profile_cfg[key]
+            source = "profile" if _profile_config_sets_kanban_key(key) else "default"
+        else:
+            value, source = default, "default"
+    _log.debug("kanban.%s=%r (source=%s)", key, value, source)
+    return value, source
+
+
 def configured_review_assignee() -> Optional[str]:
     """Default reviewer from ``kanban.review_assignee`` (no implementer fallback).
 
@@ -11309,9 +11376,7 @@ def configured_review_assignee() -> Optional[str]:
     rather than silently leaving the implementer as their own reviewer.
     """
     try:
-        from hermes_cli.config import load_config
-
-        value = (load_config() or {}).get("kanban", {}).get("review_assignee")
+        value, _source = _kanban_review_setting("review_assignee", None)
     except Exception:
         return None
     if not isinstance(value, str) or not value.strip():
@@ -11338,9 +11403,7 @@ def configured_max_review_rounds() -> int:
     Default :data:`DEFAULT_MAX_REVIEW_ROUNDS`.
     """
     try:
-        from hermes_cli.config import load_config
-
-        value = (load_config() or {}).get("kanban", {}).get(
+        value, _source = _kanban_review_setting(
             "max_review_rounds", DEFAULT_MAX_REVIEW_ROUNDS
         )
         rounds = int(value)
@@ -11367,14 +11430,13 @@ def configured_review_policy() -> str:
     value (unknown, empty) or an unreadable config fails to ``none`` — never
     to ``all`` — and logs a ``review_policy_invalid`` WARNING (spec §0.1 F0:
     a typo must not silently re-enable a reviewer on every card).
+
+    Resolved from the BOARD HOME first (see :func:`_kanban_review_setting`).
     """
     try:
-        from hermes_cli.config import load_config
-
-        kanban_cfg = (load_config() or {}).get("kanban", {}) or {}
-        if "review_policy" not in kanban_cfg:
+        raw, _source = _kanban_review_setting("review_policy", _REVIEW_SETTING_MISSING)
+        if raw is _REVIEW_SETTING_MISSING:
             return "all"
-        raw = kanban_cfg.get("review_policy")
     except Exception as exc:
         _log.warning("review_policy_invalid: config unreadable (%s); using 'none'", exc)
         return "none"
