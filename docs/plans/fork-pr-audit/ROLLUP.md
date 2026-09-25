@@ -64,86 +64,86 @@ Real `git diff --shortstat <merge-base> <branch>` of every revert branch on orig
 
 | card | keys | branch(es) |
 |---|---|---|
-| session-search-title-lane | #257, #303 | audit/agent/revert-pr257 |
-| boomerang | #203, #204 | audit/cron_tools/upstream-203 |
-| audit/agent/upstream-1052 | #1052 | audit/agent/upstream-1052 |
-| #1025 | #1025 | to build |
-| #917 | #917 | to build |
-| audit/agent/upstream-878 | #878 | audit/agent/upstream-878 |
-| #841 | #841 | to build |
-| #730 | #730 | to build |
-| #671 | #671 | to build |
-| #602 | #602 | to build |
-| #324 | #324 | to build |
-| #300 | #300 | to build |
-| #27 | #27 | to build |
-| audit/cron_tools/upstream-1027 | #1027 | audit/cron_tools/upstream-1027 |
-| audit/cron_tools/upstream-920 | #1017, #933, #920 | audit/cron_tools/upstream-920 |
-| audit/cron_tools/upstream-830 | #830 | audit/cron_tools/upstream-830 |
-| audit/cron_tools/upstream-767 | #767 | audit/cron_tools/upstream-767 |
-| audit/cron_tools/upstream-740 | #740 | audit/cron_tools/upstream-740 |
-| audit/cron_tools/upstream-632 | #632 | audit/cron_tools/upstream-632 |
-| audit/cron_tools/upstream-319 | #594, #319 | audit/cron_tools/upstream-319 |
-| #591 | #591 | to build |
-| #532 | #532 | to build |
-| audit/cron_tools/upstream-521 | #521 | audit/cron_tools/upstream-521 |
-| audit/cron_tools/upstream-477 | #477 | audit/cron_tools/upstream-477 |
-| audit/cron_tools/upstream-278 | #278 | audit/cron_tools/upstream-278 |
-| audit/cron_tools/upstream-199 | #199 | audit/cron_tools/upstream-199 |
-| audit/cron_tools/upstream-ssh-116493ff97 | nopr:10a1424335, nopr:116493ff97, nopr:c559189dd2 | audit/cron_tools/upstream-ssh-116493ff97 |
-| audit/gateway/upstream-976 | #976 | audit/gateway/upstream-976 |
-| audit/gateway/upstream-936 | #936 | audit/gateway/upstream-936 |
-| audit/gateway/upstream-935 | #935 | audit/gateway/upstream-935 |
-| #934 | #934 | to build |
-| audit/gateway/upstream-871 | #871 | audit/gateway/upstream-871 |
-| audit/gateway/upstream-869 | #869 | audit/gateway/upstream-869 |
-| audit/gateway/upstream-861 | #861 | audit/gateway/upstream-861 |
-| audit/gateway/upstream-840 | #840 | audit/gateway/upstream-840 |
-| audit/gateway/upstream-834 | #834 | audit/gateway/upstream-834 |
-| audit/gateway/upstream-782 | #782 | audit/gateway/upstream-782 |
-| #301 | #301 | to build |
-| #851 | #851 | to build |
-| audit/gateway/upstream-836 | #836 | audit/gateway/upstream-836 |
-| audit/gateway/upstream-759 | #759 | audit/gateway/upstream-759 |
-| #980 | #980 | to build |
-| audit/hermes_cli/upstream-617 | #617 | audit/hermes_cli/upstream-617 |
-| audit/hermes_cli/upstream-466 | #466 | audit/hermes_cli/upstream-466 |
-| #276 | #276 | to build |
-| audit/scripts_misc/upstream-728 | #728 | audit/scripts_misc/upstream-728 |
-| #1054 | #1054 | to build |
-| audit/agent/revert-pr806 | #806 | audit/agent/revert-pr806 |
-| #418 | #418 | to build |
-| #220 | #220 | to build |
-| #216 | #216 | to build |
-| #213 | #213 | to build |
-| #443 | #443 | to build |
-| audit/gateway/upstream-571 | #571 | audit/gateway/upstream-571 |
-| audit/plugins/upstream-902 | #902 | audit/plugins/upstream-902 |
-| audit/plugins/upstream-412 | #412 | audit/plugins/upstream-412 |
-| audit/plugins/upstream-dc4245ab4c | nopr:dc4245ab4c | audit/plugins/upstream-dc4245ab4c |
-| audit/plugins/upstream-580 | #580 | audit/plugins/upstream-580 |
-| nopr:531f1e8c64 | nopr:531f1e8c64 | to build |
-| audit/plugins/upstream-59ed0e41a1 | nopr:59ed0e41a1 | audit/plugins/upstream-59ed0e41a1 |
-| nopr:5ae50ce919 | nopr:5ae50ce919 | to build |
-| #777 | #777 | to build |
-| #763 | #763 | to build |
-| audit/gateway/upstream-635 | #635 | audit/gateway/upstream-635 |
-| audit/gateway/upstream-584 | #584 | audit/gateway/upstream-584 |
-| #1024 | #1024 | to build |
-| #927 | #927 | to build |
-| audit/cron_tools/upstream-662 | #662 | audit/cron_tools/upstream-662 |
-| audit/cron_tools/upstream-641 | #641 | audit/cron_tools/upstream-641 |
-| audit/cron_tools/upstream-618 | #618 | audit/cron_tools/upstream-618 |
-| audit/cron_tools/upstream-615 | #615 | audit/cron_tools/upstream-615 |
-| audit/cron_tools/upstream-575 | #577, #575 | audit/cron_tools/upstream-575 |
-| audit/cron_tools/upstream-553 | #553 | audit/cron_tools/upstream-553 |
-| #543 | #543 | to build |
-| audit/cron_tools/upstream-399 | #399 | audit/cron_tools/upstream-399 |
-| audit/cron_tools/upstream-314 | #314 | audit/cron_tools/upstream-314 |
-| #209 | #209 | to build |
-| audit/cron_tools/upstream-71 | #71 | audit/cron_tools/upstream-71 |
-| nopr:4d626ac813 | nopr:4d626ac813 | to build |
-| nopr:9a1db22e58 | nopr:9a1db22e58 | to build |
+| t_21eb16a1 | #257, #303 | audit/agent/revert-pr257 |
+| t_ef01d4bc | #203, #204 | audit/cron_tools/upstream-203 |
+| t_6dd3bc1c | #1052 | audit/agent/upstream-1052 |
+| t_1b907b4d | #1025 | to build |
+| t_2f79e876 | #917 | to build |
+| t_e8099117 | #878 | audit/agent/upstream-878 |
+| t_38e016d1 | #841 | to build |
+| t_ffea11fd | #730 | to build |
+| t_221decac | #671 | to build |
+| t_8745d8fe | #602 | to build |
+| t_cfb75eb5 | #324 | to build |
+| t_835842d2 | #300 | to build |
+| t_234502cd | #27 | to build |
+| t_95a0e5c4 | #1027 | audit/cron_tools/upstream-1027 |
+| t_d6dd9867 | #1017, #933, #920 | audit/cron_tools/upstream-920 |
+| t_cf98616a | #830 | audit/cron_tools/upstream-830 |
+| t_8b3280d5 | #767 | audit/cron_tools/upstream-767 |
+| t_4cbe80c7 | #740 | audit/cron_tools/upstream-740 |
+| t_8104aac7 | #632 | audit/cron_tools/upstream-632 |
+| t_4d18a826 | #594, #319 | audit/cron_tools/upstream-319 |
+| t_c2e90a10 | #591 | to build |
+| t_552fce3d | #532 | to build |
+| t_cbdab1dc | #521 | audit/cron_tools/upstream-521 |
+| t_6791824d | #477 | audit/cron_tools/upstream-477 |
+| t_e1f37c7c | #278 | audit/cron_tools/upstream-278 |
+| t_f1a79491 | #199 | audit/cron_tools/upstream-199 |
+| t_e6ede09e | nopr:10a1424335, nopr:116493ff97, nopr:c559189dd2 | audit/cron_tools/upstream-ssh-116493ff97 |
+| t_a11dae63 | #976 | audit/gateway/upstream-976 |
+| t_505f76f8 | #936 | audit/gateway/upstream-936 |
+| t_e3cc317e | #935 | audit/gateway/upstream-935 |
+| t_33c27f60 | #934 | to build |
+| t_c01d2eaf | #871 | audit/gateway/upstream-871 |
+| t_bec74c88 | #869 | audit/gateway/upstream-869 |
+| t_c05cb52b | #861 | audit/gateway/upstream-861 |
+| t_aef6e498 | #840 | audit/gateway/upstream-840 |
+| t_291eab6a | #834 | audit/gateway/upstream-834 |
+| t_afe5a29a | #782 | audit/gateway/upstream-782 |
+| t_c0a324c1 | #301 | to build |
+| t_1717a8d8 | #851 | to build |
+| t_76252db1 | #836 | audit/gateway/upstream-836 |
+| t_b0037579 | #759 | audit/gateway/upstream-759 |
+| t_9d67fba1 | #980 | to build |
+| t_a08c812a | #617 | audit/hermes_cli/upstream-617 |
+| t_61b00b5c | #466 | audit/hermes_cli/upstream-466 |
+| t_603de351 | #276 | to build |
+| t_d22f7e84 | #728 | audit/scripts_misc/upstream-728 |
+| t_a6ed9644 | #1054 | to build |
+| t_5fc4c88d | #806 | audit/agent/revert-pr806 |
+| t_cb481e35 | #418 | to build |
+| t_cb481e35 | #220 | to build |
+| t_cb481e35 | #216 | to build |
+| t_cb481e35 | #213 | to build |
+| t_cb481e35 | #443 | to build |
+| t_00401071 | #571 | audit/gateway/upstream-571 |
+| t_6621602f | #902 | audit/plugins/upstream-902 |
+| t_dee0dfe1 | #412 | audit/plugins/upstream-412 |
+| t_2629830d | nopr:dc4245ab4c | audit/plugins/upstream-dc4245ab4c |
+| t_283aa1d2 | #580 | audit/plugins/upstream-580 |
+| t_7053f65e | nopr:531f1e8c64 | to build |
+| t_048e5927 | nopr:59ed0e41a1 | audit/plugins/upstream-59ed0e41a1 |
+| t_58527481 | nopr:5ae50ce919 | to build |
+| t_dd0b8b2d | #777 | to build |
+| t_dd0b8b2d | #763 | to build |
+| t_8a17e1aa | #635 | audit/gateway/upstream-635 |
+| t_bb3454b0 | #584 | audit/gateway/upstream-584 |
+| t_e4b2e625 | #1024 | to build |
+| t_7899d415 | #927 | to build |
+| t_15bf9da0 | #662 | audit/cron_tools/upstream-662 |
+| t_a9900ff0 | #641 | audit/cron_tools/upstream-641 |
+| t_06093ad2 | #618 | audit/cron_tools/upstream-618 |
+| t_933b75ff | #615 | audit/cron_tools/upstream-615 |
+| t_dda41ad5 | #577, #575 | audit/cron_tools/upstream-575 |
+| t_b3cfa839 | #553 | audit/cron_tools/upstream-553 |
+| t_05cdacb0 | #543 | to build |
+| t_6507eb84 | #399 | audit/cron_tools/upstream-399 |
+| t_7829c723 | #314 | audit/cron_tools/upstream-314 |
+| t_13bcf452 | #209 | to build |
+| t_522e29c9 | #71 | audit/cron_tools/upstream-71 |
+| t_05cdacb0 | nopr:4d626ac813 | to build |
+| t_e480bf39 | nopr:9a1db22e58 | to build |
 
 ## 4. Expected reduction in parity-merge conflicts
 
