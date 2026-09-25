@@ -2103,6 +2103,13 @@ DEFAULT_CONFIG = {
         "loop_watchdog_probe_interval_s": 30.0,
         "loop_watchdog_probe_timeout_s": 10.0,
         "loop_watchdog_max_strikes": 3,
+        # Host-starvation classification (gateway/shutdown_watchdog.py): exit 75 assumes a WEDGED loop a
+        # restart recovers; on a CPU-starved host the restart contends for the same CPU. When
+        # load1 > max(liveness_starvation_load_factor * ncpu, a floor) the watchdog logs
+        # PHASE=liveness_starved and HOLDS instead; after liveness_starvation_max_hold_s of continuous
+        # starvation with no successful probe it exits 75 anyway (PHASE=liveness_starved_giveup).
+        "liveness_starvation_load_factor": 2.0,
+        "liveness_starvation_max_hold_s": 900.0,
         # Allow all users without allowlists (security opt-in).
         "allow_all_users": False,
         # Bot-to-bot loop guard: admitted bot messages per conversation before a cooldown.

@@ -41,6 +41,18 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 # the loop it monitors) is fixed at the root by the off-loop heartbeat write + two-witness probe (#90502),
 # so the default stays tight for genuine wedges.
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
+# Host-starvation classification for a missed-probe escalation. Exit 75 is right for a WEDGED loop
+# (deadlock / synchronous block): the process cannot recover itself and a supervised restart does.
+# It is wrong for a loop merely STARVED of CPU, because the replacement process contends for the same
+# starved host: runaway CPU burners drove load to 538 on 32 cores, the watchdog exited 75 twice, and the
+# supervisor relaunched into a 12-minute boot with every adapter timing out. Both present identically
+# at the probe, so the classification is explicit: ``load1 > max(factor * ncpu, floor)`` is starved.
+# The absolute floor keeps a 2-4 core host from being declared starved at a load that is merely busy.
+DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR = 2.0
+LIVENESS_STARVATION_LOAD_FLOOR = 8.0
+# A starved hold is bounded: after this much CONTINUOUS starvation with no successful probe, exit 75
+# anyway. Past this point the distinction stops mattering; whatever it is, it is not resolving itself.
+DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S = 900.0
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
 
@@ -84,10 +96,83 @@ def _arm_loop_floor_timer(
     return _LoopFloorTimerHandle(loop, iv if iv > 0 else DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S)
 
 
+def _sample_host_load() -> tuple[Optional[float], Optional[int]]:
+    """``(load1, ncpu)``, either ``None`` when unavailable. Never raises: this runs on a path about to
+    hard-exit, so a platform without ``os.getloadavg`` (Windows) reports ``None`` rather than costing
+    the diagnostic dump. An unavailable load average classifies as WEDGED: absence of evidence for
+    starvation must not create a hold."""
+    try:
+        load1: Optional[float] = float(os.getloadavg()[0])
+    except (OSError, AttributeError, IndexError, TypeError, ValueError):
+        load1 = None
+    try:
+        ncpu: Optional[int] = os.cpu_count()
+    except Exception:
+        ncpu = None
+    return load1, ncpu
+
+
+class _LivenessMissDecision:
+    """What the watchdog should do about one escalated missed-probe run."""
+
+    __slots__ = ("action", "strikes", "phase", "starved_since")
+
+    def __init__(self, *, action: str, strikes: int, phase: Optional[str],
+                 starved_since: Optional[float]):
+        self.action = action  # "exit" | "hold"
+        self.strikes = strikes
+        self.phase = phase
+        self.starved_since = starved_since
+
+
+def evaluate_liveness_miss(
+    *, strikes: int, strikes_limit: int, load1: Optional[float], ncpu: Optional[int],
+    load_factor: float, starved_since: Optional[float], now: float, max_hold_s: float,
+) -> _LivenessMissDecision:
+    """Classify an escalated missed-probe run as starved (hold) or wedged (exit). Pure, so the decision
+    is testable without generating real load; generating load is the incident this guards against."""
+    try:
+        factor = float(load_factor)
+        if not (factor > 0) or factor == float("inf"):
+            factor = DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR
+    except (TypeError, ValueError):
+        factor = DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR
+
+    starved = False
+    if load1 is not None and load1 == load1:  # not NaN
+        cores = ncpu if isinstance(ncpu, int) and ncpu > 0 else 1
+        starved = load1 > max(factor * cores, LIVENESS_STARVATION_LOAD_FLOOR)
+    if not starved:
+        return _LivenessMissDecision(action="exit", strikes=strikes, phase=None, starved_since=None)
+
+    began = starved_since if starved_since is not None else now
+    try:
+        ceiling = float(max_hold_s)
+    except (TypeError, ValueError):
+        ceiling = DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S
+    if now - began >= ceiling:
+        return _LivenessMissDecision(
+            action="exit", strikes=strikes, phase="liveness_starved_giveup", starved_since=began)
+    # Hold: back the counter off to one below the limit so the next HEALTHY probe clears it outright
+    # and the next MISSED one re-evaluates, rather than the hold swallowing every future miss.
+    return _LivenessMissDecision(
+        action="hold", strikes=max(strikes_limit - 1, 0), phase="liveness_starved", starved_since=began)
+
+
+def _format_starvation_line(
+    phase: str, *, load1: Optional[float], ncpu: Optional[int], strikes: int, held_s: float
+) -> str:
+    load_txt = f"{load1:.2f}" if load1 is not None else "unknown"
+    ncpu_txt = str(ncpu) if ncpu else "unknown"
+    return f"PHASE={phase} load1={load_txt} ncpu={ncpu_txt} strikes={strikes} held_s={held_s:.1f}"
+
+
 def start_loop_liveness_watchdog(
     loop: asyncio.AbstractEventLoop, *, probe_interval: float = DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     probe_timeout: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
     max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
+    starvation_load_factor: float = DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
+    starvation_max_hold_s: float = DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
     exit_code: int = GATEWAY_SERVICE_RESTART_EXIT_CODE,
 ) -> Optional[_LoopLivenessWatchdogHandle]:
     """Start an out-of-loop watchdog that hard-exits after missed probes. The caller
@@ -97,6 +182,7 @@ def start_loop_liveness_watchdog(
 
     def _watchdog() -> None:
         strikes = 0
+        starved_since: Optional[float] = None
         while not stop_event.wait(timeout=probe_interval):
             probe_event = threading.Event()
             try:
@@ -115,6 +201,7 @@ def start_loop_liveness_watchdog(
                 return
             if probe_event.is_set():
                 strikes = 0
+                starved_since = None
                 continue
             if stop_event.is_set():  # re-checked before each irreversible step: a late stop() wins
                 return
@@ -123,11 +210,38 @@ def start_loop_liveness_watchdog(
                 continue
             if stop_event.is_set():
                 return
-            with contextlib.suppress(Exception):
-                logger.critical(
-                    "Gateway event loop missed %d consecutive liveness probes; dumping all thread "
-                    "stacks and exiting with code %d so the service supervisor can restart it.",
-                    strikes, exit_code)
+            # Classify BEFORE exiting: a starved host is not a wedge, and a restart cannot fix it.
+            load1, ncpu = _sample_host_load()
+            decision = evaluate_liveness_miss(
+                strikes=strikes, strikes_limit=max_strikes, load1=load1, ncpu=ncpu,
+                load_factor=starvation_load_factor, starved_since=starved_since,
+                now=time.monotonic(), max_hold_s=starvation_max_hold_s)
+            starved_since = decision.starved_since
+            held_s = max(time.monotonic() - (starved_since or time.monotonic()), 0.0)
+            if decision.action == "hold":
+                # The structured line IS the page: this module has no alert channel of its own.
+                with contextlib.suppress(Exception):
+                    logger.critical(
+                        "Gateway event loop missed %d consecutive liveness probes, but the HOST is "
+                        "starved, not the loop wedged; HOLDING instead of exiting %d (a restart would "
+                        "contend for the same CPU). %s", strikes, exit_code,
+                        _format_starvation_line("liveness_starved", load1=load1, ncpu=ncpu,
+                                                strikes=strikes, held_s=held_s))
+                strikes = decision.strikes
+                continue
+            if decision.phase == "liveness_starved_giveup":
+                with contextlib.suppress(Exception):
+                    logger.critical(
+                        "Gateway event loop starvation hold exceeded its ceiling with no successful "
+                        "probe; exiting with code %d anyway. %s", exit_code,
+                        _format_starvation_line("liveness_starved_giveup", load1=load1, ncpu=ncpu,
+                                                strikes=strikes, held_s=held_s))
+            else:
+                with contextlib.suppress(Exception):
+                    logger.critical(
+                        "Gateway event loop missed %d consecutive liveness probes; dumping all thread "
+                        "stacks and exiting with code %d so the service supervisor can restart it.",
+                        strikes, exit_code)
             try:
                 faulthandler.dump_traceback(all_threads=True)
             except Exception:

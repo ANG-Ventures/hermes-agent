@@ -8,10 +8,24 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from gateway.shutdown_watchdog import (
     loop_heartbeat_forever,
     start_loop_liveness_watchdog,
 )
+
+
+@pytest.fixture(autouse=True)
+def _pin_host_as_unstarved():
+    """Force the WEDGED classification: these tests assert the dump + exit-75 path. Unpinned they read
+    the REAL load average, so on a busy CI runner the watchdog correctly takes the starvation HOLD
+    path and they fail. Starvation behavior is covered in test_liveness_starvation_hold.py."""
+    with (
+        patch("gateway.shutdown_watchdog.os.getloadavg", return_value=(0.5, 0.5, 0.5)),
+        patch("gateway.shutdown_watchdog.os.cpu_count", return_value=8),
+    ):
+        yield
 
 def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
