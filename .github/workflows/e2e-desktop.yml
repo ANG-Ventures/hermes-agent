@@ -20,14 +20,7 @@ jobs:
     # This job builds the renderer and the electron bundle, then drives a real
     # Electron app under xvfb. vite, tsc and the Playwright workers all scale
     # with the core count.
-    #
-    # fork 2026-09-16: NOT routed through CI_RUNNER_LABELS. The "Install system
-    # dependencies for Electron" step below needs `sudo apt-get install` (gtk,
-    # nss, xvfb, …), and the ACE-AI self-hosted pool runs its containers with
-    # --security-opt no-new-privileges, so sudo fails with "the 'no new
-    # privileges' flag is set". Same reason rust-tests.yml and nix.yml are
-    # pinned. Stays GitHub-hosted.
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     outputs:
       review_status: ${{ steps.review-status.outputs.review_status }}

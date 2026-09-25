@@ -33,15 +33,7 @@ jobs:
     # fork 2026-08-30: upstream pins a paid 32-core runner pool that does not
     # exist in this org — the job queues forever and blocks the required
     # aggregator. Standard hosted runner is fine here (30-min timeout holds).
-    #
-    # fork 2026-09-16: NOT routed through CI_RUNNER_LABELS. The "Install Tauri
-    # system dependencies" step below needs `sudo apt-get install` for
-    # webkit2gtk et al, and the ACE-AI self-hosted pool runs its containers
-    # with --security-opt no-new-privileges, so sudo fails with "the 'no new
-    # privileges' flag is set". The pool image also ships zero webkit2gtk
-    # packages, so there is nothing to skip the install for. Same reason nix.yml
-    # is pinned. Stays GitHub-hosted.
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     defaults:
       run:

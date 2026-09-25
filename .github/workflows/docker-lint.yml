@@ -23,14 +23,7 @@ concurrency:
 jobs:
   hadolint:
     name: Lint Dockerfile (hadolint)
-    # fork 2026-09-16: NOT routed through CI_RUNNER_LABELS. hadolint-action is a
-    # Docker *container* action, so the runner must `docker build` it before the
-    # step can run. The ACE-AI self-hosted pool deliberately mounts no docker
-    # socket (the pool is hardened and is not meant to build images), so the
-    # step dies with "failed to connect to the docker API at
-    # unix:///var/run/docker.sock". The shellcheck job below is a JS action with
-    # no container, so it stays on the pool. Stays GitHub-hosted.
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
       - name: Checkout code
