@@ -1326,6 +1326,8 @@ def resolve_startup_model_arg(
     raw = raw_model.strip()
     if not raw or raw.lower().startswith("moa:") or "://" in raw:
         return None, raw_model
+    _typed = re.split(r"[:/]", raw, maxsplit=1)
+    provider_seam.refresh("typed", _typed[0] if len(_typed) > 1 else None)
     try:
         inline = _parse_inline_provider_model(
             raw, current_provider or "", user_providers, custom_providers

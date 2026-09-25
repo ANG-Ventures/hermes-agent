@@ -122,6 +122,7 @@ def provider_catalog() -> list[ProviderDescriptor]:
     except Exception:
         HERMES_OVERLAYS = {}
 
+    provider_seam.refresh("picker")
     g = provider_seam.snapshot()
     out: list[ProviderDescriptor] = []
     for order, entry in enumerate(g.CANONICAL_PROVIDERS):

@@ -450,6 +450,14 @@ def test_refresh_triggers_run_before_recognition():
     models.parse_model_input("seam-typed:some-model", "openrouter")
     assert ("typed", "seam-typed") in seen
 
+    from hermes_cli.model_switch import resolve_startup_model_arg
+    from hermes_cli.provider_catalog import provider_catalog
+
+    resolve_startup_model_arg("seam-startup:some-model", "openrouter")
+    assert ("typed", "seam-startup") in seen
+    provider_catalog()
+    assert ("picker", None) in seen
+
 
 # ---------------------------------------------------------------------------
 # providers.list_providers per-generation memo (RC-E2)
