@@ -232,7 +232,13 @@ jobs:
     # matching exemption so the skip is declared rather than silent (the #476
     # rule is 'no required job vanishes unnoticed', not 'never skip').
     # Re-enable together with upstream's #76627 fix.
-    if: ${{ false && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true') }}
+    # t_bc0052b9: bare `if: false`, as upstream NousResearch did. The constant-folded
+    # `${{ false && (...) }}` form on this reusable-workflow job is upstream's documented
+    # cause of GitHub startup_failure ("An unexpected error has occurred", 0 jobs). Here it
+    # hit ~1 in 12 `--failed` re-runs (35898441649, 36070097433, 36145913460, 36170775010).
+    # To re-enable, restore:
+    #   if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
+    if: false
     uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
