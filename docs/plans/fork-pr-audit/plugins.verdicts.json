@@ -1,4 +1,68 @@
 {
+ "#480": {
+  "verdict": "KEEP",
+  "problem": "Re-vendor hermes-lcm v0.21.0-rc2 (from v0.16.2) + announce the engine_preflight_maintenance compaction arm. Fixes a compaction at ~345k tokens vs a 750k threshold with nothing in chat explaining it (naive should_compress_preflight in LCM 0.19).",
+  "evidence": {
+   "original": "PR #480 body (session evidence, 345,087 tokens vs 750,000 threshold); VENDORED_FROM.txt records source commit 10cbb78 / tag v0.21.0-rc2.",
+   "upstream_state": "read-only (D1a: reference is stephenschoettler/hermes-lcm, not NousResearch): lcmup @ 8d1b1e6 (v1.0.0-rc.1, 2026-09-03) \u2014 1277/1277 def/class names added by this row exist there (it IS upstream content). The announce half: lcmup engine.py:518 still sets `self.emit_automatic_compaction_status = False` unconditionally, so upstream's own banner stays inert (that half is graded under #497).",
+   "upstream_fix": "n/a \u2014 this row is the vendored copy of upstream itself; upstream has since moved 10cbb78 -> 8d1b1e6 (v1.0.0-rc.1)",
+   "fires": "LCM is the live engine: config.yaml `engine: lcm`, ~/.hermes/lcm.db 6.48 GB (mtime 2026-09-25); 51 'LCM compaction #' lines + 265 'Context compacted' lines in the log window (2026-07-29..2026-09-25); this row's own log literals 9 lines / 4 files.",
+   "cost": {
+    "loc": 53799,
+    "conflict_syncs": 3,
+    "conflict_files": [
+     "agent/conversation_compression.py",
+     "agent/turn_context.py",
+     "plugins/context_engine/lcm/config.py"
+    ],
+    "dependents": [
+     "#497",
+     "#508",
+     "#509",
+     "#531",
+     "#966",
+     "#996",
+     "#1023",
+     "#1053",
+     "#887",
+     "#902",
+     "#903",
+     "#465",
+     "#825"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Vendored subtree = fork-permanent by construction (no shared history). The audit question for this row is the D1a refresh decision (bump to v1.0.0-rc.1 vs cherry-pick vs stay), which the ledger already frames (DD-1/DD-2 ADOPT-THEIRS, DC-1/DC-2/DD-4 FORK-PERMANENT, DC-3 partial). Not a drop. The 3 conflict files (3 syncs) are the NousResearch-side seams agent/conversation_compression.py + agent/turn_context.py, not the vendored tree \u2014 graded with #497.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): re-vendor v0.21.0-rc2 + announce the below-threshold compaction arm (#480)"
+ },
+ "nopr:8b869633a4": {
+  "verdict": "KEEP",
+  "problem": "Vendor the LCM context engine (v0.16.2) under plugins/context_engine/lcm + normalize wrapped tool schemas.",
+  "evidence": {
+   "original": "Commit body (2026-06-16); PRD-6 LCM adoption.",
+   "upstream_state": "read-only: 496/504 added symbols exist in lcmup 8d1b1e6; the 8 misses are fork-relocated (backup_database/rotate_backup_database now in plugins/context_engine/lcm/maintenance.py, imported at command.py:51) or fork-only (_WrappedToolEngine, focus briefs). NousResearch side: agent/context_engine.py ABC exists upstream with should_compress_preflight@../up/agent/context_engine.py:156 \u2014 the ABC seam this row added is absorbed.",
+   "upstream_fix": "NousResearch ABC absorbed (agent/context_engine.py present upstream); LCM content = upstream's own",
+   "fires": "same as #480 \u2014 live engine; this row's log literals 44 lines / 1 file",
+   "cost": {
+    "loc": 15792,
+    "conflict_syncs": 3,
+    "conflict_files": [
+     "agent/agent_init.py",
+     "agent/context_engine.py",
+     "plugins/context_engine/lcm/config.py"
+    ],
+    "dependents": [
+     "#480"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Fork-permanent vendored tree. 3 conflict files (3 syncs): agent/agent_init.py + agent/context_engine.py are ABC-wiring seams that upstream now owns \u2014 at next sync take upstream's agent/context_engine.py and keep only what the lcm plugin needs. Superseded by #480's re-vendor for content.",
+  "subsystem": "plugins/context_engine",
+  "subject": "feat: vendor LCM context engine"
+ },
  "#6": {
   "verdict": "KEEP",
   "problem": "Fork-identity telemetry plugin: per-turn cost/token/tool ledger + /cost. Zero outbound network calls (checked: no http/socket in plugins/blackbox; writes only ~/.hermes/blackbox/turns.db). fork-features.json has NO blackbox entry (registry gap, flagged).",
@@ -67,6 +131,34 @@
   "subsystem": "plugins/blackbox",
   "subject": "feat(gateway): /usage shows the rich /context last-turn card + per-category context breakdown (#141)"
  },
+ "#497": {
+  "verdict": "KEEP",
+  "problem": "Below-threshold compactions announce themselves and name the cause; #480's banner shipped inert because LCM forces emit_automatic_compaction_status=False, and the host had no cause plumbing.",
+  "evidence": {
+   "original": "PR #497 body (346,375 tokens vs 750,000; two defects that survived #480).",
+   "upstream_state": "read-only: lcmup engine.py:518 still `emit_automatic_compaction_status = False` unconditionally (defect 1 present upstream). NousResearch side: ../up/agent/conversation_compression.py:4006 _announce_compression_start \u2014 upstream grew its own announce lifecycle, but 0 hits for 'below.threshold' in up/agent/{conversation_compression,turn_context,context_engine}.py, so the cause-naming half has no counterpart.",
+   "upstream_fix": "none for the cause-naming; upstream's _announce_compression_start (no single sha cited) covers the generic 'announce before compaction' half",
+   "fires": "chat emit, not a log line: this row's 4 log literals = 0 hits; 'maintenance compaction' 4 + 'engine_preflight' 2 + 'below threshold' 2 lines in the window. Rare by design since #531/#508 gate the below-threshold arm.",
+   "cost": {
+    "loc": 1148,
+    "conflict_syncs": 3,
+    "conflict_files": [
+     "agent/context_engine.py",
+     "agent/conversation_compression.py",
+     "agent/model_metadata.py",
+     "agent/turn_context.py",
+     "hermes_cli/config.py"
+    ],
+    "dependents": [
+     "#509"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Highest-cost LCM row: 5 conflict files x 3 syncs, all NousResearch seams (context_engine.py, conversation_compression.py, model_metadata.py, turn_context.py, hermes_cli/config.py). Measured only indirectly (the arm now rarely fires) \u2014 adversary may push this to UNRESOLVED. Recommendation: at next sync re-thread the announce onto upstream's _announce_compression_start lifecycle and keep only the LCM-side cause string; that converges 4 of the 5 seams.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(compaction): below-threshold compactions announce themselves and name the cause (#497)"
+ },
  "#968": {
   "verdict": "KEEP",
   "problem": "kanban-home-cards plugin: open home cards once at session start (t_13a135f5).",
@@ -86,6 +178,28 @@
   "notes": "Fork-permanent plugin, 0 conflict files.",
   "subsystem": "plugins/kanban-home-cards",
   "subject": "feat(plugins): kanban-home-cards \u2014 open home cards once at session start (t_13a135f5) (#968)"
+ },
+ "#168": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "LCM ignored compression.target_ratio and kept a fixed 32-message fresh tail; map the knob to a token budget.",
+  "evidence": {
+   "original": "PR #168 body (2026-07-01; ~6.5K-token fixed tail on live traffic).",
+   "upstream_state": "read-only: lcmup carries fresh_tail_max_tokens (command.py:804/851/893, 5 non-test hits) with tool-group integrity + orphan handling; `target_ratio` = 0 hits in lcmup. Ledger DD-1 ruled ADOPT-THEIRS.",
+   "upstream_fix": "lcmup fresh_tail.py (ledger DD-1, verified on 424a6b2 and still present at 8d1b1e6)",
+   "fires": "0 log lines; the budget is applied silently every compaction (config.yaml compression.target_ratio: 0.2). Fork still carries _fresh_tail_start@engine.py:2874, _dynamic_fresh_tail_count@:1164, _refresh_fresh_tail_token_budget@:1136.",
+   "cost": {
+    "loc": 927,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/context_engine/lcm/config.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Verdict = ledger DD-1 (ADOPT-THEIRS): delete our three tail functions, adopt their fresh_tail.py, re-express target_ratio as a ~5-line fresh_tail_max_tokens computation at config load. Landmine: same-named defs, delete explicitly. Executes at the next vendor refresh, not as a standalone revert (the two scripts/ paths in this row are already gone from the fork).",
+  "subsystem": "plugins/context_engine",
+  "subject": "feat(lcm): honor compression.target_ratio via a token-budgeted fresh tail (#168)"
  },
  "#432": {
   "verdict": "KEEP",
@@ -111,6 +225,127 @@
   "notes": "Fires this week. 2 conflict files (2 syncs).",
   "subsystem": "plugins/blackbox",
   "subject": "feat(blackbox): event-driven new-model pricing sentinel (#432)"
+ },
+ "#966": {
+  "verdict": "KEEP",
+  "problem": "FTS parity COUNT(*) over 2.5M rows ran under _LOAD_LOCK on every engine load \u2014 Apollo boot freeze #3 (card t_d3963974).",
+  "evidence": {
+   "original": "PR #966 body (measured on an APFS clone of the 10.9 GB db); card t_d3963974.",
+   "upstream_state": "RED by read: lcmup db_bootstrap.py:2394 _fts_needs_rebuild_structural still runs `SELECT COUNT(*) FROM messages` (:2420) and `COUNT(*) FROM <docsize>` (:2429), and it is called from ensure_external_content_fts (:3092 via :2943/:3002), which store.py:391 calls in _init_db on every MessageStore construction. Upstream 7c5c960 (2026-09-03, 'serialize concurrent FTS bootstrap repair #570') adds a lock but keeps the COUNT(*).",
+   "upstream_fix": "none (7c5c960 is adjacent, not this)",
+   "fires": "1,461 log lines / 20 files in the window (parity-marker + interval lines); 'parity check' 4 lines",
+   "cost": {
+    "loc": 815,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/context_engine/lcm/config.py"
+    ],
+    "dependents": [
+     "#1023",
+     "#903"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Fires constantly; upstream RED. Generic (any large lcm.db pays it) \u2014 a strong contribute-back candidate on top of their #570, but framed against their db_bootstrap shape. 1 conflict file (1).",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): FTS parity COUNT(*) ran under _LOAD_LOCK on every engine load (freeze #3) (#966)"
+ },
+ "#107": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Replayed rows all stamped time.time() at ingest (up to 1,049 rows on one instant) + dup-on-replay after compaction.",
+  "evidence": {
+   "original": "PR #107 body (2026-06-26).",
+   "upstream_state": "read-only: timestamps \u2014 lcmup store.py carries observed_at / observed_at_source columns (store.py:445-452) and 'source time contract' (f68ceaa 2026-07-20) instead of our timestamp_original/_reconstructed/_verified (0 hits in lcmup); our upstream PR #444 was CLOSED unmerged 2026-08-08. Dedup \u2014 lcmup prevents the write via reconcile.py:421 _find_reconciled_cursor_for_store_tail (ledger DD-2: ADOPT-THEIRS; superseded_by = 0 hits upstream).",
+   "upstream_fix": "f68ceaa (source time contract) + reconcile.py (DD-2)",
+   "fires": "0 log lines (silent path); 'reconcile' 20,123 lines in the window shows the replay path is hot",
+   "cost": {
+    "loc": 758,
+    "conflict_syncs": 3,
+    "conflict_files": [
+     "acp_adapter/session.py",
+     "agent/conversation_loop.py",
+     "cli.py",
+     "gateway/session.py",
+     "hermes_cli/cli_agent_setup_mixin.py",
+     "hermes_state.py",
+     "tests/test_hermes_state.py"
+    ],
+    "dependents": [
+     "#1053"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "7 conflict files x 3 syncs \u2014 the second-costliest LCM row, and 6 of the 7 are NousResearch seams (acp_adapter/session.py, agent/conversation_loop.py, cli.py, gateway/{platforms/api_server,session}.py, hermes_state.py) threading per-message timestamps. Ledger DD-2 says drop the superseded_by machinery and adopt their reconcile.py (+placeholder_ledger.py, priced). But note #1053 (2026-09-25) BUILDS on superseded_by \u2014 dropping #107 drops #1053 too; the pair goes together at the refresh. The timestamp half: upstream chose observed_at; converge on theirs.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): preserve real per-message timestamps + stop dup-on-replay (#107)"
+ },
+ "nopr:6c8202b164": {
+  "verdict": "KEEP",
+  "problem": "PRD-6 data-at-rest controls: per-row AESGCM encryption, 0700/0600 permission enforcement, synced-path detection, redaction corpus, retention.",
+  "evidence": {
+   "original": "Commit body (PRD-6 I-6/I-8).",
+   "upstream_state": "read-only: RowCipher = 0 hits in lcmup; ledger wave-2: encryption/retention 'not sent (feature, not defect) \u2014 permanent fork divergence'; redaction regex PRs #457/#458 OPEN upstream unmerged. This row also introduced the fork-only `search_content` column (git log -S: first at 6c8202b164) that #887/#902/60ea/051c later had to defend.",
+   "upstream_fix": "none (#457/#458 open)",
+   "fires": "2 log lines / 1 file; live lcm.db is mode 0600 (ls -la: -rw-------), so the permission half is in effect; sensitive_patterns_enabled not set in config.yaml (default False) so redaction is dormant; encryption key file not present under ~/.hermes (no lcm.key) \u2014 encryption not enabled.",
+   "cost": {
+    "loc": 752,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/context_engine/lcm/config.py"
+    ],
+    "dependents": [
+     "#887",
+     "nopr:60ea6b2b42",
+     "nopr:051c2076e1"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Partially dormant: permissions live, redaction+encryption off. Ledger flags the dormant openai_key regex defect (fix before enabling). Fork-permanent per ledger; the search_content schema it introduced is the root of the boot-scan class \u2014 a refresh that adopts upstream's schema retires #887/#902-half/60ea/051c together. 1 conflict file (1).",
+  "subsystem": "plugins/context_engine",
+  "subject": "feat(lcm): storage security, redaction corpus, encryption, retention"
+ },
+ "#996": {
+  "verdict": "KEEP",
+  "problem": "Turn-start reconcile scan was O(n^2) per cursor (972,426 identity computations, 47 s dead air before the model was reached).",
+  "evidence": {
+   "original": "PR #996 body, card t_49c1f7d7 (Apollo dead air 2026-09).",
+   "upstream_state": "RED by read: lcmup reconcile.py:449-470 rebuilds candidate_visible_messages / candidate_non_placeholder_messages list comprehensions inside `for cursor in range(len(messages), -1, -1)` \u2014 the same per-cursor rebuild; no memo (_replay_identity_memo_scope / _prefix_counts = 0 hits upstream).",
+   "upstream_fix": "none",
+   "fires": "0 dedicated log lines (perf fix, silent); 'reconcile' 20,123 lines show the path runs every turn",
+   "cost": {
+    "loc": 680,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "0 conflict files. Generic perf fix on upstream's own reconcile.py shape \u2014 UPSTREAM-worthy, but DD-2/DD-4 say we may adopt their reconcile.py wholesale at refresh; if so this becomes a contribute-back against their file rather than a fork carry. Keep until then.",
+  "subsystem": "plugins/context_engine",
+  "subject": "perf(lcm): turn-start reconcile scan is linear, not O(n^2) per cursor (t_49c1f7d7) (#996)"
+ },
+ "#431": {
+  "verdict": "KEEP",
+  "problem": "Cherry-pick 9 upstream fixes (#263 #264 #265 #269 #278 #280 #282 #285 incl. the Anthropic HTTP 400 summary-role pin) into the vendored copy.",
+  "evidence": {
+   "original": "PR #431 body; /tmp/lcm-refresh-out/CHERRY-PICK-LIST.md (gone).",
+   "upstream_state": "read-only: 29/30 added symbols exist in lcmup (ensure_candidate_loaded is the one miss, upstream renamed/relocated it); the content is upstream's own.",
+   "upstream_fix": "the 9 picked upstream PRs themselves",
+   "fires": "n/a (upstream content); 0 log literal hits",
+   "cost": {
+    "loc": 634,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Superseded in content by the #480 re-vendor to v0.21.0-rc2 (which includes these picks). 0 conflict. Nothing to drop separately.",
+  "subsystem": "plugins/context_engine",
+  "subject": "vendor(lcm): cherry-pick 9 upstream fixes (incl. the Anthropic HTTP 400 summary-role pin) (#431)"
  },
  "#154": {
   "verdict": "KEEP",
@@ -186,6 +421,46 @@
   "subsystem": "plugins/blackbox",
   "subject": "feat(blackbox): add per-call subscription attribution store (#799)"
  },
+ "#1023": {
+  "verdict": "KEEP",
+  "problem": "Structural FTS repair ran DDL as separately autocommitted statements (index torn for 13-28 min) and ran on the engine-load thread; defer the rebuild off-thread and make DROP work on a fresh connection.",
+  "evidence": {
+   "original": "PR #1023 body, cards t_1e04c4b*/t_d3963974 follow-up to #966.",
+   "upstream_state": "RED by read: lcmup db_bootstrap.py:2993 repair_external_content_fts has no BEGIN/transaction wrapping (grep BEGIN in that file only hits trigger bodies at :946/:960/:976/:1987/:2009) and no deferral (_defer_structural_rebuild / _run_background_fts_rebuild = 0 hits). Upstream 7c5c960 (#570) serializes concurrent repair but does not make it one transaction or move it off the load thread.",
+   "upstream_fix": "none (7c5c960 partial/adjacent)",
+   "fires": "94 log lines / 5 files (gateway.error.log, tui_gateway_crash.log) in the window; 'structural rebuild' 2 lines",
+   "cost": {
+    "loc": 563,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "0 conflict. Fires. Contribute-back candidate stacked on their #570.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): defer structural FTS rebuild off the engine-load thread; DROP works on a fresh connection (t_1e04c4bd, stacked on #971) (#1023)"
+ },
+ "nopr:6622f41055": {
+  "verdict": "KEEP",
+  "problem": "LCM fail-open degraded fallback: observable degraded state, structured warning events, rate counters, over-context path that tries ContextCompressor before raising.",
+  "evidence": {
+   "original": "Commit body (2026-06-16); ledger DC-1.",
+   "upstream_state": "read-only: fail_open = 0 hits in lcmup; their BypassMixin (bypass.py) is routing, not degradation; their compress re-raises. Ledger DC-1 ruled FORK-PERMANENT (partial adopt of their _compress_impl shape).",
+   "upstream_fix": "none \u2014 deliberate policy divergence (never-hard-fail-a-live-conversation)",
+   "fires": "'fail-open' 9 lines + 'degraded' 606 lines in the window; this row's literals 0 hits",
+   "cost": {
+    "loc": 505,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Ledger DC-1: keep behaviour, adopt their _compress_impl split at refresh to shed conflict hunks in engine.py; fix our-side 0.20 vs target_ratio inconsistency. 0 conflict files.",
+  "subsystem": "plugins/context_engine",
+  "subject": "Implement LCM fail-open degraded fallback"
+ },
  "#444": {
   "verdict": "KEEP",
   "problem": "Session depth + CLI invocation correlation columns.",
@@ -233,6 +508,170 @@
   "notes": "Half duplicates upstream: the fork re-implemented _configured_home_channels at plugin_api.py:2290 where upstream has it at :1138 \u2014 converge that half at next sync (dashboard dist/*.js + plugin_api.py conflict 1 file x3 syncs). Facet half rides the fork's home-session concept. Unmeasured because it is <24h old; adversary should re-check fires.",
   "subsystem": "plugins/kanban",
   "subject": "feat(kanban-dashboard): home-session facet + home channel on cards (#1014)"
+ },
+ "#531": {
+  "verdict": "KEEP",
+  "problem": "Maintenance compaction fired at 61% of threshold on a 100%-cached session, burning the warm prompt cache (cost to the next turn measured).",
+  "evidence": {
+   "original": "PR #531 body (session 20260806_084344, 8 consecutive 100%-cache calls; Ace: 'why did it compact again').",
+   "upstream_state": "RED by read: max_cache_hit_ratio / cache_hit = 0 hits in lcmup compaction.py/config.py. Our upstream PR #516 ('gate opportunistic maintenance compaction on token pressure') is OPEN unmerged.",
+   "upstream_fix": "none (PR #516 open)",
+   "fires": "0 log lines (gate is silent when it holds); config.yaml compression.maintenance_max_cache_hit_ratio: 0.9 is set, so the gate is armed on the live gateway",
+   "cost": {
+    "loc": 308,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/context_engine/lcm/config.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Measured-by-absence: the class of premature compaction it stops has not recurred in the log window ('maintenance compaction' 4 lines). Already pitched upstream (#516). 1 conflict file (1).",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(compaction): don't burn a warm prompt cache to compact below threshold (#531)"
+ },
+ "#465": {
+  "verdict": "KEEP",
+  "problem": "Active-context assembly dropped tool rows but never merged the adjacent bare assistant rows left behind \u2014 strict-alternation violation every downstream load had to repair.",
+  "evidence": {
+   "original": "PR #465 body.",
+   "upstream_state": "RED by read: _merge_adjacent* = 0 hits in lcmup; engine.py:6010 _assemble_context has no adjacent-assistant merge. Our upstream PR #467 ('merge adjacent assistant rows in active-context assembly') is OPEN unmerged.",
+   "upstream_fix": "none (PR #467 open)",
+   "fires": "0 log lines (silent normalization on every assembly)",
+   "cost": {
+    "loc": 238,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Already pitched upstream. 0 conflict. Absorb signal 18/48 is shared scaffolding, not absorption.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): merge adjacent assistant rows in active-context assembly (#465)"
+ },
+ "nopr:051c2076e1": {
+  "verdict": "KEEP",
+  "problem": "msg_fts_* triggers existed by name but referenced the dropped `content` column after the content->search_content rename; name-only health check reported healthy while every INSERT aborted.",
+  "evidence": {
+   "original": "Commit body (2026-06-19).",
+   "upstream_state": "GREEN by absence: search_content does not exist in lcmup (0 hits, never did per git log -S), so this drift class cannot occur upstream. lcmup db_bootstrap.py:2280 does compare normalized trigger SQL to expected (a generic form of the same check).",
+   "upstream_fix": "db_bootstrap.py:2280 normalized-trigger compare (generic; no sha isolated)",
+   "fires": "0 log lines in the window (repair path; the drifted DBs were fixed in June)",
+   "cost": {
+    "loc": 228,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Defends a fork-only schema (see 6c8202b164). Retires automatically if the refresh adopts upstream's schema; until then a required repair path for existing fleet DBs. 0 conflict. Not a DROP: reverting it would leave older DBs unrepairable.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): detect and repair content-drifted messages_fts triggers"
+ },
+ "#1053": {
+  "verdict": "KEEP",
+  "problem": "Per-session reads (get_session_tail, load_session_page, ...) returned soft-hidden superseded replay copies, so re-bind reconcile matched against hidden rows.",
+  "evidence": {
+   "original": "PR #1053 body, card t_9cdad21b (2026-09-25).",
+   "upstream_state": "GREEN by absence: superseded_by = 0 hits in lcmup (upstream prevents the duplicate write, ledger DD-2), so there are no hidden rows to leak.",
+   "upstream_fix": "reconcile.py (DD-2 prevention design)",
+   "fires": "landed 2026-09-25, 0 log literal hits (too new; read path is silent)",
+   "cost": {
+    "loc": 227,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Correct fix for the fork's tolerate-and-hide design; goes away with #107 when DD-2 executes. 0 conflict.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): session reads hide superseded replay copies (t_9cdad21b) (#1053)"
+ },
+ "#903": {
+  "verdict": "KEEP",
+  "problem": "Regression layer for the boot-scan class (a plan-level test that fails on any full-table scan during MessageStore init) + a loud signal when engine load stalls every turn.",
+  "evidence": {
+   "original": "PR #903 body (two Apollo freezes 2026-09-22, #887 + #902).",
+   "upstream_state": "read-only: lcmup has no init-cost contract test; upstream's _init_db still contains an unconditional full-table UPDATE (store.py:454) so the class is live there.",
+   "upstream_fix": "none",
+   "fires": "0 log lines (test layer + a stall signal that has not tripped in the window)",
+   "cost": {
+    "loc": 224,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Tests-only + docs + one signal in plugins/context_engine/__init__.py; 3 test-helper symbols no longer on origin/main by name (refactored since) \u2014 verify tests/context_engine/test_lcm_init_cost_regression.py still collects before any refresh. 0 conflict.",
+  "subsystem": "plugins/context_engine",
+  "subject": "test(lcm): regression layer for the boot-scan class + a loud signal when engine load stalls every turn (#903)"
+ },
+ "#509": {
+  "verdict": "KEEP",
+  "problem": "A '\ud83d\udce6 lcm maintenance compaction' banner with no '\ud83d\udddc\ufe0f Context compacted' after it: 4 of 21 compressions announced then did nothing (214->214 messages).",
+  "evidence": {
+   "original": "PR #509 body (session 20260807_183558 timestamps).",
+   "upstream_state": "read-only: preflight_is_user_visible = 0 hits in lcmup; NousResearch agent/turn_context.py has no equivalent gate (upstream's _announce_compression_start@conversation_compression.py:4006 announces before the feasibility probe by design, comment at :4078).",
+   "upstream_fix": "none",
+   "fires": "0 log lines; the no-op class ('compression done' with equal counts) not observed in the window's 201 'compression done' lines was not re-measured \u2014 indirect",
+   "cost": {
+    "loc": 211,
+    "conflict_syncs": 3,
+    "conflict_files": [
+     "agent/turn_context.py"
+    ],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict file but 3 syncs (agent/turn_context.py). Converges with #497 onto upstream's announce lifecycle at next sync.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(compaction): only announce a compaction that actually compacts (#509)"
+ },
+ "#412": {
+  "verdict": "UPSTREAM",
+  "problem": "Plugin loaders set sys.modules[name]=mod BEFORE exec_module; concurrent child agents in a shared ThreadPoolExecutor could grab a half-initialized module (no register()/engine class yet).",
+  "evidence": {
+   "original": "PR #412 body (2026-07-21).",
+   "upstream_state": "RED by read: NousResearch ../up/plugins/plugin_loader.py:75 `sys.modules[name] = mod` then :85 `exec_module(mod)` with no lock in that module (b54cc716c7 2026-09-02 'shared path-based plugin loader'); only plugins/memory/__init__.py:381 gained a `_discovery_lock` (684a2cfbd7) and it guards discovery, not the exec window for context_engine/cron_providers.",
+   "upstream_fix": "none (684a2cfbd7 partial, memory only)",
+   "fires": "0 log lines (a race; the fork's fix is silent). Structural proof only: delegation.max_concurrent_children: 32 live.",
+   "cost": {
+    "loc": 203,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic. Re-port target is upstream's single plugin_loader.py (one lock), not the fork's three per-loader locks. Upstream branch to be built in the branch pass (audit/plugins/upstream-412) \u2014 needs re-authoring against plugin_loader.py, not a rebase. 0 conflict.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(plugins): serialize plugin loader import critical-section to close partial-import race (#412)"
+ },
+ "#887": {
+  "verdict": "KEEP",
+  "problem": "_backfill_search_content ran `SELECT ... WHERE search_content IS NULL` with no usable index on every boot (~21 min on 10.9 GB, under the engine-load lock) \u2014 Apollo freeze.",
+  "evidence": {
+   "original": "PR #887 body (measured 2026-09-22).",
+   "upstream_state": "GREEN by absence: no search_content column or backfill in lcmup (fork-only schema from 6c8202b164).",
+   "upstream_fix": "n/a",
+   "fires": "0 log lines for this row's literal; the fix is that the boot no longer scans \u2014 'FTS' 815 lines in the window",
+   "cost": {
+    "loc": 200,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Required as long as the fork carries search_content. 0 conflict. Retires with the schema.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): the search_content backfill probe was a full-table scan on EVERY boot \u2014 partial index + batched commits (#887)"
  },
  "#20": {
   "verdict": "KEEP",
@@ -379,6 +818,90 @@
   "subsystem": "plugins/blackbox",
   "subject": "Blackbox card fixes: chat fields, cache %, alerts toggle, 3d price cache (#9)"
  },
+ "#508": {
+  "verdict": "KEEP",
+  "problem": "compression.maintenance_min_pressure_ratio from config.yaml never reached LCMConfig via the production loader \u2014 #506's floor was inert (a 4th premature compaction at 29% of threshold landed after the deploy).",
+  "evidence": {
+   "original": "PR #508 body (measured 221,011 tokens, 29%).",
+   "upstream_state": "read-only: maintenance_min_pressure_ratio = 0 hits in lcmup (upstream has critical_budget_pressure_ratio@config.py:484, a different knob); the bridge is fork-only config plumbing for a fork-only knob (config.yaml: maintenance_min_pressure_ratio: 1.0).",
+   "upstream_fix": "none (our PR #516 carries the pressure gate concept)",
+   "fires": "0 log lines (config bridge); the knob is set to 1.0 live, i.e. the gate is fully armed",
+   "cost": {
+    "loc": 122,
+    "conflict_syncs": 1,
+    "conflict_files": [
+     "plugins/context_engine/lcm/config.py"
+    ],
+    "dependents": [
+     "#531"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "1 conflict file (1) = lcm/config.py. Rides with #531/#516.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): bridge compression.maintenance_min_pressure_ratio into LCMConfig (#508)"
+ },
+ "nopr:60ea6b2b42": {
+  "verdict": "KEEP",
+  "problem": "After the 2026-07-25 parity merge live DBs had the old content-column FTS table; init ran _ensure_storage_columns() before the FTS self-heal so the repair could never run.",
+  "evidence": {
+   "original": "Commit body (2026-07-25 incident).",
+   "upstream_state": "GREEN by absence (search_content is fork-only); lcmup store.py _init_db@357 calls ensure_external_content_fts@391 in its own order with no storage-column step.",
+   "upstream_fix": "n/a",
+   "fires": "10 log lines / 3 files in the window",
+   "cost": {
+    "loc": 118,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fires. Fork-schema repair path. 0 conflict.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): self-heal FTS column drift at startup \u2014 reorder init so the repair can actually run"
+ },
+ "#825": {
+  "verdict": "KEEP",
+  "problem": "LCM's private Codex OAuth cap table substring-matched 'gpt-5.6' against 'gpt-5.6-sol-900k' and clamped the window to 372k for a week.",
+  "evidence": {
+   "original": "PR #825 body; ledger DC-3 (2026-09-21).",
+   "upstream_state": "read-only, PARTIAL: lcmup codex_routing.py has _CODEX_OAUTH_EXACT_CONTEXT_CAPS (#557 a646bb0, 2026-09-03) covering sol/terra/luna-900k but not gpt-6-astra-900k and still 'gpt-5.6': 372_000; our upstream PR #617 (host deferral + 372->272) is OPEN.",
+   "upstream_fix": "a646bb0 (partial)",
+   "fires": "0 log lines (silent cap); live cron models include gpt-6-astra-900k (moa config) which upstream's exact table does not cover",
+   "cost": {
+    "loc": 113,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Ledger DC-3 executes: at refresh adopt their exact table + keep our host deferral; canary tests/context_engine/test_lcm_codex_context_variant_cap.py. Already pitched (#617). 0 conflict.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): stop clamping explicit -900k Codex context variants to 372k (#825)"
+ },
+ "nopr:efe50db808": {
+  "verdict": "KEEP",
+  "problem": "Identifier-fidelity instruction was hardcoded into the summarizer prompt with no off-switch, so the baseline-repro arm could not reproduce the merge bug (infinite K=2 rerun loop, ~$40/3h).",
+  "evidence": {
+   "original": "Commit body (2026-06-19).",
+   "upstream_state": "read-only: identifier_fidelity = 0 hits in lcmup; ledger wave-2 'identifier-fidelity prompt block: not sent (prompt taste), permanent fork divergence'.",
+   "upstream_fix": "none",
+   "fires": "0 log lines; the toggle _identifier_fidelity_enabled@escalation.py:437 gates a prompt block on every L1 summary ('identifier' 2,111 log lines are mostly unrelated). The scripts/lcm_arm_b_node_recovery.py half is gone from the fork.",
+   "cost": {
+    "loc": 108,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Small, 0 conflict, fork-permanent per ledger. The toggle's off-arm only mattered for the June experiment; the on-arm is the live prompt.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): toggleable Prong-A identifier fidelity \u2014 fixes baseline-repro loop"
+ },
  "#905": {
   "verdict": "KEEP",
   "problem": "Index turns(ts_start) so rolling-window reads SEARCH not SCAN.",
@@ -398,6 +921,46 @@
   "notes": "0 conflict.",
   "subsystem": "plugins/blackbox",
   "subject": "perf(blackbox): index turns(ts_start) so rolling-window reads SEARCH instead of SCAN (#905)"
+ },
+ "nopr:dc4245ab4c": {
+  "verdict": "UPSTREAM",
+  "problem": "_synthesize_expansion_answer did response.choices[0].message.content unguarded; under concurrency an error-shaped aux response crashed the whole lcm_expand_query.",
+  "evidence": {
+   "original": "Commit body (live Arm-B 0/N node-served recall).",
+   "upstream_state": "RED by read: lcmup tools.py:1720 `content = response.choices[0].message.content` unguarded (fork guards it with _ExpansionSynthesisError@tools.py:1681/:1731).",
+   "upstream_fix": "none",
+   "fires": "0 log lines for the degrade message in the window; 'lcm_expand_query' 1,929 lines show the tool is heavily used",
+   "cost": {
+    "loc": 84,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic defensive fix on upstream's own tool. Upstream branch audit/plugins/upstream-dc4245ab4c in the branch pass (small: one guard + one test). 0 conflict.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): lcm_expand_query degrades on malformed aux-LLM response (concurrency)"
+ },
+ "#902": {
+  "verdict": "UPSTREAM",
+  "problem": "`UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL` scanned 10.9 GB on every boot (second freeze); gate one-time backfills behind a migration marker.",
+  "evidence": {
+   "original": "PR #902 body (2026-09-22 20:5x, one boot after #887).",
+   "upstream_state": "RED by read: lcmup store.py:454 runs the identical unconditional UPDATE in _init_db on every construction; is_migration_step_complete = 0 hits upstream.",
+   "upstream_fix": "none",
+   "fires": "0 log lines (the fix is the absence of a scan); the boot path runs on every gateway start",
+   "cost": {
+    "loc": 82,
+    "conflict_syncs": 0,
+    "conflict_files": [],
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic, small, upstream's own line. Upstream branch audit/plugins/upstream-902 in the branch pass. 0 conflict.",
+  "subsystem": "plugins/context_engine",
+  "subject": "fix(lcm): the ingested_at backfill was the SECOND full-table scan on every boot \u2014 gate one-time backfills behind lcm_migration_state (#902)"
  },
  "#915": {
   "verdict": "KEEP",
