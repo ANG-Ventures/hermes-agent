@@ -1779,5 +1779,163 @@
   },
   "branch": null,
   "notes": "Upstream rejected the PR, so UPSTREAM is not available; the fleet's dispatch flow (Apollo creating cards from a CLI turn) depends on it. KEEP, but the cost is real: 813 loc, 5 conflict files (3 syncs). Candidate for trimming to the CLI subscribe + warning core at the next sync."
+ },
+ "nopr:f504b1c928": {
+  "verdict": "DROP",
+  "problem": "The 2026-06-29 parity merge took upstream's toolsets.py and silently dropped two fork-only toolsets: messaging (agent-callable send_message) and moa (tools/mixture_of_agents_tool.py); resolve_toolset returned [] with no error.",
+  "evidence": {
+   "original": "commit f504b1c928 body: caught by the config-migration dry-run's post-migration toolset validation; restores both entries marked FORK-CUSTOM + the 600-line moa tool.",
+   "upstream_state": "RED by construction: own test on ../up: 6 failed (upstream toolsets.py:200 'there is deliberately no agent-callable send_message tool'; no tools/mixture_of_agents_tool.py). FM 6 passed. Upstream's position is deliberate, not a gap.",
+   "upstream_fix": "none (deliberate upstream omission)",
+   "fires": "both toolsets dormant: state.db (read-only, Apollo) assistant tool_calls name=send_message 19 total, last 2026-06-23; aegis 2, last 06-09; argus/daedalus/momus 0. mixture_of_agents tool_calls 14 total, last 2026-07-10; 0 completions in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (1 'returned error'). /moa command 0 uses. Fleet prompts now say 'do NOT use send_message' (log lines).",
+   "cost": {
+    "loc": 720,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "nopr:091b3f915d",
+     "nopr:7e505547a7"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "720 loc + 2 conflict files (3 syncs) carrying two toolsets nobody has called in 3 months. DROP both. Config cleanup needed with the revert: 'messaging'/'moa' toolset names appear in ~/.hermes/config.yaml and argus/momus/aegis profile config.yamls (+ cron/scheduler.py disables 'messaging' by name) — those lines become unknown-toolset warnings, not failures. The 'moa' provider preset (agent/moa_loop.py, hermes_cli/inventory.py) is a different thing and stays. send_message routing rows (#71/#83 lineage) judged separately; they concern the send path the gateway still uses, not the agent-callable toolset."
+ },
+ "nopr:091b3f915d": {
+  "verdict": "DROP",
+  "problem": "Greptile P1/P1/P2 on the restored moa tool: empty-content-as-success, aggregator_model ignored, OpenRouter 'openai/gpt-*' temperature guard.",
+  "evidence": {
+   "original": "commit body: Greptile findings on the restored file; no incident.",
+   "upstream_state": "n/a — file does not exist upstream (tools/mixture_of_agents_tool.py absent on ../up)",
+   "upstream_fix": "none",
+   "fires": "0 — the tool it patches has had 0 completed calls in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (last tool_call 2026-07-10)",
+   "cost": {
+    "loc": 33,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": [
+     "nopr:f504b1c928"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows nopr:f504b1c928 (the moa tool); goes with its revert."
+ },
+ "nopr:7e505547a7": {
+  "verdict": "DROP",
+  "problem": "Greptile P1 follow-up: _run_aggregator_model returned '' after both retries and the caller wrapped it as success=True.",
+  "evidence": {
+   "original": "commit body: Greptile findings on the restored file; no incident.",
+   "upstream_state": "n/a — file does not exist upstream (tools/mixture_of_agents_tool.py absent on ../up)",
+   "upstream_fix": "none",
+   "fires": "0 — the tool it patches has had 0 completed calls in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (last tool_call 2026-07-10)",
+   "cost": {
+    "loc": 9,
+    "conflict_syncs": 0,
+    "conflict_files": 0,
+    "dependents": [
+     "nopr:f504b1c928"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows nopr:f504b1c928 (the moa tool); goes with its revert."
+ },
+ "#203": {
+  "verdict": "UPSTREAM",
+  "problem": "delegate_task had no way to hand a child the parent's session state; inherit_context folds the parent transcript into one user-role context message (verbatim assistant/tool turns are disavowed by the model). /boomerang wraps it as a command.",
+  "evidence": {
+   "original": "PR #203 body: ground-truth probe P0.3 showed verbatim-copied transcripts are disavowed ('I never actually did that'); user-role fold is trusted.",
+   "upstream_state": "RED: own tests on ../up: boomerang command 2 failed / 1 passed, inherit_context module 1 collection error (no _fold_conversation_history_to_context in ../up tools/delegate_tool.py); FM 3 passed + 3 failed/15 passed (fork test drift).",
+   "upstream_fix": "none (rg inherit_context ../up/tools/delegate_tool.py hermes_cli/commands.py = 0)",
+   "fires": "state.db (read-only, Apollo): 45 assistant tool_calls with inherit_context=true 2026-06-22→09-14, 1 in the last 30 days; /boomerang user command 0 uses ever; 'inherit_context fold failed' warning 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 550,
+    "conflict_syncs": 3,
+    "conflict_files": 5,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "The delegate_task primitive is generic and was used 45×; the /boomerang command wrapper (cli.py, gateway/run.py, commands.py — 3 of the 5 conflict files) was never used. Offer inherit_context upstream (delegate_tool.py + its test only) and drop the command surface at the next sync; usage is declining (1 in 30d) so this is not a KEEP."
+ },
+ "#556": {
+  "verdict": "KEEP",
+  "problem": "Comment provenance (#545) attributed 0 of 723 live comments: the session id is a gateway contextvar, never reaching the execute_code sandbox / CLI subprocess that writes the row.",
+  "evidence": {
+   "original": "PR #556 body: measured 0/723 attributed; falsified the card's 'nothing sets HERMES_SESSION_ID' premise; two bound sessions produced distinct fingerprints via the tool path.",
+   "upstream_state": "RED: own tests on ../up: 8 failed (no resolve_current_session_id / _inject_session_id; ../up hermes_cli/kanban.py has no session_ref column at all); FM 8 passed.",
+   "upstream_fix": "none — provenance is fork-only (#545 lineage); upstream task_comments schema has no session_ref",
+   "fires": "kanban.db (read-only): task_comments 9,707 rows, 8,221 with session_ref; last 30 days 8,145 of 9,483 attributed (06-07→09-25)",
+   "cost": {
+    "loc": 510,
+    "conflict_syncs": 3,
+    "conflict_files": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Measured hard: attribution went from 0% to 86% and the board's 'provenance unknown' badge is the visible failure mode. Fork-only lineage (#545), so not UPSTREAM. Cost 510 loc, 3 conflict files (3 syncs) — session_context.py/kanban.py/kanban_tools.py are sync hotspots."
+ },
+ "#122": {
+  "verdict": "KEEP",
+  "problem": "skill_manage(create) hardcoded the gitignored local ~/.hermes/skills tree, so every agent-authored skill was single-copy, unbacked-up and not fleet-shareable; leaks required a weekly cron + manual mv.",
+  "evidence": {
+   "original": "PR #122 body: 2 skills leaked that week, 27 in a prior incident.",
+   "upstream_state": "RED (read-only): ../up tools/skill_manager_tool.py:220 knows only the local skills dir + skills.external_dirs; no skills-shared/<group> authoring, no _shared_skills_root. Own test on ../up: 1 collection error (imports the fork symbols); FM 26 passed.",
+   "upstream_fix": "none — skills-shared is a fork/fleet architecture (git-backed shared tree with 27 groups); upstream has external_dirs only",
+   "fires": "'created in skills-shared/<group>/' 52 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25) (devops 24, general 19, ...); ~/.hermes/skills-shared git log: 154 SKILL.md added in the last 30 days; 'A shared group is required' refusal 3",
+   "cost": {
+    "loc": 636,
+    "conflict_syncs": 2,
+    "conflict_files": 3,
+    "dependents": [
+     "#162",
+     "#717"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Load-bearing fleet workflow, measured daily. Fork-only by design (upstream has no shared tree). Cost 636 loc, 3 conflict files (2 syncs)."
+ },
+ "#162": {
+  "verdict": "KEEP",
+  "problem": "#122 resolved skills-shared under the profile's HERMES_HOME (profiles/<name>/skills-shared), so every non-default profile hard-errored on create ('category is not a shared group ... (none found)').",
+  "evidence": {
+   "original": "PR #162 body: ground-truthed live on athena/daedalus gateways 2026-07-01.",
+   "upstream_state": "n/a upstream (fork-only feature, see #122); own test on ../up: 1 collection error; FM 9 passed.",
+   "upstream_fix": "none",
+   "fires": "rides on #122: creates from non-default profiles succeed (log 'created in skills-shared/' lines come from profile logs)",
+   "cost": {
+    "loc": 126,
+    "conflict_syncs": 2,
+    "conflict_files": 1,
+    "dependents": [
+     "#122"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #122."
+ },
+ "#717": {
+  "verdict": "KEEP",
+  "problem": "Create-time duplicate check scanned only local + SUBSCRIBED shared groups, so a create into an unsubscribed group was invisible and a second create of the same name succeeded silently.",
+  "evidence": {
+   "original": "PR #717 body: blind surface 13 of 27 groups / 94 skills; instance vendor-invoice-payment, two copies 44s apart (kanban t_2a49949a).",
+   "upstream_state": "n/a upstream (fork-only feature, see #122); own tests on ../up: 2 failed / 1 passed; FM 3 passed.",
+   "upstream_fix": "none",
+   "fires": "no dedicated log line; guard fires only on a duplicate name (refusal text not logged). 0 in logs 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 119,
+    "conflict_syncs": 2,
+    "conflict_files": 2,
+    "dependents": [
+     "#122"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #122; a correctness guard on the fleet's shared tree with one measured incident."
  }
 }
