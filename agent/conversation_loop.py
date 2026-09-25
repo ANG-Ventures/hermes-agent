@@ -60,6 +60,8 @@ from agent.tool_dispatch_helpers import (
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
+    is_interrupt_close_row,
+    provider_owns_transcript,
     _repair_tool_call_arguments,
     coalesce_tool_call_id,
     _sanitize_messages_non_ascii,
@@ -2837,10 +2839,18 @@ def run_conversation(
             )
 
         api_messages = []
+        # t_f40dc54a: a provider that keeps its own transcript (bridge relay
+        # over a resident CLI session) must not be sent the harness-authored
+        # interrupt-close row — it is a reply the provider never produced, and
+        # the relay's coherence gate answers it with a full-history re-mint.
+        # Looked up once per request; fail-open (row sent) on any error.
+        _omit_interrupt_close = provider_owns_transcript(agent.provider)
         for idx, msg in enumerate(messages):
             # Metadata-only provider events are durable UI rows, never system
             # instructions in the provider request.
             if is_metadata_only_tool_notice(msg):
+                continue
+            if _omit_interrupt_close and is_interrupt_close_row(msg):
                 continue
 
             # Structural clone, NOT msg.copy(): every in-place transform
