@@ -1084,9 +1084,6 @@ def init_agent(
     # models to "give up" prematurely on complex tasks (#7915).
     agent._budget_exhausted_injected = False
     agent._budget_grace_call = False
-    # True only during the one post-budget grace turn; read by the tool
-    # dispatchers to refuse side-effecting tools then (Guard D-core).
-    agent._in_budget_grace = False
 
     # Optional wall-clock run budget (seconds per run_conversation turn).
     # Explicit constructor arg wins; else resolved from config.yaml
