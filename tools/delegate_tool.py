@@ -398,6 +398,11 @@ def _build_children(
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
         # Validated per-task images; absent on image-less tasks, which keep the text-only goal turn.
+        # Skills the child's compact index keeps full descriptions for (agent/system_prompt.py); set before the
+        # first request since the system prompt is built lazily.
+        _t_skills = t.get("skills")
+        if isinstance(_t_skills, list):
+            child._delegate_skills = tuple(s.strip() for s in _t_skills if isinstance(s, str) and s.strip())
         _t_images = task_images[i] if task_images and i < len(task_images) else None
         if _t_images:
             with _quiet("Could not attach images to child %d", i):
@@ -676,6 +681,13 @@ DELEGATE_TASK_SCHEMA = {
                             "screenshot the user sent, a design mock, a chart. Vision-capable children receive the "
                             "pixels on their first turn; non-vision children get path hints for vision_analyze. Text "
                             "files do NOT belong here — put paths in 'context' instead.",
+                            items={"type": "string"},
+                        ),
+                        "skills": _p(
+                            "array",
+                            "Optional skill names this child's domain needs (e.g. ['systematic-debugging']). "
+                            "Children see a compact names-only skill index; skills named here keep their full "
+                            "descriptions. The child can still load any skill with skill_view.",
                             items={"type": "string"},
                         ),
                         "group": _p(

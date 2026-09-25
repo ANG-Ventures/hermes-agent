@@ -1361,6 +1361,9 @@ DEFAULT_CONFIG = {
         # Each child re-pays a cold system prompt and re-explores the repo, and one-shot spawns are mostly
         # "review my own work" rather than parallel work (agent/oneshot_footprint.py).
         "oneshot_max_children": 2,
+        # delegate_task children get a names-only skills index (descriptions kept only for the skills a task
+        # names via tasks[i].skills); false gives children the parent's full index.
+        "compact_skill_index": True,
         # Subagent threads ALWAYS resolve approvals non-interactively (the parent TUI owns stdin;
         # input() from a worker would deadlock). false = auto-deny, true = auto-approve "once"; both
         # log a warning audit line. true only for trusted batch work.
