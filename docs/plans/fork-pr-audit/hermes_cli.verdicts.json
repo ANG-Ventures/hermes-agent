@@ -17,7 +17,7 @@
    }
   },
   "branch": null,
-  "notes": "D9: the hermes_cli hunk (5 lines, web_server ready file) exists only for the desktop Electron backend-ready.cjs; the apps/ part is already D9 DROP. dashboard.out.log prints the line but nothing non-desktop reads it.",
+  "notes": "D9: the hermes_cli hunk (5 lines, web_server ready file) exists only for the desktop Electron backend-ready.cjs; the apps/ part is already D9 DROP. dashboard.out.log prints the line but nothing non-desktop reads it. | branch NOT built (conflicts; needs hand build): revert 53cce7f872 conflicts: UU apps/desktop/electron/backend-ready.test.ts UU apps/desktop/electron/backend-ready.ts DU apps/desktop/electron/main.cjs UU apps/desktop/package.json",
   "subject": "feat(desktop): backend runs from runtime deploy tree by default (+ config override) (#158)"
  },
  "nopr:b5d533baa7": {
@@ -1048,7 +1048,7 @@
    }
   },
   "branch": null,
-  "notes": "Never fires: the warning literal has 0 hits across 1,741 log files (2026-05-10..09-25). Test-harness-only path.",
+  "notes": "Never fires: the warning literal has 0 hits across 1,741 log files (2026-05-10..09-25). Test-harness-only path. | branch NOT built (conflicts; needs hand build): revert 23af01e58b conflicts: UU hermes_cli/kanban_db.py",
   "subject": "fix(kanban): SANDBOX=1 neutralising an explicit path pin is no longer silent (#890)"
  },
  "#889": {
@@ -1724,8 +1724,8 @@
     ]
    }
   },
-  "branch": null,
-  "notes": "Dead hook: zero consumers \u2014 no caller of register_chain_source/registered_chain_sources outside fallback_config.py in the fork tree or ~/.hermes/plugins, and no `source:` fallback entry in ~/.hermes/config.yaml. Speculative infrastructure.",
+  "branch": "audit/hermes_cli/revert-802",
+  "notes": "Dead hook: zero consumers \u2014 no caller of register_chain_source/registered_chain_sources outside fallback_config.py in the fork tree or ~/.hermes/plugins, and no `source:` fallback entry in ~/.hermes/config.yaml. Speculative infrastructure. | revert branch off origin/main; tests: `python -m pytest -q -x tests/hermes_cli/test_fallback_config.py` -> rc=0 5 passed in 1.25s",
   "subject": "feat(fallback): let a chain entry derive its rungs from a registered source (#802)"
  },
  "#800": {
@@ -2007,8 +2007,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Trigger gone: ~/.hermes/cache/forensic-native-snapshot-control-20260913 was moved (only a .MOVED.txt remains) and `find ~/.hermes/cache -name '*.db'` returns nothing.",
+  "branch": "audit/hermes_cli/revert-760",
+  "notes": "Trigger gone: ~/.hermes/cache/forensic-native-snapshot-control-20260913 was moved (only a .MOVED.txt remains) and `find ~/.hermes/cache -name '*.db'` returns nothing. | revert branch off origin/main; tests: `python -m pytest -q -x tests/hermes_cli/test_backup.py` -> rc=0 80 passed in 19.11s",
   "subject": "fix(backup): exclude cache/forensic-*/ and cache/**/*.db from the backup walk (#760)"
  },
  "#720": {
@@ -2079,8 +2079,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Never configured: `model_catalog.excluded_providers` appears in no config.yaml (root or any profile). The filter can never fire on this fleet.",
+  "branch": "audit/hermes_cli/revert-712",
+  "notes": "Never configured: `model_catalog.excluded_providers` appears in no config.yaml (root or any profile). The filter can never fire on this fleet. | revert branch off origin/main; tests: `python -m pytest -q -x tests/hermes_cli/test_inventory.py` -> rc=0 23 passed in 6.98s",
   "subject": "fix(model): honour excluded_providers for user-defined and injected rows (#712)"
  },
  "#711": {
@@ -2425,8 +2425,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Never measured in use (papercut pc-bf39c22e only); 0 conflict files, so the drop is cheap either way. `hermes doctor` is not run by any script in ~/.hermes/scripts.",
+  "branch": "audit/hermes_cli/revert-619",
+  "notes": "Never measured in use (papercut pc-bf39c22e only); 0 conflict files, so the drop is cheap either way. `hermes doctor` is not run by any script in ~/.hermes/scripts. | revert branch off origin/main; tests: `python -m pytest -q -x tests/hermes_cli/test_doctor.py` -> rc=0 65 passed, 1 warning in 31.09s",
   "subject": "feat(doctor): surface the absolute runtime interpreter path (#619)"
  },
  "#617": {
@@ -2448,8 +2448,8 @@
     ]
    }
   },
-  "branch": null,
-  "notes": "Consumer exists: skills-shared/general/scheduler SKILL.md + references use `hermes cron list --json`. Generic; 0 conflict files.",
+  "branch": "audit/hermes_cli/upstream-617",
+  "notes": "Consumer exists: skills-shared/general/scheduler SKILL.md + references use `hermes cron list --json`. Generic; 0 conflict files. | upstream branch: hand-ported onto upstream/main (cherry-pick conflicted in cron.py/subcommands/cron.py) @ ea564f7cad; `python -m pytest -q tests/hermes_cli/test_cron_list_json.py` -> 2 passed in 5.08s. PR body = commit message, no fork mention.",
   "subject": "feat(cron): add `hermes cron list --json` for machine-readable job records (#617)"
  },
  "#595": {
@@ -3044,8 +3044,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Generic: the gateway advertises /curator with no dispatch.",
+  "branch": "audit/hermes_cli/upstream-466",
+  "notes": "Generic: the gateway advertises /curator with no dispatch. | upstream branch: hand-ported onto upstream/main (cherry-pick conflicted in commands.py) @ 5e5d7f3cff; `python -m pytest -q tests/hermes_cli/test_curator_cli_only.py` -> 1 passed in 2.59s. PR body = commit message, no fork mention.",
   "subject": "fix(gateway): mark /curator cli_only \u2014 advertised with no gateway handler (#466)"
  },
  "#455": {
@@ -3071,7 +3071,7 @@
   "subject": "fix(backup): skip ephemeral kanban board workspaces in the full-zip walk (#455)"
  },
  "#441": {
-  "verdict": "DROP",
+  "verdict": "UNRESOLVED",
   "problem": "feat(tui_gateway): bound heavy session reads (#441) \u2014 A single Discord voice message posted its \ud83c\udf99\ufe0f transcript echo **twice** \u2014 two identical messages 4.3s apart. The gateway log confirms the same `.ogg` was transcribed twice: ``` 09:27:37,033 INFO tools.transcription_tools: Transcribed audio_b8e37bff145d.ogg via local whisper (base,",
   "evidence": {
    "original": "PR body via REST (merged 2026-07-26T13:27:38Z); shas 098693861c",
@@ -3099,7 +3099,7 @@
    }
   },
   "branch": null,
-  "notes": "Duplicate re-land of #215 (identical stats: 474 loc, same symbols). Drop with #215.",
+  "notes": "Duplicate re-land of #215 (same symbols); grade together. Revert conflicted (UD session_db_heavy_gate.py).",
   "subject": "feat(tui_gateway): bound heavy session reads (#441)"
  },
  "#437": {
@@ -3382,7 +3382,7 @@
    }
   },
   "branch": null,
-  "notes": "Already filed upstream as NousResearch#42660 (open). Fork use is thin (1 'decomposed' event in kanban.db). Keep until 42660 lands, then drop.",
+  "notes": "Already filed upstream as NousResearch#42660 (open). Fork use is thin (1 'decomposed' event in kanban.db). Keep until 42660 lands, then drop. | no branch: already filed upstream as NousResearch#42660 (open)",
   "subject": "fix(kanban): decompose inherits board default_workdir + sibling worktree isolation (#276)"
  },
  "#240": {
@@ -3451,11 +3451,11 @@
   "subject": "feat(picker): hide numbered Claude failover lanes from the /model picker (#233)"
  },
  "#215": {
-  "verdict": "DROP",
+  "verdict": "UNRESOLVED",
   "problem": "feat(tui_gateway): bound heavy session reads (#215) \u2014 Phase 2 of docs/desktop/2026-07-05-session-list-loop-starvation-PRD.md (D-4/D-5/INV-4/INV-6). Shared per-loop async SessionDB heavy-read gate (default 2, config dashboard.heavy_read_max_concurrency, lazy/loop-bound NOT import-frozen). REST + WS list_sessions_rich (and siblings) a",
   "evidence": {
    "original": "PR body via REST (merged 2026-07-07T03:00:39Z); shas 66d98d36c1",
-   "upstream_state": "read-only: upstream has no SessionDB heavy-read gate; upstream offloads session reads per router (web_routers/sessions.py)",
+   "upstream_state": "read-only: upstream has no SessionDB heavy-read gate; upstream offloads per router (web_routers/sessions.py)",
    "upstream_fix": "none",
    "fires": "0 distinctive log/event hits [window: log files 2026-05-10..2026-09-25 (1741 files; agent/gateway logs only 2026-07-29..2026-09-25); kanban.db task_events 2026-06-07..2026-09-25]",
    "cost": {
@@ -3479,7 +3479,7 @@
    }
   },
   "branch": null,
-  "notes": "Desktop-program row (D9, PRD docs/desktop/2026-07-05-session-list-loop-starvation). Desktop client retired; gate's literals 4 lines/3 files. Re-landed as #441 after a sync; drop both.",
+  "notes": "Initially DROP (D9). Withdrawn: SessionDBHeavyReadBusy is still imported by fork tui_gateway/ws.py, and the tui_gateway WS serves the live dashboard (ai.hermes.dashboard :9119; dashboard.out.log carries sessions.changed JSON-RPC events). A non-desktop consumer exists; gate saturation is not logged, so firing is unmeasured. Revert conflicted (UU config.py/web_server.py/tui_gateway).",
   "subject": "feat(tui_gateway): bound heavy session reads (#215)"
  },
  "#200": {
@@ -3572,11 +3572,11 @@
   "subject": "fix(model-picker): don't duplicate the current model when its catalog entry is namespaced (#135)"
  },
  "#115": {
-  "verdict": "DROP",
+  "verdict": "KEEP",
   "problem": "fix(backup): exclude swiftui-docs (Apple IP) from backup zip (#115) \u2014 Adds `swiftui-docs` to `_EXCLUDED_DIRS` in `hermes_cli/backup.py` so Apple's Xcode `AdditionalDocumentation` can never enter the backup zip. ## Why `hermes backup` zips the whole `HERMES_HOME` and does **not** honor `.gitignore` (hardcoded exclude set). The new `skills-shared/mob",
   "evidence": {
    "original": "PR body via REST (merged 2026-06-29T17:46:41Z); shas d6bd86d17a",
-   "upstream_state": "read-only: upstream backup has no swiftui exclusion",
+   "upstream_state": "read-only: upstream backup has no swiftui-docs exclusion",
    "upstream_fix": "none",
    "fires": "0 distinctive log/event hits [window: log files 2026-05-10..2026-09-25 (1741 files; agent/gateway logs only 2026-07-29..2026-09-25); kanban.db task_events 2026-06-07..2026-09-25]",
    "cost": {
@@ -3590,7 +3590,7 @@
    }
   },
   "branch": null,
-  "notes": "Trigger gone: ~/.hermes/swiftui-docs does not exist.",
+  "notes": "Premise re-checked: the guard is scoped to swiftui-skills/swiftui-docs, and ~/.hermes/skills-shared/mobile-design/swiftui-skills IS live (the swiftui-docs child is absent, i.e. the belt has nothing to catch yet). Cheap Apple-IP guard for a live skill; 40 loc. Initial DROP withdrawn; the revert attempt conflicted anyway (UU backup.py, test_backup.py).",
   "subject": "fix(backup): exclude swiftui-docs (Apple IP) from backup zip (#115)"
  },
  "#39": {
@@ -3694,8 +3694,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Stale model: fleet aliases are now gpt-6-* (config model.aliases gpt/astra/sol); 0 `/model gpt-5.5` lines in agent logs.",
+  "branch": "audit/hermes_cli/revert-36134d8944",
+  "notes": "Stale model: fleet aliases are now gpt-6-* (config model.aliases gpt/astra/sol); 0 `/model gpt-5.5` lines in agent logs. | revert branch off origin/main; tests: no surviving test file for the touched module after revert (row's own tests are removed by the revert); post-revert check `python -m pytest -q -x tests/hermes_cli/test_model_switch_configured_provider_routing.py tests/hermes_cli/test_model_switch_confirm_thread.py` -> 4 passed in 3.46s",
   "subject": "fix(model): route bare gpt-5.5 to Codex OAuth"
  },
  "nopr:7cb39d1319": {
@@ -3725,11 +3725,11 @@
   "subject": "fix(backup): exclude browser-automation profiles + bulk media from full backup"
  },
  "nopr:8a8b81638c": {
-  "verdict": "UPSTREAM",
+  "verdict": "UNRESOLVED",
   "problem": "fix(recap): backtick-wrap Files touched paths to stop gateway auto-attach \u2014 The /status session recap lists touched file paths via _shortened_path, which emits a bare absolute or ~-relative path for any file outside the gateway cwd. The gateway scans outbound message text for bare local file paths and auto-uploads matches as native attachments (gateway/p",
   "evidence": {
    "original": "PR body via REST (merged direct commit); shas 8a8b81638c",
-   "upstream_state": "RED by read: _shortened_path@hermes_cli/session_recap.py:95 returns bare absolute/~ paths",
+   "upstream_state": "read-only: upstream session_recap.py:169 joins bare paths, but upstream gateway/ has no bare-path auto-attach detector (rg 'extract_local_media|_in_code' in ../up/gateway = 0); the fork's detector is _in_code@gateway/platforms/base.py:5886 on fork",
    "upstream_fix": "none",
    "fires": "0 distinctive log/event hits [window: log files 2026-05-10..2026-09-25 (1741 files; agent/gateway logs only 2026-07-29..2026-09-25); kanban.db task_events 2026-06-07..2026-09-25]",
    "cost": {
@@ -3740,7 +3740,7 @@
    }
   },
   "branch": null,
-  "notes": "Generic: bare paths in recap trigger the gateway's outbound media auto-attach.",
+  "notes": "Initially UPSTREAM; withdrawn \u2014 the leak needs the fork-side auto-attach detector, so upstream is not RED. The guard (backtick-wrapped recap paths) is silent, so firing is unmeasured. Grade with the gateway tranche's auto-attach row.",
   "subject": "fix(recap): backtick-wrap Files touched paths to stop gateway auto-attach"
  },
  "nopr:8f7823887e": {
@@ -3761,7 +3761,7 @@
    }
   },
   "branch": null,
-  "notes": "Warning-text cosmetics; 0 log hits for the row's literals; superseded in spirit by #595's classifier.",
+  "notes": "Warning-text cosmetics; 0 log hits for the row's literals; superseded in spirit by #595's classifier. | branch NOT built (conflicts; needs hand build): revert 8f7823887e conflicts: UU hermes_cli/models.py UD tests/hermes_cli/test_anthropic_messages_warning_clarity.py",
   "subject": "fix(models): name provider + endpoint in anthropic_messages fallback warning + fix provider_label shadowing"
  },
  "nopr:9c6214b9c5": {
