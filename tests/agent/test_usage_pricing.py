@@ -8,7 +8,6 @@ from agent.usage_pricing import (
     get_pricing_entry,
     has_known_pricing,
     is_notional_anthropic_provider,
-    is_notional_subscription_bridge,
     is_notional_xai_provider,
     normalize_usage,
     resolve_billing_route,
@@ -274,7 +273,7 @@ def test_notional_anthropic_has_known_pricing():
 # xai-oauth fronts Grok on a flat subscription (marginal cash $0) → priced at
 # xAI official rates, status "estimated". The metered direct-API provider ("xai")
 # prices from the SAME snapshot but bills real dollars. Single-vendor: everything
-# routes to the fixed "xai" vendor (contrast the poly-vendor gemini-bridge).
+# routes to the fixed "xai" vendor.
 _XAI_GROK_CASES = [
     # (model, in$/Mtok, out$/Mtok)  — 1M in + 1M out = in+out
     ("grok-build-0.1", 1.00, 2.00),
@@ -360,110 +359,33 @@ def test_xai_has_known_pricing():
         assert has_known_pricing("grok-build-0.1", provider=provider), provider
 
 
-# --- gemini-bridge (Google AI Ultra sub via agy) notional pricing ---------------
-# The bridge is Gemini-ONLY: it fronts the Gemini surface of the Ultra sub. (agy
-# also advertises Claude/GPT-OSS tiers, but the bridge deliberately excludes them —
-# the claude-*/gpt-oss aliases were removed 2026-07-12; zero non-Gemini spend.)
-# Each alias must normalize to a canonical priced Gemini model and route to google
-# at official-docs rates (status "estimated", never "unknown"/$0).
-_GEMINI_BRIDGE_CASES = [
-    # (model_arg, expected_vendor, expected_canonical, in$/Mtok, out$/Mtok)
-    # parity 2026-08-30: rates now come from upstream's canonical entries,
-    # which carry >200k context tiers (#93469). The 1M-token probe used by
-    # test_gemini_bridge_models_price_at_official_rates exceeds the 3.1-pro
-    # tier threshold, so its expected rates are the ABOVE-tier ones (4/18).
-    ("gemini-flash", "google", "gemini-3.5-flash", 1.50, 9.00),
-    ("gemini-pro", "google", "gemini-3.1-pro", 4.00, 18.00),
-    # the store records the provider-prefixed form too
-    ("gemini-bridge/gemini-flash", "google", "gemini-3.5-flash", 1.50, 9.00),
-]
+# --- gemini-bridge lane retired (fork-PR audit DROP of #207/#208/#312) ---------
+# The Google AI Ultra bridge had 0 turns in 30d of blackbox data, so its notional
+# pricing branch (alias map, poly-vendor routing, "unsupported_notional" sentinel)
+# was removed. The provider key is no longer a notional backend: a bridge-only
+# alias names no vendor and must NOT resolve to a priced route.
 
 
-def test_gemini_bridge_is_notional_subscription_bridge():
-    assert is_notional_subscription_bridge("gemini-bridge")
-    assert is_notional_subscription_bridge("GEMINI-BRIDGE")
-    assert not is_notional_subscription_bridge("gemini")
-    assert not is_notional_subscription_bridge("claude-bridge")
-    assert not is_notional_subscription_bridge(None)
-    assert not is_notional_subscription_bridge("")
+def test_gemini_bridge_is_not_a_notional_backend():
+    import agent.usage_pricing as up
 
-
-def test_gemini_bridge_routes_alias_to_vendor():
-    """resolve_billing_route must normalize each bridge alias to its canonical
-    priced model and route to the inferred vendor with docs-snapshot billing."""
-    for model, vendor, canonical, _in, _out in _GEMINI_BRIDGE_CASES:
-        route = resolve_billing_route(model, provider="gemini-bridge")
-        assert route.provider == vendor, f"{model}: {route.provider}"
-        assert route.model == canonical, f"{model}: {route.model}"
-        assert route.billing_mode == "official_docs_snapshot", model
-
-
-def test_gemini_bridge_models_price_at_official_rates():
-    """Every gemini-bridge model must price 'estimated' (not 'unknown'/$0). For the
-    ones with explicit expected rates, assert the exact per-Mtok dollar figure."""
-    for model, _vendor, _canonical, in_rate, out_rate in _GEMINI_BRIDGE_CASES:
-        usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000)
-        result = estimate_usage_cost(model, usage, provider="gemini-bridge")
-        assert result.status == "estimated", f"{model}: {result.status}"
-        assert result.amount_usd is not None, f"{model} priced None"
-        assert float(result.amount_usd) > 0, model
-        if in_rate is not None and out_rate is not None:
-            assert float(result.amount_usd) == round(in_rate + out_rate, 6), (
-                f"{model}: {result.amount_usd} != {in_rate + out_rate}"
-            )
-
-
-def test_gemini_bridge_has_known_pricing():
-    for model, *_ in _GEMINI_BRIDGE_CASES:
-        assert has_known_pricing(model, provider="gemini-bridge"), model
-
-
-def test_gemini_bridge_unknown_alias_routes_unknown_not_google():
-    """An unrecognized bridge model must route as 'unknown', NOT masquerade as a
-    priced route — covers BOTH (a) no known vendor prefix, and (b) a prefix-VALID
-    but unsupported id the bridge doesn't actually front (e.g. gemini-2.0-flash,
-    a real Google model but NOT one the Ultra bridge serves). Either way, pricing
-    it would misclassify a typo/misconfig as a valid route in diagnostics."""
-    bogus = (
-        "mistral-large", "totally-made-up", "flash", "opus",  # no vendor prefix
-        "gemini-2.0-flash", "gemini-2.5-flash", "claude-opus-4-8", "gpt-5.5",  # prefix-valid, not fronted
-        # Gemini-only bridge: the former claude-*/gpt-oss short aliases are no
-        # longer fronted and must now route unknown (removed 2026-07-12).
-        "claude-opus", "claude-sonnet", "gpt-oss",
-    )
-    for model in bogus:
-        route = resolve_billing_route(model, provider="gemini-bridge")
-        assert route.provider == "unknown", f"{model}: {route.provider}"
-        assert route.billing_mode == "unsupported_notional", (
-            f"{model}: {route.billing_mode}"
+    assert not hasattr(up, "is_notional_subscription_bridge")
+    for provider in ("gemini-bridge", "custom:gemini-bridge"):
+        route = resolve_billing_route("gemini-flash", provider=provider)
+        assert route.billing_mode != "official_docs_snapshot", provider
+        result = estimate_usage_cost(
+            "gemini-flash",
+            CanonicalUsage(input_tokens=1_000_000, output_tokens=100_000),
+            provider=provider,
         )
-
-
-def test_gemini_bridge_unsupported_model_prices_none_not_google_rates():
-    """MONEY-PATH regression: an unsupported-but-prefix-valid bridge model
-    (gemini-2.0-flash — a real Google model the Ultra bridge does NOT front) must
-    price as unknown/$None through the ACTUAL cost entrypoint, NOT get resurrected
-    at Google rates by the M1 vendor fallback in _lookup_official_docs_pricing.
-
-    This is the bug the "unsupported_notional" sentinel exists to close:
-    resolve_billing_route returns provider="unknown", but M1 independently
-    re-infers the vendor from the model id (gemini-2.0-flash → google) and would
-    price it ~$0.50/Mtok unless the sentinel suppresses that one fallback.
-    """
-    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000)
-    for model in ("gemini-2.0-flash", "gemini-2.5-flash", "claude-opus-4-8", "gpt-5.5"):
-        result = estimate_usage_cost(model, usage, provider="gemini-bridge")
-        assert result.status == "unknown", f"{model}: {result.status}"
-        assert result.amount_usd is None, f"{model}: priced {result.amount_usd}, expected None"
-        assert not has_known_pricing(model, provider="gemini-bridge"), model
+        assert result.status == "unknown", provider
+        assert result.amount_usd is None, provider
 
 
 def test_m1_vendor_fallback_still_prices_vendor_named_model_on_mismatched_provider():
-    """GUARD the sentinel didn't break M1's real job: a vendor-named model on a
-    MISMATCHED/unknown provider (not a notional bridge) must STILL price via the
-    M1 vendor fallback. The sentinel suppression must be scoped to
-    'unsupported_notional', never blanket-applied to every 'unknown' route — a
-    custom/localhost endpoint serving 'claude-opus-4-6' relies on M1 to price it.
+    """M1's real job: a vendor-named model on a MISMATCHED/unknown provider must
+    still price via the M1 vendor fallback — a custom/localhost endpoint serving
+    'claude-opus-4-6' relies on M1 to price it.
     """
     usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000)
     # A real Anthropic model id arriving on a non-anthropic/unknown provider: M1
@@ -1156,19 +1078,19 @@ def test_custom_lane_notional_cost_status_is_not_unknown():
     """AC3 (the symptom): a notional custom lane produces a priced turn with a
     cost_status that is NOT "unknown".
 
-    Uses the gemini-bridge lane and its bridge-only ALIAS ``gemini-flash``
-    deliberately. For a vendor-NAMED model id (claude-opus-5, grok-4.5) the M1
-    last-resort vendor fallback rescues pricing even with the lane
-    classification reverted, which would make this assertion vacuous. The
-    alias names no vendor M1 can infer and is only resolvable by unwrapping
-    the lane to its registered backend — so "unknown" here is caused solely by
-    the missing classification. Mutation-proof: revert the lane unwrap in
-    resolve_billing_route and this test goes RED with status == "unknown".
+    The M1 last-resort vendor fallback rescues the PRICE of a vendor-named model
+    (claude-opus-5) even with the lane classification reverted, so the status
+    assertion alone is vacuous. The route's billing_mode is what carries the
+    mutation proof: revert the lane unwrap in resolve_billing_route and it drops
+    to "unknown". (This test used the gemini-bridge alias ``gemini-flash`` until
+    that lane was retired.)
     """
+    route = resolve_billing_route("claude-opus-5", provider="custom:claude-apr")
+    assert route.billing_mode == "official_docs_snapshot"
     result = estimate_usage_cost(
-        "gemini-flash",
+        "claude-opus-5",
         CanonicalUsage(input_tokens=1_000_000, output_tokens=100_000),
-        provider="custom:gemini-bridge",
+        provider="custom:claude-apr",
     )
     assert result.status != "unknown"
     assert result.status == "estimated"
