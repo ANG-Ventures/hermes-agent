@@ -179,11 +179,26 @@ def _find_heredoc_close(
 
 def strip_inert_heredoc_bodies(command: str) -> str:
     """Mask heredoc bodies that are provably inert data (see module docstring)."""
+    ranges = [(start, end) for _owner, start, end in inert_heredoc_ranges(command)]
+    # Single-pass rebuild (ranges are sorted and non-overlapping), bodies -> their newlines only.
+    parts: list[str] = []
+    previous = 0
+    for start, end in ranges:
+        parts += [command[previous:start], "\n" * command.count("\n", start, end)]
+        previous = end
+    return "".join(parts) + command[previous:]
+
+
+def inert_heredoc_ranges(command: str) -> list[tuple[str, int, int]]:
+    """``(owner_command, body_start, body_end)`` for every body ``strip_inert_heredoc_bodies`` masks.
+
+    "Inert" means inert to the SHELL: an interpreter owner (python, osascript) still executes its
+    body, so callers that care what the body does must inspect it."""
     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
     if "<<" not in command:
-        return command
+        return []
     last_opener_index = command.rfind("<<")
-    ranges: list[tuple[int, int]] = []
+    ranges: list[tuple[str, int, int]] = []
     command_start = 0
     while command_start <= last_opener_index:
         (
@@ -194,20 +209,20 @@ def strip_inert_heredoc_bodies(command: str) -> str:
             owner_start,
         ) = _scan_heredoc_command_unit(command, command_start)
         if unknown_operator:
-            return command
+            return []
         if not specs:
             if command_end >= len(command):
                 break
             command_start = command_end + 1
             continue
         if command_end >= len(command):
-            return command  # opener with no body line: unterminated — leave visible
+            return []  # opener with no body line: unterminated — leave visible
         body_cursor = command_end + 1
         body_ranges: list[tuple[int, int]] = []
         for delimiter, strip_tabs, _quoted in specs:
             close_end = _find_heredoc_close(command, body_cursor, delimiter, strip_tabs)
             if close_end is None:
-                return command  # unterminated
+                return []  # unterminated
             body_ranges.append((body_cursor, close_end))
             body_cursor = close_end
         if (
@@ -220,12 +235,7 @@ def strip_inert_heredoc_bodies(command: str) -> str:
                 marker in masked_opener
                 for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")
             ) and _INERT_HEREDOC_CONSUMER_RE.search(masked_owner):
-                ranges.extend(body_ranges)
+                owner = command[owner_start:command_end].strip()
+                ranges.extend((owner, start, end) for start, end in body_ranges)
         command_start = body_cursor
-    # Single-pass rebuild (ranges are sorted and non-overlapping), bodies -> their newlines only.
-    parts: list[str] = []
-    previous = 0
-    for start, end in ranges:
-        parts += [command[previous:start], "\n" * command.count("\n", start, end)]
-        previous = end
-    return "".join(parts) + command[previous:]
+    return ranges

@@ -388,6 +388,37 @@ def _contains_launchctl_gateway_lifecycle(normalized_text: str) -> bool:
     )
 
 
+# A body the SHELL never executes can still be executed by its owner: a Python/osascript heredoc
+# that spawns a process runs whatever command text it carries. Such a body is only data when it
+# contains no process-spawning primitive.
+_BODY_EXEC_PRIMITIVE = re.compile(
+    r"\b(?:subprocess|pty|posix_spawnp?|create_subprocess_(?:exec|shell)|commands\s*\.\s*getoutput)\b"
+    r"|\bos\s*\.\s*(?:system|popen|exec\w*|spawn\w*)\b"
+    r"|\bfrom\s+os\s+import\b[^\n]*\b(?:system|popen|exec\w*|spawn\w*)\b"
+    r"|\bdo\s+shell\s+script\b"
+    r"|\b(?:exec|eval|__import__)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _interpreter_heredoc_runs_lifecycle_command(text: str) -> bool:
+    """True when an interpreter-owned heredoc body (masked as shell-inert) can spawn a process
+    AND carries a lifecycle command. A body that only mentions the phrase as data stays allowed."""
+    if "<<" not in text:
+        return False
+    from tools.shell_heredoc import inert_heredoc_ranges
+
+    for owner, start, end in inert_heredoc_ranges(text):
+        words = [w for w in owner.split() if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) and w != "env"]
+        name = Path(words[0]).name if words else ""
+        if name == "cat":
+            continue
+        body = text[start:end]
+        if _BODY_EXEC_PRIMITIVE.search(body) and contains_gateway_lifecycle_command(body):
+            return True
+    return False
+
+
 def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern.
 
@@ -417,6 +448,8 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # restart" inside such a body is documentation, not a command this shell will execute.
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
+    if _interpreter_heredoc_runs_lifecycle_command(text):
+        return True
     text = strip_inert_heredoc_bodies(text)
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
