@@ -201,5 +201,356 @@
   },
   "branch": null,
   "notes": "Mixed row: part 1 SUPERSEDED-BY-UPSTREAM (trim to upstream's parking), part 2 (webhook throttle) still fires and is generic -> UPSTREAM candidate. Kept whole here; lead should split."
+ },
+ "#1026": {
+  "verdict": "KEEP",
+  "problem": "Cron failure relay paged #alerts 26x after owner deadman declared host DOWN (cron delivery bypasses notify.py host-down gate).",
+  "evidence": {
+   "original": "PR #1026 body, card t_8c04a5d2; 2026-09-23 ACE-AI outage 14:01-20:31 PT, qbt-private-missingfiles-monitor paged 26x.",
+   "upstream_state": "RED (read-only): no host-down concept anywhere in upstream cron/ tools/ gateway/ (grep host_down → 0); _deliver_result@cron/scheduler_delivery.py:1906 has no gate",
+   "upstream_fix": "none",
+   "fires": "0 in window (merged 2026-09-25, same day as audit; gate only fires during a host-down incident); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 322,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fleet-specific (mirrors fleet notify.py policy) — not upstreamable. Problem measured (26 pages). Re-check fires after next host-down incident. Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict."
+ },
+ "nopr:d5b2992f2d": {
+  "verdict": "KEEP",
+  "problem": "`hermes cron run <id> --wait` synchronous single-job execution (upstream `run` only triggers next tick).",
+  "evidence": {
+   "original": "commit body; fleet alert templates emit `hermes cron run <name> --wait` as triage step (#507 body).",
+   "upstream_state": "RED (read-only): no run_job_now on upstream; hermes_cli/cron.py:894 'run' -> _job_action('run') -> trigger_job@cron/jobs.py:2120 (async trigger only)",
+   "upstream_fix": "none",
+   "fires": "'Error processing job' 15 + 'Output saved to:' 4 in logs; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 276,
+    "conflict_syncs": 3,
+    "conflict_files": 3,
+    "dependents": [
+     "#565",
+     "#507"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Operator-facing fork feature; #565 #507 depend on it. Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict."
+ },
+ "#565": {
+  "verdict": "KEEP",
+  "problem": "Manual `cron run --wait` on an exhausted one-shot returned false success without running.",
+  "evidence": {
+   "original": "PR #565 body (root cause: shared _process_one_job + claim_dispatch false -> success=True no-op).",
+   "upstream_state": "read-only: run_job_now absent upstream (fork-only --wait path); upstream claim_dispatch reject @cron/scheduler.py:3162 now also finish_execution(success=False) for the ticker",
+   "upstream_fix": "n/a (fork-only path)",
+   "fires": "no log marker; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 53,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "nopr:d5b2992f2d"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows nopr:d5b2992f2d."
+ },
+ "#507": {
+  "verdict": "KEEP",
+  "problem": "`cron run <name> --wait` rejected job names (ID-only lookup).",
+  "evidence": {
+   "original": "PR #507 body: alert templates use the job NAME; operators hit 'Job not found'.",
+   "upstream_state": "read-only: run_job_now absent upstream; upstream resolve_job_ref@cron/jobs.py:1878 used by all its actions",
+   "upstream_fix": "n/a (fork-only path)",
+   "fires": "no log marker; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 107,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "nopr:d5b2992f2d"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows nopr:d5b2992f2d; 107 loc."
+ },
+ "#482": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Built-in ticker never closed its execution-ledger rows (mark_execution_running/finish_execution missing in _process_one_job).",
+  "evidence": {
+   "original": "PR #482 body.",
+   "upstream_state": "GREEN (read-only): upstream _process_one_job calls finish_execution on dispatch-claim reject and mark_execution_running CAS before the run @cron/scheduler.py:3162-3176, plus finish_execution at :2637/:2741/:2788",
+   "upstream_fix": "upstream execution-ledger rework (cron/executions.py mark_execution_running@:264); -S sha lookup deferred to adversary",
+   "fires": "no log marker; logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 135,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Take upstream's ledger lifecycle at next sync. The dict-model half of the subject is #477. Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict."
+ },
+ "#477": {
+  "verdict": "UPSTREAM",
+  "problem": "Dict-form job model {'model','provider'} reported as 'no model configured' every tick (dict is truthy).",
+  "evidence": {
+   "original": "PR #477 body: resolution-upgrade-monitor failed every tick with self-contradicting error.",
+   "upstream_state": "RED (live repro on ../up): PYTHONPATH=up python probe: _load_cron_job_config({'model':{'model':'gpt-5.6-sol','provider':'openai-codex'}}) -> RuntimeError \"Cron job 'x' has no model configured (job.model={'model': 'gpt-5.6-sol', ...})\"",
+   "upstream_fix": "none",
+   "fires": "4 dict-model jobs in live stores (1 scheduled); no log hits in window; live job stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 167,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic, small (_coerce_job_model). Upstream still RED."
+ },
+ "#473": {
+  "verdict": "KEEP",
+  "problem": "Cron agent turns carried no chat identity in turn telemetry (chat_id=job id, chat_name='cron / <name>').",
+  "evidence": {
+   "original": "PR #473 body (identity-judgment table).",
+   "upstream_state": "read-only: upstream deliberately sets chat_id='' chat_name='' in _CronRunScope.__init__@cron/scheduler.py:2280-2283",
+   "upstream_fix": "none (upstream design differs; it clears routing identity on purpose)",
+   "fires": "not measurable: ~/.hermes/turns.db and blackbox.db are 0 B on this host (telemetry store moved); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 47,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "WEAK KEEP: 47 loc, fork telemetry-only. If the lead cannot find the telemetry consumer this becomes DROP. Upstream clears chat_id to stop async-delegation misrouting — ensure fork value does not reintroduce that (adversary check)."
+ },
+ "#394": {
+  "verdict": "KEEP",
+  "problem": "Provider-only fallback entries paged #alerts as UNDECLARED.",
+  "evidence": {
+   "original": "PR #394 body (Greptile #385 residual).",
+   "upstream_state": "read-only: per-job fallback chain + declared/undeclared alert are fork-only (no job.get('fallback') / fallback_alert in upstream cron/)",
+   "upstream_fix": "none",
+   "fires": "17 scheduled jobs carry per-job fallback + allow_cross_provider_fallback; live job stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 43,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#130"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #130 / nopr:6ae6cbe84c."
+ },
+ "#278": {
+  "verdict": "UPSTREAM",
+  "problem": "Cron worker turns inferred a delivery chat from task text and posted to the wrong Discord thread.",
+  "evidence": {
+   "original": "PR #278 body: live incident 2026-07-10 15:32, card t_37659d3c.",
+   "upstream_state": "RED (read-only): upstream exposes the target only via ContextVars (_VAR_MAP set @cron/scheduler.py:2345) — nothing surfaces it to the worker turn; no 'CRON DELIVERY TARGET' hint in upstream",
+   "upstream_fix": "none",
+   "fires": "'CRON DELIVERY TARGET (authoritative):' 27 log lines (+ hint body 4); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 216,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic misroute class; small (_bind_cron_delivery_target_hint). Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict."
+ },
+ "#199": {
+  "verdict": "UPSTREAM",
+  "problem": "Code-formatted [SILENT] sentinel (`[SILENT]` / fenced) leaked to the channel.",
+  "evidence": {
+   "original": "PR #199 body: skill-patch-applier run posted ```[SILENT]``` to #logs.",
+   "upstream_state": "RED (live repro on ../up): PYTHONPATH=up python -c is_autonomous_silence_response('`[SILENT]`'), ('```\\n[SILENT]\\n```') -> False False; same probe on fork origin/main af43fd64ff -> True True",
+   "upstream_fix": "none",
+   "fires": "no log marker (suppression is silent); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 53,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic. Fork logic now lives partly in gateway/response_filters.py (5/15 original lines remain in scheduler)."
+ },
+ "#139": {
+  "verdict": "KEEP",
+  "problem": "Cron delivery header label '🪪 job_id:' -> 'Job ID:' (Ace readability request).",
+  "evidence": {
+   "original": "PR #139 body: requested by Ace.",
+   "upstream_state": "read-only: upstream header '(job_id: ...)' @cron/scheduler_delivery.py:1959",
+   "upstream_fix": "none",
+   "fires": "fires on every wrapped cron delivery (cosmetic); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 8,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "#28"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Owner preference, 8 loc, but sits in the 3x-conflicting delivery header. Lead may fold #28/#139/#16/#134 into one 'delivery framing' patch to re-apply on scheduler_delivery.py."
+ },
+ "#28": {
+  "verdict": "KEEP",
+  "problem": "Cron delivery header '(job_id: X)' -> '🪪 job_id: X'.",
+  "evidence": {
+   "original": "PR #28 body (cosmetic).",
+   "upstream_state": "read-only: upstream '(job_id: ...)' @cron/scheduler_delivery.py:1959",
+   "upstream_fix": "none",
+   "fires": "every wrapped delivery (cosmetic)",
+   "cost": {
+    "loc": 8,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "#139"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Superseded internally by #139 (same line). Treat #28+#139 as one row."
+ },
+ "#16": {
+  "verdict": "KEEP",
+  "problem": "Cron failure deliveries were double-wrapped inside the success 'Cronjob Response' header.",
+  "evidence": {
+   "original": "PR #16 body (morning-digest broken-pipe).",
+   "upstream_state": "RED (read-only): upstream _deliver_result@cron/scheduler_delivery.py:1906 wraps every content in 'Cronjob Response:' (:1958) regardless of for_failure; no 'Cronjob Failed' header",
+   "upstream_fix": "none",
+   "fires": "every failed wrapped delivery; 70 jobs with last_error in live stores; live job stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 80,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "#134"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Delivery-framing family (#16 #28 #139 #134). Fork keeps a 9,154-line monolithic cron/scheduler.py; upstream split delivery into cron/scheduler_delivery.py (absent on fork) — every scheduler.py row rides that conflict."
+ },
+ "#134": {
+  "verdict": "KEEP",
+  "problem": "Fallback alert rendered inside 'Cronjob Failed' envelope (wrap_override=False).",
+  "evidence": {
+   "original": "PR #134 body (live-verified #alerts post).",
+   "upstream_state": "read-only: fork-only (fallback alert #130)",
+   "upstream_fix": "none",
+   "fires": "3 jobs set fallback_alert_deliver; live job stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 43,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#130",
+     "#16"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Follows #130/#16."
+ },
+ "#130": {
+  "verdict": "KEEP",
+  "problem": "Per-job cross-provider fallback opt-in + LOUD alert when fallback fires (Ace: codex primary + opus fallback for digest crons).",
+  "evidence": {
+   "original": "PR #130 body.",
+   "upstream_state": "RED (read-only): upstream pinned jobs get NO fallback chain at all (_job_fallback_chain@cron/scheduler.py:108 -> scoped_fallback_chain pinned=True); no per-job chain, no opt-in, no alert",
+   "upstream_fix": "none",
+   "fires": "17 scheduled jobs set allow_cross_provider_fallback + fallback; live job stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 501,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "nopr:6ae6cbe84c",
+     "#394",
+     "#134"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Measured by live usage. Core of the per-job fallback family (6ae6cbe84c, bb4e64499c, #394, #134)."
+ },
+ "nopr:6ae6cbe84c": {
+  "verdict": "KEEP",
+  "problem": "Per-job `fallback` chain so codex-pinned jobs have a same-provider net.",
+  "evidence": {
+   "original": "commit body (#21444 recurring gpt-5.5 silent reject).",
+   "upstream_state": "RED (read-only): upstream never reads job['fallback']; pinned jobs get chain=None @cron/scheduler.py:108-116",
+   "upstream_fix": "none",
+   "fires": "18 jobs define fallback (17 scheduled); live job stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 127,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": [
+     "#130"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Base of #130."
+ },
+ "nopr:bb4e64499c": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Codex-pinned cron job silently finished on Opus via the GLOBAL fallback chain.",
+  "evidence": {
+   "original": "commit body (morning-digest 'Model fallback detected').",
+   "upstream_state": "GREEN (read-only): upstream _job_fallback_chain@cron/scheduler.py:108 — a pinned job never borrows global fallback_providers (#100437)",
+   "upstream_fix": "upstream #100437 (_job_fallback_chain / scoped_fallback_chain)",
+   "fires": "'Set HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK=1 to revert.' 845 log lines (filter fires); logs: 685 files (~/.hermes/logs agent.log* 09-24 12:44→09-25, gateway.log* 09-13→09-25, profile logs 06-02→09-25)",
+   "cost": {
+    "loc": 227,
+    "conflict_syncs": 3,
+    "conflict_files": 2,
+    "dependents": [
+     "nopr:6ae6cbe84c",
+     "#130"
+    ]
+   }
+  },
+  "branch": null,
+  "notes": "Original problem fixed upstream in a stricter form. The fork's _filter_fallback_chain_for_pinned_job is still load-bearing for the per-job chain (6ae6cbe84c/#130): on drop, re-home the cross-provider strip inside the per-job resolver and take upstream's global-chain rule. Also retire the HERMES_CRON_ALLOW_CROSS_PROVIDER_FALLBACK env var (non-secret env, AGENTS rubric)."
+ },
+ "nopr:05d38f1d0d": {
+  "verdict": "KEEP",
+  "problem": "Per-job api_max_retries override (raise retry floor for flaky codex job).",
+  "evidence": {
+   "original": "commit body (morning-digest on openai-codex).",
+   "upstream_state": "RED (read-only): no api_max_retries read in upstream cron/ (grep 0)",
+   "upstream_fix": "none",
+   "fires": "1 job sets api_max_retries; live job stores ~/.hermes/cron/jobs.json + profiles/*/cron/jobs.json read 2026-09-25: 521 jobs, 338 scheduled",
+   "cost": {
+    "loc": 109,
+    "conflict_syncs": 3,
+    "conflict_files": 1,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "WEAK KEEP (1 job, 109 loc). Candidate DROP if that job is retired."
  }
 }
