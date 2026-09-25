@@ -9,6 +9,8 @@ unbounded/inverted ``days`` forces full-history InsightsEngine work.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
@@ -22,6 +24,17 @@ def client(tmp_path, monkeypatch):
     from hermes_cli import web_server
 
     with TestClient(web_server.app, raise_server_exceptions=False) as c:
+        # The lifespan starts a daemon ``statedb-eager-reconcile`` thread that
+        # creates this fresh state.db with a writable open.  On SQLite builds
+        # that keep a new store in journal_mode=DELETE (CI's 3.50.4) each of
+        # its schema commits locks readers out; a descheduled commit outlasts
+        # the read-only open's 1.0 s busy timeout and the in-range requests
+        # 500 with "database is locked" (run 36069213079).  These tests are
+        # about query-param clamps, not startup contention: wait for it.
+        for t in threading.enumerate():
+            if t.name == "statedb-eager-reconcile":
+                t.join(timeout=30)
+                assert not t.is_alive(), "statedb-eager-reconcile never finished"
         c.headers["Authorization"] = "Bearer clamp-test-token"
         yield c
 
