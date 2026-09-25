@@ -168,6 +168,33 @@ def _pattern_has_regex_newline(pattern: str) -> bool:
     return "\n" in pattern or bool(_REGEX_NEWLINE_ESCAPE_RE.search(pattern))
 
 
+# rg's default engine (Rust ``regex``) has no look-around, named ``(?<name>)`` groups,
+# ``\K`` or backreferences; ``--pcre2`` supports them.
+_PCRE2_SYNTAX_RE = re.compile(r"\(\?<[=!]|\(\?<\w+>|\\K|\(\?[=!]")
+
+_PCRE2_ONLY_ERROR_MARKERS = (
+    "look-around, including look-ahead and look-behind, is not supported",
+    "unrecognized flag",
+    "backreferences are not supported",
+)
+
+
+def _pattern_needs_pcre2(pattern: str) -> bool:
+    """True when a content regex uses syntax only rg's PCRE2 engine supports, so a valid
+    PCRE like ``(?<!def )foo`` searches instead of hard-erroring "unrecognized flag"."""
+    return bool(_PCRE2_SYNTAX_RE.search(pattern))
+
+
+def _is_pcre2_only_syntax_error(text: Optional[str]) -> bool:
+    """True for rg's parse error on syntax that only the PCRE2 engine accepts."""
+    if not text:
+        return False
+    lowered = text.lower()
+    if "regex parse error" not in lowered and "error:" not in lowered:
+        return False
+    return any(marker in lowered for marker in _PCRE2_ONLY_ERROR_MARKERS)
+
+
 def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
     """Return True for rg's hard error when multiline mode is required."""
     return bool(error) and "literal \"\\n\" is not allowed" in error and "--multiline" in error
@@ -886,6 +913,9 @@ class SearchMixin:
         multiline = _pattern_has_regex_newline(pattern)
         if multiline:
             cmd_parts.append("--multiline")
+        # Look-around / backrefs hard-error on the default engine; switch to PCRE2 up front.
+        if _pattern_needs_pcre2(pattern):
+            cmd_parts.append("--pcre2")
         if context > 0:
             cmd_parts.extend(["-C", str(context)])
         cmd_parts.extend(self._rg_exclusion_globs(path))
@@ -900,7 +930,13 @@ class SearchMixin:
             "Pattern contains \\n — multiline mode (-U) was enabled automatically "
             "so the regex can match across line boundaries."
         ) if multiline else None
-        return self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context, warning=ml_note)
+        result = self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context, warning=ml_note)
+        # A PCRE2-only construct the detector does not recognize still errors on the
+        # default engine: retry once with --pcre2 so the whole class searches.
+        if "--pcre2" not in cmd_parts and _is_pcre2_only_syntax_error(result.error):
+            retry_parts = [cmd_parts[0], "--pcre2", *cmd_parts[1:]]
+            result = self._run_search_pipeline(retry_parts, output_mode, limit, offset, context, warning=ml_note)
+        return result
 
     def _grep_cmd(self, head: List[str], pattern: str, output_mode: str, context: int,
                   file_glob: Optional[str] = None) -> List[str]:
