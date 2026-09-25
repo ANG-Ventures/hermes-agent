@@ -1,10 +1,10 @@
 # gateway tranche — auditor verdicts (t_35a3b292)
 
-Rows: 181 · verdicts banked: 50 · log window scanned: 2026-05-10..2026-09-25 (540 files, 821 MiB under ~/.hermes/logs + profiles/*/logs; older history is rotated away — a 0 here means 'not in the last ~6 days', not 'never').
+Rows: 181 · verdicts banked: 80 · log window scanned: 2026-05-10..2026-09-25 (540 files, 821 MiB under ~/.hermes/logs + profiles/*/logs; older history is rotated away — a 0 here means 'not in the last ~6 days', not 'never').
 
 Upstream = NousResearch/hermes-agent main @ 59004a6235 (worktree ../up). Fork main @ ec84b3d155 (2026-09-25). `read-only:` = upstream state established by reading the upstream path, not a live run.
 
-Counts: KEEP=29, DROP=5, UPSTREAM=6, SUPERSEDED-BY-UPSTREAM=10, UNRESOLVED=0
+Counts: KEEP=46, DROP=7, UPSTREAM=10, SUPERSEDED-BY-UPSTREAM=17, UNRESOLVED=0
 
 | PR | problem + evidence | upstream RED/GREEN (how) | upstream fix sha | fire count (window) | cost loc/conflict(syncs) | verdict | branch |
 |---|---|---|---|---|---|---|---|
@@ -58,36 +58,36 @@ Counts: KEEP=29, DROP=5, UPSTREAM=6, SUPERSEDED-BY-UPSTREAM=10, UNRESOLVED=0
 | #857 fix(gateway): a /stop'd turn must never be auto-resumed after a restar | a /stop'd turn was auto-resumed after a restart — PR body | RED (read-only: user_stopped 0 hits upstream; _resume_pending_candidates has no user-stop exclusion) | none | 292 in 2026-05-10..2026-09-25 (PHASE=user_stopped 146) | 606/2(3) deps=[] | **KEEP** |  Measured; generic — UPSTREAM candidate. |
 | #961 fix(gateway): restart follow-ups keep adapter-granted admission; refus | restart follow-ups lost adapter-granted admission; refused replays unreported — t_e253d9d5 r3 | n/a (fork follow-up spool, #937) | n/a | 0 (8 literals = failure paths) | 593/2(3) deps=[] | **KEEP** |  Follows #937. |
 | #137 fix(gateway): per-session quiescence + task-liveness reaper (busy-gate | busy-gateway deferred restart needed per-session quiescence + task-liveness reaper — PR body | RED (fork deferred-restart family; upstream has no reaper loop for stranded running-agent entries — 'reaper' pattern absent in up/gateway/run*.py) | none | 0 (3 literals = failure paths) | 581/2(3) deps=[] | **KEEP** |  Follows #295. KEEP-UNPROVEN by log. |
-| #945 | _pending_ | | | | 578/1(3) | — | |
-| #970 | _pending_ | | | | 574/3(3) | — | |
-| #692 | _pending_ | | | | 567/1(1) | — | |
-| #738 | _pending_ | | | | 566/2(3) | — | |
-| #862 | _pending_ | | | | 564/1(2) | — | |
-| #97 | _pending_ | | | | 563/5(3) | — | |
-| nopr:b728ad49f9 | _pending_ | | | | 551/2(3) | — | |
-| #582 | _pending_ | | | | 540/1(3) | — | |
-| #560 | _pending_ | | | | 539/1(3) | — | |
-| #840 | _pending_ | | | | 530/1(3) | — | |
-| #716 | _pending_ | | | | 508/1(2) | — | |
-| #562 | _pending_ | | | | 495/1(1) | — | |
-| #170 | _pending_ | | | | 494/2(3) | — | |
-| #801 | _pending_ | | | | 476/1(3) | — | |
-| #598 | _pending_ | | | | 470/3(3) | — | |
-| #883 | _pending_ | | | | 462/0(0) | — | |
-| #758 | _pending_ | | | | 461/0(0) | — | |
-| #318 | _pending_ | | | | 451/2(3) | — | |
-| #855 | _pending_ | | | | 445/0(0) | — | |
-| nopr:19c2e7cc30 | _pending_ | | | | 438/2(3) | — | |
-| nopr:1832ed4e78 | _pending_ | | | | 436/2(3) | — | |
-| #834 | _pending_ | | | | 430/0(0) | — | |
-| #639 | _pending_ | | | | 430/0(0) | — | |
-| nopr:5074cd02b0 | _pending_ | | | | 425/1(3) | — | |
-| #851 | _pending_ | | | | 409/0(0) | — | |
-| nopr:217d61ddce | _pending_ | | | | 403/1(3) | — | |
-| #69 | _pending_ | | | | 398/2(3) | — | |
-| #7536 | _pending_ | | | | 397/1(3) | — | |
-| nopr:2ee2e03b68 | _pending_ | | | | 396/1(3) | — | |
-| nopr:ec4b3176ff | _pending_ | | | | 389/0(0) | — | |
+| #945 fix(gateway): spool adapter-parked follow-ups before teardown clears t | adapter-parked follow-ups were cleared by teardown before the restart spool captured them — t_e253d9d5 r4 | n/a (fork follow-up spool #937) | n/a | 0 (6 literals = failure paths) | 578/1(3) deps=[] | **KEEP** |  Follows #937. |
+| #970 fix(gateway): /model persist + rehydrate never probe /v1/models on the | /model persist + rehydrate probed /v1/models synchronously on the event loop — t_515b7… card cited in subject; loop-hygiene | RED (read-only: upstream model_switch persist path still calls the catalog probe inline — _SkipCatalogProbe 0 hits upstream) | none | n/a (no literal) | 574/3(3) deps=[] | **UPSTREAM** |  Off-loop family; 574 loc, 3 conflict files (3 syncs). |
+| #692 fix(kanban): retry contended gateway dispatcher leadership (#692) | kanban dispatcher leadership lost on a contended singleton lock; needed standby + retry — PR body | RED (read-only: up/gateway/kanban_watchers_dispatcher.py holds the singleton lock but has no standby/leadership retry — 'standby'/'leadership' 0 hits) | none | 216 in 2026-05-10..2026-09-25 (assumed leadership after standby 139, holding singleton lock 77) | 567/1(1) deps=[] | **KEEP** |  Measured 139 standby takeovers — load-bearing for the fleet's multi-gateway kanban dispatch. Generic; UPSTREAM candidate on kanban_watchers_dispatcher.py. |
+| #738 fix(gateway): cap signal-driven stop drain to launchd's live ExitTimeO | signal-driven stop drain exceeded launchd's live ExitTimeOut — PR body | GREEN (read-only: read_launchd_exit_timeout_s@up/gateway/restart.py:122, resolve_launchd_capped_drain; 7/8 symbols, absorb 58%) | aa0289f307 2026-09-19 (Kyzcreig, same change upstream) | 0 (1 literal = probe failure) | 566/2(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Kyzcreig-authored upstream; take upstream's. Base of the drain-budget unit (#821 #838 #861). |
+| #862 fix(gateway): move the thread-participation persist off the event loop | thread-participation persist on the event loop — t_13445a80 ratchet 17->16 | GREEN (2/2 symbols upstream, absorb 64%) | ee8a3ded96 2026-09-22 (Kyzcreig, same change upstream) | n/a | 564/1(2) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Kyzcreig-authored upstream. |
+| #97 fix(gateway): stop per-session os.environ clobber across concurrent se | per-session os.environ clobber across concurrent sessions (v3-latch bug) — PR body | GREEN (read-only: upstream scopes per-session env via tokens — _set_session_env/_clear_session_env@up/gateway/run_turn.py:2064/622; _current_session_id defined upstream) | upstream session-env token scoping (run_turn.py) | n/a | 563/5(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  563 loc, 5 conflict files (3 syncs) — a hotspot worth dropping. Adversary: verify the v3-latch case (env restored on the wrong session) is covered by upstream's token scoping tests. |
+| nopr:b728ad49f9 refactor(gateway): extract route identity helpers | route identity helpers extracted out of run.py (declared refactor) — commit body | n/a (fork-only module gateway/routing_identity.py; follows #315/#659) | n/a | n/a | 551/2(3) deps=[] | **KEEP** |  Conflict-reduction refactor; dissolves if #315 and #659 both go. |
+| #582 fix(gateway): bound the post-update notification retry so an undeliver | post-update notification retried forever on an undeliverable marker — PR body | RED (read-only: _schedule_update_notification_watch@up/gateway/run_startup.py:1445 re-arms without an age bound; _update_marker_age_seconds 0 hits) | none | 0 (1 literal) | 540/1(3) deps=[] | **KEEP** |  KEEP-UNPROVEN by log; generic — UPSTREAM candidate (small). |
+| #560 fix(gateway): don't spawn boot-resume turns for sessions with nothing  | boot-resume turns spawned for sessions with nothing to resume — PR body | RED (read-only: has_resumable_work 0 hits upstream; _resume_pending_candidates keys only on the resume_pending flag) | none | 183 in 2026-05-10..2026-09-25 (PHASE=boot_resume_skipped — shared literal with #761) | 539/1(3) deps=[] | **KEEP** |  Measured. Generic — UPSTREAM candidate. |
+| #840 fix(gateway): make the restart-failure-counts read-modify-write atomic | .restart_failure_counts read-modify-write was not atomic across processes — PR body | RED (read-only: _increment_restart_failure_counts@up/gateway/run_shutdown.py:1326 has no lock — _restart_failure_counts_lock/_rmw 0 hits) | none | n/a | 530/1(3) deps=[] | **UPSTREAM** |  Small generic fix on an upstream-owned file; 530 loc mostly tests. |
+| #716 fix(discord): native slash commands delivered the gateway reply twice  | Discord native slash commands delivered the gateway reply twice — PR body | read-only: _deliver_inline_command_reply 0 hits upstream; upstream adapter refactored 6e5b084b8b — not verified whether the double-delivery path survived | unverified | n/a (no literal) | 508/1(2) deps=[] | **KEEP** |  KEEP-UNPROVEN: needs a live check on upstream's post-6e5b084b8b slash path; adversary should reproduce. |
+| #562 fix(kanban): resolve the wake's participant so an identity-less sub ca | kanban wake minted a phantom session for an identity-less sub — PR body | RED (resolve_wake_participant 0 hits upstream) | none | n/a | 495/1(1) deps=[] | **KEEP** |  Fleet-specific (kanban wake routing). KEEP-UNPROVEN by log; 1 conflict file (1 sync). |
+| #170 refactor: share inactivity watchdog polling (#170) | shared inactivity watchdog polling (refactor) — commit body (refactor) | read-only: InactivityDiagnostic/InactivityWaitResult 0 hits upstream; upstream session_stall.py + run_watchers.py own inactivity differently | upstream refactor path (run_watchers.py) | 0 (1 literal) | 494/2(3) deps=[] | **DROP** |  Refactor with no consumer evidence; fork-only file. 494 loc, 2 conflict files (3 syncs). Revert attempt in branch pass. |
+| #801 fix(gateway): charge dispatched resumes and preserve cap across rollba | dispatched resumes were not charged against the per-session cap; cap lost across rollbacks — PR body (#761 follow-up) | n/a (fork auto_resume.py) | n/a | 0 (4 literals = failure paths) | 476/1(3) deps=[] | **KEEP** |  Follows #761. |
+| #598 fix(gateway): deliver model route changes durably (#598) | model route change notices were dropped when the status send failed — PR body | RED-partial (2/5 symbols upstream; _warn_route_drop 0) | partial | n/a | 470/3(3) deps=[] | **KEEP** |  Route-announce family (#228). KEEP-UNPROVEN. |
+| #883 fix(gateway): move the artifact transport off the event loop (ratchet  | one-shot artifact transport on the event loop — t_13445a80 ratchet 15->14 | GREEN (_artifact_store_for_async defined upstream; absorb 40%) | f276ff3f6f 2026-09-23 (Kyzcreig, same change upstream) | n/a | 462/0(0) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Kyzcreig-authored upstream. |
+| #758 test(gateway): AST contract — no synchronous subprocess/sleep calls on | AST contract: no synchronous subprocess/sleep on the event loop (test-only + baseline) — t_13445a80 ratchet baseline | n/a (fork lint; upstream has tests/gateway AST lints of its own but not this one) | n/a | n/a | 461/0(0) deps=[] | **KEEP** |  Gate for the off-loop family; UPSTREAM together with the family if upstream wants the lint. 0 conflict files. |
+| #318 fix(gateway): show effective route in reset banner (#318) | reset banner showed configured route instead of effective route — PR body | GREEN (read-only: _reset_notice_session_info/_format_session_info defined upstream; absorb 40%) | upstream reset banner (slash_commands_session.py) | n/a | 451/2(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Take upstream's; verify effective-route display in a live /new. |
+| #855 fix(gateway): move the sticker-description cache write off the event l | sticker-description cache write on the event loop — ratchet | GREEN (cache_sticker_description_async defined upstream; absorb 36%) | upstream gateway/sticker_cache.py async write | n/a | 445/0(0) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  0 conflict files. |
+| nopr:19c2e7cc30 refactor(gateway): extract restart failure codec | restart failure codec extracted (declared refactor) — commit body | n/a (fork_ext/restart_codec.py) | n/a | n/a | 438/2(3) deps=[] | **KEEP** |  Follows #456 / restart family. |
+| nopr:1832ed4e78 fix(gateway): bind session context at agent turn entry | session context bound at agent turn entry — commit body | GREEN (read-only: reset_session_vars@up/gateway/session_context.py:160, reset_session_cwd defined; upstream binds session vars in run_turn.py:2064) | upstream session_context.py | n/a | 436/2(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  absorb 28%; 2 conflict files (3 syncs). |
+| #834 fix(gateway): move the transcript cap-drop spool write off the event l | transcript cap-drop spool write on the event loop — ratchet 26->2x | RED (read-only: cap_drop spool in up/gateway/shutdown_flush.py writes inline; _submit_spool_write 0 hits) | none | n/a | 430/0(0) deps=[] | **UPSTREAM** |  Off-loop family; 0 conflict files. |
+| #639 fix(telegram): make silent inbound update drops visible via an intake  | silent Telegram inbound update drops invisible; intake sentinel — PR body | RED (_observe_intake_update/_intake_update_kind 0 hits in up/plugins/platforms/telegram) | none | n/a (no literal extracted) | 430/0(0) deps=[] | **KEEP** |  Telegram is a live fleet surface; KEEP-UNPROVEN by log. 0 conflict files. |
+| nopr:5074cd02b0 feat(compaction-announce): announce hygiene compactions + Issue-8 abor | hygiene compactions were silent; Issue-8 abort guard — commit body | RED (_announce_hygiene_compaction 0 hits upstream) | none | 0 (1 literal = skip path) | 425/1(3) deps=[] | **KEEP** |  Compaction-announce family (#452 #316 #627 #404 #626 #173). KEEP-UNPROVEN by log; announces are chat messages. |
+| #851 fix(gateway): make the scoped-lock ownership decision and its release  | scoped platform-lock ownership decision and release were two critical sections — PR body | RED (_retire_platform_lock_acquisition 0 hits upstream; base.py:2185 lock path unchanged) | none | n/a | 409/0(0) deps=[] | **UPSTREAM** |  Pairs with #836. 0 conflict files. |
+| nopr:217d61ddce fix(gateway): boot-resume protection marker owned by turn lifecycle, n | boot-resume protection marker owned by turn lifecycle, not the wrapper — commit body | n/a (fork boot-resume marker) | n/a | n/a | 403/1(3) deps=[] | **KEEP** |  Follows #289/#295. |
+| #69 fix(discord): stop "is typing…" orphaned by typing-loop recreate race  | Discord 'is typing…' orphaned by a typing-loop recreate race — PR body | RED (read-only: upstream _typing_tasks@up/plugins/platforms/discord/adapter.py:1070/4207-4241 pops+recreates without a currency token; _typing_token_* 0 hits) | none | n/a (no literal) | 398/2(3) deps=[] | **KEEP** |  Generic — UPSTREAM candidate; KEEP-UNPROVEN by log. 2 conflict files. |
+| #7536 fix(gateway): stuck-loop counter must gate on genuine interruption, no | stuck-loop counter must gate on genuine interruption, not clean drain — PR body | read-only: upstream _increment_restart_failure_counts@run_shutdown.py:1326 is called with the CURRENT _running_agents (:1837 comment) — the clean-drain case is already excluded upstream | upstream run_shutdown.py:1837 (active-session gating) | n/a | 397/1(3) deps=[] | **DROP** |  Follows the F1/F2 unit (#70). Verify by reading run_shutdown.py:1830-1840 before revert. |
+| nopr:2ee2e03b68 feat(gateway): resume-request dropbox — external resume asks without t | external resume requests had to edit sessions.json; resume-request dropbox — commit body | RED (gateway/resume_requests.py fork-only) | none | 220 in 2026-05-10..2026-09-25 (PHASE=dropbox_resume 214) | 396/1(3) deps=[] | **KEEP** |  Measured (safe-restart watcher uses it). Follows #295. |
+| nopr:ec4b3176ff feat(gateway): narrow code-skew guard to in-process import oracle (A1a | code-skew guard narrowed to in-process import oracle — commit body (A1a) | RED-partial (upstream gateway/code_skew.py exists but _loaded_first_party_paths 0 hits) | none | n/a | 389/0(0) deps=[] | **KEEP** |  Code-skew family (#184 #493). KEEP-UNPROVEN; 0 conflict files. |
 | #746 | _pending_ | | | | 382/3(3) | — | |
 | #96 | _pending_ | | | | 377/1(3) | — | |
 | #710 | _pending_ | | | | 365/1(2) | — | |
