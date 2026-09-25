@@ -20531,6 +20531,16 @@ def _default_spawn(
     # watcher (gateway/run.py) which pops it for the same reason.
     env.pop("_HERMES_GATEWAY", None)
 
+    # A worker imports the runtime tree its argv's venv points at — never a
+    # dispatcher's PYTHONPATH/PYTHONHOME. sys.path beats the venv's editable
+    # finder, so a gateway pinned to a side-by-side release via its plist
+    # (registry-pins v0.2) silently ran every worker on that release, and
+    # runtime deploys never reached workers (t_e8c867d3: #1075 invisible,
+    # 0 review_skipped). Mirrors the `hermes` shim's load-bearing unset,
+    # which this direct venv exec bypasses.
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
     # config.  Without this, `env = dict(os.environ)` copies only the parent's
