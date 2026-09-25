@@ -1,10 +1,10 @@
 # gateway tranche — auditor verdicts (t_35a3b292)
 
-Rows: 181 · verdicts banked: 110 · log window scanned: 2026-05-10..2026-09-25 (540 files, 821 MiB under ~/.hermes/logs + profiles/*/logs; older history is rotated away — a 0 here means 'not in the last ~6 days', not 'never').
+Rows: 181 · verdicts banked: 140 · log window scanned: 2026-05-10..2026-09-25 (540 files, 821 MiB under ~/.hermes/logs + profiles/*/logs; older history is rotated away — a 0 here means 'not in the last ~6 days', not 'never').
 
 Upstream = NousResearch/hermes-agent main @ 59004a6235 (worktree ../up). Fork main @ ec84b3d155 (2026-09-25). `read-only:` = upstream state established by reading the upstream path, not a live run.
 
-Counts: KEEP=65, DROP=12, UPSTREAM=13, SUPERSEDED-BY-UPSTREAM=20, UNRESOLVED=0
+Counts: KEEP=91, DROP=12, UPSTREAM=15, SUPERSEDED-BY-UPSTREAM=22, UNRESOLVED=0
 
 | PR | problem + evidence | upstream RED/GREEN (how) | upstream fix sha | fire count (window) | cost loc/conflict(syncs) | verdict | branch |
 |---|---|---|---|---|---|---|---|
@@ -118,36 +118,36 @@ Counts: KEEP=65, DROP=12, UPSTREAM=13, SUPERSEDED-BY-UPSTREAM=20, UNRESOLVED=0
 | #173 feat(gateway): granular CompactionStats breakdown for manual /compress | granular CompactionStats breakdown for manual /compress — PR body | RED (agent/compaction_stats.py fork-only) | none | n/a | 250/2(3) deps=[] | **KEEP** |  Compaction-announce family; KEEP-UNPROVEN. |
 | #333 feat(desktop): /footer command — runtime-metadata footer on desktop tu | /footer command on desktop turns — PR body | RED for the tui_gateway/server.py half (_turn_runtime_footer 0 hits upstream) | none | n/a | 243/1(3) deps=[] | **KEEP** |  Mixed desktop row (apps/ DROP by D9); server.py footer seam consumed by dashboard. Follows #357. |
 | #140 fix(gateway): hard-exit after graceful shutdown so a wedged worker can | a wedged worker stranded the gateway after graceful shutdown — PR body | GREEN-partial (read-only: upstream run_shutdown.py:2118-2120 os._exit past drain+grace) — but _executor_drain_timeout/_force_process_exit 0 hits | upstream shutdown watchdog os._exit (run_shutdown.py:2118) | 0 (2 literals) | 238/2(3) deps=[] | **KEEP** |  Likely superseded by upstream's shutdown watchdog; kept KEEP only because the drain-budget unit (#821/#838/#861) builds on its executor-drain timing. Lead: fold into that unit. |
-| #358 | _pending_ | | | | 237/2(3) | — | |
-| #184 | _pending_ | | | | 234/1(1) | — | |
-| nopr:ba371ef32f | _pending_ | | | | 233/1(2) | — | |
-| #403 | _pending_ | | | | 223/2(3) | — | |
-| #1007 | _pending_ | | | | 220/1(3) | — | |
-| #452 | _pending_ | | | | 218/3(3) | — | |
-| #627 | _pending_ | | | | 217/4(3) | — | |
-| nopr:cf58afc340 | _pending_ | | | | 217/2(3) | — | |
-| #899 | _pending_ | | | | 213/2(3) | — | |
-| #316 | _pending_ | | | | 212/4(3) | — | |
-| #705 | _pending_ | | | | 210/1(3) | — | |
-| #742 | _pending_ | | | | 207/1(3) | — | |
-| nopr:7fabbdba23 | _pending_ | | | | 207/1(3) | — | |
-| #34 | _pending_ | | | | 201/1(2) | — | |
-| #750 | _pending_ | | | | 200/1(3) | — | |
-| #304 | _pending_ | | | | 197/3(2) | — | |
-| #493 | _pending_ | | | | 193/1(3) | — | |
-| #884 | _pending_ | | | | 189/1(3) | — | |
-| #352 | _pending_ | | | | 187/1(3) | — | |
-| #527 | _pending_ | | | | 186/2(3) | — | |
-| #584 | _pending_ | | | | 179/0(0) | — | |
-| #976 | _pending_ | | | | 173/2(3) | — | |
-| #405 | _pending_ | | | | 172/8(3) | — | |
-| nopr:a11aecf67b | _pending_ | | | | 164/1(3) | — | |
-| #751 | _pending_ | | | | 161/1(3) | — | |
-| nopr:6e862490c8 | _pending_ | | | | 159/3(3) | — | |
-| #1031 | _pending_ | | | | 155/2(3) | — | |
-| #589 | _pending_ | | | | 153/2(2) | — | |
-| #691 | _pending_ | | | | 149/2(3) | — | |
-| #19 | _pending_ | | | | 149/1(3) | — | |
+| #358 fix(gateway): reject empty prompt.submit + skip no-op model-switch sid | tui_gateway accepted an empty prompt.submit and ran model-switch side effects on a no-op switch — PR body | read-only: absorb 56% of src lines already in up/tui_gateway (prompt.submit contract models reject undeclared/empty params via extra=forbid dispatcher) | upstream tui_gateway contracts refactor (dispatcher param validation) | n/a (no literal) | 237/2(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  D9-adjacent (tui_gateway). Adversary: confirm empty-string text (not missing key) is rejected upstream. |
+| #184 fix(gateway): narrow stale-code /model guard to runtime Python changes | stale-code /model guard fired on non-runtime file changes — PR body | RED (read-only: _is_runtime_python/_runtime_python_changed 0 hits in up/gateway/code_skew.py) | none | n/a | 234/1(1) deps=[] | **KEEP** |  Code-skew family (nopr:ec4b3176ff, #493). KEEP-UNPROVEN by log; 1 conflict file (1 sync). |
+| nopr:ba371ef32f fix(discord): let free-response channels quote bot mentions | free-response Discord channels could not quote bot mentions — commit body | read-only: not located upstream (absorb 10%) | none found | n/a | 233/1(2) deps=[] | **KEEP** |  KEEP-UNPROVEN; small (233 loc). |
+| #403 fix(footer): honor per-model reasoning_overrides and fallback per-entr | footer ignored per-model reasoning_overrides and fallback per-entry effort — PR body | RED (_footer_reasoning_label 0 hits upstream) | none | n/a | 223/2(3) deps=[] | **KEEP** |  Footer family. |
+| #1007 fix(gateway): refuse to start a turn whose generation was invalidated  | a turn whose generation was invalidated during pre-flight (by /stop or /new) still started — PR body | RED (read-only: no generation re-check between preflight and start in up/gateway/run_turn.py) | none | n/a | 220/1(3) deps=[] | **KEEP** |  1 day old; generic — UPSTREAM candidate. KEEP-UNPROVEN by log. |
+| #452 feat(compress): interim progress ack + per-event LCM compaction teleme | manual /compress gave no interim progress ack; no per-event LCM compaction telemetry — PR body | RED (_send_compress_progress_ack 0 hits upstream) | none | 0 (1 literal) | 218/3(3) deps=[] | **KEEP** |  Compaction-announce family; LCM telemetry consumer is the fleet's LCM plugin. 3 conflict files, 15 locales. |
+| #627 fix(agent): manual compression banners name their trigger at the choke | manual compression banners did not name their trigger — PR body | RED (agent/manual_compression_feedback.py fork-only) | none | n/a | 217/4(3) deps=[] | **KEEP** |  Compaction-announce family; with #626 #404. |
+| nopr:cf58afc340 feat(model): announce mid-session /model switch in-chat (A4 axis A) | mid-session /model switch not announced in-chat — commit body (A4 axis A) | RED (_announce_model_switch 0 hits upstream) | none | 0 (1 literal) | 217/2(3) deps=[] | **KEEP** |  Route-announce family (#228). |
+| #899 feat(gateway): make the user-turn reserve a config knob (gateway.user_ | user-turn reserve in turn admission was a hardcoded constant — PR body | n/a (gateway/turn_admission.py is fork-only, #827) | n/a | 468 in 2026-05-10..2026-09-25 (PHASE=turn_admission_init cap= — per boot) | 213/2(3) deps=[] | **KEEP** |  Follows #827. |
+| #316 fix(compress): distinguish a persist-FAILURE from a genuine no-op (#44 | manual /compress reported a persist FAILURE as a genuine no-op — PR body (#44794) | read-only: upstream compress_now treats CompressionLockHeld as clean no-op (methods_slash.py:260); persist-failure distinction not found | none found | n/a | 212/4(3) deps=[] | **KEEP** |  KEEP-UNPROVEN; 4 conflict files (3 syncs), 15 locales — candidate to UPSTREAM to kill the locale churn. |
+| #705 fix(gateway): --replace waits the full drain budget before SIGKILL (st | gateway --replace SIGKILLed the old owner before its drain finished (state.db corruption class) — PR body | RED (resolve_replace_takeover_grace_s 0 hits upstream; hermes_cli/gateway.py:5312 comment acknowledges the draining-owner case but uses the fixed grace) | none | n/a | 210/1(3) deps=[] | **KEEP** |  Drain-budget unit (#738 #821 #838 #861). KEEP-UNPROVEN by log. |
+| #742 fix(gateway): /model switch note names the LIVE route, not the stale o | /model switch note named the stale override instead of the live route — PR body | n/a (fork route-announce) | n/a | 0 (1 literal) | 207/1(3) deps=[] | **KEEP** |  Route-announce family. |
+| nopr:7fabbdba23 fix(gateway): dropbox resume requests stamp kind=self and carry the ha | dropbox resume requests lost the self-restart handoff kind — commit body | n/a (fork resume_requests.py) | n/a | 214 in 2026-05-10..2026-09-25 (PHASE=dropbox_resume) | 207/1(3) deps=[] | **KEEP** |  Follows nopr:2ee2e03b68. |
+| #34 fix(discord): stop typing indicator getting stuck on rate-limited chan | Discord typing indicator stuck on rate-limited channels — PR body | GREEN (read-only: up/plugins/platforms/discord/adapter.py:4221-4231 honors retry_after on the typing POST and returns on other errors; _interruptible_sleep defined upstream) | upstream Discord plugin typing loop (cc8e5ec2af lineage) | n/a | 201/1(2) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  absorb 22%. |
+| #750 fix(gateway): boot-resume gate looks past session_meta; cron-only drai | boot-resume gate only looked at session_meta; cron-only drain overrun kept .clean — PR body | n/a (fork auto_resume.py) | n/a | n/a | 200/1(3) deps=[] | **KEEP** |  Follows #289/#295. |
+| #304 fix(kanban): stop false "profile health" stall warning when dispatcher | false 'profile health' stall warning when the kanban dispatcher is throttled — PR body | RED (read-only: up/gateway/kanban_watchers.py:312 emits the profile-health warning; _stall_streak_is_bad 0 hits) | none | n/a | 197/3(2) deps=[] | **KEEP** |  Generic — UPSTREAM candidate; KEEP-UNPROVEN. |
+| #493 feat(gateway): config toggle for the model-switch stale-code guard (#4 | no config toggle for the model-switch stale-code guard — PR body | RED (_stale_code_switch_guard_enabled 0 hits) | none | n/a | 193/1(3) deps=[] | **KEEP** |  Code-skew family. |
+| #884 fix(gateway): a safe-restart we REQUESTED is not an unexplained death  | a safe-restart we requested was announced as an unexplained death — PR body | n/a (fork_ext/unclean_restart_notice.py) | n/a | 28 in 2026-05-10..2026-09-25 (PHASE=unclean_restart_notice_suppressed) | 189/1(3) deps=[] | **KEEP** |  Follows #790; measured. |
+| #352 fix(desktop): stop live-sync duplicating every message on send (#352) | desktop live-sync duplicated every message on send — PR body | RED for the tui_gateway/server.py half (_completed_turn_committed_ids 0 hits upstream) | none | n/a | 187/1(3) deps=[] | **KEEP** |  Mixed desktop row (apps/ DROP by D9). Server half is the livesync seam (D9 trap); consumer check needed by lead — if fork livesync is reverted (scripts+misc revert-livesync branch exists), this DROPs with it. |
+| #527 fix(compress): inherit resident live route (#527) | manual /compress used the configured route instead of the resident live route — PR body | read-only: upstream _build_manual_compression_agent@up/gateway/slash_commands_session.py:577 takes runtime_kwargs from the caller; not verified whether it is the live route | unverified | n/a | 186/2(3) deps=[] | **KEEP** |  KEEP-UNPROVEN; adversary should check upstream's runtime_kwargs source. |
+| #584 fix(telegram): retry transient media downloads (#584) | transient Telegram media download failures were not retried — PR body | RED (read-only: get_file() calls @up/plugins/platforms/telegram/adapter.py:6215/6647/6696/6720 have no retry; _download_media_with_retry 0 hits) | none | n/a | 179/0(0) deps=[] | **UPSTREAM** |  Generic; 0 conflict files. Pairs with #635. |
+| #976 fix(gateway): keep AIAgent construction + skill scan off the asyncio t | AIAgent construction + skill scan ran on the asyncio thread (Discord heartbeat blocks) — PR body (Discord heartbeat blocked) | RED (read-only: _hmwa_hygiene_build_agent@up/gateway/run_turn.py:1252 constructs AIAgent inline at :1275 inside the coroutine; _build_manual_compression_agent@slash_commands_session.py:577/602 same) | none | n/a | 173/2(3) deps=[] | **UPSTREAM** |  absorb 55% is surrounding context, not the fix. Off-loop family. |
+| #405 refactor: unify r:<effort> display-label mapping into one chokepoint ( | r:<effort> display-label mapping duplicated across surfaces — declared refactor | RED (reasoning_label def 0 hits upstream) | none | n/a | 172/8(3) deps=[] | **KEEP** |  Footer family chokepoint; 8 conflict files (3 syncs) — hotspot. Dissolves only if the whole footer family goes. |
+| nopr:a11aecf67b feat(gateway): post-restart auto-closeout nudge on resume note, cache- | post-restart auto-closeout nudge on the resume note (cache-safe) — commit body (A5-B) | n/a (fork resume note) | n/a | n/a | 164/1(3) deps=[] | **KEEP** |  Follows #289. KEEP-UNPROVEN. |
+| #751 fix(gateway): resolve Discord chat types for session-key migration con | Discord chat-type resolution for session-key migration ran serially (311 lookups) — PR body | n/a (fork #659 migration) | n/a | n/a | 161/1(3) deps=[] | **KEEP** |  Follows #659. |
+| nopr:6e862490c8 fix(gateway): complete fork/upstream reconciliation for slice-5 CI red | fork/upstream reconciliation for slice-5 CI reds — commit body (merge reconciliation) | n/a (sync artifact) | n/a | n/a | 159/3(3) deps=[] | **KEEP** |  Merge-reconciliation glue; follows whatever it reconciles. Not independently revertible. |
+| #1031 fix(gateway): persisted route lookup off the event loop; one-hop Sessi | persisted route lookup on the event loop — t_a… card (subject) | n/a (persisted route lookup is fork #315 code) | n/a | n/a | 155/2(3) deps=[] | **KEEP** |  Follows #315: if the sticky-reset layer goes, this goes. |
+| #589 harden(kanban): single-source the creator-stamp shape rule + contract  | kanban creator-stamp shape rule duplicated — PR body | n/a (fork kanban wake routing) | n/a | n/a | 153/2(2) deps=[] | **KEEP** |  Follows #562. |
+| #691 fix(gateway): honor durable chat pins in reset banners (#691) | reset banners ignored durable chat pins — PR body | n/a (chat pins are fork #659) | n/a | 0 (1 literal) | 149/2(3) deps=[] | **KEEP** |  Follows #659. |
+| #19 fix(gateway): bind originating channel into session context for plugin | plugin slash commands lacked the originating channel in session context — PR body | read-only: not confirmed upstream (absorb 20%); upstream session_context.py binds platform/chat but plugin-command path not traced | unverified | n/a | 149/1(3) deps=[] | **KEEP** |  KEEP-UNPROVEN; small. |
 | #687 | _pending_ | | | | 149/3(3) | — | |
 | #694 | _pending_ | | | | 146/1(3) | — | |
 | #401 | _pending_ | | | | 146/1(3) | — | |
