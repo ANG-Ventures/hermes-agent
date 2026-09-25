@@ -190,13 +190,3 @@ def test_state_ext_runner_writes_are_guarded(monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(Path.home() / ".hermes"))
     with pytest.raises(UnsafeHomeError):
         state_runner.run_case({"kind": "denorm_flag", "configs": [True]})
-    with pytest.raises(UnsafeHomeError):
-        state_runner.run_case(
-            {
-                "kind": "title_search",
-                "name": "guard probe",
-                "query": "x",
-                "limit": 1,
-                "include_archived": False,
-            }
-        )

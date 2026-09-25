@@ -5,7 +5,6 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 
-from hermes_state import SessionDB
 from scripts.refactor_equiv.sandbox_guard import require_sandboxed_home
 
 
@@ -20,8 +19,6 @@ def run_case(case: dict):
         }
     if kind == "denorm_flag":
         return _run_denorm_case(case)
-    if kind == "title_search":
-        return _run_title_search_case(case)
     raise AssertionError(f"unknown state_ext case kind: {kind!r}")
 
 
@@ -47,66 +44,6 @@ def _run_denorm_case(case: dict):
                 _write_dashboard_flag(bool(enabled))
                 out.append(helper())
     return {"return": out, "messages": [], "db": []}
-
-
-def _run_title_search_case(case: dict):
-    db_path = require_sandboxed_home() / (case["name"].replace(" ", "_") + ".db")
-    db = SessionDB(db_path=db_path)
-    try:
-        _seed_title_search_fixture(db)
-        rows = db.search_sessions_by_title(
-            case["query"],
-            limit=case["limit"],
-            include_archived=case["include_archived"],
-        )
-        selected = [
-            {
-                "id": row["id"],
-                "title": row.get("title"),
-                "display_name": row.get("display_name"),
-                "source": row.get("source"),
-                "preview": row.get("preview"),
-            }
-            for row in rows
-        ]
-        persisted = [
-            dict(row)
-            for row in db._conn.execute(
-                "SELECT id, source, title, display_name FROM sessions ORDER BY id"
-            ).fetchall()
-        ]
-        return {"return": selected, "messages": [], "db": persisted}
-    finally:
-        db.close()
-
-
-def _seed_title_search_fixture(db: SessionDB) -> None:
-    db.create_session(session_id="dc", source="discord")
-    db.record_gateway_session_peer(
-        "dc",
-        source="discord",
-        session_key="agent:main:discord:thread:dc",
-        chat_id="123",
-        display_name="Daemonarchy / #general / Deploy Notes",
-    )
-    db.append_message("dc", role="user", content="discord preview")
-
-    db.create_session(session_id="tg", source="telegram")
-    db.set_session_title("tg", "General chatter")
-    db.append_message("tg", role="user", content="telegram preview")
-
-    db.create_session(session_id="titled", source="cli")
-    db.set_session_title("titled", "Deploy pipeline")
-    db.append_message("titled", role="user", content="cli preview")
-
-    db.create_session(session_id="wild", source="cli")
-    db.set_session_title("wild", "100% coverage plan")
-    db.append_message("wild", role="user", content="wildcard preview")
-
-    db.create_session(session_id="plain", source="cli")
-    db.set_session_title("plain", "No platform words here")
-
-    db.create_session(session_id="untitled-discord", source="discord")
 
 
 def _helper(name: str):

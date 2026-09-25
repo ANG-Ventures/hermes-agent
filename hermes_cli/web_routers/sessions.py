@@ -353,42 +353,6 @@ async def search_sessions(
                     },
                 )
 
-            # fork-parity: title/channel/platform matches second. Titles are
-            # human-assigned intent (`/title` on any platform, desktop rename,
-            # auto-titling), and the display path carries the platform
-            # channel/thread names (e.g. "Daemonarchy / #general / My Thread"),
-            # so these hits outrank message-content hits — it is what makes
-            # "general discord" find that channel's sessions from the desktop.
-            # Upstream extracted this handler from ITS web_server, which has no
-            # title lane, so the extraction dropped the fork's; re-grafted here.
-            # SessionDB.search_sessions_by_title takes no source kwargs (unlike
-            # search_sessions_by_id), so scope its rows through the same
-            # source/exclude filter the SQL lanes apply.
-            for row in db.search_sessions_by_title(
-                q, limit=safe_limit, include_archived=True
-            ):
-                row_source = row.get("source")
-                if include_sources and row_source not in include_sources:
-                    continue
-                if exclude_list and row_source in exclude_list:
-                    continue
-                sid = row.get("id")
-                preview = (row.get("preview") or "").strip()
-                title = (row.get("title") or "").strip()
-                display_name = (row.get("display_name") or "").strip()
-                add_lineage_result(
-                    sid,
-                    {
-                        "snippet": preview or title or display_name,
-                        "title": title,
-                        "display_name": display_name or None,
-                        "role": None,
-                        "source": row.get("source"),
-                        "model": row.get("model"),
-                        "session_started": row.get("started_at"),
-                    },
-                )
-
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" → "nimb*" matches "nimby"
             # Preserve quoted phrases and existing wildcards as-is

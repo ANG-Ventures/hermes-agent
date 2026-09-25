@@ -58,11 +58,6 @@ class _FakeSessionDB:
             )
         ][:limit]
 
-    def search_sessions_by_title(self, query, limit=20, include_archived=True):
-        assert query == "20260603"
-        assert include_archived is True
-        return []
-
     def search_messages(
         self,
         query,
@@ -145,97 +140,3 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
             },
         ]
     }
-
-
-class _FakeTitleSessionDB:
-    """Fake proving title matches rank above content matches (and dedupe)."""
-
-    opened_read_only = None
-
-    # fork-parity: upstream's _open_session_db_at_path bootstraps a missing
-    # store via SessionDB(db_path=..., read_only=False), and its search handler
-    # passes source/sources/exclude_sources (+ fields on search_messages). This
-    # fork-authored fake predates both, so it needs the permissive ctor its
-    # sibling _FakeSessionDB already has and the widened kwargs.
-    def __init__(self, *args, **kwargs):
-        type(self).opened_read_only = kwargs.get("read_only")
-
-    def search_sessions_by_id(
-        self,
-        query,
-        limit=20,
-        include_archived=True,
-        source=None,
-        sources=None,
-        exclude_sources=None,
-    ):
-        return []
-
-    def search_sessions_by_title(self, query, limit=20, include_archived=True):
-        assert query == "portal"
-        return [
-            {
-                "id": "titled_session",
-                "title": "DNS Portal Investigation",
-                "preview": "first user message",
-                "source": "discord",
-                "model": "claude",
-                "started_at": 300,
-            }
-        ]
-
-    def search_messages(
-        self,
-        query,
-        limit=20,
-        source_filter=None,
-        exclude_sources=None,
-        fields=None,
-    ):
-        assert query == "portal*"
-        return [
-            # Content hit on the SAME session the title lane already surfaced —
-            # must dedupe by lineage, not double-list.
-            {
-                "session_id": "titled_session",
-                "snippet": "portal mentioned in content",
-                "role": "user",
-                "source": "discord",
-                "model": "claude",
-                "session_started": 300,
-            },
-            {
-                "session_id": "content_only",
-                "snippet": "another portal content hit",
-                "role": "assistant",
-                "source": "cli",
-                "model": "gpt",
-                "session_started": 400,
-            },
-        ]
-
-    def get_session(self, session_id):
-        return {"id": session_id, "parent_session_id": None}
-
-    def get_compression_tip(self, session_id):
-        return session_id
-
-    def close(self):
-        pass
-
-
-def test_desktop_session_search_ranks_title_matches_before_content_matches(monkeypatch):
-    _FakeTitleSessionDB.opened_read_only = None
-    monkeypatch.setattr("hermes_state.SessionDB", _FakeTitleSessionDB)
-
-    response = asyncio.run(web_server.search_sessions(q="portal", limit=5))
-
-    results = response["results"]
-    assert [r["session_id"] for r in results] == ["titled_session", "content_only"]
-    # The title lane carries the title through to the client.
-    assert results[0]["title"] == "DNS Portal Investigation"
-    # Title-lane snippet prefers the session preview.
-    assert results[0]["snippet"] == "first user message"
-    # The duplicate content hit on titled_session did not double-list it.
-    assert len(results) == 2
-    assert _FakeTitleSessionDB.opened_read_only is True

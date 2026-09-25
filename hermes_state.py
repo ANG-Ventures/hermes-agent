@@ -54,9 +54,6 @@ from agent.skill_commands import (
 from hermes_constants import get_hermes_home
 from hermes_state_ext import (
     _session_list_denorm_enabled,
-    _session_title_search_like,
-    _session_title_search_platform_sources,
-    _session_title_search_score,
     _sql_placeholders,
 )
 from hermes_cli.cli_hint import hint_value
@@ -15241,99 +15238,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Search
     # =========================================================================
 
-
-    def search_sessions_by_title(
-        self,
-        query: str,
-        limit: int = 20,
-        include_archived: bool = True,
-    ) -> List[Dict[str, Any]]:
-        """Search surfaced sessions by title, channel/thread name, and platform.
-
-        Titles are human-assigned intent (``/title`` on any platform, the
-        desktop rename action, auto-titling), so a title hit should outrank a
-        message-content hit in cross-surface search. Beyond titles, sessions
-        born on messaging platforms carry ``display_name`` (the gateway's
-        presentation path, e.g. ``"Daemonarchy / #general / My Thread"``) and
-        ``source`` (the platform id) — both are searched so a query like
-        ``"general discord"`` surfaces that channel's sessions even when no
-        title mentions it.
-
-        Matching is per-token with partial credit: every whitespace token that
-        hits the title, the display path, or the platform name/alias counts.
-        Rows matching more tokens rank first; ties break on where the best
-        match landed (whole-phrase title exact > prefix > substring > token in
-        title > token in channel/thread path > platform-only), then recency
-        (``started_at`` DESC). Only listable rows are returned (sub-agent runs
-        and compression continuations excluded — same visibility contract as
-        the sidebar).
-
-        A plain ``LIKE`` scan is deliberate: ``sessions`` is a small table
-        (tens of thousands of rows), so no FTS index is warranted.
-        """
-        needle = (query or "").strip().lower()
-        if not needle or limit <= 0:
-            return []
-
-        tokens = [t for t in needle.split() if t]
-
-        # Candidate fetch: any token substring-hits title or display_name, or
-        # names a platform. Python does the real ranking; SQL just narrows.
-        or_clauses: List[str] = []
-        params: List[Any] = []
-        for tok in tokens:
-            or_clauses.append("LOWER(COALESCE(s.title, '')) LIKE ? ESCAPE '\\'")
-            params.append(_session_title_search_like(tok))
-            or_clauses.append(
-                "LOWER(COALESCE(s.display_name, '')) LIKE ? ESCAPE '\\'"
-            )
-            params.append(_session_title_search_like(tok))
-        platform_sources = _session_title_search_platform_sources(tokens)
-        if platform_sources:
-            marks = ",".join("?" for _ in platform_sources)
-            or_clauses.append(f"s.source IN ({marks})")
-            params.extend(platform_sources)
-
-        where = [
-            f"({' OR '.join(or_clauses)})",
-            # Findable rows carry human-facing text: a title or a display path.
-            "(COALESCE(TRIM(s.title), '') != '' OR "
-            " COALESCE(TRIM(s.display_name), '') != '')",
-            _LISTABLE_CHILD_SQL,
-            f"{_delegate_from_json('s.model_config')} IS NULL",
-        ]
-        if not include_archived:
-            where.append("s.archived = 0")
-
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                "SELECT s.id, s.title, s.display_name, s.source, s.model, "
-                "s.started_at, "
-                "(SELECT m.content FROM messages m "
-                " WHERE m.session_id = s.id AND m.role = 'user' "
-                " ORDER BY m.timestamp ASC LIMIT 1) AS preview "
-                f"FROM sessions s WHERE {' AND '.join(where)} "
-                "ORDER BY s.started_at DESC "
-                "LIMIT ?",
-                params + [max(limit * 8, 80)],
-            ).fetchall()
-
-        ranked = sorted(
-            enumerate(rows),
-            key=lambda item: (
-                *_session_title_search_score(item[1], tokens, needle),
-                item[0],
-            ),
-        )
-        out: List[Dict[str, Any]] = []
-        for _, row in ranked[:limit]:
-            if _session_title_search_score(row, tokens, needle)[0] == 0:
-                continue  # candidate row that no token actually scored on
-            d = dict(row)
-            preview = (d.get("preview") or "").strip()
-            d["preview"] = preview[:200] if preview else ""
-            out.append(d)
-        return out
 
     def search_sessions(
         self,
