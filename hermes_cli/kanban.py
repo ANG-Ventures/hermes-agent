@@ -4622,16 +4622,25 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         # or as the operator session that made ``claim --review`` (human lane).
         worker_run = _worker_run_id_for(tid)
         held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
+        parked_session = None
         if held_run is None:
-            print(
-                f"cannot request changes for {tid}: this session does not hold its "
-                f"review run; claim it from the reviewing session first "
-                f"(hermes kanban claim {tid} --review). Delegate children and "
-                f"cron jobs cannot hold a human-lane review claim.",
-                file=sys.stderr,
-            )
-            return 1
-        if args.coverage is not None:
+            # Card parked in ``review`` with nobody holding it: the operator
+            # session opens the review run itself and sends back in ONE txn
+            # (same audit as ``claim --review`` + request-changes). Only a
+            # session that could hold that claim may do this.
+            task = kb.get_task(conn, tid)
+            if task is not None and task.status == "review":
+                parked_session = _operator_review_session_ref()
+            if parked_session is None:
+                print(
+                    f"cannot request changes for {tid}: this session does not hold its "
+                    f"review run; claim it from the reviewing session first "
+                    f"(hermes kanban claim {tid} --review). Delegate children and "
+                    f"cron jobs cannot hold a human-lane review claim.",
+                    file=sys.stderr,
+                )
+                return 1
+        elif args.coverage is not None:
             kb.add_comment(
                 conn, tid, _profile_author(),
                 "review_coverage: " + str(kb.redact_review_value(args.coverage)),
@@ -4642,6 +4651,18 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             tid,
             reason=reason,
             expected_run_id=held_run,
+            **(
+                {
+                    # Open the review run as this session, and record the
+                    # coverage on it inside the same transaction so the
+                    # coverage gate can pass.
+                    "claimer": _profile_author(),
+                    "coverage": args.coverage,
+                    "session_ref": parked_session,
+                }
+                if parked_session is not None
+                else {}
+            ),
         )
         if not ok:
             print(
@@ -4658,7 +4679,11 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                 conn, tid, _profile_author(),
                 "changes requested (human review lane): "
                 + str(kb.redact_review_value(reason)),
-                run_id=held_run, session_ref=session_ref,
+                run_id=(
+                    held_run if held_run is not None
+                    else getattr(kb.latest_run(conn, tid), "id", None)
+                ),
+                session_ref=session_ref,
             )
         print(
             f"Requested changes for {tid}"
