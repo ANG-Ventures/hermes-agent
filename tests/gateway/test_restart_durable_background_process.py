@@ -38,9 +38,16 @@ def registry(tmp_path, monkeypatch):
     reg = pr_mod.ProcessRegistry()
     monkeypatch.setattr(pr_mod, "process_registry", reg)
     yield reg
-    for s in list(reg._running.values()):
+    sessions = list(reg._running.values()) + list(reg._finished.values())
+    for s in sessions:
         if s.pid and pr_mod.ProcessRegistry._host_pid_is_ours(s.pid, s.host_start_time):
             pr_mod.ProcessRegistry._terminate_host_pid(s.pid, s.host_start_time)
+    # A live reader thread rewrites the checkpoint through the module-global
+    # CHECKPOINT_PATH when its child exits; join it before monkeypatch points
+    # that global at the next test's tmp_path.
+    for s in sessions:
+        if s._reader_thread is not None:
+            s._reader_thread.join(timeout=10)
 
 
 def _spawn(reg, command, *, routable=True):
