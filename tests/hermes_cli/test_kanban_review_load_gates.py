@@ -138,7 +138,9 @@ def _one_round(conn, tid, reviewer="argus"):
     assert ok, reason
     review = kb.claim_review_task(conn, tid)
     assert review is not None
-    assert kb.request_changes(
+    from tests.kanban_review_helpers import covered_request_changes
+
+    assert covered_request_changes(
         conn, tid, reason="fix", expected_run_id=review.current_run_id,
     )[0] is True
 
