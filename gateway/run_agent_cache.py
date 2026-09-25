@@ -499,6 +499,17 @@ class GatewayAgentCacheMixin:
         interrupt_for_session(
             session_key=session_key, reason=invalidation_reason,
             parent_session_id=str(getattr(running_agent, "session_id", "") or ""))
+        # A turn parked in clarify_gateway.wait_for_response never sees the hard interrupt, so its
+        # entry would outlive the stop (the turn's finally is unreached) and _hm_clarify_reply would
+        # feed the user's NEXT message to the dead turn, whose output the bumped generation drops —
+        # the message is silently swallowed. Clearing also wakes the parked thread. Idempotent.
+        try:
+            from tools.clarify_gateway import clear_session as _clear_clarify
+            if _cancelled := _clear_clarify(session_key):
+                logger.info("Cancelled %d pending clarify prompt(s) for %s on %s",
+                            _cancelled, session_key, interrupt_reason)
+        except Exception:
+            logger.debug("clarify cancel skipped for %s", session_key, exc_info=True)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             # Plugins holding a per-turn external resource (an outbound RPC blocked on a tool result
             # the loop will never consume) learn the turn is gone. Fires for /stop and the /new
