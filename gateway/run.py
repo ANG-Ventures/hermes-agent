@@ -7539,25 +7539,6 @@ class TurnRunner:
                 getattr(_resume_entry, "last_resume_marked_at", None),
                 window_secs=_freshness_window,
             )
-        # 🔴 Defensive reset (pass-2 B1): clear any stale suppress flag from
-        # a PRIOR turn before this turn can set it. A cached/reused agent can
-        # carry _suppress_user_turn_persist=True if a prior resume turn set it
-        # then aborted before build_turn_context consumed it — which would
-        # wrongly drop THIS turn's (possibly real) user row. Reset every turn
-        # so the flag only ever reflects the current turn's resume-pending
-        # decision below.
-        #
-        # Parity note (2026-08-08): upstream has no reference to this flag in
-        # gateway/run.py (it consumes-once inside agent/turn_context.py), so
-        # the merge took upstream's side here and silently dropped the fork's
-        # per-turn reset. turn_context's own docstring still promises "the
-        # gateway additionally resets it at the top of every turn so it never
-        # carries across turns" — consume-once alone does NOT give that: an
-        # aborted resume turn leaves the flag set with nothing to consume it.
-        try:
-            agent._suppress_user_turn_persist = False
-        except Exception:
-            pass
         _is_resume_pending = bool(
             _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
@@ -7572,41 +7553,6 @@ class TurnRunner:
         if _is_resume_pending:
             _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
             _persist_user_message_override = ctx.message
-            # An internal auto-resume continuation with no real user text (the
-            # MessageEvent text="" internal=True trigger — the ONLY path that
-            # produces an empty resume-pending turn) must NOT persist an empty
-            # user row: it pollutes the transcript, breaks role alternation,
-            # and is what /undo lands on as "(no text)". Flag the agent so
-            # build_turn_context stamps the user row ephemeral and the flush
-            # drops it. A resume turn carrying REAL queued user text has
-            # non-empty ``ctx.message`` here, so it still persists (I2). The
-            # model still receives the resume prompt built below (I1).
-            #
-            # Parity note (2026-08-08): upstream has no reference to
-            # _suppress_user_turn_persist in gateway/run.py, so the merge
-            # dropped BOTH halves of the fork's suppression (this set and the
-            # per-turn defensive reset above). agent/turn_context.py still
-            # consumes the flag and its docstring still promises the gateway
-            # sets/resets it — restored here against upstream's ctx shape.
-            if not str(ctx.message or "").strip():
-                # Belt-and-suspenders (pass-1 B1): flag the row ephemeral AND
-                # keep the override forced to empty text, so if the ephemeral
-                # stamp ever misses the persisted row degrades to a benign
-                # EMPTY row — never to a resume-prompt-shaped fake user
-                # message (ctx.message is reassigned to the prompt just below).
-                _persist_user_message_override = ""
-                try:
-                    agent._suppress_user_turn_persist = True
-                    logger.info(
-                        "resume: suppressing empty internal-resume user row "
-                        "for %s (reason=%s) — not persisting an empty user turn",
-                        ctx.session_key, _reason,
-                    )
-                except Exception:
-                    logger.debug(
-                        "resume: could not flag empty-resume user-row suppression",
-                        exc_info=True,
-                    )
             # The empty-message case is the auto-resume startup turn
             # synthesized by _schedule_resume_pending_sessions — there is
             # no NEW user message to address.  Guidance is adapter-aware:
@@ -8405,15 +8351,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # background reaper to evict ONLY entries whose task is genuinely done()/cancelled
         # (a leaked slot), never a live long-running turn. Cleared in _release_running_agent_state.
         self._running_agent_tasks: Dict[str, Any] = {}
-        # A turn that was /stop'd but whose coroutine is still DRAINING (the
-        # cooperative interrupt hasn't been reached yet). /stop releases the
-        # _running_agents slot immediately, so the running-agent guard can't see
-        # this state — but the draining turn is still appending transcript rows.
-        # /undo and /redo consult this to refuse a rewind that would race a
-        # still-writing turn (the 2026-07-14 undo-clobber incident). Populated in
-        # _interrupt_and_clear_session; cleared in _release_running_agent_state
-        # (the turn's true exit) and pruned-on-access once the task is done().
-        self._draining_turns: Dict[str, Any] = {}
         self._session_initiated_restart: Dict[str, bool] = {}
         self._resumed_this_boot: set[str] = set()
         # Per-SESSION_ID turn lease (#64934): serializes the
@@ -24199,10 +24136,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except (ValueError, IndexError):
                     _undo_n = 1
             _undo_detail = (
-                "This backs up the last half-turn (one party's run of "
-                "messages) from history."
+                "This removes the last user/assistant exchange from history."
                 if _undo_n == 1
-                else f"This backs up the last {_undo_n} half-turns from history."
+                else f"This removes the last {_undo_n} user turns from history."
             )
             return await self._maybe_confirm_destructive_slash(
                 event=event,
@@ -24211,9 +24147,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 detail=_undo_detail,
                 execute=_do_undo,
             )
-
-        if canonical == "redo":
-            return await self._handle_redo_command(event)
 
         if canonical == "sethome":
             return await self._handle_set_home_command(event)
@@ -28080,13 +28013,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry.session_id, entry,
                             skip_db=agent_persisted,
                         )
-                        if agent_persisted and msg.get("role") == "user":
-                            try:
-                                from hermes_undo import on_user_message_appended
-
-                                on_user_message_appended(session_entry.session_id)
-                            except Exception as e:
-                                logger.debug("redo clear on user append failed: %s", e)
 
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
@@ -35216,32 +35142,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # outlives the slot. Idempotent: pop-on-absent is harmless, so a reaper eviction
         # racing this finally double-releases safely (AC-10).
         getattr(self, "_running_agent_tasks", {}).pop(session_key, None)
-        # Clear a DRAINING-turn marker ONLY when its task is None or actually
-        # done(). /stop calls this release immediately after registering the
-        # drain (task still not-done) — popping unconditionally here would erase
-        # the marker the instant it's set, defeating the /undo guard, so the
-        # not-done entry is preserved.
-        #
-        # Lifecycle note (Greptile #339 P2): the draining turn's OWN finally
-        # re-enters this method, but `Task.done()` is still False *inside* that
-        # finally (the coroutine hasn't returned yet), so this block does NOT
-        # clear the entry on the stopped turn's own unwind. Cleanup therefore
-        # happens via two other paths: (1) PRIMARY — prune-on-access in
-        # `_session_turn_draining` (the /undo·/redo guard) pops a done entry the
-        # next time either command runs; (2) the NEXT turn for the same session
-        # completes and re-enters here with the (now truly done) task → cleared.
-        # Net: in active sessions accumulation is bounded to a single
-        # (session_key → done-Task) entry; a session that is /stop'd and then
-        # goes dormant retains one stale entry until its next turn/undo — a
-        # bounded, harmless leak (the guard prunes it on the next access).
-        try:
-            _draining = getattr(self, "_draining_turns", None)
-            if _draining is not None:
-                _dt = _draining.get(session_key)
-                if _dt is None or _dt.done():
-                    _draining.pop(session_key, None)
-        except Exception:
-            logger.debug("draining-turn clear skipped for %s", session_key, exc_info=True)
         # Turn boundary: a running-agent slot was just released.  Persist the
         # new (lower) in-flight count so the dashboard readout stays current
         # between lifecycle transitions.  Preserves gateway_state (see
@@ -35733,20 +35633,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "clarify cancel skipped for %s", session_key, exc_info=True
             )
         if release_running_state:
-            # Register a DRAINING turn BEFORE releasing state (which pops the
-            # task handle). If the turn's coroutine is still mid-flight (its
-            # asyncio Task is not done()), the cooperative interrupt hasn't been
-            # reached yet, so it will keep appending transcript rows for a short
-            # window. Record it so /undo·/redo refuse a rewind that would race
-            # the still-writing turn. A turn's OWN normal exit also flows through
-            # here, but with a done/finishing task, so it never registers a
-            # false drain. Best-effort: never let this break /stop.
-            try:
-                _task = getattr(self, "_running_agent_tasks", {}).get(session_key)
-                if _task is not None and not _task.done():
-                    self._draining_turns[session_key] = _task
-            except Exception:
-                logger.debug("draining-turn capture skipped for %s", session_key, exc_info=True)
             self._release_running_agent_state(session_key)
             # Evict the cached agent: ``_interrupt_requested`` is only
             # cleared by the turn finalizer, so on a hung or still-draining

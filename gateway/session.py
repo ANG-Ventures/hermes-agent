@@ -13,7 +13,6 @@ import hashlib
 import logging
 import os
 import json
-import sqlite3
 import threading
 import time
 import uuid
@@ -23,21 +22,6 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Any, Literal, NamedTuple
 
 logger = logging.getLogger(__name__)
-
-
-def _is_transient_db_busy(exc: BaseException) -> bool:
-    """True for the SQLite lock/busy class — a transient, retryable condition.
-
-    Mirrors the discrimination in ``SessionDB._execute_write`` (and its sibling
-    ``hermes_undo._is_transient_redo_error``): only a ``sqlite3.OperationalError``
-    whose message names ``locked``/``busy`` is transient. Anything else (schema
-    errors, logic bugs, non-DB exceptions) is a real fault and must NOT be
-    reported to the user as a transient "try again".
-    """
-    if not isinstance(exc, sqlite3.OperationalError):
-        return False
-    msg = str(exc).lower()
-    return "locked" in msg or "busy" in msg
 
 
 def _now() -> datetime:
@@ -121,7 +105,6 @@ from .whatsapp_identity import (
     normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
 )
 from utils import atomic_replace
-from hermes_state import RewindWouldOrphanError
 from agent.turn_context import extract_api_content_sidecar
 
 # Session keys/ids flow into filesystem paths downstream (e.g.
@@ -4917,15 +4900,6 @@ class SessionStore:
                         "(on-disk spool unavailable)",
                         session_id, self._MAX_PENDING_PER_SESSION,
                     )
-            # Fork feature (/undo /redo): a fresh user message invalidates the
-            # redo stack for this session.
-            if message.get("role") == "user":
-                try:
-                    from hermes_undo import on_user_message_appended
-
-                    on_user_message_appended(session_id)
-                except Exception as e:
-                    logger.debug("redo clear on user append failed: %s", e)
             # Snapshot the first pending message, then release the lock
             # before the DB write so other sessions are not blocked.
             msg = pending[0]
@@ -5276,16 +5250,6 @@ class SessionStore:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
                 return False
             self._clear_dirty_transcript(session_id)
-            # Fork feature (/undo /redo): a transcript rewrite hard-deletes and
-            # renumbers rows, so any in-memory undo/redo stack now references
-            # dead ids. Invalidate it so a later /redo can't try to restore
-            # vanished rows.
-            try:
-                import hermes_undo
-
-                hermes_undo.clear_state(session_id)
-            except Exception as e:
-                logger.debug("rewrite_transcript: undo-state clear skipped: %s", e)
             return True
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
@@ -5346,124 +5310,24 @@ class SessionStore:
         *,
         require_retryable_composite: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Back up ``n`` half-turns / user turns.
+        """Back up ``n`` user turns via soft-delete, keeping rows for audit.
 
-        Two callers, two contracts (fork parity 2026-08-29):
+        Unlike :meth:`rewrite_transcript` (a hard replace), this flips the
+        truncated rows to ``active=0`` in state.db so they survive for audit
+        and stay hidden from re-prompts and search. Mirrors the CLI/TUI
+        ``/undo [N]``. ``n`` clamps to the oldest user turn. A composite
+        compaction carrier keeps its hidden handoff scaffold as the new head.
 
-        - Plain path (gateway ``/undo [N]``, fork feature): delegates to the
-          shared undo core (``hermes_undo.undo``), soft-deleting rows
-          (active=0, kept for audit). Returns one of four outcomes so the
-          caller can report HONESTLY (the 2026-07-15 false-"Nothing to undo"
-          bug was this method collapsing EVERY exception into ``None``):
-          - a real result dict (has ``rewound_ids``) — success.
-          - ``None`` — a genuine, healthy empty (nothing to rewind).
-          - ``{"status": "busy"}`` — a RETRYABLE condition: a transient
-            lock/busy DB error, OR the orphan-guard ``RewindWouldOrphanError``
-            (a mid-flush race that self-heals); render "try again", never
-            "nothing to undo".
-          - ``{"status": "error"}`` — any OTHER exception (a genuine bug, a
-            non-lock ``OperationalError``); render a distinct internal-error
-            message, logged at ERROR, never "nothing to undo".
-          Every non-success outcome is safe to call "nothing was changed"
-          because ``rewind_to_message`` validates + orphan-guards BEFORE its
-          single write, so a raise from that path means no mutation occurred.
+        Returns ``{"rewound_count", "turns_undone", "target_text"}`` or
+        ``None`` (no DB / no rewindable turn / persistence failure).
 
-        - ``require_retryable_composite=True`` (gateway ``/retry`` on a
-          composite carrier, upstream #84078 family): the selected current
-          turn must still be a composite carrier, and its live payload must be
-          losslessly replayable as text before anything changes. Runs under
-          the transcript drain lock with CAS guards
-          (``expected_active_ids``/``expected_target_content``) and returns
-          ``{"rewound_count", "turns_undone", "target_text"}`` or ``None``.
+        ``require_retryable_composite=True`` is the gateway ``/retry`` guard:
+        the selected turn must be a composite carrier whose live payload is
+        losslessly replayable as text — that replay-policy ``ValueError``
+        propagates so /retry can explain why the carrier is unsafe.
         """
         if not self._db:
             return None
-        if require_retryable_composite:
-            return self._rewind_retryable_composite(session_id, n)
-        # Serialize against pending-queue drains/appends (upstream contract:
-        # a concurrent append_to_transcript must not interleave with a rewind
-        # boundary). The fork's undo core owns the DB mutation; this lock
-        # owns the in-process ordering.
-        with self._get_transcript_drain_lock():
-            return self._rewind_via_undo_core(session_id, n)
-
-    def _rewind_via_undo_core(
-        self, session_id: str, n: int
-    ) -> Optional[Dict[str, Any]]:
-        """Plain /undo path: delegate to the shared undo core (fork contract)."""
-        self._clear_dirty_transcript(session_id)
-        if n < 1:
-            n = 1
-        try:
-            import hermes_undo
-
-            hermes_undo._session_db = self._db
-            result = hermes_undo.undo(session_id, n)
-        except RewindWouldOrphanError as e:
-            # A concurrent turn is mid-flush (an assistant(tool_calls)→tool pair
-            # is being written) so the rewind would transiently orphan a tool
-            # row. Self-heals once the flush completes → RETRYABLE, WARNING (not
-            # an ERROR-logged permanent fault). The 2026-07-15 incident's most
-            # likely trigger; the whole point is to stop reporting it as "nothing
-            # to undo" or a hard error.
-            logger.warning(
-                "rewind_session: transient orphan-guard (mid-flush) for %s: %r",
-                session_id, e,
-            )
-            return {"status": "busy"}
-        except sqlite3.OperationalError as e:
-            if _is_transient_db_busy(e):
-                logger.warning(
-                    "rewind_session: transient DB busy for %s: %r", session_id, e
-                )
-                return {"status": "busy"}
-            logger.error(
-                "rewind_session: DB error for %s: %r", session_id, e, exc_info=True
-            )
-            return {"status": "error"}
-        except Exception as e:
-            logger.error(
-                "rewind_session: undo failed for %s: %r", session_id, e, exc_info=True
-            )
-            return {"status": "error"}
-        if not result.get("rewound_ids"):
-            # Genuine empty — nothing rewound. Record the active-row count + the
-            # computed target the undo core saw (B2/RC2).
-            active_count = result.get("active_count")
-            target_id = result.get("target_id")
-            if active_count:
-                # 🔴 The incident signature: rows PRESENT but /undo rewound
-                # NOTHING — whether because no half-turn target was found OR a
-                # target was found but deactivated 0 rows (RC3: both are "rows
-                # existed, undo said nothing"). This is NOT a healthy empty —
-                # surface at WARNING so a recurrence is visible at prod log level
-                # (DEBUG is invisible there).
-                logger.warning(
-                    "rewind_session: /undo rewound NOTHING for %s despite "
-                    "%s active row(s) (n=%s target_id=%s) — possible "
-                    "transient/mid-flush state; reporting 'nothing to undo'",
-                    session_id, active_count, n, target_id,
-                )
-            else:
-                logger.debug(
-                    "rewind_session: nothing to undo for %s "
-                    "(healthy empty; n=%s active_count=%s target_id=%s)",
-                    session_id, n, active_count, target_id,
-                )
-            return None
-        return result
-
-    def _rewind_retryable_composite(
-        self, session_id: str, n: int = 1
-    ) -> Optional[Dict[str, Any]]:
-        """Composite-carrier-aware rewind for gateway ``/retry`` (upstream path).
-
-        The selected current turn must still be a composite carrier, and its
-        live payload must be losslessly replayable as text before anything
-        changes. Replay-policy failures (``retryable_user_text``) raise
-        ``ValueError`` to the caller so /retry can explain why the carrier is
-        unsafe; persistence errors return ``None``.
-        """
         with self._get_transcript_drain_lock():
             if n < 1:
                 n = 1
@@ -5472,6 +5336,7 @@ class SessionStore:
                 split_user_originated_turn,
                 user_originated_turn_view,
             )
+            from agent.message_content import flatten_message_text
 
             try:
                 expected_active_ids = self._db.get_active_message_ids(session_id)
@@ -5494,14 +5359,17 @@ class SessionStore:
                 handoff, target_view = split_user_originated_turn(target)
                 if target_view is None:
                     return None
-                if handoff is None:
+                if require_retryable_composite and handoff is None:
                     return None
             except Exception as e:
                 logger.debug("rewind_session: failed to resolve canonical target: %s", e)
                 return None
-            # Keep replay-policy failures distinct from persistence errors
-            # so /retry can explain why the selected carrier is unsafe.
-            target_text = retryable_user_text(target_view.get("content"))
+            if require_retryable_composite:
+                # Keep replay-policy failures distinct from persistence errors
+                # so /retry can explain why the selected carrier is unsafe.
+                target_text = retryable_user_text(target_view.get("content"))
+            else:
+                target_text = flatten_message_text(target_view.get("content"))
             try:
                 result = self._db.rewind_to_message(
                     session_id,
@@ -5522,44 +5390,6 @@ class SessionStore:
                 "turns_undone": turns_undone,
                 "target_text": target_text,
             }
-
-    def restore_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
-        """Redo ``n`` undo operations via the shared undo core.
-
-        Honesty contract (parallels :meth:`rewind_session` but note: ``redo()``
-        never returns ``None`` for a healthy empty — it returns a real dict with
-        ``reactivated_count == 0``, which the caller renders as "nothing to
-        redo"). Outcomes:
-        - a real result dict (``reactivated_count`` present) — success OR a
-          healthy empty (count 0) OR an honest partial (``partial_retryable``).
-        - ``{"status": "busy"}`` — a RETRYABLE lock/busy DB error.
-        - ``{"status": "error"}`` — a genuine bug / non-lock error (logged ERROR).
-        - ``None`` — only when there is no DB handle at all.
-        """
-        if not self._db:
-            return None
-        try:
-            import hermes_undo
-
-            hermes_undo._session_db = self._db
-            result = hermes_undo.redo(session_id, n)
-        except sqlite3.OperationalError as e:
-            if _is_transient_db_busy(e):
-                logger.warning(
-                    "restore_session: transient DB busy for %s: %r", session_id, e
-                )
-                return {"status": "busy"}
-            logger.error(
-                "restore_session: DB error for %s: %r", session_id, e, exc_info=True
-            )
-            return {"status": "error"}
-        except Exception as e:
-            logger.error(
-                "restore_session: redo failed for %s: %r", session_id, e, exc_info=True
-            )
-            return {"status": "error"}
-        return result
-
 
 
 def build_session_context(

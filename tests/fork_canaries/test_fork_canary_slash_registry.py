@@ -10,8 +10,7 @@ existing.
 
 Covered commands and why each is fork-load-bearing:
 
-* ``/undo`` + ``/redo`` — half-turn rewind with a redo branch. The fork ships
-  ``hermes_undo.py`` + ``tests/test_undo_redo_stack.py``; the registry rows are
+* ``/undo`` — user-turn rewind with an optional count; the registry row is
   the only thing that routes a user's ``/undo`` to it.
 * ``/branch`` (alias ``/fork``) — session branching; on Discord it spawns a
   context-inheriting thread (``tests/gateway/test_discord_branch_thread_merge.py``).
@@ -42,7 +41,6 @@ def _registry():
     "name,category",
     [
         ("undo", "Session"),
-        ("redo", "Session"),
         ("branch", "Session"),
         ("merge", "Session"),
         ("fast", "Configuration"),
@@ -69,17 +67,14 @@ def test_fork_slash_command_is_registered(name, category):
 # Per-command contracts
 # --------------------------------------------------------------------------- #
 
-def test_undo_and_redo_accept_a_count_argument():
-    """Both take an optional N (half-turns). Losing the args_hint means the
-    completer stops offering it and /help stops documenting it.
+def test_undo_accepts_a_count_argument():
+    """``/undo`` takes an optional N (user turns). Losing the args_hint means
+    the completer stops offering it and /help stops documenting it.
 
-    RED-PROVABLE: remove ``args_hint="[N]"`` from the ``undo`` (or ``redo``)
-    CommandDef in hermes_cli/commands.py (~L124 / ~L126)."""
+    RED-PROVABLE: remove ``args_hint="[N]"`` from the ``undo`` CommandDef in
+    hermes_cli/commands.py (~L124)."""
     reg = _registry()
-    for name in ("undo", "redo"):
-        assert "N" in reg[name].args_hint, (
-            f"/{name} lost its [N] count argument hint"
-        )
+    assert "N" in reg["undo"].args_hint, "/undo lost its [N] count argument hint"
 
 
 def test_branch_keeps_the_fork_alias():

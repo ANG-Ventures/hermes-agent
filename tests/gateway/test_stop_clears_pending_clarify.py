@@ -45,7 +45,6 @@ def _bare_runner():
     runner = object.__new__(GatewayRunner)
     runner._running_agents = {}
     runner._running_agent_tasks = {}
-    runner._draining_turns = {}
     runner._pending_messages = {}
     runner.session_store = MagicMock()
     runner.session_store._entries = {}

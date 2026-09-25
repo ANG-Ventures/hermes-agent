@@ -8,7 +8,7 @@ history, fires the memory-provider hook with ``rewound=True``, and
 returns ``{"type": "prefill", "message": <text>, "notice": ...}`` so
 the Ink client drops the message into the composer for editing.
 
-``/undo N`` backs up N half-turns at once (default 1). See issue #21910.
+``/undo N`` backs up N user turns at once (default 1). See issue #21910.
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def test_undo_returns_prefill_with_target_text(server, session_with_history):
     resp = _call(server, "command.dispatch", session_id=sid, name="undo", arg="")
     result = resp["result"]
     assert result["type"] == "prefill"
-    # Default /undo removes the assistant half-turn and prefills the surviving user tail.
+    # Default /undo backs up one user turn — "question 3"
     assert result["message"] == "question 3"
     assert "Undid" in result["notice"]
     assert s["history"]

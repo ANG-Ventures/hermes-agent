@@ -476,20 +476,10 @@ async def test_gateway_retry_stops_when_transcript_rewrite_fails():
     )
 
 
-def test_gateway_undo_keeps_composite_carrier_intact(
+def test_gateway_undo_prefills_live_carrier_text_and_keeps_scaffold(
     tmp_path, monkeypatch
 ):
-    """Gateway /undo on a composite-carrier turn must not lose the scaffold.
-
-    Fork mechanism (shared hermes_undo core, half-turn semantics — adjudicated
-    in RESOLUTION-LEDGER-2026-08-29.md rows 96-98): /undo retires ONE half-turn
-    (the failed assistant reply) and the carrier user row survives ACTIVE with
-    BOTH the compacted history and the live ask intact — no data loss.
-    (Upstream's retired inline rewind instead split the carrier: retired 2 rows
-    and re-inserted the hidden handoff, asserting target_text == "REAL ASK".)
-    """
     import hermes_state
-    import hermes_undo
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
 
     store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
@@ -497,27 +487,17 @@ def test_gateway_undo_keeps_composite_carrier_intact(
     store._db.create_session(session_id=session_id, source="test")
     store._db.append_message(session_id, "user", _composite_carrier()["content"])
     store._db.append_message(session_id, "assistant", "failed answer")
-    hermes_undo._session_db = store._db
-    hermes_undo.clear_state()
 
     result = store.rewind_session(session_id)
 
-    assert result is not None and "status" not in result
-    assert len(result["rewound_ids"]) == 1  # the failed assistant reply only
+    assert result["target_text"] == "REAL ASK"
+    assert result["rewound_count"] == 2
     active = store._db.get_messages_as_conversation(
         session_id, include_row_ids=True
     )
     assert len(active) == 1
-    # Carrier survives as the active head with scaffold AND live ask intact.
-    assert active[0]["role"] == "user"
-    assert "REAL ASK" in active[0]["content"]
-    assert "old task" in active[0]["content"]
-    # The retired reply is soft-deleted (audit-recoverable), not hard-deleted.
-    rows = store._db._conn.execute(
-        "SELECT role, active FROM messages WHERE session_id = ? ORDER BY id",
-        (session_id,),
-    ).fetchall()
-    assert [tuple(row) for row in rows] == [("user", 1), ("assistant", 0)]
+    assert active[0]["display_kind"] == "hidden"
+    assert "REAL ASK" not in active[0]["content"]
 
 
 @pytest.mark.asyncio

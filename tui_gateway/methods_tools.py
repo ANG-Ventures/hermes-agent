@@ -1034,35 +1034,6 @@ def _(rid, params: dict) -> dict:
             {"type": "prefill", "message": target_text, "notice": notice},
         )
 
-    if name == "redo":
-        if not session:
-            return _err(rid, 4001, "no active session to redo")
-        if session.get("running"):
-            return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /redo"
-            )
-        n = 1
-        arg_str = (arg or "").strip()
-        if arg_str:
-            try:
-                n = int(arg_str.split()[0])
-            except (ValueError, IndexError):
-                return _err(rid, 4004, f"redo: invalid count {arg_str!r} — use /redo or /redo N")
-        result = _redo_session_core(rid, session, n)
-        if "error" in result:
-            return result
-        payload = result.get("result", {})
-        reactivated = int(payload.get("reactivated_count") or 0)
-        if reactivated <= 0:
-            return _ok(rid, {"type": "notice", "notice": payload.get("message") or "nothing to redo"})
-        return _ok(
-            rid,
-            {
-                "type": "notice",
-                "notice": f"↷ Redid {n} undo operation(s) ({reactivated} message(s) restored).",
-            },
-        )
-
     if name in {"snapshot", "snap"}:
         subcommand = arg.split(maxsplit=1)[0].lower() if arg else ""
         if subcommand in {"restore", "rewind"}:

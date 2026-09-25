@@ -421,14 +421,6 @@ gateway:
       **العرض:** show, hide
 
       **الحفظ:** أضف `--global` للحفظ بعد هذه الجلسة'
-  redo:
-    busy: ⏳ The database was busy — nothing was changed. Try /redo again in a moment.
-    draining: ⏳ The last turn was stopped but is still finishing its current step — /redo can't run yet. Try again in a moment.
-    error: ⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged.
-    invalid_count: Invalid count "{arg}" — use /redo or /redo N.
-    nothing: Nothing to redo.
-    restart_lost: Nothing to redo — redo history does not survive a restart.
-    restored: ↪️ Redid {ops} undo operation(s) ({count} message(s) restored).
   reload_mcp:
     added: '➕ أُضيف: {names}'
     always_followup: 'ℹ️ ستُشغَّل استدعاءات `/reload-mcp` المستقبلية دون تأكيد. أعِد التفعيل عبر `approvals.mcp_reload_confirm: true` في config.yaml.'
@@ -645,22 +637,13 @@ gateway:
     unauthorized: غير مصرّح لك باستخدام /topic على هذا البوت.
     untitled_session: جلسة دون عنوان
   undo:
-    busy: ⏳ The database was busy — nothing was changed. Try /undo again in a moment.
-    draining: ⏳ The last turn was stopped but is still finishing its current step — /undo can't run yet. Try again in a moment.
-    error: ⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged.
     invalid_count: عدد غير صالح "{arg}" — استخدم /undo أو /undo N.
     nothing: لا شيء للتراجع عنه.
-    now_at: '↦ Now at — {who}:
+    removed: '↩️ تم التراجع عن {turns} دور ({count} رسالة).
 
-      “{preview}”'
-    now_at_notext: ↦ Now at — {who} (no text).
-    now_empty: ↦ Now at — start of the thread (no messages left).
-    party:
-      assistant: my reply
-      message: the last message
-      tool: a tool result
-      user: your message
-    removed: ↩️ تم التراجع عن {turns} دور ({count} رسالة).
+      نُسخ احتياطيًا إلى: "{preview}"
+
+      انسخ/عدّل النص أعلاه وأرسله لإعادة التوجيه من هنا.'
   update:
     hermes_cmd_not_found: ✗ تعذّر تحديد موقع أمر `hermes`. Hermes يعمل، لكن أمر التحديث لم يجد الملف التنفيذي على PATH أو عبر مُفسّر Python الحالي. جرّب تشغيل `hermes update` يدويًا في طرفيتك.
     not_git_repo: ✗ ليس مستودع git — لا يمكن التحديث.

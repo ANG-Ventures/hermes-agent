@@ -853,14 +853,6 @@ def _(rid, params: dict) -> dict:
     # string to a "disk full" toast so the user knows why the send vanished.
     try:
         _ensure_session_db_row(session)
-        # A user turn invalidates any pending redo stack (hermes_undo): the
-        # branch the redo would have restored is no longer the live tail.
-        try:
-            from hermes_undo import on_user_message_appended
-
-            on_user_message_appended(session["session_key"])
-        except Exception as exc:
-            print(f"[tui_gateway] redo clear on user append failed: {exc}", file=sys.stderr)
         # A branch becomes real here: copy its parent's transcript into the row so it
         # resumes with full context (the agent won't persist the seed itself).
         _persist_branch_seed(session)

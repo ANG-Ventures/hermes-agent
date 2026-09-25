@@ -405,14 +405,6 @@ gateway:
       **Visualización:** show, hide
 
       **Persistir:** añade `--global` para guardar más allá de esta sesión'
-  redo:
-    busy: ⏳ The database was busy — nothing was changed. Try /redo again in a moment.
-    draining: ⏳ El último turno se detuvo pero aún está terminando su paso actual — /redo no puede ejecutarse todavía. Inténtalo de nuevo en un momento.
-    error: ⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged.
-    invalid_count: Invalid count "{arg}" — use /redo or /redo N.
-    nothing: Nothing to redo.
-    restart_lost: Nothing to redo — redo history does not survive a restart.
-    restored: ↪️ Redid {ops} undo operation(s) ({count} message(s) restored).
   reload_mcp:
     added: '➕ Añadidos: {names}'
     always_followup: 'ℹ️ Las próximas llamadas a `/reload-mcp` se ejecutarán sin confirmación. Reactiva mediante `approvals.mcp_reload_confirm: true` en `config.yaml`.'
@@ -629,22 +621,13 @@ gateway:
     unauthorized: No tienes autorización para usar /topic en este bot.
     untitled_session: Sesión sin título
   undo:
-    busy: ⏳ The database was busy — nothing was changed. Try /undo again in a moment.
-    draining: ⏳ El último turno se detuvo pero aún está terminando su paso actual — /undo no puede ejecutarse todavía. Inténtalo de nuevo en un momento.
-    error: ⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged.
     invalid_count: Cantidad no válida "{arg}" — usa /undo o /undo N.
     nothing: Nada que deshacer.
-    now_at: '↦ Now at — {who}:
+    removed: '↩️ {turns} turno(s) deshecho(s) ({count} mensaje(s)).
 
-      “{preview}”'
-    now_at_notext: ↦ Now at — {who} (no text).
-    now_empty: ↦ Now at — start of the thread (no messages left).
-    party:
-      assistant: my reply
-      message: the last message
-      tool: a tool result
-      user: your message
-    removed: ↩️ Undid {turns} half-turn(s) ({count} message(s)).
+      Respaldado en: "{preview}"
+
+      Copia/edita el texto de arriba y envíalo para volver a preguntar desde aquí.'
   update:
     hermes_cmd_not_found: ✗ No se pudo localizar el comando `hermes`. Hermes está en ejecución, pero el comando de actualización no encontró el ejecutable en PATH ni a través del intérprete de Python actual. Intenta ejecutar `hermes update` manualmente en tu terminal.
     not_git_repo: ✗ No es un repositorio git — no se puede actualizar.

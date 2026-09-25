@@ -458,7 +458,6 @@ py-modules = [
   "hermes_test_context",
   "hermes_time",
   "hermes_logging",
-  "hermes_undo",
   "utils",
   "mcp_serve",
 ]

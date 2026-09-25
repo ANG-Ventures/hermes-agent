@@ -405,14 +405,6 @@ gateway:
       **Megjelenítés:** show, hide
 
       **Megőrzés:** add hozzá a `--global` opciót a munkameneten túli mentéshez'
-  redo:
-    busy: ⏳ The database was busy — nothing was changed. Try /redo again in a moment.
-    draining: ⏳ Az utolsó kör leállt, de még az aktuális lépését fejezi be — a /redo még nem futtatható. Próbáld újra egy pillanat múlva.
-    error: ⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged.
-    invalid_count: Invalid count "{arg}" — use /redo or /redo N.
-    nothing: Nothing to redo.
-    restart_lost: Nothing to redo — redo history does not survive a restart.
-    restored: ↪️ Redid {ops} undo operation(s) ({count} message(s) restored).
   reload_mcp:
     added: '➕ Hozzáadva: {names}'
     always_followup: 'ℹ️ A jövőbeli `/reload-mcp` hívások megerősítés nélkül futnak. Újra engedélyezhető az `approvals.mcp_reload_confirm: true` beállítással a config.yaml fájlban.'
@@ -623,22 +615,13 @@ gateway:
     unauthorized: Nincs jogosultságod a /topic használatához ezen a boton.
     untitled_session: Cím nélküli munkamenet
   undo:
-    busy: ⏳ The database was busy — nothing was changed. Try /undo again in a moment.
-    draining: ⏳ Az utolsó kör leállt, de még az aktuális lépését fejezi be — a /undo még nem futtatható. Próbáld újra egy pillanat múlva.
-    error: ⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged.
     invalid_count: Érvénytelen szám "{arg}" — használd a /undo vagy /undo N parancsot.
     nothing: Nincs mit visszavonni.
-    now_at: '↦ Now at — {who}:
+    removed: '↩️ {turns} fordulat visszavonva ({count} üzenet).
 
-      “{preview}”'
-    now_at_notext: ↦ Now at — {who} (no text).
-    now_empty: ↦ Now at — start of the thread (no messages left).
-    party:
-      assistant: my reply
-      message: the last message
-      tool: a tool result
-      user: your message
-    removed: ↩️ Undid {turns} half-turn(s) ({count} message(s)).
+      Biztonsági mentés ide: "{preview}"
+
+      Másold/szerkeszd a fenti szöveget, és küldd el, hogy innen újra kérdezz.'
   update:
     hermes_cmd_not_found: ✗ Nem sikerült megtalálni a `hermes` parancsot. A Hermes fut, de a frissítőparancs nem találta a futtatható fájlt a PATH-on vagy a jelenlegi Python interpreteren keresztül. Próbáld futtatni a `hermes update` parancsot manuálisan a terminálban.
     not_git_repo: ✗ Nem git-tárhely — frissítés nem lehetséges.

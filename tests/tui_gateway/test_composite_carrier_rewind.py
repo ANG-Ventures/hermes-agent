@@ -76,10 +76,10 @@ def _dispatch(sid: str, name: str) -> dict:
     )
 
 
-def _session_undo(sid: str, n: int = 1) -> dict:
+def _session_undo(sid: str) -> dict:
     return server._methods["session.undo"](
         "request-id",
-        {"session_id": sid, "n": n},
+        {"session_id": sid},
     )
 
 
@@ -363,11 +363,7 @@ def test_session_undo_preserves_the_composite_carriers_scaffold(carrier_session)
         [_composite_carrier(), {"role": "assistant", "content": "answer"}]
     )
 
-    # Fork architecture note (parity 2026-08-29): session.undo is half-turn
-    # based (hermes_undo core, paired with session.redo) — upstream's rewrite
-    # rewinds a whole user turn per call. n=2 half-turns covers the same
-    # exchange; the scaffold-preservation contract under test is identical.
-    response = _session_undo(sid, n=2)
+    response = _session_undo(sid)
 
     assert response["result"]["removed"] == 2
     _assert_scaffold_preserved(db, session_key, session)

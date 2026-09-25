@@ -405,14 +405,6 @@ gateway:
       **Показ:** show, hide
 
       **Зберегти:** додайте `--global`, щоб зберегти поза цим сеансом'
-  redo:
-    busy: ⏳ The database was busy — nothing was changed. Try /redo again in a moment.
-    draining: ⏳ Останній хід зупинено, але він ще завершує поточний крок — /redo поки недоступний. Повторіть за мить.
-    error: ⚠️ Couldn't complete /redo (internal error — nothing was changed). It's been logged.
-    invalid_count: Invalid count "{arg}" — use /redo or /redo N.
-    nothing: Nothing to redo.
-    restart_lost: Nothing to redo — redo history does not survive a restart.
-    restored: ↪️ Redid {ops} undo operation(s) ({count} message(s) restored).
   reload_mcp:
     added: '➕ Додано: {names}'
     always_followup: 'ℹ️ Наступні виклики `/reload-mcp` виконуватимуться без підтвердження. Увімкнути знову можна через `approvals.mcp_reload_confirm: true` у `config.yaml`.'
@@ -623,22 +615,13 @@ gateway:
     unauthorized: Ви не маєте дозволу використовувати /topic у цьому боті.
     untitled_session: Сесія без назви
   undo:
-    busy: ⏳ The database was busy — nothing was changed. Try /undo again in a moment.
-    draining: ⏳ Останній хід зупинено, але він ще завершує поточний крок — /undo поки недоступний. Повторіть за мить.
-    error: ⚠️ Couldn't complete /undo (internal error — nothing was changed). It's been logged.
     invalid_count: Недійсне число «{arg}» — використовуйте /undo або /undo N.
     nothing: Немає чого скасовувати.
-    now_at: '↦ Now at — {who}:
+    removed: '↩️ Скасовано ходів: {turns} (повідомлень: {count}).
 
-      “{preview}”'
-    now_at_notext: ↦ Now at — {who} (no text).
-    now_empty: ↦ Now at — start of the thread (no messages left).
-    party:
-      assistant: my reply
-      message: the last message
-      tool: a tool result
-      user: your message
-    removed: ↩️ Undid {turns} half-turn(s) ({count} message(s)).
+      Резервна копія: «{preview}»
+
+      Скопіюйте/відредагуйте текст вище та надішліть його, щоб запитати знову звідси.'
   update:
     hermes_cmd_not_found: ✗ Не вдалося знайти команду `hermes`. Hermes запущено, але команда оновлення не знайшла виконуваний файл у PATH або через поточний інтерпретатор Python. Спробуйте виконати `hermes update` вручну у вашому терміналі.
     not_git_repo: ✗ Не git-репозиторій — оновлення неможливе.

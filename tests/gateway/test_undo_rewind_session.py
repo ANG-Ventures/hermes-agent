@@ -1,8 +1,9 @@
 """Tests for SessionStore.rewind_session — the gateway /undo [N] primitive.
 
-The gateway /undo backs up N half-turns by soft-deleting rows in state.db
-(active=0, kept for audit, hidden from re-prompts/search) via the shared
-undo core. load_transcript returns only the active view. See issue #21910.
+The gateway /undo backs up N user turns by soft-deleting the truncated rows
+in state.db (active=0, kept for audit, hidden from re-prompts/search) via
+SessionDB.rewind_to_message, rather than the old hard rewrite_transcript.
+load_transcript returns only the active view. See issue #21910.
 """
 
 from __future__ import annotations
@@ -37,34 +38,23 @@ def _seed(store, sid, source="telegram", turns=3):
 def test_rewind_default_one_turn(store):
     sid = _seed(store, "gw-1")
     res = store.rewind_session(sid)
-    assert res["rewound_ids"]
-    assert res["prefill_text"] == "q3"
-    assert len(res["rewound_ids"]) == 1  # a3
+    assert res["turns_undone"] == 1
+    assert res["target_text"] == "q3"
+    assert res["rewound_count"] == 2  # q3 + a3
     active = store.load_transcript(sid)
-    assert [m["role"] for m in active] == ["user", "assistant", "user", "assistant", "user"]
+    assert [m["role"] for m in active] == ["user", "assistant", "user", "assistant"]
 
 
 def test_rewind_n_turns(store):
     sid = _seed(store, "gw-2")
     res = store.rewind_session(sid, 2)
-    assert len(res["rewound_ids"]) == 2  # q3,a3
-    assert res["prefill_text"] is None
-    assert len(store.load_transcript(sid)) == 4  # q1,a1,q2,a2
+    assert res["turns_undone"] == 2
+    assert res["target_text"] == "q2"
+    assert res["rewound_count"] == 4  # q2,a2,q3,a3
+    assert len(store.load_transcript(sid)) == 2  # q1,a1
 
 
-def test_rewind_operates_on_raw_active_rows_not_projection(store):
-    """The fork /undo (shared hermes_undo core, half-turn semantics) computes
-    its target on the RAW active row set, not the replay projection.
-
-    Legacy background-review rows are intentionally absent from replay, but
-    remain physical active rows. The rewind must neither lose them nor corrupt
-    the visible transcript: exactly one raw half-turn (the physical tail, here
-    the curator-only reply) is soft-deleted, everything else stays active.
-
-    (Upstream's inline full-user-turn CAS rewind asserted target_text == "q2"
-    / rewound_count == 4 here; that mechanism was retired in favor of the
-    fork's hermes_undo core — RESOLUTION-LEDGER-2026-08-29.md rows 96/97/111.)
-    """
+def test_rewind_pins_raw_active_ids_when_projection_hides_review_harness(store):
     sid = _seed(store, "gw-review-harness", turns=2)
     store._db.append_message(
         sid,
@@ -73,53 +63,26 @@ def test_rewind_operates_on_raw_active_rows_not_projection(store):
     )
     store._db.append_message(sid, "assistant", "curator-only reply")
 
+    # Legacy background-review rows are intentionally absent from replay, but
+    # they remain physical active rows that the rewind CAS must pin.
     assert [message["content"] for message in store.load_transcript(sid)] == [
         "q1",
         "a1",
         "q2",
         "a2",
     ]
-    raw_before = store._db._conn.execute(
-        "SELECT id, content FROM messages "
-        "WHERE session_id = ? AND active = 1 ORDER BY id",
-        (sid,),
-    ).fetchall()
-    curator_reply_id = raw_before[-1][0]
 
     result = store.rewind_session(sid)
 
     assert result is not None
-    assert "status" not in result
-    # Half-turn contract: only the raw physical tail was retired, soft-deleted
-    # (recoverable for audit), not hard-deleted.
-    assert result["rewound_ids"] == [curator_reply_id]
-    rows = store._db._conn.execute(
-        "SELECT id, active FROM messages WHERE session_id = ? ORDER BY id",
-        (sid,),
-    ).fetchall()
-    assert [tuple(row) for row in rows] == [
-        (row_id, 1) for row_id, _ in raw_before[:-1]
-    ] + [(curator_reply_id, 0)]
-    # The visible transcript is uncorrupted.
+    assert result["target_text"] == "q2"
+    assert result["rewound_count"] == 4
     assert [message["content"] for message in store.load_transcript(sid)] == [
         "q1",
         "a1",
-        "q2",
-        "a2",
     ]
 
 
-_CAS_STOP_REASON = (
-    "STOP-B1 (docs/sync/review/FIXPASS-LOG-B.md): fail-closed CAS for the plain "
-    "/undo path requires adopting expected_active_ids in hermes_undo.undo's "
-    "rewind_to_message call — hermes_undo.py is outside card-B file ownership "
-    "(^tests/gateway/ + gateway/ only). Until that lands, a cross-process "
-    "append racing /undo between its snapshot read and its write is silently "
-    "soft-deleted along with the rewind."
-)
-
-
-@pytest.mark.xfail(reason=_CAS_STOP_REASON, strict=False)
 def test_rewind_fails_closed_when_transcript_changes_after_snapshot(
     store, monkeypatch
 ):
@@ -133,12 +96,7 @@ def test_rewind_fails_closed_when_transcript_changes_after_snapshot(
 
     monkeypatch.setattr(store._db, "rewind_to_message", _append_then_rewind)
 
-    result = store.rewind_session(sid)
-    # Fail-closed contract: when the active transcript changed between the
-    # snapshot read and the write, NOTHING may be mutated. (The fork's honesty
-    # contract reports the conflict as a retryable sentinel, never a silent
-    # success — any of None/busy/error is acceptable as long as no row moved.)
-    assert result is None or result.get("status") in ("busy", "error")
+    assert store.rewind_session(sid) is None
 
     rows = store._db._conn.execute(
         "SELECT content, active FROM messages "
@@ -155,31 +113,26 @@ def test_rewind_fails_closed_when_transcript_changes_after_snapshot(
     sibling.close()
 
 
-@pytest.mark.xfail(reason=_CAS_STOP_REASON, strict=False)
 def test_rewind_fails_closed_when_new_turn_lands_after_id_snapshot(
     store, monkeypatch
 ):
     sid = _seed(store, "gw-snapshot-order", turns=2)
     sibling = SessionDB(db_path=store._db.db_path)
-    # The fork undo core snapshots via SessionDB.get_messages (upstream's
-    # inline rewind used get_messages_as_conversation); inject the race at the
-    # read the live code path actually performs, one-shot so the post-commit
-    # prefill read doesn't re-fire it.
-    original_load = store._db.get_messages
-    fired = {"done": False}
+    original_load = store._db.get_messages_as_conversation
+
+    calls = []
 
     def _load_then_append(*args, **kwargs):
         snapshot = original_load(*args, **kwargs)
-        if not fired["done"]:
-            fired["done"] = True
+        if not calls:  # one new turn lands between the id snapshot and the write, however often the DB is read
             sibling.append_message(sid, "user", "q3-from-other-process")
             sibling.append_message(sid, "assistant", "a3-from-other-process")
+        calls.append(1)
         return snapshot
 
-    monkeypatch.setattr(store._db, "get_messages", _load_then_append)
+    monkeypatch.setattr(store._db, "get_messages_as_conversation", _load_then_append)
 
-    result = store.rewind_session(sid)
-    assert result is None or result.get("status") in ("busy", "error")
+    assert store.rewind_session(sid) is None
 
     rows = store._db._conn.execute(
         "SELECT content, active FROM messages "
@@ -195,3 +148,40 @@ def test_rewind_fails_closed_when_new_turn_lands_after_id_snapshot(
         ("a3-from-other-process", 1),
     ]
     sibling.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_evicts_cached_agent_under_profile_namespaced_key():
+    """/undo must evict under the key the cache is keyed by. On a multiplexed gateway that is
+    ``agent:<profile>:…``; a bare ``build_session_key(source)`` yields ``agent:main:…``, the
+    eviction misses and the next turn reuses an agent still holding the undone turns."""
+    from gateway.platforms.base import Platform, SessionSource
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.session import build_session_key
+
+    class _Entry:
+        session_id = "sid"
+        last_prompt_tokens = 0
+
+    class _Store:
+        async def get_or_create_session(self, source):
+            return _Entry()
+
+        async def rewind_session(self, sid, n):
+            return {"target_text": "q3", "turns_undone": 1, "rewound_count": 2}
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", user_id="u1")
+    source.profile = "work"
+    evicted = []
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.session_store = _Store()
+    runner._async_session_store = _Store()
+    runner._async_session_store._store = runner.session_store
+    runner._evict_cached_agent = evicted.append
+    runner._session_key_for_source = lambda s: build_session_key(s, profile=s.profile)
+
+    await runner._handle_undo_command(MessageEvent(text="/undo", message_type=MessageType.TEXT, source=source))
+
+    assert evicted == ["agent:work:telegram:dm:123"]

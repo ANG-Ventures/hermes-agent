@@ -429,14 +429,14 @@ def test_R3_rewind_after_header_keeps_dedupe_after_restart(mod, home):
     assert out is None
 
 
-def test_R3_redo_restores_header_and_dedupe(mod, home):
+def test_R3_restore_rewound_restores_header_and_dedupe(mod, home):
     _card(_board(home), "t_home0001", session_id=SID)
     db = _state_db(mod, SID, 3, header_at=1)
     uids = _user_ids(db, SID)
     db.rewind_to_message(SID, uids[1])
     inactive = [m["id"] for m in db.get_messages(SID, include_inactive=True)
                 if m["id"] >= uids[1]]
-    assert db.restore_ids(SID, inactive) == len(inactive)
+    assert db.restore_rewound(SID, uids[1]) == len(inactive)
     _, out = _restart_and_hook(SID, db)
     assert out is None
 

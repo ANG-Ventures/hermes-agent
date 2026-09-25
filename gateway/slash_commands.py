@@ -37,7 +37,6 @@ from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
     SessionSource,
-    build_session_key,
     is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
@@ -4133,172 +4132,42 @@ class GatewaySlashCommandsMixin:
                 pass
         return output
 
-    def _session_turn_draining(self, source: "SessionSource") -> bool:
-        """True if this source's session has a /stop'd-but-still-draining turn.
-
-        After /stop, the running-agent slot is released immediately but the turn
-        coroutine keeps appending transcript rows until it reaches its next
-        cooperative interrupt checkpoint. A rewind (/undo) or restore (/redo)
-        during that window races the still-writing turn and produces a landing
-        the drain immediately clobbers (the 2026-07-14 undo-clobber incident).
-        Reads `_draining_turns`, pruning the entry on access once its task is
-        done. FAIL-OPEN: any lookup/introspection error returns False so a guard
-        bug can never wedge /undo — the worst case reverts to prior behavior.
-        """
-        try:
-            session_key = self._session_key_for_source(source)
-            draining = getattr(self, "_draining_turns", None)
-            if not draining:
-                return False
-            task = draining.get(session_key)
-            if task is None:
-                return False
-            if task.done():
-                draining.pop(session_key, None)  # prune-on-access
-                return False
-            return True
-        except Exception as e:  # pragma: no cover - defensive fail-open
-            logger.debug("undo/redo drain-guard lookup skipped: %s", e)
-            return False
-
     async def _handle_undo_command(self, event: MessageEvent) -> str:
-        """Handle /undo [N] by delegating to the shared half-turn undo core."""
+        """Handle /undo [N] — back up N user turns (default 1), soft-deleting
+        the truncated rows on disk and echoing the backed-up message text so
+        the user can copy/edit and resend.
+
+        Rewound rows stay in state.db (active=0) for audit and are hidden from
+        re-prompts and search. The cached agent is evicted so the next message
+        rebuilds context from the truncated (active-only) transcript.
+        """
         source = event.source
-
-        # Refuse while a /stop'd turn is still draining (still writing rows) —
-        # a rewind here would race it and land somewhere the drain clobbers.
-        if self._session_turn_draining(source):
-            return t("gateway.undo.draining")
-
-        # Parse optional half-turn count: "/undo" → 1, "/undo 3" → 3.
         n = 1
         raw_args = event.get_command_args().strip()
         if raw_args:
             try:
-                n = int(raw_args.split()[0])
-            except (ValueError, IndexError):
+                n = max(1, int(raw_args.split()[0]))
+            except ValueError:
                 return t("gateway.undo.invalid_count", arg=raw_args.split()[0])
-            if n < 1:
-                n = 1
-
         session_entry = await self.async_session_store.get_or_create_session(source)
         result = await self.async_session_store.rewind_session(session_entry.session_id, n)
-
         if result is None:
             return t("gateway.undo.nothing")
-        # Honest reporting of a non-empty failure (2026-07-15 fix): distinguish a
-        # transient DB-busy from a real internal error — never render either as
-        # "Nothing to undo." Both mean the rewind did NOT happen (validation +
-        # orphan-guard run before the write).
-        status = result.get("status") if isinstance(result, dict) else None
-        if status == "busy":
-            return t("gateway.undo.busy")
-        if status == "error":
-            return t("gateway.undo.error")
-
-        # Reset stored token count — transcript was truncated.
-        session_entry.last_prompt_tokens = 0
-        # Evict the cached agent so the next turn rebuilds from the active-only
-        # transcript and memory providers refresh their per-session caches.
+        session_entry.last_prompt_tokens = 0  # transcript was truncated
         try:
-            session_key = build_session_key(source)
-            self._evict_cached_agent(session_key)
+            # The cache is keyed by the profile-namespaced key; a bare
+            # build_session_key(source) misses for every secondary profile.
+            self._evict_cached_agent(self._session_key_for_source(source))
         except Exception as e:
             logger.debug("undo: cached-agent eviction skipped: %s", e)
-
+        target_text = result["target_text"]
+        preview = target_text[:200] + "..." if len(target_text) > 200 else target_text
         return t(
             "gateway.undo.removed",
-            turns=n,
-            count=len(result.get("rewound_ids") or []),
-        ) + self._undo_tail_suffix(session_entry.session_id)
-
-    def _undo_tail_suffix(self, session_id: str) -> str:
-        """Render a one-line '↦ now at …' confirmation of the active tail.
-
-        Lets a user confirm at a glance WHERE the thread landed after /undo or
-        /redo — which message is now last — without scrolling. Best-effort:
-        never let a preview failure break the command's primary reply.
-        """
-        try:
-            import hermes_undo
-
-            hermes_undo._session_db = self.session_store._db
-            info = hermes_undo.tail_preview(session_id)
-        except Exception as e:
-            logger.debug("undo/redo tail preview skipped: %s", e)
-            return ""
-        # The read itself failed (transient DB error) — the primary undo/redo
-        # already succeeded, so omit the suffix rather than misreport "empty".
-        if info.get("error"):
-            return ""
-        if info.get("empty"):
-            return "\n" + t("gateway.undo.now_empty")
-        # Bound the role to the set that has a translated party label; an
-        # unexpected role (system/developer/legacy function) would otherwise
-        # ask t() for a missing key and render the raw key path to the user.
-        role = info.get("role") or "message"
-        if role not in {"user", "assistant", "tool", "message"}:
-            role = "message"
-        who = t(f"gateway.undo.party.{role}")
-        preview = info.get("preview")
-        if preview:
-            return "\n" + t("gateway.undo.now_at", who=who, preview=preview)
-        return "\n" + t("gateway.undo.now_at_notext", who=who)
-
-    async def _handle_redo_command(self, event: MessageEvent) -> str:
-        """Handle /redo [N] by delegating to the shared redo core."""
-        source = event.source
-        # Same drain guard as /undo: a restore during a /stop'd turn's drain
-        # window races the still-writing turn.
-        if self._session_turn_draining(source):
-            return t("gateway.redo.draining")
-        n = 1
-        raw_args = event.get_command_args().strip()
-        if raw_args:
-            try:
-                n = int(raw_args.split()[0])
-            except (ValueError, IndexError):
-                return t("gateway.redo.invalid_count", arg=raw_args.split()[0])
-
-        session_entry = await self.async_session_store.get_or_create_session(source)
-        result = await self.async_session_store.restore_session(session_entry.session_id, n)
-        if result is None:
-            return t("gateway.redo.nothing")
-        # Honest reporting of a non-empty failure (2026-07-15 fix): a transient
-        # DB-busy or a real internal error must not read as "nothing to redo".
-        status = result.get("status") if isinstance(result, dict) else None
-        if status == "busy":
-            return t("gateway.redo.busy")
-        if status == "error":
-            return t("gateway.redo.error")
-
-        reactivated = int(result.get("reactivated_count") or 0)
-        if reactivated <= 0:
-            message = str(result.get("message") or "")
-            if "restart" in message:
-                return t("gateway.redo.restart_lost")
-            return t("gateway.redo.nothing")
-
-        session_entry.last_prompt_tokens = 0
-        try:
-            session_key = build_session_key(source)
-            self._evict_cached_agent(session_key)
-        except Exception as e:
-            logger.debug("redo: cached-agent eviction skipped: %s", e)
-
-        base = t(
-            "gateway.redo.restored",
-            ops=n,
-            count=reactivated,
+            turns=result["turns_undone"],
+            count=result["rewound_count"],
+            preview=preview,
         )
-        # If only SOME ops were redone (a transcript rewrite or a mid-loop
-        # transient/hard error), surface the honest partial note the undo core
-        # produced instead of implying a full redo. Detect via the language-
-        # neutral ``partial`` flag, not the (English) message text.
-        partial_note = str(result.get("message") or "")
-        if result.get("partial") and partial_note:
-            base = f"{base}\n⚠️ {partial_note}"
-        return base + self._undo_tail_suffix(session_entry.session_id)
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""

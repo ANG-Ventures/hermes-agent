@@ -4058,20 +4058,6 @@ class CompressionSessionClosedError(RuntimeError):
         )
 
 
-class RewindWouldOrphanError(ValueError):
-    """A rewind target would orphan an active tool row (deactivate an
-    ``assistant(tool_calls)`` while its ``tool`` result stays active).
-
-    Subclasses ``ValueError`` so existing ``except ValueError`` callers still
-    catch it. This is a TRANSIENT, self-healing condition: it fires when a
-    concurrent turn is mid-flush (the ``assistant(tool_calls)``→``tool`` pair
-    is being written), and clears once the flush completes. Callers should
-    report it as retryable ("try again in a moment"), NOT a permanent internal
-    error — see the 2026-07-15 false-"Nothing to undo" incident.
-    """
-
-
-
 class TranscriptInvariantError(ValueError):
     """A transcript rewrite would leave two ACTIVE result rows for one tool call.
 
@@ -14924,7 +14910,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         target_message_id: int,
-        require_user_role: bool = True,
         *,
         preserve_compaction_handoff: bool = False,
         expected_active_ids: Optional[List[int]] = None,
@@ -14943,13 +14928,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             {
                 "rewound_count": int,    # number of rows newly flipped to active=0
                 "target_message": dict,  # full row dict of the target
-                "new_head_id":   int|None, # id of the last still-active row, or None
-                "rewound_ids":   list[int] # rows newly flipped active=1 -> active=0
+                "new_head_id":   int|None  # id of the last still-active row, or None
             }
 
         Raises ``ValueError`` if the target message does not exist in
-        *session_id* or, when ``require_user_role`` is true, if its role is
-        not ``"user"``.  With
+        *session_id* or if its role is not ``"user"``.  With
         ``preserve_compaction_handoff=True``, a composite summary carrier is
         split inside the same write transaction: its original row is archived
         and its canonical hidden handoff scaffold is inserted as the new head.
@@ -15003,7 +14986,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"message {target_message_id} not found in session {session_id}"
                 )
             target_row = dict(row)
-            if require_user_role and target_row.get("role") != "user":
+            if target_row.get("role") != "user":
                 raise ValueError(
                     f"rewind target must be a 'user' message (got role="
                     f"{target_row.get('role')!r}, id={target_message_id})"
@@ -15041,16 +15024,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "preserve_compaction_handoff requires an active composite carrier"
                     )
                 replacement = handoff if preserve_compaction_handoff else None
-
-            # Fork guard (orphaned-tool-row protection). Upstream moved the
-            # whole rewind inside this write transaction, so the guard has to
-            # move with it — and it must reuse ``conn``: ``_execute_write``
-            # already holds ``self._lock`` (a plain, non-reentrant Lock), so
-            # the guard's own ``with self._lock`` would self-deadlock here.
-            # Runs before any mutation, same as the fork's pre-txn placement.
-            self._raise_if_rewind_would_orphan_tool(
-                session_id, target_message_id, conn=conn
-            )
 
             cursor = conn.execute(
                 "SELECT id FROM messages "
@@ -15109,74 +15082,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "rewound_count": len(rewound),
             "target_message": target_row,
             "new_head_id": new_head_id,
-            "rewound_ids": rewound,
         }
         if preserve_compaction_handoff:
             result["replacement_message_id"] = replacement_message_id
         return result
 
-    def _raise_if_rewind_would_orphan_tool(
-        self, session_id: str, target_message_id: int, conn=None
-    ) -> None:
-        """Fail before an id-range rewind can leave a tool row without owner.
-
-        ``conn``: when supplied, the read runs on the caller's live write
-        connection. rewind_to_message now calls this from INSIDE
-        ``_execute_write``, which already holds ``self._lock``; re-acquiring
-        that non-reentrant lock here would deadlock.
-        """
-        if conn is not None:
-            rows = conn.execute(
-                "SELECT id, role, tool_call_id, tool_calls FROM messages "
-                "WHERE session_id = ? AND active = 1 ORDER BY id",
-                (session_id,),
-            ).fetchall()
-        else:
-            with self._read_ctx() as read_conn:
-                rows = read_conn.execute(
-                    "SELECT id, role, tool_call_id, tool_calls FROM messages "
-                    "WHERE session_id = ? AND active = 1 ORDER BY id",
-                    (session_id,),
-                ).fetchall()
-
-        assistant_call_ids: set[str] = set()
-        for row in rows:
-            if row["id"] < target_message_id or row["role"] != "assistant":
-                continue
-            raw = row["tool_calls"]
-            if not raw:
-                continue
-            try:
-                calls = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                calls = []
-            if isinstance(calls, dict):
-                calls = [calls]
-            if not isinstance(calls, list):
-                continue
-            for call in calls:
-                if isinstance(call, dict) and call.get("id"):
-                    assistant_call_ids.add(str(call["id"]))
-
-        if not assistant_call_ids:
-            return
-
-        for row in rows:
-            if row["id"] >= target_message_id or row["role"] != "tool":
-                continue
-            call_id = row["tool_call_id"]
-            if call_id and str(call_id) in assistant_call_ids:
-                raise RewindWouldOrphanError(
-                    "rewind would orphan active tool row "
-                    f"id={row['id']} by deactivating its assistant owner "
-                    f"at or after target id={target_message_id}"
-                )
-
     def restore_rewound(self, session_id: str, since_message_id: int) -> int:
-        """DEPRECATED for stacked undo/redo — use ``restore_ids``.
-
-        Mark inactive messages with id >= *since_message_id* active again.
-        ``id >=`` range restore clobbers stacked ops of differing N.
+        """Mark inactive messages with id >= *since_message_id* active again.
 
         Returns the number of rows flipped back to ``active=1``.
         Intended for undo-of-rewind and test cleanup; not wired to a
@@ -15199,44 +15111,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
-    def restore_ids(self, session_id: str, ids: List[int]) -> int:
-        """Reactivate the inactive rows in ``ids`` for ``session_id``.
-
-        Idempotent: rows that are already active, from another session, or
-        absent are skipped. ``redo_count`` is intentionally not bumped here;
-        the shared undo/redo core owns that single command-level counter.
-        """
-        bounded_ids = [int(i) for i in ids]
-        if not bounded_ids:
-            return 0
-
-        def _do(conn):
-            placeholders = ",".join("?" for _ in bounded_ids)
-            cursor = conn.execute(
-                f"UPDATE messages SET active = 1 "
-                f"WHERE session_id = ? AND id IN ({placeholders}) AND active = 0",
-                (session_id, *bounded_ids),
-            )
-            return cursor.rowcount
-
-        return self._execute_write(_do)
-
-    def bump_redo_count(self, session_id: str) -> None:
-        """Increment ``sessions.redo_count`` by one (once per /redo command).
-
-        Public helper so the shared undo/redo core doesn't reach into the
-        private ``_execute_write``. Counter asymmetry is intentional:
-        ``rewind_count`` bumps per low-level ``rewind_to_message`` call;
-        ``redo_count`` bumps once per /redo command, regardless of M.
-        """
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET redo_count = COALESCE(redo_count, 0) + 1 "
-                "WHERE id = ?",
-                (session_id,),
-            )
-
-        self._execute_write(_do)
     # =========================================================================
     # Search
     # =========================================================================

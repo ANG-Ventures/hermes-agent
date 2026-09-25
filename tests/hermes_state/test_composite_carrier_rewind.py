@@ -171,16 +171,8 @@ def test_default_rewind_return_shape_and_active_counters_remain_compatible(db):
 
     result = db.rewind_to_message(sid, target_id)
 
-    # Fork: rewound_ids rides along for the /undo half-turn feature
-    # (tui_gateway/server.py consumes it); the upstream trio stays intact.
-    assert set(result) == {
-        "rewound_count",
-        "target_message",
-        "new_head_id",
-        "rewound_ids",
-    }
+    assert set(result) == {"rewound_count", "target_message", "new_head_id"}
     assert result["rewound_count"] == 2
-    assert result["rewound_count"] == len(result["rewound_ids"])
     assert _session_counts(db, sid) == (2, 0, 1)
 
 

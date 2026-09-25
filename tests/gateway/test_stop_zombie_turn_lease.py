@@ -107,7 +107,6 @@ def _bare_runner(registry: SessionTurnLeaseRegistry):
     runner._turn_leases = registry
     runner._running_agents = {}
     runner._running_agent_tasks = {}
-    runner._draining_turns = {}
     runner._pending_messages = {}
     runner.session_store = MagicMock()
     runner.session_store._entries = {}

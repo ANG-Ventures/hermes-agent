@@ -2885,28 +2885,27 @@ def _(rid, params: dict) -> dict:
     # write would either clobber the undo (version matches) or
     # silently drop the agent's output (version mismatch, see below).
     # Neither is what the user wants — make them /interrupt first.
+    busy = _err(rid, 4009, "session busy — /interrupt the current turn before /undo")
     if session.get("running"):
-        return _err(
-            rid, 4009, "session busy — /interrupt the current turn before /undo"
+        return busy
+    removed = 0
+    with session["history_lock"]:
+        if session.get("running"):
+            return busy
+        history = _history_without_ephemeral_scaffolding(session.get("history", []))
+        # Truncate from the last *real* user turn (not a timeline marker /
+        # compaction handoff).
+        from agent.context_compressor import user_originated_turn_view
+
+        user_turns = sum(
+            1 for message in history if user_originated_turn_view(message) is not None
         )
-    # Fork architecture: undo/redo is DB-backed (hermes_undo + the
-    # rewind/reactivate stacks), not an in-memory history truncation, so the
-    # /undo N form and session.redo can share one implementation.
-    #
-    # Parity 2026-08-29: upstream's side of this hunk carried the #80622
-    # "skip synthetic timeline rows" fix in its truncation branch. That fix is
-    # NOT free on the fork path — hermes_undo.compute_half_turn_target counted
-    # every role="user" row, marker or not (verified: a trailing model_switch
-    # row was the undo target). It is now enforced at that shared choke point
-    # (hermes_undo._boundary_party), so both this method and the /undo N form
-    # inherit it.
-    try:
-        n = int(params.get("n", params.get("count", 1)) or 1)
-    except (TypeError, ValueError):
-        return _err(rid, 4004, "undo: invalid count — use /undo or /undo N")
-    if n < 1:
-        n = 1
-    return _undo_session_core(rid, session, n)
+        if user_turns:
+            try:
+                removed = _rewind_active_session_history(session, user_turns - 1)[2]
+            except Exception as exc:
+                return _err(rid, 5008, f"undo: {exc}")
+    return _ok(rid, {"removed": removed})
 
 
 @method("session.compress")

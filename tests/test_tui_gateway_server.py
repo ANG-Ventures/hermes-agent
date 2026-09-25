@@ -12869,11 +12869,11 @@ def test_session_undo_rejects_while_running():
 
 
 def test_session_undo_allowed_when_idle(tmp_path, monkeypatch):
-    """Regression guard: when not running, /undo backs up a half-turn.
+    """Regression guard: when not running, /undo backs up one user turn.
 
-    Half-turn undo is DB-backed (reversible active-flags), so seed real rows
+    The rewind is DB-backed (soft-deleted active flags), so seed real rows
     via SessionDB and assert the surviving in-memory history reflects the
-    deactivated tail.
+    deactivated turn.
     """
     from hermes_state import SessionDB
 
@@ -12894,9 +12894,9 @@ def test_session_undo_allowed_when_idle(tmp_path, monkeypatch):
             {"id": "1", "method": "session.undo", "params": {"session_id": "sid"}}
         )
         assert resp.get("result"), f"got error: {resp.get('error')}"
-        # /undo 1 removes the trailing assistant half-turn, leaving the user tail.
-        assert resp["result"]["removed"] == 1
-        assert [m["role"] for m in server._sessions["sid"]["history"]] == ["user"]
+        # /undo removes the last user turn (the user row and its reply).
+        assert resp["result"]["removed"] == 2
+        assert server._sessions["sid"]["history"] == []
     finally:
         server._sessions.pop("sid", None)
         server._db = None

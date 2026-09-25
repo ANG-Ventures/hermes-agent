@@ -22,7 +22,7 @@ class TestSlashCommandPrefixMatching:
         when upstream added ``/context`` alongside ``/config``. ``config`` is NOT
         a prefix of ``context``, so they are unrelated siblings and the CLI
         correctly stays AMBIGUOUS — the same rule that keeps /re from silently
-        picking /redo over /reset. Asserting /con still dispatches would demand
+        picking /reset over /retry. Asserting /con still dispatches would demand
         the CLI guess between two unrelated commands. ``/conf`` is the unique
         prefix now, and it exercises the same dispatch path.
         """
@@ -99,11 +99,9 @@ class TestSlashCommandPrefixMatching:
     def test_tied_shortest_matches_still_ambiguous(self):
         """/re matches many unrelated commands — no single base, stays ambiguous.
 
-        Regression guard (undo/redo half-turn branch): adding /redo made it the
-        unique *shortest* /re* command (5 chars). The old "unique shortest match"
-        heuristic then silently resolved /re → /redo, swallowing the ambiguity.
-        /redo/reset/retry are unrelated siblings (none is a prefix of the others),
-        so the prefix must stay ambiguous rather than fire redo on a bare /re.
+        /reset and /retry are unrelated siblings (neither is a prefix of the
+        other), so the prefix must stay ambiguous rather than fire one of them
+        on a bare /re.
         """
         cli_obj = _make_cli()
         printed = []
