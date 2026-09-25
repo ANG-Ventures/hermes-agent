@@ -109,8 +109,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Inert in this fleet (gui-domain jobs are clamped to 60s, the case where both formulas agree — PR body says so) — so not a fleet KEEP on measurement; it is a generic correctness fix on top of Kyzcreig's own upstream aa0289f307, hence UPSTREAM. 1897 loc mostly tests. Port needs a hand rebase (upstream split run.py into run_shutdown.py).",
+  "branch": "audit/gateway/upstream-861",
+  "notes": "Inert in this fleet (gui-domain jobs are clamped to 60s, the case where both formulas agree — PR body says so) — so not a fleet KEEP on measurement; it is a generic correctness fix on top of Kyzcreig's own upstream aa0289f307, hence UPSTREAM. 1897 loc mostly tests. Port needs a hand rebase (upstream split run.py into run_shutdown.py). | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-861 @ 55b2104fad on upstream/main ec243785e4 Hand port, much smaller than the fork (1.9k loc): upstream already routes the cron leash through the watchdog formula but (a) caps the agent drain at ExitTimeOut-10 instead of armed_leash-10 and (b) ignores pre-drain elapsed (effective_stop_drain_timeout@gateway/restart.py:187 vs _effective_watchdog_leash@run_shutdown.py:149, armed at _stop_impl:2179). Port: fit_drain_to_armed_leash + ctx.armed_leash_s/armed_at. The fork's re-arm-after-elapsed step is not needed: the watchdog is armed once and both consumers subtract elapsed-since-arm. Ran: `test-gate pytest -q tests/gateway/test_drain_fits_armed_watchdog.py tests/gateway/test_launchd_exit_timeout_drain_cap.py tests/gateway/test_shutdown_watchdog.py` -> 18 passed, 1 skipped; `test_cron_active_work_drain.py test_bounded_adapter_teardown.py` -> 4 passed; `test_gateway_process_exit.py test_cron_drain_floor.py test_shutdown_cache_cleanup.py` -> 23 passed. Mutation (run_shutdown.py wiring reverted, fit function kept): 2 failed, 1 passed (cron test: elapsed ~0.0002 vs >= 4.0).",
   "subject": "fix(gateway): fit the drain to the ARMED watchdog deadline, one source (#838 P1 close-out) (#861)"
  },
  "#221": {
@@ -147,8 +147,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Generic + measured (py-spy). Port needs a hand rebase: upstream split gateway/session.py into session_persistence.py/session_recovery.py (d7bdf2788d). Fork dependents: the loop-reachability AST tests (#758 baseline) reference this writer.",
+  "branch": "audit/gateway/upstream-782",
+  "notes": "Generic + measured (py-spy). Port needs a hand rebase: upstream split gateway/session.py into session_persistence.py/session_recovery.py (d7bdf2788d). Fork dependents: the loop-reachability AST tests (#758 baseline) reference this writer. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-782 @ fb5a46d5b4 on upstream/main ec243785e4 Row's cited chain (clear_resume_pending -> _save_entries) is now off-loop upstream via AsyncSessionStore (asyncio.to_thread per call, gateway/session.py:755); remaining loop reach is adapter observe paths calling get_or_create_session synchronously (telegram adapter.py:6323 in a sync def called from async _handle_media_message; slack adapter.py:3771; yuanbao). Port = off-loop latest-wins sessions.json mirror once state.db committed; state.db write itself stays inline (not in this row's scope). Ran: `test-gate pytest -q tests/gateway/test_sessions_json_write_off_loop.py` -> 4 passed; `tests/gateway/test_purge_profile_routing.py test_rekey_profile_routing.py test_session_model_override_persistence.py` -> 11 passed; `tests/gateway/test_session.py test_session_store_prune.py test_session_db_recovery.py` -> 69 passed, 1 failed (test_session_store_default_db_uses_runtime_*_home: order-dependent, fails identically on unmodified upstream/main when run after test_session.py; passes alone on the branch). Mutation (gateway/ at upstream, test kept): 2 failed, 2 passed, 4 errors.",
   "subject": "fix(gateway): persist sessions.json off the event loop, and freeze the class (#782)"
  },
  "#198": {
@@ -242,8 +242,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Generic loop-hygiene fix; measured only via the AST ratchet, not a production stall. Part of the off-loop family (#782 #836 #817 #868 #832 #967 #862 #883 #855 #834 #869 #976 #1031 #970 #911 #935 #759): upstream already took 4 of these from Kyzcreig, so the rest port cleanly one at a time.",
+  "branch": "audit/gateway/upstream-871",
+  "notes": "Generic loop-hygiene fix; measured only via the AST ratchet, not a production stall. Part of the off-loop family (#782 #836 #817 #868 #832 #967 #862 #883 #855 #834 #869 #976 #1031 #970 #911 #935 #759): upstream already took 4 of these from Kyzcreig, so the rest port cleanly one at a time. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-871 @ 601174f319 on STACKED on audit/gateway/upstream-834 (hard-exit fence drains its spool lane); upstream/main ec243785e4 Hand port onto upstream call sites: cancel_background_tasks@gateway/platforms/base.py:4609 and _stop_release_runtime_state@gateway/run_shutdown.py:1971; hard-exit fence added to _exit_after_graceful_shutdown@gateway/run.py:6058. Post-flush _pending_messages.clear() removed from both (drain=True owns it). Ran: `pytest -q tests/gateway/test_shutdown_pending_flush_off_loop.py tests/gateway/test_shutdown_flush.py tests/gateway/test_transcript_spool_off_loop.py` -> 39 passed; `pytest -q tests/gateway/test_cancel_background_drain.py tests/gateway/test_pending_queue_spool.py` -> 7 passed. Mutation (gateway/ at upstream-834, new test kept): 21 failed, 1 passed, 22 errors.",
   "subject": "fix(gateway): move the shutdown pending-message flush off the event loop (ratchet 18 -> 17) (#871)"
  },
  "#836": {
@@ -261,8 +261,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Same family as #871. 1307 loc across 9 adapter files (each call site), 1 conflict file.",
+  "branch": "audit/gateway/upstream-836",
+  "notes": "Same family as #871. 1307 loc across 9 adapter files (each call site), 1 conflict file. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-836 @ 55990d8c0b on upstream/main ec243785e4 Premise re-verified: take_over_scoped_lock_holder@gateway/status.py:1951 -> _terminate_verified_owner sleeps up to 20x0.5+20x0.25 s, reached from 11 async connect()/open() sites. Deliberately smaller than the fork: to_thread + shield + adapter-local generation for the cancelled-acquire release, instead of the fork's process-wide token registry (_PLATFORM_LOCK_OWNERS). Ran: `pytest -q tests/gateway/test_platform_lock_acquire_off_loop.py tests/gateway/test_stale_platform_lock_retryable.py tests/gateway/test_platform_reconnect.py` -> 37 passed; neighbours `test_whatsapp_connect.py test_telegram_polling_progress.py test_telegram_closewait_limits.py` -> 22 passed, 5 skipped; `test_telegram_error_redaction.py test_whatsapp_stale_bridge.py test_platform_base.py` -> 104 passed, 16 skipped. Mutation (gateway/+plugins/ at upstream, new test kept): 5 failed, 1 passed (negative control).",
   "subject": "fix(gateway): move the platform-lock acquire off the event loop (ratchet 26 -> 22) (#836)"
  },
  "#229": {
@@ -280,8 +280,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Dormant flag never enabled (0 fires in 4.5 months); desktop is D9 upstream-owned and upstream has its own session_auto_continue. 1272 loc, 3 conflict files (3 syncs). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: revert conflicts in 3 files, 14 hunks, ~10.8k diff lines; the flag has since spread to tui_gateway/methods_session.py and config_defaults.py. Hand-built revert left for continuation card.",
+  "branch": "audit/gateway/revert-229",
+  "notes": "Dormant flag never enabled (0 fires in 4.5 months); desktop is D9 upstream-owned and upstream has its own session_auto_continue. 1272 loc, 3 conflict files (3 syncs). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS 2026-09-25: revert-229: conflicts in hermes_cli/config.py, hermes_state.py, tui_gateway/server.py; mechanical revert NOT clean, so no branch was pushed and no tests were run. Needs a hand-built revert (same as scripts+misc t_4f1b06ad). | BRANCH PASS: revert conflicts in 3 files, 14 hunks, ~10.8k diff lines; the flag has since spread to tui_gateway/methods_session.py and config_defaults.py. Hand-built revert left for continuation card. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/revert-229 @ d96e727829 on origin/main ee88b629d2 Hand revert by symbol (mechanical revert conflicts in config.py/hermes_state.py/server.py; hook spread to methods_session.py x3). -1127 lines: 30 server.py names + 5 call sites, 3 methods_session wrappers, 6 SessionDB methods, config key, feature test. KEPT: schema DDL + SCHEMA_VERSION (no version rollback on migrated state.db; 2 empty tables), and #229-introduced helpers now used elsewhere (_command_invokes_safe_restart, _SAFE_RESTART_INSPECTION_VERBS, _tool_args_command, _coerce_float_config_value, _compute_host_inflight_turns). Ran: py_compile OK on server.py/methods_session.py/hermes_state.py/config_defaults.py; ruff --isolated F401/F811/F821/F841: no new findings vs HEAD. `test-gate pytest -q tests/tui_gateway/test_resume_live_lazy_session.py tests/tui_gateway/test_session_resume_db_ownership.py tests/tui_gateway/test_server_no_duplicate_defs.py` -> 22 passed; `tests/test_hermes_state_core.py tests/tui_gateway/test_stale_provider_resume_live.py` -> 160 passed.",
   "subject": "feat(tui): desktop/TUI session auto-resume after backend restart (dormant flag) (#229)"
  },
  "#228": {
@@ -418,11 +418,11 @@
   "subject": "fix(gateway): close the round-3 FleetReview P1s on the shutdown budget (#838)"
  },
  "#817": {
-  "verdict": "UPSTREAM",
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
   "problem": "write_runtime_status (read-merge-atomic-write + psutil) reached from 12 loop coroutines",
   "evidence": {
    "original": "t_13445a80 ratchet 44->41; measured median 0.9ms / max 7.7ms idle",
-   "upstream_state": "RED-partial (read-only: startup site already off-loop via asyncio.to_thread@up/gateway/run_startup.py:909; shutdown site _write_runtime_status_quiet@run_shutdown.py:748 and the reconnect/scale-to-zero/per-turn sites remain sync)",
+   "upstream_state": "GREEN (read-only, re-verified at ec243785e4): d5479495b8 (Philip Kirkbride 2026-09-19) moved runtime-status persistence to a single background writer. Loop-side wrappers _write_runtime_status_quiet@gateway/run.py:3288 and BasePlatformAdapter._write_runtime_status_safe@gateway/platforms/base.py:2142 call publish_runtime_status@gateway/status.py (merge in memory with load_existing=False, writer.submit, no wait). Remaining sync write_runtime_status callers: run_startup.py:908 (already asyncio.to_thread) and shutdown_watchdog.py:167 (watchdog thread, not the loop).",
    "upstream_fix": "partial (startup call wrapped in to_thread upstream)",
    "fires": "n/a (no literal)",
    "cost": {
@@ -433,15 +433,15 @@
    }
   },
   "branch": null,
-  "notes": "Off-loop family. Port the remaining call sites only. 956 loc, 2 conflict files.",
+  "notes": "Off-loop family. Port the remaining call sites only. 956 loc, 2 conflict files. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): VERDICT CORRECTED (UPSTREAM -> SUPERSEDED-BY-UPSTREAM) Original row cited _write_runtime_status_quiet@run_shutdown.py:748 as a sync write; it delegates to the non-blocking publish_runtime_status. Corrected in the branch pass. Ran: none (no branch: premise no longer holds)",
   "subject": "fix(gateway): move the runtime-status write off the event loop (ratchet 44 -> 41) (#817)"
  },
  "#868": {
-  "verdict": "UPSTREAM",
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
   "problem": "three atomic_json_write sites in gateway/platforms/weixin.py driven from coroutines",
   "evidence": {
    "original": "t_13445a80 ratchet 15->13",
-   "upstream_state": "RED (read-only: up/gateway/platforms/weixin.py still calls atomic_json_write inline from its coroutines — file unchanged in this respect; weixin is not used by this fleet)",
+   "upstream_state": "GREEN (read-only): ContextTokenStore.set@up/gateway/platforms/weixin.py:211-218 persists via asyncio.to_thread under an asyncio.Lock (1730a2c32a, kshitijk4poor 2026-09-03); _poll_loop cursor via asyncio.to_thread(_save_sync_buf)@weixin.py:835 (73dc249cca, devorun 2026-09-22). Remaining inline write save_weixin_account@weixin.py:643 is inside qr_login, whose only caller is asyncio.run(qr_login(...))@hermes_cli/gateway_setup_wizard.py:446 - a private one-shot loop in the setup wizard, no other tasks to starve.",
    "upstream_fix": "none",
    "fires": "0 (3 literals) — weixin adapter is not enabled in the fleet",
    "cost": {
@@ -452,7 +452,7 @@
    }
   },
   "branch": null,
-  "notes": "Never fires here (no weixin). Pure upstream contribution; 0 conflict files. If upstream declines, DROP.",
+  "notes": "Never fires here (no weixin). Pure upstream contribution; 0 conflict files. If upstream declines, DROP. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): VERDICT CORRECTED (UPSTREAM -> SUPERSEDED-BY-UPSTREAM) Verdict corrected in the branch pass: 2 of 3 sites independently fixed upstream; 3rd is not loop-reachable from the gateway. Fork's weixin lane + hard-exit-fence registry are not needed upstream. Ran: none (no branch: premise no longer holds on upstream/main ec243785e4)",
   "subject": "fix(gateway): move the weixin durable writes off the event loop (ratchet 15 -> 13) (#868)"
  },
  "#765": {
@@ -969,11 +969,11 @@
   "subject": "fix(gateway): spool adapter-parked follow-ups before teardown clears them (t_e253d9d5 r4, stacked on #937) (#945)"
  },
  "#970": {
-  "verdict": "UPSTREAM",
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
   "problem": "/model persist + rehydrate probed /v1/models synchronously on the event loop",
   "evidence": {
    "original": "t_515b7… card cited in subject; loop-hygiene",
-   "upstream_state": "RED (read-only: upstream model_switch persist path still calls the catalog probe inline — _SkipCatalogProbe 0 hits upstream)",
+   "upstream_state": "Re-verified at ec243785e4 (read-only): the /model door already offloads switch_model via asyncio.to_thread@gateway/slash_commands_model.py:149. Rehydrate (_rehydrate_session_model_override@gateway/run_agent_cache.py:146) re-resolves via _resolve_runtime_agent_kwargs_for_provider -> resolve_runtime_provider, never switch_model/validate_requested_model; the fork-only persistability check (_model_override_is_persistable -> _reresolve_model_override_credentials -> switch_model -> fetch_api_models) has 0 hits upstream. `_SkipCatalogProbe 0 hits` in the original row is because the probe it skips is not on any upstream loop path.",
    "upstream_fix": "none",
    "fires": "n/a (no literal)",
    "cost": {
@@ -984,7 +984,7 @@
    }
   },
   "branch": null,
-  "notes": "Off-loop family; 574 loc, 3 conflict files (3 syncs).",
+  "notes": "Off-loop family; 574 loc, 3 conflict files (3 syncs). | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): VERDICT CORRECTED (UPSTREAM -> SUPERSEDED-BY-UPSTREAM (the chain #970 gates does not exist upstream)) Original row's premise ('upstream persist path still calls the catalog probe inline') does not hold. CAVEAT, different bug: resolve_runtime_provider is still reached synchronously from coroutines (e.g. run_inbound.py:1480 -> _resolve_session_agent_runtime) and can hit _auto_detect_local_model@hermes_cli/runtime_provider.py:433 (requests.get, timeout (2,3)) for a local base_url with no model. Not #970's fix; left as a candidate for a separate audit row. Ran: none (no branch)",
   "subject": "fix(gateway): /model persist + rehydrate never probe /v1/models on the event loop (t_515b7fce) (#970)"
  },
  "#692": {
@@ -1135,8 +1135,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Small generic fix on an upstream-owned file; 530 loc mostly tests.",
+  "branch": "audit/gateway/upstream-840",
+  "notes": "Small generic fix on an upstream-owned file; 530 loc mostly tests. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-840 @ 84358cb4a3 on upstream/main ec243785e4 Hand port: upstream counts are plain {key:int} (no replay_marks), mutators live in run_shutdown.py (_increment_restart_failure_counts:1326, _clear_restart_failure_count:1361). Race reproduced by the new test on upstream code. Ran: `pytest -q tests/gateway/test_restart_failure_counts_rmw.py tests/gateway/test_stuck_loop.py tests/gateway/test_empty_sentinel_rewrite_copy.py` -> 7 passed. Mutation (run_shutdown.py at upstream, new test kept): `pytest -q tests/gateway/test_restart_failure_counts_rmw.py` -> 1 failed, 2 passed (concurrent-clear test fails: key resurrected).",
   "subject": "fix(gateway): make the restart-failure-counts read-modify-write atomic (#840)"
  },
  "#716": {
@@ -1363,8 +1363,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Off-loop family; 0 conflict files.",
+  "branch": "audit/gateway/upstream-834",
+  "notes": "Off-loop family; 0 conflict files. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-834 @ 766c9b90ff on upstream/main ec243785e4 Lane + fence ported verbatim into upstream gateway/shutdown_flush.py; drain keeps upstream's db_known_failing kwarg. Loop-reachable callers upstream: session_transcript._spool_dropped via sync append_to_transcript from telegram adapter.py:6330 / yuanbao.py:1097. Ran: `pytest -q tests/gateway/test_transcript_spool_off_loop.py tests/gateway/test_shutdown_flush.py` -> 17 passed; `pytest -q tests/gateway/test_pending_queue_spool.py` -> 6 passed. Mutation (gateway/ at upstream, new test kept): new test file -> 3 failed, 3 passed, 6 teardown errors (fence_spool_lane absent).",
   "subject": "fix(gateway): move the transcript cap-drop spool write off the event loop (ratchet 26 -> 22) (#834)"
  },
  "#639": {
@@ -1421,7 +1421,7 @@
    }
   },
   "branch": null,
-  "notes": "Pairs with #836. 0 conflict files.",
+  "notes": "Pairs with #836. 0 conflict files. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): VERDICT CORRECTED (UPSTREAM -> folded into #836 port (no separate branch)) no branch: audit/gateway/upstream-836 (folded) #851 closes a race INSIDE the fork's #836 token registry (_PLATFORM_LOCK_OWNERS: record-vs-acquire and claim-vs-release in separate critical sections). The upstream port does not carry that registry (adapter-local generation instead), so the race class #851 fixes does not exist in the port; its user-visible property (a cancelled acquire must not release a retry connect's lock) is pinned by the #836 branch test. Ran: covered by test_cancelled_acquire_leaves_a_newer_acquire_alone in the #836 branch",
   "subject": "fix(gateway): make the scoped-lock ownership decision and its release one critical section (#851)"
  },
  "nopr:217d61ddce": {
@@ -1724,8 +1724,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Off-loop family; 0 conflict files.",
+  "branch": "audit/gateway/upstream-869",
+  "notes": "Off-loop family; 0 conflict files. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-869 @ 424fbadb9c on upstream/main ec243785e4 Upstream is worse than the fork's pre-#869 state: record_startup@gateway/lifecycle_ledger.py:266 runs fully inline from start_gateway@gateway/run.py:5883-5893 (incl. PRAGMA quick_check after an unclean exit). Port adds record_startup_async and awaits it. Ran: `pytest -q tests/gateway/test_lifecycle_ledger_boot_record_off_loop.py tests/gateway/test_lifecycle_state_db_check.py` -> 11 passed. Mutation (gateway/ at upstream, new test kept): new test file -> 3 failed.",
   "subject": "fix(gateway): move the whole boot lifecycle record off the event loop (ratchet 18 -> 17) (#869)"
  },
  "#339": {
@@ -1762,8 +1762,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Off-loop family; 1 conflict file.",
+  "branch": "audit/gateway/upstream-759",
+  "notes": "Off-loop family; 1 conflict file. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-759 @ 7cfaa1ab0d on upstream/main ec243785e4 Scope narrowed to the proxy half. Upstream since added a 60 s memo (16b18ce602, _detect_macos_system_proxy@gateway/platforms/base.py:272) but a miss still forks scutil on the loop; port adds stale-while-revalidate + startup prime (run_startup._start_impl). The boot-recovery half (_recover_async_delegations_once) does not exist upstream: delegation recovery is an sqlite ledger (tools/async_delegation.py:258 recover_abandoned_delegations), a different design - not ported. Ran: `pytest -q tests/gateway/test_system_proxy_detection_off_loop.py tests/gateway/test_proxy_mode.py tests/agent/test_proxy_bypass_shared.py` -> 29 passed. Mutation (gateway/ at upstream, new test kept): new test -> 4 failed, 1 passed (off-loop sync-probe test is a guard, passes both ways).",
   "subject": "fix(gateway): stop blocking the event loop with the system-proxy probe and boot recovery (#759)"
  },
  "#175": {
@@ -2484,8 +2484,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Generic; 0 conflict files. Pairs with #635.",
+  "branch": "audit/gateway/upstream-584",
+  "notes": "Generic; 0 conflict files. Pairs with #635. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-584 @ f7e8f4442e on upstream/main ec243785e4 8 inbound download sites routed through _download_media_with_retry (observed media, voice/audio/video via _cache_inbound_av, image/video/generic document, photo, sticker). Ran: `HERMES_TEST_ISOLATION=1 venv/bin/python -m pytest -q tests/gateway/test_telegram_documents.py` -> 19 passed. Mutation (adapter.py back to upstream, tests kept): `-k 'retries or three_exponential or bad_request'` -> 2 failed, 1 passed (BadRequest no-retry test is a guard, passes both ways).",
   "subject": "fix(telegram): retry transient media downloads (#584)"
  },
  "#976": {
@@ -2503,8 +2503,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "absorb 55% is surrounding context, not the fix. Off-loop family.",
+  "branch": "audit/gateway/upstream-976",
+  "notes": "absorb 55% is surrounding context, not the fix. Off-loop family. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-976 @ 5d54644a94 on upstream/main ec243785e4 Port covers the 2 AIAgent sites only: upstream already moved the skill-slash path (incl. _check_unavailable_skill) off-loop via _run_in_executor_with_context@gateway/run_inbound.py:1236. AST contract widened from run.py+slash_commands.py to every gateway/*.py (upstream split). Ran: `pytest -q tests/gateway/test_no_agent_construction_on_event_loop.py tests/gateway/test_compress_command.py tests/gateway/test_shutdown_executor_quiesce.py` -> 142 passed. Mutation (gateway/ at upstream, new test kept): contract test -> 2 failed (run_turn.py, slash_commands_session.py), 121 passed.",
   "subject": "fix(gateway): keep AIAgent construction + skill scan off the asyncio thread (Discord heartbeat stalls) (#976)"
  },
  "#405": {
@@ -3149,8 +3149,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Privacy fix, generic. Adversary: confirm upstream serve fallback still logs the frame.",
+  "branch": "audit/gateway/upstream-571",
+  "notes": "Privacy fix, generic. Adversary: confirm upstream serve fallback still logs the frame. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-571 @ 7cb482d579 on upstream/main ec243785e4 Adversary check: upstream write_json@tui_gateway/server.py:639 still ends `(current_transport() or _stdio_transport).write(obj)` and _session_info@server.py:2242 still puts system_prompt in session.info; serve still sets the serve-mode env var (main_dashboard.py:960). Premise holds. Ran: `pytest -q tests/tui_gateway/test_tui_gateway_server.py::test_write_json_redacts_session_prompt_from_headless_fallback_only ::test_write_json_serializes_concurrent_writes` -> 2 passed. Mutation (server.py at upstream, test kept): new test -> 1 failed.",
   "subject": "fix(tui-gateway): redact serve prompt fallback logs (#571)"
  },
  "#698": {
@@ -3320,8 +3320,8 @@
     "dependents": []
    }
   },
-  "branch": null,
-  "notes": "Pairs with #584; 0 conflict files.",
+  "branch": "audit/gateway/upstream-635",
+  "notes": "Pairs with #584; 0 conflict files. | BRANCH PASS 2 (t_32ef8a2c, 2026-09-25): BRANCH audit/gateway/upstream-635 @ 07ea93726a on STACKED on audit/gateway/upstream-584 (uses its _download_media_with_retry helper); upstream/main ec243785e4 Stacked on upstream-584 (the timeouts live inside the retry helper). Submit after/with #584. Ran: `pytest -q tests/gateway/test_telegram_documents.py` -> 20 passed. Mutation (adapter.py at upstream-584, test kept): `pytest ...::TestDocumentDownloadBlock::test_media_download_uses_generous_per_request_timeouts` -> 1 failed.",
   "subject": "fix(telegram): give media downloads their own generous per-request timeouts (#635)"
  },
  "nopr:3d5ecfa0ae": {
