@@ -420,6 +420,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument("--body-file", default=None, metavar="PATH",
+                          help="Read the opening post from PATH ('-' = stdin). Use this instead of --body for text with backticks or $(...): the shell never sees it.")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -803,7 +805,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
     p_comment.add_argument("task_id")
-    p_comment.add_argument("text", nargs="+", help="Comment body")
+    p_comment.add_argument("text", nargs="*", help="Comment body (or use --body-file)")
+    p_comment.add_argument("--body-file", default=None, metavar="PATH",
+                           help="Read the comment body from PATH ('-' = stdin). Use this for "
+                                "text with backticks or $(...): the shell never sees it.")
     p_comment.add_argument("--author", default=None,
                            help="Author name (default: $HERMES_PROFILE or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
@@ -2269,6 +2274,18 @@ def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
         return False
 
 
+def _read_body_file(path: str) -> str:
+    """Read a card/comment body from ``path`` (``-`` = stdin).
+
+    Shell callers pass markdown through ``--body-file`` / a quoted heredoc
+    instead of a double-quoted argv string, where backticks and ``$(...)``
+    are executed by the shell as command substitution (t_f7e11e44).
+    """
+    if path == "-":
+        return sys.stdin.read()
+    return Path(path).expanduser().read_text(encoding="utf-8")
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_worker_policy as _kwp
 
@@ -2286,6 +2303,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
         return 2
+    body_file = getattr(args, "body_file", None)
+    if body_file is not None:
+        if args.body is not None:
+            print("kanban: --body and --body-file are mutually exclusive", file=sys.stderr)
+            return 2
+        try:
+            args.body = _read_body_file(body_file)
+        except OSError as exc:
+            print(f"kanban: --body-file: {exc}", file=sys.stderr)
+            return 2
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
@@ -3860,7 +3887,24 @@ def _cmd_comment(args: argparse.Namespace) -> int:
       Saying "unknown" is the honest answer, and it is what the tri-state
       contract elsewhere in this codebase already does.
     """
-    body = " ".join(args.text).strip()
+    body_file = getattr(args, "body_file", None)
+    if body_file is not None and args.text:
+        print("kanban: pass the comment as TEXT or --body-file, not both", file=sys.stderr)
+        return 2
+    if body_file is None and not args.text:
+        print("kanban: comment body required (TEXT or --body-file)", file=sys.stderr)
+        return 2
+    if body_file is not None:
+        try:
+            body = _read_body_file(body_file).strip()
+        except OSError as exc:
+            print(f"kanban: --body-file: {exc}", file=sys.stderr)
+            return 2
+    else:
+        body = " ".join(args.text).strip()
+    if not body:
+        print("kanban: comment body is empty", file=sys.stderr)
+        return 2
     if args.max_len is not None:
         if args.max_len < 1:
             print("kanban: --max-len must be positive", file=sys.stderr)
