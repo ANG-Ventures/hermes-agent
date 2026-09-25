@@ -5064,6 +5064,13 @@ class MutationActor:
     profile: Optional[str]
     foreign_ok: Optional[str] = None
     surface: str = "cli"  # "cli" | "tool" -- only shapes the refusal hint
+    # ``--operator "<who: why>"``: an operator profile applying a relayed
+    # human decision. Recorded as an ``operator_override`` event, no comment.
+    operator: Optional[str] = None
+
+
+# Profiles allowed to use the ``--operator`` override. ``default`` is Apollo.
+OPERATOR_PROFILES: frozenset[str] = frozenset({"default", "apollo", "aegis"})
 
 
 _MUTATION_ACTOR: ContextVar[Optional[MutationActor]] = ContextVar(
@@ -5124,6 +5131,7 @@ def mutation_actor(
     profile: Optional[str] = None,
     foreign_ok: Optional[str] = None,
     surface: str = "cli",
+    operator: Optional[str] = None,
 ):
     """Bind the chat-facing caller for the home-session guard."""
     ids = tuple(dict.fromkeys(
@@ -5134,6 +5142,7 @@ def mutation_actor(
         profile=(str(profile).strip() or None) if profile else None,
         foreign_ok=(str(foreign_ok).strip() or None) if foreign_ok else None,
         surface=surface,
+        operator=(str(operator).strip() or None) if operator else None,
     )
     token = _MUTATION_ACTOR.set(actor)
     ev_token = _EVENT_ACTOR.set(actor)
@@ -5164,6 +5173,70 @@ def _caller_session_lineage(session_id: str) -> tuple[str, ...]:
         return tuple(str(x) for x in (lineage or ()) if x)
     except Exception:
         return ()
+
+
+def session_owner_profile(session_id: Optional[str]) -> Optional[str]:
+    """The profile whose ``state.db`` holds ``session_id`` (``default`` for
+    the root home), or ``None``.
+
+    The profile env of a CLI call is not the caller's identity: a script
+    that repoints the home at the root board (to reach ``~/.hermes`` state)
+    resolves as ``default`` from inside another profile's session. The
+    session row is. Read-only, short timeout, fail-open; consulted only on
+    the guard's mismatch path.
+    """
+    sid = (str(session_id).strip() if session_id else "")
+    if not sid:
+        return None
+    try:
+        from hermes_cli.profiles import _get_default_hermes_home
+
+        root = _get_default_hermes_home()
+    except Exception:
+        return None
+    candidates = [("default", root / "state.db")]
+    try:
+        candidates += [
+            (p.name, p / "state.db")
+            for p in sorted((root / "profiles").iterdir())
+            if p.is_dir()
+        ]
+    except OSError:
+        pass
+    for name, path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0
+            )
+            try:
+                hit = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (sid,)
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+        if hit is not None:
+            return name
+    return None
+
+
+def _actor_profiles(actor: MutationActor) -> frozenset[str]:
+    """Every profile identity the actor legitimately holds: the bound
+    profile plus the owner profile of each caller session."""
+    names = {actor.profile} if actor.profile else set()
+    for sid in actor.session_ids:
+        owner = session_owner_profile(sid)
+        if owner:
+            names.add(owner)
+    return frozenset(names)
+
+
+def _valid_operator_reason(reason: str) -> bool:
+    who, sep, why = reason.partition(":")
+    return bool(sep and who.strip() and why.strip())
 
 
 HOME_LINEAGE_MAX_DEPTH = 10
@@ -5427,9 +5500,27 @@ def check_home_session(
     for sid in actor.session_ids:
         if home in home_ids(sid) or home in _caller_session_lineage(sid):
             return None
+    # Assignee identity = the profile of the caller SESSION too, not only the
+    # profile env (a root-home repoint makes that read ``default``).
+    profiles = _actor_profiles(actor)
+    if (row["assignee"] or "") in profiles:
+        return None
+    caller = ", ".join(actor.session_ids) or "none"
+    if actor.operator:
+        if not (profiles & OPERATOR_PROFILES):
+            raise ForeignSessionMutationError(
+                f"refused {action} on {task_id}: --operator is for operator "
+                f"profiles ({', '.join(sorted(OPERATOR_PROFILES))}); caller "
+                f"profile(s): {', '.join(sorted(profiles)) or 'unknown'}."
+            )
+        if not _valid_operator_reason(actor.operator):
+            raise ForeignSessionMutationError(
+                f"refused {action} on {task_id}: --operator needs "
+                f"\"<who: why>\" (e.g. \"Ace via Aegis: ruled (a)\")."
+            )
+        return actor
     if actor.foreign_ok:
         return actor
-    caller = ", ".join(actor.session_ids) or "none"
     if home_guard_mode() == "warn":
         print(
             f"kanban: warning: {action} on {task_id} from caller session "
@@ -5442,6 +5533,12 @@ def check_home_session(
         '--takeover "<reason>"' if actor.surface == "cli"
         else 'foreign_ok="<reason>"'
     )
+    operator_hint = (
+        f" An operator profile ({', '.join(sorted(OPERATOR_PROFILES))}) "
+        f"applying a relayed human decision uses --operator \"<who: why>\" "
+        f"instead (recorded as an operator_override event, pages nothing)."
+        if actor.surface == "cli" else ""
+    )
     if is_unhomed(home):
         raise ForeignSessionMutationError(
             f"refused {action} on {task_id}: it is UNHOMED (born with no "
@@ -5451,6 +5548,7 @@ def check_home_session(
             f"explicitly with {override} (adopt it for good: hermes kanban "
             f"update {task_id} --session <yours> --takeover \"<reason>\"); "
             f"the takeover is recorded as an event + audit comment."
+            f"{operator_hint}"
         )
     raise ForeignSessionMutationError(
         f"refused {action} on {task_id}: its home session is {home} "
@@ -5458,7 +5556,7 @@ def check_home_session(
         f"home session or the assignee -- comment instead: "
         f"hermes kanban comment {task_id} \"...\" "
         f"(or take over with {override}, which records a takeover event + "
-        f"an audit comment the home session sees)."
+        f"an audit comment the home session sees).{operator_hint}"
     )
 
 
@@ -5473,11 +5571,30 @@ def _mutation_succeeded(result: Any) -> bool:
 def record_foreign_action(
     conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor
 ) -> None:
-    """Append the audit comment for an overridden foreign-session mutation."""
+    """Append the audit comment for an overridden foreign-session mutation.
+
+    An ``--operator`` override records an ``operator_override`` event only:
+    no comment, so nothing pages the home session.
+    """
     sess = ", ".join(actor.session_ids) or "no-session"
     home_row = conn.execute(
         "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
+    if actor.operator:
+        with write_txn(conn, allow_nested=True):
+            _append_event(
+                conn,
+                task_id,
+                "operator_override",
+                {
+                    "action": action,
+                    "reason": actor.operator,
+                    "by_sessions": list(actor.session_ids),
+                    "by_profile": actor.profile,
+                    "home": (home_row["session_id"] if home_row is not None else None),
+                },
+            )
+        return
     with write_txn(conn, allow_nested=True):
         _append_event(
             conn,
