@@ -14867,22 +14867,37 @@ def _worker_cpu_active(pid: int) -> bool:
     keepalive tickers. Unknown process state (``ps`` missing/failing/
     unparseable) returns True so it never authorizes a kill.
     """
-    import subprocess
     try:
-        ps = subprocess.run(
-            ["ps", "-A", "-o", "pid=,ppid=,pcpu="],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
-            check=True,
-        )
-        for line in ps.stdout.splitlines():
-            fields = line.split()
-            if len(fields) != 3:
-                continue
-            proc, cpu = int(fields[0]), float(fields[2])
-            if proc == pid and cpu > 0:
-                return True
+        return _cpu_active_in_table(_process_cpu_table(), pid)
     except (OSError, ValueError, subprocess.SubprocessError):
         return True  # Unknown process state must not authorize a kill.
+
+
+def _process_cpu_table() -> str:
+    """Raw ``pid ppid pcpu`` table from ``ps`` (the probe's only I/O).
+
+    Split out so tests can feed a deterministic table instead of depending on
+    a loaded host's scheduler to make a real child read 0.0% in time.
+    """
+    return subprocess.run(
+        ["ps", "-A", "-o", "pid=,ppid=,pcpu="],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
+        check=True,
+    ).stdout
+
+
+def _cpu_active_in_table(table: str, pid: int) -> bool:
+    """Pure parse: True iff ``pid`` itself shows CPU > 0 (children never veto).
+
+    Raises ValueError on an unparseable row so the caller treats it as unknown.
+    """
+    for line in table.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        proc, cpu = int(fields[0]), float(fields[2])
+        if proc == pid and cpu > 0:
+            return True
     return False
 
 
