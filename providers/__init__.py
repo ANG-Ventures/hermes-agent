@@ -62,6 +62,35 @@ def discovery_in_progress() -> bool:
 _BUNDLED_PLUGINS_DIR = (
     Path(__file__).resolve().parent.parent / "plugins" / "model-providers"
 )
+_BUNDLED_NS = "plugins.model_providers"
+
+
+def _ensure_bundled_namespace() -> None:
+    """Make ``plugins.model_providers.<name>`` importable before discovery.
+
+    The on-disk dir is ``model-providers`` (not an identifier), so the stable
+    import path only existed once ``_import_plugin_dir`` had run. A caller
+    importing a bundled profile class directly then depended on something
+    else having triggered discovery first. Register the parent namespace
+    here instead; submodules resolve against the bundled dir and use the
+    same module name ``_import_plugin_dir`` assigns, so each loads once.
+    """
+    if _BUNDLED_NS in sys.modules or not _BUNDLED_PLUGINS_DIR.is_dir():
+        return
+    try:
+        import plugins as _plugins_pkg
+    except ImportError:
+        return
+    import types
+
+    ns = types.ModuleType(_BUNDLED_NS)
+    ns.__path__ = [str(_BUNDLED_PLUGINS_DIR)]  # type: ignore[attr-defined]
+    ns.__package__ = _BUNDLED_NS
+    sys.modules[_BUNDLED_NS] = ns
+    _plugins_pkg.model_providers = ns  # type: ignore[attr-defined]
+
+
+_ensure_bundled_namespace()
 
 
 def register_provider(profile: ProviderProfile) -> None:
