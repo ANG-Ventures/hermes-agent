@@ -3219,7 +3219,16 @@ def _record_blackbox_compaction(agent: Any, *, trigger: str | None,
     Several compactions in one turn: ``compaction_tokens_before`` keeps the
     FIRST compaction's pre-size (the context the turn arrived with),
     ``compaction_tokens_after`` the LAST one's post-size, and the cost sums.
+
+    Also leaves the one-shot ``_blackbox_prefix_reset`` marker the prefix-
+    stability guard consumes at the next request (card t_c07124ab): a
+    committed compaction is the sanctioned history rewrite, so the guard
+    tags that request's diff ``compaction:<trigger>`` instead of paging.
     """
+    try:
+        agent._blackbox_prefix_reset = f"compaction:{trigger or 'unattributed'}"
+    except Exception:
+        pass
     state = getattr(agent, "_blackbox_compaction", None)
     if not isinstance(state, dict):
         return

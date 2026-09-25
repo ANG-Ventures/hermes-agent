@@ -197,6 +197,66 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ON turn_api_calls(ts);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
             ON turn_api_calls(sub_key);
+
+        -- Conversation prefix-stability guard (card t_c07124ab). One row per
+        -- session holding the fingerprint of the LAST request sent on it
+        -- (hashes + byte sizes only, never text); the next request of the
+        -- same session is compared against it and then replaces it. Keyed on
+        -- the session so the check survives agent-cache eviction and gateway
+        -- restarts (a cross-process comparison is tagged, see `context`).
+        -- `alerted_at` is the once-per-session page stamp (transition state).
+        CREATE TABLE IF NOT EXISTS prefix_sessions (
+            session_key TEXT PRIMARY KEY,
+            turn_id TEXT,
+            seq INT,
+            ts REAL,
+            pid INT,
+            api_mode TEXT,
+            model TEXT,
+            cache_read INT,
+            fingerprint_json TEXT,
+            updated_at REAL,
+            alerted_at REAL
+        );
+
+        -- One row per violated segment per request pair. `kind` is
+        -- 'mutation' (a historical index changed in place — the class that
+        -- collapses every cache read to the static prefix) or 'shrink'
+        -- (history got shorter). `context` is NULL for an unexplained
+        -- mutation; a tagged one carries why it is expected
+        -- ('compaction:<trigger>', 'process_restart', 'api_mode_change',
+        -- 'model_change') and is excluded from alerting, not allowlisted.
+        -- `alerted` = 1 on the one row per session that paged #alerts.
+        CREATE TABLE IF NOT EXISTS prefix_mutations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL,
+            session_key TEXT,
+            turn_id TEXT,
+            seq INT,
+            prev_turn_id TEXT,
+            prev_seq INT,
+            prev_ts REAL,
+            provider TEXT,
+            lane_family TEXT,
+            model TEXT,
+            segment TEXT,
+            kind TEXT,
+            first_divergent_index INT,
+            bytes_before INT,
+            bytes_after INT,
+            messages_before INT,
+            messages_after INT,
+            context TEXT,
+            allowlisted INT NOT NULL DEFAULT 0,
+            allowlist_reason TEXT,
+            cache_read_before INT,
+            cache_read_after INT,
+            alerted INT NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_blackbox_prefix_mutations_ts
+            ON prefix_mutations(ts);
+        CREATE INDEX IF NOT EXISTS idx_blackbox_prefix_mutations_session
+            ON prefix_mutations(session_key);
         """
     )
     # Additive migration for DBs created before the last-call cache split
@@ -793,6 +853,178 @@ def mark_alerted(turn_id: str) -> bool:
             (turn_id,),
         )
         return cur.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
+# Conversation prefix-stability guard (card t_c07124ab).
+#
+# A prefix-cached provider serves a cache hit only when the leading bytes of a
+# request equal an earlier request's. Within one session the harness must keep
+# the system prompt, the tool schemas and every already-sent message
+# byte-stable between consecutive requests. ``record_prefix_check`` compares
+# the fingerprint of each outbound request with the previous request of the
+# same session, persists one ``prefix_mutations`` row per violated segment and
+# reports whether this is the session's FIRST unexplained mutation — the
+# transition the caller pages on, exactly once per session.
+# ---------------------------------------------------------------------------
+
+PREFIX_ALERT_MIN_SPACING_S = 15 * 60
+_PREFIX_ALERT_META_KEY = "prefix_guard_last_alert_ts"
+
+
+def _prefix_context(prev: sqlite3.Row, *, pid: int, api_mode: str, model: str,
+                    reset: str | None) -> str | None:
+    """Why a rewrite is EXPECTED for this pair, or None (unexplained).
+
+    Compaction is the one sanctioned history rewrite and is tagged by the
+    harness event that performed it (``reset``), so it is excluded rather
+    than allowlisted. A cross-process pair (gateway restart rebuilt the
+    request from the transcript) and a model / API-mode switch (different
+    tool schema, different system prompt) are recorded but not paged.
+    """
+    if reset:
+        return reset
+    if prev["pid"] is not None and int(prev["pid"]) != int(pid):
+        return "process_restart"
+    if (prev["api_mode"] or "") != (api_mode or ""):
+        return "api_mode_change"
+    if (prev["model"] or "") != (model or ""):
+        return "model_change"
+    return None
+
+
+def record_prefix_check(
+    *, session_key: str, turn_id: str, seq: int, ts: float, pid: int,
+    provider: str, model: str, api_mode: str, fingerprint: dict[str, Any],
+    cache_read: int | None, reset: str | None = None,
+    allowlist: Any = None,
+) -> dict[str, Any]:
+    """Compare one request with the session's previous request and persist.
+
+    Returns ``{"violations": [...], "alert": bool, "suppressed": int}``.
+    ``alert`` is True only on the transition from "this session has never
+    paged" to "it has an unexplained, non-allowlisted mutation", and only
+    when the profile-wide spacing floor allows another page; ``suppressed``
+    counts pages held back by that floor since the last one went out.
+    The previous fingerprint is replaced by this one in the same transaction,
+    so a mutation is reported once, at the request that introduced it.
+    """
+    from plugins.blackbox import prefix_guard
+
+    violations: list[dict[str, Any]] = []
+    pageable: list[dict[str, Any]] = []
+    alert = False
+    suppressed = 0
+    previous: dict[str, Any] | None = None
+    with _connect() as conn:
+        prev = conn.execute(
+            "SELECT * FROM prefix_sessions WHERE session_key = ?", (session_key,)
+        ).fetchone()
+        if prev is not None and prev["fingerprint_json"]:
+            try:
+                prev_fp = json.loads(prev["fingerprint_json"])
+            except (TypeError, ValueError):
+                prev_fp = None
+            if isinstance(prev_fp, dict):
+                previous = {
+                    "turn_id": prev["turn_id"], "seq": prev["seq"], "ts": prev["ts"],
+                    "messages": len(prev_fp.get("messages") or []),
+                    "cache_read": prev["cache_read"],
+                }
+                context = _prefix_context(
+                    prev, pid=pid, api_mode=api_mode, model=model, reset=reset,
+                )
+                if context is None and prefix_guard.native_checkpoint_changed(prev_fp, fingerprint):
+                    context = "compaction:native"
+                for diff in prefix_guard.compare(prev_fp, fingerprint):
+                    reason = prefix_guard.allowlist_reason(
+                        allowlist, segment=diff["segment"], session_key=session_key,
+                        now=ts,
+                    )
+                    row = {
+                        **diff,
+                        "context": context,
+                        "allowlisted": 1 if reason else 0,
+                        "allowlist_reason": reason,
+                    }
+                    violations.append(row)
+                    conn.execute(
+                        """
+                        INSERT INTO prefix_mutations (
+                            ts, session_key, turn_id, seq, prev_turn_id, prev_seq,
+                            prev_ts, provider, lane_family, model, segment, kind,
+                            first_divergent_index, bytes_before, bytes_after,
+                            messages_before, messages_after, context, allowlisted,
+                            allowlist_reason, cache_read_before, cache_read_after
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ts, session_key, turn_id, seq, prev["turn_id"], prev["seq"],
+                            prev["ts"], provider, lane_family(provider), model,
+                            diff["segment"], diff["kind"], diff["first_divergent_index"],
+                            diff["bytes_before"], diff["bytes_after"],
+                            len(prev_fp.get("messages") or []),
+                            len(fingerprint.get("messages") or []),
+                            context, row["allowlisted"], reason,
+                            prev["cache_read"], cache_read,
+                        ),
+                    )
+                pageable = [
+                    v for v in violations
+                    if v["kind"] == prefix_guard.KIND_MUTATION
+                    and v["context"] is None and not v["allowlisted"]
+                ]
+                if pageable and prev["alerted_at"] is None:
+                    last = conn.execute(
+                        "SELECT value FROM meta WHERE key = ?", (_PREFIX_ALERT_META_KEY,)
+                    ).fetchone()
+                    last_ts = float(last["value"]) if last and last["value"] else None
+                    held = conn.execute(
+                        "SELECT value FROM meta WHERE key = 'prefix_guard_suppressed'"
+                    ).fetchone()
+                    suppressed = int(held["value"]) if held and held["value"] else 0
+                    if last_ts is None or ts - last_ts >= PREFIX_ALERT_MIN_SPACING_S:
+                        alert = True
+                        conn.execute(
+                            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                            (_PREFIX_ALERT_META_KEY, repr(float(ts))),
+                        )
+                        conn.execute(
+                            "INSERT OR REPLACE INTO meta(key, value) "
+                            "VALUES ('prefix_guard_suppressed', '0')"
+                        )
+                        conn.execute(
+                            "UPDATE prefix_mutations SET alerted = 1 WHERE id = ("
+                            "SELECT MAX(id) FROM prefix_mutations WHERE session_key = ?"
+                            " AND context IS NULL AND allowlisted = 0 AND kind = ?)",
+                            (session_key, prefix_guard.KIND_MUTATION),
+                        )
+                    else:
+                        suppressed += 1
+                        conn.execute(
+                            "INSERT OR REPLACE INTO meta(key, value) "
+                            "VALUES ('prefix_guard_suppressed', ?)",
+                            (str(suppressed),),
+                        )
+        alerted_at = prev["alerted_at"] if prev is not None else None
+        if pageable and alerted_at is None:
+            # A held-back page still consumes the session's single alert slot:
+            # the mutation is on record, the next one in this session is noise.
+            alerted_at = ts
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO prefix_sessions (
+                session_key, turn_id, seq, ts, pid, api_mode, model, cache_read,
+                fingerprint_json, updated_at, alerted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_key, turn_id, seq, ts, pid, api_mode, model, cache_read,
+                json.dumps(fingerprint, separators=(",", ":")), time.time(), alerted_at,
+            ),
+        )
+    return {"violations": violations, "alert": alert, "suppressed": suppressed,
+            "previous": previous}
 
 
 # ---------------------------------------------------------------------------

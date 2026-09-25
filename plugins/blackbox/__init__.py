@@ -51,6 +51,10 @@ _DEFAULTS = {
     # so this default is documented-but-inert on purpose (no theater: it becomes
     # load-bearing only when the sweep loop that reads it ships). Default off.
     "reprice_enabled": False,
+    # Conversation prefix-stability guard (card t_c07124ab): fingerprint every
+    # outbound request and page #alerts once per session when already-sent
+    # history / system prompt / tools change between consecutive requests.
+    "prefix_guard": True,
 }
 
 _lock = Lock()
@@ -95,14 +99,22 @@ def record_api_call(
     relay_synthetic: bool,
     route_id: str | None,
     cache_ttl_requested: str | None = None,
+    api_kwargs: Any = None,
+    session_key: str | None = None,
+    prefix_reset: str | None = None,
 ) -> None:
     """Persist one completion attempt when Blackbox is enabled.
 
     This is deliberately a thin, fail-loud plugin boundary. The transport
     caller owns fail-open handling so sequence-allocation or schema errors are
     visible in logs without changing inference behavior.
+
+    ``api_kwargs`` / ``session_key`` / ``prefix_reset`` feed the prefix-
+    stability guard AFTER the ledger row is durable; that observer is
+    fail-open on its own so a guard defect can never cost a ledger row.
     """
-    if _config() is None:
+    cfg = _config()
+    if cfg is None:
         return
     from agent.usage_pricing import CanonicalUsage, normalize_usage
     from plugins.blackbox import store
@@ -131,6 +143,98 @@ def record_api_call(
         cache_write_1h=tier_1h,
         cache_ttl_requested=cache_ttl_requested,
     )
+    if api_kwargs is not None and session_key:
+        observe_request_prefix(
+            cfg,
+            session_key=session_key,
+            turn_id=turn_id,
+            seq=seq,
+            ts=ts,
+            provider=provider,
+            model=model,
+            api_mode=api_mode,
+            api_kwargs=api_kwargs,
+            cache_read=canonical.cache_read_tokens if usage is not None else None,
+            reset=prefix_reset,
+        )
+
+
+def observe_request_prefix(
+    cfg: dict[str, Any],
+    *,
+    session_key: str,
+    turn_id: str,
+    seq: int,
+    ts: float,
+    provider: str,
+    model: str,
+    api_mode: str,
+    api_kwargs: Any,
+    cache_read: int | None,
+    reset: str | None = None,
+    alert_fn: Any = None,
+) -> dict[str, Any] | None:
+    """Prefix-stability guard entrypoint (card t_c07124ab). NEVER raises.
+
+    Fingerprints the outbound request, compares it with the session's
+    previous request in the store, and on the session's first unexplained
+    mutation dispatches ONE #alerts page on a daemon thread. Returns the
+    store result (diagnostic; the caller ignores it) or None when disabled
+    or failed. ``blackbox.prefix_guard: false`` switches the guard off.
+    """
+    try:
+        if not bool(cfg.get("prefix_guard", True)):
+            return None
+        from plugins.blackbox import prefix_guard, store
+
+        fingerprint = prefix_guard.fingerprint_request(api_kwargs)
+        if fingerprint is None:
+            return None
+        import os
+
+        result = store.record_prefix_check(
+            session_key=session_key,
+            turn_id=turn_id,
+            seq=seq,
+            ts=ts,
+            pid=os.getpid(),
+            provider=provider,
+            model=model,
+            api_mode=api_mode,
+            fingerprint=fingerprint,
+            cache_read=cache_read,
+            reset=reset,
+            allowlist=cfg.get("prefix_guard_allowlist"),
+        )
+        violations = result.get("violations") or []
+        if violations:
+            logger.warning(
+                "blackbox prefix guard: session=%s turn=%s seq=%s %s (context=%s)",
+                session_key, turn_id, seq,
+                "; ".join(prefix_guard._describe(v) for v in violations),
+                violations[0].get("context"),
+            )
+        if result.get("alert"):
+            previous = result.get("previous") or {}
+            body = prefix_guard.render_alert(
+                profile=_profile_name(),
+                provider=provider,
+                model=model,
+                session_key=session_key,
+                turn_id=turn_id,
+                seq=seq,
+                violations=violations,
+                messages_before=int(previous.get("messages") or 0),
+                messages_after=len(fingerprint.get("messages") or []),
+                cache_read_before=previous.get("cache_read"),
+                cache_read_after=cache_read,
+                suppressed=int(result.get("suppressed") or 0),
+            )
+            prefix_guard.dispatch_alert(body, alert_fn)
+        return result
+    except Exception:
+        logger.warning("blackbox prefix guard failed", exc_info=True)
+        return None
 
 
 
