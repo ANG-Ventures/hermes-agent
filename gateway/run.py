@@ -4328,6 +4328,102 @@ def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None
     return slug, declared_name
 
 
+# slug -> [(declared_name, SKILL.md path)], built ONCE per set of skill roots.
+#
+# 2026-09-24 04:51 Apollo was killed by the loop-liveness watchdog because
+# _check_unavailable_skill rglob'd + read ~906 SKILL.md files on the event loop
+# for every unknown /command. The walk now happens once (off-loop, see
+# _check_unavailable_skill_async) and is reused until the roots change shape
+# (visible root children / first-level dir mtimes) or /reload-skills invalidates it.
+_SkillSlugIndex = Dict[str, List[Tuple[str, Path]]]
+_skill_slug_index_cache: Dict[Tuple[str, ...], Tuple[Tuple[Tuple[str, int], ...], _SkillSlugIndex]] = {}
+_skill_slug_index_lock = threading.Lock()
+
+# Upper bound an unknown /command waits for the "disabled / not installed"
+# hint. A cold index build on a saturated disk can take tens of seconds; past
+# this budget the user gets the generic unknown-command reply and the build
+# keeps warming in its worker thread for the next call.
+_UNAVAILABLE_SKILL_HINT_BUDGET_S = 0.75
+
+
+def _skill_roots_fingerprint(roots: Tuple[Path, ...]) -> Tuple[Tuple[str, int], ...]:
+    """Track visible root child names and immediate directory mtimes.
+
+    Category mtimes detect skill additions/removals within categories; child
+    names detect flat skill additions/removals. Hidden telemetry/curator files
+    and directories never invalidate the index. /reload-skills picks up deeper
+    edits such as a frontmatter rename.
+    """
+    out: List[Tuple[str, int]] = []
+    for root in roots:
+        try:
+            out.append((str(root), 0))
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if entry.name.startswith("."):
+                        continue
+                    try:
+                        mtime = entry.stat().st_mtime_ns if entry.is_dir() else -1
+                        out.append((entry.path, mtime))
+                    except OSError:
+                        continue
+        except OSError:
+            out.append((str(root), -1))
+    return tuple(sorted(out))
+
+
+def _skill_slug_index(roots: Tuple[Path, ...]) -> _SkillSlugIndex:
+    """Return the cached slug index for ``roots``; build it on first use.
+
+    Blocking (walks the trees on a miss) — call only off the event loop.
+    Single-flight: concurrent callers wait on the lock instead of walking twice.
+    """
+    from agent.skill_utils import is_excluded_skill_path
+
+    key = tuple(str(r) for r in roots)
+    with _skill_slug_index_lock:
+        fingerprint = _skill_roots_fingerprint(roots)
+        cached = _skill_slug_index_cache.get(key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        index: _SkillSlugIndex = {}
+        for root in roots:
+            if not root.exists():
+                continue
+            for skill_md in root.rglob("SKILL.md"):
+                if is_excluded_skill_path(skill_md):
+                    continue
+                slug, declared_name = _skill_slug_from_frontmatter(skill_md)
+                if not slug or not declared_name:
+                    continue
+                index.setdefault(slug, []).append((declared_name, skill_md))
+        _skill_slug_index_cache[key] = (fingerprint, index)
+        return index
+
+
+def _invalidate_skill_slug_index() -> None:
+    """Drop every cached slug index (called by /reload-skills)."""
+    with _skill_slug_index_lock:
+        _skill_slug_index_cache.clear()
+
+
+async def _check_unavailable_skill_async(command_name: str) -> str | None:
+    """Event-loop-safe :func:`_check_unavailable_skill`, bounded by a budget."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_check_unavailable_skill, command_name),
+            timeout=_UNAVAILABLE_SKILL_HINT_BUDGET_S,
+        )
+    except asyncio.TimeoutError:
+        logger.info(
+            "Unavailable-skill hint for /%s skipped: skill index still building "
+            "after %.2fs (continues off-loop)",
+            command_name,
+            _UNAVAILABLE_SKILL_HINT_BUDGET_S,
+        )
+        return None
+
+
 def _check_unavailable_skill(command_name: str) -> str | None:
     """Check if a command matches a known-but-inactive skill.
 
@@ -4346,47 +4442,36 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     normalized = command_name.lower().replace("_", "-")
     try:
         from tools.skills_tool import _get_disabled_skill_names
-        from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+        from agent.skill_utils import get_all_skills_dirs
         disabled = _get_disabled_skill_names()
 
-        # Check disabled skills across all dirs (local + external)
-        for skills_dir in get_all_skills_dirs():
-            if not skills_dir.exists():
-                continue
-            for skill_md in skills_dir.rglob("SKILL.md"):
-                if is_excluded_skill_path(skill_md):
-                    continue
-                slug, declared_name = _skill_slug_from_frontmatter(skill_md)
-                if not slug or not declared_name:
-                    continue
-                # disabled is keyed by the declared frontmatter name (what
-                # skills.disabled / skills.platform_disabled store).
-                if slug == normalized and declared_name in disabled:
-                    return (
-                        f"The **{command_name}** skill is installed but disabled.\n"
-                        f"Enable it with: `hermes skills config`"
-                    )
+        # Check disabled skills across all dirs (local + external). The slug
+        # index is built once and cached — see _skill_slug_index.
+        installed = _skill_slug_index(tuple(get_all_skills_dirs()))
+        for declared_name, _skill_md in installed.get(normalized, ()):
+            # disabled is keyed by the declared frontmatter name (what
+            # skills.disabled / skills.platform_disabled store).
+            if declared_name in disabled:
+                return (
+                    f"The **{command_name}** skill is installed but disabled.\n"
+                    f"Enable it with: `hermes skills config`"
+                )
 
         # Check optional skills (shipped with repo but not installed)
         from hermes_constants import get_optional_skills_dir
         repo_root = Path(__file__).resolve().parent.parent
         optional_dir = get_optional_skills_dir(repo_root / "optional-skills")
         if optional_dir.exists():
-            for skill_md in optional_dir.rglob("SKILL.md"):
-                if is_excluded_skill_path(skill_md):
-                    continue
-                slug, _declared = _skill_slug_from_frontmatter(skill_md)
-                if not slug:
-                    continue
-                if slug == normalized:
-                    # Build install path: official/<category>/<name>
-                    rel = skill_md.parent.relative_to(optional_dir)
-                    parts = list(rel.parts)
-                    install_path = f"official/{'/'.join(parts)}"
-                    return (
-                        f"The **{command_name}** skill is available but not installed.\n"
-                        f"Install it with: `hermes skills install {hint_value(install_path)}`"
-                    )
+            optional = _skill_slug_index((optional_dir,))
+            for _declared, skill_md in optional.get(normalized, ()):
+                # Build install path: official/<category>/<name>
+                rel = skill_md.parent.relative_to(optional_dir)
+                parts = list(rel.parts)
+                install_path = f"official/{'/'.join(parts)}"
+                return (
+                    f"The **{command_name}** skill is available but not installed.\n"
+                    f"Install it with: `hermes skills install {hint_value(install_path)}`"
+                )
     except Exception:
         pass
     return None
@@ -24432,9 +24517,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
                     # uninstalled skill and give actionable guidance.
-                    # rglob + read_text over every SKILL.md (900+ on the fleet)
-                    # — measured PHASE=event_loop_blocked 10 s; keep it off-loop.
-                    _unavail_msg = await asyncio.to_thread(_check_unavailable_skill, command)
+                    _unavail_msg = await _check_unavailable_skill_async(command)
                     if _unavail_msg:
                         return _unavail_msg
                     # Genuinely unrecognized /command: not a built-in, not a
