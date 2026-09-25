@@ -45,11 +45,6 @@ from typing import Any, List, Optional, Protocol
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
-from agent.inactivity_watch import (
-    POLL_INTERVAL_SECONDS,
-    build_activity_diagnostic,
-    wait_for_future_or_inactivity,
-)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     _expand_env_vars,
@@ -7457,12 +7452,17 @@ def run_job(
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
-            _activity = build_activity_diagnostic(agent)
-            _last_desc = _activity.last_activity_desc
-            _secs_ago = _activity.seconds_since_activity
-            _cur_tool = _activity.current_tool
-            _iter_n = _activity.api_call_count
-            _iter_max = _activity.max_iterations
+            _activity = {}
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    _activity = agent.get_activity_summary()
+                except Exception:
+                    pass
+            _last_desc = _activity.get("last_activity_desc", "unknown")
+            _secs_ago = _activity.get("seconds_since_activity", 0)
+            _cur_tool = _activity.get("current_tool")
+            _iter_n = _activity.get("api_call_count", 0)
+            _iter_max = _activity.get("max_iterations", 0)
 
             logger.error(
                 "Job '%s' idle for %.0fs (inactivity limit %.0fs) "

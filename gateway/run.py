@@ -64,11 +64,6 @@ from agent.conversation_compression import (
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.compaction_display import project_compaction_message_for_display
 from agent.i18n import t
-from agent.inactivity_watch import (
-    POLL_INTERVAL_SECONDS,
-    build_activity_diagnostic,
-    wait_for_task_or_inactivity,
-)
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
@@ -38442,6 +38437,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._get_turn_admission().retain_worker(_executor_task)
 
             _inactivity_timeout = False
+            _POLL_INTERVAL = 5.0
 
             async def _check_backup_interrupt():
                 if not _interrupt_detected.is_set() and session_key:
@@ -38509,7 +38505,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = None
                 while True:
                     done, _ = await asyncio.wait(
-                        {_executor_task}, timeout=POLL_INTERVAL_SECONDS
+                        {_executor_task}, timeout=_POLL_INTERVAL
                     )
                     if done:
                         response = _executor_task.result()
@@ -38521,31 +38517,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Poll loop: check the agent's built-in activity tracker
                 # (updated by _touch_activity() on every tool call, API
                 # call, and stream delta) every few seconds.
-                _wait_result = await wait_for_task_or_inactivity(
-                    _executor_task,
-                    get_agent=lambda: agent_holder[0],
-                    inactivity_limit=_agent_timeout,
-                    poll_interval=POLL_INTERVAL_SECONDS,
-                    on_idle_check=_send_inactivity_warning,
-                    on_poll=_check_backup_interrupt,
-                    require_truthy_agent=True,
-                )
-                response = _wait_result.result
-                _inactivity_timeout = _wait_result.timed_out
+                response = None
+                while True:
+                    done, _ = await asyncio.wait(
+                        {_executor_task}, timeout=_POLL_INTERVAL
+                    )
+                    if done:
+                        response = _executor_task.result()
+                        break
+                    # Agent still running — check inactivity.
+                    _agent_ref = agent_holder[0]
+                    _idle_secs = 0.0
+                    if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
+                        try:
+                            _act = _agent_ref.get_activity_summary()
+                            _idle_secs = _act.get("seconds_since_activity", 0.0)
+                        except Exception:
+                            pass
+                    await _send_inactivity_warning(_idle_secs)
+                    if _idle_secs >= _agent_timeout:
+                        _inactivity_timeout = True
+                        break
+                    # Backup interrupt check (same as unlimited path).
+                    await _check_backup_interrupt()
 
             if _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
-                _activity = build_activity_diagnostic(
-                    _timed_out_agent,
-                    require_truthy_agent=True,
-                )
+                _activity = {}
+                if _timed_out_agent and hasattr(_timed_out_agent, "get_activity_summary"):
+                    try:
+                        _activity = _timed_out_agent.get_activity_summary()
+                    except Exception:
+                        pass
 
-                _last_desc = _activity.last_activity_desc
-                _secs_ago = _activity.seconds_since_activity
-                _cur_tool = _activity.current_tool
-                _iter_n = _activity.api_call_count
-                _iter_max = _activity.max_iterations
+                _last_desc = _activity.get("last_activity_desc", "unknown")
+                _secs_ago = _activity.get("seconds_since_activity", 0)
+                _cur_tool = _activity.get("current_tool")
+                _iter_n = _activity.get("api_call_count", 0)
+                _iter_max = _activity.get("max_iterations", 0)
 
                 logger.error(
                     "Agent idle for %.0fs (timeout %.0fs) in session %s "
