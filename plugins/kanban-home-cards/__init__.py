@@ -16,7 +16,24 @@ Invariants (spec plans/2026-09-24_session-start-home-cards.md §5):
 - I2 home-only: the only card query filters ``session_id IN home_ids(...)``.
 - I3 hard cap: <= ``MAX_CARDS`` lines, each <= ``MAX_LINE`` chars, block <=
   ``MAX_CHARS`` incl. header + overflow; truncation by whole lines only.
-- I5 fail-open: DB work bounded by ``BUDGET_S``; never raises.
+- I5 fail-open: the turn waits at most ``BUDGET_S``; never raises.  A
+  timeout names the stage that was still running so it is attributable.
+  Every first turn logs exactly one line.
+- P2 no cold state.db read gates the turn (t_11f2cf60 r3, t_15d21849):
+  lineage, dedupe and an index read over the fallback home (id +
+  in-process parent + the lineage persisted in the index) all start at
+  once on background threads; the turn blocks on ONE event until they
+  settle or ``BUDGET_S`` passes, then uses the best answer it has (exact
+  lineage > fallback home; dedupe not in yet = inject).  One timed wait,
+  so a host that oversleeps timed waits pays that slack once, not per
+  stage.  The log line names ``lineage=state.db|index|in-process`` and
+  ``dedupe=clean|pending``.
+- P1 no board fan-out on the turn path (t_11f2cf60): cards come from ONE
+  read of the cross-board home index (``hermes_cli.kanban_home_index``),
+  which the kanban write path keeps current.  A missing / not-backfilled /
+  unreadable index renders nothing (one log line); boards are never
+  scanned.  The same path serves user inbound, boot auto-resume and
+  internal wakes -- there is nothing to prewarm.
 - I6 no block for kanban workers, delegate children, cron.
 - I7 titles/comments are redacted and framed as data.
 - I8 read-only: ``mode=ro`` URIs + busy timeout, never ``immutable=1``.
@@ -50,8 +67,26 @@ TITLE_MAX = 60
 COMMENT_MAX = 70
 
 # ── budget (I5) ─────────────────────────────────────────────────────────────
-BUDGET_S = 0.75
-PER_BOARD_BUSY_MS = 150
+# Hard ceiling on what the first turn waits for, end to end (t_15d21849 AC3:
+# a slow/locked/cold read degrades to skip in <= 250 ms, never holds init).
+# Measured on a copy of the live 77-board fleet under load (8 CPU burners, a
+# board writer, 8 concurrent session inits): warm path p95 164 ms, so the
+# index read fits; the 750 ms ceiling it replaces let a cold state.db hold
+# every first turn ~500 ms.
+# 0.22, not 0.25: the timeout path ends in a timed wait, and the loaded
+# Studio oversleeps those (measured 2026-09-24, load avg 17-24: wait(0.25)
+# returned after 383-397 ms; sliced into 2 ms waits, 251-265 ms).
+BUDGET_S = 0.22
+# The turn waits in slices this long.  macOS timer coalescing grows a timed
+# wait's slack with its length (a single 0.25 s wait overslept ~140 ms);
+# 2 ms slices keep the overshoot to ~15 ms.  A completion still wakes the
+# turn at once -- slicing only bounds the timeout path.
+WAIT_SLICE_S = 0.002
+# Busy wait on the home index's lock (a writer holds it for one small txn).
+INDEX_BUSY_S = 0.10
+# Upper bound on the probe thread's own state.db work (the turn stops
+# waiting at BUDGET_S; this only stops a wedged read from running forever).
+PROBE_MAX_S = 30.0
 
 # ── restart dedupe (R3) ─────────────────────────────────────────────────────
 DEDUPE_USER_ROWS = 20
@@ -78,12 +113,16 @@ _SEEN_LOCK = threading.Lock()
 def home_ids(session_id: str) -> tuple[str, ...]:
     """Return the session ids whose cards count as this session's home.
 
-    Single seam for OQ-1.  Exact-id semantics until the shared lineage
-    helper from #951 lands; that follow-up PR replaces this body with a call
-    to the helper ``kanban list --home`` uses (id + parent_session_id chain,
-    same session_key, depth <= 10), so both surfaces share one semantics.
+    Single seam for OQ-1: :func:`hermes_cli.kanban_db.home_ids`, the same
+    lineage ``kanban list --home`` and the home guard use (id +
+    parent_session_id chain, same session_key, depth <= 10; per-process
+    cached).  Fails open to the exact id.
     """
-    return (session_id,) if session_id else ()
+    if not session_id:
+        return ()
+    from hermes_cli import kanban_db
+
+    return tuple(sorted(kanban_db.home_ids(session_id)))
 
 
 # ── pure renderer (I3, I7) ──────────────────────────────────────────────────
@@ -169,118 +208,15 @@ def render(cards: Sequence[Mapping[str, Any]]) -> Optional[str]:
     return "\n".join(lines)
 
 
-# ── read-only board scan (I2, I5, I8) ───────────────────────────────────────
-def _board_dbs() -> list[tuple[str, Path]]:
-    from hermes_cli import kanban_db
+# ── indexed read (I2, I5, I8) ───────────────────────────────────────────────
+def query_cards(ids: Sequence[str]) -> list[dict]:
+    """Open cards homed at ``ids``: ONE read of the cross-board home index
+    (:mod:`hermes_cli.kanban_home_index`), maintained on the kanban write
+    path.  Never opens a board database.  Raises
+    ``kanban_home_index.IndexUnavailable`` when the index cannot answer."""
+    from hermes_cli import kanban_home_index
 
-    root = kanban_db.kanban_home()
-    out: list[tuple[str, Path]] = [("default", root / "kanban.db")]
-    boards = root / "kanban" / "boards"
-    if boards.is_dir():
-        for child in sorted(boards.iterdir(), key=lambda p: p.name.lower()):
-            if child.name == "default":
-                continue
-            out.append((child.name, child / "kanban.db"))
-    return [(slug, p) for slug, p in out if p.is_file() and p.stat().st_size > 0]
-
-
-_CARD_SQL = """
-SELECT t.id, t.status, t.title,
-       (SELECT c.body FROM task_comments c WHERE c.task_id = t.id
-         ORDER BY c.created_at DESC, c.id DESC LIMIT 1) AS last_comment,
-       MAX(t.created_at,
-           COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id), 0),
-           COALESCE((SELECT MAX(c.created_at) FROM task_comments c WHERE c.task_id = t.id), 0)
-       ) AS last_activity
-  FROM tasks t
- WHERE t.session_id IN ({ids}) AND t.status IN ({statuses})
-"""
-
-
-class _BudgetExceeded(Exception):
-    """Total budget blown. ``partial_cards`` = cards read before the deadline."""
-
-    def __init__(self, partial_cards: int = 0) -> None:
-        super().__init__("budget exceeded")
-        self.partial_cards = partial_cards
-
-
-MAX_WORKERS = 16
-
-
-def _query_board(slug: str, path: Path, sql: str, params: list, deadline: float) -> list[dict]:
-    # SQLite's own busy handler sleeps in whole seconds on builds without
-    # usleep (measured 1.06 s for busy_timeout=150 on macOS), so it is off
-    # and the per-board busy wait is a short explicit retry instead.
-    board_deadline = min(deadline, time.monotonic() + PER_BOARD_BUSY_MS / 1000.0)
-    while True:
-        conn = sqlite3.connect(
-            f"{path.resolve().as_uri()}?mode=ro", uri=True,
-            timeout=0, check_same_thread=False,
-        )
-        try:
-            conn.execute("PRAGMA busy_timeout = 0")
-            conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
-            return [
-                {"id": r[0], "status": r[1], "title": r[2], "last_comment": r[3],
-                 "last_activity": r[4], "board": slug}
-                for r in conn.execute(sql, params)
-            ]
-        except sqlite3.OperationalError as exc:
-            msg = str(exc).lower()
-            if ("locked" in msg or "busy" in msg) and time.monotonic() + 0.02 < board_deadline:
-                time.sleep(0.02)
-                continue
-            raise
-        finally:
-            conn.close()
-
-
-def query_cards(ids: Sequence[str], *, budget_s: float = BUDGET_S) -> tuple[list[dict], dict]:
-    """Read open cards homed at ``ids`` from every board, within ``budget_s``.
-
-    Boards are read concurrently (per-board cost is dominated by opening the
-    WAL database, not the indexed query).  Returns ``(cards, stats)``; a board
-    that is locked/corrupt is skipped (``stats['skipped']``).  Blowing the
-    total budget raises ``_BudgetExceeded`` — partial results are discarded
-    rather than presented as the full home.
-    """
-    from concurrent.futures import ThreadPoolExecutor, wait
-
-    deadline = time.monotonic() + budget_s
-    stats = {"boards": 0, "skipped": 0}
-    cards: list[dict] = []
-    if not ids:
-        return cards, stats
-    sql = _CARD_SQL.format(
-        ids=",".join("?" * len(ids)), statuses=",".join("?" * len(OPEN_STATUSES))
-    )
-    params = [*ids, *OPEN_STATUSES]
-    dbs = _board_dbs()
-    stats["boards"] = len(dbs)
-    if not dbs:
-        return cards, stats
-    pool = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(dbs)),
-                              thread_name_prefix="kanban-home-cards")
-    try:
-        futures = [pool.submit(_query_board, slug, path, sql, params, deadline)
-                   for slug, path in dbs]
-        done, pending = wait(futures, timeout=max(0.0, deadline - time.monotonic()))
-        timed_out = bool(pending)
-        for fut in done:
-            try:
-                cards.extend(fut.result())
-            except sqlite3.Error:
-                if time.monotonic() >= deadline:
-                    timed_out = True
-                else:
-                    stats["skipped"] += 1
-        if timed_out:
-            raise _BudgetExceeded(len(cards))
-    finally:
-        # Never block the turn on a straggler; its progress handler aborts it.
-        pool.shutdown(wait=False, cancel_futures=True)
-    return cards, stats
+    return kanban_home_index.open_cards(ids, timeout_s=INDEX_BUSY_S)
 
 
 # ── gates (I1, I6, R3) ──────────────────────────────────────────────────────
@@ -402,12 +338,107 @@ def _unavailable(reason: str) -> str:
     return f"[Your open cards: unavailable ({reason}) — {LIST_HINT}]"[:MAX_UNAVAILABLE]
 
 
+# ── probe (I5, P2) ──────────────────────────────────────────────────────────
+def _ms(since: float) -> int:
+    return int((time.monotonic() - since) * 1000)
+
+
+class _Bg:
+    """Run ``fn(*args)`` on a daemon thread; the turn polls ``done``.
+
+    The thread outlives a turn that stopped waiting, so a cold read still
+    completes and warms its cache (``home_ids``) / persists its answer
+    (``remember_home``) for the next first turn -- off the turn path.
+    """
+
+    def __init__(self, name: str, fn, *args: Any,
+                 wake: Optional[threading.Event] = None) -> None:
+        self.value: Any = None
+        self._wake = wake
+        self.error: Optional[str] = None
+        self.ms: Optional[int] = None
+        self.done = threading.Event()
+        self._fn, self._args = fn, args
+        threading.Thread(target=self._run, name=f"kanban-home-cards-{name}",
+                         daemon=True).start()
+
+    def _run(self) -> None:
+        t = time.monotonic()
+        try:
+            self.value = self._fn(*self._args)
+        except Exception as exc:
+            self.error = str(exc)
+        finally:
+            self.ms = _ms(t)
+            self.done.set()
+            if self._wake is not None:
+                self._wake.set()
+
+
+def _resolve_lineage(session_id: str) -> tuple[str, ...]:
+    """state.db lineage (cached per process), persisted into the home index
+    so a cold process can answer it without state.db next time."""
+    ids = home_ids(session_id)
+    try:
+        from hermes_cli import kanban_home_index
+
+        # Own thread: the index write must not delay the lineage answer.
+        threading.Thread(target=kanban_home_index.remember_home, args=(session_id, ids),
+                         name="kanban-home-cards-remember", daemon=True).start()
+    except Exception:
+        pass
+    return ids
+
+
+def _read_cards(session_id: str, ids: Optional[Sequence[str]],
+                parent_session_id: str) -> tuple:
+    """Index stage.  ``ids`` is the resolved lineage, or None when state.db
+    did not answer in time: then the home is the in-process id + parent plus
+    the lineage persisted in the index (a subset of the truth -- it can
+    under-count, never show another chain's card).  Returns
+    ``(lineage_source, result)``; ``result`` as in :func:`on_pre_llm_call`."""
+    from hermes_cli import kanban_home_index
+
+    if ids is not None:
+        source, home = "state.db", tuple(ids)
+    else:
+        known = kanban_home_index.known_home(session_id, timeout_s=INDEX_BUSY_S)
+        source = "index" if known else "in-process"
+        home = tuple(sorted({session_id, *([parent_session_id] if parent_session_id else []),
+                             *known}))
+    try:
+        return source, ("cards", query_cards(home))
+    except kanban_home_index.IndexUnavailable as exc:
+        return source, ("no-index", str(exc))
+
+
+def _stage_ms(**stages: Optional[_Bg]) -> str:
+    out = []
+    for name, bg in stages.items():
+        if bg is None:
+            continue
+        out.append(f"{name}_ms={bg.ms}" if bg.done.is_set() else f"{name}_ms=pending")
+    return " ".join(out)
+
+
 def on_pre_llm_call(
     session_id: str = "",
     platform: str = "",
     conversation_history: Any = None,
+    parent_session_id: str = "",
     **_: Any,
 ) -> Optional[dict]:
+    """The first turn waits at most ``BUDGET_S`` (t_15d21849 AC3), once.
+
+    Lineage (state.db), dedupe (state.db) and a fallback-home index read
+    start together.  When lineage answers, an exact-home index read starts.
+    The turn wakes on every completion and stops as soon as dedupe and the
+    best available index read are in; at ``BUDGET_S`` it takes what it has:
+    exact cards, else fallback-home cards (a subset of the truth -- can
+    under-count, never shows another chain's card), else nothing.  Dedupe
+    not in yet = INJECT (a duplicate block costs ~335 tokens, a missing one
+    defeats the feature).  Nothing here ever scans the boards.
+    """
     try:
         sid = str(session_id or "")
         if not sid or _excluded(platform):
@@ -415,31 +446,56 @@ def on_pre_llm_call(
         if not _first_sighting(sid):  # I1 — marked before any DB work
             return None
         if _recently_injected(conversation_history):  # R3 (replayed history)
+            logger.info("kanban-home-cards: session=%s dedupe=history", sid)
             return None
         started = time.monotonic()
-        if _persisted_recently_injected(sid, started + BUDGET_S):  # R3 (state.db)
-            return None
-        remaining = BUDGET_S - (time.monotonic() - started)
-        if remaining <= 0:
-            logger.info("kanban-home-cards: session=%s unavailable=timeout (dedupe)", sid)
-            return None
-        try:
-            cards, stats = query_cards(home_ids(sid), budget_s=remaining)
-        except _BudgetExceeded as exc:
-            logger.info(
-                "kanban-home-cards: session=%s unavailable=timeout partial_cards=%d",
-                sid, exc.partial_cards,
+        deadline = started + BUDGET_S
+        parent = str(parent_session_id or "")
+        wake = threading.Event()
+        lin = _Bg("lineage", _resolve_lineage, sid, wake=wake)
+        dd = _Bg("dedupe", _persisted_recently_injected, sid, started + PROBE_MAX_S, wake=wake)
+        fb = _Bg("index", _read_cards, sid, None, parent, wake=wake)
+        exact: Optional[_Bg] = None
+        while True:
+            wake.clear()  # before evaluating: a completion after this re-sets it
+            if dd.done.is_set() and dd.value is True:  # R3 (state.db)
+                logger.info("kanban-home-cards: session=%s dedupe=state.db ms=%d %s",
+                            sid, _ms(started), _stage_ms(lineage=lin, dedupe=dd))
+                return None
+            if exact is None and lin.done.is_set() and lin.error is None:
+                exact = _Bg("exact", _read_cards, sid, lin.value, parent, wake=wake)
+            if dd.done.is_set():
+                if exact is not None and exact.done.is_set():
+                    break
+                if lin.done.is_set() and lin.error is not None and fb.done.is_set():
+                    break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wake.wait(min(WAIT_SLICE_S, remaining))  # early on any completion
+        stages = _stage_ms(lineage=lin, dedupe=dd, index=fb, exact=exact)
+        pick = exact if (exact is not None and exact.done.is_set()) else (
+            fb if fb.done.is_set() else None)
+        if pick is None:
+            logger.info(  # I5 — the turn never waits longer than BUDGET_S
+                "kanban-home-cards: session=%s unavailable=timeout stage=index ms=%d %s",
+                sid, _ms(started), stages,
             )
-            # A home already known to be non-empty gets a pointer; an
-            # unknown/empty one stays zero-token (D5) instead of paying a
-            # line on every session start of a loaded host.
-            return {"context": _unavailable("timeout")} if exc.partial_cards else None
+            return None
+        if pick.error is not None:
+            logger.warning("kanban-home-cards: session=%s failed open: %s", sid, pick.error)
+            return None
+        source, result = pick.value
+        dedupe = "clean" if dd.done.is_set() else "pending"
+        tail = f"lineage={source} dedupe={dedupe} {stages}"
+        if result[0] == "no-index":  # fail-open, never scan boards
+            logger.info("kanban-home-cards: session=%s unavailable=%s ms=%d %s",
+                        sid, result[1], _ms(started), tail)
+            return None
+        cards = result[1]
         block = render(cards)
-        ms = int((time.monotonic() - started) * 1000)
-        logger.info(
-            "kanban-home-cards: session=%s cards=%d chars=%d ms=%d boards=%d skipped=%d",
-            sid, len(cards), len(block or ""), ms, stats["boards"], stats["skipped"],
-        )
+        logger.info("kanban-home-cards: session=%s cards=%d chars=%d ms=%d %s",
+                    sid, len(cards), len(block or ""), _ms(started), tail)
         return {"context": block} if block else None
     except Exception as exc:  # I5 — never raise into the turn
         logger.warning("kanban-home-cards: failed open: %s", exc)

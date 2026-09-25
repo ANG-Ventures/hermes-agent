@@ -4801,6 +4801,20 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+        # Cross-board home index (t_11f2cf60): mirror the cards this commit
+        # (or any earlier event-writing commit on this board) touched, from
+        # the committed rows. Every guarded mutator and every execution-lane
+        # writer commits here. Best-effort, never raises.
+        _sync_home_index(conn)
+
+
+def _sync_home_index(conn: sqlite3.Connection) -> None:
+    try:
+        from hermes_cli import kanban_home_index
+
+        kanban_home_index.sync_after_commit(conn)
+    except Exception:  # pragma: no cover - the index is a mirror, never a gate
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -5154,6 +5168,21 @@ def _caller_session_lineage(session_id: str) -> tuple[str, ...]:
 
 HOME_LINEAGE_MAX_DEPTH = 10
 
+# Per-process lineage cache.  Lineage rows are append-mostly (ancestors never
+# change; descendants appear on rotation, which hands the caller a NEW id), so
+# a short TTL bounds the only staleness (a new descendant of an OLD id).
+# Keyed by (session id, state.db path).  Only successful DB-backed answers are
+# cached: a fail-open ``{session_id}`` (no db, no row yet, locked) is retried.
+HOME_IDS_CACHE_MAX = 256
+HOME_IDS_CACHE_TTL_S = 300.0
+_HOME_CACHE: "dict[tuple[str, str, int], tuple[float, frozenset[str], Optional[float]]]" = {}
+_HOME_CACHE_LOCK = threading.Lock()
+
+
+def clear_home_ids_cache() -> None:
+    with _HOME_CACHE_LOCK:
+        _HOME_CACHE.clear()
+
 
 def home_ids(session_id: Optional[str], *, db_path: Any = None) -> frozenset[str]:
     """THE definition of a session's kanban "home": the id plus its
@@ -5171,64 +5200,114 @@ def home_ids(session_id: Optional[str], *, db_path: Any = None) -> frozenset[str
     ``busy_timeout``, and FAIL-OPEN: any error (no state.db, no such row,
     locked, old schema) returns ``{session_id}`` -- exactly the pre-lineage
     exact-id behaviour. Shared by ``list --home``, ``show``'s home label,
-    the home-session guard and the kanban-home-cards plugin.
+    the home-session guard and the kanban-home-cards plugin.  Answers are
+    cached per process (:data:`HOME_IDS_CACHE_TTL_S`).
+    """
+    return home_lineage(session_id, db_path=db_path)[0]
+
+
+def home_lineage(
+    session_id: Optional[str], *, db_path: Any = None
+) -> tuple[frozenset[str], Optional[float]]:
+    """``(home_ids(session_id), earliest started_at in that home)``.
+
+    The start time is ``None`` whenever it is unknown (fail-open answer, no
+    ``started_at``), which callers must treat as "could be arbitrarily old".
     """
     sid = (str(session_id).strip() if session_id else "")
     if not sid:
-        return frozenset()
-    only = frozenset({sid})
+        return frozenset(), None
+    only = (frozenset({sid}), None)
     try:
         if db_path is None:
             from hermes_state import _default_db_path
 
             db_path = _default_db_path()
         path = Path(db_path)
+        try:
+            st = path.stat()
+        except OSError:
+            return only
+        # inode in the key: a replaced/recreated state.db is a new cache.
+        key = (sid, str(path), st.st_ino)
+        now = time.monotonic()
+        with _HOME_CACHE_LOCK:
+            hit = _HOME_CACHE.get(key)
+            if hit is not None and now - hit[0] < HOME_IDS_CACHE_TTL_S:
+                return hit[1], hit[2]
         if not path.is_file():
             return only
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
-        try:
-            conn.execute("PRAGMA busy_timeout = 2000")
-            row = conn.execute(
-                "SELECT session_key, parent_session_id FROM sessions WHERE id = ?",
-                (sid,),
-            ).fetchone()
-            if row is None or not row[0]:
-                return only
-            key = row[0]
-            ids = {sid}
-            parent = row[1]
-            for _ in range(HOME_LINEAGE_MAX_DEPTH):
-                if not parent or parent in ids:
-                    break
-                prow = conn.execute(
-                    "SELECT parent_session_id FROM sessions "
-                    "WHERE id = ? AND session_key = ?",
-                    (parent, key),
-                ).fetchone()
-                if prow is None:
-                    break
-                ids.add(parent)
-                parent = prow[0]
-            frontier = [sid]
-            for _ in range(HOME_LINEAGE_MAX_DEPTH):
-                if not frontier:
-                    break
-                ph = ",".join("?" * len(frontier))
-                kids = [
-                    r[0] for r in conn.execute(
-                        f"SELECT id FROM sessions WHERE parent_session_id IN ({ph}) "
-                        "AND session_key = ?",
-                        (*frontier, key),
-                    )
-                    if r[0] and r[0] not in ids
-                ]
-                ids.update(kids)
-                frontier = kids
-            return frozenset(ids)
-        finally:
-            conn.close()
+        found = _home_lineage_query(path, sid)
+        if found is None:
+            return only
+        with _HOME_CACHE_LOCK:
+            _HOME_CACHE.pop(key, None)
+            _HOME_CACHE[key] = (now, found[0], found[1])
+            while len(_HOME_CACHE) > HOME_IDS_CACHE_MAX:
+                _HOME_CACHE.pop(next(iter(_HOME_CACHE)))
+        return found
     except Exception:
         return only
+
+
+def _home_lineage_query(
+    path: Path, sid: str
+) -> Optional[tuple[frozenset[str], Optional[float]]]:
+    """Walk the lineage in ``path``; ``None`` = no keyed row (not cacheable)."""
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
+    try:
+        conn.execute("PRAGMA busy_timeout = 2000")
+        # started_at is optional: a sessions table without it (older schema,
+        # the dashboard facet fixture) still yields the lineage, start unknown.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        st = "started_at" if "started_at" in cols else "NULL"
+        row = conn.execute(
+            f"SELECT session_key, parent_session_id, {st} FROM sessions WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        key = row[0]
+        ids = {sid}
+        starts = [row[2]]
+        parent = row[1]
+        for _ in range(HOME_LINEAGE_MAX_DEPTH):
+            if not parent or parent in ids:
+                break
+            prow = conn.execute(
+                f"SELECT parent_session_id, {st} FROM sessions "
+                "WHERE id = ? AND session_key = ?",
+                (parent, key),
+            ).fetchone()
+            if prow is None:
+                break
+            ids.add(parent)
+            starts.append(prow[1])
+            parent = prow[0]
+        frontier = [sid]
+        for _ in range(HOME_LINEAGE_MAX_DEPTH):
+            if not frontier:
+                break
+            ph = ",".join("?" * len(frontier))
+            kids = []
+            for r in conn.execute(
+                f"SELECT id, {st} FROM sessions WHERE parent_session_id IN ({ph}) "
+                "AND session_key = ?",
+                (*frontier, key),
+            ):
+                if r[0] and r[0] not in ids:
+                    kids.append(r[0])
+                    starts.append(r[1])
+            ids.update(kids)
+            frontier = kids
+        try:
+            started = min(float(x) for x in starts) if all(
+                isinstance(x, (int, float)) for x in starts) else None
+        except (TypeError, ValueError):
+            started = None
+        return frozenset(ids), started
+    finally:
+        conn.close()
 
 
 def home_guard_mode() -> str:
