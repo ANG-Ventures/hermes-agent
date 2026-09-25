@@ -1,10 +1,10 @@
 # gateway tranche — auditor verdicts (t_35a3b292)
 
-Rows: 181 · verdicts banked: 140 · log window scanned: 2026-05-10..2026-09-25 (540 files, 821 MiB under ~/.hermes/logs + profiles/*/logs; older history is rotated away — a 0 here means 'not in the last ~6 days', not 'never').
+Rows: 181 · verdicts banked: 181 · log window scanned: 2026-05-10..2026-09-25 (540 files, 821 MiB under ~/.hermes/logs + profiles/*/logs; older history is rotated away — a 0 here means 'not in the last ~6 days', not 'never').
 
 Upstream = NousResearch/hermes-agent main @ 59004a6235 (worktree ../up). Fork main @ ec84b3d155 (2026-09-25). `read-only:` = upstream state established by reading the upstream path, not a live run.
 
-Counts: KEEP=91, DROP=12, UPSTREAM=15, SUPERSEDED-BY-UPSTREAM=22, UNRESOLVED=0
+Counts: KEEP=117, DROP=15, UPSTREAM=18, SUPERSEDED-BY-UPSTREAM=31, UNRESOLVED=0
 
 | PR | problem + evidence | upstream RED/GREEN (how) | upstream fix sha | fire count (window) | cost loc/conflict(syncs) | verdict | branch |
 |---|---|---|---|---|---|---|---|
@@ -148,44 +148,44 @@ Counts: KEEP=91, DROP=12, UPSTREAM=15, SUPERSEDED-BY-UPSTREAM=22, UNRESOLVED=0
 | #589 harden(kanban): single-source the creator-stamp shape rule + contract  | kanban creator-stamp shape rule duplicated — PR body | n/a (fork kanban wake routing) | n/a | n/a | 153/2(2) deps=[] | **KEEP** |  Follows #562. |
 | #691 fix(gateway): honor durable chat pins in reset banners (#691) | reset banners ignored durable chat pins — PR body | n/a (chat pins are fork #659) | n/a | 0 (1 literal) | 149/2(3) deps=[] | **KEEP** |  Follows #659. |
 | #19 fix(gateway): bind originating channel into session context for plugin | plugin slash commands lacked the originating channel in session context — PR body | read-only: not confirmed upstream (absorb 20%); upstream session_context.py binds platform/chat but plugin-command path not traced | unverified | n/a | 149/1(3) deps=[] | **KEEP** |  KEEP-UNPROVEN; small. |
-| #687 | _pending_ | | | | 149/3(3) | — | |
-| #694 | _pending_ | | | | 146/1(3) | — | |
-| #401 | _pending_ | | | | 146/1(3) | — | |
-| #197 | _pending_ | | | | 130/3(3) | — | |
-| nopr:c05a81d90a | _pending_ | | | | 126/1(3) | — | |
-| nopr:0f64a3653b | _pending_ | | | | 125/1(3) | — | |
-| #453 | _pending_ | | | | 124/1(3) | — | |
-| #939 | _pending_ | | | | 113/2(3) | — | |
-| #290 | _pending_ | | | | 112/1(3) | — | |
-| #777 | _pending_ | | | | 109/1(2) | — | |
-| #934 | _pending_ | | | | 107/1(3) | — | |
-| #904 | _pending_ | | | | 102/1(3) | — | |
-| #520 | _pending_ | | | | 98/1(3) | — | |
-| nopr:6dc72a75d4 | _pending_ | | | | 96/1(3) | — | |
-| #334 | _pending_ | | | | 93/3(3) | — | |
-| #745 | _pending_ | | | | 91/1(3) | — | |
-| #460 | _pending_ | | | | 86/1(3) | — | |
-| #53 | _pending_ | | | | 84/2(3) | — | |
-| #230 | _pending_ | | | | 83/1(2) | — | |
-| nopr:4ed79b6dad | _pending_ | | | | 81/0(0) | — | |
-| #357 | _pending_ | | | | 78/1(3) | — | |
-| #935 | _pending_ | | | | 77/1(3) | — | |
-| #404 | _pending_ | | | | 77/2(3) | — | |
-| #626 | _pending_ | | | | 75/1(3) | — | |
-| nopr:f29eede0e2 | _pending_ | | | | 75/1(3) | — | |
-| #571 | _pending_ | | | | 75/2(3) | — | |
-| #698 | _pending_ | | | | 73/2(3) | — | |
-| #984 | _pending_ | | | | 70/1(3) | — | |
-| #395 | _pending_ | | | | 70/1(3) | — | |
-| #183 | _pending_ | | | | 67/1(3) | — | |
-| #911 | _pending_ | | | | 65/1(3) | — | |
-| #422 | _pending_ | | | | 61/1(3) | — | |
-| nopr:5378b19f73 | _pending_ | | | | 60/1(3) | — | |
-| #633 | _pending_ | | | | 54/1(3) | — | |
-| #635 | _pending_ | | | | 43/0(0) | — | |
-| nopr:3d5ecfa0ae | _pending_ | | | | 33/1(3) | — | |
-| #163 | _pending_ | | | | 26/1(3) | — | |
-| #138 | _pending_ | | | | 22/2(3) | — | |
-| nopr:0fee1b8b64 | _pending_ | | | | 21/1(2) | — | |
-| nopr:4c595fc6f1 | _pending_ | | | | 15/2(3) | — | |
-| nopr:59429f36db | _pending_ | | | | 11/1(3) | — | |
+| #687 fix(delegation): retain refused completions and shutdown claims (#687) | refused async-delegation completions and shutdown claims were dropped — PR body (#683 follow-up) | n/a (fork JSON completion-outbox ack, #683) | n/a | n/a (no literal) | 149/3(3) deps=[] | **KEEP** |  Follows #683. |
+| #694 fix(gateway): count only user messages in the /queue "(N queued)" read | /queue '(N queued)' readout counted internal events, not just user messages — PR body | RED (read-only: run_busy.py:1026-1027 depth = self._queue_depth(quick_key) counts every queued event; _user_queue_depth 0 hits) | none | n/a | 146/1(3) deps=[] | **KEEP** |  Small cosmetic fix; UPSTREAM candidate. KEEP-UNPROVEN by log. |
+| #401 fix(gateway): /stop cancels pending clarify prompts so the next messag | /stop left a pending clarify prompt that swallowed the next message — PR body | read-only: no clarify cancel found in up/gateway/slash_commands_session.py or run_busy.py /stop path | none found | n/a | 146/1(3) deps=[] | **KEEP** |  Generic; UPSTREAM candidate. KEEP-UNPROVEN. |
+| #197 feat(gateway): show reasoning effort in /model switch confirmation (#1 | /model switch confirmation did not show reasoning effort — PR body | RED (_reasoning_effort_label 0 hits upstream) | none | n/a | 130/3(3) deps=[] | **KEEP** |  Route-announce family; 15 locales, 3 conflict files. |
+| nopr:c05a81d90a fix(gateway): boot-resume marker must survive the SENTINEL phase of th | boot-resume marker dropped during the SENTINEL phase of the recovery turn — commit body | n/a (fork boot-resume marker) | n/a | n/a | 126/1(3) deps=[] | **KEEP** |  Follows #289/#295. |
+| nopr:0f64a3653b fix(gateway): successful turns reset the stuck-loop restart counter ag | successful turns did not reset the stuck-loop restart counter — commit body | GREEN-equivalent (absorb 50%; upstream stuck-loop file .restart_failure_counts handled in run_shutdown.py:1326/1837) | upstream run_shutdown.py stuck-loop accounting | n/a | 125/1(3) deps=[] | **DROP** |  F1/F2 stuck-loop unit with #7536 #70. |
+| #453 fix(gateway): bind the real profile in session context, not "" (#453) | session context bound profile='' instead of the real profile — PR body | read-only: up/gateway/session_context.py:119 default profile=""; binding at the gateway call site not traced | unverified | n/a | 124/1(3) deps=[] | **KEEP** |  KEEP-UNPROVEN; adversary should check upstream's session-context bind site. |
+| #939 fix(gateway): boot-resume fan-out is unbounded by default — every rest | boot-resume fan-out unbounded by default: every restart-interrupted session resumed at once — 2026-09-23 Apollo freeze follow-up (aegis story sec.7) | RED (read-only: _schedule_resume_pending_sessions@up/gateway/run_startup.py:587-620 spawns every candidate in one loop, no throttle) | none | n/a (config default change) | 113/2(3) deps=[] | **KEEP** |  Follows #827 throttle. Generic; port together with #936. |
+| #290 fix(gateway): harden auto-resume durability and scope (#290) | auto-resume durability and scope hardening — PR body | n/a (fork auto_resume.py) | n/a | n/a | 112/1(3) deps=[] | **KEEP** |  Follows #289. |
+| #777 fix(discord): port command-sync retry review fixes (#777) | review fixes on the Discord command-sync retry — PR body (#763 review) | GREEN (upstream command-sync rate-limit path, see #763) | cc8e5ec2af / 6e5b084b8b | 0 (5 literals) | 109/1(2) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Follows #763. |
+| #934 fix(gateway): size the turn-body executor to turn admission — admitted | turn executor sized to admission (interim fix) — 2026-09-23 freeze | RED upstream (see #936 live repro) but this row is superseded IN THE FORK by #936 the same morning | none | n/a | 107/1(3) deps=[] | **DROP** |  Dead code path: #936 replaced _executor_max_workers sizing. Nothing left to revert beyond what #936 already overwrote; fold into #936's upstream port. |
+| #904 fix(gateway): ONE restart line per boot — planned names who/how, unpla | restart notice emitted several lines per boot; planned/unplanned cause unnamed — PR body | n/a (fork_ext/unclean_restart_notice.py) | n/a | 455 in 2026-05-10..2026-09-25 (PHASE=restart_notice) | 102/1(3) deps=[] | **KEEP** |  Follows #790; measured. |
+| #520 fix(gateway): restore served provider + reasoning in turn result; re-w | turn result lost served provider + reasoning; served-route persistence unwired — PR body | n/a (fork footer/route family) | n/a | n/a | 98/1(3) deps=[] | **KEEP** |  Footer family. |
+| nopr:6dc72a75d4 fix(gateway): synthetic internal events must never impersonate the use | synthetic internal events could impersonate the user — commit body | GREEN-likely (absorb 50%; upstream MessageEvent(internal=True) for resume @run_startup.py:611, internal flag honoured in run_inbound.py:213-217) | upstream internal-event flag | n/a | 96/1(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Adversary: verify upstream never attributes internal=True events to the user in transcript rows. |
+| #334 feat(footer): opt-in 'latency' field — wall-clock turn duration (#334) | opt-in footer 'latency' field — PR body | GREEN (_format_latency defined upstream; absorb 62%) | ad345a99d8 2026-07-26 (Kyzcreig, 'add opt-in latency runtime footer field') | n/a | 93/3(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Kyzcreig-authored upstream. |
+| #745 fix(gateway): persist active_agent_keys when a turn is promoted sentin | active_agent_keys not persisted when a turn was promoted sentinel -> agent — PR body | GREEN (absorb 100%: every added src line is on upstream; upstream persists at claim @run_startup.py:609 _persist_active_agents) | upstream run.py _persist_active_agents | n/a | 91/1(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Revert is a no-op diff against upstream. |
+| #460 fix(gateway): clear resume_pending for sessions that finished during a | resume_pending not cleared for sessions that finished during a timed-out drain — PR body | read-only: absorb 33%; not confirmed upstream clears on late finish | unverified | n/a | 86/1(3) deps=[] | **KEEP** |  KEEP-UNPROVEN; drain family. |
+| #53 fix(gateway): classify credential-resolution errors as auth failures ( | credential-resolution errors not classified as auth failures — PR body | read-only: absorb 27%; agent/turn_finalizer.py classifier not confirmed upstream | unverified | n/a | 84/2(3) deps=[] | **KEEP** |  KEEP-UNPROVEN; small. |
+| #230 fix(discord): populate parent_chat_id on native slash events in thread | native slash events in Discord threads lacked parent_chat_id — PR body | GREEN (read-only: up/plugins/platforms/discord/adapter.py:4674-4675 slash path passes guild_id/parent_chat_id 'exactly as on_message') | upstream Discord plugin slash source | n/a | 83/1(2) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  |
+| nopr:4ed79b6dad fix(telegram): make network-reconnect ladder configurable, raise defau | Telegram network-reconnect ladder not configurable — commit body | GREEN-equivalent (telegram moved to plugins/platforms/telegram with its own bounded reconnect ladder, adapter.py:414-428); fork path gateway/platforms/telegram.py no longer exists on fork main (PATHS-GONE-FORK) | upstream Telegram plugin migration | n/a | 81/0(0) deps=[] | **DROP** |  Dead in fork: target file gone. Only gateway/config.py residue remains. |
+| #357 fix(desktop): ship the runtime footer as metadata, not message text (# | desktop runtime footer shipped as message text instead of metadata — PR body | RED for tui_gateway/server.py footer seam (fork footer metadata not upstream) | none | n/a | 78/1(3) deps=[] | **KEEP** |  Mixed desktop row (apps/ DROP by D9); server.py footer seam is the D9 trap, consumed by #333. |
+| #935 fix(gateway): route the stderr log handler through the async QueueList | stderr log handler attached directly to root: a WARNING on the Discord heartbeat path became a synchronous disk write and a 10s loop block — 2026-09-23 Apollo freeze story piece 6 (30 ack_stale reconnects) | RED (read-only: up/gateway/run.py:5221-5225 _stderr_handler = logging.StreamHandler(_safe_stderr()); root.addHandler — not routed through hermes_logging's QueueListener) | none | n/a (no literal) | 77/1(3) deps=[] | **UPSTREAM** |  Measured incident, generic, 77 loc. |
+| #404 fix(compress): manual /compress granular Model line shows session-trut | manual /compress Model line showed config r:<effort> instead of session-truthful effort — PR body | n/a (fork granular compress lines, #173) | n/a | n/a | 77/2(3) deps=[] | **KEEP** |  Compaction-announce family. |
+| #626 fix(gateway): manual /compress banner names its trigger (#626) | manual /compress banner did not name its trigger — PR body | n/a (see #627) | n/a | n/a | 75/1(3) deps=[] | **KEEP** |  With #627. |
+| nopr:f29eede0e2 fix(gateway): hand back the resume pre-claim WITHOUT stripping protect | resume pre-claim hand-back stripped boot-resume protection — commit body | n/a (fork boot-resume protection) | n/a | n/a | 75/1(3) deps=[] | **KEEP** |  Follows nopr:217d61ddce. |
+| #571 fix(tui-gateway): redact serve prompt fallback logs (#571) | tui-gateway serve prompt fallback logs carried unredacted prompt text — PR body | RED (_headless_server_log_frame 0 hits upstream) | none | n/a | 75/2(3) deps=[] | **UPSTREAM** |  Privacy fix, generic. Adversary: confirm upstream serve fallback still logs the frame. |
+| #698 fix(tui): retain a refused kanban batch instead of dropping it (#698) | refused kanban batch dropped in tui_gateway — PR body | RED (_restore_kanban_batch 0 hits upstream) | none | n/a | 73/2(3) deps=[] | **KEEP** |  KEEP-UNPROVEN. |
+| #984 fix(gateway): internal events reuse the pinned session-context prompt  | internal events rebuilt the session-context prompt instead of reusing the pinned one (prefix-cache break A->B->A) — PR body | read-only: upstream pins the prompt for user turns (_pinned_session_context_prompt@up/gateway/run_turn.py:2074, c0c76a4715); internal-event path not traced | c0c76a4715 (user-turn pin only, unverified for internal events) | n/a | 70/1(3) deps=[] | **KEEP** |  Cache invariant; if upstream's pin covers internal events this becomes SUPERSEDED. KEEP-UNPROVEN. |
+| #395 fix(gateway): draining gateway must not consume resume-dropbox request | a draining gateway consumed resume-dropbox requests and lost them — PR body | n/a (fork dropbox) | n/a | 638 in 2026-05-10..2026-09-25 (PHASE=dropbox_resume_deferred) | 70/1(3) deps=[] | **KEEP** |  Measured; follows nopr:2ee2e03b68. |
+| #183 feat(gateway): show reasoning effort in the session-reset banner (#183 | session-reset banner did not show reasoning effort — PR body | read-only: upstream reset banner (_format_session_info) has route but effort not confirmed | unverified | n/a | 67/1(3) deps=[] | **KEEP** |  Route-announce family; KEEP-UNPROVEN. |
+| #911 fix(gateway): loop-wakeup watcher reads state_meta off the event loop  | loop-wakeup watcher read state_meta on the event loop (10-50s blocks) — 2026-09-23 freeze story piece 7 (25 loop blocks -> 0) | GREEN (read-only: _loop_wakeup_watcher@up/gateway/run_goals.py:483 awaits self._run_in_executor_with_context(list_active_loops)) | 98428d20bc 2026-09-03 'route loop-wakeup DB call off the loop' (kshitijk4poor) | n/a | 65/1(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Upstream fixed it 20 days earlier; the fork needed its own copy only because fork run.py still carries the pre-split watcher. Resolves at next parity sync. |
+| #422 fix(test): hermetic env-detection tests — pin container/supervisor/HOM | env-detection tests not hermetic (container/supervisor/HOME probes) — PR body | GREEN (is_container_restart_context defined upstream) | bcec6c8d39 2026-07-25 (Kyzcreig, same change upstream) | n/a | 61/1(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Kyzcreig-authored upstream. |
+| nopr:5378b19f73 fix(fallback): address Greptile review on the recovery-announce helper | Greptile review on the recovery-announce helper — commit body | n/a (follows #249) | n/a | n/a | 60/1(3) deps=[] | **KEEP** |  Follows #249. |
+| #633 fix(gateway): bound Discord reconnect backoff (#633) | Discord reconnect backoff unbounded — PR body | GREEN (read-only: _reconnect_backoff@up/gateway/run.py:3232 = min(30*2^(n-1), _RECONNECT_BACKOFF_CAP) — 5 min cap) | upstream run.py _RECONNECT_BACKOFF_CAP | n/a | 54/1(3) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  |
+| #635 fix(telegram): give media downloads their own generous per-request tim | Telegram media downloads shared the short request timeout — PR body | RED-partial (read-only: upstream telegram adapter has media_write_timeout for sends @adapter.py:502/2984 but get_file downloads use the default read_timeout 20s) | none for downloads | n/a | 43/0(0) deps=[] | **UPSTREAM** |  Pairs with #584; 0 conflict files. |
+| nopr:3d5ecfa0ae fix(gateway): restore fork systemd exit-0 restart branch (Linux CI sli | fork systemd exit-0 restart branch lost in reconciliation (Linux CI) — commit body | n/a (reconciliation glue, absorb 50%) | n/a | n/a | 33/1(3) deps=[] | **KEEP** |  Merge-reconciliation glue; 33 loc. |
+| #163 fix(gateway): correct reaper design comment (_touch_activity is NOT de | reaper design comment wrong; hoist comment — PR body (comment-only) | n/a | n/a | n/a | 26/1(3) deps=[] | **KEEP** |  Comment-only, follows #137. |
+| #138 chore(gateway): address Greptile review — observable non-int row-id +  | Greptile review follow-up (non-int row-id observable; None-vs-empty comment) — commit body | n/a | n/a | n/a | 22/2(3) deps=[] | **KEEP** |  Follows #137; 22 loc. |
+| nopr:0fee1b8b64 fix(gateway): per-token exception guard in restore_session_vars (revie | restore_session_vars had no per-token exception guard — commit body (review) | GREEN-likely (upstream session_context.py token-based reset_session_vars:160; absorb 14%) | upstream session_context.py | n/a | 21/1(2) deps=[] | **SUPERSEDED-BY-UPSTREAM** |  Follows nopr:1832ed4e78. |
+| nopr:4c595fc6f1 fix(gateway): pass agent provider into runtime-footer result dict | runtime-footer result dict lacked the agent provider — commit body | n/a (fork footer fields) | n/a | n/a | 15/2(3) deps=[] | **KEEP** |  Footer family; 15 loc. |
+| nopr:59429f36db fix(gateway): clear typing indicator on stale-result early-return path | typing indicator not cleared on the stale-result early-return path — commit body | read-only: not traced upstream | unverified | n/a | 11/1(3) deps=[] | **KEEP** |  11 loc; KEEP-UNPROVEN. |

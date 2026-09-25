@@ -2658,5 +2658,784 @@
   "branch": null,
   "notes": "KEEP-UNPROVEN; small.",
   "subject": "fix(gateway): bind originating channel into session context for plugin slash commands (#19)"
+ },
+ "#687": {
+  "verdict": "KEEP",
+  "problem": "refused async-delegation completions and shutdown claims were dropped",
+  "evidence": {
+   "original": "PR body (#683 follow-up)",
+   "upstream_state": "n/a (fork JSON completion-outbox ack, #683)",
+   "upstream_fix": "n/a",
+   "fires": "n/a (no literal)",
+   "cost": {
+    "loc": 149,
+    "conflict_files": 3,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #683.",
+  "subject": "fix(delegation): retain refused completions and shutdown claims (#687)"
+ },
+ "#694": {
+  "verdict": "KEEP",
+  "problem": "/queue '(N queued)' readout counted internal events, not just user messages",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED (read-only: run_busy.py:1026-1027 depth = self._queue_depth(quick_key) counts every queued event; _user_queue_depth 0 hits)",
+   "upstream_fix": "none",
+   "fires": "n/a",
+   "cost": {
+    "loc": 146,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Small cosmetic fix; UPSTREAM candidate. KEEP-UNPROVEN by log.",
+  "subject": "fix(gateway): count only user messages in the /queue \"(N queued)\" readout (#694)"
+ },
+ "#401": {
+  "verdict": "KEEP",
+  "problem": "/stop left a pending clarify prompt that swallowed the next message",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "read-only: no clarify cancel found in up/gateway/slash_commands_session.py or run_busy.py /stop path",
+   "upstream_fix": "none found",
+   "fires": "n/a",
+   "cost": {
+    "loc": 146,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Generic; UPSTREAM candidate. KEEP-UNPROVEN.",
+  "subject": "fix(gateway): /stop cancels pending clarify prompts so the next message isn't swallowed (#401)"
+ },
+ "#197": {
+  "verdict": "KEEP",
+  "problem": "/model switch confirmation did not show reasoning effort",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED (_reasoning_effort_label 0 hits upstream)",
+   "upstream_fix": "none",
+   "fires": "n/a",
+   "cost": {
+    "loc": 130,
+    "conflict_files": 3,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Route-announce family; 15 locales, 3 conflict files.",
+  "subject": "feat(gateway): show reasoning effort in /model switch confirmation (#197)"
+ },
+ "nopr:c05a81d90a": {
+  "verdict": "KEEP",
+  "problem": "boot-resume marker dropped during the SENTINEL phase of the recovery turn",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "n/a (fork boot-resume marker)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 126,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #289/#295.",
+  "subject": "fix(gateway): boot-resume marker must survive the SENTINEL phase of the recovery turn"
+ },
+ "nopr:0f64a3653b": {
+  "verdict": "DROP",
+  "problem": "successful turns did not reset the stuck-loop restart counter",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "GREEN-equivalent (absorb 50%; upstream stuck-loop file .restart_failure_counts handled in run_shutdown.py:1326/1837)",
+   "upstream_fix": "upstream run_shutdown.py stuck-loop accounting",
+   "fires": "n/a",
+   "cost": {
+    "loc": 125,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "F1/F2 stuck-loop unit with #7536 #70.",
+  "subject": "fix(gateway): successful turns reset the stuck-loop restart counter again"
+ },
+ "#453": {
+  "verdict": "KEEP",
+  "problem": "session context bound profile='' instead of the real profile",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "read-only: up/gateway/session_context.py:119 default profile=\"\"; binding at the gateway call site not traced",
+   "upstream_fix": "unverified",
+   "fires": "n/a",
+   "cost": {
+    "loc": 124,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "KEEP-UNPROVEN; adversary should check upstream's session-context bind site.",
+  "subject": "fix(gateway): bind the real profile in session context, not \"\" (#453)"
+ },
+ "#939": {
+  "verdict": "KEEP",
+  "problem": "boot-resume fan-out unbounded by default: every restart-interrupted session resumed at once",
+  "evidence": {
+   "original": "2026-09-23 Apollo freeze follow-up (aegis story sec.7)",
+   "upstream_state": "RED (read-only: _schedule_resume_pending_sessions@up/gateway/run_startup.py:587-620 spawns every candidate in one loop, no throttle)",
+   "upstream_fix": "none",
+   "fires": "n/a (config default change)",
+   "cost": {
+    "loc": 113,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #827 throttle. Generic; port together with #936.",
+  "subject": "fix(gateway): boot-resume fan-out is unbounded by default — every restart-interrupted session resumes at once (Ace ruling 2026-09-23 09:40) (#939)"
+ },
+ "#290": {
+  "verdict": "KEEP",
+  "problem": "auto-resume durability and scope hardening",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "n/a (fork auto_resume.py)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 112,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #289.",
+  "subject": "fix(gateway): harden auto-resume durability and scope (#290)"
+ },
+ "#777": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "review fixes on the Discord command-sync retry",
+  "evidence": {
+   "original": "PR body (#763 review)",
+   "upstream_state": "GREEN (upstream command-sync rate-limit path, see #763)",
+   "upstream_fix": "cc8e5ec2af / 6e5b084b8b",
+   "fires": "0 (5 literals)",
+   "cost": {
+    "loc": 109,
+    "conflict_files": 1,
+    "conflict_syncs": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #763.",
+  "subject": "fix(discord): port command-sync retry review fixes (#777)"
+ },
+ "#934": {
+  "verdict": "DROP",
+  "problem": "turn executor sized to admission (interim fix)",
+  "evidence": {
+   "original": "2026-09-23 freeze",
+   "upstream_state": "RED upstream (see #936 live repro) but this row is superseded IN THE FORK by #936 the same morning",
+   "upstream_fix": "none",
+   "fires": "n/a",
+   "cost": {
+    "loc": 107,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Dead code path: #936 replaced _executor_max_workers sizing. Nothing left to revert beyond what #936 already overwrote; fold into #936's upstream port.",
+  "subject": "fix(gateway): size the turn-body executor to turn admission — admitted turns queued 2151-2356 s behind a 10-thread pool (Apollo 2026-09-23) (#934)"
+ },
+ "#904": {
+  "verdict": "KEEP",
+  "problem": "restart notice emitted several lines per boot; planned/unplanned cause unnamed",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "n/a (fork_ext/unclean_restart_notice.py)",
+   "upstream_fix": "n/a",
+   "fires": "455 in 2026-05-10..2026-09-25 (PHASE=restart_notice)",
+   "cost": {
+    "loc": 102,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #790; measured.",
+  "subject": "fix(gateway): ONE restart line per boot — planned names who/how, unplanned names the cause; queue-ack stops re-announcing (#904)"
+ },
+ "#520": {
+  "verdict": "KEEP",
+  "problem": "turn result lost served provider + reasoning; served-route persistence unwired",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "n/a (fork footer/route family)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 98,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Footer family.",
+  "subject": "fix(gateway): restore served provider + reasoning in turn result; re-wire served-route persist (#520)"
+ },
+ "nopr:6dc72a75d4": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "synthetic internal events could impersonate the user",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "GREEN-likely (absorb 50%; upstream MessageEvent(internal=True) for resume @run_startup.py:611, internal flag honoured in run_inbound.py:213-217)",
+   "upstream_fix": "upstream internal-event flag",
+   "fires": "n/a",
+   "cost": {
+    "loc": 96,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Adversary: verify upstream never attributes internal=True events to the user in transcript rows.",
+  "subject": "fix(gateway): synthetic internal events must never impersonate the user"
+ },
+ "#334": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "opt-in footer 'latency' field",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "GREEN (_format_latency defined upstream; absorb 62%)",
+   "upstream_fix": "ad345a99d8 2026-07-26 (Kyzcreig, 'add opt-in latency runtime footer field')",
+   "fires": "n/a",
+   "cost": {
+    "loc": 93,
+    "conflict_files": 3,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Kyzcreig-authored upstream.",
+  "subject": "feat(footer): opt-in 'latency' field — wall-clock turn duration (#334)"
+ },
+ "#745": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "active_agent_keys not persisted when a turn was promoted sentinel -> agent",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "GREEN (absorb 100%: every added src line is on upstream; upstream persists at claim @run_startup.py:609 _persist_active_agents)",
+   "upstream_fix": "upstream run.py _persist_active_agents",
+   "fires": "n/a",
+   "cost": {
+    "loc": 91,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Revert is a no-op diff against upstream.",
+  "subject": "fix(gateway): persist active_agent_keys when a turn is promoted sentinel -> agent (#745)"
+ },
+ "#460": {
+  "verdict": "KEEP",
+  "problem": "resume_pending not cleared for sessions that finished during a timed-out drain",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "read-only: absorb 33%; not confirmed upstream clears on late finish",
+   "upstream_fix": "unverified",
+   "fires": "n/a",
+   "cost": {
+    "loc": 86,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "KEEP-UNPROVEN; drain family.",
+  "subject": "fix(gateway): clear resume_pending for sessions that finished during a timed-out drain (#460)"
+ },
+ "#53": {
+  "verdict": "KEEP",
+  "problem": "credential-resolution errors not classified as auth failures",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "read-only: absorb 27%; agent/turn_finalizer.py classifier not confirmed upstream",
+   "upstream_fix": "unverified",
+   "fires": "n/a",
+   "cost": {
+    "loc": 84,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "KEEP-UNPROVEN; small.",
+  "subject": "fix(gateway): classify credential-resolution errors as auth failures (#53)"
+ },
+ "#230": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "native slash events in Discord threads lacked parent_chat_id",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "GREEN (read-only: up/plugins/platforms/discord/adapter.py:4674-4675 slash path passes guild_id/parent_chat_id 'exactly as on_message')",
+   "upstream_fix": "upstream Discord plugin slash source",
+   "fires": "n/a",
+   "cost": {
+    "loc": 83,
+    "conflict_files": 1,
+    "conflict_syncs": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "",
+  "subject": "fix(discord): populate parent_chat_id on native slash events in threads (#230)"
+ },
+ "nopr:4ed79b6dad": {
+  "verdict": "DROP",
+  "problem": "Telegram network-reconnect ladder not configurable",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "GREEN-equivalent (telegram moved to plugins/platforms/telegram with its own bounded reconnect ladder, adapter.py:414-428); fork path gateway/platforms/telegram.py no longer exists on fork main (PATHS-GONE-FORK)",
+   "upstream_fix": "upstream Telegram plugin migration",
+   "fires": "n/a",
+   "cost": {
+    "loc": 81,
+    "conflict_files": 0,
+    "conflict_syncs": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Dead in fork: target file gone. Only gateway/config.py residue remains.",
+  "subject": "fix(telegram): make network-reconnect ladder configurable, raise default tolerance"
+ },
+ "#357": {
+  "verdict": "KEEP",
+  "problem": "desktop runtime footer shipped as message text instead of metadata",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED for tui_gateway/server.py footer seam (fork footer metadata not upstream)",
+   "upstream_fix": "none",
+   "fires": "n/a",
+   "cost": {
+    "loc": 78,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Mixed desktop row (apps/ DROP by D9); server.py footer seam is the D9 trap, consumed by #333.",
+  "subject": "fix(desktop): ship the runtime footer as metadata, not message text (#357)"
+ },
+ "#935": {
+  "verdict": "UPSTREAM",
+  "problem": "stderr log handler attached directly to root: a WARNING on the Discord heartbeat path became a synchronous disk write and a 10s loop block",
+  "evidence": {
+   "original": "2026-09-23 Apollo freeze story piece 6 (30 ack_stale reconnects)",
+   "upstream_state": "RED (read-only: up/gateway/run.py:5221-5225 _stderr_handler = logging.StreamHandler(_safe_stderr()); root.addHandler — not routed through hermes_logging's QueueListener)",
+   "upstream_fix": "none",
+   "fires": "n/a (no literal)",
+   "cost": {
+    "loc": 77,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Measured incident, generic, 77 loc.",
+  "subject": "fix(gateway): route the stderr log handler through the async QueueListener — a WARNING on the event loop was a synchronous disk write (#935)"
+ },
+ "#404": {
+  "verdict": "KEEP",
+  "problem": "manual /compress Model line showed config r:<effort> instead of session-truthful effort",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "n/a (fork granular compress lines, #173)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 77,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Compaction-announce family.",
+  "subject": "fix(compress): manual /compress granular Model line shows session-truthful r:<effort> (#404)"
+ },
+ "#626": {
+  "verdict": "KEEP",
+  "problem": "manual /compress banner did not name its trigger",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "n/a (see #627)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 75,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "With #627.",
+  "subject": "fix(gateway): manual /compress banner names its trigger (#626)"
+ },
+ "nopr:f29eede0e2": {
+  "verdict": "KEEP",
+  "problem": "resume pre-claim hand-back stripped boot-resume protection",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "n/a (fork boot-resume protection)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 75,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows nopr:217d61ddce.",
+  "subject": "fix(gateway): hand back the resume pre-claim WITHOUT stripping protection"
+ },
+ "#571": {
+  "verdict": "UPSTREAM",
+  "problem": "tui-gateway serve prompt fallback logs carried unredacted prompt text",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED (_headless_server_log_frame 0 hits upstream)",
+   "upstream_fix": "none",
+   "fires": "n/a",
+   "cost": {
+    "loc": 75,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Privacy fix, generic. Adversary: confirm upstream serve fallback still logs the frame.",
+  "subject": "fix(tui-gateway): redact serve prompt fallback logs (#571)"
+ },
+ "#698": {
+  "verdict": "KEEP",
+  "problem": "refused kanban batch dropped in tui_gateway",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED (_restore_kanban_batch 0 hits upstream)",
+   "upstream_fix": "none",
+   "fires": "n/a",
+   "cost": {
+    "loc": 73,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "KEEP-UNPROVEN.",
+  "subject": "fix(tui): retain a refused kanban batch instead of dropping it (#698)"
+ },
+ "#984": {
+  "verdict": "KEEP",
+  "problem": "internal events rebuilt the session-context prompt instead of reusing the pinned one (prefix-cache break A->B->A)",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "read-only: upstream pins the prompt for user turns (_pinned_session_context_prompt@up/gateway/run_turn.py:2074, c0c76a4715); internal-event path not traced",
+   "upstream_fix": "c0c76a4715 (user-turn pin only, unverified for internal events)",
+   "fires": "n/a",
+   "cost": {
+    "loc": 70,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Cache invariant; if upstream's pin covers internal events this becomes SUPERSEDED. KEEP-UNPROVEN.",
+  "subject": "fix(gateway): internal events reuse the pinned session-context prompt (prefix-cache A→B→A) (#984)"
+ },
+ "#395": {
+  "verdict": "KEEP",
+  "problem": "a draining gateway consumed resume-dropbox requests and lost them",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "n/a (fork dropbox)",
+   "upstream_fix": "n/a",
+   "fires": "638 in 2026-05-10..2026-09-25 (PHASE=dropbox_resume_deferred)",
+   "cost": {
+    "loc": 70,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Measured; follows nopr:2ee2e03b68.",
+  "subject": "fix(gateway): draining gateway must not consume resume-dropbox requests (#395)"
+ },
+ "#183": {
+  "verdict": "KEEP",
+  "problem": "session-reset banner did not show reasoning effort",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "read-only: upstream reset banner (_format_session_info) has route but effort not confirmed",
+   "upstream_fix": "unverified",
+   "fires": "n/a",
+   "cost": {
+    "loc": 67,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Route-announce family; KEEP-UNPROVEN.",
+  "subject": "feat(gateway): show reasoning effort in the session-reset banner (#183)"
+ },
+ "#911": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "loop-wakeup watcher read state_meta on the event loop (10-50s blocks)",
+  "evidence": {
+   "original": "2026-09-23 freeze story piece 7 (25 loop blocks -> 0)",
+   "upstream_state": "GREEN (read-only: _loop_wakeup_watcher@up/gateway/run_goals.py:483 awaits self._run_in_executor_with_context(list_active_loops))",
+   "upstream_fix": "98428d20bc 2026-09-03 'route loop-wakeup DB call off the loop' (kshitijk4poor)",
+   "fires": "n/a",
+   "cost": {
+    "loc": 65,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Upstream fixed it 20 days earlier; the fork needed its own copy only because fork run.py still carries the pre-split watcher. Resolves at next parity sync.",
+  "subject": "fix(gateway): loop-wakeup watcher reads state_meta off the event loop (10-50 s loop blocks; Discord 3 s ack misses) + sync-DB-in-coroutine lint (#911)"
+ },
+ "#422": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "env-detection tests not hermetic (container/supervisor/HOME probes)",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "GREEN (is_container_restart_context defined upstream)",
+   "upstream_fix": "bcec6c8d39 2026-07-25 (Kyzcreig, same change upstream)",
+   "fires": "n/a",
+   "cost": {
+    "loc": 61,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Kyzcreig-authored upstream.",
+  "subject": "fix(test): hermetic env-detection tests — pin container/supervisor/HOME probes (#422)"
+ },
+ "nopr:5378b19f73": {
+  "verdict": "KEEP",
+  "problem": "Greptile review on the recovery-announce helper",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "n/a (follows #249)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 60,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #249.",
+  "subject": "fix(fallback): address Greptile review on the recovery-announce helper"
+ },
+ "#633": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Discord reconnect backoff unbounded",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "GREEN (read-only: _reconnect_backoff@up/gateway/run.py:3232 = min(30*2^(n-1), _RECONNECT_BACKOFF_CAP) — 5 min cap)",
+   "upstream_fix": "upstream run.py _RECONNECT_BACKOFF_CAP",
+   "fires": "n/a",
+   "cost": {
+    "loc": 54,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "",
+  "subject": "fix(gateway): bound Discord reconnect backoff (#633)"
+ },
+ "#635": {
+  "verdict": "UPSTREAM",
+  "problem": "Telegram media downloads shared the short request timeout",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED-partial (read-only: upstream telegram adapter has media_write_timeout for sends @adapter.py:502/2984 but get_file downloads use the default read_timeout 20s)",
+   "upstream_fix": "none for downloads",
+   "fires": "n/a",
+   "cost": {
+    "loc": 43,
+    "conflict_files": 0,
+    "conflict_syncs": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Pairs with #584; 0 conflict files.",
+  "subject": "fix(telegram): give media downloads their own generous per-request timeouts (#635)"
+ },
+ "nopr:3d5ecfa0ae": {
+  "verdict": "KEEP",
+  "problem": "fork systemd exit-0 restart branch lost in reconciliation (Linux CI)",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "n/a (reconciliation glue, absorb 50%)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 33,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Merge-reconciliation glue; 33 loc.",
+  "subject": "fix(gateway): restore fork systemd exit-0 restart branch (Linux CI slice 3)"
+ },
+ "#163": {
+  "verdict": "KEEP",
+  "problem": "reaper design comment wrong; hoist comment",
+  "evidence": {
+   "original": "PR body (comment-only)",
+   "upstream_state": "n/a",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 26,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Comment-only, follows #137.",
+  "subject": "fix(gateway): correct reaper design comment (_touch_activity is NOT dead code) + hoist compaction_stats imports (#163)"
+ },
+ "#138": {
+  "verdict": "KEEP",
+  "problem": "Greptile review follow-up (non-int row-id observable; None-vs-empty comment)",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "n/a",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 22,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #137; 22 loc.",
+  "subject": "chore(gateway): address Greptile review — observable non-int row-id + None-vs-empty comment (#138)"
+ },
+ "nopr:0fee1b8b64": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "restore_session_vars had no per-token exception guard",
+  "evidence": {
+   "original": "commit body (review)",
+   "upstream_state": "GREEN-likely (upstream session_context.py token-based reset_session_vars:160; absorb 14%)",
+   "upstream_fix": "upstream session_context.py",
+   "fires": "n/a",
+   "cost": {
+    "loc": 21,
+    "conflict_files": 1,
+    "conflict_syncs": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows nopr:1832ed4e78.",
+  "subject": "fix(gateway): per-token exception guard in restore_session_vars (review)"
+ },
+ "nopr:4c595fc6f1": {
+  "verdict": "KEEP",
+  "problem": "runtime-footer result dict lacked the agent provider",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "n/a (fork footer fields)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 15,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Footer family; 15 loc.",
+  "subject": "fix(gateway): pass agent provider into runtime-footer result dict"
+ },
+ "nopr:59429f36db": {
+  "verdict": "KEEP",
+  "problem": "typing indicator not cleared on the stale-result early-return path",
+  "evidence": {
+   "original": "commit body",
+   "upstream_state": "read-only: not traced upstream",
+   "upstream_fix": "unverified",
+   "fires": "n/a",
+   "cost": {
+    "loc": 11,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "11 loc; KEEP-UNPROVEN.",
+  "subject": "fix(gateway): clear typing indicator on stale-result early-return path"
  }
 }
