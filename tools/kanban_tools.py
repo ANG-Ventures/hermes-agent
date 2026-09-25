@@ -955,7 +955,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
             run = kb.latest_run(conn, tid)
             after = kb.get_task(conn, tid)
-            if after is not None and after.status == "review":
+            if getattr(after, "status", None) == "review":
                 return _ok(
                     task_id=tid, run_id=run.id if run else None,
                     status="review",

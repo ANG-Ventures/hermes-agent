@@ -4043,7 +4043,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 after = kb.get_task(conn, tid)
-                if after is not None and after.status == "review":
+                if getattr(after, "status", None) == "review":
                     print(f"Routed {tid} to review (handoff names a still-OPEN PR; not done)")
                 else:
                     print(f"Completed {tid}")
