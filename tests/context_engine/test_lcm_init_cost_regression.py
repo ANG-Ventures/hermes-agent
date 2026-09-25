@@ -52,6 +52,7 @@ from plugins.context_engine.lcm import db_bootstrap
 from plugins.context_engine.lcm.config import LCMConfig
 from plugins.context_engine.lcm.engine import LCMEngine
 from plugins.context_engine.lcm.lifecycle_state import LifecycleStateStore
+from plugins.context_engine.lcm.storage_security import AEAD_PREFIX
 from plugins.context_engine.lcm.store import MessageStore, build_message_fts_spec
 
 # Any full traversal of one of these tables on a per-load / per-session-start
@@ -72,6 +73,12 @@ def _fill(db: Path, n: int) -> None:
         ("s%d" % (i % 50), "user", st._cipher.encrypt_text("m%d" % i, field="content"), float(i))
         for i in range(n)
     ]
+    # One row the profile cannot decrypt (an AEAD-prefixed payload with the
+    # cipher disabled — the fleet DB has three of these). Its search_content
+    # stays NULL forever, so the partial-index probe finds it on EVERY boot;
+    # the old backfill then wrote NULL over NULL, which fired the FTS5 update
+    # trigger and took the write lock on every load (4-57 s on the fleet index).
+    rows.append(("s0", "user", AEAD_PREFIX + "bm90LXJlYWxseS1lbmNyeXB0ZWQ=", float(n)))
     conn.executemany(
         "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)", rows
     )
@@ -282,6 +289,30 @@ def test_concurrent_ingest_between_parity_counts_cannot_trigger_rebuild(tmp_path
     finally:
         reader.close()
         writer.close()
+
+
+def test_structural_rebuild_logs_its_reason(tmp_path, caplog):
+    """A structural FTS rebuild must say WHY, before it runs.
+
+    On 2026-09-24 two rebuilds (13 min + 6.5 min, holding _LOAD_LOCK) left no
+    log line at all; the only trace was a load_slow WARNING minutes later.
+    """
+    import logging
+
+    db = tmp_path / "lcm.db"
+    _fill(db, 200)
+    conn = sqlite3.connect(str(db))
+    conn.execute("DROP TABLE messages_fts_docsize")
+    conn.commit()
+    with caplog.at_level(logging.WARNING, logger="plugins.context_engine.lcm.db_bootstrap"):
+        result = db_bootstrap.repair_external_content_fts(
+            conn, build_message_fts_spec(), throttle=True
+        )
+    conn.close()
+    assert result["rebuilt"] is True
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "needs a structural rebuild" in text and "messages_fts_docsize" in text, text
+    assert "rebuilt in" in text, text
 
 
 def test_init_time_does_not_scale_with_row_count(tmp_path):
