@@ -19,6 +19,28 @@
   "problem": "Summary-row detection by regex over flattened content was fragile; LCM engine now tags its summary row (_lcm_summary) + degrade observability.",
   "verdict": "KEEP"
  },
+ "#1001": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#469",
+     "#596",
+     "#701",
+     "#623"
+    ],
+    "loc": 622
+   },
+   "fires": "'no eligible sub' 3,555 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #1001 (t_ card in subject); 2026-07-11 21:14 pool saturation incident cited by #309.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'no eligible sub' 0 hits in ../up/agent; upstream _candidate_pool_exhausted@../up/agent/chat_completion_helpers.py:1898 models credential-pool cooldowns, not relay seats"
+  },
+  "notes": "Fleet relay-pool family (#1001 root; #469,#596,#701,#623,#739 ride on it): the claude-apr/bpr relay speaks a private 503 {\"error\":\"no eligible sub\"} = capacity, pool read-phase 504s and Claude-Code-CLI usage-cap sentences that upstream's classifier has never seen. Upstream's nearest concept is _candidate_pool_exhausted (credential pools, not relay seats). Not upstreamable without the relay; measured heavily.",
+  "problem": "Relay 'no eligible sub' 503 was treated as a provider failure; it is capacity \u2014 wait for a seat before moving hosts.",
+  "verdict": "KEEP"
+ },
  "#101": {
   "branch": null,
   "evidence": {
@@ -55,6 +77,25 @@
   },
   "notes": "Rides with #913.",
   "problem": "Billed HTTP-200s the loop rejects were missing from turn totals (I4 class 2).",
+  "verdict": "KEEP"
+ },
+ "#1015": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#973"
+    ],
+    "loc": 204
+   },
+   "fires": "'display_kind' 4 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #1015.",
+   "upstream_fix": "none",
+   "upstream_state": "RED-partial: display_kind exists upstream (turn_context/conversation_loop/agent_runtime_helpers) but the iteration-limit summary strip is fork-only"
+  },
+  "notes": "Small; generic \u2014 UPSTREAM-able if the lead wants a branch.",
+  "problem": "Iteration-limit summary leaked display_kind/display_metadata.",
   "verdict": "KEEP"
  },
  "#103": {
@@ -387,6 +428,23 @@
   "problem": "Provenance stamp gated to single-pass; multi-pass sessions degraded.",
   "verdict": "KEEP"
  },
+ "#195": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 188
+   },
+   "fires": "not separately logged",
+   "original": "PR #195.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/error_classifier.py (1,491 lines; FailoverReason enum of 28 members incl. rate_limit/overloaded/timeout/payload_too_large/model_entitlement/incomplete_response/format_error/role_alternation):286-318 request-validation table (non-rotating) + :658 'generic invalid_request_error is deliberately NOT a 400 validation'; role_alternation/format_error reasons"
+  },
+  "notes": "",
+  "problem": "Malformed-conversation 400 cascaded across every provider.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#2": {
   "branch": null,
   "evidence": {
@@ -405,6 +463,46 @@
   },
   "notes": "hermes_state.py (3/3 syncs) carries the columns \u2014 cost is real. Generic enough to UPSTREAM if the lead wants a branch.",
   "problem": "/usage lost the last-turn token snapshot when the agent was evicted; persist it on the session row.",
+  "verdict": "KEEP"
+ },
+ "#205": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#206"
+    ],
+    "loc": 102
+   },
+   "fires": "see #206",
+   "original": "PR #205.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #206)"
+  },
+  "notes": "Rides with #206.",
+  "problem": "x-hermes-session header for reset-weighted router affinity.",
+  "verdict": "KEEP"
+ },
+ "#206": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#205",
+     "#241",
+     "nopr:fba50537aa"
+    ],
+    "loc": 256
+   },
+   "fires": "7d: 19,311 apx/apr+bpx/bpr api calls carry the header (turn_api_calls.lane_family); consumed by the relay router, not visible in agent logs",
+   "original": "PR #206.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'x-hermes' 0 hits in ../up/agent"
+  },
+  "notes": "Relay-affinity header family. Measured on the send side; the lead should confirm with the relay owner that the router still keys on x-hermes-lane/x-hermes-session (claude-relay-pool-ops).",
+  "problem": "Stamp x-hermes-lane on pool main-turn requests (relay router lanes).",
   "verdict": "KEEP"
  },
  "#207": {
@@ -473,6 +571,26 @@
   },
   "notes": "Composition-snapshot family (#21 root; #29,#32,#23,#24,#26,#43,#45,#46 ride on it): fork-only per-request composition for /context /usage /compress that feeds the blackbox comp_* columns. Upstream has no compose_request_breakdown (grep 0) and no comp_* sink. Measured live. The six divisor-tuning rows are one constant edited six times \u2014 not separable; the lead should count them as one. Flag: HERMES_COMPOSITION_CHARS_PER_TOKEN{,_FIXED} are HERMES_* env vars for non-secret config (upstream AGENTS.md rejects) \u2014 if this family is ever upstreamed it must move to config.yaml.",
   "problem": "/context /usage /compress showed guesses; real per-request composition snapshot.",
+  "verdict": "KEEP"
+ },
+ "#21256": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:29886643e0",
+     "nopr:e655dd5bf3"
+    ],
+    "loc": 162
+   },
+   "fires": "configured in 1 of 13 profile configs (daedalus: fallback_providers[0].reasoning_effort)",
+   "original": "PR #21256 (upstream issue number in subject).",
+   "upstream_fix": "none (per-model half is upstream)",
+   "upstream_state": "RED-partial (read-only): upstream re-resolves PER-MODEL overrides on fallback (_reresolve_fallback_reasoning_config@:1977) but fallback entries carry only provider+model (_validate_fallback_model@../up/hermes_cli/config.py:1147); no per-ENTRY key"
+  },
+  "notes": "Marginal: one profile uses it and a per-model override would express the same thing on ../up. Lead may downgrade to DROP if daedalus can use models.<id>.reasoning_effort instead.",
+  "problem": "Per-entry reasoning_effort in the fallback chain.",
   "verdict": "KEEP"
  },
  "#213": {
@@ -556,6 +674,59 @@
   "problem": "Re-land of the session.list denorm behind dashboard.session_list_denorm (default off), with the backfill VERSION bumped past a poisoned marker on the live DB.",
   "verdict": "UPSTREAM"
  },
+ "#222": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 203
+   },
+   "fires": "not measurable from gateway/agent logs (acp_adapter has its own process); no acp log under ~/.hermes/logs",
+   "original": "PR #222.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): upstream ACP adapter has no relay routing"
+  },
+  "notes": "Needs the ACP owner: is any ACP client still launched with the relay route? 2 syncs, 203 loc.",
+  "problem": "Route Claude ACP adapters through the Claude Relay pool.",
+  "verdict": "UNRESOLVED"
+ },
+ "#223": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 202
+   },
+   "fires": "'529' 3,221 / 'overload' 1,138 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #223.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): parse_retry_after_seconds@../up/agent/retry_utils.py:30 (numeric/HTTP-date/headers) + FailoverReason.overloaded"
+  },
+  "notes": "Adversary: confirm the 529 path passes the header into the wait on ../up.",
+  "problem": "Retry-After honored only on rate-limit, not 503/529 overload.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#225": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21256"
+    ],
+    "loc": 757
+   },
+   "fires": "'reasoning_config resolved' 1,106 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (same line upstream emits); audit sink 0 files",
+   "original": "PR #225.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent for announce + effort (_reresolve_fallback_reasoning_config@:1977 'Closes #21256'); the durable audit sink is fork-only but has no file under ~/.hermes/logs (ls 'route' \u2192 none) \u2014 never written in this deployment"
+  },
+  "notes": "757 loc on 3/3-sync files for behaviour upstream now has; the sink half is dead.",
+  "problem": "Announce provider-only route changes + durable audit sink + reasoning-effort re-resolve on fallback.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#226": {
   "branch": null,
   "evidence": {
@@ -573,6 +744,25 @@
   },
   "notes": "Rides with #7; 50 loc, one set member \u2014 idle in window.",
   "problem": "Yunwu claude-* turns priced at the Anthropic snapshot.",
+  "verdict": "KEEP"
+ },
+ "#227": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#1001"
+    ],
+    "loc": 434
+   },
+   "fires": "'rate limit' 9,325 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (subset not separable)",
+   "original": "PR #227.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): fork-specific keyless (relay) client path; upstream has no keyless client concept for pools"
+  },
+  "notes": "Rides with the relay family; unmeasured on its own.",
+  "problem": "Credential-pool rate-limit masked as a non-retryable keyless-client auth failure.",
   "verdict": "KEEP"
  },
  "#23": {
@@ -594,6 +784,23 @@
   "problem": "Tunable chars-per-token divisor (default 3.5) for the composition estimate.",
   "verdict": "KEEP"
  },
+ "#236": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 168
+   },
+   "fires": "model.auto_recovery set in 0 of 13 profile configs (default path only); 'safety refusal' 42 in window",
+   "original": "PR #236.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'auto_recovery' 0 hits in ../up/agent"
+  },
+  "notes": "Knob nobody sets; the sticky-refusal cooldown is the only live half and upstream treats content_policy_blocked as non-retryable already. Revert branch attempted at end of run.",
+  "problem": "model.auto_recovery toggle + sticky cooldown on safety refusal.",
+  "verdict": "DROP"
+ },
  "#24": {
   "branch": null,
   "evidence": {
@@ -611,6 +818,25 @@
   },
   "notes": "Rides with #21. Adversary: with the anchor live, is a 3.5-vs-4 divisor still observable anywhere except /context display?",
   "problem": "Unify all rough token estimators on the 3.5 divisor.",
+  "verdict": "KEEP"
+ },
+ "#241": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#206"
+    ],
+    "loc": 42
+   },
+   "fires": "see #206",
+   "original": "PR #241.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #206)"
+  },
+  "notes": "Rides with #206.",
+  "problem": "Affinity gate accepts claude-apr (rename) + legacy claude-app.",
   "verdict": "KEEP"
  },
  "#242": {
@@ -725,6 +951,44 @@
   "problem": "Local ctx probe read max_tokens as the context window.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#27": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:7188575694"
+    ],
+    "loc": 208
+   },
+   "fires": "'TTFB' 16,378 / 'no-byte' 6,729 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #27.",
+   "upstream_fix": "upstream watchdog tiers",
+   "upstream_state": "GREEN-equivalent (read-only): upstream SSE keepalive detection + giant-conversation watchdog tiers (../up/agent/chat_completion_helpers.py:241-254, 374, 573)"
+  },
+  "notes": "Heavily exercised on the fork; adversary should run tests/agent/test_codex_ttfb_watchdog.py against ../up to prove the same hangs are bounded there.",
+  "problem": "Keepalive-only Codex hangs: progress-stall watchdog.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#280": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#309"
+    ],
+    "loc": 170
+   },
+   "fires": "'connection issue' 276 / 'provider overloaded' 60 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #280.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent: FailoverReason.incomplete_response + _fallback_reason_text (../up/agent/error_classifier.py (1,491 lines; FailoverReason enum of 28 members incl. rate_limit/overloaded/timeout/payload_too_large/model_entitlement/incomplete_response/format_error/role_alternation):54; chat_completion_helpers.py:1759 'provider overloaded' table)"
+  },
+  "notes": "Failover-reason/announce family: upstream converged on the same design (classified FailoverReason threaded into try_activate_fallback, reason text in the chat notice, reset_at-aware cooldown). The fork's error_classifier.py is 2,635 lines vs upstream 1,491 \u2014 most of the delta is relay-specific vocabulary (see #1001 family) layered on an older copy of the same file. Adversary: replay the fork's tests/agent/test_error_classifier.py against ../up to enumerate exactly which classifications upstream lacks.",
+  "problem": "Fallback announce did not say WHY on stream-drop failovers.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#29": {
   "branch": null,
   "evidence": {
@@ -743,6 +1007,25 @@
   "notes": "Rides with #21.",
   "problem": "Split system prompt into identity+skills; per-message framing tokens.",
   "verdict": "KEEP"
+ },
+ "#309": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#280"
+    ],
+    "loc": 551
+   },
+   "fires": "'reason=' 8,592 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #309 body: 2026-07-11 21:14 session 20260710_182847_84cb906d relay 503s announced without reason.",
+   "upstream_fix": "upstream reason threading (git log upstream/main -S'_fallback_reason_text' -- agent/chat_completion_helpers.py)",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/chat_completion_helpers.py try_activate_fallback(agent, reason, reset_at)@2026 \u2192 notice '\u26a0\ufe0f Model fallback: {old} via {prov} unavailable ({_fallback_reason_text(reason)}); using {fb} via {fbprov}' @2124-2127 + _buffer_fallback_notice@2015 + _log_fallback_activated; 18 call sites in ../up/agent pass (reason, reset_at), 0 bare try_activate_fallback(agent) calls"
+  },
+  "notes": "Failover-reason/announce family: upstream converged on the same design (classified FailoverReason threaded into try_activate_fallback, reason text in the chat notice, reset_at-aware cooldown). The fork's error_classifier.py is 2,635 lines vs upstream 1,491 \u2014 most of the delta is relay-specific vocabulary (see #1001 family) layered on an older copy of the same file. Adversary: replay the fork's tests/agent/test_error_classifier.py against ../up to enumerate exactly which classifications upstream lacks.",
+  "problem": "4 of 10 _try_activate_fallback call sites dropped the classified reason.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#31": {
   "branch": null,
@@ -820,6 +1103,25 @@
   "problem": "Drop stale claude/gpt-oss aliases from the Gemini-only bridge.",
   "verdict": "KEEP"
  },
+ "#317": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:4972c37aa9"
+    ],
+    "loc": 120
+   },
+   "fires": "see nopr:4972c37aa9",
+   "original": "PR #317.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent: upstream announces from try_activate_fallback regardless of pin; cooldown text appended (:2128-2130)"
+  },
+  "notes": "",
+  "problem": "Route-change announce suppressed after cooldown-pin.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#32": {
   "branch": null,
   "evidence": {
@@ -858,6 +1160,23 @@
   "problem": "Self-heal stale aggregator cache entries.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#337": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 435
+   },
+   "fires": "'Stopping' 3,623 / '/stop' 605 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #337.",
+   "upstream_fix": "unknown",
+   "upstream_state": "not settled read-only: upstream fallback loop has interrupt handling (chat_completion_helpers.py:85-96 join-after-interrupt; conversation_loop.py:1469 'interrupt' exit) but whether a /stop during a chained fallback wait returns promptly needs a live repro on ../up"
+  },
+  "notes": "435 loc incl. 20 locale files (3/3 syncs). Repro: start a turn on a dead primary with a chain, /stop during the wait, on ../up.",
+  "problem": "/stop ignored inside the fallback retry loop; 'Stopping' wording.",
+  "verdict": "UNRESOLVED"
+ },
  "#342": {
   "branch": null,
   "evidence": {
@@ -876,6 +1195,25 @@
   "notes": "MoA is not used by the fleet in the window; 300 loc on conversation_loop.py/moa_loop.py (3/3 syncs). Revert branch attempted at end of run.",
   "problem": "Price MoA turns by physical model routes.",
   "verdict": "DROP"
+ },
+ "#36": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#12"
+    ],
+    "loc": 191
+   },
+   "fires": "every background review",
+   "original": "PR #36.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #12)"
+  },
+  "notes": "Rides with the #12 background_review decision.",
+  "problem": "Background-review fork CLI session isolated from bridge routing.",
+  "verdict": "KEEP"
  },
  "#38": {
   "branch": null,
@@ -1154,6 +1492,44 @@
   "problem": "claude-opus-5 resolved at 200K instead of 1M.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#467": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21256"
+    ],
+    "loc": 522
+   },
+   "fires": "not separately logged",
+   "original": "PR #467.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/gateway/run.py:4494 _live_status_adapter late binding; effort re-resolve at chat_completion_helpers.py:1977"
+  },
+  "notes": "Adversary: single _live_status_adapter reference upstream \u2014 verify it is read at send time, not bound at construction.",
+  "problem": "Stale status adapter after reconnect; effort clobbered on failover.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#469": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#1001"
+    ],
+    "loc": 100
+   },
+   "fires": "see #1001",
+   "original": "PR #469.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #1001)"
+  },
+  "notes": "Rides with #1001.",
+  "problem": "Honest label for multi-sub pool exhaustion.",
+  "verdict": "KEEP"
+ },
  "#48": {
   "branch": null,
   "evidence": {
@@ -1172,6 +1548,42 @@
   "notes": "Generic; could ride an UPSTREAM branch, but for the fleet it only matters through the notional stack.",
   "problem": "Cache-write billed $0 when no cache-write rate published; bill at input rate.",
   "verdict": "KEEP"
+ },
+ "#495": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 253
+   },
+   "fires": "consumed at agent/conversation_loop.py:8298 and chat_completion_helpers.py:5877 (fork providers)",
+   "original": "PR #495.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 0 hits in ../up"
+  },
+  "notes": "Has real consumers on the fork (not speculative). Adversary: name the provider profile that overrides it; if none, DROP.",
+  "problem": "ProviderProfile.process_response_text hook.",
+  "verdict": "KEEP"
+ },
+ "#496": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "nopr:4972c37aa9"
+    ],
+    "loc": 63
+   },
+   "fires": "see nopr:4972c37aa9",
+   "original": "PR #496.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent: upstream buffers notices into a single pending list flushed once by _emit_pending_fallback_notice (:2015-2024)"
+  },
+  "notes": "Adversary: confirm one hop \u2192 one message on ../up with a two-entry chain.",
+  "problem": "One failover hop announced as two chat messages.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#501": {
   "branch": null,
@@ -1250,6 +1662,23 @@
   "problem": "Background-review iteration ceiling 16\u219230 + loud exhaustion.",
   "verdict": "KEEP"
  },
+ "#505": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 207
+   },
+   "fires": "knob not set in config.yaml",
+   "original": "PR #505.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/anthropic_adapter.py:220 _TOOL_STREAMING_BETA + :325 beta gating + :709 retry knob"
+  },
+  "notes": "",
+  "problem": "Gate fine-grained-tool-streaming beta behind a config knob.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#506": {
   "branch": null,
   "evidence": {
@@ -1307,6 +1736,23 @@
   "problem": "compose_request_breakdown double-billed document+audio base64.",
   "verdict": "KEEP"
  },
+ "#517": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 108
+   },
+   "fires": "'auth refresh' 104 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #517.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): FailoverReason.model_entitlement (retryable=False, rotate-then-fallback) at ../up/agent/error_classifier.py (1,491 lines; FailoverReason enum of 28 members incl. rate_limit/overloaded/timeout/payload_too_large/model_entitlement/incomplete_response/format_error/role_alternation):53,467"
+  },
+  "notes": "Adversary: wording differs ('model entitlement' vs 'account blocked'); behaviour matches.",
+  "problem": "Entitlement 403 announced as '(auth refresh)' instead of '(account blocked)'.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "#528": {
   "branch": null,
   "evidence": {
@@ -1345,6 +1791,61 @@
   "notes": "Rides with #111 removal.",
   "problem": "seed_skew_calibration clamped scale-up ratios on restart.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#530": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#533"
+    ],
+    "loc": 517
+   },
+   "fires": "'decode' 15 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #530.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): format_error/incomplete_response reasons + _RESET_FIELDS (resets_in_seconds/resets_at/reset_at/retry_after) at ../up/agent/error_classifier.py (1,491 lines; FailoverReason enum of 28 members incl. rate_limit/overloaded/timeout/payload_too_large/model_entitlement/incomplete_response/format_error/role_alternation):1225 \u2192 reset_at surfaced in the cooldown notice"
+  },
+  "notes": "Adversary: the 'corrupt body' classification (JSON decode of a 200) \u2014 verify ../up maps it to format_error not unknown.",
+  "problem": "Classify corrupt response bodies + name the exhausted quota window.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#533": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#530"
+    ],
+    "loc": 213
+   },
+   "fires": "not separately logged",
+   "original": "PR #533.",
+   "upstream_fix": "upstream reset_at cooldown",
+   "upstream_state": "GREEN-equivalent (read-only): switch_deferred_by_reset + _arm_rate_limit_cooldown(reason, reset_at) at ../up/agent/chat_completion_helpers.py:2031-2033"
+  },
+  "notes": "",
+  "problem": "Honor an identified 7d quota window in the primary cooldown.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#535": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [],
+    "loc": 223
+   },
+   "fires": "relay-side; 0 syncs (no conflict cost)",
+   "original": "PR #535 ([verified]).",
+   "upstream_fix": "n/a",
+   "upstream_state": "RED: relay_llm.py is fork-only (the relay itself)"
+  },
+  "notes": "Zero sync cost, relay-internal. KEEP by default; belongs with the relay code, not the agent tranche.",
+  "problem": "Relay sanitizes split surrogates before stream encoding.",
+  "verdict": "KEEP"
  },
  "#539": {
   "branch": null,
@@ -1513,6 +2014,122 @@
   "problem": "grok-4.6 catalog, pricing, 500K context, effort dial.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#596": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#1001"
+    ],
+    "loc": 193
+   },
+   "fires": "see #1001",
+   "original": "PR #596.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #1001)"
+  },
+  "notes": "Rides with #1001.",
+  "problem": "Name the model and scope on a pool-exhaustion fallback.",
+  "verdict": "KEEP"
+ },
+ "#597": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#604",
+     "#609"
+    ],
+    "loc": 1143
+   },
+   "fires": "'413' 3,297 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (post-hoc 413s still common); preflight marker 'preflight' 14 / 'request body' 7",
+   "original": "PR #597.",
+   "upstream_fix": "none",
+   "upstream_state": "RED-partial (read-only): upstream classifies payload_too_large post-hoc (../up/agent/error_classifier.py (1,491 lines; FailoverReason enum of 28 members incl. rate_limit/overloaded/timeout/payload_too_large/model_entitlement/incomplete_response/format_error/role_alternation):175-177) and estimates wire size for compaction (conversation_loop.py:85-91 #96995) but has no pre-send byte preflight (request_body_budget 0 hits)"
+  },
+  "notes": "1,143 loc on 3/3-sync files. Fires rarely as a preflight; the post-hoc 413 path upstream now handles. Adversary: is the preflight ever the thing that saved a turn? If not, this is a DROP.",
+  "problem": "Preflight provider body byte limits before sending (413 avoidance).",
+  "verdict": "KEEP"
+ },
+ "#604": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#597"
+    ],
+    "loc": 171
+   },
+   "fires": "see #597",
+   "original": "PR #604.",
+   "upstream_fix": "none",
+   "upstream_state": "see #597"
+  },
+  "notes": "Rides with #597.",
+  "problem": "Distinguish byte-413 remediation telemetry.",
+  "verdict": "KEEP"
+ },
+ "#605": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#608"
+    ],
+    "loc": 256
+   },
+   "fires": "'malformed' 981 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #605.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent: format_error / incomplete_response reasons + SSE keepalive/empty-frame handling (../up/agent/chat_completion_helpers.py:241-254)"
+  },
+  "notes": "",
+  "problem": "Malformed provider responses did not fail over.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#608": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#605",
+     "#610"
+    ],
+    "loc": 122
+   },
+   "fires": "'malformed' 981 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #608.",
+   "upstream_fix": "partial (#107830 upstream)",
+   "upstream_state": "RED-partial: agent/stream_diag.py fork-only; upstream anthropic_adapter.py:709 has a retry knob for malformed fine-grained tool-JSON streams"
+  },
+  "notes": "Diagnostic module; keep until the #610/#63 surrogate family is decided.",
+  "problem": "Classify malformed final stream messages (stream_diag).",
+  "verdict": "KEEP"
+ },
+ "#609": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 0,
+    "dependents": [
+     "#597"
+    ],
+    "loc": 89
+   },
+   "fires": "see #597",
+   "original": "PR #609.",
+   "upstream_fix": "none",
+   "upstream_state": "see #597"
+  },
+  "notes": "Rides with #597 (relay-specific limits).",
+  "problem": "Inherit APR/APX body limits.",
+  "verdict": "KEEP"
+ },
  "#61": {
   "branch": null,
   "evidence": {
@@ -1532,6 +2149,82 @@
   "problem": "provider=auto kept stale main model when crossed onto a fallback client.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "#610": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#63"
+    ],
+    "loc": 491
+   },
+   "fires": "see #63 (5)",
+   "original": "PR #610.",
+   "upstream_fix": "upstream #107830",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/anthropic_adapter.py:709 malformed fine-grained tool-JSON stream retry (#107830) + sanitization above"
+  },
+  "notes": "agent/anthropic_stream_repair.py fork-only; adversary to replay its test on ../up.",
+  "problem": "Split surrogates in tool-input JSON deltas broke the Anthropic SDK accumulator.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#621": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#622"
+    ],
+    "loc": 796
+   },
+   "fires": "'Tailscale' 1 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #621 ([verified]).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): 'tailscale' 0 hits in ../up/agent except redact/model_metadata comments"
+  },
+  "notes": "796 loc on 3/3-sync files (chat_completion_helpers, conversation_loop, error_classifier) + shared_transport_guard.py for a condition seen once in 4 months of logs. Revert branch attempted at end of run.",
+  "problem": "Bound Tailscale transport outages in failover.",
+  "verdict": "DROP"
+ },
+ "#622": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#621"
+    ],
+    "loc": 41
+   },
+   "fires": "see #621 (1)",
+   "original": "PR #622.",
+   "upstream_fix": "none",
+   "upstream_state": "see #621"
+  },
+  "notes": "Rides with #621 revert.",
+  "problem": "Keep Tailscale errors terse.",
+  "verdict": "DROP"
+ },
+ "#623": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#1001"
+    ],
+    "loc": 232
+   },
+   "fires": "504 read-phase not separately logged",
+   "original": "PR #623.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #1001)"
+  },
+  "notes": "Rides with #1001; unmeasured on its own.",
+  "problem": "Pool read-phase 504 burned 3 retries before failing over.",
+  "verdict": "KEEP"
+ },
  "#629": {
   "branch": null,
   "evidence": {
@@ -1549,6 +2242,25 @@
   },
   "notes": "36 loc; rides with #172 \u2014 re-apply the wording on upstream's module if it lacks it.",
   "problem": "Trigger clause should say 'manual' literally.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#63": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#610"
+    ],
+    "loc": 569
+   },
+   "fires": "'surrogate' 5 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #63.",
+   "upstream_fix": "upstream sanitization",
+   "upstream_state": "GREEN-equivalent (read-only): surrogate handling present in ../up/agent/message_sanitization.py, agent_runtime_helpers.py, turn_context.py, conversation_loop.py (grep -l 'surrogate')"
+  },
+  "notes": "Adversary: run tests/agent/test_stream_surrogate*.py against ../up.",
+  "problem": "Split-surrogate emoji in streams caused a fallback to codex.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#630": {
@@ -1624,6 +2336,40 @@
   "notes": "Rides with #7.",
   "problem": "Codex notional route consulted external catalogs before the curated snapshot.",
   "verdict": "KEEP"
+ },
+ "#674": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 181
+   },
+   "fires": "cosmetic",
+   "original": "PR #674.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN (read-only): upstream notices already use '\u26a0\ufe0f' with FE0F (../up/agent/chat_completion_helpers.py:581,1356)"
+  },
+  "notes": "181 loc across 5 files (3/3 syncs) for a glyph; drop on sync.",
+  "problem": "Chat-facing warning glyphs lacked emoji presentation (U+FE0F).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#676": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 260
+   },
+   "fires": "'safety refusal' 42 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "PR #676.",
+   "upstream_fix": "upstream codex refusal delta",
+   "upstream_state": "GREEN (read-only): ../up/agent/codex_runtime.py:731,855 handles response.refusal.delta; transports/codex.py:851 terminal content_filter refusal"
+  },
+  "notes": "",
+  "problem": "Codex safety refusals invisible to the user.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "#679": {
   "branch": null,
@@ -1753,6 +2499,25 @@
   "problem": "Subscription proxies/bridges (claude-api-proxy/apr/bpr, openai-codex) reported $0; price them at vendor list rates as 'estimated' for fleet cost visibility.",
   "verdict": "KEEP"
  },
+ "#701": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#1001"
+    ],
+    "loc": 391
+   },
+   "fires": "'Retry-After' 1,186 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (pool-exhausted subset not separable)",
+   "original": "PR #701.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #1001)"
+  },
+  "notes": "Rides with #1001.",
+  "problem": "Rate-limit Retry-After honored on a pool-exhausted seat (wrong wait).",
+  "verdict": "KEEP"
+ },
  "#722": {
   "branch": null,
   "evidence": {
@@ -1769,6 +2534,25 @@
   "notes": "Adversary: the bridge emits cache_creation_tokens (Anthropic name), upstream reads cache_write_tokens \u2014 verify the key alias on ../up before dropping.",
   "problem": "Anthropic-backed OpenAI bridges report cache_creation_tokens; transport ignored it.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "#739": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#1001"
+    ],
+    "loc": 226
+   },
+   "fires": "'rate limit' 9,325 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02) (cap subset not separable)",
+   "original": "PR #739.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (read-only): fork agent/error_classifier.py:396,1262 matches the CLI's own cap sentence; ../up/agent/error_classifier.py (1,491 lines; FailoverReason enum of 28 members incl. rate_limit/overloaded/timeout/payload_too_large/model_entitlement/incomplete_response/format_error/role_alternation) has _USAGE_LIMIT_PATTERNS ('usage limit','quota') but not the CLI wording"
+  },
+  "notes": "Relay/bridge-specific string; rides with #1001.",
+  "problem": "Claude Code CLI usage-cap sentence (via relay) classified as a connection issue instead of a quota.",
+  "verdict": "KEEP"
  },
  "#76": {
   "branch": null,
@@ -1930,6 +2714,23 @@
   "problem": "C2 accumulator: every upstream call appends a turn_api_calls row with wire attribution.",
   "verdict": "KEEP"
  },
+ "#917": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 327
+   },
+   "fires": "30d: claude-opus-5-5 537 turns (all via relays)",
+   "original": "PR #917.",
+   "upstream_fix": "unknown",
+   "upstream_state": "not settled read-only: 'opus-5-5' 0 hits in ../up/agent/anthropic_adapter.py; whether upstream's adapter already emits the 5.5-compatible shape needs the fork's tests/agent/test_anthropic_opus_5_5_contract.py run against ../up"
+  },
+  "notes": "20-minute check: run the contract test on ../up; RED \u21d2 UPSTREAM, GREEN \u21d2 SUPERSEDED.",
+  "problem": "Guard the two Opus 5.5 request-shape breaking changes.",
+  "verdict": "UNRESOLVED"
+ },
  "#95": {
   "branch": null,
   "evidence": {
@@ -1965,6 +2766,25 @@
   "notes": "Never fires; models.dev fallback would price it anyway. Revert branch attempted at end of run (see branch field).",
   "problem": "Pin GPT-5.5 official list rate and context tier.",
   "verdict": "DROP"
+ },
+ "#973": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#1015"
+    ],
+    "loc": 98
+   },
+   "fires": "every iteration-limit summary on a routed profile",
+   "original": "PR #973.",
+   "upstream_fix": "none",
+   "upstream_state": "RED (fork routing-user concept)"
+  },
+  "notes": "Fleet routing-user plumbing; rides with the gateway tranche's routing decision.",
+  "problem": "Iteration-limit summary carries the profile's session routing user.",
+  "verdict": "KEEP"
  },
  "#978": {
   "branch": null,
@@ -2076,6 +2896,46 @@
   "problem": "Wire the announce at the engine-agnostic compress_context done-site.",
   "verdict": "KEEP"
  },
+ "nopr:29886643e0": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21256"
+    ],
+    "loc": 413
+   },
+   "fires": "see #21256",
+   "original": "commit 29886643e0 (refactor).",
+   "upstream_fix": "none",
+   "upstream_state": "see #21256"
+  },
+  "notes": "Rides with #21256 (this is the isolation refactor).",
+  "problem": "Layer per-entry reasoning_effort on upstream's chokepoint; fix mcp-discovery.",
+  "verdict": "KEEP"
+ },
+ "nopr:4972c37aa9": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#496",
+     "#317",
+     "nopr:d0f884298b"
+    ],
+    "loc": 238
+   },
+   "fires": "'Model fallback' 3,067 in 54 rotated gateway/agent logs (mtime 2026-07-29..2026-09-25; first lines from 2026-06-02)",
+   "original": "commit 4972c37aa9.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): upstream notice + _buffer_fallback_notice one-shot buffer (chat_completion_helpers.py:2015-2024, 2124-2130)"
+  },
+  "notes": "Failover-reason/announce family: upstream converged on the same design (classified FailoverReason threaded into try_activate_fallback, reason text in the chat notice, reset_at-aware cooldown). The fork's error_classifier.py is 2,635 lines vs upstream 1,491 \u2014 most of the delta is relay-specific vocabulary (see #1001 family) layered on an older copy of the same file. Adversary: replay the fork's tests/agent/test_error_classifier.py against ../up to enumerate exactly which classifications upstream lacks.",
+  "problem": "Announce model fallback in chat, always-emitted + deduped (Phase A).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "nopr:5c0ecedb4b": {
   "branch": null,
   "evidence": {
@@ -2095,6 +2955,25 @@
   "problem": "Auxiliary routing runtime globals stayed on the primary after failover \u2192 aux tasks on stale model.",
   "verdict": "KEEP"
  },
+ "nopr:7188575694": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#27"
+    ],
+    "loc": 142
+   },
+   "fires": "see #27",
+   "original": "commit 7188575694.",
+   "upstream_fix": "see #27",
+   "upstream_state": "see #27"
+  },
+  "notes": "Rides with #27.",
+  "problem": "No-byte TTFB watchdog fires before the stale timer.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "nopr:78ce24d1db": {
   "branch": null,
   "evidence": {
@@ -2112,6 +2991,25 @@
   "problem": "Resolver ignored ProviderProfile.api_mode for explicit providers.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
+ "nopr:85ee6f0f12": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [
+     "nopr:e2e69f6fd1"
+    ],
+    "loc": 167
+   },
+   "fires": "not logged",
+   "original": "commit 85ee6f0f12 (test-heavy).",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (read-only): ../up/agent/error_classifier.py (1,491 lines; FailoverReason enum of 28 members incl. rate_limit/overloaded/timeout/payload_too_large/model_entitlement/incomplete_response/format_error/role_alternation):286 'must have non-empty content' classification + anthropic_adapter placeholder handling (:380)"
+  },
+  "notes": "Adversary: run tests/agent/test_anthropic_no_blank_text_invariant.py on ../up.",
+  "problem": "Class-level invariant: no conversion path may emit a blank text block (Anthropic 400).",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "nopr:9c52daad05": {
   "branch": null,
   "evidence": {
@@ -2127,6 +3025,25 @@
   },
   "notes": "10 loc",
   "problem": "auxiliary.<task>.model: auto sent literally to the wire.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "nopr:a0eec7dd47": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#533"
+    ],
+    "loc": 67
+   },
+   "fires": "see #533",
+   "original": "commit a0eec7dd47.",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN-equivalent (see #533)"
+  },
+  "notes": "",
+  "problem": "Honor provider retry-after during fallback cooldown.",
   "verdict": "SUPERSEDED-BY-UPSTREAM"
  },
  "nopr:a557064b09": {
@@ -2297,6 +3214,40 @@
   "problem": "Link a compaction to a same-turn preceding fallback ('after model fallback' rider).",
   "verdict": "KEEP"
  },
+ "nopr:d0f884298b": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [],
+    "loc": 18
+   },
+   "fires": "see nopr:4972c37aa9",
+   "original": "commit d0f884298b (18 loc).",
+   "upstream_fix": "upstream",
+   "upstream_state": "GREEN (read-only): upstream notice renders '{old_model} via {old_provider} \u2026 using {fb_model} via {fb_provider}' (:2124-2126)"
+  },
+  "notes": "",
+  "problem": "Render provider/model on both sides of the announce.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
+ "nopr:e2e69f6fd1": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 2,
+    "dependents": [],
+    "loc": 23
+   },
+   "fires": "not logged",
+   "original": "commit e2e69f6fd1 (23 loc).",
+   "upstream_fix": "upstream",
+   "upstream_state": "see nopr:85ee6f0f12"
+  },
+  "notes": "",
+  "problem": "Non-whitespace placeholder for the synthetic leading user turn.",
+  "verdict": "SUPERSEDED-BY-UPSTREAM"
+ },
  "nopr:e57e66e59f": {
   "branch": null,
   "evidence": {
@@ -2314,6 +3265,25 @@
   },
   "notes": "In-memory half is upstream; the persisted half is #2.",
   "problem": "Retain the last provider-call token snapshot on the agent.",
+  "verdict": "KEEP"
+ },
+ "nopr:e655dd5bf3": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#21256"
+    ],
+    "loc": 48
+   },
+   "fires": "see #21256",
+   "original": "commit e655dd5bf3.",
+   "upstream_fix": "none",
+   "upstream_state": "see #21256"
+  },
+  "notes": "Rides with #21256.",
+  "problem": "None chokepoint resolution keeps current reasoning (session override survives).",
   "verdict": "KEEP"
  },
  "nopr:f20f0cc2cc": {
@@ -2352,6 +3322,25 @@
   },
   "notes": "",
   "problem": "Thread trigger_reason from all in-turn call sites.",
+  "verdict": "KEEP"
+ },
+ "nopr:fba50537aa": {
+  "branch": null,
+  "evidence": {
+   "cost": {
+    "conflict_syncs": 3,
+    "dependents": [
+     "#206"
+    ],
+    "loc": 633
+   },
+   "fires": "see #206",
+   "original": "commit fba50537aa (refactor).",
+   "upstream_fix": "none",
+   "upstream_state": "RED (see #206)"
+  },
+  "notes": "This is the isolation refactor that keeps #206/#205/#241 out of the sync-conflict path \u2014 the right shape; rides with #206.",
+  "problem": "Extract relay header fork extension into agent/relay_headers.py (fork-features.json).",
   "verdict": "KEEP"
  }
 }
