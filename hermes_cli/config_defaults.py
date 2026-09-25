@@ -462,6 +462,13 @@ DEFAULT_CONFIG = {
         # being truncated; lower it to force background discipline.
         # Bridged to TERMINAL_MAX_FOREGROUND_TIMEOUT for child processes.
         "max_foreground_timeout": 600,
+        # Tighter foreground cap for turns delivered over a human messaging
+        # channel (Discord, Telegram, Slack, ...). The chat session cannot
+        # answer new messages while a foreground call runs, so this holds even
+        # when max_foreground_timeout is raised for CLI work. Can only lower
+        # the general cap, never raise it. Bridged to
+        # TERMINAL_GATEWAY_MAX_FOREGROUND_TIMEOUT.
+        "gateway_max_foreground_timeout": 600,
         # Free-disk threshold (GB) below which terminal output carries a
         # low-disk warning. Bridged to TERMINAL_DISK_WARNING_GB.
         "disk_warning_gb": 500.0,
@@ -3134,11 +3141,15 @@ DEFAULT_CONFIG = {
         "max_review_rounds": 3,
         # "all" (default): every request_review routes to review_assignee.
         # "milestone_only": only cards whose title/body carry "[milestone]"
-        # or that are parents in task_links get a reviewer session; every
+        # or "qa:required" get a reviewer session (being a task_links parent
+        # does NOT count — fan-in QA makes every slice a parent); every
         # other card that asks for review is completed in place with a
         # review_skipped event (CI is the gate for slice work) — even when
         # the worker names a reviewer profile; only reviewer=human or
         # --force bypasses it.
+        # "none": no card gets a reviewer session (same bypasses).
+        # A present-but-unknown/empty value fails to "none" (never "all")
+        # and logs review_policy_invalid.
         "review_policy": "all",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,

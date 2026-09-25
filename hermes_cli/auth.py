@@ -84,6 +84,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from hermes_cli.provider_seam import GuardedDict
+from hermes_cli import provider_seam
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +242,7 @@ class ProviderConfig:
     base_url_env_var: str = ""
 
 
-PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
+PROVIDER_REGISTRY: Dict[str, ProviderConfig] = GuardedDict(__name__, "PROVIDER_REGISTRY", {
     "nous": ProviderConfig(
         id="nous",
         name="Nous Portal",
@@ -563,7 +565,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("AZURE_FOUNDRY_API_KEY",),
         base_url_env_var="AZURE_FOUNDRY_BASE_URL",
     ),
-}
+})
 
 # ``hermes_cli.config`` discovers model-provider plugins while importing.  A
 # provider plugin may in turn register its auth metadata here.  Keep this import
@@ -7223,7 +7225,8 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
 
 def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for API-key providers (z.ai, Kimi, MiniMax)."""
-    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    g = provider_seam.snapshot()
+    pconfig = g.PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "api_key":
         return {"configured": False}
 
@@ -7233,7 +7236,7 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     # and GUI contract tests use.
     try:
         from hermes_cli.providers import HERMES_OVERLAYS
-        _overlay = HERMES_OVERLAYS.get(provider_id)
+        _overlay = g.get("HERMES_OVERLAYS", HERMES_OVERLAYS).get(provider_id)
     except Exception:
         _overlay = None
     if _overlay is not None and getattr(_overlay, "keyless", False):

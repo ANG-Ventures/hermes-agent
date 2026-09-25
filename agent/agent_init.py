@@ -30,6 +30,8 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
+from hermes_cli import provider_seam
+
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
@@ -149,10 +151,13 @@ def _normalize_route_base_url(base_url: Any) -> str:
 def _provider_default_routes(provider: str) -> set[str]:
     """Return known exact default routes for a canonical provider id."""
     routes: set[str] = set()
+    # One generation for both registries; a container whose owning module is
+    # first imported below falls back to its live facade.
+    g = provider_seam.snapshot()
     try:
         from hermes_cli.providers import HERMES_OVERLAYS, get_provider
 
-        overlay = HERMES_OVERLAYS.get(provider)
+        overlay = g.get("HERMES_OVERLAYS", HERMES_OVERLAYS).get(provider)
         provider_def = get_provider(provider, allow_network=False)
         for value in (
             getattr(overlay, "base_url_override", ""),
@@ -181,7 +186,7 @@ def _provider_default_routes(provider: str) -> set[str]:
         from hermes_cli.models import normalize_provider as normalize_model_provider
         from hermes_cli.providers import normalize_provider as normalize_registry_provider
 
-        for provider_id, config in PROVIDER_REGISTRY.items():
+        for provider_id, config in g.get("PROVIDER_REGISTRY", PROVIDER_REGISTRY).items():
             canonical_id = normalize_registry_provider(
                 normalize_model_provider(provider_id)
             )

@@ -13,7 +13,10 @@ cores until the gateway starved. Each test pins ONE removed mechanism:
 * ``max_review_rounds`` — round N+1 blocks the card for orchestrator take-over
   instead of re-spawning the reviewer.
 * ``review_policy=milestone_only`` — slice cards complete in place; only
-  ``[milestone]`` / parent cards get a reviewer session.
+  ``[milestone]`` / ``qa:required`` cards get a reviewer session (a task_links
+  parent is NOT a milestone — fan-in QA makes every slice a parent).
+* ``review_policy=none`` / invalid values — every card completes in place; an
+  unknown value fails to ``none``, never ``all``.
 """
 from __future__ import annotations
 
@@ -224,14 +227,15 @@ def test_milestone_only_routes_marker_and_parent_cards(kanban_home, monkeypatch)
         assert kb.request_review(conn, tid, summary="s", reviewer="argus",
                                  expected_run_id=claimed.current_run_id) is True
         assert kb.get_task(conn, tid).status == "review"
-        # parent in task_links
+        # an unmarked task_links PARENT is NOT a milestone (spec §5.2: under
+        # fan-in QA every slice is a parent of its QA card)
         parent = kb.create_task(conn, title="umbrella", assignee="builder")
         child = kb.create_task(conn, title="leaf", assignee="builder")
         with kb.write_txn(conn):
             conn.execute(
                 "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, child)
             )
-        assert kb.is_milestone_card(conn, parent) is True
+        assert kb.is_milestone_card(conn, parent) is False
         assert kb.is_milestone_card(conn, child) is False
         # an explicit reviewer PROFILE on a slice card does NOT bypass the policy
         # (workers were templated to pass reviewer="argus" on every card — that is
@@ -273,3 +277,121 @@ def test_review_policy_none_skips_every_card(tmp_path, monkeypatch):
     monkeypatch.setattr(kb, "_kanban_cfg", lambda: {"review_policy": "none"}, raising=False)
     monkeypatch.setattr(kb, "configured_review_policy", lambda: "none")
     assert kb.configured_review_policy() == "none"
+
+
+def _claim_and_request(conn, tid, **kw):
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    return kb.request_review(
+        conn, tid, summary="PR green", expected_run_id=claimed.current_run_id,
+        with_reason=True, **kw,
+    )
+
+
+def test_review_policy_none_completes_in_place(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "none")
+    monkeypatch.setattr(kb, "configured_max_review_rounds", lambda: 0)
+    with kb.connect() as conn:
+        # even a marked milestone and an explicit reviewer profile complete in place
+        for title in ("slice: add flag", "[milestone] wave done"):
+            tid = kb.create_task(conn, title=title, assignee="builder")
+            ok, reason = _claim_and_request(conn, tid, reviewer="argus")
+            assert ok is True and "review skipped" in reason
+            assert "review_policy=none" in reason and "milestone_only" not in reason
+            task = kb.get_task(conn, tid)
+            assert task.status == "done"
+            skipped = _events(conn, tid, "review_skipped")
+            assert skipped and skipped[0]["policy"] == "none"
+            assert _events(conn, tid, "review_requested") == []
+
+
+def test_unknown_review_policy_fails_to_none(monkeypatch, caplog):
+    import logging
+
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {"review_policy": "garbage"}})
+    with caplog.at_level(logging.WARNING, logger=kb._log.name):
+        assert kb.configured_review_policy() == "none"
+    assert "review_policy_invalid" in caplog.text and "garbage" in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {"review_policy": ""}})
+    with caplog.at_level(logging.WARNING, logger=kb._log.name):
+        assert kb.configured_review_policy() == "none"
+    assert "review_policy_invalid" in caplog.text
+
+    # missing key keeps the documented upstream default
+    caplog.clear()
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {}})
+    assert kb.configured_review_policy() == "all"
+    assert "review_policy_invalid" not in caplog.text
+
+    # valid values pass through (case/space-insensitive)
+    monkeypatch.setattr(cfg, "load_config", lambda: {"kanban": {"review_policy": " Milestone_Only "}})
+    assert kb.configured_review_policy() == "milestone_only"
+
+    # unreadable config fails closed to none, too
+    def _boom():
+        raise RuntimeError("config unreadable")
+
+    caplog.clear()
+    monkeypatch.setattr(cfg, "load_config", _boom)
+    with caplog.at_level(logging.WARNING, logger=kb._log.name):
+        assert kb.configured_review_policy() == "none"
+    assert "review_policy_invalid" in caplog.text
+
+
+def test_qa_required_synonym_is_milestone(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "milestone_only")
+    monkeypatch.setattr(kb, "configured_max_review_rounds", lambda: 0)
+    with kb.connect() as conn:
+        in_body = kb.create_task(conn, title="wave 3", body="acceptance... QA:Required", assignee="builder")
+        in_title = kb.create_task(conn, title="qa:required integration", assignee="builder")
+        plain = kb.create_task(conn, title="slice", body="qa optional", assignee="builder")
+        assert kb.is_milestone_card(conn, in_body) is True
+        assert kb.is_milestone_card(conn, in_title) is True
+        assert kb.is_milestone_card(conn, plain) is False
+        ok, reason = _claim_and_request(conn, in_body, reviewer="argus")
+        assert ok is True, reason
+        assert kb.get_task(conn, in_body).status == "review"
+
+
+def test_fanin_slice_parent_is_not_milestone(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "milestone_only")
+    monkeypatch.setattr(kb, "configured_max_review_rounds", lambda: 0)
+    with kb.connect() as conn:
+        slice_tid = kb.create_task(conn, title="slice: parser", assignee="builder")
+        qa = kb.create_task(conn, title="[milestone] QA", assignee="argus", parents=[slice_tid])
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?", (slice_tid, qa)
+        ).fetchone() is not None
+        assert kb.is_milestone_card(conn, slice_tid) is False
+        assert kb.is_milestone_card(conn, qa) is True
+        ok, reason = _claim_and_request(conn, slice_tid, reviewer="argus")
+        assert ok is True and "review skipped" in reason
+        assert kb.get_task(conn, slice_tid).status == "done"
+        skipped = _events(conn, slice_tid, "review_skipped")
+        assert skipped and skipped[0]["policy"] == "milestone_only"
+
+
+def test_none_with_review_assignee_human_and_reviewer_omitted_completes_in_place(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(
+        cfg, "load_config",
+        lambda: {"kanban": {"review_policy": "none", "review_assignee": "human",
+                            "max_review_rounds": 0}},
+    )
+    assert kb.configured_review_policy() == "none"
+    assert kb.configured_review_assignee() == "human"
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="slice", assignee="builder")
+        ok, reason = _claim_and_request(conn, tid)  # reviewer omitted
+        assert ok is True and "review skipped" in reason
+        assert kb.get_task(conn, tid).status == "done"
+        skipped = _events(conn, tid, "review_skipped")
+        assert skipped and skipped[0]["policy"] == "none"
+        assert _events(conn, tid, "review_requested") == []

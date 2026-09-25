@@ -1441,17 +1441,21 @@ class TestStripProviderPrefix:
     def test_registered_profile_name_and_alias_are_stripped(self, monkeypatch):
         import providers
         from providers import ProviderProfile
+        from hermes_cli import provider_seam
 
-        monkeypatch.setattr(providers, "_REGISTRY", {})
-        monkeypatch.setattr(providers, "_ALIASES", {})
-        monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+        generation = provider_seam.current()
+        provider_seam._reset("_REGISTRY", "_ALIASES")
         monkeypatch.setattr(providers, "_discovered", True)
-        providers.register_provider(
-            ProviderProfile(name="fake-provider", aliases=("fake-alias",))
-        )
+        try:
+            providers.register_provider(
+                ProviderProfile(name="fake-provider", aliases=("fake-alias",))
+            )
 
-        assert _strip_provider_prefix("fake-provider:org/model") == "org/model"
-        assert _strip_provider_prefix("fake-alias:org/model") == "org/model"
+            assert _strip_provider_prefix("fake-provider:org/model") == "org/model"
+            assert _strip_provider_prefix("fake-alias:org/model") == "org/model"
+        finally:
+            provider_seam._restore(generation)
+
 
     def test_bundled_plugin_provider_prefix_is_stripped(self):
         assert _strip_provider_prefix("fireworks:accounts/fireworks/models/foo") == (

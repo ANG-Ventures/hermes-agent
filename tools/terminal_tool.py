@@ -152,6 +152,62 @@ def _foreground_max_timeout() -> int:
     )
 
 
+# Foreground cap for turns delivered over a human MESSAGING channel (Discord,
+# Telegram, Slack, ...). Set via ``terminal.gateway_max_foreground_timeout``
+# (bridged to TERMINAL_GATEWAY_MAX_FOREGROUND_TIMEOUT). It can only LOWER the
+# general cap, never raise it.
+#
+# Why a separate cap: while a foreground tool call runs, that chat session
+# cannot answer new messages. On 2026-09-24 a profile with the general cap
+# raised to 3600 s let the model run its own 60-minute ``for ... sleep 45``
+# polling loops in the foreground, and the user sat unanswered for 20-30
+# minutes across several Discord sessions. A CLI user can Ctrl-C; a chat user
+# cannot, so the raised general cap stays valid for CLI/TUI/kanban while
+# messaging turns keep a short one.
+GATEWAY_FOREGROUND_MAX_TIMEOUT_DEFAULT = 600
+
+
+def _is_messaging_gateway_turn() -> bool:
+    """True when this call runs inside a human messaging-channel turn.
+
+    Uses the session-context predicate the gateway already binds per turn
+    (ContextVar, so concurrent sessions in one process never leak into each
+    other). Cron jobs are excluded: they bind a platform for delivery routing
+    but have no human waiting on the session.
+    """
+    try:
+        from gateway.session_context import is_cron_session, session_is_messaging_surface
+
+        return bool(session_is_messaging_surface()) and not is_cron_session()
+    except Exception:
+        return False
+
+
+def _gateway_foreground_max_timeout() -> int:
+    """Configured messaging-gateway foreground cap (re-read per call)."""
+    return _safe_parse_import_env(
+        "TERMINAL_GATEWAY_MAX_FOREGROUND_TIMEOUT",
+        GATEWAY_FOREGROUND_MAX_TIMEOUT_DEFAULT,
+        int,
+        "integer",
+    )
+
+
+def _effective_foreground_max_timeout() -> "tuple[int, bool]":
+    """Return ``(cap, gateway_capped)`` for THIS call's session.
+
+    ``gateway_capped`` is True when the messaging-gateway cap is the binding
+    limit, so callers can explain why a timeout the schema allows in general
+    is refused here.
+    """
+    cap = _foreground_max_timeout()
+    if _is_messaging_gateway_turn():
+        gw = _gateway_foreground_max_timeout()
+        if 0 < gw < cap:
+            return gw, True
+    return cap, False
+
+
 # Disk usage warning threshold (in GB). Same import-vs-bridge timing caveat as
 # above — read via ``_disk_warning_gb()``.
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
@@ -1814,12 +1870,22 @@ def _timeout_param_description(cap: "int | None" = None) -> str:
     """
     if cap is None:
         cap = _foreground_max_timeout()
-    return (
+    text = (
         f"Max seconds to wait (default: 180, foreground max: {cap}). Returns "
         f"INSTANTLY when command finishes — set high for long tasks, you won't "
         f"wait unnecessarily. Foreground timeout above {cap}s is rejected; use "
         f"background=true for longer commands."
     )
+    # Process-static (depends only on config), so the schema stays
+    # byte-stable for the life of a conversation — prompt cache safe.
+    gw = _gateway_foreground_max_timeout()
+    if 0 < gw < cap:
+        text += (
+            f" Limit is {gw}s in messaging-gateway sessions (Discord, "
+            f"Telegram, ...): the chat cannot answer while a foreground call "
+            f"runs, so longer work goes to background=true or a kanban card."
+        )
+    return text
 
 
 def _refresh_terminal_schema_limits() -> None:
@@ -2830,6 +2896,63 @@ def _foreground_background_guidance(command: str) -> str | None:
     return None
 
 
+# In-turn polling loops (messaging-gateway turns only). A loop whose body
+# sleeps >= this many seconds is a wait, not work; in a chat session it keeps
+# the conversation deaf for the whole wait.
+POLL_LOOP_MIN_SLEEP_S = 30
+
+_POLL_LOOP_KEYWORD_RE = re.compile(
+    r"(?:^|[;&|(\n{]|\b(?:do|then|else)\s)\s*(?:for|while|until)\b"
+)
+_POLL_SLEEP_RE = re.compile(
+    r"(?:^|[;&|(\n{]|\b(?:then|do|else|command|builtin)\s+|/(?:usr/)?bin/)"
+    r"\s*sleep\s+(\d+(?:\.\d+)?)\s*([smhd]?)\b",
+    re.IGNORECASE,
+)
+_POLL_SLEEP_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+# `watch CMD` repeats until interrupted — always a poll. Anchored at command
+# position so `gh run watch` / `npm run watch` / `--watch` don't match.
+_WATCH_COMMAND_RE = re.compile(
+    r"(?:^|[;&|(\n{]|\b(?:do|then|else|exec|command)\s)\s*(?:/usr/bin/)?watch\s"
+)
+
+
+def _gateway_polling_loop_guidance(command: str) -> str | None:
+    """Refusal text for a foreground polling loop, else None.
+
+    Only consulted for messaging-gateway turns (CLI behavior is unchanged).
+    Quoted spans are stripped first so data like a commit message cannot trip
+    it. This is a behavioral guardrail, not a sandbox: the foreground cap in
+    ``_effective_foreground_max_timeout`` is the hard backstop for shapes it
+    cannot see (a script file, ``bash -c "..."``, a python sleep loop).
+    """
+    if not command:
+        return None
+    unquoted = _strip_quotes(command)
+    literal = None
+    if _WATCH_COMMAND_RE.search(unquoted):
+        literal = "watch"
+    elif _POLL_LOOP_KEYWORD_RE.search(unquoted):
+        for m in _POLL_SLEEP_RE.finditer(unquoted):
+            secs = float(m.group(1)) * _POLL_SLEEP_UNITS[m.group(2).lower()]
+            if secs >= POLL_LOOP_MIN_SLEEP_S:
+                literal = f"sleep {m.group(1)}{m.group(2)} inside a for/while/until loop"
+                break
+    if literal is None:
+        return None
+    return (
+        f"Refused: foreground polling loop ({literal}) in a messaging-gateway "
+        f"session. While a foreground tool call runs, this chat cannot answer "
+        f"new messages — a 60-minute poll leaves the user unanswered for 60 "
+        f"minutes. Do this instead: (1) re-send it with background=true and "
+        f"notify_on_complete=true (or watch_patterns for the line you are "
+        f"waiting for), then END THE TURN — you will be notified; (2) for "
+        f"waits longer than ~10 minutes, hand the work to a kanban card or a "
+        f"cron job; (3) for a one-shot status check, run the check once "
+        f"without the loop."
+    )
+
+
 def _resolve_notification_flag_conflict(
     *,
     notify_on_complete: bool,
@@ -3031,18 +3154,35 @@ def terminal_tool(
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above the foreground cap — nudge it toward background.
-        _fg_max = _foreground_max_timeout()
+        # Messaging-gateway turns get a tighter cap (see
+        # _effective_foreground_max_timeout): the chat is deaf while we wait.
+        _fg_max, _gw_capped = _effective_foreground_max_timeout()
         if not background and timeout and timeout > _fg_max:
+            if _gw_capped:
+                return tool_error(
+                    f"Foreground timeout {timeout}s exceeds the maximum of "
+                    f"{_fg_max}s for messaging-gateway sessions: while a "
+                    f"foreground call runs, this chat cannot answer new "
+                    f"messages. Use background=true with "
+                    f"notify_on_complete=true and end the turn, or hand work "
+                    f"longer than ~10 min to a kanban card or cron job."
+                )
             return tool_error(
                 f"Foreground timeout {timeout}s exceeds the maximum of "
                 f"{_fg_max}s. Use background=true with "
                 f"notify_on_complete=true for long-running commands."
             )
+        # A long configured default (terminal.timeout) must not smuggle an
+        # over-cap wait into a messaging turn when the model omits timeout.
+        if not background and _gw_capped and effective_timeout > _fg_max:
+            effective_timeout = _fg_max
 
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
         if not background:
             guidance = _foreground_background_guidance(command)
+            if not guidance and _is_messaging_gateway_turn():
+                guidance = _gateway_polling_loop_guidance(command)
             if guidance:
                 return json.dumps({
                     "output": "",

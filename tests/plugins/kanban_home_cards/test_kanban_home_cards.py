@@ -74,6 +74,18 @@ def _card(path: Path, tid: str, *, session_id, status="ready", title="t",
         )
     conn.commit()
     conn.close()
+    _reindex()
+
+
+def _reindex():
+    """Backfill/resync the cross-board home index (what install + the daily
+    cron do).  Raw INSERTs above write no event rows, so the write path
+    would not see them; the resync reads every board."""
+    from hermes_cli import kanban_home_index
+
+    report = kanban_home_index.resync()
+    assert not report["errors"], report
+    return report
 
 
 def _cards(n, **kw):
@@ -187,9 +199,8 @@ def test_I2_only_home_cards_foreign_null_worker_absent(mod, home):
     _card(d, "t_null0001", session_id=None, title="NULLHOME")
     _card(d, "t_wrkr0001", session_id="t_deadbeef", title="WORKERRUN")
     _card(d, "t_done0001", session_id=SID, title="CLOSED", status="done")
-    cards, stats = mod.query_cards(mod.home_ids(SID), budget_s=10)
+    cards = mod.query_cards(mod.home_ids(SID))
     assert {c["id"] for c in cards} == {"t_home0001", "t_home0002"}
-    assert stats["boards"] == 2
     out = mod.render(cards)
     for bad in ("FOREIGN", "NULLHOME", "WORKERRUN", "CLOSED"):
         assert bad not in out
@@ -197,10 +208,13 @@ def test_I2_only_home_cards_foreign_null_worker_absent(mod, home):
 
 
 def test_I2_grep_gate_single_query_filters_on_session_id(mod):
+    # The plugin never queries a board; the one card query is the index's.
     src = (PLUGIN_DIR / "__init__.py").read_text()
-    selects = re.findall(r"FROM tasks\b[^;]*?WHERE[^\n]*", src)
-    assert selects and all("session_id IN" in s for s in selects)
-    assert src.count("FROM tasks") == 1
+    assert "FROM tasks" not in src and "kanban.db" not in src
+    idx = (REPO / "hermes_cli" / "kanban_home_index.py").read_text()
+    body = idx[idx.index("def open_cards"):]
+    selects = re.findall(r"FROM cards WHERE[^\n]*", body)
+    assert len(selects) == 1 and "session_id IN" in selects[0]
 
 
 def test_I8_read_only_uri_never_immutable(mod, home):
@@ -209,7 +223,7 @@ def test_I8_read_only_uri_never_immutable(mod, home):
     d = _board(home)
     _card(d, "t_home0001", session_id=SID)
     before = d.stat().st_mtime_ns, d.read_bytes()
-    mod.query_cards(mod.home_ids(SID), budget_s=10)
+    mod.query_cards(mod.home_ids(SID))
     assert (d.stat().st_mtime_ns, d.read_bytes()) == before
 
 
@@ -220,7 +234,8 @@ def test_last_comment_and_activity_come_from_newest_comment(mod, home):
     conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) "
                  "VALUES ('t_home0001','x','newest',1790000500)")
     conn.commit(); conn.close()
-    (card,), _ = mod.query_cards([SID], budget_s=10)
+    _reindex()  # raw INSERT writes no event row; real add_comment does
+    (card,) = mod.query_cards([SID])
     assert card["last_comment"] == "newest" and card["last_activity"] == 1_790_000_500
 
 
@@ -240,8 +255,10 @@ def test_I1_seen_mark_happens_before_query(mod, home, monkeypatch):
         calls.append(ids); raise RuntimeError("db down")
     monkeypatch.setattr(mod, "query_cards", boom)
     assert mod.on_pre_llm_call(session_id=SID) is None
+    first_turn = len(calls)  # fallback-home read + exact-home read
+    assert 1 <= first_turn <= 2
     assert mod.on_pre_llm_call(session_id=SID) is None
-    assert len(calls) == 1  # a failure does not retry on every later turn
+    assert len(calls) == first_turn  # a failure does not retry on later turns
 
 
 def test_I1_threads_race_single_winner(mod, home):
@@ -487,48 +504,61 @@ def test_missing_session_id_is_noop(mod, stamped):
 
 # ── I5 fail-open, bounded latency ───────────────────────────────────────────
 
-def test_I5_locked_board_skipped_turn_proceeds(mod, home):
-    d = _board(home)
-    o = _board(home, "locked-board")
-    _card(d, "t_home0001", session_id=SID)
-    _card(o, "t_home0002", session_id=SID)
-    locker = sqlite3.connect(o, isolation_level=None)
+def test_I5_locked_index_fails_open_within_budget(mod, home, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    from hermes_cli import kanban_home_index
+
+    locker = sqlite3.connect(kanban_home_index.index_path(), isolation_level=None)
     locker.execute("PRAGMA journal_mode=DELETE")
     locker.execute("BEGIN EXCLUSIVE")
     try:
-        t = time.monotonic()
-        out = mod.on_pre_llm_call(session_id=SID)
-        assert time.monotonic() - t < mod.BUDGET_S + 0.5
+        with caplog.at_level("INFO", logger=mod.logger.name):
+            t = time.monotonic()
+            out = mod.on_pre_llm_call(session_id=SID)
+            assert time.monotonic() - t < mod.BUDGET_S + 0.5
     finally:
         locker.execute("ROLLBACK"); locker.close()
-    assert out and "t_home0001" in out["context"]
+    assert out is None
+    assert any(f"session={SID} unavailable=" in r.getMessage() for r in caplog.records)
 
 
-def test_I5_slow_board_hits_budget_and_fails_open(mod, home, monkeypatch):
+def test_I5_missing_index_renders_nothing_and_never_scans(mod, home, monkeypatch, caplog):
     d = _board(home)
     _card(d, "t_home0001", session_id=SID)
-    _board(home, "slow-board")
-    real = mod._query_board
-    def slow(slug, *a):
-        if slug == "slow-board":
-            time.sleep(3)
-        return real(slug, *a)
-    monkeypatch.setattr(mod, "_query_board", slow)
-    t = time.monotonic()
-    out = mod.on_pre_llm_call(session_id=SID)
-    elapsed = time.monotonic() - t
-    assert elapsed < mod.BUDGET_S + 0.5, elapsed
-    # the home is known non-empty (default board answered) → pointer line
-    assert out["context"].startswith("[Your open cards: unavailable (timeout)")
-    assert len(out["context"]) <= mod.MAX_UNAVAILABLE
+    from hermes_cli import kanban_home_index
+
+    kanban_home_index.index_path().unlink()
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        assert mod.on_pre_llm_call(session_id=SID) is None
+    assert any("unavailable=no-index" in r.getMessage() for r in caplog.records)
 
 
-def test_I5_timeout_with_empty_home_is_zero_tokens(mod, home, monkeypatch):
+def test_I5_not_backfilled_index_renders_nothing(mod, home, caplog):
+    from hermes_cli import kanban_home_index
+
     _board(home)
-    monkeypatch.setattr(mod, "_query_board", lambda *a: time.sleep(3) or [])
-    t = time.monotonic()
-    assert mod.on_pre_llm_call(session_id=SID) is None
-    assert time.monotonic() - t < mod.BUDGET_S + 0.5
+    conn = kanban_home_index._open_rw(kanban_home_index.index_path())  # schema only
+    conn.close()
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        assert mod.on_pre_llm_call(session_id=SID) is None
+    assert any("unavailable=not-backfilled" in r.getMessage() for r in caplog.records)
+
+
+def test_P1_turn_path_never_opens_a_board_db(mod, home, monkeypatch):
+    """Argus r1 B1 / Apollo ruling 1: the first turn reads ONE index."""
+    for slug in ("default", "b1", "b2", "b3"):
+        _card(_board(home, slug), f"t_{slug[:2]}000001".ljust(10, "0"), session_id=SID)
+    opened = []
+    real = sqlite3.connect
+
+    def spy(database, *a, **kw):
+        opened.append(str(database))
+        return real(database, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    out = mod.on_pre_llm_call(session_id=SID)
+    assert out and out["context"].count("\n- t_") == 4
+    assert opened and not [u for u in opened if "kanban.db" in u], opened
 
 
 def test_I5_never_raises(mod, home, monkeypatch):
@@ -567,3 +597,232 @@ def test_real_loader_not_enabled_by_default(home):
     mgr = PluginManager()
     mgr.discover_and_load()
     assert not [r for r in mgr.invoke_hook("pre_llm_call", session_id=SID, platform="cli") if r]
+
+
+# ── shared lineage ──────────────────────────────────────────────────────────
+
+def test_plugin_home_ids_is_the_shared_lineage(mod, home):
+    from hermes_state import SessionDB
+
+    key = "agent:main:discord:group:9"
+    parent = "20260924_110000_pppppp"
+    db = SessionDB()
+    db.create_session(parent, "discord", session_key=key)
+    db.create_session(SID, "discord", session_key=key, parent_session_id=parent)
+    db.close()
+    assert set(mod.home_ids(SID)) == {parent, SID}
+    d = _board(home)
+    _card(d, "t_prnt0001", session_id=parent, title="parent card")
+    out = mod.on_pre_llm_call(session_id=SID, platform="discord")
+    assert "parent card" in out["context"]
+
+
+# ── I5 stage-attributed timeout (t_11f2cf60) ────────────────────────────────
+
+def test_I5_turn_ceiling_is_at_most_250ms(mod):
+    # t_15d21849 AC3: a timeout degrades to skip in <= 250 ms.
+    assert 0 < mod.BUDGET_S <= 0.25
+
+
+def _slow(value, secs=3.0):
+    return lambda *a, **k: time.sleep(secs) or value
+
+
+# ── P2: no cold state.db read gates the first turn (t_11f2cf60 r3) ──────────
+
+def test_P2_slow_lineage_still_renders_exact_id_cards_within_budget(mod, home, monkeypatch, caplog):
+    _card(_board(home), "t_home0001", session_id=SID, title="exact id card")
+    monkeypatch.setattr(mod, "home_ids", _slow((SID,)))
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        t = time.monotonic()
+        out = mod.on_pre_llm_call(session_id=SID)
+        took = time.monotonic() - t
+    assert out and "exact id card" in out["context"]
+    assert took < mod.BUDGET_S + 0.1
+    line = next(r.getMessage() for r in caplog.records if "cards=1" in r.getMessage())
+    assert "lineage=in-process" in line and "lineage_ms=pending" in line
+
+
+def test_P2_slow_lineage_uses_in_process_parent(mod, home, monkeypatch):
+    parent = "20260924_110000_pppppp"
+    d = _board(home)
+    _card(d, "t_prnt0001", session_id=parent, title="parent card")
+    _card(d, "t_frgn0001", session_id=FOREIGN, title="foreign card")
+    monkeypatch.setattr(mod, "home_ids", _slow((SID,)))
+    out = mod.on_pre_llm_call(session_id=SID, parent_session_id=parent)
+    assert "parent card" in out["context"] and "foreign card" not in out["context"]
+
+
+def test_P2_slow_lineage_uses_lineage_persisted_in_index(mod, home, monkeypatch, caplog):
+    from hermes_cli import kanban_home_index
+
+    grand = "20260924_100000_gggggg"
+    d = _board(home)
+    _card(d, "t_gran0001", session_id=grand, title="grandparent card")
+    _card(d, "t_frgn0001", session_id=FOREIGN, title="foreign card")
+    assert kanban_home_index.remember_home(SID, (SID, grand))
+    monkeypatch.setattr(mod, "home_ids", _slow((SID,)))
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        out = mod.on_pre_llm_call(session_id=SID)
+    assert "grandparent card" in out["context"] and "foreign card" not in out["context"]
+    assert any("lineage=index" in r.getMessage() for r in caplog.records)
+
+
+def test_P2_completed_lineage_is_persisted_for_the_next_cold_process(mod, home, monkeypatch):
+    from hermes_cli import kanban_home_index
+
+    parent = "20260924_110000_pppppp"
+    _card(_board(home), "t_home0001", session_id=SID)
+    monkeypatch.setattr(mod, "home_ids", lambda s: (parent, s))
+    assert mod.on_pre_llm_call(session_id=SID)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not kanban_home_index.known_home(SID):
+        time.sleep(0.02)
+    assert kanban_home_index.known_home(SID) == frozenset({SID, parent})
+
+
+def test_P2_remember_home_skips_trivial_and_unbackfilled(home):
+    from hermes_cli import kanban_home_index
+
+    assert kanban_home_index.remember_home(SID, (SID,)) is False
+    assert kanban_home_index.remember_home(SID, (SID, FOREIGN)) is False  # no index yet
+    assert kanban_home_index.known_home(SID) == frozenset()
+
+
+def test_P2_slow_dedupe_injects_and_says_pending(mod, home, monkeypatch, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    monkeypatch.setattr(mod, "_persisted_recently_injected", _slow(True))
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        t = time.monotonic()
+        out = mod.on_pre_llm_call(session_id=SID)
+        took = time.monotonic() - t
+    assert out and took < mod.BUDGET_S + 0.1
+    line = next(r.getMessage() for r in caplog.records if "cards=1" in r.getMessage())
+    assert "dedupe=pending" in line and "dedupe_ms=pending" in line
+
+
+def test_P2_index_busy_wait_fits_inside_the_ceiling(mod):
+    assert mod.INDEX_BUSY_S < mod.BUDGET_S
+
+
+def test_I5_index_timeout_names_stage(mod, home, monkeypatch, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    monkeypatch.setattr(mod, "BUDGET_S", 0.2)
+    monkeypatch.setattr(mod, "query_cards", lambda ids: time.sleep(1) or [])
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        t = time.monotonic()
+        assert mod.on_pre_llm_call(session_id=SID) is None
+        assert time.monotonic() - t < 0.2 + 0.1
+    line = next(r.getMessage() for r in caplog.records if "unavailable=timeout" in r.getMessage())
+    assert "stage=index" in line and "lineage_ms=" in line and "dedupe_ms=" in line
+
+
+def test_success_log_carries_stage_timings(mod, home, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        assert mod.on_pre_llm_call(session_id=SID)
+    line = next(r.getMessage() for r in caplog.records if "cards=1" in r.getMessage())
+    for f in ("ms=", "lineage_ms=", "dedupe_ms=", "index_ms=", "lineage=state.db", "dedupe=clean"):
+        assert f in line, (f, line)
+
+
+# ── one log line per first turn (Argus r1 non-blocking b) ───────────────────
+
+def test_dedupe_results_are_logged(mod, home, caplog):
+    _card(_board(home), "t_home0001", session_id=SID)
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        assert mod.on_pre_llm_call(session_id=SID, conversation_history=_hist(1, header_at=0)) is None
+    assert any(f"session={SID} dedupe=history" in r.getMessage() for r in caplog.records)
+    fresh = _load()
+    _state_db(fresh, FOREIGN, 2, header_at=0)
+    with caplog.at_level("INFO", logger=fresh.logger.name):
+        assert fresh.on_pre_llm_call(session_id=FOREIGN, conversation_history=[]) is None
+    assert any(f"session={FOREIGN} dedupe=state.db" in r.getMessage() for r in caplog.records)
+
+
+def test_only_pre_llm_call_is_registered():
+    manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
+    assert manifest["hooks"] == ["pre_llm_call"]
+    assert "250 ms" in manifest["description"]
+    hooks = []
+    _load().register(type("Ctx", (), {"register_hook": lambda self, n, f: hooks.append(n)})())
+    assert hooks == ["pre_llm_call"]
+
+
+# ── t_15d21849: 77 boards, first turn never held past BUDGET_S ───────────────
+
+N_BOARDS = 77
+
+
+@pytest.fixture
+def fleet77(home):
+    """77 boards (default + 76 named), one open home card on every 7th."""
+    paths = [_board(home)] + [_board(home, f"b{i:02d}") for i in range(1, N_BOARDS)]
+    for i, p in enumerate(paths):
+        conn = sqlite3.connect(p)
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, session_id) VALUES (?,?,?,?,?)",
+            (f"t_frgn{i:04d}", f"foreign {i}", "ready", 1_790_000_000, FOREIGN),
+        )
+        if i % 7 == 0:
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, created_at, session_id) VALUES (?,?,?,?,?)",
+                (f"t_home{i:04d}", f"home {i}", "ready", 1_790_000_000 + i, SID),
+            )
+        conn.commit(); conn.close()
+    report = _reindex()
+    return paths, report
+
+
+def _timed(mod, **kw):
+    t = time.monotonic()
+    out = mod.on_pre_llm_call(**kw)
+    return out, time.monotonic() - t
+
+
+# Scheduling slack for a loaded CI runner; the ceiling itself is BUDGET_S.
+SLACK_S = 0.1
+
+
+def test_77_boards_warm_turn_renders_home_cards_within_ceiling(mod, fleet77):
+    out, took = _timed(mod, session_id=SID)
+    assert out and "t_home" in out["context"] and "foreign" not in out["context"]
+    assert took < mod.BUDGET_S + SLACK_S, took
+
+
+def test_77_boards_cold_state_db_degrades_within_250ms(mod, fleet77, monkeypatch):
+    """Cold state.db after a restart (lineage + dedupe take seconds): the
+    turn stops waiting at BUDGET_S and still answers from the index."""
+    monkeypatch.setattr(mod, "home_ids", _slow((SID,), secs=5))
+    monkeypatch.setattr(mod, "_persisted_recently_injected", _slow(False, secs=5))
+    out, took = _timed(mod, session_id=SID)
+    assert took < 0.25 + SLACK_S, took
+    assert out and "t_home" in out["context"]
+
+
+def test_77_boards_locked_index_skips_within_250ms(mod, fleet77, caplog):
+    from hermes_cli import kanban_home_index
+
+    locker = sqlite3.connect(kanban_home_index.index_path(), isolation_level=None)
+    locker.execute("PRAGMA journal_mode=DELETE")
+    locker.execute("BEGIN EXCLUSIVE")
+    try:
+        with caplog.at_level("INFO", logger=mod.logger.name):
+            out, took = _timed(mod, session_id=SID)
+    finally:
+        locker.execute("ROLLBACK"); locker.close()
+    assert out is None
+    assert took < 0.25 + SLACK_S, took
+    assert any(f"session={SID} unavailable=" in r.getMessage() for r in caplog.records)
+
+
+def test_77_boards_27_concurrent_first_turns_all_within_ceiling(mod, fleet77):
+    """The 10:00-12:00 shape: 27 session inits, 8 at a time, 77 boards."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    sids = [SID] + [f"20260924_1200{i:02d}_cccccc" for i in range(26)]
+    with ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(lambda s: _timed(mod, session_id=s), sids))
+    worst = max(took for _, took in res)
+    assert worst < mod.BUDGET_S + SLACK_S, worst
+    assert res[0][0] and "t_home" in res[0][0]["context"]

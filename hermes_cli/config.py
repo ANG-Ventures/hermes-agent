@@ -3711,6 +3711,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     # config.yaml. Bridged here like every other terminal.* knob so users can
     # set them in config.yaml; the env vars keep working for child processes.
     "max_foreground_timeout": "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+    "gateway_max_foreground_timeout": "TERMINAL_GATEWAY_MAX_FOREGROUND_TIMEOUT",
     "disk_warning_gb": "TERMINAL_DISK_WARNING_GB",
 }
 

@@ -119,7 +119,15 @@ def _hermetic_repo_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _merged(sha: str = "abcdef1234567890", at: str = "2026-09-20T13:05:00Z") -> dict:
+# Default merge time is AFTER any block a test can create: a PR that merged
+# before the block is history, not a gate (t_20b94ef5), so the "the gate PR
+# merged" fixture must merge later than the block it releases. Tests about
+# history refs pass an explicit past ``at``.
+_AFTER_ANY_BLOCK = "2099-01-01T00:00:00Z"
+_BEFORE_ANY_BLOCK = "2020-01-01T00:00:00Z"
+
+
+def _merged(sha: str = "abcdef1234567890", at: str | None = _AFTER_ANY_BLOCK) -> dict:
     return {"state": "MERGED", "mergedAt": at, "mergeCommitSha": sha}
 
 
@@ -846,6 +854,101 @@ def test_all_merged_unblocks_and_records_one_event(kanban_home: Path) -> None:
         assert comments[0] == outcomes[0].detail
 
 
+def _gate_events(conn, tid: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) c FROM task_events "
+        "WHERE task_id = ? AND kind = 'gate_auto_resolved'",
+        (tid,),
+    ).fetchone()["c"]
+
+
+def test_pr_merged_before_the_block_is_history_not_a_gate(
+    kanban_home: Path,
+) -> None:
+    """t_20b94ef5: a dependency block on a sibling CARD that cites an
+    already-merged PR as background must stay blocked.
+
+    Pre-fix, the gate read the cited PR as the gate condition, found it
+    merged, and unblocked the card within one tick — twice in ten minutes,
+    each time respawning a worker for nothing.
+    """
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn,
+            kind="dependency",
+            reason=(
+                "Waiting on t_082e7650 (per-tick pool spawn budget fix). The "
+                "deployed o/r#953 lets whole bursts through, so resume once "
+                "the t_082e7650 PR is merged and deployed."
+            ),
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        outcomes = prg.reevaluate_pr_gates(
+            conn,
+            query_fn=_stub({("o/r", 953): _merged(at=_BEFORE_ANY_BLOCK)}),
+        )
+        assert [o.action for o in outcomes] == ["history_only"]
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _gate_events(conn, tid) == 0
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM task_comments WHERE task_id = ?", (tid,)
+        ).fetchone()["c"] == 0
+
+
+def test_history_ref_does_not_mask_or_satisfy_a_live_gate(
+    kanban_home: Path,
+) -> None:
+    """A reason citing one old merged PR AND one live PR gates on the live one."""
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn, reason="o/r#953 landed already; now merge o/r#7 then unblock me",
+        )
+        old = _merged(at=_BEFORE_ANY_BLOCK)
+        held = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 953): old, ("o/r", 7): _open_pr()}),
+        )
+        assert [o.action for o in held] == ["held"]
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        prg.clear_cache()
+        done = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 953): old, ("o/r", 7): _merged()}),
+        )
+        assert [o.action for o in done] == ["unblocked"]
+        payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'gate_auto_resolved'",
+            (tid,),
+        ).fetchone()["payload"])
+        # Only the live gate is cited as the evidence.
+        assert payload["prs"] == ["o/r#7"]
+
+
+def test_pr_already_resolved_for_this_card_is_not_resolved_again(
+    kanban_home: Path,
+) -> None:
+    """Fallback for an unknown ``mergedAt``: a PR this gate already resolved
+    for the card is spent, so a later block that re-cites it stays blocked."""
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 then unblock me")
+        unknown_time = _stub({("o/r", 7): _merged(at=None)})
+        first = prg.reevaluate_pr_gates(conn, query_fn=unknown_time)
+        assert [o.action for o in first] == ["unblocked"]
+
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, kind="dependency",
+            reason="o/r#7 is in; now waiting on sibling card t_deadbeef",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+        prg.clear_cache()
+        second = prg.reevaluate_pr_gates(conn, query_fn=unknown_time)
+        assert [o.action for o in second] == ["history_only"]
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _gate_events(conn, tid) == 1
+
+
 def test_one_open_pr_holds_the_card(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = _blocked_card(conn, reason="merge o/r#7 and o/r#8 then unblock me")
@@ -1157,7 +1260,7 @@ def test_dispatch_tick_resolves_a_satisfied_gate(
             argv, 0,
             stdout=json.dumps({
                 "state": "closed",
-                "merged_at": "2026-09-20T13:05:00Z",
+                "merged_at": "2099-01-01T00:00:00Z",
                 "merge_commit_sha": "deadbeefcafebabe",
             }),
             stderr="",
@@ -1562,7 +1665,7 @@ from hermes_cli import kanban_pr_gate as prg
 
 # Fabricated oracle: every PR is MERGED, and gh is never consulted.
 prg.query_pr = lambda repo, number: {{
-    "state": "MERGED", "mergedAt": "2026-09-21T07:32:50Z",
+    "state": "MERGED", "mergedAt": "2099-01-01T00:00:00Z",
     "mergeCommitSha": "deadbeefcafe1234",
 }}
 
@@ -1733,7 +1836,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_pr_gate as prg
 
 prg.query_pr = lambda repo, number: {{
-    "state": "MERGED", "mergedAt": "2026-09-21T07:32:50Z",
+    "state": "MERGED", "mergedAt": "2099-01-01T00:00:00Z",
     "mergeCommitSha": "deadbeefcafe1234",
 }}
 

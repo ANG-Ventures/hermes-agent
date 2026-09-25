@@ -132,6 +132,14 @@ def sandbox_home(tmp_path, monkeypatch):
     cfgmod._LOAD_CONFIG_CACHE.clear()
     cfgmod._RAW_CONFIG_CACHE.clear()
     yield home
+    # Drain the module-global runtime-status lane before the next test.  A test
+    # that queues status writes from a running loop (the loop-lag gate queues
+    # 200) returns long before the single lane worker has run them; the backlog
+    # would otherwise keep writing -- and calling psutil/realpath -- while the
+    # NEXT test runs, under the next test's HERMES_HOME.
+    from gateway import status as gwstatus
+
+    gwstatus._fence_runtime_status_lane()
     cfgmod._LOAD_CONFIG_CACHE.clear()
     cfgmod._RAW_CONFIG_CACHE.clear()
 
@@ -432,17 +440,28 @@ def test_boot_id_is_computed_once_per_process_not_per_message(sandbox_home):
 
     A process's kernel create_time is IMMUTABLE for the life of the process, so
     calling it on every status write is pure waste on the loop.
+
+    Only THIS thread's calls are counted.  The psutil patch is process-global,
+    and the ``gateway-runtime-status`` lane worker also reaches
+    ``_compute_boot_id`` (via ``_build_pid_record``) for any write still queued;
+    if it misses the just-reset cache at the same moment as the test's first
+    call, both compute once.  That duplicate is a benign race on an idempotent
+    cache fill, not a per-message recompute, and it made this test fail with
+    "called 2x" on a loaded CI runner (run 36069213079, slice 12).
     """
     import psutil
 
     from gateway import status as gwstatus
 
+    gwstatus._fence_runtime_status_lane()
     gwstatus._reset_identity_caches()
     calls = {"n": 0}
     real_create_time = psutil.Process.create_time
+    test_thread = threading.get_ident()
 
     def counting(self):
-        calls["n"] += 1
+        if threading.get_ident() == test_thread:
+            calls["n"] += 1
         return real_create_time(self)
 
     psutil.Process.create_time = counting  # type: ignore[assignment]

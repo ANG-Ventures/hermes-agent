@@ -4801,6 +4801,20 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+        # Cross-board home index (t_11f2cf60): mirror the cards this commit
+        # (or any earlier event-writing commit on this board) touched, from
+        # the committed rows. Every guarded mutator and every execution-lane
+        # writer commits here. Best-effort, never raises.
+        _sync_home_index(conn)
+
+
+def _sync_home_index(conn: sqlite3.Connection) -> None:
+    try:
+        from hermes_cli import kanban_home_index
+
+        kanban_home_index.sync_after_commit(conn)
+    except Exception:  # pragma: no cover - the index is a mirror, never a gate
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -5154,6 +5168,21 @@ def _caller_session_lineage(session_id: str) -> tuple[str, ...]:
 
 HOME_LINEAGE_MAX_DEPTH = 10
 
+# Per-process lineage cache.  Lineage rows are append-mostly (ancestors never
+# change; descendants appear on rotation, which hands the caller a NEW id), so
+# a short TTL bounds the only staleness (a new descendant of an OLD id).
+# Keyed by (session id, state.db path).  Only successful DB-backed answers are
+# cached: a fail-open ``{session_id}`` (no db, no row yet, locked) is retried.
+HOME_IDS_CACHE_MAX = 256
+HOME_IDS_CACHE_TTL_S = 300.0
+_HOME_CACHE: "dict[tuple[str, str, int], tuple[float, frozenset[str], Optional[float]]]" = {}
+_HOME_CACHE_LOCK = threading.Lock()
+
+
+def clear_home_ids_cache() -> None:
+    with _HOME_CACHE_LOCK:
+        _HOME_CACHE.clear()
+
 
 def home_ids(session_id: Optional[str], *, db_path: Any = None) -> frozenset[str]:
     """THE definition of a session's kanban "home": the id plus its
@@ -5171,64 +5200,114 @@ def home_ids(session_id: Optional[str], *, db_path: Any = None) -> frozenset[str
     ``busy_timeout``, and FAIL-OPEN: any error (no state.db, no such row,
     locked, old schema) returns ``{session_id}`` -- exactly the pre-lineage
     exact-id behaviour. Shared by ``list --home``, ``show``'s home label,
-    the home-session guard and the kanban-home-cards plugin.
+    the home-session guard and the kanban-home-cards plugin.  Answers are
+    cached per process (:data:`HOME_IDS_CACHE_TTL_S`).
+    """
+    return home_lineage(session_id, db_path=db_path)[0]
+
+
+def home_lineage(
+    session_id: Optional[str], *, db_path: Any = None
+) -> tuple[frozenset[str], Optional[float]]:
+    """``(home_ids(session_id), earliest started_at in that home)``.
+
+    The start time is ``None`` whenever it is unknown (fail-open answer, no
+    ``started_at``), which callers must treat as "could be arbitrarily old".
     """
     sid = (str(session_id).strip() if session_id else "")
     if not sid:
-        return frozenset()
-    only = frozenset({sid})
+        return frozenset(), None
+    only = (frozenset({sid}), None)
     try:
         if db_path is None:
             from hermes_state import _default_db_path
 
             db_path = _default_db_path()
         path = Path(db_path)
+        try:
+            st = path.stat()
+        except OSError:
+            return only
+        # inode in the key: a replaced/recreated state.db is a new cache.
+        key = (sid, str(path), st.st_ino)
+        now = time.monotonic()
+        with _HOME_CACHE_LOCK:
+            hit = _HOME_CACHE.get(key)
+            if hit is not None and now - hit[0] < HOME_IDS_CACHE_TTL_S:
+                return hit[1], hit[2]
         if not path.is_file():
             return only
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
-        try:
-            conn.execute("PRAGMA busy_timeout = 2000")
-            row = conn.execute(
-                "SELECT session_key, parent_session_id FROM sessions WHERE id = ?",
-                (sid,),
-            ).fetchone()
-            if row is None or not row[0]:
-                return only
-            key = row[0]
-            ids = {sid}
-            parent = row[1]
-            for _ in range(HOME_LINEAGE_MAX_DEPTH):
-                if not parent or parent in ids:
-                    break
-                prow = conn.execute(
-                    "SELECT parent_session_id FROM sessions "
-                    "WHERE id = ? AND session_key = ?",
-                    (parent, key),
-                ).fetchone()
-                if prow is None:
-                    break
-                ids.add(parent)
-                parent = prow[0]
-            frontier = [sid]
-            for _ in range(HOME_LINEAGE_MAX_DEPTH):
-                if not frontier:
-                    break
-                ph = ",".join("?" * len(frontier))
-                kids = [
-                    r[0] for r in conn.execute(
-                        f"SELECT id FROM sessions WHERE parent_session_id IN ({ph}) "
-                        "AND session_key = ?",
-                        (*frontier, key),
-                    )
-                    if r[0] and r[0] not in ids
-                ]
-                ids.update(kids)
-                frontier = kids
-            return frozenset(ids)
-        finally:
-            conn.close()
+        found = _home_lineage_query(path, sid)
+        if found is None:
+            return only
+        with _HOME_CACHE_LOCK:
+            _HOME_CACHE.pop(key, None)
+            _HOME_CACHE[key] = (now, found[0], found[1])
+            while len(_HOME_CACHE) > HOME_IDS_CACHE_MAX:
+                _HOME_CACHE.pop(next(iter(_HOME_CACHE)))
+        return found
     except Exception:
         return only
+
+
+def _home_lineage_query(
+    path: Path, sid: str
+) -> Optional[tuple[frozenset[str], Optional[float]]]:
+    """Walk the lineage in ``path``; ``None`` = no keyed row (not cacheable)."""
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
+    try:
+        conn.execute("PRAGMA busy_timeout = 2000")
+        # started_at is optional: a sessions table without it (older schema,
+        # the dashboard facet fixture) still yields the lineage, start unknown.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        st = "started_at" if "started_at" in cols else "NULL"
+        row = conn.execute(
+            f"SELECT session_key, parent_session_id, {st} FROM sessions WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        key = row[0]
+        ids = {sid}
+        starts = [row[2]]
+        parent = row[1]
+        for _ in range(HOME_LINEAGE_MAX_DEPTH):
+            if not parent or parent in ids:
+                break
+            prow = conn.execute(
+                f"SELECT parent_session_id, {st} FROM sessions "
+                "WHERE id = ? AND session_key = ?",
+                (parent, key),
+            ).fetchone()
+            if prow is None:
+                break
+            ids.add(parent)
+            starts.append(prow[1])
+            parent = prow[0]
+        frontier = [sid]
+        for _ in range(HOME_LINEAGE_MAX_DEPTH):
+            if not frontier:
+                break
+            ph = ",".join("?" * len(frontier))
+            kids = []
+            for r in conn.execute(
+                f"SELECT id, {st} FROM sessions WHERE parent_session_id IN ({ph}) "
+                "AND session_key = ?",
+                (*frontier, key),
+            ):
+                if r[0] and r[0] not in ids:
+                    kids.append(r[0])
+                    starts.append(r[1])
+            ids.update(kids)
+            frontier = kids
+        try:
+            started = min(float(x) for x in starts) if all(
+                isinstance(x, (int, float)) for x in starts) else None
+        except (TypeError, ValueError):
+            started = None
+        return frozenset(ids), started
+    finally:
+        conn.close()
 
 
 def home_guard_mode() -> str:
@@ -7905,6 +7984,126 @@ def _owner_identity(pid, claimed_at, spawned_at, start_token=None) -> str:
     return "verified" if started else "recycled"
 
 
+def _worker_owner_window(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: Optional[int],
+    run_id: Optional[int] = None,
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """The owner window ``(claimed_at, spawned_at, start_token)`` for ``pid``.
+
+    ``start_token`` is the clock-step-immune stamp the ``spawned`` event
+    recorded (t_21dfa673); when present :func:`_owner_identity` matches on it
+    and ignores the wall-clock bounds, exactly like the claim guard.
+
+    Feeds :func:`_owner_identity` for the TERMINATION and LIVENESS paths, so
+    they judge a live PID by the same rule the claim guard uses (t_0ae83825):
+    a live process at ``tasks.worker_pid`` is the recorded worker only if it
+    was created no earlier than its run's claim and no later than the
+    ``spawned`` event that recorded it.
+
+    ``run_id`` defaults to the card's ``current_run_id``. The lower bound is
+    that run's ``claimed`` event, falling back to the run's ``started_at``
+    and then the card's first ``started_at`` (a worker cannot predate the
+    card's first start). The upper bound is the newest ``spawned`` event of
+    the run that recorded this pid. A missing bound is ``None`` and is simply
+    not applied, so missing evidence can never prove a PID recycled.
+    """
+    if not pid:
+        return (None, None, None)
+    if run_id is None:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        run_id = row["current_run_id"] if row is not None else None
+    claimed_at = None
+    if run_id is not None:
+        ev = conn.execute(
+            "SELECT created_at FROM task_events WHERE task_id = ? "
+            "AND run_id = ? AND kind = 'claimed' ORDER BY id ASC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if ev is not None:
+            claimed_at = ev["created_at"]
+        else:
+            run = conn.execute(
+                "SELECT started_at FROM task_runs WHERE id = ?", (int(run_id),),
+            ).fetchone()
+            if run is not None:
+                claimed_at = run["started_at"]
+    if claimed_at is None:
+        row = conn.execute(
+            "SELECT started_at FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is not None:
+            claimed_at = row["started_at"]
+    spawned_at = None
+    if run_id is not None:
+        spawns = conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+            "AND kind = 'spawned' AND run_id = ? ORDER BY id DESC",
+            (task_id, int(run_id)),
+        ).fetchall()
+    else:
+        spawns = conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+            "AND kind = 'spawned' ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+    start_token = None
+    for ev in spawns:
+        try:
+            payload = json.loads(ev["payload"] or "{}")
+            if int(payload["pid"]) == int(pid):
+                spawned_at = ev["created_at"]
+                start_token = payload.get("start_token")
+                break
+        except (TypeError, ValueError, KeyError, AttributeError):
+            continue
+    return (claimed_at, spawned_at, start_token)
+
+
+def _recorded_worker_alive(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: Optional[int],
+    run_id: Optional[int] = None,
+) -> bool:
+    """True if ``pid`` is alive AND is not provably a recycled PID.
+
+    Liveness is not identity: a dead, unreaped worker's PID can be reused by
+    any process (measured on the live board: macOS daemons and another card's
+    worker). An ``unverified`` identity (create time unreadable) counts as
+    alive -- fail closed, never release beside a possible owner.
+    """
+    if not _pid_alive(pid):
+        return False
+    window = _worker_owner_window(conn, task_id, pid, run_id)
+    return _owner_identity(int(pid), *window) != "recycled"
+
+
+class _PendingTermination(tuple):
+    """A ``(worker_pid, claim_lock)`` pair plus its owner-identity window.
+
+    Deferred (post-commit) terminations are drained after the run that
+    recorded the pid has been closed, so the causal window is captured while
+    the evidence is at hand. Compares and unpacks exactly like the plain
+    2-tuple callers already use.
+    """
+
+    owner_window: tuple
+
+    def __new__(cls, pid, claim_lock, owner_window=(None, None)):
+        obj = super().__new__(cls, (pid, claim_lock))
+        obj.owner_window = tuple(owner_window)
+        return obj
+
+
+def _termination_window(entry) -> tuple:
+    """Owner window carried by a deferred termination entry, if any."""
+    return getattr(entry, "owner_window", (None, None))
+
+
 @_home_session_guarded("claim")
 def claim_task(
     conn: sqlite3.Connection,
@@ -8320,7 +8519,9 @@ def release_stale_claims(
         if (
             host_local
             and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            # Identity, not bare liveness: a recycled holder must not keep
+            # extending a dead worker's claim forever (t_0ae83825).
+            and _recorded_worker_alive(conn, row["id"], row["worker_pid"])
             and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
@@ -8361,6 +8562,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            owner_window=_worker_owner_window(conn, row["id"], row["worker_pid"]),
             conn=conn, task_id=row["id"],
         )
         # Never release a claim while our own worker is still alive: that would
@@ -8484,6 +8686,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        owner_window=_worker_owner_window(conn, task_id, row["worker_pid"]),
         conn=conn, task_id=task_id,
     )
     # Never release a claim while our host-local worker is alive or its
@@ -10999,6 +11202,7 @@ def configured_review_assignee() -> Optional[str]:
 
 DEFAULT_MAX_REVIEW_ROUNDS = 3
 MILESTONE_MARKER = "[milestone]"
+QA_REQUIRED_MARKER = "qa:required"
 REVIEW_POLICIES = ("all", "milestone_only", "none")
 
 
@@ -11008,8 +11212,10 @@ def configured_max_review_rounds() -> int:
     A "round" is one ``changes_requested`` verdict. Once a card has collected
     this many, the NEXT ``request_review`` does not re-spawn the reviewer: the
     card is BLOCKED (``needs_input``) for the orchestrator to take over. Measured
-    2026-09-24 (Mac Studio): 458 reviewed cards / 7d averaged 10.8 rounds, max
-    123, 107 cards at 13+ — the tail that produced 498 reviewer sessions a day.
+    2026-09-24 (Mac Studio): 458 reviewed cards / 7d averaged 10.8 reviewer
+    SESSIONS per card (incl. rate-limited respawns — not changes_requested
+    rounds), max 123, 107 cards at 13+ — the tail that produced 498 reviewer
+    sessions a day.
     Default :data:`DEFAULT_MAX_REVIEW_ROUNDS`.
     """
     try:
@@ -11037,33 +11243,41 @@ def configured_review_policy() -> str:
     gate for slice work, the reviewer profile is functional QA at milestones.
     Applies even when a reviewer PROFILE is named explicitly; only the
     ``human`` sentinel or ``force=True`` bypasses it.
+
+    A MISSING key keeps the documented default ``all``. A PRESENT-but-invalid
+    value (unknown, empty) or an unreadable config fails to ``none`` — never
+    to ``all`` — and logs a ``review_policy_invalid`` WARNING (spec §0.1 F0:
+    a typo must not silently re-enable a reviewer on every card).
     """
     try:
         from hermes_cli.config import load_config
 
-        value = (load_config() or {}).get("kanban", {}).get("review_policy", "all")
-    except Exception:
-        return "all"
-    value = str(value or "all").strip().lower()
-    return value if value in REVIEW_POLICIES else "all"
+        kanban_cfg = (load_config() or {}).get("kanban", {}) or {}
+        if "review_policy" not in kanban_cfg:
+            return "all"
+        raw = kanban_cfg.get("review_policy")
+    except Exception as exc:
+        _log.warning("review_policy_invalid: config unreadable (%s); using 'none'", exc)
+        return "none"
+    value = str(raw if raw is not None else "").strip().lower()
+    if value in REVIEW_POLICIES:
+        return value
+    _log.warning("review_policy_invalid: %r is not one of %s; using 'none'", raw, REVIEW_POLICIES)
+    return "none"
 
 
 def is_milestone_card(conn: sqlite3.Connection, task_id: str) -> bool:
-    """A card is a milestone when its title/body carries ``[milestone]`` (any
-    case) or it is a PARENT in ``task_links`` (an umbrella closing over its
-    children). Slice cards — leaves without the marker — are not."""
+    """A card is a milestone when its title/body carries ``[milestone]`` or
+    ``qa:required`` (any case). Nothing else: being a PARENT in ``task_links``
+    does NOT qualify — under fan-in QA every slice is the parent of its QA
+    card (spec §5.2), so a parent clause routed every slice to a reviewer."""
     row = conn.execute(
         "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False
     text = f"{row['title'] or ''}\n{row['body'] or ''}".lower()
-    if MILESTONE_MARKER in text:
-        return True
-    child = conn.execute(
-        "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
-    ).fetchone()
-    return child is not None
+    return MILESTONE_MARKER in text or QA_REQUIRED_MARKER in text
 
 
 def count_review_rounds(conn: sqlite3.Connection, task_id: str) -> int:
@@ -11367,7 +11581,7 @@ def request_review(
                     )
             return _ret(False, reason)
 
-    # ── Review policy (kanban.review_policy=milestone_only) ────────────────
+    # ── Review policy (kanban.review_policy=milestone_only|none) ────────────────
     # Slice cards do not get a reviewer session; CI is their gate. They are
     # COMPLETED here with a review_skipped event so the orchestrator's merge
     # pass sees them as done-with-PR. The policy applies even when the worker
@@ -11390,16 +11604,17 @@ def request_review(
             if not done:
                 return _ret(
                     False,
-                    "review_policy=milestone_only: card is not a milestone and "
+                    f"review_policy={_policy}: card needs no review session and "
                     "could not be completed in place (not running/ready, or "
                     "expected_run_id mismatch)",
                 )
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "review_skipped",
-                    {"policy": "milestone_only", "summary": (summary or "")[:400] or None},
+                    {"policy": _policy, "summary": (summary or "")[:400] or None},
                 )
-            return _ret(True, "review skipped (non-milestone card, kanban.review_policy=milestone_only) — card completed; CI is the gate")
+            _why = "review_policy=none" if _policy == "none" else "non-milestone card"
+            return _ret(True, f"review skipped ({_why}, kanban.review_policy={_policy}) — card completed; CI is the gate")
 
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
@@ -12176,7 +12391,13 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = _retry_status_for_run(
                     conn, row["id"], row["current_run_id"]
                 )
-                terminations.append((row["worker_pid"], row["claim_lock"]))
+                terminations.append(_PendingTermination(
+                    row["worker_pid"], row["claim_lock"],
+                    _worker_owner_window(
+                        conn, row["id"], row["worker_pid"],
+                        row["current_run_id"],
+                    ),
+                ))
                 run_id = _end_run(
                     conn,
                     row["id"],
@@ -12247,8 +12468,11 @@ def invalidate_descendants_for_parent_reopen(
         # Standalone call: we committed above, so the audit trail is durable
         # — safe to kill workers now. Composed calls leave this to the
         # caller (post-commit), preserving events-before-termination.
-        for pid, claim_lock in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock)
+        for entry in terminations:
+            pid, claim_lock = entry
+            _terminate_reclaimed_worker(
+                pid, claim_lock, owner_window=_termination_window(entry),
+            )
     return {"invalidated": invalidated, "terminations": terminations}
 
 
@@ -14780,11 +15004,27 @@ def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    owner_window: tuple,
     signal_fn=None,
     conn: Optional[sqlite3.Connection] = None,
     task_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    ``owner_window`` is the recorded run's owner window
+    ``(claimed_at, spawned_at, start_token)`` from :func:`_worker_owner_window`. It is a
+    REQUIRED keyword so no call site can signal a PID without an identity
+    check (t_0ae83825): liveness is not identity, and a dead, unreaped
+    worker's PID can be reused by an unrelated process -- a macOS daemon or
+    another card's live worker. A live PID is classified by
+    :func:`_owner_identity` BEFORE any signal:
+
+    * ``recycled`` -- provably not the recorded worker. Never signalled; the
+      recorded worker is gone, so ``terminated=True, identity_mismatch=True``.
+    * ``unverified`` -- create time unreadable. Fail CLOSED: never signalled
+      and never released (``liveness_unprovable``).
+    * ``verified`` -- signalled exactly as before.
+    """
     import signal
 
     info: dict[str, Any] = {
@@ -14842,10 +15082,27 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
 
+    if _pid_alive(pid):
+        identity = _owner_identity(int(pid), *owner_window)
+        info["owner_identity"] = identity
+        if identity == "recycled":
+            # The recorded worker is gone; this PID now belongs to someone
+            # else. Signalling it would kill an unrelated process, and
+            # holding the claim for it would defer forever.
+            info["identity_mismatch"] = True
+            info["terminated"] = True
+            return info
+        if identity == "unverified":
+            info["identity_unverifiable"] = True
+            info["liveness_unprovable"] = True
+            info["needs_attention"] = True
+            return info
+
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
     )
     if kill is None:
+        info["terminated"] = not _pid_alive(pid)
         return info
 
     info["termination_attempted"] = True
@@ -14856,6 +15113,13 @@ def _terminate_reclaimed_worker(
         # survival. Leaving terminated=False here would make the reclaim guard
         # misread a dead worker as still-alive and defer forever.
         info["terminated"] = True
+        return info
+    except PermissionError:
+        # Identity was verified above (or the pid was not visibly alive), so
+        # this is OUR recorded worker running under another uid: hold it and
+        # surface it rather than retrying silently every tick.
+        info["signal_error"] = "EPERM"
+        info["needs_attention"] = True
         return info
     except OSError:
         return info
@@ -15092,33 +15356,16 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        # SIGTERM then SIGKILL (5 s grace) through the shared helper, so the
+        # owner-identity check guards this path too (t_0ae83825): a recycled
+        # PID is never signalled and proves the recorded worker gone.
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn,
+            owner_window=_worker_owner_window(conn, tid, pid),
+            conn=conn, task_id=tid,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
-
-        if _pid_alive(pid):
+        killed = bool(termination.get("sigkill"))
+        if not termination.get("terminated"):
             # Signal delivery (including SIGKILL) is not proof of death.
             # Keep the owner and run intact until a later tick proves it gone.
             with write_txn(conn):
@@ -15131,8 +15378,12 @@ def enforce_max_runtime(
                     "SELECT 1 FROM task_events WHERE task_id=? AND kind='timeout_refused' "
                     "AND run_id=? LIMIT 1", (tid, current["current_run_id"]),
                 ).fetchone():
-                    _append_event(conn, tid, "timeout_refused",
-                                  {"pid": pid, "sigkill": killed, "needs_attention": True},
+                    refused = {"pid": pid, "sigkill": bool(termination.get("sigkill")),
+                               "needs_attention": True}
+                    for key in ("owner_identity", "identity_unverifiable", "signal_error"):
+                        if key in termination:
+                            refused[key] = termination[key]
+                    _append_event(conn, tid, "timeout_refused", refused,
                                   run_id=current["current_run_id"])
             continue
 
@@ -15154,6 +15405,8 @@ def enforce_max_runtime(
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                if termination.get("identity_mismatch"):
+                    payload["identity_mismatch"] = True
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -15202,41 +15455,46 @@ def _worker_cpu_active(pid: int) -> bool:
     processes are deliberately NOT a veto: workers hold persistent idle
     children (execute_code kernels, LSP servers) for their whole life, and a
     healthy long tool call already advances ``progress_at`` through the tool
-    keepalive tickers. Unknown process state (``ps`` missing/failing/
-    unparseable) returns True so it never authorizes a kill.
+    keepalive tickers.
+
+    "Right now" is a delta: two samples of the pid's cumulative user+system
+    CPU time :data:`_CPU_SAMPLE_SECONDS` apart. ``ps -o pcpu`` cannot answer
+    it on Linux, where procps reports lifetime cputime / lifetime elapsed: a
+    worker that burned CPU once and then stalled read busy for minutes to
+    hours and vetoed its own reclaim, and a fresh idle child read busy ~1 s
+    per 1 ms of startup CPU (t_46a2f8a1). A pid that no longer exists reads
+    idle (nothing to veto). Unknown state (psutil missing, access denied,
+    any other probe error) returns True so it never authorizes a kill.
     """
     try:
-        return _cpu_active_in_table(_process_cpu_table(), pid)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return True  # Unknown process state must not authorize a kill.
+        before = _process_cpu_seconds(pid)
+        time.sleep(_CPU_SAMPLE_SECONDS)
+        after = _process_cpu_seconds(pid)
+    except Exception as exc:
+        try:
+            import psutil
+        except ImportError:
+            return True  # Unknown process state must not authorize a kill.
+        # NoSuchProcess includes ZombieProcess: exited, not busy.
+        return not isinstance(exc, psutil.NoSuchProcess)
+    return after > before
 
 
-def _process_cpu_table() -> str:
-    """Raw ``pid ppid pcpu`` table from ``ps`` (the probe's only I/O).
+# Window between the two CPU-time samples in :func:`_worker_cpu_active`.
+_CPU_SAMPLE_SECONDS = 0.5
 
-    Split out so tests can feed a deterministic table instead of depending on
-    a loaded host's scheduler to make a real child read 0.0% in time.
+
+def _process_cpu_seconds(pid: int) -> float:
+    """Cumulative user+system CPU seconds of ``pid`` (the probe's only I/O).
+
+    Children are never counted. Split out so tests inject a deterministic
+    sampler instead of depending on a loaded host's scheduler. Raises
+    ImportError / psutil errors; the caller maps them.
     """
-    return subprocess.run(
-        ["ps", "-A", "-o", "pid=,ppid=,pcpu="],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
-        check=True,
-    ).stdout
+    import psutil
 
-
-def _cpu_active_in_table(table: str, pid: int) -> bool:
-    """Pure parse: True iff ``pid`` itself shows CPU > 0 (children never veto).
-
-    Raises ValueError on an unparseable row so the caller treats it as unknown.
-    """
-    for line in table.splitlines():
-        fields = line.split()
-        if len(fields) != 3:
-            continue
-        proc, cpu = int(fields[0]), float(fields[2])
-        if proc == pid and cpu > 0:
-            return True
-    return False
+    times = psutil.Process(int(pid)).cpu_times()
+    return times.user + times.system
 
 
 def _run_progress_at(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[int]:
@@ -15324,7 +15582,8 @@ def detect_progress_stalls(
         if age < reclaim_seconds:
             continue
         termination = _terminate_reclaimed_worker(
-            pid, lock, conn=conn, task_id=row["id"],
+            pid, lock, owner_window=_worker_owner_window(conn, row["id"], pid, rid),
+            conn=conn, task_id=row["id"],
         )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
@@ -15421,6 +15680,7 @@ def detect_stale_running(
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn, conn=conn, task_id=tid,
+            owner_window=_worker_owner_window(conn, tid, pid),
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -15523,7 +15783,7 @@ def reconcile_orphaned_running(
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _pid_alive(pid):
+        if pid and _recorded_worker_alive(conn, tid, pid):
             # The recorded worker may still be doing real work — never
             # requeue beside a live process. Retry next tick.
             _log.debug(
@@ -15975,7 +16235,11 @@ def detect_crashed_workers(
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
-            if _pid_alive(row["worker_pid"]):
+            # Identity, not bare liveness: a recycled holder of a dead
+            # worker's PID must not hide the crash forever (t_0ae83825).
+            if _recorded_worker_alive(
+                conn, row["id"], row["worker_pid"], row["current_run_id"],
+            ):
                 continue
 
             pid = int(row["worker_pid"])
@@ -16785,6 +17049,9 @@ def _abort_lost_claim_spawn(
     if pid:
         termination = _terminate_reclaimed_worker(
             int(pid), task.claim_lock, conn=conn, task_id=task.id,
+            owner_window=_worker_owner_window(
+                conn, task.id, int(pid), task.current_run_id,
+            ),
         )
         payload.update(termination)
         if not termination.get("terminated"):

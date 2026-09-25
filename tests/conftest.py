@@ -2088,3 +2088,32 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _kanban_stubbed_liveness_implies_identity(monkeypatch):
+    """A stubbed ``kanban_db._pid_alive`` also vouches for owner identity.
+
+    t_0ae83825: termination/liveness paths now require a live PID to have been
+    created inside its run's causal window (``_pid_started_in_claim``). Tests
+    that stub ``_pid_alive`` over a SYNTHETIC pid (12345, 999_998, ...) are
+    asserting "this is our live worker"; the real create-time probe cannot
+    read a synthetic pid and would fail closed (``unverified``). While
+    ``_pid_alive`` is stubbed, identity therefore follows the stub. With the
+    real ``_pid_alive`` the real identity probe runs untouched, and a test that
+    patches ``_pid_started_in_claim`` itself still wins.
+    """
+    kb = sys.modules.get("hermes_cli.kanban_db")
+    if kb is None or not hasattr(kb, "_real_pid_started_in_claim"):
+        yield
+        return
+    real_alive = kb._pid_alive
+    real_started = kb._real_pid_started_in_claim
+
+    def _started(pid, claimed_at, spawned_at, start_token=None):
+        if kb._pid_alive is not real_alive:
+            return True
+        return real_started(pid, claimed_at, spawned_at, start_token)
+
+    monkeypatch.setattr(kb, "_pid_started_in_claim", _started)
+    yield

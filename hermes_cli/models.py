@@ -34,6 +34,8 @@ from hermes_cli.fast_mode_contracts import (
     normalize_fast_model_id,
 )
 from hermes_cli.urllib_security import open_credentialed_url, url_origin
+from hermes_cli import provider_seam
+from hermes_cli.provider_seam import GuardedDict, GuardedList, GuardedSet
 from utils import atomic_json_write, base_url_host_matches
 
 logger = logging.getLogger(__name__)
@@ -281,7 +283,7 @@ def _xai_curated_models() -> list[str]:
     return _xai_finalize_catalog(list(_XAI_STATIC_FALLBACK))
 
 
-_PROVIDER_MODELS: dict[str, list[str]] = {
+_PROVIDER_MODELS: dict[str, list[str]] = GuardedDict(__name__, "_PROVIDER_MODELS", {
     "moa": ["default"],
     "nous": [
         # Anthropic
@@ -841,7 +843,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek/deepseek-r1-0528",
         "qwen/qwen3-235b-a22b-fp8",
     ],
-}
+})
 
 # Vercel AI Gateway: derive the bare-model-id catalog from the curated
 # ``VERCEL_AI_GATEWAY_MODELS`` snapshot so both the picker (tuples with descriptions)
@@ -1436,7 +1438,7 @@ def _extend_canonical_from_plugins() -> None:
         added: list[ProviderEntry] = []
         try:
             from providers import list_providers as _list_providers_for_canonical
-            known = {p.slug for p in list.__iter__(CANONICAL_PROVIDERS)}
+            known = {p.slug for p in provider_seam.current().CANONICAL_PROVIDERS}
             for _pp in _list_providers_for_canonical():
                 if _pp.name in known:
                     continue
@@ -1445,27 +1447,31 @@ def _extend_canonical_from_plugins() -> None:
                 _label = _pp.display_name or _pp.name
                 _desc = _pp.description or f"{_label} (direct API)"
                 entry = ProviderEntry(_pp.name, _label, _desc)
-                list.append(CANONICAL_PROVIDERS, entry)
                 known.add(_pp.name)
                 added.append(entry)
         except Exception:
             pass
         finally:
             _canonical_extend_active = False
-            _canonical_extended = True
-        if not added:
-            return
-        # Keep the derived surfaces in step. They are defined below this
-        # function in the module body but always exist by the time any read
-        # can reach here (reads are what trigger this call).
-        labels = globals().get("_PROVIDER_LABELS")
-        if labels is not None:
-            for entry in added:
-                dict.setdefault(labels, entry.slug, entry.label)
-        known_names = globals().get("_KNOWN_PROVIDER_NAMES")
-        if known_names is not None:
-            for entry in added:
-                known_names.add(entry.slug)
+        if added:
+            # One generation swap for all three surfaces, so a plugin provider
+            # is never on the canonical list without its label / parser
+            # membership. The derived surfaces are defined below this function
+            # in the module body; a read that reaches here before they exist
+            # extends the list alone.
+            delta: dict = {"CANONICAL_PROVIDERS": added}
+            if "_PROVIDER_LABELS" in globals():
+                labels = provider_seam.current()._PROVIDER_LABELS
+                delta["_PROVIDER_LABELS"] = {
+                    e.slug: e.label for e in added if e.slug not in labels
+                }
+            if "_KNOWN_PROVIDER_NAMES" in globals():
+                delta["_KNOWN_PROVIDER_NAMES"] = {e.slug for e in added}
+            try:
+                provider_seam.publish(delta)
+            except provider_seam.SeamCollision:
+                logger.warning("canonical provider auto-extend skipped: label collision", exc_info=True)
+        _canonical_extended = True
 
 
 def _ensure_canonical_extended() -> None:
@@ -1473,151 +1479,62 @@ def _ensure_canonical_extended() -> None:
         _extend_canonical_from_plugins()
 
 
-class _LazyCanonicalProviders(list):
-    """``list`` whose first read triggers the plugin auto-extend.
+provider_seam.add_snapshot_hook(_ensure_canonical_extended)
+
+
+class _LazyCanonicalProviders(GuardedList):
+    """Seam ``GuardedList`` whose first read triggers the plugin auto-extend.
 
     Exists so every existing reader (``for p in CANONICAL_PROVIDERS``,
     ``len(...)``, ``enumerate(...)``, ``[...][i]``) keeps working unchanged
-    while discovery moves out of import time.
+    while discovery moves out of import time. Every facade read goes through
+    ``_data()``; writes never trigger the extend.
     """
 
     __slots__ = ()
 
-    def __iter__(self):
+    def _data(self):
         _ensure_canonical_extended()
-        return list.__iter__(self)
-
-    def __len__(self):
-        _ensure_canonical_extended()
-        return list.__len__(self)
-
-    def __getitem__(self, item):
-        _ensure_canonical_extended()
-        return list.__getitem__(self, item)
-
-    def __contains__(self, item):
-        _ensure_canonical_extended()
-        return list.__contains__(self, item)
-
-    def __reversed__(self):
-        _ensure_canonical_extended()
-        return list.__reversed__(self)
-
-    def __repr__(self):
-        _ensure_canonical_extended()
-        return list.__repr__(self)
-
-    def index(self, *args):
-        _ensure_canonical_extended()
-        return list.index(self, *args)
-
-    def count(self, item):
-        _ensure_canonical_extended()
-        return list.count(self, item)
-
-    def copy(self):
-        _ensure_canonical_extended()
-        return list(list.__iter__(self))
+        return GuardedList._data(self)
 
 
-class _LazyProviderLabels(dict):
-    """``dict`` whose first read triggers the plugin auto-extend."""
+class _LazyProviderLabels(GuardedDict):
+    """Seam ``GuardedDict`` whose first read triggers the plugin auto-extend."""
 
     __slots__ = ()
 
-    def __iter__(self):
+    def _data(self):
         _ensure_canonical_extended()
-        return dict.__iter__(self)
-
-    def __len__(self):
-        _ensure_canonical_extended()
-        return dict.__len__(self)
-
-    def __getitem__(self, key) -> str:
-        _ensure_canonical_extended()
-        return dict.__getitem__(self, key)
-
-    def __contains__(self, key):
-        _ensure_canonical_extended()
-        return dict.__contains__(self, key)
-
-    def __repr__(self):
-        _ensure_canonical_extended()
-        return dict.__repr__(self)
-
-    def get(self, key, default=None):  # type: ignore[override]
-        _ensure_canonical_extended()
-        return dict.get(self, key, default)
-
-    def keys(self):
-        _ensure_canonical_extended()
-        return dict.keys(self)
-
-    def values(self):
-        _ensure_canonical_extended()
-        return dict.values(self)
-
-    def items(self):
-        _ensure_canonical_extended()
-        return dict.items(self)
-
-    def copy(self):
-        _ensure_canonical_extended()
-        return dict(dict.items(self))
+        return GuardedDict._data(self)
 
 
-class _LazyKnownProviderNames(collections.abc.Set):
+class _LazyKnownProviderNames(GuardedSet):
     """Set of known provider names whose first read triggers the auto-extend.
 
-    Deliberately a ``collections.abc.Set`` and NOT a ``set`` subclass.
+    A ``collections.abc.Set`` (via ``GuardedSet``) and NOT a ``set`` subclass:
     CPython's ``set_update_internal`` takes a ``PyAnySet_Check`` fast path
     that copies a real set's hash table directly, so ``set(x)`` /
     ``frozenset(x)`` / ``s.update(x)`` / ``s | x`` NEVER call a subclass's
     ``__iter__`` — the lazy trigger would be silently skipped and the copy
-    would be missing every plugin-registered provider. (Measured: with a
-    ``set`` subclass, ``PROBE in set(_KNOWN_PROVIDER_NAMES)`` was False while
-    ``PROBE in _KNOWN_PROVIDER_NAMES`` was True.) ``dict`` does not have this
-    problem — ``dict_merge`` checks that ``tp_iter`` is unchanged — which is
-    why ``_LazyProviderLabels`` can stay a ``dict`` subclass.
+    would be missing every plugin-registered provider. ``dict`` does not have
+    this problem — ``dict_merge`` checks that ``tp_iter`` is unchanged — which
+    is why ``_LazyProviderLabels`` can stay a ``dict`` subclass.
     """
 
-    __slots__ = ("_names",)
+    __slots__ = ()
 
-    def __init__(self, names) -> None:
-        self._names: set[str] = set(names)
-
-    def _get(self) -> set[str]:
+    def _data(self):
         _ensure_canonical_extended()
-        return self._names
-
-    # -- the three abstract methods; every other Set operation derives from
-    #    these, so each one goes through the lazy trigger.
-    def __contains__(self, item) -> bool:
-        return item in self._get()
-
-    def __iter__(self):
-        return iter(self._get())
-
-    def __len__(self) -> int:
-        return len(self._get())
-
-    def __repr__(self) -> str:
-        return repr(self._get())
-
-    def add(self, item: str) -> None:
-        """Used by the auto-extend to fold in a newly discovered provider."""
-        self._names.add(item)
-
-    def copy(self) -> set[str]:
-        return set(self._get())
+        return GuardedSet._data(self)
 
 
-
-CANONICAL_PROVIDERS = _LazyCanonicalProviders(CANONICAL_PROVIDERS)
+CANONICAL_PROVIDERS = _LazyCanonicalProviders(__name__, "CANONICAL_PROVIDERS", CANONICAL_PROVIDERS)
 
 # Derived dicts — used throughout the codebase
 _PROVIDER_LABELS = _LazyProviderLabels(
-    {p.slug: p.label for p in list.__iter__(CANONICAL_PROVIDERS)}
+    __name__,
+    "_PROVIDER_LABELS",
+    {p.slug: p.label for p in provider_seam.current().CANONICAL_PROVIDERS},
 )
 _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
 
@@ -1727,7 +1644,7 @@ def group_providers(slugs):
     return rows
 
 
-_PROVIDER_ALIASES = {
+_PROVIDER_ALIASES = GuardedDict(__name__, "_PROVIDER_ALIASES", {
     "glm": "zai",
     "z-ai": "zai",
     "z.ai": "zai",
@@ -1823,7 +1740,7 @@ _PROVIDER_ALIASES = {
     "lm_studio": "lmstudio",
     "ollama": "custom",  # bare "ollama" = local; use "ollama-cloud" for cloud
     "ollama_cloud": "ollama-cloud",
-}
+})
 
 
 # In-repo fallback for the model Hermes silently lands on when the user never
@@ -3065,9 +2982,11 @@ def _fetch_novita_pricing(
 # Lazy for the same reason as CANONICAL_PROVIDERS: it derives from
 # _PROVIDER_LABELS, which the plugin auto-extend tops up on first read.
 _KNOWN_PROVIDER_NAMES: collections.abc.Set[str] = _LazyKnownProviderNames(
-    set(dict.keys(_PROVIDER_LABELS))
+    __name__,
+    "_KNOWN_PROVIDER_NAMES",
+    set(provider_seam.current()._PROVIDER_LABELS)
     | set(_PROVIDER_ALIASES.keys())
-    | {"openrouter", "custom"}
+    | {"openrouter", "custom"},
 )
 
 
@@ -3103,16 +3022,17 @@ def list_available_providers() -> list[dict[str, str]]:
     source of truth shared with ``hermes model``, ``/model``, etc.).
     """
     # Derive display order from canonical list + custom
-    provider_order = [p.slug for p in CANONICAL_PROVIDERS] + ["custom"]
+    g = provider_seam.snapshot()
+    provider_order = [p.slug for p in g.CANONICAL_PROVIDERS] + ["custom"]
 
     # Build reverse alias map
     aliases_for: dict[str, list[str]] = {}
-    for alias, canonical in _PROVIDER_ALIASES.items():
+    for alias, canonical in g._PROVIDER_ALIASES.items():
         aliases_for.setdefault(canonical, []).append(alias)
 
     result = []
     for pid in provider_order:
-        label = _PROVIDER_LABELS.get(pid, pid)
+        label = g._PROVIDER_LABELS.get(pid, pid)
         alias_list = aliases_for.get(pid, [])
         # Check if this provider has credentials available
         has_creds = False
@@ -3169,6 +3089,7 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
     if colon > 0:
         provider_part = stripped[:colon].strip().lower()
         model_part = stripped[colon + 1:].strip()
+        provider_seam.refresh("typed", provider_part or None)
         if provider_part and model_part and provider_part in _KNOWN_PROVIDER_NAMES:
             if provider_part == "custom":
                 lowered = stripped.lower()
@@ -3818,11 +3739,12 @@ def detect_static_provider_for_model(
     # provider switch and pick the first model from that provider's catalog.
     # Skip "custom" and "openrouter" — custom has no model catalog, and
     # openrouter requires an explicit model name to be useful.
-    resolved_provider = _PROVIDER_ALIASES.get(name_lower, name_lower)
+    g = provider_seam.snapshot()
+    resolved_provider = g._PROVIDER_ALIASES.get(name_lower, name_lower)
     if resolved_provider not in {"custom", "openrouter"}:
-        default_models = _PROVIDER_MODELS.get(resolved_provider, [])
+        default_models = g._PROVIDER_MODELS.get(resolved_provider, [])
         if (
-            resolved_provider in _PROVIDER_LABELS
+            resolved_provider in g._PROVIDER_LABELS
             and default_models
             and resolved_provider not in current_keys
         ):
@@ -3853,7 +3775,7 @@ def detect_static_provider_for_model(
         current_provider == "custom"
         or current_provider.startswith("custom:")
     )
-    for pid in _PROVIDER_MODELS:
+    for pid in g._PROVIDER_MODELS:
         if (
             pid in current_keys
             or pid in _AGGREGATOR_PROVIDERS

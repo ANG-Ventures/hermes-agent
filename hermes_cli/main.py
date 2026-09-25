@@ -4033,8 +4033,10 @@ def select_provider_and_model(args=None):
         group_providers,
         provider_group_for_slug,
     )
+    from hermes_cli import provider_seam
 
-    provider_labels = dict(_PROVIDER_LABELS)  # derive from canonical list
+    g = provider_seam.snapshot()
+    provider_labels = dict(g._PROVIDER_LABELS)  # derive from canonical list
     if active and active in _custom_provider_map:
         active_label = _custom_provider_map[active]["name"]
     else:
@@ -4052,7 +4054,7 @@ def select_provider_and_model(args=None):
     # row ("Kimi / Moonshot ▸"); picking it opens a member sub-picker that
     # resolves back to a concrete slug, so the dispatch chain below is
     # unchanged. Custom providers and the trailing actions stay flat.
-    canonical_descs = {p.slug: p.tui_desc for p in CANONICAL_PROVIDERS}
+    canonical_descs = {p.slug: p.tui_desc for p in g.CANONICAL_PROVIDERS}
     # Honor ``model_catalog.excluded_providers`` so the CLI ``hermes model``
     # picker hides the same providers the gateway/TUI pickers do. A canonical
     # provider is hidden if its slug OR any of its aliases appears in the
@@ -4064,18 +4066,18 @@ def select_provider_and_model(args=None):
         if p
     }
     if _cli_excluded:
-        _alias_to_canon = _PROVIDER_ALIASES
+        _alias_to_canon = g._PROVIDER_ALIASES
         _names_for: dict[str, set[str]] = {}
-        for _p in CANONICAL_PROVIDERS:
+        for _p in g.CANONICAL_PROVIDERS:
             _names_for[_p.slug] = {_p.slug.lower()}
         for _alias, _canon in _alias_to_canon.items():
             _names_for.setdefault(_canon, {_canon.lower()}).add(_alias.lower())
         _visible_slugs = [
-            p.slug for p in CANONICAL_PROVIDERS
+            p.slug for p in g.CANONICAL_PROVIDERS
             if not _names_for.get(p.slug, {p.slug.lower()}) & _cli_excluded
         ]
     else:
-        _visible_slugs = [p.slug for p in CANONICAL_PROVIDERS]
+        _visible_slugs = [p.slug for p in g.CANONICAL_PROVIDERS]
 
     # Hide the numeric failover lanes (``claude-apx-7``, ``claude-bpx-15``, …)
     # exactly as ``list_picker_providers`` (CLI/Discord) and
