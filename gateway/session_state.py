@@ -109,6 +109,9 @@ class ConversationState:
     sidecar_notes: List[str] = field(default_factory=list)
     # Pinned session-context bytes: (change_key, text).
     ephemeral_pin: Optional[Tuple[Any, ...]] = None
+    # Channel inputs of the last human turn: (channel_prompt, parent_chat_id).
+    # Internal events reuse them so they cannot toggle the system prompt.
+    channel_pin: Optional[Tuple[Optional[str], Optional[str]]] = None
     # Last voice-channel context delivered (None = never delivered).
     vc_last: Optional[str] = None
 
@@ -128,6 +131,7 @@ class ConversationState:
         self.queued_events = []
         self.sidecar_notes = []
         self.ephemeral_pin = None
+        self.channel_pin = None
         self.vc_last = None
 
 
