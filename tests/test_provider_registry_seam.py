@@ -259,6 +259,13 @@ def test_t5_bypass_returns_same_content_and_held_base_iterator_is_loud():
         list(held)
 
 
+def _describe(value) -> str:
+    try:
+        return repr(value)
+    except Exception as exc:  # a half-built facade copy cannot even repr itself
+        return f"<{type(value).__name__}: repr raised {type(exc).__name__}>"
+
+
 # ---------------------------------------------------------------------------
 # t6 — C-consumer matrix, AFTER a publish and an overwriting facade write
 # ---------------------------------------------------------------------------
@@ -330,7 +337,7 @@ def test_t6_c_consumer_matrix_after_publish_and_overwrite():
         except Exception as exc:
             got = f"{type(exc).__name__}: {exc}"
         if got != expect:
-            failures[label] = got
+            failures[label] = _describe(got)
     print(f"t6 matrix: {len(checks)} checks on python {platform.python_version()}")
     assert not failures, f"C-consumer checks that did not see the data: {failures}"
 
