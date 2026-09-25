@@ -387,14 +387,6 @@ def test_empty_pr_number_is_not_queued():
 # ─── workflow wiring ──────────────────────────────────────────────────
 
 
-def test_workflow_passes_the_slower_interval():
-    """The 15s interval is what exhausted the installation budget."""
-    root = Path(__file__).resolve().parents[2]
-    text = (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
-    assert "--interval 45" in text
-    assert "--interval 15" not in text
-
-
 def test_default_interval_matches_the_workflow():
     """A drifting default silently restores the storm for any other caller.
 
@@ -706,91 +698,6 @@ def test_queue_pause_is_bounded_by_the_wall_clock_budget(monkeypatch):
     assert slept[-1] < _mod._MERGE_QUEUE_RECHECK_INTERVAL, (
         f"the final pause was not clamped to the remaining wall-clock room "
         f"(slept {slept[-1]}s of a {budget}s budget; pauses={slept})"
-    )
-
-
-def _workflow_wall_budget():
-    """The budget the workflow ACTUALLY runs with: override or default.
-
-    An absent `--max-wall-seconds` means the script's default applies. A
-    PRESENT one must be read in whatever form argparse accepts — argparse
-    takes `--max-wall-seconds=1799` as readily as the space form, and a
-    regex matching only the space form would silently substitute the safe
-    default and let these guards pass while the poller ran with 1799s.
-    A present-but-unparseable value is a hard failure, not a default.
-    """
-    root = Path(__file__).resolve().parents[2]
-    text = (root / ".github/workflows/ci-review-comment.yml").read_text(
-        encoding="utf-8")
-    job_timeout_min = int(
-        re.search(r"^\s*timeout-minutes:\s*(\d+)", text, re.M).group(1))
-    # Only the invocation matters — the file's comments discuss the flag.
-    invocation = text[text.index("live_comment.py"):]
-    present = re.search(r"--max-wall-seconds(?:[=\s]+)(\S+)", invocation)
-    if present is None:
-        budget = _mod._DEFAULT_MAX_WALL_SECONDS
-    else:
-        raw = present.group(1).strip().strip("\\").strip()
-        assert raw.isdigit(), (
-            f"the workflow passes --max-wall-seconds {raw!r}, which this "
-            "guard cannot evaluate — the poller would run with an unchecked "
-            "wall-clock budget"
-        )
-        budget = int(raw)
-    return job_timeout_min * 60, budget
-
-
-def _workflow_poll_ceiling():
-    """When the workflow's poller actually STOPS polling."""
-    _, budget = _workflow_wall_budget()
-    return budget - _mod._SHUTDOWN_RESERVE_SECONDS
-
-
-def test_workflow_sets_a_wall_clock_budget_below_the_job_timeout():
-    """A budget at or above timeout-minutes would never fire."""
-    job_timeout, budget = _workflow_wall_budget()
-    assert budget < job_timeout, (
-        f"the poller's effective wall budget {budget} is not below the job's "
-        f"timeout-minutes ({job_timeout}s), so "
-        "the poller is still killed before it can stop cleanly"
-    )
-
-
-def test_workflow_keeps_the_supported_50_minute_monitoring_window():
-    """F1: the monitoring window is a DECISION, not a side-effect.
-
-    Active polling must still reach 3000s — the window the poller had
-    before the shutdown reserve was carved out of the budget. Letting the
-    reserve shorten it (budget 2700 => ceiling 2400) is a user-visible
-    regression: a CI or merge-queue run finishing between 40 and 50 minutes
-    has its final snapshot taken while still in progress and is never
-    updated.
-
-    A LITERAL, not derived from the constants — deriving it would move the
-    expectation in lockstep with any future budget cut and gate nothing.
-    """
-    assert _workflow_poll_ceiling() >= 3000, (
-        f"active polling now stops at {_workflow_poll_ceiling()}s; the "
-        "supported monitoring window is 50 minutes (3000s), so a run "
-        "finishing after that is reported as still running"
-    )
-
-
-def test_the_workflow_states_its_budget_explicitly():
-    """F1: the window must not be INHERITED from the script's default.
-
-    ``_workflow_poll_ceiling`` above is satisfied either by the flag or by
-    the default, so each alone gates nothing. The workflow is where an
-    operator reads the monitoring window, and a silent change to the
-    script's default must not move it.
-    """
-    root = Path(__file__).resolve().parents[2]
-    text = (root / ".github/workflows/ci-review-comment.yml").read_text(
-        encoding="utf-8")
-    invocation = text[text.index("live_comment.py"):]
-    assert re.search(r"--max-wall-seconds[=\s]", invocation), (
-        "the workflow passes no --max-wall-seconds, so its monitoring "
-        "window is whatever the script's default happens to be"
     )
 
 
@@ -1453,7 +1360,7 @@ def test_wall_clock_budget_leaves_a_real_shutdown_margin():
     in lockstep with the code, so zeroing either constant stayed green
     (measured: 68 passed with ``_SHUTDOWN_RESERVE_SECONDS = 0``).
     """
-    job_timeout, budget = _workflow_wall_budget()
+    budget = _mod._DEFAULT_MAX_WALL_SECONDS
 
     # A reserve that is actually a window, sized for the serial API calls
     # the snapshot makes. 60s is the floor a single artifact fetch needs.
@@ -1467,18 +1374,6 @@ def test_wall_clock_budget_leaves_a_real_shutdown_margin():
     )
     poll_ceiling = budget - _mod._SHUTDOWN_RESERVE_SECONDS
     assert poll_ceiling > 0, "the reserve consumed the entire budget"
-
-    # An in-flight redirect + blob request plus the final PATCH, at the
-    # socket timeouts a GitHub API call and an artifact blob are allowed:
-    # 30 + 30 + 30. Literal, not derived. 60 undercounted the very path
-    # this docstring describes and would have admitted a 60-89s margin that
-    # is still SIGKILLed before publishing.
-    overrun = 90
-    assert job_timeout - budget >= overrun, (
-        f"the wall budget {budget}s ends only {job_timeout - budget}s before "
-        f"the job's {job_timeout}s deadline, but an in-flight artifact "
-        f"request plus the final PATCH can overrun it by {overrun}s"
-    )
 
 
 # ─── round 5 ──────────────────────────────────────────────────────────
@@ -1785,15 +1680,6 @@ def test_wall_clock_ceiling_is_finite_by_default():
     assert inspect.signature(_mod.run).parameters["max_wall_seconds"].default == \
         _mod._DEFAULT_MAX_WALL_SECONDS, \
         "run()'s default leaves the wall-clock ceiling unset"
-
-    root = Path(__file__).resolve().parents[2]
-    text = (root / ".github/workflows/ci-review-comment.yml").read_text(encoding="utf-8")
-    job_timeout = int(
-        re.search(r"^\s*timeout-minutes:\s*(\d+)", text, re.M).group(1)) * 60
-    assert _mod._DEFAULT_MAX_WALL_SECONDS < job_timeout, (
-        f"the default ceiling ({_mod._DEFAULT_MAX_WALL_SECONDS}s) is not "
-        f"below the job deadline ({job_timeout}s)"
-    )
 
 
 # ─── round 6 ──────────────────────────────────────────────────────────

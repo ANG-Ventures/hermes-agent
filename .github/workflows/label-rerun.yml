@@ -9,9 +9,8 @@ name: Label rerun
 # the 40-minute comment poller and the 45-minute image build. Each one moved
 # to its own workflow, so a CI run ends when its required jobs end.
 #
-# The review comment updates without help. The poller in
-# ci-review-comment.yml watches the CI run through the API. It gets the
-# rerun results.
+# The live review-comment poller (ci-review-comment.yml) was retired on
+# 2026-09-25 (CI efficiency spec L10); it had been disabled since before then.
 
 on:
   pull_request:
@@ -32,8 +31,7 @@ jobs:
     # Pure API poller (`gh run watch` for up to 35 min) — it never checks out
     # or builds the repo, so it must NOT take a self-hosted runner slot: on a
     # small self-hosted pool it sits on one runner waiting for the very CI run
-    # that pool is trying to finish. Pin to GitHub-hosted, same as
-    # ci-review-comment.yml.
+    # that pool is trying to finish. Pin to GitHub-hosted.
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:

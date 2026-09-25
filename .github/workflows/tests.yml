@@ -84,13 +84,19 @@ jobs:
           CI_RUNNER_LABELS: ${{ vars.CI_RUNNER_LABELS }}
           # Optional trial: overrides routing for the N lightest non-core slices.
           CI_ARM_HOSTED_SLICES: ${{ vars.CI_ARM_HOSTED_SLICES }}
+          # Arm-first (spec L5): with ARM on, every hosted non-core slice goes
+          # to ubuntu-24.04-arm (3.4 vs 5.1 min p50, 2026-09-25 audit) except
+          # this many, which stay x64 as arch canaries whatever K the
+          # placement controller writes. Rollback: CI_X64_HOSTED_MIN=off.
+          CI_X64_HOSTED_MIN: ${{ vars.CI_X64_HOSTED_MIN || '2' }}
         run: |
           MATRIX=$(python3 scripts/run_tests_parallel.py \
             --generate-slices ${{ inputs.slice_count }} \
             --test-scope '${{ inputs.test_scope }}' \
             --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
             --self-hosted-labels "$CI_RUNNER_LABELS" \
-            --arm-hosted-slices="$CI_ARM_HOSTED_SLICES")
+            --arm-hosted-slices="$CI_ARM_HOSTED_SLICES" \
+            --x64-hosted-min="$CI_X64_HOSTED_MIN")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           # A full matrix (~350 KB) exceeds Linux's 128 KB per-env-string limit
           # (E2BIG), so overflow tooling reads it from a file, never env/argv.
