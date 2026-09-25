@@ -1463,6 +1463,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_hl.add_argument("--dry-run", action="store_true",
                       help="With --backfill: list what would be stamped")
     p_hl.add_argument("--json", action="store_true")
+    p_hl.add_argument("--open-prs", action="store_true",
+                      help="List done cards (last 7 days) whose result names a "
+                           "still-OPEN GitHub PR (exit 1 when any)")
 
     # --- repair ---
     p_repair = sub.add_parser(
@@ -2457,6 +2460,19 @@ def _cmd_home_lint(args: argparse.Namespace) -> int:
     Designed for a no_agent cron (empty stdout = nothing delivered). With
     ``--backfill`` stamps the stragglers ``unhomed`` and exits 0.
     """
+    if getattr(args, "open_prs", False):
+        from hermes_cli import kanban_open_pr
+        with kb.connect_closing() as conn:
+            hits = kanban_open_pr.find_done_with_open_pr(conn)
+        if args.json:
+            print(json.dumps({"done_with_open_pr": hits}))
+        else:
+            for hit in hits:
+                print(
+                    f"kanban home-lint: {hit['id']} is DONE but names OPEN PR(s) "
+                    f"{', '.join(hit['open_prs'])} -- {hit['title']}"
+                )
+        return 1 if hits else 0
     with kb.connect_closing() as conn:
         if getattr(args, "backfill", False):
             ids = kb.backfill_unhomed(conn, dry_run=bool(args.dry_run))
@@ -4026,7 +4042,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
-                print(f"Completed {tid}")
+                after = kb.get_task(conn, tid)
+                if after is not None and after.status == "review":
+                    print(f"Routed {tid} to review (handoff names a still-OPEN PR; not done)")
+                else:
+                    print(f"Completed {tid}")
     return 0 if not failed else 1
 
 
