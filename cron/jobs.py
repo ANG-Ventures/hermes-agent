@@ -2732,6 +2732,82 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
 # Completed one-shots are retained in jobs.json (final status stays inspectable) and pruned by
 # _sweep_completed_oneshots once they age out.
 COMPLETED_ONESHOT_RETENTION_DAYS = 7
+_STALE_FIRE_LOCK_AGE_SECONDS = 60.0
+_FIRE_LOCK_NAME_RE = re.compile(r"^\.fire-[0-9a-f]{32}\.lock$")
+
+
+def _reap_stale_fire_locks(
+    live_job_ids: Collection[str], *, now_epoch: Optional[float] = None
+) -> int:
+    """Remove old fire-fence pathnames that no current job can open again.
+
+    Fire-fence files are durable synchronization pathnames and normally outlive
+    each lock holder.  Only a file whose hashed job id is absent from the
+    current store is residue.  The age floor avoids racing a just-deleted job,
+    and a non-blocking exclusive ``flock`` preserves an orphan whose final run
+    still has the inode open.  Current-job files are never unlinked: deleting a
+    pathname while a waiter has opened the old inode could split future callers
+    across two lock files.  Platforms without ``fcntl`` fail closed.
+    """
+    if fcntl is None:
+        return 0
+
+    cron_dir = _current_cron_store().cron_dir
+    live_lock_names = {
+        f".fire-{uuid.uuid5(uuid.NAMESPACE_URL, f'{cron_dir.resolve()}::{job_id}').hex}.lock"
+        for job_id in live_job_ids
+        if job_id
+    }
+    now = time.time() if now_epoch is None else now_epoch
+    removed = 0
+    try:
+        candidates = list(cron_dir.glob(".fire-*.lock"))
+    except OSError:
+        return 0
+
+    for lock_path in candidates:
+        if (
+            not _FIRE_LOCK_NAME_RE.fullmatch(lock_path.name)
+            or lock_path.name in live_lock_names
+        ):
+            continue
+        lock_fd = None
+        acquired = False
+        try:
+            before = lock_path.stat()
+            if before.st_size != 0 or now - before.st_mtime <= _STALE_FIRE_LOCK_AGE_SECONDS:
+                continue
+            lock_fd = open(lock_path, "a+", encoding="utf-8")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (OSError, IOError):
+                continue
+
+            # The pathname may have been replaced between stat() and flock().
+            # Delete only the exact inode we inspected and locked.
+            held = os.fstat(lock_fd.fileno())
+            current = lock_path.stat()
+            if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+                continue
+            if current.st_size != 0 or now - current.st_mtime <= _STALE_FIRE_LOCK_AGE_SECONDS:
+                continue
+            lock_path.unlink()
+            removed += 1
+        except (OSError, IOError):
+            continue
+        finally:
+            if lock_fd is not None:
+                try:
+                    if acquired:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except (OSError, IOError):
+                    pass
+                lock_fd.close()
+
+    if removed:
+        logger.info("Pruned %d stale cron fire-fence lock file(s)", removed)
+    return removed
 
 
 def _cron_config_number(key: str, default: Any, cast: Callable[[Any], Any]) -> Any:
@@ -3221,6 +3297,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # One-shot run-claim TTL, resolved once per scan (see _oneshot_run_claim_ttl_seconds).
     run_claim_ttl = _oneshot_run_claim_ttl_seconds()
 
+    # Reap fire-fence lock files whose job no longer exists; a live holder fails the probe.
+    _reap_stale_fire_locks({job_id for job in raw_jobs if (job_id := job.get("id"))})
     # Retention sweep: completed one-shots are kept for inspection but must not accumulate forever.
     if _sweep_completed_oneshots(raw_jobs, scan.now, removed_ids=scan.removed):
         scan.needs_save = True
