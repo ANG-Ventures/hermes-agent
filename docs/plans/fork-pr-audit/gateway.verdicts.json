@@ -378,5 +378,575 @@
   "branch": null,
   "notes": "Hottest literal in the tranche but it is per-boot telemetry, not a defect firing. Upstream's own gate (Kyzcreig-ported base + Teknium refactor) covers the fail-open; fork's extra per-event retry/backoff replay owner is not evidenced as needed. 1020 loc, 1 conflict file.",
   "subject": "fix(gateway): fail open startup restore intake (#301)"
+ },
+ "#827": {
+  "verdict": "KEEP",
+  "problem": "gateway went deaf 8-10 min per message after interrupted restarts: 29 simultaneous run_conversation frames, 265 threads, unbounded turn admission + boot-resume fan-out",
+  "evidence": {
+   "original": "P1 2026-09-21 02:52-03:07 PT, py-spy on pid 99910",
+   "upstream_state": "RED (read-only: upstream has no turn-admission wait — only a hard reject at max_concurrent_sessions, _drop_turn_slot@up/gateway/run_agent_cache.py:284 / run_inbound.py:1335 (639c1e3636); no boot-resume throttle)",
+   "upstream_fix": "639c1e3636 2026-06-09 (max_concurrent_sessions REJECT, not a bounded wait) — different semantics",
+   "fires": "2266 in 2026-05-10..2026-09-25 (turn_slot_acquire 2208, turn_slot_wait 30, boot_resume_throttled 28)",
+   "cost": {
+    "loc": 1018,
+    "conflict_files": 3,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Admission is now the ONLY concurrency control after #936 removed the pool cap — this is the piece that bounds Apollo. Measured on every turn. 1018 loc, 3 conflict files.",
+  "subject": "fix(gateway): bound turn concurrency + boot-resume fan-out (P1 2026-09-21 starvation) (#827)"
+ },
+ "#838": {
+  "verdict": "KEEP",
+  "problem": "9 unresolved FleetReview P1s on the shutdown budget landed with #821 (teardown reserve, watchdog arm)",
+  "evidence": {
+   "original": "FleetReview round-3 record on #821 head ad9c32339e",
+   "upstream_state": "RED (read-only: hard_exit_reserve / teardown.json 0 hits upstream; upstream run_shutdown.py:2118 arms a fixed drain+grace os._exit)",
+   "upstream_fix": "none",
+   "fires": "0 (1 literal = failure path)",
+   "cost": {
+    "loc": 1007,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Correctness close-out for #821; follows #821's verdict (KEEP while launchd-exit-timeout drain is fork-owned; #861 then supersedes its deadline math). Not independently measured.",
+  "subject": "fix(gateway): close the round-3 FleetReview P1s on the shutdown budget (#838)"
+ },
+ "#817": {
+  "verdict": "UPSTREAM",
+  "problem": "write_runtime_status (read-merge-atomic-write + psutil) reached from 12 loop coroutines",
+  "evidence": {
+   "original": "t_13445a80 ratchet 44->41; measured median 0.9ms / max 7.7ms idle",
+   "upstream_state": "RED-partial (read-only: startup site already off-loop via asyncio.to_thread@up/gateway/run_startup.py:909; shutdown site _write_runtime_status_quiet@run_shutdown.py:748 and the reconnect/scale-to-zero/per-turn sites remain sync)",
+   "upstream_fix": "partial (startup call wrapped in to_thread upstream)",
+   "fires": "n/a (no literal)",
+   "cost": {
+    "loc": 956,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Off-loop family. Port the remaining call sites only. 956 loc, 2 conflict files.",
+  "subject": "fix(gateway): move the runtime-status write off the event loop (ratchet 44 -> 41) (#817)"
+ },
+ "#868": {
+  "verdict": "UPSTREAM",
+  "problem": "three atomic_json_write sites in gateway/platforms/weixin.py driven from coroutines",
+  "evidence": {
+   "original": "t_13445a80 ratchet 15->13",
+   "upstream_state": "RED (read-only: up/gateway/platforms/weixin.py still calls atomic_json_write inline from its coroutines — file unchanged in this respect; weixin is not used by this fleet)",
+   "upstream_fix": "none",
+   "fires": "0 (3 literals) — weixin adapter is not enabled in the fleet",
+   "cost": {
+    "loc": 923,
+    "conflict_files": 0,
+    "conflict_syncs": 0,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Never fires here (no weixin). Pure upstream contribution; 0 conflict files. If upstream declines, DROP.",
+  "subject": "fix(gateway): move the weixin durable writes off the event loop (ratchet 15 -> 13) (#868)"
+ },
+ "#765": {
+  "verdict": "KEEP",
+  "problem": "/stop hard-interrupts but the turn lease is released only in _handle_message's finally; a stopped turn parked in a foreground tool keeps the lease and the next message blocks",
+  "evidence": {
+   "original": "PR body class description + fork tests",
+   "upstream_state": "RED (read-only: upstream turn_lease.py has no stale-holder bound/surface — stale_lease 0 hits in up/gateway)",
+   "upstream_fix": "none",
+   "fires": "56 in 2026-05-10..2026-09-25 (PHASE=stale_lease_holder)",
+   "cost": {
+    "loc": 912,
+    "conflict_files": 3,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Measured (56 stale-lease holds surfaced). Generic; UPSTREAM candidate on turn_lease.py.",
+  "subject": "fix(gateway): bound and surface a /stop'd turn that still holds the turn lease (#765)"
+ },
+ "#790": {
+  "verdict": "KEEP",
+  "problem": "sessions boot-resumed after a watchdog exit-75 got no explanation of why the gateway restarted",
+  "evidence": {
+   "original": "incident 2026-09-20 16:01 Apollo (loop blocked 30s in atomic_replace, watchdog os._exit(75))",
+   "upstream_state": "RED-partial (read-only: upstream detects the prior unclean death — detect_unclean_exit@up/gateway/lifecycle_ledger.py:156, _recover_unclean_sessions@run_startup.py:710 (6774760b6f) — but does not carry the cause into the resumed session's notice)",
+   "upstream_fix": "6774760b6f 2026-08-06 (recovery only, no cause attribution)",
+   "fires": "151 in 2026-05-10..2026-09-25 (PHASE=unclean_restart_notice)",
+   "cost": {
+    "loc": 903,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Measured. Dependents #884 #904 #1004 (restart notice family).",
+  "subject": "fix(gateway): tell resumed sessions WHY the gateway was restarted after an unclean exit (#790)"
+ },
+ "#433": {
+  "verdict": "KEEP",
+  "problem": "the 07-23 parity merge landed four tui_gateway/server.py blocks twice; the dead upstream copy of one diverged cluster hid two compute-host fixes",
+  "evidence": {
+   "original": "merge artifact diagnosed in PR body",
+   "upstream_state": "n/a (fork merge-hygiene fix; no upstream counterpart)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 880,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Reverting would re-introduce duplicate module-level defs. Follows #198 (SUPERSEDED): when upstream's compute host is taken wholesale this row dissolves. 880 loc, 1 conflict file.",
+  "subject": "fix(tui_gateway): dedup merge-introduced module-level defs + recover two dead compute-host fixes (#433)"
+ },
+ "#821": {
+  "verdict": "KEEP",
+  "problem": "launchd drains had no headroom for post-drain teardown; SIGKILL at ExitTimeOut corrupted state.db",
+  "evidence": {
+   "original": "PR body (teardown timing persisted to state/gateway.teardown.json; restart-interrupted boot counts)",
+   "upstream_state": "RED (read-only: teardown.json / hard_exit_reserve 0 hits upstream; upstream reads ExitTimeOut via Kyzcreig's aa0289f307 but reserves no measured teardown headroom)",
+   "upstream_fix": "aa0289f307 (base only)",
+   "fires": "0 (2 literals)",
+   "cost": {
+    "loc": 872,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Unmeasured beyond its tests (teardown timings live in gateway-exit-diag.log, not grepped here). Same family as #738 (Kyz upstream) / #838 / #861 — recommend the lead treats #738+#821+#838+#861 as ONE unit: the correct end state is UPSTREAM the whole drain-budget stack on top of aa0289f307.",
+  "subject": "fix(gateway): reserve launchd shutdown teardown headroom (#821)"
+ },
+ "#763": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "Discord slash-command sync silently lost commands (stop/restart absent from 64-command registry) and never recovered after a 429",
+  "evidence": {
+   "original": "measured on the live app 2026-09-20",
+   "upstream_state": "GREEN (read-only: _record_command_sync_rate_limit@up/plugins/platforms/discord/adapter.py:2026, bounded 429 retry :2140-2151)",
+   "upstream_fix": "cc8e5ec2af 2026-05-12 Discord plugin migration carries command-sync rate-limit handling; later refinements in 6e5b084b8b",
+   "fires": "0 (3 literals incl. PHASE=discord_command_registry_drift — no drift observed since)",
+   "cost": {
+    "loc": 861,
+    "conflict_files": 1,
+    "conflict_syncs": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Check before revert that upstream's sync path never vacates commands mid-sync (fork's 'never vacate' guard); registry-drift check is fork-only but has fired 0 times. Dependent #777 (review fixes) follows.",
+  "subject": "fix(discord): never vacate a slash command mid-sync, and self-heal after a 429 (#763)"
+ },
+ "#249": {
+  "verdict": "KEEP",
+  "problem": "only the failover leg of a safety-refusal fallback was announced; the restore leg (opus->fable) was invisible and the durable sink had zero recovery lines",
+  "evidence": {
+   "original": "live 2026-07-08 observation in PR body",
+   "upstream_state": "RED (read-only: no model-restore announce upstream; restore_announce/snap-back 0 hits)",
+   "upstream_fix": "none",
+   "fires": "0 (4 literals = failure paths)",
+   "cost": {
+    "loc": 847,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Fleet-specific fallback UX (claude-bridge). Base for nopr:29059863f8 and nopr:5378b19f73. 847 loc, 2 conflict files.",
+  "subject": "feat(fallback): announce the model-restore leg where it happens — inline restore + pre-run re-init (refusing-pin fix) (#249)"
+ },
+ "#807": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "session housekeeping shared the 10-thread turn pool; abandoned housekeeping retired turn slots; boot-resume gap of 590s",
+  "evidence": {
+   "original": "measured 590s boot-resume gap (PR body)",
+   "upstream_state": "GREEN for the housekeeping-pool split (read-only: _get_housekeeping_executor@up/gateway/run.py:4306, _HOUSEKEEPING_MAX_WORKERS=4 :63) — but upstream still has _TURN_MAX_WORKERS = 10 (run.py:61), the Apollo-freeze root cause (see #936)",
+   "upstream_fix": "9815b44568 2026-09-21 (Kyzcreig, same change upstream)",
+   "fires": "112 in 2026-05-10..2026-09-25 (PHASE=executor_wait — the line that diagnosed the freeze)",
+   "cost": {
+    "loc": 824,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Already Kyzcreig-authored upstream; the fork copy's executor cap was removed by #936. Keep only the PHASE=executor_wait line if #936 is ported.",
+  "subject": "fix(gateway): run session housekeeping on its own pool so it cannot starve turn bodies (#807)"
+ },
+ "#160": {
+  "verdict": "KEEP",
+  "problem": "Telegram boot redelivery answered the same update twice after a restart",
+  "evidence": {
+   "original": "PR body ('hard-kill duplicate-answer guard, scope B')",
+   "upstream_state": "RED (read-only: gateway/telegram_redelivery.py is fork-only; no upstream equivalent file)",
+   "upstream_fix": "none found",
+   "fires": "0 (3 literals incl. PHASE=tg_redelivery_suppressed — no suppression event in 4.5 months)",
+   "cost": {
+    "loc": 813,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Unmeasured: guard never suppressed anything in the retained window. Telegram is a live fleet surface, so the guard is cheap insurance, but per README rule this is KEEP-UNPROVEN; adversary/lead may downgrade to DROP. 813 loc, 1 conflict file.",
+  "subject": "feat(telegram): hard-kill boot-redelivery duplicate-answer guard (scope B) (#160)"
+ },
+ "#832": {
+  "verdict": "KEEP",
+  "problem": "deferred-restart arm did atomic writes on the event loop",
+  "evidence": {
+   "original": "t_13445a80 ratchet 37->26",
+   "upstream_state": "n/a (deferred_restart.py is fork-only; nothing to port)",
+   "upstream_fix": "n/a",
+   "fires": "n/a",
+   "cost": {
+    "loc": 797,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #295 (KEEP).",
+  "subject": "fix(gateway): move the deferred-restart arm off the event loop (ratchet 37 -> 26) (#832)"
+ },
+ "#80": {
+  "verdict": "DROP",
+  "problem": "F2 restart-loop breaker needed an authoritative restart-initiator breadcrumb",
+  "evidence": {
+   "original": "PR body (breaker design)",
+   "upstream_state": "GREEN-equivalent (read-only: upstream restart_loop_guard.py (b48cacb97b) is the restart-loop breaker upstream chose; fork now carries BOTH it and the F1/F2 breadcrumb breaker)",
+   "upstream_fix": "b48cacb97b 2026-07-01 teknium1 (restart_loop_guard.check_and_record)",
+   "fires": "119 in 2026-05-10..2026-09-25 — ALL housekeeping (breadcrumb written 59, swept 19x3, stale 3); zero breaker trips",
+   "cost": {
+    "loc": 783,
+    "conflict_files": 3,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Breadcrumbs are written and swept every boot but the breaker never tripped; upstream's restart_loop_guard (also present in fork, extended by #761/#906) covers the loop case. Revert with #70/#72/#86 as one unit.",
+  "subject": "fix(gateway): authoritative restart-initiator breadcrumb for F2 breaker (#80)"
+ },
+ "#616": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "tui_gateway turns kept running after the websocket client disconnected",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "GREEN (read-only: client_gone handling in up/tui_gateway/session_lifecycle.py; absorb 34%)",
+   "upstream_fix": "14b50f5edd 2026-08-19 (Kyzcreig, same change upstream)",
+   "fires": "12 in 2026-05-10..2026-09-25 (client_gone sid=)",
+   "cost": {
+    "loc": 729,
+    "conflict_files": 3,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Kyzcreig-authored upstream; take upstream's.",
+  "subject": "fix(tui-gateway): interrupt turns after websocket disconnect (#616)"
+ },
+ "#70": {
+  "verdict": "DROP",
+  "problem": "restart-cascade replay loop (F1 drain-mark + F2 circuit breaker)",
+  "evidence": {
+   "original": "PR body (2026-06-21 cascade)",
+   "upstream_state": "GREEN-equivalent (read-only: upstream restart_loop_guard.py b48cacb97b, consumed by _resume_pending_candidates@run_startup.py:548-557; upstream _AUTO_RESUME_REASONS gating@run.py:4013)",
+   "upstream_fix": "b48cacb97b 2026-07-01",
+   "fires": "0 (1 literal = notify failure); F2 trip never observed (see #80)",
+   "cost": {
+    "loc": 701,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Predates upstream's breaker by 10 days; both now coexist in the fork. Revert unit: #70 #72 #80 #86 (+ nopr:0f64a3653b, #7536 stuck-loop counter rows follow). 701 loc, 2 conflict files.",
+  "subject": "fix(gateway): break the restart-cascade replay loop (F1 drain-mark + F2 circuit-breaker) (#70)"
+ },
+ "#814": {
+  "verdict": "KEEP",
+  "problem": "stale queued turn recursion",
+  "evidence": {
+   "original": "PR body; 4 fork tests",
+   "upstream_state": "read-only: not located upstream (queued_turn only in tests); PR describes a fork queue path (adapter _pending_messages replay)",
+   "upstream_fix": "none found",
+   "fires": "n/a (no literal)",
+   "cost": {
+    "loc": 696,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "KEEP-UNPROVEN: no measurement; keep on the strength of its 4 tests + it being 3 days old (t_e253d9d5 family). Lead may downgrade.",
+  "subject": "fix(gateway): stop stale queued turn recursion (#814)"
+ },
+ "#967": {
+  "verdict": "KEEP",
+  "problem": "Discord restart-recovery persistence ran on the event loop; plugin-scope atomic writes",
+  "evidence": {
+   "original": "t_13445a80 ratchet",
+   "upstream_state": "n/a for the fork restart-recovery state (follows #157); the plugin-scope atomic-write helper: UPDEF 8/11 symbols exist upstream",
+   "upstream_fix": "partial (helper symbols present upstream)",
+   "fires": "0 (3 literals)",
+   "cost": {
+    "loc": 690,
+    "conflict_files": 1,
+    "conflict_syncs": 2,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #157: if #157 is dropped for upstream's backfill, this row's fork half goes with it. Keep until then.",
+  "subject": "fix(discord): take restart-recovery persistence off the event loop + plugin-scope atomic-write lint (t_eb49443b) (#967)"
+ },
+ "#769": {
+  "verdict": "KEEP",
+  "problem": "unclean lifecycle-ledger exit did not name the killer (launchd SIGKILL vs watchdog vs OOM)",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED-partial (read-only: upstream lifecycle_ledger.detect_unclean_exit records evidence but no killer attribution)",
+   "upstream_fix": "none",
+   "fires": "0 (5 literals = failure paths); attribution appears in gateway-exit-diag.log which was not grepped",
+   "cost": {
+    "loc": 680,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Restart-notice family (#790 #884 #904 #1004).",
+  "subject": "fix(gateway): name the killer on an unclean lifecycle-ledger exit (#769)"
+ },
+ "nopr:29059863f8": {
+  "verdict": "KEEP",
+  "problem": "re-init model snap-back was silent (unified recovery announce)",
+  "evidence": {
+   "original": "commit body (A4 axis)",
+   "upstream_state": "RED (no restore announce upstream)",
+   "upstream_fix": "none",
+   "fires": "0 (2 literals = failure paths)",
+   "cost": {
+    "loc": 679,
+    "conflict_files": 4,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #249.",
+  "subject": "feat(fallback): announce the re-init model snap-back (unified recovery announce + (new turn)/(re-init) rider)"
+ },
+ "#353": {
+  "verdict": "DROP",
+  "problem": "/undo reported 'Nothing to undo.' on a swallowed error",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "n/a (fork /undo·/redo core)",
+   "upstream_fix": "n/a",
+   "fires": "0",
+   "cost": {
+    "loc": 678,
+    "conflict_files": 5,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #49 (DROP).",
+  "subject": "fix(undo): stop /undo·/redo reporting a false 'Nothing to undo.' on a swallowed error (#353)"
+ },
+ "#557": {
+  "verdict": "KEEP",
+  "problem": "/model clobbered the session's reasoning effort (#467 contract)",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "read-only: 2/4 symbols exist upstream (model_switch.py) — partial; effort preservation on /model not verified upstream",
+   "upstream_fix": "partial",
+   "fires": "0 (1 literal)",
+   "cost": {
+    "loc": 675,
+    "conflict_files": 3,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Route-announce family (#228). KEEP-UNPROVEN beyond tests.",
+  "subject": "fix(model-switch): stop /model clobbering the session's reasoning effort (#467 contract) (#557)"
+ },
+ "#770": {
+  "verdict": "KEEP",
+  "problem": "scheduled-but-unstarted boot resumes were admitted after shutdown began",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "n/a (fork boot-resume scheduler)",
+   "upstream_fix": "n/a",
+   "fires": "4 in 2026-05-10..2026-09-25 (PHASE=drain_admission)",
+   "cost": {
+    "loc": 671,
+    "conflict_files": 1,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #295; measured 4.",
+  "subject": "fix(gateway): cancel scheduled-but-unstarted boot resumes at shutdown instead of admitting them into the drain (#770)"
+ },
+ "#772": {
+  "verdict": "KEEP",
+  "problem": "loop-liveness watchdog exit-75'd on host starvation (load) rather than a true loop block",
+  "evidence": {
+   "original": "PR body (2026-09-20 host load)",
+   "upstream_state": "RED (read-only: start_loop_liveness_watchdog@up/gateway/shutdown_watchdog.py (7af3a6fc7c) has no starvation hold — 'starvation' 0 hits in up/gateway)",
+   "upstream_fix": "none",
+   "fires": "n/a (no literal)",
+   "cost": {
+    "loc": 670,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "KEEP-UNPROVEN by log; relevant given 2026-09-23 host storm (load 86). Generic — UPSTREAM candidate.",
+  "subject": "fix(gateway): hold instead of exit-75 when the liveness miss is host starvation (#772)"
+ },
+ "#201": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "isolated session metadata reads routed through compute host",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "GREEN (6/6 symbols defined upstream; absorb 63%)",
+   "upstream_fix": "7d27a31ce7 (compute host upstream)",
+   "fires": "n/a",
+   "cost": {
+    "loc": 660,
+    "conflict_files": 4,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #198.",
+  "subject": "feat(tui_gateway): route isolated session metadata reads (#201)"
+ },
+ "#180": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "problem": "desktop live slash commands not routed",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "GREEN (5/8 symbols upstream; absorb 39%; desktop is D9)",
+   "upstream_fix": "upstream tui_gateway slash routing (methods_tools.py)",
+   "fires": "n/a",
+   "cost": {
+    "loc": 660,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "D9 desktop; take upstream.",
+  "subject": "fix(desktop): route live slash commands (#180)"
+ },
+ "#142": {
+  "verdict": "KEEP",
+  "problem": "drain-interrupted self-restart was not auto-surfaced; PHASE observability missing",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED (no PHASE= markers upstream: 0 hits in up/gateway/run.py)",
+   "upstream_fix": "none",
+   "fires": "2316 in 2026-05-10..2026-09-25 (shutdown_mark 1126, boot_resume_scheduled 1190)",
+   "cost": {
+    "loc": 609,
+    "conflict_files": 3,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "The PHASE= instrumentation is what diagnosed the 09-23 freeze; heavily measured.",
+  "subject": "fix(gateway): auto-surface a drain-interrupted self-restart + PHASE observability + reboot-parity proof (#142)"
+ },
+ "#857": {
+  "verdict": "KEEP",
+  "problem": "a /stop'd turn was auto-resumed after a restart",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED (read-only: user_stopped 0 hits upstream; _resume_pending_candidates has no user-stop exclusion)",
+   "upstream_fix": "none",
+   "fires": "292 in 2026-05-10..2026-09-25 (PHASE=user_stopped 146)",
+   "cost": {
+    "loc": 606,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Measured; generic — UPSTREAM candidate.",
+  "subject": "fix(gateway): a /stop'd turn must never be auto-resumed after a restart (#857)"
+ },
+ "#961": {
+  "verdict": "KEEP",
+  "problem": "restart follow-ups lost adapter-granted admission; refused replays unreported",
+  "evidence": {
+   "original": "t_e253d9d5 r3",
+   "upstream_state": "n/a (fork follow-up spool, #937)",
+   "upstream_fix": "n/a",
+   "fires": "0 (8 literals = failure paths)",
+   "cost": {
+    "loc": 593,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #937.",
+  "subject": "fix(gateway): restart follow-ups keep adapter-granted admission; refused replays reported lost (t_43e058b7) (#961)"
+ },
+ "#137": {
+  "verdict": "KEEP",
+  "problem": "busy-gateway deferred restart needed per-session quiescence + task-liveness reaper",
+  "evidence": {
+   "original": "PR body",
+   "upstream_state": "RED (fork deferred-restart family; upstream has no reaper loop for stranded running-agent entries — 'reaper' pattern absent in up/gateway/run*.py)",
+   "upstream_fix": "none",
+   "fires": "0 (3 literals = failure paths)",
+   "cost": {
+    "loc": 581,
+    "conflict_files": 2,
+    "conflict_syncs": 3,
+    "dependents": []
+   }
+  },
+  "branch": null,
+  "notes": "Follows #295. KEEP-UNPROVEN by log.",
+  "subject": "fix(gateway): per-session quiescence + task-liveness reaper (busy-gateway deferred restart never fires) (#137)"
  }
 }
