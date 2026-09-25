@@ -156,7 +156,14 @@ jobs:
       # and all CI jobs share the 60-concurrent hosted cap: 13 in-flight
       # runs at ~20 jobs held the queue at 0 merges in 40 min. Halving the
       # gate's matrix halves its share of that cap.
-      slice_count: ${{ github.event_name == 'merge_group' && 8 || 16 }}
+      #
+      # 2026-09-25 (t_f447539b, dynamic CI slots): merge_group follows the LIVE
+      # self-hosted slot total, which ci-placement writes to
+      # vars.CI_MERGE_GROUP_SLICES through scripts/ci_routing_ledger.py (the only
+      # sanctioned writer). A 16-slice matrix onto 5 live slots just queues.
+      # Clamped 4..16 here AND in ci-overflow-controller `slice_counts`; unset
+      # = 8, today's value, so this is a no-op until placement is armed.
+      slice_count: ${{ github.event_name == 'merge_group' && (vars.CI_MERGE_GROUP_SLICES == '' && 8 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) < 4 && 4 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) > 16 && 16 || fromJSON(vars.CI_MERGE_GROUP_SLICES)))) || 16 }}
       test_scope: ${{ needs.detect.outputs.test_scope }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
