@@ -291,6 +291,11 @@ jobs:
           # Verbose pytest output lets timeout verdicts name the last test reached.
           scripts/run_tests.sh --files '${{ matrix.slice.files }}' -- -v
         env:
+          # Known-flaky tests, written by the fleet's mq-flake-quarantine lane
+          # (every entry names card + owner + expiry). tests/flake_quarantine.py
+          # turns them into xfail(strict=False) / file skips so a flake stops
+          # ejecting merge-queue groups. Unset or empty = no quarantine.
+          CI_TEST_QUARANTINE: ${{ vars.CI_TEST_QUARANTINE }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

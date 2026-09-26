@@ -44,7 +44,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # later importers get a brand-new module object, so a subsequent test patches an
 # orphaned copy while the code under test imports a different one.
 # Opt out with @pytest.mark.allow_sys_modules_purge (and say why).
-pytest_plugins = ["tests.sys_modules_leak_gate"]
+pytest_plugins = ["tests.sys_modules_leak_gate", "tests.flake_quarantine"]
 
 
 def _strip_nonsandbox_file_handlers(sandbox_prefix=None):
