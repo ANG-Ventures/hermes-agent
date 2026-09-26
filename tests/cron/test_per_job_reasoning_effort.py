@@ -97,6 +97,61 @@ class TestPersistence:
         update_job(job["id"], {"reasoning_effort": None})
         assert get_job(job["id"]).get("reasoning_effort") in (None, "")
 
+    # t_ef1ba08b: an explicit per-entry fallback effort overrides the pin on
+    # the fallback turn, so setting the pin must rewrite those entries.
+    def test_update_pin_rewrites_explicit_fallback_efforts(self):
+        job = create_job(prompt="brief", schedule="every 1h", reasoning_effort="xhigh")
+        chain = [
+            {"provider": "openai-codex", "model": "gpt-a", "reasoning_effort": "xhigh"},
+            {"provider": "claude-bpr", "model": "opus-b"},
+            {"provider": "claude-bpr", "model": "opus-c", "reasoning_effort": "minimal"},
+        ]
+        update_job(job["id"], {"fallback": chain})
+        update_job(job["id"], {"reasoning_effort": "low"})
+        stored = get_job(job["id"])
+        assert stored["reasoning_effort"] == "low"
+        assert [e.get("reasoning_effort") for e in stored["fallback"]] == ["low", None, "low"]
+        assert [e["model"] for e in stored["fallback"]] == ["gpt-a", "opus-b", "opus-c"]
+
+    def test_update_pin_rewrites_single_dict_fallback(self):
+        job = create_job(prompt="brief", schedule="every 1h")
+        update_job(job["id"], {"fallback": {"provider": "p", "model": "m", "reasoning_effort": "high"}})
+        update_job(job["id"], {"reasoning_effort": "medium"})
+        assert get_job(job["id"])["fallback"] == {"provider": "p", "model": "m", "reasoning_effort": "medium"}
+
+    def test_clearing_pin_leaves_fallback_entries_alone(self):
+        job = create_job(prompt="brief", schedule="every 1h", reasoning_effort="xhigh")
+        chain = [{"provider": "p", "model": "m", "reasoning_effort": "xhigh"}]
+        update_job(job["id"], {"fallback": chain})
+        update_job(job["id"], {"reasoning_effort": None})
+        assert get_job(job["id"])["fallback"] == chain
+
+    def test_explicit_fallback_in_same_update_wins(self):
+        job = create_job(prompt="brief", schedule="every 1h")
+        chain = [{"provider": "p", "model": "m", "reasoning_effort": "xhigh"}]
+        update_job(job["id"], {"reasoning_effort": "low", "fallback": chain})
+        assert get_job(job["id"])["fallback"] == chain
+
+    def test_cli_reports_fallback_entries(self):
+        import hermes_cli.cron as mod
+        before = {"reasoning_effort": "xhigh", "fallback": [
+            {"provider": "a", "model": "x", "reasoning_effort": "xhigh"},
+            {"provider": "b", "model": "y"},
+            {"provider": "c", "model": "z", "reasoning_effort": "high"},
+        ]}
+        after = {"reasoning_effort": None, "fallback": before["fallback"]}
+        lines = mod._fallback_effort_lines(before, after)
+        assert "Fallback[0] a/x: NOT touched, keeps its own reasoning_effort 'xhigh'" in lines[0]
+        assert "Fallback[1] b/y: inherits the job effort" in lines[1]
+        after = {"reasoning_effort": "low", "fallback": [
+            {"provider": "a", "model": "x", "reasoning_effort": "low"},
+            {"provider": "b", "model": "y"},
+            {"provider": "c", "model": "z", "reasoning_effort": "low"},
+        ]}
+        lines = mod._fallback_effort_lines(before, after)
+        assert "Fallback[0] a/x: reasoning_effort xhigh -> low" in lines[0]
+        assert "Fallback[2] c/z: reasoning_effort high -> low" in lines[2]
+
 
 # ---------------------------------------------------------------------------
 # The cronjob tool: validation + threading
