@@ -11,6 +11,7 @@ an advisory diff match; live canonical reachability is the landed authority.
 TEST-REPIN: fdedf3fc2e6a21e808b0b8b9cd94557b46856c72 ANG-Ventures/hermes-agent#795 — merged survivor authority supersedes artifact-shape and inert mutation assertions.
 """
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -23,6 +24,9 @@ def git(repo, *args):
     return subprocess.run(
         ["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL,
         capture_output=True, check=True,
+        # filter-branch otherwise sleeps 10s on its deprecation warning, once
+        # per rewriting_mirror() call (~130s of this file's CI time).
+        env={**os.environ, "FILTER_BRANCH_SQUELCH_WARNING": "1"},
     ).stdout.decode().strip()
 
 

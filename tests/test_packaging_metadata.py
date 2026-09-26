@@ -1,4 +1,5 @@
 import ast
+import functools
 import re
 import tomllib
 from pathlib import Path
@@ -99,6 +100,26 @@ def _top_level_single_file_modules_on_disk():
     }
 
 
+@functools.lru_cache(maxsize=None)
+def _top_level_imports(path: Path) -> frozenset[str]:
+    """Top-level names ``path`` imports absolutely (``import a.b`` -> ``a``).
+
+    Cached: the caller asks once per candidate module, and re-parsing every
+    shipped file per candidate made this file ~100s of CI time.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (SyntaxError, UnicodeDecodeError):
+        return frozenset()
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".", 1)[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".", 1)[0])
+    return frozenset(names)
+
+
 def _shipped_importers_of(module: str) -> list[str]:
     """Non-test, non-vendored source files that ``import <module>`` (top-level name).
 
@@ -124,19 +145,8 @@ def _shipped_importers_of(module: str) -> list[str]:
                 if "tests" not in p.parts and ".worktrees" not in p.parts
             ]
     for p in py_files:
-        try:
-            tree = ast.parse(p.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                if any(a.name.split(".", 1)[0] == module for a in node.names):
-                    hits.append(str(p.relative_to(REPO_ROOT)))
-                    break
-            elif isinstance(node, ast.ImportFrom):
-                if node.level == 0 and node.module and node.module.split(".", 1)[0] == module:
-                    hits.append(str(p.relative_to(REPO_ROOT)))
-                    break
+        if module in _top_level_imports(p):
+            hits.append(str(p.relative_to(REPO_ROOT)))
     return sorted(set(hits))
 
 
