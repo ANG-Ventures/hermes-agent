@@ -7554,25 +7554,6 @@ class TurnRunner:
                 getattr(_resume_entry, "last_resume_marked_at", None),
                 window_secs=_freshness_window,
             )
-        # 🔴 Defensive reset (pass-2 B1): clear any stale suppress flag from
-        # a PRIOR turn before this turn can set it. A cached/reused agent can
-        # carry _suppress_user_turn_persist=True if a prior resume turn set it
-        # then aborted before build_turn_context consumed it — which would
-        # wrongly drop THIS turn's (possibly real) user row. Reset every turn
-        # so the flag only ever reflects the current turn's resume-pending
-        # decision below.
-        #
-        # Parity note (2026-08-08): upstream has no reference to this flag in
-        # gateway/run.py (it consumes-once inside agent/turn_context.py), so
-        # the merge took upstream's side here and silently dropped the fork's
-        # per-turn reset. turn_context's own docstring still promises "the
-        # gateway additionally resets it at the top of every turn so it never
-        # carries across turns" — consume-once alone does NOT give that: an
-        # aborted resume turn leaves the flag set with nothing to consume it.
-        try:
-            agent._suppress_user_turn_persist = False
-        except Exception:
-            pass
         _is_resume_pending = bool(
             _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
@@ -7587,41 +7568,6 @@ class TurnRunner:
         if _is_resume_pending:
             _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
             _persist_user_message_override = ctx.message
-            # An internal auto-resume continuation with no real user text (the
-            # MessageEvent text="" internal=True trigger — the ONLY path that
-            # produces an empty resume-pending turn) must NOT persist an empty
-            # user row: it pollutes the transcript, breaks role alternation,
-            # and is what /undo lands on as "(no text)". Flag the agent so
-            # build_turn_context stamps the user row ephemeral and the flush
-            # drops it. A resume turn carrying REAL queued user text has
-            # non-empty ``ctx.message`` here, so it still persists (I2). The
-            # model still receives the resume prompt built below (I1).
-            #
-            # Parity note (2026-08-08): upstream has no reference to
-            # _suppress_user_turn_persist in gateway/run.py, so the merge
-            # dropped BOTH halves of the fork's suppression (this set and the
-            # per-turn defensive reset above). agent/turn_context.py still
-            # consumes the flag and its docstring still promises the gateway
-            # sets/resets it — restored here against upstream's ctx shape.
-            if not str(ctx.message or "").strip():
-                # Belt-and-suspenders (pass-1 B1): flag the row ephemeral AND
-                # keep the override forced to empty text, so if the ephemeral
-                # stamp ever misses the persisted row degrades to a benign
-                # EMPTY row — never to a resume-prompt-shaped fake user
-                # message (ctx.message is reassigned to the prompt just below).
-                _persist_user_message_override = ""
-                try:
-                    agent._suppress_user_turn_persist = True
-                    logger.info(
-                        "resume: suppressing empty internal-resume user row "
-                        "for %s (reason=%s) — not persisting an empty user turn",
-                        ctx.session_key, _reason,
-                    )
-                except Exception:
-                    logger.debug(
-                        "resume: could not flag empty-resume user-row suppression",
-                        exc_info=True,
-                    )
             # The empty-message case is the auto-resume startup turn
             # synthesized by _schedule_resume_pending_sessions — there is
             # no NEW user message to address.  Guidance is adapter-aware:
@@ -10960,53 +10906,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return pending_event
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
-        """Total pending /queue items for a session — slot + overflow.
-
-        Counts EVERY queued event, synthetic ones included. This is the
-        resource-accounting number: it backs the ``_BUSY_QUEUE_MAX_PENDING``
-        cap, where a synthetic wake occupies a slot exactly like a user
-        message does. For the number shown to a human, use
-        ``_user_queue_depth`` — see the docstring there.
-        """
+        """Total pending /queue items for a session — slot + overflow."""
         _q_state = self._peek_session_state(session_key)
         depth = len(_q_state.conversation.queued_events) if _q_state else 0
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
-        return depth
-
-    @classmethod
-    def _is_user_queued_event(cls, event: Any) -> bool:
-        """Whether a queued event represents a message the USER sent.
-
-        Synthetic turns share the FIFO with real user messages:
-        ``internal=True`` events (kanban completion wakes, auto-resume
-        continuations, plugin-injected turns) and ``/goal`` continuations.
-        They must occupy queue slots — but they are not something the user
-        typed, so they must not be counted in a user-facing total.
-        """
-        if event is None:
-            return False
-        if getattr(event, "internal", False):
-            return False
-        if cls._is_goal_continuation_event(event):
-            return False
-        return True
-
-    def _user_queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
-        """Pending queue items the USER actually sent — slot + overflow.
-
-        The user-facing counterpart to ``_queue_depth``. ``/queue`` reports
-        this one so a single ``/queue`` issued while a kanban wake (or any
-        other synthetic turn) is already parked doesn't tell the user they
-        queued two things (#queue-depth-overcount).
-        """
-        _q_state = self._peek_session_state(session_key)
-        overflow = _q_state.conversation.queued_events if _q_state else []
-        depth = sum(1 for ev in overflow if self._is_user_queued_event(ev))
-        if adapter is not None:
-            pending_slot = getattr(adapter, "_pending_messages", {}) or {}
-            if self._is_user_queued_event(pending_slot.get(session_key)):
-                depth += 1
         return depth
 
     @staticmethod
@@ -23015,13 +22919,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timestamp=event.timestamp,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
-        # User-facing count: synthetic turns (kanban wakes, /goal
-        # continuations) share this FIFO but are not something the user
-        # queued, so reporting the raw depth told a user who sent ONE
-        # /queue that "(2 queued)".
-        depth = self._user_queue_depth(
-            quick_key, adapter=self._adapter_for_source(source)
-        )
+        depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
         if depth <= 1:
             return "Queued for the next turn."
         return f"Queued for the next turn. ({depth} queued)"

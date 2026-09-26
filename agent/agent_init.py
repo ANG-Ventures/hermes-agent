@@ -957,10 +957,6 @@ def init_agent(
     # tail (the restart-loop backstop / auto-continue signal). Fresh per agent, so
     # the next turn's agent starts unset.
     agent._persist_superseded = False
-    # Set True by the gateway on an internal empty-text auto-resume turn so
-    # build_turn_context stamps the user row ephemeral (dropped from the durable
-    # transcript). Consumed once per turn. Default False = persist normally.
-    agent._suppress_user_turn_persist = False
     # Explicit hard cancellation is separate from redirect/message state. A
     # thread-safe Event makes the cause atomic for auxiliary stream pollers.
     agent._hard_interrupt_requested = threading.Event()
