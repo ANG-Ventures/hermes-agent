@@ -543,14 +543,7 @@ class DirectAlias(NamedTuple):
 
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
-#
-# Keep bare GPT-5.5 on the ChatGPT/Codex OAuth backend by default.  The OpenAI
-# API catalog also advertises gpt-5.5, but Ace's fleet convention is that
-# `/model gpt-5.5` means the subscription-backed Codex route; users can still
-# request the API route explicitly with `/model openai-api:gpt-5.5`.
-_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {
-    "gpt-5.5": DirectAlias("gpt-5.5", "openai-codex", ""),
-}
+_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
 
 # Merged dict (builtins + user config); populated by _load_direct_aliases()
 DIRECT_ALIASES: dict[str, DirectAlias] = {}

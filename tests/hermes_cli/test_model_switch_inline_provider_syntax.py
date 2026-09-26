@@ -13,17 +13,10 @@ from hermes_cli.model_switch import switch_model
 _MOCK_VALIDATION = {"accepted": True, "persist": True, "recognized": True, "message": None}
 
 
-def _switch(raw_input: str, *, current_provider: str = "openrouter", catalog=None, mock_alias=True):
+def _switch(raw_input: str, *, current_provider: str = "openrouter", catalog=None):
     """Run switch_model with network/catalog/metadata calls mocked out."""
     catalog = [] if catalog is None else catalog
-    alias_patch = patch("hermes_cli.model_switch.resolve_alias", return_value=None)
-    if not mock_alias:
-        # Exercise the real alias resolver for tests that pin built-in direct
-        # aliases (e.g. bare gpt-5.5 -> openai-codex).  Keep the rest mocked so
-        # the test remains network-free and focused on switch_model behavior.
-        from contextlib import nullcontext
-        alias_patch = nullcontext()
-    with alias_patch, \
+    with patch("hermes_cli.model_switch.resolve_alias", return_value=None), \
          patch("hermes_cli.model_switch.list_provider_models", return_value=catalog), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                return_value={"api_key": "test", "base_url": "https://example.invalid/v1", "api_mode": "chat_completions"}), \
@@ -38,15 +31,6 @@ def _switch(raw_input: str, *, current_provider: str = "openrouter", catalog=Non
             current_base_url="https://openrouter.ai/api/v1",
             current_api_key="test",
         )
-
-
-def test_bare_gpt_5_5_prefers_openai_codex_direct_alias():
-    result = _switch("gpt-5.5", current_provider="claude-bridge-f1", mock_alias=False)
-
-    assert result.success, result.error_message
-    assert result.provider_changed is True
-    assert result.target_provider == "openai-codex"
-    assert result.new_model == "gpt-5.5"
 
 
 def test_colon_provider_model_switches_provider_before_catalog_logic():
