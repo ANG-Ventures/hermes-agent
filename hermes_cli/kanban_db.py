@@ -78,6 +78,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import hashlib
 import inspect
@@ -230,6 +231,27 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+def _is_delegated_child() -> bool:
+    """Whether this code runs inside a ``delegate_task`` child context."""
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
+# Set only by :func:`add_comment` for the duration of its own write. The single
+# append-only write a delegated child may perform (t_70fcc2c3): comments carry
+# no status/ownership/claim state, and add_comment stamps the author with
+# :data:`SUBAGENT_AUTHOR_MARKER` so the thread shows who actually wrote it.
+_DELEGATED_CHILD_COMMENT_GRANT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "kanban_delegated_child_comment_grant", default=False
+)
+
+SUBAGENT_AUTHOR_MARKER = " (subagent)"
+
+
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
 
@@ -237,20 +259,48 @@ def _assert_not_delegated_child_mutation() -> None:
     guards for better UX, but neither is a trust boundary: a delegated child can
     still shell out to the CLI or import this module directly. The actual
     invariant belongs at the DB/filesystem mutation layer so every public
-    mutator that uses ``write_txn`` (tasks, runs, comments, attachments,
-    dispatcher claims, repair events, subscriptions, GC, etc.) and every board
-    metadata mutator fails closed before touching durable state.
-    """
-    try:
-        from agent.delegation_context import is_delegated_child_process_context
+    mutator that uses ``write_txn`` (tasks, runs, attachments, dispatcher
+    claims, repair events, subscriptions, GC, etc.) and every board metadata
+    mutator fails closed before touching durable state.
 
-        delegated = is_delegated_child_process_context()
-    except Exception:
-        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
-    if delegated:
+    Reads are allowed: a child's :func:`connect` opens the existing DB with
+    ``PRAGMA query_only=ON`` and skips schema/migration writes. The only write
+    exception is :func:`add_comment` (append-only, author marked as subagent).
+    """
+    if _is_delegated_child() and not _DELEGATED_CHILD_COMMENT_GRANT.get():
         raise PermissionError(
             "delegate_task child contexts cannot mutate Kanban tasks or boards"
         )
+
+
+def _connect_delegated_child(path: Path) -> sqlite3.Connection:
+    """Open an EXISTING board DB for a ``delegate_task`` child, read-only.
+
+    No mkdir, no permission repair, no schema script, no migrations — those are
+    all writes. The connection runs with ``PRAGMA query_only=ON`` so even a
+    direct ``conn.execute("UPDATE ...")`` that bypasses :func:`write_txn` is
+    refused by SQLite itself. :func:`add_comment` lifts it for its own insert.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        raise PermissionError(
+            "delegate_task child contexts cannot initialize a Kanban board "
+            f"(no board DB at {path})"
+        )
+    conn = _sqlite_connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA cell_size_check=ON")
+        conn.execute("PRAGMA query_only=ON")
+        if not _schema_is_present(conn):
+            raise PermissionError(
+                "delegate_task child contexts cannot initialize a Kanban board "
+                f"(no schema in {path})"
+            )
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -3968,6 +4018,8 @@ def connect(
     # directly is the same leak through a different door. ``init_db`` routes
     # through here, so it is covered as well.
     _assert_live_board_write_allowed(path)
+    if _is_delegated_child():
+        return _connect_delegated_child(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -4142,6 +4194,12 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    if _is_delegated_child():
+        # A child may not create or migrate a board; it may only confirm the
+        # board exists and is readable (connect raises otherwise).
+        with contextlib.closing(connect(path)):
+            pass
+        return path
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
@@ -7060,6 +7118,33 @@ def add_comment(
         raise ValueError("comment author is required")
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     now = int(time.time())
+    if _is_delegated_child():
+        # The one write a delegate_task child may make (t_70fcc2c3). Append-only
+        # and attributed: the marker is added here, not by the caller, so an
+        # explicit ``--author`` cannot pass a child's words off as the parent's.
+        if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
+            author = author.strip() + SUBAGENT_AUTHOR_MARKER
+        grant = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
+        conn.execute("PRAGMA query_only=OFF")
+        try:
+            return _add_comment_txn(
+                conn, task_id, author, body, run_id, session_ref, now
+            )
+        finally:
+            conn.execute("PRAGMA query_only=ON")
+            _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
+    return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now)
+
+
+def _add_comment_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    run_id: Optional[int],
+    session_ref: Optional[str],
+    now: int,
+) -> int:
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
