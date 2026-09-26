@@ -867,9 +867,11 @@ def test_diag_shows_backoff_hold():
 
 def _rl_burst(conn, ends, provider="claude-apr"):
     """A finished card whose runs closed rate_limited at ``ends`` on ``provider``."""
-    tid = kb.create_task(conn, title="storm", assignee="z", model_override="m",
-                         provider_override=provider)
-    conn.execute("UPDATE tasks SET status='done', completed_at=strftime('%s','now') WHERE id=?", (tid,))
+    tid = kb.create_task(conn, title="storm", assignee="z")
+    # Raw write: a historical row may carry a single-sub pin (claude-apx-N) that
+    # the writers now refuse (t_141135aa); the circuit must still key on it.
+    conn.execute("UPDATE tasks SET model_override='m', provider_override=?, status='done', "
+                 "completed_at=strftime('%s','now') WHERE id=?", (provider, tid))
     _runs(conn, tid, [("rate_limited", e) for e in ends])
     return tid
 

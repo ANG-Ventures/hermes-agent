@@ -164,6 +164,13 @@ def test_canonical_ledger_control_caps_admission():
     ("unknown-top-level-field", lambda s: s.update(carry={"2026-09-23": -35})),
     ("boolean-version", lambda s: s.update(version=True)),
     ("float-version", lambda s: s.update(version=1.0)),
+    # t_f459aa52: billed samples feed the admission estimate; a forged sample is corruption.
+    ("sample-over-ceiling", lambda s: s.update(billed_samples={"slice": [36]})),
+    ("sample-zero", lambda s: s.update(billed_samples={"slice": [0]})),
+    ("sample-bool", lambda s: s.update(billed_samples={"slice": [True]})),
+    ("sample-unknown-kind", lambda s: s.update(billed_samples={"macos": [5]})),
+    ("sample-overlong", lambda s: s.update(billed_samples={"slice": [5] * 201})),
+    ("reservation-over-ceiling", lambda s: s["attempts"]["123:9:1"]["jobs"][0].update(reserved_minutes=36)),
 ])
 def test_semantically_corrupt_ledger_refuses_without_put(name, change):
     """Corrupt persisted state => ledger-unavailable on EVERY path: new-key reserve, same-key
@@ -542,3 +549,130 @@ def test_corrupt_hosted_minutes_refused(name, change):
     r = ledger(api, limit=35).reserve(key(), proposed("a"))
     assert isinstance(r, Refusal) and r.incident == "ledger-unavailable", name
     assert api.writes == 0
+
+
+# --- D4 amendment 2026-09-26 (t_f459aa52): admit at the measured estimate E with headroom M -------
+
+NAMES = [f"slice {i}/8" for i in range(1, 9)] + ["e2e"]
+
+
+def run_plan():
+    """What plan() hands reserve(): every job priced at its timeout ceiling."""
+    return Plan([JobPlacement(n, ["ubuntu-latest"], "cloud-overflow", 20 if n == "e2e" else 35) for n in NAMES],
+                [], {"mode": "cloud-only"})
+
+
+def est_ledger(api, *, limit, headroom=1000, day="2026-09-23"):
+    return Ledger(api, daily_limit=limit, estimate_headroom=headroom,
+                  clock=lambda: datetime.fromisoformat(day + "T12:00:00+00:00"))
+
+
+def sampled(slice_minutes=8, e2e_minutes=2, n=20):
+    return Contents({"version": 1, "attempts": {}, "daily_totals": {},
+                     "billed_samples": {"slice": [slice_minutes] * n, "e2e": [e2e_minutes] * n}})
+
+
+def test_estimate_is_p90_of_ledger_samples():
+    from scripts.ci_overflow_ledger import _estimate
+    state = {"billed_samples": {"slice": list(range(1, 21)), "e2e": [1] * 19}}
+    assert _estimate(state, "slice") == 18          # nearest-rank p90 of 1..20
+    assert _estimate(state, "e2e") == 20            # 19 < MIN_SAMPLES: no estimate, reserve the ceiling
+    assert _estimate({}, "slice") == 35
+
+
+def test_admission_at_estimate_within_headroom():
+    """Positive: with M=1000 of a 1100 day, 100 min admit a whole 8-slice+e2e run at E (8*8+2=66),
+    where the D4 ceiling (300) would have put it all local."""
+    api = sampled()
+    got = est_ledger(api, limit=1100).reserve(key(), run_plan())
+    assert isinstance(got, Reservation)
+    assert [j.reserved_minutes for j in got.plan.jobs] == [8] * 8 + [2]
+    assert all(j.labels == ["ubuntu-latest"] for j in got.plan.jobs)
+    assert got.plan.summary["remaining_allowance"] == 100 - 66
+    assert got.plan.summary["admission_estimate"] == {"slice": 8, "e2e": 2, "headroom": 1000,
+                                                     "samples": {"slice": 20, "e2e": 20}}
+    legacy = ledger(sampled(), limit=100).reserve(key(), run_plan())
+    assert sum(j.reserved_minutes for j in legacy.plan.jobs) == 2 * 35 + 20   # ceiling mode unchanged
+
+
+def test_burst_beyond_cap_minus_headroom_goes_local():
+    """Negative: a burst of concurrent attempts never holds more than limit - M in estimates; the
+    job that would cross it is refused to the pool with the budget reason."""
+    api = sampled()
+    held, local = 0, []
+    for run in range(1, 5):
+        got = est_ledger(api, limit=1100).reserve(key(run), run_plan())
+        held += sum(j.reserved_minutes for j in got.plan.jobs)
+        local += [j for j in got.plan.jobs if j.labels == POOL]
+    assert held <= 100 and held == Ledger._consumed(api.state, "2026-09-23")
+    assert local and all(j.reason == "budget-overrides-cloud-only" and j.reserved_minutes == 0 for j in local)
+    # No headroom at all left once the day's folded spend reaches limit - M.
+    api.state["daily_totals"]["2026-09-23"] = 1100 - 1000
+    api.state["attempts"].clear()
+    assert all(j.labels == POOL for j in est_ledger(api, limit=1100).reserve(key(9), run_plan()).plan.jobs)
+
+
+def test_invalid_headroom_admits_no_cloud():
+    for bad in (-1, "1000", 1.5, True):
+        got = est_ledger(sampled(), limit=6000, headroom=bad).reserve(key(), run_plan())
+        assert all(j.labels == POOL for j in got.plan.jobs), bad
+
+
+def test_reconcile_charges_billed_above_estimate_and_records_samples():
+    """Reconcile keeps charging ceil(billed): above E is charged in full (up to the ceiling), below E
+    refunds; every measured job becomes a sample for the next estimate."""
+    api = sampled()
+    est_ledger(api, limit=1100).reserve(key(), run_plan())
+    jobs = [_hosted(n, 12 if n == "slice 1/8" else 50 if n == "slice 2/8" else 5) for n in NAMES]
+    rr = est_ledger(api, limit=1100).reconcile(key(), evidence(jobs=jobs))
+    # slice1 12 (+4), slice2 capped at 35 (+27), six slices 5 (-3 each), e2e 5 (+3): net +16 charged.
+    assert rr == ReleaseResult(-16)
+    assert api.state["daily_totals"] == {"2026-09-23": 66 + 16}
+    assert api.state["billed_samples"]["slice"][-8:] == [12, 35, 5, 5, 5, 5, 5, 5]
+    assert api.state["billed_samples"]["e2e"][-1] == 5
+    assert est_ledger(api, limit=1100).reconcile(key(), evidence(jobs=jobs)) == ReleaseResult(0)
+
+
+def test_billed_samples_are_bounded():
+    api = sampled(n=200)
+    for run in range(1, 4):
+        est_ledger(api, limit=6000).reserve(key(run), run_plan())
+        est_ledger(api, limit=6000).reconcile(key(run), evidence(run=run, jobs=[_hosted(n, 6) for n in NAMES]))
+    assert len(api.state["billed_samples"]["slice"]) == 200 and api.state["billed_samples"]["slice"][-1] == 6
+
+
+def test_unmeasured_executed_job_at_estimate_charges_ceiling():
+    api = sampled()
+    est_ledger(api, limit=1100).reserve(key(), Plan([JobPlacement("slice 1/8", ["ubuntu-latest"], "cloud-overflow", 35)],
+                                                   [], {"mode": "cloud-only"}))
+    job = {"name": "slice 1/8", "status": "completed", "labels": ["ubuntu-latest"], "runner_name": "GitHub Actions 7"}
+    assert est_ledger(api, limit=1100).reconcile(key(), evidence(jobs=[job])) == ReleaseResult(8 - 35)
+    assert api.state["daily_totals"] == {"2026-09-23": 35}
+
+
+@pytest.mark.parametrize("estimate", [False, True])
+def test_runnerless_cancelled_job_releases_reservation(estimate):
+    """Ride-along (spec 5.3a): cancelled before any runner (runner_name empty, steps=[]) never ran."""
+    api = sampled()
+    make = (lambda: est_ledger(api, limit=1100)) if estimate else (lambda: ledger(api, limit=35))
+    make().reserve(key(), proposed("a"))
+    held = api.state["attempts"]["123:1:1"]["jobs"][0]["reserved_minutes"]
+    job = {"name": "a", "status": "completed", "conclusion": "cancelled", "labels": ["ubuntu-latest"],
+           "runner_name": "", "steps": [], "started_at": "2026-09-23T10:00:00Z", "completed_at": "2026-09-23T10:00:01Z"}
+    assert make().reconcile(key(), evidence(jobs=[job])) == ReleaseResult(held)
+    assert api.state["daily_totals"] == {"2026-09-23": 0}
+
+
+@pytest.mark.parametrize("name,change", [
+    ("has-steps", {"steps": [{"name": "Set up job"}]}),
+    ("had-runner", {"runner_name": "GitHub Actions 7"}),
+    ("steps-unknown", {"steps": None}),
+    ("not-cancelled", {"conclusion": "failure"}),
+])
+def test_cancelled_job_with_execution_evidence_is_not_released(name, change):
+    api = Contents()
+    ledger(api, limit=35).reserve(key(), proposed("a"))
+    job = dict({"name": "a", "status": "completed", "conclusion": "cancelled", "labels": ["ubuntu-latest"],
+                "runner_name": "", "steps": []}, **change)
+    assert ledger(api, limit=35).reconcile(key(), evidence(jobs=[job])).released_minutes <= 0, name
+    assert api.state["daily_totals"] == {"2026-09-23": 35}, name

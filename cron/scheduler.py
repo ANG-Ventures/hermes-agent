@@ -5040,6 +5040,12 @@ def _run_job_script(
         # profile (t_7fee0f83). Any agent a script launches re-advertises itself.
         for _agent_marker in ("AI_AGENT", "HERMES_AGENT"):
             env.pop(_agent_marker, None)
+        # Same reason for the gateway's agent.process_env_files overlay (the gh
+        # lane PATH shim + git credential helper, t_45c11886): a script child
+        # keeps the env it had before this gateway sourced those files.
+        from hermes_cli.process_env_files import strip_overlay
+
+        strip_overlay(env)
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).

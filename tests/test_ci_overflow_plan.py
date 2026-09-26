@@ -268,7 +268,6 @@ def test_sampler_snapshot_older_than_60s_is_unknown():
 
 @pytest.mark.parametrize("name,kwargs,reason", [
     ("unknown-overflow", {"status": "unknown"}, "local-queue"),
-    ("unknown-cloud-only", {"status": "unknown", "mode": "cloud-only"}, "local-queue"),
     ("invalid-k-overflow", {"k": None}, "invalid-k"),
     ("self-only", {"mode": "self-only"}, "local-queue"),
     ("self-only-invalid-k", {"mode": "self-only", "k": None}, "invalid-k"),
@@ -277,6 +276,17 @@ def test_queued_local_reason_names_the_cause(name, kwargs, reason):
     """When cloud is off, every job queues on the pool with the diagnostic reason, never local-idle/budget-queue."""
     p = decide(idle=4, **kwargs)
     assert [(j.reason, j.labels, j.reserved_minutes) for j in p.jobs] == [(reason, POOL, 0)] * 4, name
+
+
+def test_cloud_only_ignores_unknown_pool_telemetry():
+    """cloud-only never uses the pool, so an unknown snapshot still places every job on cloud (budget-gated)
+    and still raises the telemetry incident; overflow with unknown telemetry keeps queueing locally."""
+    p = decide(idle=4, status="unknown", mode="cloud-only")
+    assert [(j.reason, j.labels == POOL) for j in p.jobs] == [("cloud-overflow", False)] * 4
+    assert "telemetry-unavailable" in p.incidents
+    broke = decide(idle=4, status="unknown", mode="cloud-only", allowance=0)
+    assert all((j.reason, j.labels) == ("budget-overrides-cloud-only", POOL) for j in broke.jobs)
+    assert all(j.reason == "local-queue" for j in decide(idle=4, status="unknown").jobs)
 
 
 def test_e2e_leads_when_no_core_slice():

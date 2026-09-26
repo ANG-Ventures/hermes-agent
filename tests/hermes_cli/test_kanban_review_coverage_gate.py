@@ -57,6 +57,7 @@ def coverage(lenses=None, **overrides):
         'lenses': lenses or all_done(),
         'findings': 1, 'items': ['Missing behavior assertion at handler:42'],
         'review_minutes': 12, 'battery': 'seeded', 'batch_id': 'batch-123',
+        'head_sha': '0123456789abcdef0123456789abcdef01234567',
     }
     payload.update(overrides)
     return 'review_coverage: ' + json.dumps(payload)

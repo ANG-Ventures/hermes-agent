@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
-from hermes_cli.config import load_env
+from hermes_cli.config import dotenv_revoked, load_env
 from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
     fingerprint_secret_value,
@@ -3159,7 +3159,11 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         _env_file = load_env()
 
         def _env_val(key: str) -> str:
-            return (_env_file.get(key) or _get_secret(key, "") or "").strip()
+            raw = (_env_file.get(key) or "").strip()
+            if raw:
+                return raw
+            fallback = (_get_secret(key, "") or "").strip()
+            return "" if dotenv_revoked(key, fallback) else fallback
 
         anthropic_api_key = _env_val("ANTHROPIC_API_KEY")
         anthropic_oauth_env = (
@@ -3520,7 +3524,14 @@ def get_env_prefer_dotenv(key: str) -> str:
     # .env-takes-precedence behaviour is preserved unchanged.
     if raw.startswith("op://") and scoped_value:
         return scoped_value
-    return raw or scoped_value
+    if raw:
+        return raw
+    # Line removed or blanked: a value that came from this .env is revoked,
+    # not resurrected from the copy its load left in the environment/scope
+    # (t_8dccb8ef). Shell/external-source values still fall through.
+    if scoped_value and dotenv_revoked(key, scoped_value):
+        return ""
+    return scoped_value
 
 
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
