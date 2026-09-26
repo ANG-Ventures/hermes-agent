@@ -56,6 +56,13 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # POSIX-sh files sourced ONCE at agent-process start (gateway, kanban
+        # worker, CLI); their exports land in the process env, so every child
+        # it spawns (in-process gh/git, workers, execute_code) inherits them.
+        # terminal.shell_init_files only reaches terminal shells. Fleet use:
+        # ["~/.hermes/fleet/gh-lane-env.sh"] puts process-spawned gh on the
+        # profile's GitHub lane. Fail-open; [] = off.
+        "process_env_files": [],
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

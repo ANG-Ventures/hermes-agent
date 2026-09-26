@@ -15,6 +15,7 @@
 //
 // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
 // `--concurrency N` sets the limit. `--list` prints the units and exits.
+// `--skip <pkg>::<script>` leaves one unit out (repeatable).
 
 import { execFileSync, spawn } from 'node:child_process'
 import { availableParallelism } from 'node:os'
@@ -76,7 +77,20 @@ function runUnit(unit) {
 
 async function main() {
   const argv = process.argv.slice(2)
-  const units = discoverUnits()
+  let units = discoverUnits()
+
+  // `--skip <pkg>::<script>` (repeatable) drops a unit that another CI job
+  // runs instead (js-tests.yml shards apps/desktop check:test:ui). A skip
+  // that matches nothing is an error: after a rename the suite would
+  // otherwise run in neither job and everything would still report green.
+  const skips = argv.flatMap((a, i) => (a === '--skip' ? [argv[i + 1]] : []))
+  for (const skip of skips) {
+    if (!units.some((u) => `${u.pkg}::${u.script}` === skip)) {
+      console.error(`::error::--skip ${skip} matches no workspace check unit — refusing to guess.`)
+      process.exit(1)
+    }
+  }
+  units = units.filter((u) => !skips.includes(`${u.pkg}::${u.script}`))
 
   if (units.length === 0) {
     console.error(

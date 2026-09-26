@@ -104,7 +104,10 @@ def plan(slices_with_weights, e2e, snapshot: Snapshot, policy: Policy, allowance
         incidents.append("pool-offline")
     available = max(0, snapshot.idle - snapshot.queued_matching_jobs)
     local_count = min(len(jobs), available, k) if k is not None and mode == "overflow" and snapshot.status == "ok" and snapshot.online else 0
-    cloud_allowed = mode != "self-only" and k is not None and snapshot.status == "ok"
+    # cloud-only never places on the pool, so pool telemetry cannot change its decision: an unknown
+    # snapshot must not demote a cloud-only attempt to the local queue (t_e52aa3ee: 25/48 admissions
+    # in one hour were unknown, parking whole merge groups on the 4-slot pool). The budget still gates.
+    cloud_allowed = mode != "self-only" and k is not None and (snapshot.status == "ok" or mode == "cloud-only")
     if mode == "self-only" or not cloud_allowed:
         local_count = len(jobs)  # queue rather than assume an idle slot
     placements = []

@@ -13,11 +13,11 @@ def sh(c, cwd=R):
 
 
 def census():
-    return json.load(open(D + 'census/census_v2.json'))['rows']
+    return json.load(open(D + 'census/census_v2.json', encoding='utf-8'))['rows']
 
 
 def load_merged():
-    return json.load(open(L + 'merged.json'))
+    return json.load(open(L + 'merged.json', encoding='utf-8'))
 
 
 def advres(x):
