@@ -1699,6 +1699,33 @@ def _worker_log_run_segment(
         return None
 
 
+# A worker that dies on a provider wall BEFORE the model loop can exit 1 with
+# the cause only in its log ("Codex credential is in cooldown." — raised at
+# credential resolve, where the EX_TEMPFAIL sentinel is never reached). Only the
+# run's final lines count, so a stray mention earlier in a real crash does not.
+_STDERR_COOLDOWN_CLASSES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("credential_cooldown", re.compile(r"\bcredentials? (?:is|are) in cooldown\b", re.IGNORECASE)),
+    ("quota", re.compile(
+        r"\b(?:rate[\s_-]?limit(?:ed)?|too many requests|quota (?:exceeded|exhausted)|"
+        r"usage limit (?:reached|exceeded)|(?:HTTP|status|error)[\s:]*429)\b",
+        re.IGNORECASE,
+    )),
+)
+_STDERR_COOLDOWN_TAIL_LINES = 3
+
+
+def _stderr_cooldown_class(segment: Optional[str]) -> Optional[str]:
+    """Name the provider-wall class this run's last log lines show, or None."""
+    if not segment:
+        return None
+    lines = [ln.strip() for ln in segment.splitlines() if ln.strip()]
+    tail = "\n".join(lines[-_STDERR_COOLDOWN_TAIL_LINES:])
+    for name, pattern in _STDERR_COOLDOWN_CLASSES:
+        if pattern.search(tail):
+            return name
+    return None
+
+
 def _run_output_fingerprint(segment: Optional[str]) -> str:
     """Fingerprint ONE run's output; "" when there is nothing comparable.
 
@@ -16840,6 +16867,13 @@ def detect_crashed_workers(
         for row, pid, kind, code in dead:
             rate_limited_exit = False
             cohort_death = row["id"] in cohort_ids
+            stderr_exit_class = None
+            if kind == "nonzero_exit" and not cohort_death:
+                stderr_exit_class = _stderr_cooldown_class(
+                    _worker_log_run_segment(row["id"], board=board)
+                )
+                if stderr_exit_class is not None:
+                    kind = "rate_limited"
             if cohort_death:
                 protocol_violation = False
                 error_text = (
@@ -16921,8 +16955,12 @@ def detect_crashed_workers(
                 # trip the circuit breaker and permanently block the card.
                 protocol_violation = False
                 rate_limited_exit = True
-                exit_class = _run_exit_class(conn, row["id"], row["current_run_id"])
+                exit_class = (
+                    _run_exit_class(conn, row["id"], row["current_run_id"])
+                    or stderr_exit_class
+                )
                 _wall = {
+                    "credential_cooldown": "credential cooldown",
                     "upstream_capacity": "provider capacity overload",
                     "pool_exhausted": "sub pool capped",
                     "pinned_provider_unavailable": "pinned provider unavailable",
@@ -16946,6 +16984,10 @@ def detect_crashed_workers(
                 }
                 if exit_class:
                     event_payload["exit_class"] = exit_class
+                if stderr_exit_class is not None:
+                    stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
+                    if stderr_tail:
+                        event_payload["stderr_tail"] = stderr_tail
             elif kind == "infra_unavailable":
                 # The worker HARNESS could not be executed (126/127) — the CLI
                 # path was missing or unrunnable, so no worker code ran and the
