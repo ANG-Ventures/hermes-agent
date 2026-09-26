@@ -6682,9 +6682,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "   To avoid this delay, set display.streaming: false "
                                 "in config.yaml\n"
                             )
-                        logger.exception(
+                        # WARNING, not ERROR: the error propagates to the
+                        # main retry loop, which may retry/fail over and
+                        # succeed, and which logs the final-failure ERROR
+                        # itself ("API call failed after N retries").
+                        logger.warning(
                             "Streaming failed before delivery: %s",
                             e,
+                            exc_info=True,
                         )
 
                     # Propagate the error to the main retry loop instead of
