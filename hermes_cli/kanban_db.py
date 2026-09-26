@@ -9371,10 +9371,20 @@ def complete_task(
                 f"{r.repo}#{r.number}" for r in still_open
             ])
             routed_summary = "\n".join(filter(None, [note, summary or result]))
-            ok = request_review(
+            ok, route_reason = request_review(
                 conn, task_id, summary=routed_summary, metadata=routed_meta,
-                expected_run_id=expected_run_id, force=True,
+                expected_run_id=expected_run_id, force=True, with_reason=True,
             )
+            if not ok:
+                # complete_task returns a bare bool, so callers can only say
+                # "unknown id or already terminal". Leave the real refusal on
+                # the card where an operator can read it (t_503df7c5).
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_route_refused",
+                        {"open_prs": routed_meta["auto_routed_open_prs"],
+                         "reason": route_reason},
+                    )
             if ok:
                 with write_txn(conn):
                     _append_event(
@@ -12012,6 +12022,7 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        reviewer_from_provenance = False
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -12050,12 +12061,22 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
+                reviewer_from_provenance = True
         # Validate/resolve at the gate: a review assignee must be spawnable
         # (a real profile) or the explicit `human` sentinel. A placeholder
         # string used to be accepted here and parked the card forever.
         reviewer, reviewer_error = resolve_reviewer(
             reviewer, implementer, allow_same_actor=allow_same_actor
         )
+        if reviewer_error is not None and reviewer_from_provenance:
+            # Inherited provenance the gate now refuses (e.g. a same-actor
+            # review drain recorded reviewer == implementer, t_503df7c5):
+            # the worker never chose it, so refusing strands a finished card
+            # behind a generic "unknown id or already terminal". Fall back to
+            # the configured default reviewer instead.
+            reviewer, reviewer_error = resolve_reviewer(
+                None, implementer, allow_same_actor=allow_same_actor
+            )
         if reviewer_error is not None:
             return _ret(False, reviewer_error)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
