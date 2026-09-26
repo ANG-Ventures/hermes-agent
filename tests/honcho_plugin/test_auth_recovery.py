@@ -140,6 +140,27 @@ class TestExchangeRetry:
         token, _ = oauth.ensure_fresh_token(path, "hermes", now=2000)
         assert token == "hch-at-fresh"
 
+    def test_external_relogin_in_same_mtime_tick_clears_verdict(self, tmp_path, monkeypatch):
+        """A re-login written by another process inside the same mtime tick
+        (coarse-mtime filesystems) must still clear the memoized verdict: the
+        memo keys on file content, not mtime."""
+        import os
+
+        path = tmp_path / "honcho.json"
+        _write(path, {"hosts": {"hermes": _host_block()}})
+        monkeypatch.setattr(oauth, "_REFRESH_RETRY_DELAY_SECONDS", 0)
+        monkeypatch.setattr(
+            oauth, "_http_post_form_status",
+            lambda *a, **k: (400, {"error": "invalid_grant"}),
+        )
+        oauth.ensure_fresh_token(path, "hermes", now=1000)
+        st = os.stat(path)
+        assert oauth.reauth_required(path, "hermes") is True
+
+        _write(path, {"hosts": {"hermes": _host_block(refresh="hch-rt-fresh")}})
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))  # same tick
+        assert oauth.reauth_required(path, "hermes") is False
+
     def test_error_body_is_logged(self, tmp_path, monkeypatch, caplog):
         path = tmp_path / "honcho.json"
         _write(path, {"hosts": {"hermes": _host_block()}})
