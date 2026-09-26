@@ -577,3 +577,111 @@ def test_drain_non_correction_keeps_normal_salience_path(tmp_path):
     assert store.rows == []                 # gate dropped the below-threshold turn
     assert store.kwargs_seen[0]["prompt"] == "GATE_V3"
     assert "capture_correction" not in store.kwargs_seen[0]["metadata"]
+
+
+# ---------------------------------------------------------------------------
+# Primary cooldown gate (t_4971fd06): a 429 from codex-bridge opens a gate that skips the primary
+# until the bridge's own reset window lifts, so captures stop burning a wasted call per pass.
+# ---------------------------------------------------------------------------
+
+import io as _io
+import urllib.error as _uerr
+
+
+def _cooldown_429(url, reset_seconds=38270, code="model_cooldown", headers=None):
+    body = json.dumps({"error": {"code": code, "message": "All credentials for model gpt-6-astra are "
+                       "cooling down via provider codex", "reset_seconds": reset_seconds}}).encode()
+    return _uerr.HTTPError(url, 429, "Too Many Requests", headers or {}, _io.BytesIO(body))
+
+
+class _Cooldown429HTTP(FakeHTTP):
+    """Primary answers 429 (CLIProxyAPI model_cooldown body) until `primary_ok` is flipped on."""
+    def __init__(self, *, body_reset=38270, headers=None, raw_body=None, **kw):
+        super().__init__(**kw)
+        self.primary_ok = False
+        self.body_reset = body_reset
+        self.headers = headers
+        self.raw_body = raw_body
+
+    def __call__(self, url, body, headers, timeout):
+        if "18812" in url and not self.primary_ok:
+            self.calls.append(url)
+            if self.raw_body is not None:
+                raise _uerr.HTTPError(url, 429, "Too Many Requests", self.headers or {},
+                                      _io.BytesIO(self.raw_body))
+            raise _cooldown_429(url, self.body_reset, headers=self.headers)
+        return super().__call__(url, body, headers, timeout)
+
+
+@pytest.fixture
+def _fresh_cooldowns():
+    cr.reset_primary_cooldowns()
+    yield
+    cr.reset_primary_cooldowns()
+
+
+def _primary_calls(http):
+    return sum(1 for u in http.calls if "18812" in u)
+
+
+def test_primary_429_opens_gate_and_later_passes_skip_primary(_fresh_cooldowns, caplog):
+    http = _Cooldown429HTTP(prefs_cands=[{"content": "x", "class": "preference", "confidence": 0.9}])
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    caplog.set_level("DEBUG", logger=cr.logger.name)
+    r1 = ext.extract("preference|ops_state p", "u", "a")
+    assert r1["provider"] == "gemini-bridge" and _primary_calls(http) == 1
+    for _ in range(5):
+        r = ext.extract("preference|ops_state p", "u", "a")
+        assert r["provider"] == "gemini-bridge"
+        assert r["candidates"] and "cooldown" in r["primary_error"]
+    assert _primary_calls(http) == 1, "primary must not be called while its cooldown gate is open"
+    # the bridge's reset_seconds (38270) is honored, capped so an early recovery is re-probed
+    assert 0 < cr.primary_cooldown_remaining(ext._primary_url) <= cr._COOLDOWN_MAX_S
+    # no WARNING-level 'pass failed' line for a known cooldown (errors.log is WARNING+)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_gate_is_shared_across_extractor_instances(_fresh_cooldowns):
+    http = _Cooldown429HTTP()
+    BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s").extract("p", "u", "a")
+    BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s").extract("p", "u", "a")
+    assert _primary_calls(http) == 1
+
+
+def test_primary_is_retried_after_cooldown_lifts(_fresh_cooldowns, monkeypatch):
+    http = _Cooldown429HTTP(body_reset=30)
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    t = [1_000_000.0]
+    monkeypatch.setattr(cr.time, "time", lambda: t[0])
+    assert ext.extract("p", "u", "a")["provider"] == "gemini-bridge"
+    assert cr.primary_cooldown_remaining(ext._primary_url) == pytest.approx(30.0)
+    t[0] += 29
+    assert ext.extract("p", "u", "a")["provider"] == "gemini-bridge"
+    assert _primary_calls(http) == 1
+    t[0] += 2  # window lifted and codex is back
+    http.primary_ok = True
+    assert ext.extract("p", "u", "a")["provider"] == "codex-bridge"
+    assert _primary_calls(http) == 2
+    assert cr.primary_cooldown_remaining(ext._primary_url) == 0.0
+
+
+def test_non_429_primary_errors_do_not_open_the_gate(_fresh_cooldowns):
+    http = FakeHTTP(fail_primary=True)
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    ext.extract("p", "u", "a")
+    ext.extract("p", "u", "a")
+    assert _primary_calls(http) == 2
+    assert cr.primary_cooldown_remaining(ext._primary_url) == 0.0
+
+
+@pytest.mark.parametrize("headers,raw_body,expected", [
+    ({"Retry-After": "120"}, b"", 120.0),            # no body -> Retry-After
+    ({}, b"not json", cr._COOLDOWN_DEFAULT_S),        # nothing usable -> short default
+])
+def test_429_without_reset_seconds_uses_retry_after_then_default(_fresh_cooldowns, monkeypatch,
+                                                                 headers, raw_body, expected):
+    monkeypatch.setattr(cr.time, "time", lambda: 5_000.0)
+    http = _Cooldown429HTTP(headers=headers, raw_body=raw_body)
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    ext.extract("p", "u", "a")
+    assert cr.primary_cooldown_remaining(ext._primary_url) == pytest.approx(expected)
