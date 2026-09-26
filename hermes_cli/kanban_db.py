@@ -1699,6 +1699,33 @@ def _worker_log_run_segment(
         return None
 
 
+# A worker that dies on a provider wall BEFORE the model loop can exit 1 with
+# the cause only in its log ("Codex credential is in cooldown." — raised at
+# credential resolve, where the EX_TEMPFAIL sentinel is never reached). Only the
+# run's final lines count, so a stray mention earlier in a real crash does not.
+_STDERR_COOLDOWN_CLASSES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("credential_cooldown", re.compile(r"\bcredentials? (?:is|are) in cooldown\b", re.IGNORECASE)),
+    ("quota", re.compile(
+        r"\b(?:rate[\s_-]?limit(?:ed)?|too many requests|quota (?:exceeded|exhausted)|"
+        r"usage limit (?:reached|exceeded)|(?:HTTP|status|error)[\s:]*429)\b",
+        re.IGNORECASE,
+    )),
+)
+_STDERR_COOLDOWN_TAIL_LINES = 3
+
+
+def _stderr_cooldown_class(segment: Optional[str]) -> Optional[str]:
+    """Name the provider-wall class this run's last log lines show, or None."""
+    if not segment:
+        return None
+    lines = [ln.strip() for ln in segment.splitlines() if ln.strip()]
+    tail = "\n".join(lines[-_STDERR_COOLDOWN_TAIL_LINES:])
+    for name, pattern in _STDERR_COOLDOWN_CLASSES:
+        if pattern.search(tail):
+            return name
+    return None
+
+
 def _run_output_fingerprint(segment: Optional[str]) -> str:
     """Fingerprint ONE run's output; "" when there is nothing comparable.
 
@@ -9356,20 +9383,57 @@ def complete_task(
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
+    # A reviewer approval (the active run was claimed from ``review``) that
+    # names the reviewed PR head writes the APPROVE review_coverage record
+    # card-sourced land requests read as the review of record (t_7fee0f83).
+    # Validated here, before any mutation; an implementer run never writes one.
+    approve_head_sha: Optional[str] = None
+    if (
+        isinstance(metadata, dict)
+        and metadata.get("head_sha") is not None
+        and candidate.status == "running"
+        and candidate.current_run_id is not None
+        and _retry_status_for_run(conn, task_id, candidate.current_run_id) == "review"
+    ):
+        approve_head_sha = str(metadata["head_sha"]).strip()
+        if not _REVIEW_HEAD_SHA_RE.fullmatch(approve_head_sha):
+            raise ValueError(
+                "head_sha must be the reviewed PR head (7-40 hex characters)"
+            )
     # A completion whose evidence names a still-OPEN PR is a review handoff,
     # not ``done``: done releases dependants, and an unmerged PR has no owner
     # once the card is terminal (t_1bd02e0b, 2026-09-25). A card already in
-    # ``review`` is a reviewer/human approval and is left alone.
-    if candidate.status != 'review':
+    # ``review`` is a reviewer/human approval and is left alone; so is a
+    # claimed reviewer run approving with ``head_sha`` -- the PR it approved
+    # is OPEN by definition and the land queue merges it from that record.
+    if candidate.status != 'review' and not approve_head_sha:
         from hermes_cli import kanban_open_pr as _open_pr
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
         )
         if still_open:
+            # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
+            # DraftPrError, nothing mutated), update a stale head, arm a green
+            # non-milestone PR through fleet-merge.sh.
+            from hermes_cli import kanban_pr_freshness as _fresh
+            try:
+                freshness = _fresh.check(
+                    still_open, task_id=task_id,
+                    allow_arm=not is_milestone_card(conn, task_id),
+                )
+            except _fresh.DraftPrError as draft_err:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_draft_pr",
+                        {"prs": draft_err.prs},
+                    )
+                raise
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])
+            if freshness.get("prs"):
+                routed_meta["handoff_freshness"] = freshness
             routed_summary = "\n".join(filter(None, [note, summary or result]))
             ok, route_reason = request_review(
                 conn, task_id, summary=routed_summary, metadata=routed_meta,
@@ -9483,6 +9547,14 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if approve_head_sha:
+            add_comment(
+                conn, task_id, candidate.assignee or "reviewer",
+                "review_coverage: " + json.dumps(
+                    {"verdict": "approve", "head_sha": approve_head_sha}
+                ),
+                run_id=int(candidate.current_run_id),
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -12153,6 +12225,9 @@ def request_review(
 import unicodedata  # noqa: E402
 
 from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LENSES  # noqa: E402
+from hermes_cli.kanban_review_schema import HEAD_SHA_PATTERN as _HEAD_SHA_PATTERN  # noqa: E402
+
+_REVIEW_HEAD_SHA_RE = re.compile(_HEAD_SHA_PATTERN)
 # An ``n/a: <reason>`` lens value certifies the lens does not APPLY to the
 # deliverable. A reason that reports an INABILITY anywhere in it ("skipped",
 # "the reviewer could not run it", "mutmut missing on host", "budget
@@ -12307,6 +12382,10 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     batch = coverage.get("batch_id")
     if not isinstance(batch, str) or not batch.strip():
         return "batch_id must identify the single delegate_task batch in this comment"
+    head = coverage.get("head_sha")
+    if not (isinstance(head, str) and (_REVIEW_HEAD_SHA_RE.fullmatch(head.strip())
+                                        or _review_na_reason_ok(head))):
+        return "head_sha must be the reviewed PR head (7-40 hex) or 'n/a: <reason>' for a card with no PR"
     return None
 
 
@@ -16822,6 +16901,13 @@ def detect_crashed_workers(
         for row, pid, kind, code in dead:
             rate_limited_exit = False
             cohort_death = row["id"] in cohort_ids
+            stderr_exit_class = None
+            if kind == "nonzero_exit" and not cohort_death:
+                stderr_exit_class = _stderr_cooldown_class(
+                    _worker_log_run_segment(row["id"], board=board)
+                )
+                if stderr_exit_class is not None:
+                    kind = "rate_limited"
             if cohort_death:
                 protocol_violation = False
                 error_text = (
@@ -16903,8 +16989,12 @@ def detect_crashed_workers(
                 # trip the circuit breaker and permanently block the card.
                 protocol_violation = False
                 rate_limited_exit = True
-                exit_class = _run_exit_class(conn, row["id"], row["current_run_id"])
+                exit_class = (
+                    _run_exit_class(conn, row["id"], row["current_run_id"])
+                    or stderr_exit_class
+                )
                 _wall = {
+                    "credential_cooldown": "credential cooldown",
                     "upstream_capacity": "provider capacity overload",
                     "pool_exhausted": "sub pool capped",
                     "pinned_provider_unavailable": "pinned provider unavailable",
@@ -16928,6 +17018,10 @@ def detect_crashed_workers(
                 }
                 if exit_class:
                     event_payload["exit_class"] = exit_class
+                if stderr_exit_class is not None:
+                    stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
+                    if stderr_tail:
+                        event_payload["stderr_tail"] = stderr_tail
             elif kind == "infra_unavailable":
                 # The worker HARNESS could not be executed (126/127) — the CLI
                 # path was missing or unrunnable, so no worker code ran and the
