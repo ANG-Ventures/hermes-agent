@@ -420,6 +420,74 @@ def assess_interrupted_turn(
     return InterruptedTurnAssessment(turn_rowid=turn_rowid, auto_eligible=True)
 
 
+_INFLIGHT_ARGS_PREVIEW_CHARS = 300
+_INFLIGHT_MAX_CALLS = 5
+
+
+def describe_inflight_tool_calls(messages: Iterable[dict[str, Any]]) -> str | None:
+    """Name the tool calls in the interrupted turn that have no real result.
+
+    A restart that lands mid-tool-call leaves an assistant ``tool_calls`` row
+    with no result, or with the synthetic interrupted result. The resume note
+    used to tell the model to skip those, which is how a PR create, a merge
+    and a chain launch were dropped on 2026-09-25. This returns one line the
+    resumed turn can act on: read-only calls are safe to re-issue, and for
+    any other call the model has to check whether it took effect before
+    running it again. Returns None when nothing was cut mid-call.
+    """
+    rows = _turn_segment(messages)
+    answered: set[str] = set()
+    for row in rows:
+        if row.get("role") != "tool":
+            continue
+        call_id = row.get("tool_call_id")
+        if isinstance(call_id, str) and call_id and not is_interrupted_tool_result(
+            row.get("content")
+        ):
+            answered.add(call_id)
+
+    pending: list[str] = []
+    for row in rows:
+        calls = row.get("tool_calls")
+        if isinstance(calls, str):
+            # Raw state.db rows carry tool_calls as JSON text.
+            try:
+                calls = json.loads(calls)
+            except ValueError:
+                continue
+        if row.get("role") != "assistant" or not isinstance(calls, list):
+            continue
+        for call in calls:
+            name, call_id = _tool_name(call)
+            if name is None or call_id in answered:
+                continue
+            args = (call.get("function") or {}).get("arguments", "")
+            if not isinstance(args, str):
+                try:
+                    args = json.dumps(args, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    args = str(args)
+            args = " ".join(args.split())
+            if len(args) > _INFLIGHT_ARGS_PREVIEW_CHARS:
+                args = args[:_INFLIGHT_ARGS_PREVIEW_CHARS] + "…"
+            kind = (
+                "read-only: re-issue it"
+                if name in _READ_ONLY_TOOLS
+                else "may have taken effect: check its effect before re-running it"
+            )
+            pending.append(f"{name}({args}) [{kind}]")
+    if not pending:
+        return None
+    extra = len(pending) - _INFLIGHT_MAX_CALLS
+    shown = "; ".join(pending[:_INFLIGHT_MAX_CALLS])
+    if extra > 0:
+        shown += f"; …and {extra} more"
+    return (
+        "Tool calls in flight when the gateway stopped (no result recorded): "
+        f"{shown}."
+    )
+
+
 def _serialized_store_call(method):
     """Serialize read/modify/write across dispatch workers sharing one store."""
     @wraps(method)
