@@ -503,6 +503,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
                                "the dispatcher SIGTERMs (then SIGKILLs) the worker "
                                "and re-queues the task.")
+    p_create.add_argument("--force", default=None, dest="force_reason",
+                          metavar="REASON",
+                          help="File the card even though a non-archived card "
+                               "with the same title was created in the last 24h "
+                               "(near-duplicate guard). The reason is recorded "
+                               "as a near_duplicate_forced event.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
@@ -2405,8 +2411,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     triage=bool(getattr(args, "triage", False)),
                 ),
                 session_id=_resolve_session_flag(getattr(args, "session", None)),
+                duplicate_guard=True,
+                force_reason=getattr(args, "force_reason", None),
             )
             task = kb.get_task(conn, task_id)
+            dup_warning = kb.near_duplicate_warning(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -2420,6 +2429,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 "Subscribed the calling session for finish notifications "
                 "(kanban.cli_auto_subscribe)."
             )
+        if dup_warning:
+            similar = ", ".join(
+                f"{d['id']} ({d['score']:.2f})" for d in dup_warning.get("duplicates", [])
+            )
+            print(f"\n⚠  similar card(s) created in the last 24h: {similar}", file=sys.stderr)
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are

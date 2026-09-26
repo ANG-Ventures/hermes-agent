@@ -1620,6 +1620,9 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    force_reason = args.get("force_reason")
+    if force_reason is not None and not isinstance(force_reason, str):
+        return tool_error("force_reason must be a string")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     from hermes_cli import kanban_worker_policy as _worker_policy
@@ -1703,7 +1706,10 @@ def _handle_create(args: dict, **kw) -> str:
                 ),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                duplicate_guard=True,
+                force_reason=force_reason,
             )
+            dup_warning = kb.near_duplicate_warning(conn, new_tid)
             if assignee_remap is not None:
                 with kb.write_txn(conn):
                     kb._append_event(
@@ -1722,6 +1728,10 @@ def _handle_create(args: dict, **kw) -> str:
                 reasoning_effort=(new_task.reasoning_effort if new_task else None),
                 subscribed=subscribed,
                 **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
+                **(
+                    {"near_duplicates": dup_warning.get("duplicates", [])}
+                    if dup_warning else {}
+                ),
             )
         finally:
             conn.close()
@@ -2664,6 +2674,16 @@ KANBAN_CREATE_SCHEMA = {
                     "If a non-archived task with this key already "
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
+                ),
+            },
+            "force_reason": {
+                "type": "string",
+                "description": (
+                    "Near-duplicate override. Creation is refused when a "
+                    "non-archived card with the same title (and >=0.8 "
+                    "title+body similarity) was created in the last 24h; "
+                    "pass why this is not a duplicate to file anyway "
+                    "(recorded on the card)."
                 ),
             },
             "max_runtime_seconds": {
