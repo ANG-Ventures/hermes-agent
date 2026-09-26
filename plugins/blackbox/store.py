@@ -332,6 +332,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+    _fe_have = {row[1] for row in conn.execute("PRAGMA table_info(fallback_events)")}
+    for _col, _kind in _FALLBACK_EVENT_PHASE2_COLUMNS:
+        if _col not in _fe_have:
+            try:
+                conn.execute(f"ALTER TABLE fallback_events ADD COLUMN {_col} {_kind}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
     _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
     for col, kind in (("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
                       ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT")):
@@ -938,8 +946,19 @@ _FALLBACK_EVENT_COLUMNS = (
     "to_provider", "to_model", "kind", "reason", "trigger_class",
     "class_source", "http_status", "relay_synthetic", "route_id", "err_hash",
     "err_head", "cooldown_s", "sticky_until_epoch",
+    # Phase 2 (§4.7 / §4.8): policy + notice columns.
+    "hop", "seat", "attempts", "first_err_ts", "last_err_ts", "return_branch",
+    "expected_warm", "dwell_s", "dwell_turns", "notice_text",
+    "gate_bound_expires_in_s",
 )
-FALLBACK_EVENT_KINDS = ("failover", "recovery", "restore_refused")
+# Additive columns on fallback_events (Phase 2); migrated per column.
+_FALLBACK_EVENT_PHASE2_COLUMNS = (
+    ("hop", "TEXT"), ("seat", "TEXT"), ("attempts", "INT"), ("first_err_ts", "REAL"),
+    ("last_err_ts", "REAL"), ("return_branch", "TEXT"), ("expected_warm", "INT"),
+    ("dwell_s", "REAL"), ("dwell_turns", "INT"), ("notice_text", "TEXT"),
+    ("gate_bound_expires_in_s", "REAL"),
+)
+FALLBACK_EVENT_KINDS = ("failover", "recovery", "restore_refused", "sticky_resume")
 
 
 def insert_fallback_event(row: dict[str, Any]) -> None:
@@ -952,6 +971,8 @@ def insert_fallback_event(row: dict[str, Any]) -> None:
     if values.get("err_head"):
         values["err_head"] = scrub_and_truncate(values["err_head"], 160)
     values["relay_synthetic"] = _bool_int(values.get("relay_synthetic"))
+    if values.get("expected_warm") is not None:
+        values["expected_warm"] = _bool_int(values.get("expected_warm"))
     cols = ", ".join(_FALLBACK_EVENT_COLUMNS)
     marks = ", ".join("?" for _ in _FALLBACK_EVENT_COLUMNS)
     with _connect() as conn:

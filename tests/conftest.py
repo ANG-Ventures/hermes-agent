@@ -804,6 +804,24 @@ def _isolate_hermes_home(_hermetic_environment):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_fallback_sticky_store():
+    """Fresh process-global sticky store per test (fallback spec §4.2): its
+    in-memory map outlives the per-test HERMES_HOME sandbox otherwise."""
+    try:
+        from agent import fallback_sticky_store as _fss
+        from agent import fallback_wiring as _fw
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    _fss._DEFAULT = None
+    _fw._last_primary_note.clear()
+    _fw._purged = False
+    yield
+    _fss._DEFAULT = None
+    _fw._last_primary_note.clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_session_contextvars():
     """Reset every gateway session ContextVar to ``_UNSET`` around each test.
 
