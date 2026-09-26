@@ -4,6 +4,8 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+from hermes_cli.lazy_registry import LazyFilledDict
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -1924,15 +1926,6 @@ DEFAULT_CONFIG = {
         # falls through to request reconstruction rather than breaking
         # the login flow.
         "public_url": "",
-    # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
-    # Re-homed here from hermes_cli/config.py when upstream extracted
-    # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
-        "session_sync": {
-            "enabled": True,
-            "t_silence": 10.0,
-            "poll_interval": 2.5,
-            "refocus_debounce": 1.0,
-        },
     # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
     # Re-homed here from hermes_cli/config.py when upstream extracted
     # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
@@ -5561,3 +5554,9 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
 }
+
+
+
+# Provider/platform extensions are registered by the config module as fillers
+# that run on the first read (see lazy_registry for why).
+OPTIONAL_ENV_VARS = LazyFilledDict(OPTIONAL_ENV_VARS)

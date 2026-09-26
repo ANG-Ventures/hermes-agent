@@ -28,7 +28,7 @@ name: CI
 #   docker-lint.yml hadolint is a Docker container action; no socket on the pool
 #   js-tests.yml    mid-flight vitest death, not root-caused; see js-tests.yml
 #
-# ``installer-tests``, the ``tests-os`` matrix and ``ci-review-comment`` use a
+# ``installer-tests`` and the ``tests-os`` matrix use a
 # literal ``runs-on`` and are hosted by design. Further hosted pins are listed
 # below. Any PR touching ``.github/workflows/**`` also needs the ``ci-reviewed``
 # label or the Review label gate hard-blocks it.

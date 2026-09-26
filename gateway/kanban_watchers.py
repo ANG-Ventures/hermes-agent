@@ -866,11 +866,11 @@ class GatewayKanbanWatchersMixin:
         ``review_requested``, ``changes_requested``,
         ``block_loop_detected``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. The subscription is removed only when the
-        task is ``archived``. A ``done`` task can be reopened for review or
-        continuation, so its subscription and origin-session ownership must
-        survive completion. Cursor advancement prevents old events replaying
-        when that happens.
+        then advances the cursor. The subscription is removed after that
+        delivery once the task is ``done`` or ``archived``
+        (``kanban_db.NOTIFY_SUB_FINAL_STATUSES``): the terminal line arrives,
+        then the row is gone so it can never wake the origin session again.
+        A controller that reopens a ``done`` card re-subscribes explicitly.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -900,9 +900,8 @@ class GatewayKanbanWatchersMixin:
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "stalled", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
-        # Subscriptions are removed only when the task reaches the irreversible
-        # archived status. ``done`` is reversible in review/controller flows,
-        # so removing its subscription would silence a later reopen. We used
+        # Subscriptions are removed after delivery once the task is done or
+        # archived (kanban_db.NOTIFY_SUB_FINAL_STATUSES, t_6d6e9467). We used
         # to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
         # silently dropped the user out of the loop whenever the dispatcher
@@ -1518,7 +1517,9 @@ class GatewayKanbanWatchersMixin:
                         #   advances after it succeeds — a failure rewinds the
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
-                        task_terminal = task and task.status == "archived"
+                        # done/archived end subscription ownership once the
+                        # claimed events are delivered (t_6d6e9467).
+                        task_terminal = _kb.notify_sub_is_final(task)
                         # Kinds that hand a decision back to the origin, so the
                         # origin has to take a turn. ``review_requested`` (the
                         # implementation is done and waits for a reviewer),
@@ -1798,11 +1799,11 @@ class GatewayKanbanWatchersMixin:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
                             sub_fail_counts.pop(sub_key, None)
-                        # Unsubscribe only on archive. Completion (``done``)
-                        # remains reversible: controllers reopen completed
-                        # work for review corrections and continuation. The
-                        # retained cursor prevents replay while preserving the
-                        # original delivery and wake ownership for that cycle.
+                        # Unsubscribe once the task is done/archived, AFTER
+                        # delivery (every failure path above ``continue``s
+                        # before reaching here). A reopened ``done`` card is
+                        # re-subscribed explicitly by its controller; leaving
+                        # the row would keep waking the origin session.
                         if _is_push_adapter and send_passive and _wake_kinds:
                             # notify+wake: the text ping above was the
                             # delivery and the cursor has advanced; the wake
