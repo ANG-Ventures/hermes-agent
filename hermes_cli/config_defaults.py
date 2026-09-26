@@ -3073,6 +3073,11 @@ DEFAULT_CONFIG = {
         # 10 min hold that pool's spawns for 10 min (one #logs line per trip).
         # Non-pool providers never count. 0 disables.
         "rate_limit_trip": 5,
+        # After a worker refuses its route because the provider's credential is
+        # rate limited (worker_route_pin_refused rate_limited=true, e.g. "Codex
+        # credential is in cooldown"), treat that provider as capped for this
+        # many seconds: no spawn and no fallback rung onto it. 0 disables.
+        "credential_cooldown_seconds": 1800,
         # CPU scheduling priority for dispatcher-spawned worker gateways, and
         # therefore for everything they spawn (terminal-tool children inherit
         # niceness). "background" (default) runs each worker at nice 19 — and,
