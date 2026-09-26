@@ -20930,6 +20930,11 @@ def _default_spawn(
     # GitHub lane is decided by the worker's PROFILE in the gh shim (spec D3); an inherited lane
     # (e.g. a dispatcher launched from a laned script) must not ride into the worker.
     env.pop("HERMES_GH_LANE", None)
+    # The dispatcher's own agent.process_env_files overlay was resolved for ITS
+    # profile (e.g. no bot git identity); the worker re-sources the files for
+    # its own profile at startup, so hand it the pre-overlay env (t_45c11886).
+    from hermes_cli.process_env_files import strip_overlay
+    strip_overlay(env)
 
     # A dispatcher-spawned worker is its OWN single-session process, NOT the
     # gateway. The gateway sets _HERMES_GATEWAY=1 process-wide; copying it into
