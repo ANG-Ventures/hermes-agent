@@ -14186,6 +14186,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     old_effort=old_effort,
                     new_effort=new_effort,
                 )
+                from agent import fallback_events as _fbe
+
+                _fbe.record(
+                    agent, "recovery",
+                    from_provider=prev_route[0], from_model=prev_route[1],
+                    to_provider=applied_provider, to_model=applied_model,
+                    consume=False,
+                )
                 announce = False
                 try:
                     from hermes_cli.config import read_raw_config
