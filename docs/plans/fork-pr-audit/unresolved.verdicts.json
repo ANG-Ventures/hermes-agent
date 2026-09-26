@@ -1,0 +1,242 @@
+{
+ "#620": {
+  "verdict": "DROP",
+  "measure": "0/34,120 sessions across 12 profile state.db (2026-05-08..2026-09-26) have model LIKE 'name:%'; 0 config.yaml/cron jobs use a name:<sub>/<model> string; 0 'could not verify name:' lines in ~/.hermes/logs + profiles/*/logs",
+  "upstream": "RED by read: up validate_requested_model@hermes_cli/models_validate.py:780 has no name: strip (relocated from models.py)",
+  "why": "warning-text fix for a model-string form nobody uses; never fires",
+  "card": "t_111298c6",
+  "tranche": "hermes_cli",
+  "subject": "fix(models): strip relay routing prefix before model-listing lookup (#620)",
+  "loc": 58
+ },
+ "#326": {
+  "verdict": "UPSTREAM",
+  "measure": "live repro in temp HOME: seed auth.json xai-oauth.last_auth_error, call _save_xai_oauth_tokens(new tokens): upstream c15ebb1435 -> last_auth_error present=True (RED); fork 858ee59722 -> False. xai-oauth is live on root auth.json (last_refresh 2026-09-25T21:25Z), so the path runs in production",
+  "upstream": "RED (live): up _save_xai_oauth_tokens@hermes_cli/auth_xai.py:127 does state.update(...) and never pops last_auth_error",
+  "why": "generic 1-line fix, reproduced on upstream, provider in live use; effect is a stale error record that misleads triage (07-14 incident)",
+  "card": "t_4bf92fd0",
+  "tranche": "hermes_cli",
+  "subject": "fix(auth): clear stale xai-oauth last_auth_error on successful token save (#326)",
+  "loc": 44
+ },
+ "#166": {
+  "verdict": "UPSTREAM",
+  "measure": "live trigger shape confirmed: ~/.hermes/plugins/model-providers/claude-apr fallback_models = 'claude-apr/<id>' x5 (namespaced with own slug) while GET 127.0.0.1:18810/anthropic/v1/models returns bare ids. Real provider_model_ids() with that exact profile shape (stubbed fetch): upstream c15ebb1435 -> 10 rows (every model twice); fork -> 5",
+  "upstream": "RED (live call): up provider_model_ids@hermes_cli/models.py:1683 merges curated-namespaced + live-bare without canonicalizing",
+  "why": "duplicate picker rows reproduce on upstream with the fleet's live claude-apr catalog shape; fix is generic (own-slug prefix only)",
+  "card": "t_db92203d",
+  "tranche": "hermes_cli",
+  "subject": "fix(models): dedup namespaced curated vs bare live ids in provider_model_ids merge (#166)",
+  "loc": 173
+ },
+ "#135": {
+  "verdict": "UPSTREAM",
+  "measure": "live trigger: root ~/.hermes/config.yaml model.default=claude-fable-5-1 (bare), provider claude-bpr whose plugin fallback_models are 'claude-bpr/<id>'. Upstream _finalize_picker_rows(row models=['claude-bpr/claude-fable-5-1','claude-bpr/claude-opus-5-5'], current='claude-fable-5-1') -> ['claude-fable-5-1','claude-bpr/claude-fable-5-1',...] (current model listed twice)",
+  "upstream": "RED (live call): up _finalize_picker_rows@hermes_cli/model_switch_providers.py:1280 uses plain `current_model not in models`",
+  "why": "Apollo's own root config hits it every /model picker open; generic namespace-aware presence check",
+  "card": "t_bc006a95",
+  "tranche": "hermes_cli",
+  "subject": "fix(model-picker): don't duplicate the current model when its catalog entry is namespaced (#135)",
+  "loc": 94
+ },
+ "#33": {
+  "verdict": "DROP",
+  "measure": "live CDP repro, Chrome 154.0.8037.57 headless on temp profiles: with upstream launch args (no --remote-allow-origins) the handshake WITHOUT an Origin header (websockets default = upstream tools/browser_cdp_tool.py:176) -> OK; only a handshake WITH an Origin header -> HTTP 403. The launcher that this PR edits logged 0 'browser debug launch: spawned' lines across ~/.hermes/logs + profiles/*/logs; 0 CDP 403/'Rejected an incoming WebSocket' lines",
+  "upstream": "GREEN for upstream's own CDP client (no Origin sent); 403 only reproduces for Origin-sending clients",
+  "why": "launcher never used in window; upstream client unaffected; --remote-allow-origins=* also widens the debug port to any web origin",
+  "card": "t_d3825c87",
+  "tranche": "hermes_cli",
+  "subject": "fix(browser): add --remote-allow-origins to CDP debug launch for Chrome 111+ (#33)",
+  "loc": 25
+ },
+ "#356": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "measure": "live call on upstream c15ebb1435: gateway.run._prepare_resume_pending_message('restart','') returns a non-empty persist text (the recovery note), so the synthesized empty-text resume event (up gateway/run_startup.py:611) no longer yields an empty user row; real text still persisted clean",
+  "upstream": "GREEN: fixed by upstream 0cc26777bb 'fix(gateway): persist resume recovery notes' + c69b6471e6 (#86580), consumed at up gateway/run_turn_runner.py:1647",
+  "why": "upstream solved the same empty-row bug (persists the note instead of dropping the row); fork flag+drop machinery is redundant",
+  "card": "t_da2a5730",
+  "tranche": "gateway",
+  "subject": "fix(resume): don't persist an empty user row on auto-resume (the /undo '(no text)' bug) (#356)",
+  "loc": 285
+ },
+ "#358": {
+  "verdict": "DROP",
+  "measure": "4020 rejections are not logged anywhere (0 hits for 4020 in dashboard.{out,err}.log, dashboard-auth.log); a count needs live instrumentation and ~/.hermes is read-only for this card. Substitute measurement of the path's traffic: root state.db has 8 source='tui' sessions out of 15,265 (all 2026-08-20; 2026-05-08..2026-09-26); 0 empty user rows ever from source tui. The triggering client (fork desktop reconnect loop) is retired by D9 (desktop upstream-owned since 2026-08-08)",
+  "upstream": "RED by read: up prompt.submit@tui_gateway/methods_prompt.py:564 has no empty-text rejection (auditor's 'absorbed' premise falsified)",
+  "why": "guard's path carries ~no traffic here and the client that looped is gone; not worth 237 loc on 2 files that conflict every sync. Reopen if a desktop empty-submit loop recurs",
+  "card": "t_28b13602",
+  "tranche": "gateway",
+  "subject": "fix(gateway): reject empty prompt.submit + skip no-op model-switch side effects (#358)",
+  "loc": 237
+ },
+ "#291": {
+  "verdict": "SUPERSEDED-BY-UPSTREAM",
+  "measure": "live call on upstream c15ebb1435 with a 4-profile temp home and list_profiles() wrapped with a call counter: web_routers.profiles._profile_targets (serves GET /api/profiles/sessions + /sidebar) and web_server_cron._cron_profile_dicts both return all 4 profiles with 0 list_profiles() calls",
+  "upstream": "GREEN: upstream uses profiles_to_serve() (directory read) for both hot paths \u2014 de626c5a36 (_profile_targets) + 4590ef8b58 '#114041 polled profile lists never walk skill trees'; the auditor read of 'keeps full list_profiles()' was wrong",
+  "why": "upstream solved the same 10s sidebar cost the same way",
+  "card": "t_ee9353f2",
+  "tranche": "hermes_cli",
+  "subject": "perf(dashboard): lightweight profile listing for session-list + cron aggregators (10s -> ~1s) (#291)",
+  "loc": 111
+ },
+ "#441": {
+  "verdict": "DROP",
+  "measure": "the gate logs INFO 'session_db_heavy_read queue_wait=... outcome=acquired' whenever a read waits >=1 ms and WARNING '... outcome=shed' on busy; the dashboard process's hermes_cli.* loggers demonstrably reach ~/.hermes/logs/agent.log (8 web_server + 153 dashboard_auth.registry lines, same process). Count: 0 'session_db_heavy_read' lines in root agent.log* (2026-09-25 04:05..18:11) and errors.log* (02:58..18:20), and 0 across every file under ~/.hermes/logs + profiles/*/logs. Not one heavy read queued even 1 ms in the window. (Live counter /api/status.session_db_heavy_reads is auth-gated; not read.)",
+  "upstream": "RED by read (no admission gate; up offloads per router + bounds read connections in hermes_state_readpool.py)",
+  "why": "never contends under fleet load; 473/474 loc across 5 files that conflict in all 3 syncs. #441 is a re-land of #215: revert as one unit incl. the tui_gateway/ws.py import",
+  "card": "t_7c17872a",
+  "tranche": "hermes_cli",
+  "subject": "feat(tui_gateway): bound heavy session reads (#441)",
+  "loc": 474
+ },
+ "#215": {
+  "verdict": "DROP",
+  "measure": "the gate logs INFO 'session_db_heavy_read queue_wait=... outcome=acquired' whenever a read waits >=1 ms and WARNING '... outcome=shed' on busy; the dashboard process's hermes_cli.* loggers demonstrably reach ~/.hermes/logs/agent.log (8 web_server + 153 dashboard_auth.registry lines, same process). Count: 0 'session_db_heavy_read' lines in root agent.log* (2026-09-25 04:05..18:11) and errors.log* (02:58..18:20), and 0 across every file under ~/.hermes/logs + profiles/*/logs. Not one heavy read queued even 1 ms in the window. (Live counter /api/status.session_db_heavy_reads is auth-gated; not read.)",
+  "upstream": "RED by read (no admission gate; up offloads per router + bounds read connections in hermes_state_readpool.py)",
+  "why": "never contends under fleet load; 473/474 loc across 5 files that conflict in all 3 syncs. #441 is a re-land of #215: revert as one unit incl. the tui_gateway/ws.py import",
+  "card": "t_7c17872a",
+  "tranche": "hermes_cli",
+  "subject": "feat(tui_gateway): bound heavy session reads (#215)",
+  "loc": 473
+ },
+ "nopr:8a8b81638c": {
+  "verdict": "DROP",
+  "measure": "caller count: build_recap (the only public entry of hermes_cli/session_recap.py) has 0 non-test callers on fork 858ee59722 and 0 on upstream c15ebb1435 (grep over *.py/*.ts/*.tsx/*.yaml); the module is not imported by gateway/ or hermes_cli anywhere. The guard's code path cannot run",
+  "upstream": "n/a: upstream session_recap.py:169 is equally unreached; upstream's extract_local_files@gateway/platforms/base.py:3283 is only called from gateway/kanban_watchers.py:162",
+  "why": "guard on a dead module; fires 0 by construction",
+  "card": "t_08d470c3",
+  "tranche": "hermes_cli",
+  "subject": "fix(recap): backtick-wrap Files touched paths to stop gateway auto-attach",
+  "loc": 69
+ },
+ "#579": {
+  "verdict": "KEEP",
+  "measure": "trigger still occurs: 4 zero-byte .db decoys on the LIVE board tree right now (~/.hermes/kanban/kanban.db 09-22 01:01, boards/'*.db' 09-22 09:41, board.db 09-24 07:35, default.db 09-24 17:21; all created after #579 merged 08-11). Repro on a zero-byte kanban.db in a temp home: fork connect_readonly -> KanbanDbNotABoardError; upstream c15ebb1435 has no read-only reader and its connect() silently turns the decoy into a real empty board (0 tasks, 0 -> 4096 bytes); fork connect() does the same",
+  "upstream": "RED (live call): up connect@hermes_cli/kanban_db_connect.py:668 initialises schema in a zero-byte file",
+  "why": "decoys are being created weekly; the reader half is what stops a script reading them as an empty board. Follow-up: something other than connect() still creates the stubs (a literal '*.db' = an unexpanded shell glob), so the source half does not cover all creators",
+  "card": null,
+  "tranche": "hermes_cli",
+  "subject": "fix(kanban): zero-byte board .db files must not exist, and must not read as empty boards (#579)",
+  "loc": 493
+ },
+ "#879": {
+  "verdict": "KEEP",
+  "measure": "trigger shape is live: 3 of 1,715 repository keys in live kanban.db task_workspace_survivors.bases contain whitespace (card t_f5ebd9db, keys ending '/fresh clone'); a bare `--survivor-pr <key>=...` hint for those splits in the shell. Fork 858ee59722: tests/hermes_cli/test_cli_hint.py passes in the 175-test narrow run (test-gate, ACE-MEDIA)",
+  "upstream": "n/a: survivor/hint path is fork-only (hint_arg, kanban_survivor absent upstream)",
+  "why": "rare but real; 225 loc, 0 conflicting files; operator-facing remedy that otherwise cannot be pasted",
+  "card": null,
+  "tranche": "hermes_cli",
+  "subject": "fix(cli): a printed --flag hint must parse as pasted, for any repo key or path (#879)",
+  "loc": 225
+ },
+ "#18": {
+  "verdict": "KEEP",
+  "measure": "/compress usage counted from gateway logs: 19 \"[Discord] slash '/compress' invoked\" lines by Ace's user id in ~/.hermes/logs/gateway.log* (window 2026-09-20..09-25, ~6 days: 10 on 09-20, 4 on 09-21, 5 on 09-23) \u2014 each renders this readout",
+  "upstream": "read-only: upstream /compress reply has no measured-context / full-request lines (readout keys fork-only)",
+  "why": "the operator reads it ~3x/day; #18 layers on #17, keep as one unit. 508 loc over 15 locale files is the cost; candidate for upstreaming as one PR later",
+  "card": null,
+  "tranche": "hermes_cli",
+  "subject": "fix(compress): two-line readout \u2014 Chat size + Full request size (#18)",
+  "loc": 325
+ },
+ "#17": {
+  "verdict": "KEEP",
+  "measure": "/compress usage counted from gateway logs: 19 \"[Discord] slash '/compress' invoked\" lines by Ace's user id in ~/.hermes/logs/gateway.log* (window 2026-09-20..09-25, ~6 days: 10 on 09-20, 4 on 09-21, 5 on 09-23) \u2014 each renders this readout",
+  "upstream": "read-only: upstream /compress reply has no measured-context / full-request lines (readout keys fork-only)",
+  "why": "the operator reads it ~3x/day; #18 layers on #17, keep as one unit. 508 loc over 15 locale files is the cost; candidate for upstreaming as one PR later",
+  "card": null,
+  "tranche": "hermes_cli",
+  "subject": "fix(compress): show real measured context alongside estimate; estimate over full transcript (#17)",
+  "loc": 183
+ },
+ "#894": {
+  "verdict": "DROP",
+  "measure": "trigger = a whitespace in the home / interpreter / skill-category / plugin path pasted into a hint. Measured on both fleet hosts: Mac Studio HOME=/Users/alexgierczyk, ACE-AI HOME=/home/ace; 0 of 18 profile dirs, 0 skill category dirs (skills, skills-shared, fork skills/ + optional-skills/), 0 venv interpreter paths contain whitespace. The printed hints round-trip unquoted here",
+  "upstream": "not applicable as-is: routes through hint_value from fork-only #889",
+  "why": "never fires on this fleet; 629 loc incl. gateway/run.py (conflicts in all 3 syncs). If wanted for Windows users, upstream #889+#894 together as one PR",
+  "card": "t_ceb111f9",
+  "tranche": "scripts_misc",
+  "subject": "fix(cli): the six residual pasteable-hint sites must survive a real shell (#894)",
+  "loc": 629
+ },
+ "#780": {
+  "verdict": "KEEP",
+  "measure": "follows #764 (lead: KEEP, 2 bridge-side 'confab notice emitted out-of-band' across 20 bridges). Consumer-side count: messages.display_kind='confab_notice' = 2 rows in root state.db (2026-09-21 07:58 and 08:09 UTC, source cli), 0 in the other 13 profile DBs; 0 after #780 merged (09-21 18:02 UTC) over 58,652 later assistant rows. Low fire, but the rows exist and #780 is the P1 correctness fix to a KEPT consumer",
+  "upstream": "n/a (fleet-only)",
+  "why": "reverting #780 alone would leave #764's consumer with 5 known P1 defects (dropped/duplicated/false notices). Its fate is #764's: if #764 is later dropped, drop both",
+  "card": null,
+  "tranche": "scripts_misc",
+  "subject": "fix(confab-notice): close the 5 FleetReview P1s on the OOB notice consumer (#764 merged mid-run) (#780)",
+  "loc": 1681
+ },
+ "nopr:7c3d5cdd0f": {
+  "verdict": "DROP",
+  "measure": "the in-repo diff is only C-2 (lint_provider_collisions + a doctor line; C-1 normalisation is not in this commit). Ran the fork lint against the LIVE plugin registry (real HOME, read-only): 0 collisions. 'Provider collision lint' warning lines: 0 across ~/.hermes/logs + profiles/*/logs. Callers: doctor.py:1928 only; no cron job or script runs it (the 'cli-parity sweep' caller named in the docstring does not exist in cron/jobs.json or ~/.hermes/scripts)",
+  "upstream": "n/a (fleet copy-paste fN plugin hazard)",
+  "why": "never fired, verified clean at landing and now; 121 loc in providers/__init__.py which diverges +184/-346 from upstream",
+  "card": "t_c4b3a02c",
+  "tranche": "scripts_misc",
+  "subject": "feat(telemetry): fN alias collision lint + stop composite model strings leaking to charts (A4 axis C)",
+  "loc": 121
+ },
+ "nopr:8dcc69611c": {
+  "verdict": "DROP",
+  "measure": "G1/G2 refusals return to the model as skill_manage tool results. Across all 14 profile state.db since the commit (2026-07-08..2026-09-26): 3,130 skill_manage tool results, 0 containing 'Refusing to author', 'reserved work-queue-note prefix' or 'Post-write placement check failed' (the 5 LIKE hits are all read_file/terminal/execute_code rows showing the SOURCE template '{name}', incl. this audit). scripts/local-skill-leak-check.py has 0 callers (launchd ai.hermes.skill-collision-check runs the skills-shared copy)",
+  "upstream": "n/a (fleet-only skills-shared layout)",
+  "why": "0 fires in ~80 days / 3,130 writes; the repo script is dead. 554 loc in tools/skill_manager_tool.py + agent/skill_utils.py (2 files, conflict in 2 syncs)",
+  "card": "t_cad124fd",
+  "tranche": "scripts_misc",
+  "subject": "feat(skills): write-time skill-hygiene guard (A3)",
+  "loc": 554
+ },
+ "nopr:08fc3aff65": {
+  "verdict": "DROP",
+  "measure": "auto (tests-only): tests/test_skill_hygiene_guards_a3.py tests nopr:8dcc69611c; follows it",
+  "upstream": "n/a",
+  "why": "rides the nopr:8dcc69611c revert",
+  "card": "t_cad124fd",
+  "tranche": "auto",
+  "subject": "fix(test): rewrite A3 guard test as a proper pytest module (was a script \u2192 CI collection abort)",
+  "loc": 109
+ },
+ "#695": {
+  "verdict": "UPSTREAM",
+  "measure": "merge-queue counts via REST job logs (ANSI-stripped, grep 'FAIL ... virtualHistoryOffsetCache.test.ts'): BEFORE the fix (merge_group runs 2026-09-07..09-14 13:52, 201 runs) 10 'JS & TS checks' jobs failed on this exact file (09-07, 09-08, 09-09 x4, 09-10 x2, 09-14 x2). AFTER (2026-09-14 14:00..09-26, 2,297 runs, 120 failed runs) 0 failures of this file (1 JS&TS failure total, a different test)",
+  "upstream": "RED by read: up ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts lacks the act()/IS_REACT_ACT_ENVIRONMENT settle",
+  "why": "the flake was real (5% of merge-queue runs over a week) and the fix removed it; test-only, generic. Branch already built: audit/scripts_misc/upstream-695 @ 830f68a5dc (hand port off upstream/main)",
+  "card": "t_c1c5035d",
+  "tranche": "scripts_misc",
+  "subject": "test(tui): settle deferred rows before unmount compensation checks (#695)",
+  "loc": 87
+ },
+ "#907": {
+  "verdict": "KEEP",
+  "measure": "trigger measured in the live board: incident card t_e1c2dae5 (2026-09-21 14:51, 'a probe that redirected HOME still wrote to the live board'), and kanban.db task_events shows 21 review_stale_alerted events on 17 cards dated 2026-09-22 UTC, the burst the PR describes. Repro on fork 858ee59722: test_diverged_pin_cannot_create_a_task_or_append_an_event and test_pin_contradicting_explicit_board_arg_REFUSES pass (part of a 175-test narrow run via test-gate on ACE-MEDIA)",
+  "upstream": "RED by read: upstream reads the same board-path pin env but has no KanbanPinDivergenceError / refusal",
+  "why": "guard on a destructive path with two live-board incidents in the last 5 days; silent by design (a refusal raises to the caller)",
+  "card": null,
+  "tranche": "hermes_cli",
+  "subject": "fix(kanban): refuse destructive writes when pin contradicts requested board (t_e1c2dae5) (#907)",
+  "loc": 1149
+ },
+ "#858": {
+  "verdict": "KEEP",
+  "measure": "trigger measured: live card t_880f5d17 (2026-09-22 05:05, argus) records repair_db() PROCEEDING from a pytest context and leaving .init.lock + .bak beside a production board. Fork repro: tests/hermes_cli/test_kanban_live_board_write_guard.py (test_test_context_refused_on_live_board etc.) pass in the same 175-test narrow run",
+  "upstream": "n/a: fork-only kanban path (fork kanban_db.py diverged from upstream split modules)",
+  "why": "112 loc closing a measured second rw door to the live board",
+  "card": null,
+  "tranche": "hermes_cli",
+  "subject": "fix(kanban): gate repair_db(), the second rw door to the live board (t_880f5d17) (#858)",
+  "loc": 112
+ },
+ "#798": {
+  "verdict": "KEEP",
+  "measure": "DB signal exists after all: task_events 'blocked' payload carries source_status. Since merge (2026-09-21 18:51 UTC): 76 blocks with source_status='review' on 68 cards, and 84 'unblocked' events restoring status='review' (85 with resume_status='review', 70 cards)",
+  "upstream": "RED by read: up block_task UPDATE@hermes_cli/kanban_db.py:3287 still limits to status IN ('running','ready'), so a review card cannot be parked",
+  "why": "fires ~19x/day on the live board; fork review lane depends on it",
+  "card": null,
+  "tranche": "hermes_cli",
+  "subject": "fix(kanban): park a review card \u2014 block accepts review, unblock restores it, triage-resolve names the verb (#798)",
+  "loc": 156
+ }
+}
