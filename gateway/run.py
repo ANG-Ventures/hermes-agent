@@ -35579,42 +35579,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _generation_at_interrupt = self._invalidate_session_run_generation(
             session_key, reason=invalidation_reason
         )
-        # Explicit stop relinquishes durable ownership even when the executor
-        # thread is still unwinding. Keep the holder on the agent as a late-write
-        # fence, but unregister it process-locally and delete its durable row so
-        # the replacement turn can acquire immediately instead of waiting for
-        # the stopped turn's TTL.
-        _turn_lease_holder = getattr(
-            running_agent, "_active_session_turn_lease_holder", None
-        )
-        if isinstance(_turn_lease_holder, str) and _turn_lease_holder:
-            try:
-                from hermes_state import _unregister_active_session_turn_lease_holder
-
-                _unregister_active_session_turn_lease_holder(_turn_lease_holder)
-            except Exception:
-                logger.warning(
-                    "Failed to unregister stopped session turn lease holder=%s",
-                    _turn_lease_holder,
-                    exc_info=True,
-                )
-            _turn_session_db = getattr(running_agent, "_session_db", None)
-            _turn_session_id = getattr(running_agent, "session_id", None)
-            if _turn_session_db is not None and _turn_session_id:
-                try:
-                    await asyncio.to_thread(
-                        _turn_session_db.release_session_turn_lease,
-                        _turn_session_id,
-                        _turn_lease_holder,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Failed to release stopped session turn lease "
-                        "session=%s holder=%s",
-                        _turn_session_id,
-                        _turn_lease_holder,
-                        exc_info=True,
-                    )
         if _process_task_id and _process_baseline is not None:
             threading.Thread(
                 target=_reap_gateway_turn_processes,
@@ -35710,17 +35674,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key,
                     exc_info=True,
                 )
-        try:
-            await self.async_session_store.clear_resume_pending(session_key)
-        except Exception:
-            logger.warning(
-                "Failed to clear resume-pending state for stopped session %s",
-                session_key,
-                exc_info=True,
-            )
-        else:
-            getattr(self, "_startup_resume_modes", {}).pop(session_key, None)
-            getattr(self, "_resumed_this_boot", set()).discard(session_key)
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         # Cancel any pending clarify prompts NOW, not just in the turn's
@@ -36349,58 +36302,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         same task_id inherits them.
         """
         if agent is None:
-            return
-        # /stop force-clears the runner slot while its executor thread may still
-        # be unwinding. Cache-coherence eviction must not then tear down that
-        # live agent merely because _running_agents no longer names it. The
-        # durable turn-lease holder is authoritative across that gap.
-        active_lease_holder = getattr(
-            agent, "_active_session_turn_lease_holder", None
-        )
-        if isinstance(active_lease_holder, str) and active_lease_holder:
-            logger.error(
-                "Refusing soft eviction of agent with active durable turn lease "
-                "holder=%s",
-                active_lease_holder,
-            )
-            if not getattr(agent, "_soft_release_deferred", False):
-                agent._soft_release_deferred = True
-
-                def _release_after_turn_lease() -> None:
-                    deadline = time.monotonic() + 3600.0
-                    while (
-                        getattr(agent, "_active_session_turn_lease_holder", None)
-                        and time.monotonic() < deadline
-                    ):
-                        time.sleep(5.0)
-                    agent._soft_release_deferred = False
-                    if not getattr(
-                        agent, "_active_session_turn_lease_holder", None
-                    ):
-                        self._release_evicted_agent_soft(agent)
-                    else:
-                        logger.warning(
-                            "Deferred soft eviction timed out with active durable "
-                            "turn lease holder=%s",
-                            getattr(
-                                agent, "_active_session_turn_lease_holder", None
-                            ),
-                        )
-
-                try:
-                    threading.Thread(
-                        target=_release_after_turn_lease,
-                        daemon=True,
-                        name="agent-soft-evict-after-turn-lease",
-                    ).start()
-                except Exception:
-                    agent._soft_release_deferred = False
-                    logger.warning(
-                        "Failed to defer soft eviction for active durable turn "
-                        "lease holder=%s",
-                        active_lease_holder,
-                        exc_info=True,
-                    )
             return
         try:
             if hasattr(agent, "release_clients"):
@@ -37238,87 +37139,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 restore_session_vars(session_tokens)
             finally:
                 restore_session_vars(reset_tokens)
-
-    async def _run_queued_followup_if_current(
-        self,
-        *,
-        current_result: Any,
-        message: Any,
-        context_prompt: str,
-        history: List[Dict[str, Any]],
-        source: SessionSource,
-        session_id: str,
-        session_key: str,
-        generation_session_key: str,
-        run_generation: Optional[int],
-        interrupt_depth: int,
-        event_message_id: Optional[str],
-        channel_prompt: Optional[str],
-        message_type: Optional[str],
-        queued_event: Optional[MessageEvent],
-        queued_adapter: Any,
-    ) -> Any:
-        """Run an in-band follow-up only while its parent generation owns it."""
-        if (
-            run_generation is not None
-            and not self._is_session_run_current(
-                generation_session_key, run_generation
-            )
-        ):
-            adapter = queued_adapter
-            if adapter and queued_event is not None:
-                _pending_messages = getattr(adapter, "_pending_messages", None)
-                if isinstance(_pending_messages, dict):
-                    merge_pending_message_event(
-                        _pending_messages, session_key, queued_event
-                    )
-            elif adapter:
-                _queue_message = getattr(adapter, "queue_message", None)
-                if callable(_queue_message):
-                    _queue_message(session_key, message)
-                else:
-                    _pending_messages = getattr(adapter, "_pending_messages", None)
-                    if isinstance(_pending_messages, dict):
-                        merge_pending_message_event(
-                            _pending_messages,
-                            session_key,
-                            MessageEvent(
-                                text=str(message or ""),
-                                message_type=MessageType.TEXT,
-                                source=source,
-                            ),
-                        )
-            logger.info(
-                "Re-queued follow-up for session %s — parent run generation "
-                "%s is no longer current (stopped)",
-                generation_session_key or "?",
-                run_generation,
-            )
-            return current_result
-        followup_result = await self._run_agent(
-            message=message,
-            context_prompt=context_prompt,
-            history=history,
-            source=source,
-            session_id=session_id,
-            session_key=session_key,
-            run_generation=run_generation,
-            _interrupt_depth=interrupt_depth,
-            event_message_id=event_message_id,
-            channel_prompt=channel_prompt,
-            message_type=message_type,
-            # A kanban wake / async-delegation completion that arrived while
-            # this session was busy is drained here instead of through
-            # _handle_message_with_agent; keep its row typed (#82888).
-            persist_user_display_kind=(
-                "internal_notification"
-                if getattr(queued_event, "internal", False)
-                else None
-            ),
-        )
-        return _preserve_queued_followup_history_offset(
-            current_result, followup_result
-        )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -38814,50 +38634,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pending = None
 
             if pending_event or pending:
-                # /stop invalidates the generation before the executor-backed
-                # turn necessarily returns. A queued event can still be visible
-                # while that stopped coroutine unwinds. Never recurse under its
-                # stale generation: the recursive turn is not registered as a
-                # fresh top-level run, so it would run invisibly after /stop and
-                # contend with the next user turn's durable lease.
-                if (
-                    run_generation is not None
-                    and not self._is_session_run_current(session_key, run_generation)
-                ):
-                    if adapter and pending_event is not None:
-                        _pending_messages = getattr(
-                            adapter, "_pending_messages", None
-                        )
-                        if isinstance(_pending_messages, dict):
-                            merge_pending_message_event(
-                                _pending_messages, session_key, pending_event
-                            )
-                    elif adapter:
-                        _queue_message = getattr(adapter, "queue_message", None)
-                        if callable(_queue_message):
-                            _queue_message(session_key, pending)
-                        else:
-                            _pending_messages = getattr(
-                                adapter, "_pending_messages", None
-                            )
-                            if isinstance(_pending_messages, dict):
-                                merge_pending_message_event(
-                                    _pending_messages,
-                                    session_key,
-                                    MessageEvent(
-                                        text=str(pending or ""),
-                                        message_type=MessageType.TEXT,
-                                        source=source,
-                                    ),
-                                )
-                    logger.info(
-                        "Discarding stale queued-follow-up recursion for session %s; "
-                        "re-queued message because run generation %s is no longer "
-                        "current (stopped)",
-                        session_key or "?",
-                        run_generation,
-                    )
-                    return result
                 logger.debug("Processing pending message: '%s...'", pending[:40])
 
                 # Clear the adapter's interrupt event so the next _run_agent call
@@ -39087,23 +38863,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                return await self._run_queued_followup_if_current(
-                    current_result=result,
+                followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=next_source,
                     session_id=session_id,
                     session_key=next_session_key,
-                    generation_session_key=session_key,
                     run_generation=run_generation,
-                    interrupt_depth=_interrupt_depth + 1,
+                    _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
-                    queued_event=pending_event,
-                    queued_adapter=adapter,
+                    # A kanban wake / async-delegation completion that arrived while
+                    # this session was busy is drained here instead of through
+                    # _handle_message_with_agent; keep its row typed (#82888).
+                    persist_user_display_kind=(
+                        "internal_notification"
+                        if getattr(pending_event, "internal", False)
+                        else None
+                    ),
                 )
+                return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
