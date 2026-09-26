@@ -13154,23 +13154,6 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
     return result
 
 
-def _cron_profile_names() -> List[str]:
-    """Profile NAMES only, via the lightweight (name, home) listing.
-
-    The cron job aggregators only need names to route _call_cron_for_profile;
-    going through _cron_profile_dicts() -> list_profiles() paid the full
-    config.yaml-parse + gateway-PID-probe + skills-rglob cost per profile on
-    every /api/cron/jobs call (a boot-path RPC — py-spy showed it stacked on
-    top of the session-list refresh on every sidebar load).
-    """
-    from hermes_cli import profiles as profiles_mod
-    try:
-        return [name for name, _home in profiles_mod.list_profile_homes()]
-    except Exception:
-        _log.exception("Failed to list profile homes for cron; falling back to full listing")
-        return [str(p.get("name") or "") for p in _cron_profile_dicts()]
-
-
 def _notify_cron_provider_for_profile(target_profile: Optional[str]) -> None:
     """Best-effort provider reconcile against one profile's job store.
 
@@ -13239,7 +13222,8 @@ def _mutate_cron_for_profile(
 
 
 def _find_cron_job_profile(job_id: str) -> Optional[str]:
-    for name in _cron_profile_names():
+    for profile in _cron_profile_dicts():
+        name = str(profile.get("name") or "")
         if not name:
             continue
         jobs = _call_cron_for_profile(name, "list_jobs", True)
@@ -13254,7 +13238,8 @@ def _list_cron_jobs_sync(profile: str = "all"):
         return _call_cron_for_profile(requested, "list_jobs", True)
 
     jobs: List[Dict[str, Any]] = []
-    for name in _cron_profile_names():
+    for profile in _cron_profile_dicts():
+        name = str(profile.get("name") or "")
         if not name:
             continue
         try:

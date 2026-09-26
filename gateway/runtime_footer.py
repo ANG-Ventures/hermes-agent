@@ -78,22 +78,18 @@ def _split_provider_model(
 ) -> tuple[str, str]:
     """Resolve a clean ``(provider, model)`` pair.
 
-    Mirrors the blackbox-inspect ``/context`` logic: when ``provider`` is unset
-    but ``model`` carries a ``provider/model`` prefix, split it so the footer
-    reads cleanly (``provider/model``, not ``unset/a/b``).
-
-    When the ``model`` ALREADY carries a ``provider/`` prefix, that embedded
-    prefix wins and any separately-supplied ``provider`` is ignored — this
-    avoids an ugly triple like ``openai-codex/claude-app/claude-opus-4-8`` when
-    a caller passes both a provider and a prefixed model. The model's own
-    prefix is the more specific source.
+    Thin alias over the shared ``agent.provider_model_util.split_provider_model``
+    so the footer, the compaction banner and ``/compress`` render the SAME
+    provider/model string — the two copies had already drifted once (the footer
+    let a ``vendor/model`` aggregator id swallow the served provider:
+    ``openrouter`` + ``moonshotai/kimi-k3`` rendered as ``moonshotai/kimi-k3``).
+    The served provider is authoritative; a ``/`` in the model id is part of
+    the model id unless it merely repeats the provider (de-duped). See the
+    shared helper for the full case table.
     """
-    prov = (provider or "").strip()
-    mdl = (model or "").strip()
-    if "/" in mdl:
-        # The model carries its own provider prefix — it's authoritative.
-        prov, _, mdl = mdl.partition("/")
-    return prov, mdl
+    from agent.provider_model_util import split_provider_model
+
+    return split_provider_model(provider, model)
 
 
 def _humanize_tok(n: Any) -> str:
