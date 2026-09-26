@@ -14662,6 +14662,72 @@ def rate_limit_circuits(
     return open_until
 
 
+# A worker that refused its route because the provider's credential is rate
+# limited (``worker_route_pin_refused`` with ``rate_limited: true``, e.g.
+# "Codex credential is in cooldown") is proof the credential is dead for every
+# card, not just that one. Treat the provider as capped for this long after the
+# latest refusal, so the capped-pool fallback does not spawn more workers into
+# it (t_6445986b: a P0 card hit exit 75 three times in 25 min, each one
+# stamping a longer rate_limit backoff). ``kanban.credential_cooldown_seconds``.
+DEFAULT_CREDENTIAL_COOLDOWN_SECONDS = 1800  # 30 minutes
+
+
+def _resolve_credential_cooldown() -> int:
+    """``kanban.credential_cooldown_seconds`` (0 disables)."""
+    try:
+        from hermes_cli.config import load_config
+        value = int(load_config().get("kanban", {}).get(
+            "credential_cooldown_seconds", DEFAULT_CREDENTIAL_COOLDOWN_SECONDS))
+        return value if value >= 0 else DEFAULT_CREDENTIAL_COOLDOWN_SECONDS
+    except Exception:
+        return DEFAULT_CREDENTIAL_COOLDOWN_SECONDS
+
+
+def cooling_providers(
+    conn: sqlite3.Connection, *, now: int, window: int,
+) -> dict[str, int]:
+    """``{provider: cooling_until}`` for providers with a recent rate-limited refusal.
+
+    Keyed by provider name (lower case), not ``pool_key``: ``openai-codex`` is
+    not pool-bound, so the rate-limit circuit can never see it. The events are
+    run-scoped, so only runs still open or closed inside ``window`` are read
+    (``idx_events_run``), never the whole event table.
+    """
+    if window <= 0:
+        return {}
+    from hermes_cli.kanban_worker_route import WORKER_ROUTE_PIN_REFUSED_EVENT
+
+    run_ids = [int(r[0]) for r in conn.execute(
+        "SELECT id FROM task_runs WHERE ended_at IS NULL OR ended_at >= ?",
+        (now - window,),
+    )]
+    until: dict[str, int] = {}
+    for i in range(0, len(run_ids), 500):
+        chunk = run_ids[i:i + 500]
+        for ev in conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE run_id IN ("
+            + ",".join("?" * len(chunk)) + ") AND kind = ? AND created_at >= ?",
+            (*chunk, WORKER_ROUTE_PIN_REFUSED_EVENT, now - window),
+        ):
+            try:
+                payload = json.loads(ev["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("rate_limited") is not True:
+                continue
+            provider = payload.get("provider")
+            if not isinstance(provider, str) or not provider.strip():
+                continue
+            key = provider.strip().lower()
+            until[key] = max(until.get(key, 0), int(ev["created_at"]) + window)
+    return until
+
+
+def _format_skipped_rungs(skipped) -> str:
+    """``openai-codex:credential_cooldown, claude-apr:pool_budget``."""
+    return ", ".join(f"{s.get('provider')}:{s.get('reason')}" for s in skipped or ())
+
+
 def _notify_rate_limit_circuit(
     board: Optional[str], pool: str, until: int, trip: int, *, now: Optional[int] = None,
 ) -> None:
@@ -19294,10 +19360,18 @@ def _dispatch_once_locked(
         # Fail OPEN: a broken circuit query must never halt spawning.
         _log.warning("kanban rate-limit circuit check failed (%s: %s)", type(exc).__name__, exc)
         circuits = {}
+    cooling: dict[str, int] = {}
+    try:
+        cooling = cooling_providers(
+            conn, now=_tick_now, window=_resolve_credential_cooldown())
+    except Exception as exc:
+        # Fail OPEN, same as the circuit query above.
+        _log.warning("kanban credential cooldown check failed (%s: %s)", type(exc).__name__, exc)
+        cooling = {}
 
     def provider_admission(task_id, assignee):
         if (not health_probes and not any(pool_urls.values()) and not box_health
-                and not circuits):
+                and not circuits and not cooling):
             return False, None
         task = get_task(conn, task_id)
         if task is None:
@@ -19314,6 +19388,11 @@ def _dispatch_once_locked(
             # provider_capped: hold unless a rung on another open pool exists.
             payload = {"reason": "rate_limit_circuit", "provider": route_provider,
                        "pool": circuit_pool, "until": circuits[circuit_pool]}
+        elif (route_provider or "").strip().lower() in cooling:
+            # The route's own credential is cooling: spawning would die at
+            # auth (exit 75) and stamp a rate_limit backoff. Same verdict.
+            payload = {"reason": "credential_cooldown", "provider": route_provider,
+                       "until": cooling[(route_provider or "").strip().lower()]}
         else:
             payload = capped_provider(
                 task, health_probes, health_cache, min_eligible=min_eligible,
@@ -19324,11 +19403,15 @@ def _dispatch_once_locked(
         if payload is None:
             admitted_routes[task_id] = circuit_pool
             return False, None
+        skipped: list = []
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
             pool_urls=pool_urls, skip_pools=frozenset(circuits), box_health=box_health,
             budget_available=lambda provider: pool_budget(provider) is None,
+            skip_providers=frozenset(cooling), skipped=skipped,
         )
+        if skipped:
+            payload = {**payload, "fallback_skipped": skipped}
         if fallback is not None and fallback_flagship_banned(task_id, fallback[0]):
             # The flagship gate covers the post-fallback route too: a capped
             # pool must not become a side door onto a banned model. Defer
@@ -19345,6 +19428,13 @@ def _dispatch_once_locked(
             admitted_routes[task_id] = pool_key(fallback[1])
             return False, (fallback, payload)
         result.respawn_guarded.append((task_id, payload["reason"]))
+        if skipped:
+            # Every rung is capped or cooling: HOLD (deferred, no spawn, no
+            # run, so no rate_limited close and no backoff stamp).
+            _log.info(
+                "PHASE=kanban_dispatch_fallback_held task=%s from=%s reason=%s skipped=%s",
+                task_id, route_provider, payload["reason"], _format_skipped_rungs(skipped),
+            )
         if not dry_run:
             with write_txn(conn):
                 _append_event(conn, task_id, "deferred", payload)
@@ -19365,11 +19455,20 @@ def _dispatch_once_locked(
             return
         (model, provider), capped = selection
         claimed.model_override, claimed.provider_override = model, provider
+        event = {"from_provider": capped["provider"], "to_provider": provider,
+                 "to_model": model}
+        if capped.get("fallback_skipped"):
+            event["skipped"] = capped["fallback_skipped"]
         with write_txn(conn):
-            _append_event(conn, claimed.id, "dispatch_provider_fallback", {
-                "from_provider": capped["provider"], "to_provider": provider,
-                "to_model": model,
-            }, run_id=claimed.current_run_id)
+            _append_event(conn, claimed.id, "dispatch_provider_fallback", event,
+                          run_id=claimed.current_run_id)
+
+    def fallback_route_source(source, selection):
+        skipped = selection[1].get("fallback_skipped")
+        if not skipped:
+            return f"dispatch-fallback(capped {source})"
+        return (f"dispatch-fallback(capped {source}; "
+                f"skipped {_format_skipped_rungs(skipped)})")
 
     try:
         from hermes_cli.config import load_config as _load_dispatch_config
@@ -19695,7 +19794,7 @@ def _dispatch_once_locked(
             "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
-            route_source = f"dispatch-fallback(capped {route_source})"
+            route_source = fallback_route_source(route_source, fallback_selection)
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -19893,7 +19992,7 @@ def _dispatch_once_locked(
             "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
-            review_route_source = f"dispatch-fallback(capped {review_route_source})"
+            review_route_source = fallback_route_source(review_route_source, fallback_selection)
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
