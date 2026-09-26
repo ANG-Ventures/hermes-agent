@@ -1942,7 +1942,6 @@ DEFAULT_CONFIG = {
         # Config.yaml only: no env override, so the reconnect path remains inert
         # until an operator deliberately flips this key.
         "desktop_auto_resume": False,
-        "heavy_read_max_concurrency": 2,
         # Dormant/default-off rollout gate for the indexed session.list recency
         # path. Config.yaml only: no env override, so production stays on the
         # legacy CTE until an operator deliberately flips this key.
