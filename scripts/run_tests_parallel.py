@@ -620,13 +620,14 @@ def _route_arm_slices(
 
 
 # Paid third rung of the venue ladder: free self-hosted -> free GitHub-hosted
-# -> Blacksmith. Keyed on the GitHub-hosted label a slice already holds, so
-# the arch the ARM/x64-floor routing chose is kept and nothing that is not a
-# GitHub-hosted Linux label (self-hosted pool, Windows, macOS) can ever move.
-_BLACKSMITH_BY_HOSTED = {
-    _HOSTED_RUNNER_LABELS: '["blacksmith-4vcpu-ubuntu-2404"]',
-    '["ubuntu-24.04-arm"]': '["blacksmith-4vcpu-ubuntu-2404-arm"]',
-}
+# -> Blacksmith. Blacksmith is x64-ONLY (t_56b21c1e): its ARM runners are
+# Ampere Neoverse-N1 (~1,340 single-thread vs GitHub ARM N2 ~1,874; our
+# pytest slices ran 299 s vs 204 s), while Blacksmith x64 (~4,259) beats
+# GitHub x64 (2,268-3,500). So only GitHub-hosted x64 slices ever move; ARM,
+# self-hosted, Windows and macOS labels are never touched, and no emitted
+# label may be a Blacksmith ARM label (ci_speed_lint R13 enforces it).
+_BLACKSMITH_RUNNER_LABELS = '["blacksmith-4vcpu-ubuntu-2404"]'
+assert "-arm" not in _BLACKSMITH_RUNNER_LABELS, "Blacksmith is x64-only"
 # Events whose code is trusted to run on a paid third-party runner. A
 # pull_request additionally needs its head in this repository (no forks).
 _BLACKSMITH_TRUSTED_EVENTS = {"push", "merge_group"}
@@ -646,10 +647,11 @@ def _route_blacksmith_slices(
     event: str | None,
     same_repo: str | None,
 ) -> None:
-    """Move the LAST N GitHub-hosted slices (by index) to Blacksmith.
+    """Move the LAST N GitHub-hosted x64 slices (by index) to Blacksmith x64.
 
     Runs after self-hosted and ARM routing, so it only ever takes slices that
-    would otherwise have queued on GitHub-hosted runners. ``raw_count``
+    would otherwise have queued on GitHub-hosted x64 runners; ARM slices stay
+    on GitHub ARM (Blacksmith ARM is slower). ``raw_count``
     unset/0/invalid, or an untrusted event (fork PR, schedule, dispatch, an
     unknown event), leaves the matrix untouched.
     """
@@ -676,10 +678,10 @@ def _route_blacksmith_slices(
             file=sys.stderr,
         )
         return
-    hosted = [s for s in matrix["slice"] if s["runs_on"] in _BLACKSMITH_BY_HOSTED]
+    hosted = [s for s in matrix["slice"] if s["runs_on"] == _HOSTED_RUNNER_LABELS]
     chosen = sorted(hosted, key=lambda s: s["index"])[-count:]
     for slice_ in chosen:
-        slice_["runs_on"] = _BLACKSMITH_BY_HOSTED[slice_["runs_on"]]
+        slice_["runs_on"] = _BLACKSMITH_RUNNER_LABELS
     print(f"Blacksmith: {len(chosen)} slice(s) routed", file=sys.stderr)
 
 
