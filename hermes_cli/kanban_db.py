@@ -8549,10 +8549,9 @@ def claim_task(
     return claimed
 
 
-# Guarded to satisfy the status-writer contract; inert in practice: the
-# dispatcher (claim_review_task) has no mutation actor, and request_changes'
-# own guard has already cleared the actor before calling this.
-@_home_session_guarded("request-changes")
+# Unguarded helper (EXECUTION_LANE in test_kanban_home_session): its callers
+# carry the policy. claim_review_task is the unguarded claim lane (dispatcher
+# and ``claim --review``); request_changes is guarded before it gets here.
 def _open_review_run(
     conn: sqlite3.Connection,
     task_id: str,

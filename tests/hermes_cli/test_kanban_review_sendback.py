@@ -231,17 +231,63 @@ def test_dispatched_reviewer_path_unchanged(board: Path) -> None:
         _assert_sent_back(conn, tid, "argus:1")
 
 
-def test_cli_request_changes_sends_back_parked_review(board: Path) -> None:
-    with kb.connect() as conn:
-        tid = _parked_review(conn)
-    rc = kc._cmd_request_changes(
+def _cli_send_back(tid: str) -> int:
+    return kc._cmd_request_changes(
         argparse.Namespace(
             task_id=tid, reason=["add", "the", "test"], coverage=COVERAGE,
         ),
     )
-    assert rc == 0
+
+
+def test_cli_request_changes_sends_back_parked_review(
+    board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = "20260926_070000_operator"
+    monkeypatch.setenv("HERMES_SESSION_ID", session)
     with kb.connect() as conn:
+        tid = _parked_review(conn)
+    assert _cli_send_back(tid) == 0
+    with kb.connect() as conn:
+        events = _kinds(conn, tid)
+        after = events[[k for k, _, _ in events].index("review_requested") + 1:]
+        # The one-shot send-back leaves claim --review's audit: the session
+        # is bound on the claimed event, then the human-lane rework comment.
+        assert [k for k, _, _ in after] == [
+            "claimed", "commented", "changes_requested", "commented",
+        ]
+        claimed, run_id = after[0][1], after[0][2]
+        assert claimed["session_ref"] == kb.derive_session_ref(session)
+        rework = [
+            c for c in kb.list_comments(conn, tid)
+            if c.body.startswith("changes requested (human review lane):")
+        ]
+        assert [c.run_id for c in rework] == [run_id]
+        # Drop the trailing rework comment; the rest is the shared shape.
+        conn.execute(
+            "DELETE FROM task_events WHERE id = (SELECT MAX(id) FROM task_events "
+            "WHERE task_id = ?)", (tid,),
+        )
         _assert_sent_back(conn, tid, "apollo")
+
+
+@pytest.mark.parametrize("session", [None, "cron_abc123_20260926_070000"])
+def test_cli_parked_send_back_refused_without_bindable_session(
+    board: Path, monkeypatch: pytest.MonkeyPatch, session,
+) -> None:
+    """Same provenance rule as claim --review (t_088fe9e3): a sessionless
+    caller or a cron job cannot open the human-lane review run."""
+    if session is None:
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_SESSION_ID", session)
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        before = len(_kinds(conn, tid))
+    assert _cli_send_back(tid) == 1
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "review" and task.claim_lock is None
+        assert len(_kinds(conn, tid)) == before
 
 
 def test_tool_request_changes_sends_back_parked_review(board: Path) -> None:
