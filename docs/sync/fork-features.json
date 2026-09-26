@@ -385,7 +385,7 @@
       "discord"
     ],
     "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_discord_free_response.py (RED-proven: revert to isinstance(str))",
-    "coverage_gap": "Track via upstream PR #72014 (OPEN/MERGEABLE/CLEAN as of 2026-08-31, CI green). Keep the fork canary until #72014 lands. Do NOT open a sibling PR for the mention half, and do NOT re-PR the scalar coercion."
+    "coverage_gap": "Track via upstream PR #72014 (OPEN/MERGEABLE/CLEAN as of 2026-08-31, CI green; re-verified OPEN 2026-09-25, head da09ab81b2, checks 17 success / 12 skipped / 1 neutral / 0 failed; the salvage #86825 closed UNMERGED 2026-09-14, so #72014 is the only live track). Gap still present on upstream main 02f57212a4: _discord_message_admission drops an other-bot mention before the free-response lookup. Fork-PR audit (t_586f8488) converted nopr:ba371ef32f from DROP to UPSTREAM on this basis, so no revert branch exists. Keep the fork canary until #72014 lands. Do NOT open a sibling PR for the mention half, and do NOT re-PR the scalar coercion."
   },
   {
     "feature": "telegram intake sentinel makes silent inbound update drops visible",
