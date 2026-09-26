@@ -20608,6 +20608,9 @@ def _default_spawn(
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # GitHub lane is decided by the worker's PROFILE in the gh shim (spec D3); an inherited lane
+    # (e.g. a dispatcher launched from a laned script) must not ride into the worker.
+    env.pop("HERMES_GH_LANE", None)
 
     # A dispatcher-spawned worker is its OWN single-session process, NOT the
     # gateway. The gateway sets _HERMES_GATEWAY=1 process-wide; copying it into
