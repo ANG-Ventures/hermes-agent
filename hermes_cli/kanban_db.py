@@ -5580,10 +5580,29 @@ def _mutation_succeeded(result: Any) -> bool:
 # ``--takeover`` on these verbs ADOPTS the card: the taking session becomes its
 # home (children and pings follow). Other verbs stay a one-off foreign action;
 # ``edit --session <sid>`` re-homes without a status change. ``--operator``
-# never re-homes (it applies a relayed ruling, it does not adopt).
+# never re-homes (it applies a relayed ruling, it does not adopt). ``complete``
+# is terminal, so it never adopts either. Sweep actors (cron sessions,
+# delegate children) never re-home: see :func:`_can_adopt_home`.
 REHOME_ON_TAKEOVER_ACTIONS: frozenset[str] = frozenset({
-    "assign", "unblock", "promote", "reclaim", "triage-resolve", "complete",
+    "assign", "unblock", "promote", "reclaim", "triage-resolve",
 })
+
+
+def _can_adopt_home(session_id: str) -> bool:
+    """True when *session_id* may become a card's home on ``--takeover``.
+
+    A cron run (``cron_<job>_<ts>``) or a ``delegate_task`` child is a sweep,
+    not a conversation: adopting would pull the card out of its home chat and
+    route its pings nowhere. The takeover event still records the actor.
+    """
+    if session_id.startswith("cron_"):
+        return False
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return not is_delegated_child_process_context()
+    except Exception:
+        return not os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT")
 
 
 def record_foreign_action(
@@ -5616,7 +5635,9 @@ def record_foreign_action(
     prev_home = home_row["session_id"] if home_row is not None else None
     new_home = (
         actor.session_ids[0]
-        if action in REHOME_ON_TAKEOVER_ACTIONS and actor.session_ids
+        if action in REHOME_ON_TAKEOVER_ACTIONS
+        and actor.session_ids
+        and _can_adopt_home(actor.session_ids[0])
         else None
     )
     payload = {

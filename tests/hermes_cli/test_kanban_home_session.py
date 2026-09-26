@@ -1015,7 +1015,6 @@ def test_cli_operator_flag(kanban_home, monkeypatch):
 @pytest.mark.parametrize("verb,mutate", [
     ("unblock", lambda c, t: kb.unblock_task(c, t)),
     ("assign", lambda c, t: kb.assign_task(c, t, "someone-else")),
-    ("complete", lambda c, t: kb.complete_task(c, t, result="x")),
 ])
 def test_takeover_rehomes_card_and_records_prev(kanban_home, verb, mutate):
     with kb.connect_closing() as conn:
@@ -1040,6 +1039,36 @@ def test_takeover_on_non_adopting_verb_does_not_rehome(kanban_home):
                                foreign_ok="one-off"):
             assert kb.set_task_model(conn, tid, "m")
         assert kb.get_task(conn, tid).session_id == HOME
+
+
+def test_complete_takeover_does_not_rehome(kanban_home):
+    # complete is terminal: re-homing a finished card only moves it between
+    # conversations' counts (mq-review-card-closer runs complete --takeover).
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="MQ landing confirmed"):
+            assert kb.complete_task(conn, tid, result="x")
+        assert kb.get_task(conn, tid).session_id == HOME
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "takeover"]
+        assert len(ev) == 1 and "prev_session_id" not in ev[0].payload
+
+
+def test_cron_actor_takeover_does_not_rehome(kanban_home):
+    # Sweeps never re-home: a cron_* session adopting would pull the card out
+    # of its home conversation and route pings nowhere. The takeover event
+    # still records the actor.
+    cron_sid = "cron_1cd274c546db_20260925_205000"
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(cron_sid,), profile="default",
+                               foreign_ok="sweep"):
+            assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).session_id == HOME
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "takeover"]
+        assert len(ev) == 1
+        assert ev[0].payload["by_sessions"] == [cron_sid]
+        assert "prev_session_id" not in ev[0].payload
 
 
 def test_operator_override_does_not_rehome(kanban_home, monkeypatch):

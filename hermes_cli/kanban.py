@@ -1527,9 +1527,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                 help="Act on a card whose home session is another session "
                      "(or an unhomed card); records a takeover event and "
                      "posts REASON as a comment the home session sees. On "
-                     "assign/unblock/promote/reclaim/triage-resolve/complete "
+                     "assign/unblock/promote/reclaim/triage-resolve "
                      "it also RE-HOMES the card to your session (children "
-                     "and pings follow; prev_session_id kept in the event). "
+                     "and pings follow; prev_session_id kept in the event); "
+                     "never on complete, and never for cron/sweep actors. "
                      "Re-home without a status change: "
                      "hermes kanban edit <id> --session <sid> --takeover R.",
             )
