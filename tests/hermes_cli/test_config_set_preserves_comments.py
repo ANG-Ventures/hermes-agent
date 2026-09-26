@@ -143,3 +143,25 @@ def test_custom_toplevel_notice_only_for_custom_toplevel_keys(_isolated_hermes_h
 
     set_config_value("my_custom_toplevel_xyz", "1")
     assert "Custom top-level keys" in capsys.readouterr().out
+
+
+def test_backup_sibling_holds_exact_pre_write_bytes(_isolated_hermes_home):
+    """Every `config set` that changes the file leaves a config.yaml.bak-configset-* sibling with the
+    OLD bytes (t_6da78aab: the 09-25 daedalus rewrite had none; profile-config-keyguard also needs
+    it to accept a guarded-key change)."""
+    _write(_isolated_hermes_home)
+
+    set_config_value("agent.reasoning_effort", "high")
+
+    baks = sorted(_isolated_hermes_home.glob("config.yaml.bak-configset-*"))
+    assert len(baks) == 1, baks
+    assert baks[0].read_text(encoding="utf-8") == FIXTURE
+    assert _cfg(_isolated_hermes_home).read_text(encoding="utf-8") != FIXTURE
+
+
+def test_no_backup_when_nothing_changes(_isolated_hermes_home):
+    _write(_isolated_hermes_home)
+
+    set_config_value("agent.reasoning_effort", "medium")  # already medium in FIXTURE
+
+    assert list(_isolated_hermes_home.glob("config.yaml.bak-configset-*")) == []

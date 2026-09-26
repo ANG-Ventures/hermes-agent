@@ -6070,6 +6070,20 @@ def set_config_value(key: str, value: str, force: bool = False):
             file=sys.stderr,
         )
         sys.exit(1)
+    # Pre-write backup (2026-09-26, t_6da78aab follow-up). A comment-preserving rewrite with no
+    # backup is still how profiles/daedalus/config.yaml silently lost agent.max_turns 300->77 on
+    # 09-25 (a test harness resolved the wrong home and wrote the LIVE file). The sibling copy is
+    # also what scripts/profile-config-keyguard.py requires to ACCEPT a guarded-key change: it keeps
+    # the new value only when a config.yaml.bak* created <=300 s earlier holds the old one, so an
+    # intentional `config set` on a guarded key sticks instead of being reverted and paged.
+    if original_text and new_text != original_text:
+        import shutil
+        import time
+
+        backup = config_path.with_name(
+            f"{config_path.name}.bak-configset-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        )
+        shutil.copy2(config_path, backup)
     atomic_write_text(config_path, new_text, preserve_mode=True)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
