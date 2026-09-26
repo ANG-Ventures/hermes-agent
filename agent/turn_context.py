@@ -994,9 +994,17 @@ def build_turn_context(
                 tools=agent.tools or None,
             )
             # Post-compression target size: don't summarise a thread already
-            # below what compaction would reduce it to.
+            # below what compaction would reduce it to. The compressor may be
+            # a ContextCompressor OR a context-engine plugin (LCMEngine); only
+            # the former is guaranteed to carry ``summary_target_ratio``, so
+            # read it duck-typed exactly as conversation_compression does.
+            _idle_ratio = getattr(_compressor, "summary_target_ratio", None)
+            if not isinstance(_idle_ratio, (int, float)) or isinstance(_idle_ratio, bool):
+                _idle_ratio = getattr(
+                    getattr(_compressor, "_config", None), "target_ratio", 0.20
+                )
             _idle_floor = int(
-                _compressor.threshold_tokens * _compressor.summary_target_ratio
+                getattr(_compressor, "threshold_tokens", 0) * float(_idle_ratio)
             )
             _idle_cooldown = getattr(
                 _compressor, "get_active_compression_failure_cooldown", lambda: None
