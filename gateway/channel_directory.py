@@ -245,8 +245,15 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
         # Also include DM-capable users we've interacted with is not
         # feasible via guild enumeration; those come from sessions.
 
-    # Merge any DMs from session history
-    channels.extend(_build_from_sessions("discord"))
+    # Merge any DMs from session history, minus targets the adapter has
+    # negative-cached as deleted (404 10003) — a dead session origin must not
+    # be re-published as a send target on every rebuild.
+    is_dead = getattr(adapter, "_is_dead_channel", None)
+    for entry in _build_from_sessions("discord"):
+        ids = [entry.get("thread_id"), str(entry.get("id") or "").split(":")[0]]
+        if callable(is_dead) and any(i and is_dead(i) for i in ids):
+            continue
+        channels.append(entry)
     return channels
 
 

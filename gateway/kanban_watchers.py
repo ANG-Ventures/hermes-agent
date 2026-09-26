@@ -1426,6 +1426,10 @@ class GatewayKanbanWatchersMixin:
                             # is resolved (reset or bumped) by the wake
                             # outcome there, not by skipping the send here.
                             continue
+                        # A target the adapter classified as gone (deleted
+                        # chat/thread) never comes back: drop on the first
+                        # failure instead of burning MAX_SEND_FAILURES ticks.
+                        _target_gone = False
                         try:
                             _send_res = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
@@ -1438,6 +1442,9 @@ class GatewayKanbanWatchersMixin:
                             # None (or anything non-SendResult shaped) keep
                             # the legacy "no exception == delivered" contract.
                             if getattr(_send_res, "success", True) is False:
+                                _target_gone = (
+                                    getattr(_send_res, "error_kind", None) == "not_found"
+                                )
                                 raise RuntimeError(
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
@@ -1480,7 +1487,7 @@ class GatewayKanbanWatchersMixin:
                                 sub["task_id"], platform_str, fails,
                                 MAX_SEND_FAILURES, exc,
                             )
-                            if fails >= MAX_SEND_FAILURES:
+                            if fails >= MAX_SEND_FAILURES or _target_gone:
                                 logger.warning(
                                     "kanban notifier: dropping subscription "
                                     "%s on %s after %d consecutive send failures",
