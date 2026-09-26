@@ -116,7 +116,7 @@ def _failing_slice(work: Path) -> str:
 
 
 def _entry(node):
-    return {"node_id": node, "owner": "daedalus", "until": "2099-01-01", "evidence": []}
+    return {"node_id": node, "card": "t_162ffd04", "owner": "daedalus", "until": "2099-01-01", "evidence": []}
 
 
 def _run_verdict(work: Path, base_sha: str, outcome="failure"):
