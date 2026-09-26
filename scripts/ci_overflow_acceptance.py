@@ -128,9 +128,9 @@ def matrix_budget() -> CheckResult:
                 raise ValueError("scoped generator failed open; no scoped measurement")
             local = copy.deepcopy(matrix)
             for row in local["slice"]:
-                row["runs_on"] = '["self-hosted","Linux","X64","hermes-ci"]'
+                row["runs_on"] = '["ubuntu-latest"]'
             # Actions outputs are key=value plus newline; placement emits one more matrix.
-            generate = output_bytes(f"matrix={raw}\nlocal_matrix={json.dumps(local)}\nrequest_digest=sha256:{'0' * 64}\n")
+            generate = output_bytes(f"matrix={raw}\nfallback_matrix={json.dumps(local)}\nrequest_digest=sha256:{'0' * 64}\n")
             placement = output_bytes(f"matrix={raw}\ne2e_runs_on=[\"ubuntu-latest\"]\nplan_valid=true\n")
             counts[scope] = {"slices": len(matrix["slice"]), "generate_bytes_utf16": generate,
                              "placement_bytes_utf16": placement, "run_bytes_utf16": generate + placement}

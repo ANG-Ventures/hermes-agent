@@ -17,10 +17,10 @@ spec.loader.exec_module(integ)
 IF = "always() && !cancelled() && needs.generate.result == 'success'"
 MATRIX = ("${{ fromJSON(github.event_name != 'merge_group' && needs.generate.outputs.matrix || "
           "needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && "
-          "needs.placement.outputs.matrix || needs.generate.outputs.local_matrix) }}")
+          "needs.placement.outputs.matrix || needs.generate.outputs.fallback_matrix) }}")
 E2E_RUNS_ON = ("${{ github.event_name != 'merge_group' && fromJSON('[\"ubuntu-latest\"]') || "
                "fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && "
-               "needs.placement.outputs.e2e_runs_on || '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]') }}")
+               "needs.placement.outputs.e2e_runs_on || '[\"ubuntu-latest\"]') }}")
 
 
 def workflow(test_if=IF, matrix=MATRIX, e2e_if=IF, e2e_runs_on=E2E_RUNS_ON):
@@ -47,9 +47,11 @@ def test_p2b_fallback_predicate_passes():
 @pytest.mark.parametrize("mutant", [
     {"test_if": "!cancelled() && needs.generate.result == 'success'"},        # always() dropped
     {"e2e_if": "needs.generate.result == 'success'"},                          # e2e fallback dropped
-    {"matrix": MATRIX.replace(" || needs.generate.outputs.local_matrix", "")},  # no local fallback
+    {"matrix": MATRIX.replace(" || needs.generate.outputs.fallback_matrix", "")},  # no fallback
+    {"matrix": MATRIX.replace("outputs.fallback_matrix", "outputs.local_matrix")},  # no-plan -> local pool
     {"matrix": MATRIX.replace("needs.placement.outputs.plan_valid == 'true' && ", "")},
-    {"e2e_runs_on": E2E_RUNS_ON.replace(" || '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]'", "")},
+    {"e2e_runs_on": E2E_RUNS_ON.replace(" || '[\"ubuntu-latest\"]'", "")},
+    {"e2e_runs_on": E2E_RUNS_ON.replace("'[\"ubuntu-latest\"]') }}", "'[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]') }}")},
 ])
 def test_removing_any_fallback_guard_blocks(mutant):
     assert integ.fallback_predicate(workflow(**mutant))["status"] == "BLOCK"

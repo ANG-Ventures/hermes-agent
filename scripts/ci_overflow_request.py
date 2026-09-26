@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate-side CI overflow outputs: the all-local matrix and the placement request.
+"""Generate-side CI overflow outputs: placement's all-local input, the no-plan hosted fallback, the request.
 
 Runs in tests.yml's ``generate`` job right after ``run_tests_parallel.py
 --generate-slices``. Slice membership is computed ONCE by that generator; this
-script only relabels (``local_matrix``) and summarises (request artifact). The
+script only relabels (``local_matrix`` = placement input, ``hosted_fallback_matrix``
+= the merge_group matrix when there is no valid plan) and summarises (request artifact). The
 request carries slice ids, the core flag and duration weights — never file
 lists, test contents or shell (spec §5.1, parsed by ci_overflow_plan.parse_request).
 """
@@ -20,10 +21,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.ci_overflow_plan import POOL  # noqa: E402
+from scripts.ci_overflow_plan import POOL, X64  # noqa: E402
 from scripts import run_tests_parallel as rtp  # noqa: E402
 
 LOCAL_RUNS_ON = json.dumps(POOL, separators=(",", ":"))
+HOSTED_RUNS_ON = json.dumps(X64, separators=(",", ":"))
 E2E_JOB_ID = "e2e"
 LEGACY_NOTE = "policy=legacy, excluded_from_overflow_budget"
 
@@ -33,6 +35,17 @@ def local_matrix(matrix: dict) -> dict:
     out = copy.deepcopy(matrix)
     for row in out["slice"]:
         row["runs_on"] = LOCAL_RUNS_ON
+    return out
+
+
+def hosted_fallback_matrix(matrix: dict) -> dict:
+    """NO-PLAN MERGE_GROUP -> HOSTED (t_89964c9c, Apollo): the identical matrix with every slice on
+    GitHub-hosted x64. The merge queue head never waits on the local pool; with no validated plan
+    (controller refusal, dead placement, re-run) the pool may be drained or full -- the 2026-09-25
+    stall was 70 min on a starved X64 pool after 21 id-domain refusals. Hosted minutes are free here."""
+    out = copy.deepcopy(matrix)
+    for row in out["slice"]:
+        row["runs_on"] = HOSTED_RUNS_ON
     return out
 
 
@@ -69,6 +82,8 @@ def main(argv=None) -> int:
     request = build_request(matrix, durations, e2e_files)
     (args.out_dir / "request.json").write_text(json.dumps(request, separators=(",", ":")) + "\n", encoding="utf-8")
     (args.out_dir / "local_matrix.json").write_text(json.dumps(local_matrix(matrix)), encoding="utf-8")
+    (args.out_dir / "hosted_fallback_matrix.json").write_text(json.dumps(hosted_fallback_matrix(matrix)),
+                                                              encoding="utf-8")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary and (args.event != "merge_group" or args.managed.lower() != "true"):
         with open(summary, "a", encoding="utf-8") as fh:

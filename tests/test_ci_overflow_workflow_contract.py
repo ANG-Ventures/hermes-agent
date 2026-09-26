@@ -20,7 +20,7 @@ import yaml
 from scripts.ci_overflow_placement import (PlanInvalid, gate, poll, summary_markdown, validate_record,
                                            write_outputs)
 from scripts.ci_overflow_plan import ARM, POOL, X64, parse_request
-from scripts.ci_overflow_request import build_request, local_matrix
+from scripts.ci_overflow_request import build_request, hosted_fallback_matrix, local_matrix
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -174,22 +174,24 @@ PLACED["slice"][1]["runs_on"] = json.dumps(POOL, separators=(",", ":"))
 
 RUN_ATTEMPT = 2  # executing github.run_attempt in every scenario
 
+# Unusable plans carry e2e on POOL so an unbound/unvalidated read is distinguishable from the
+# hosted no-plan fallback (t_89964c9c: a valid plan and the fallback both put e2e on ubuntu-latest).
 PLACEMENT_OUTCOMES = {
     "skipped": {"result": "skipped", "outputs": {}},
     "valid": {"result": "success", "outputs": {"plan_valid": "true", "plan_attempt": str(RUN_ATTEMPT),
                                                "matrix": json.dumps(PLACED), "e2e_runs_on": json.dumps(X64)}},
     # "Re-run failed jobs": placement is NOT re-run; attempt N+1 reuses attempt N's
-    # outputs (measured live, runs 35966312383 / 36056222052). Must fall back local.
+    # outputs (measured live, runs 35966312383 / 36056222052). Must fall back (hosted).
     "reused-prior-attempt": {"result": "success", "outputs": {"plan_valid": "true", "plan_attempt": str(RUN_ATTEMPT - 1),
-                                                              "matrix": json.dumps(PLACED), "e2e_runs_on": json.dumps(X64)}},
+                                                              "matrix": json.dumps(PLACED), "e2e_runs_on": json.dumps(POOL)}},
     "valid-without-attempt": {"result": "success", "outputs": {"plan_valid": "true", "matrix": json.dumps(PLACED),
-                                                               "e2e_runs_on": json.dumps(X64)}},
+                                                               "e2e_runs_on": json.dumps(POOL)}},
     "invalid": {"result": "success", "outputs": {"plan_valid": "false"}},
     # the explicit flag, not the presence of a matrix, is what authorises it
     # (carries the CURRENT plan_attempt so the plan_valid guard is tested on its own)
     "invalid-with-matrix": {"result": "success", "outputs": {"plan_valid": "false", "plan_attempt": str(RUN_ATTEMPT),
                                                              "matrix": json.dumps(PLACED),
-                                                             "e2e_runs_on": json.dumps(X64)}},
+                                                             "e2e_runs_on": json.dumps(POOL)}},
     "failure": {"result": "failure", "outputs": {}},
     "timeout": {"result": "failure", "outputs": {}},
     "cancelled": {"result": "cancelled", "outputs": {}},
@@ -198,7 +200,7 @@ PLACEMENT_OUTCOMES = {
     # killed after writing plan_valid but job failed: must still fall back
     "failed-after-output": {"result": "failure", "outputs": {"plan_valid": "true", "plan_attempt": str(RUN_ATTEMPT),
                                                              "matrix": json.dumps(PLACED),
-                                                             "e2e_runs_on": json.dumps(X64)}},
+                                                             "e2e_runs_on": json.dumps(POOL)}},
 }
 
 
@@ -207,7 +209,7 @@ def _ctx(event, placement, runner_labels, enabled=False):
                                                        "CI_OVERFLOW_PLACEMENT_ENABLED": "true" if enabled else ""},
             "needs": {"generate": {"result": "success",
                                    "outputs": {"matrix": json.dumps(GEN_MATRIX),
-                                               "local_matrix": json.dumps(local_matrix(GEN_MATRIX)) if event == "merge_group" and enabled else ""}},
+                                               "fallback_matrix": json.dumps(hosted_fallback_matrix(GEN_MATRIX)) if event == "merge_group" and enabled else ""}},
                       "placement": placement}}
 
 
@@ -225,7 +227,7 @@ def _job_runs(job: dict, ctx: dict) -> bool:
 def check_fallback(doc: dict) -> list[str]:
     """Every placement outcome × event: test/e2e run, on the right matrix/labels."""
     jobs, errors = doc["jobs"], []
-    local = json.dumps(local_matrix(GEN_MATRIX))
+    fallback = json.dumps(hosted_fallback_matrix(GEN_MATRIX))
     for event in ("pull_request", "push", "merge_group"):
         for enabled in (False, True):
             for outcome, placement in PLACEMENT_OUTCOMES.items():
@@ -255,7 +257,8 @@ def check_fallback(doc: dict) -> list[str]:
                     elif outcome == "valid":
                         want, want_e2e = PLACED, X64
                     else:
-                        want, want_e2e = json.loads(local), POOL
+                        # t_89964c9c: no valid plan -> ALL hosted; the merge queue head never waits on the pool.
+                        want, want_e2e = json.loads(fallback), X64
                     if matrix != want:
                         errors.append(f"{where}: wrong matrix selected")
                     if e2e != want_e2e:
@@ -307,8 +310,24 @@ def test_mutating_attempt_binding_out_fails_integration(site):
 def test_mutating_managed_fallback_to_legacy_matrix_fails_integration():
     doc = _tests_yml()
     doc["jobs"]["test"]["strategy"]["matrix"] = doc["jobs"]["test"]["strategy"]["matrix"].replace(
-        "needs.generate.outputs.local_matrix", "needs.generate.outputs.matrix")
+        "needs.generate.outputs.fallback_matrix", "needs.generate.outputs.matrix")
     assert any("wrong matrix" in e for e in check_fallback(doc))
+
+
+def test_no_plan_merge_group_never_falls_back_to_the_local_pool():
+    """t_89964c9c (Apollo): a no-plan merge_group spills to GitHub-hosted, not the local X64 pool.
+    Re-pointing either fallback at the pool must go RED."""
+    doc = _tests_yml()
+    doc["jobs"]["e2e"]["runs-on"] = doc["jobs"]["e2e"]["runs-on"].replace(
+        """'["ubuntu-latest"]') }}""", """'["self-hosted","Linux","X64","hermes-ci"]') }}""")
+    assert any("e2e runs-on" in e and "merge_group/enabled=True" in e for e in check_fallback(doc))
+    doc = _tests_yml()
+    ctx = _ctx("merge_group", copy.deepcopy(PLACEMENT_OUTCOMES["failure"]), None, enabled=True)
+    ctx["needs"]["generate"]["outputs"]["fallback_matrix"] = json.dumps(local_matrix(GEN_MATRIX))
+    status = {"always": True, "cancelled": False, "failure": False, "success": True}
+    # the workflow takes whatever generate emitted, so the CONTENT is pinned at the producer:
+    assert evaluate(doc["jobs"]["test"]["strategy"]["matrix"], ctx, status) == local_matrix(GEN_MATRIX)
+    assert {r["runs_on"] for r in hosted_fallback_matrix(GEN_MATRIX)["slice"]} == {'["ubuntu-latest"]'}
 
 
 def test_static_routing_switch_mutation_fails_integration():
@@ -344,9 +363,10 @@ def test_placement_job_shape_and_permissions_exact():
     assert job["outputs"]["plan_attempt"] == "${{ steps.plan.outputs.plan_attempt }}"
 
 
-def test_generate_emits_local_matrix_and_request_artifact():
+def test_generate_emits_fallback_matrix_and_request_artifact():
     gen = _tests_yml()["jobs"]["generate"]
-    assert {"matrix", "local_matrix", "request_digest"} <= set(gen["outputs"])
+    assert {"matrix", "fallback_matrix", "request_digest"} <= set(gen["outputs"])
+    assert "local_matrix" not in gen["outputs"]  # placement reads the local matrix as an artifact only
     upload = next(s for s in gen["steps"] if s.get("id") == "request")
     assert upload["with"]["name"] == "ci-overflow-request-${{ github.run_id }}-${{ github.run_attempt }}"
     assert upload["with"]["path"] == "ci-overflow/request.json"
@@ -370,7 +390,7 @@ def test_generate_step_emits_local_output_only_on_managed_merge_group(tmp_path):
         proc = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=tmp_path, env=env,
                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
         assert proc.returncode == 0, proc.stderr
-        assert output.read_text().startswith("local_matrix=") == (event == "merge_group" and enabled == "true")
+        assert output.read_text().startswith("fallback_matrix=") == (event == "merge_group" and enabled == "true")
         assert (tmp_path / "ci-overflow" / "request.json").exists()
 
 
@@ -395,7 +415,7 @@ def test_matrices_never_travel_through_env():
     for job in _tests_yml()["jobs"].values():
         for step in job.get("steps", []):
             for key, value in (step.get("env") or {}).items():
-                assert "outputs.matrix" not in value and "outputs.local_matrix" not in value, (key, value)
+                assert "outputs.matrix" not in value and "outputs.fallback_matrix" not in value, (key, value)
                 assert "toJSON(needs" not in value, (key, value)  # measured E2BIG, run 35892732551
 
 
@@ -406,7 +426,7 @@ def test_fromjson_never_fed_a_possibly_missing_output():
         if "needs.placement.outputs" in expr:
             assert "needs.placement.result == 'success'" in expr and "plan_valid == 'true'" in expr
             assert "needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt)" in expr
-            assert expr.rstrip().endswith(("local_matrix", "'[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]'"))
+            assert expr.rstrip().endswith(("fallback_matrix", "'[\"ubuntu-latest\"]'"))
 
 
 def test_gate_cli_reads_results_from_env(tmp_path):
@@ -522,6 +542,9 @@ def test_local_matrix_membership_identical_real_generator(tmp_path, scope):
     local = json.loads((out / "local_matrix.json").read_text(encoding="utf-8"))
     assert _file_set(local) == _file_set(original)
     assert {row["runs_on"] for row in local["slice"]} == {json.dumps(POOL, separators=(",", ":"))}
+    hosted = json.loads((out / "hosted_fallback_matrix.json").read_text(encoding="utf-8"))
+    assert _file_set(hosted) == _file_set(original)
+    assert {row["runs_on"] for row in hosted["slice"]} == {json.dumps(X64, separators=(",", ":"))}
     raw = (out / "request.json").read_bytes()
     req = parse_request(raw)
     assert [s["job_id"] for s in req.slices] == [row["name"] for row in original["slice"]]
@@ -661,7 +684,7 @@ def test_place_without_digest_falls_back_without_network(tmp_path):
                           capture_output=True, text=True, timeout=60, cwd=ROOT)
     assert proc.returncode == 0, proc.stderr
     assert out.read_text(encoding="utf-8") == "plan_valid=false\n"
-    assert "local fallback" in summ.read_text(encoding="utf-8")
+    assert "hosted fallback" in summ.read_text(encoding="utf-8")
 
 
 def test_summary_table_columns():

@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ci_overflow_acceptance import CheckResult, api, check, command  # noqa: E402
 
 LOCAL_LABELS = ["self-hosted", "Linux", "X64", "hermes-ci"]
+HOSTED_LABELS = ["ubuntu-latest"]  # no-plan merge_group fallback (t_89964c9c)
 # Identifiers of the controller App (app_id, installation_id, client_id, 1Password item id, key-file
 # name). Public ids, but their presence on an Actions surface would mean the identity leaked there.
 CONTROLLER_IDENTITY = re.compile(
@@ -46,7 +47,8 @@ def _jobs(workflow_text: str) -> dict:
 
 
 def fallback_predicate(workflow_text: str) -> CheckResult:
-    """merge_group local fallback must survive a dead/failed/timed-out placement (spec §5.1)."""
+    """merge_group hosted fallback must survive a dead/failed/timed-out placement (spec §5.1; hosted,
+    not local, since t_89964c9c: the queue head never waits on the pool)."""
     name = "fallback_predicate_static"
     jobs = _jobs(workflow_text)
     problems = []
@@ -59,14 +61,15 @@ def fallback_predicate(workflow_text: str) -> CheckResult:
         if "placement" not in (job.get("needs") or []):
             problems.append(f"{job_id} does not need placement")
     matrix = str(((jobs.get("test") or {}).get("strategy") or {}).get("matrix", ""))
-    if not matrix.rstrip("} ").endswith("needs.generate.outputs.local_matrix)"):
-        problems.append("test matrix does not end in the generate.local_matrix fallback")
+    if not matrix.rstrip("} ").endswith("needs.generate.outputs.fallback_matrix)"):
+        problems.append("test matrix does not end in the generate.fallback_matrix (hosted) fallback")
     for gate in ("needs.placement.result == 'success'", "needs.placement.outputs.plan_valid == 'true'"):
         if gate not in matrix:
             problems.append(f"placement matrix not gated by {gate!r}")
     e2e_runs_on = str((jobs.get("e2e") or {}).get("runs-on", ""))
-    if json.dumps(LOCAL_LABELS).replace(" ", "") not in e2e_runs_on.replace(" ", "").replace("'", ""):
-        problems.append("e2e runs-on has no fixed local-label fallback")
+    if not e2e_runs_on.replace(" ", "").replace("'", "").rstrip("}").endswith(
+            json.dumps(HOSTED_LABELS).replace(" ", "") + ")"):
+        problems.append("e2e runs-on has no fixed hosted-label fallback")
     evidence = {"test_if": str((jobs.get("test") or {}).get("if")), "e2e_if": str((jobs.get("e2e") or {}).get("if")),
                 "problems": problems}
     return check(name, "BLOCK" if problems else "PASS", evidence, "; ".join(problems))
@@ -325,7 +328,7 @@ NOT_RUN = {
     "ac3_live_executed_delayed_ambiguous_charged": "executed/delayed/ambiguous hosted jobs stay charged",
     "ac3_live_missing_corrupt_ledger": "missing/corrupt ledger -> no cloud + page",
     "ac4_pages_delivered": "pool-offline + budget-exhausted delivered to #alerts, retry, dedupe, #logs recovery",
-    "fallback_live_placement_failures": "placement exception/timeout/cancel + controller outage -> all local on a real merge_group",
+    "fallback_live_placement_failures": "placement exception/timeout/cancel + controller outage -> all hosted on a real merge_group",
 }
 
 

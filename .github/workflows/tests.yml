@@ -36,11 +36,12 @@ jobs:
     outputs:
       # Legacy/original matrix: the ONLY matrix non-merge_group events run.
       matrix: ${{ steps.matrix.outputs.matrix }}
-      # CI overflow (spec §5.1): the same slices with every runs_on forced to
-      # the local X64 pool — the merge_group fallback when placement has no
-      # validated plan. Never the legacy matrix: that one may already carry
-      # unreserved hosted labels.
-      local_matrix: ${{ steps.overflow.outputs.local_matrix }}
+      # CI overflow: the same slices with every runs_on forced to GitHub-hosted
+      # x64 — the merge_group fallback when placement has no validated plan.
+      # The merge queue head never waits on the local pool (t_89964c9c: 70-min
+      # stall on a starved X64 pool after 21 refusals). Never the legacy
+      # matrix: that one routes slices 1..K to the pool.
+      fallback_matrix: ${{ steps.overflow.outputs.fallback_matrix }}
       request_digest: ${{ steps.request.outputs.artifact-digest }}
     steps:
       - name: Checkout code
@@ -117,12 +118,12 @@ jobs:
         run: |
           python3 scripts/ci_overflow_request.py --matrix-file ci-overflow/matrix.json --out-dir ci-overflow --event "$EVENT_NAME" --managed "$MANAGED_PLACEMENT"
           if [[ "$EVENT_NAME" == "merge_group" && "$MANAGED_PLACEMENT" == "true" ]]; then
-            echo "local_matrix=$(cat ci-overflow/local_matrix.json)" >> "$GITHUB_OUTPUT"
+            echo "fallback_matrix=$(cat ci-overflow/hosted_fallback_matrix.json)" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload CI overflow request
         id: request
-        # A failed upload only means no plan: placement falls back to local.
+        # A failed upload only means no plan: merge_group falls back to hosted.
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -144,7 +145,8 @@ jobs:
 
   # Read-only consumer of the external controller's ledger plan (spec §5.1).
   # merge_group only; any failure/timeout/mismatch leaves plan_valid unset or
-  # false and the test/e2e jobs below select generate.local_matrix instead.
+  # false and the test/e2e jobs below select generate.fallback_matrix (all
+  # GitHub-hosted) instead.
   placement:
     name: Placement
     needs: generate
@@ -154,7 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # A dead placement (checkout/runner failure, 5-min kill) must not fail the
-    # required check: the fallback already ran every slice locally. Only a
+    # required check: the fallback already ran every slice hosted. Only a
     # validated plan ever writes plan_valid=true, so this cannot admit one.
     continue-on-error: true
     permissions:
@@ -166,7 +168,7 @@ jobs:
       # The run_attempt this plan was admitted for. "Re-run failed jobs" reuses
       # this job's outputs in attempt N+1 WITHOUT re-running it, so test/e2e take
       # the plan only when plan_attempt == github.run_attempt; a selective re-run
-      # therefore runs all-local (no allowance). A full re-run re-plans.
+      # therefore runs all-hosted (no allowance). A full re-run re-plans.
       plan_attempt: ${{ steps.plan.outputs.plan_attempt }}
     steps:
       - name: Checkout code
@@ -197,7 +199,7 @@ jobs:
     name: Run tests ${{ matrix.slice.name }}
     needs: [generate, placement]
     # always(): run even though placement is skipped (non-merge_group) or
-    # failed/timed out (merge_group local fallback). Placement changes labels
+    # failed/timed out (merge_group hosted fallback). Placement changes labels
     # only; membership always comes from generate.
     if: always() && !cancelled() && needs.generate.result == 'success'
     # Per-slice runner class, stamped by the generate job (see its
@@ -211,8 +213,8 @@ jobs:
       fail-fast: false
       # Static routing remains the default for every event, including
       # merge_group, until Phase-4 activation. Managed placement is selected
-      # only with the explicit switch; a failed plan then uses all-local.
-      matrix: ${{ fromJSON((github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && needs.generate.outputs.matrix || needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.matrix || needs.generate.outputs.local_matrix) }}
+      # only with the explicit switch; a failed plan then uses all-hosted.
+      matrix: ${{ fromJSON((github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && needs.generate.outputs.matrix || needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.matrix || needs.generate.outputs.fallback_matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -366,8 +368,8 @@ jobs:
     needs: [generate, placement]
     if: always() && !cancelled() && needs.generate.result == 'success'
     # Static routing (including merge_group with the switch OFF) retains the
-    # legacy X64 expression. Managed mode uses plan labels or fixed local.
-    runs-on: ${{ (github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON('["ubuntu-latest"]')) || fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || '["self-hosted","Linux","X64","hermes-ci"]') }}
+    # legacy X64 expression. Managed mode uses plan labels or fixed hosted x64.
+    runs-on: ${{ (github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && fromJSON(format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","'))) || fromJSON('["ubuntu-latest"]')) || fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || '["ubuntu-latest"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout code
