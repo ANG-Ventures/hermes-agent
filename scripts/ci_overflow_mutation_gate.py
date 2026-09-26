@@ -55,6 +55,18 @@ CASES = [
      "object_pairs_hook=None)", "raw_wire_corrupt and duplicate", "tests/test_ci_overflow_ledger.py"),
     ("C33-version-not-exact-int", "scripts/ci_overflow_ledger.py", " or type(data[\"version\"]) is not int\n", "\n",
      "version", "tests/test_ci_overflow_ledger.py"),
+    # t_38a419e0: hosted jobs charge measured billed minutes; closed rows fold on every admission.
+    ("F2-hosted-actual-ignored", "scripts/ci_overflow_ledger.py", "elif HOSTED not in entry:", "elif False:",
+     "test_hosted_reconcile_releases_unused_remainder", "tests/test_ci_overflow_ledger.py"),
+    ("F2-charge-flat-reservation", "scripts/ci_overflow_ledger.py", "return job.get(HOSTED, job[\"reserved_minutes\"])",
+     "return job[\"reserved_minutes\"]", "test_admit_and_reconcile_n_runs", "tests/test_ci_overflow_ledger.py"),
+    ("F2-fold-only-past-soft-limit", "scripts/ci_overflow_ledger.py", "            self._compact(state, today)\n",
+     "            if len(_encode(state)) >= SOFT_LIMIT:\n                self._compact(state, today)\n",
+     "test_reserve_folds_closed_rows_below_soft_limit", "tests/test_ci_overflow_ledger.py"),
+    ("F2-hosted-bound-unchecked", "scripts/ci_overflow_ledger.py", "or not 0 < job[HOSTED] <= job[\"reserved_minutes\"]",
+     "or False", "test_corrupt_hosted_minutes_refused", "tests/test_ci_overflow_ledger.py"),
+    ("F2-billed-without-runner", "scripts/ci_overflow_ledger.py", "            or not job.get(\"runner_name\")):",
+     "            or False):", "no-runner", "tests/test_ci_overflow_ledger.py"),
 ]
 
 
