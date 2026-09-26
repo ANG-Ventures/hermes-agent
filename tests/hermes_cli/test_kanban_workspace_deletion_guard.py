@@ -1471,3 +1471,65 @@ def test_completion_commits_before_cleanup_so_the_workspace_is_removed(kanban_ho
     )
     lines = _audit_lines()
     assert any("\tDELETE\t" in ln and "reason=complete_task" in ln for ln in lines), lines
+
+
+# ---------------------------------------------------------------------------
+# Configured ``kanban.workspaces_root`` (RAM-disk scratch) is a managed root
+# ---------------------------------------------------------------------------
+#
+# t_bbea6686: with ``kanban.workspaces_root: /Volumes/ramscratch/kanban-workspaces``
+# every scratch dir lives at ``<root>/<board>/<task>``, but the containment
+# gate only knew the legacy ``<home>/kanban/workspaces`` roots. Every GC/reaper
+# removal outside a worker's env pin was refused ("not a strict descendant")
+# and the ramdisk filled (92 GB / 334 dirs).
+
+
+def _configure_root(home: Path, root: Path) -> None:
+    (home / "config.yaml").write_text(
+        "kanban:\n  workspaces_root: " + str(root) + "\n", encoding="utf-8"
+    )
+
+
+def test_configured_root_workspace_of_done_card_is_removable(kanban_home, tmp_path):
+    root = tmp_path / "ramscratch" / "kanban-workspaces"
+    _configure_root(kanban_home, root)
+    board_root = root / kb.DEFAULT_BOARD
+    task_id = _mktask("finished on the ramdisk")
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        conn.commit()
+    ws = board_root / task_id
+    ws.mkdir(parents=True)
+    (ws / "artifact.txt").write_text("x\n", encoding="utf-8")
+
+    assert kb._is_managed_scratch_path(ws) is True
+    assert kb.safe_remove_workspace_dir(ws, task_id=task_id, reason="test") is True
+    assert not ws.exists()
+    assert board_root.is_dir()
+
+
+def test_configured_root_resolves_through_a_symlinked_spelling(kanban_home, tmp_path):
+    real = tmp_path / "mount" / "kanban-workspaces"
+    (real / kb.DEFAULT_BOARD).mkdir(parents=True)
+    link = tmp_path / "alias"
+    link.symlink_to(tmp_path / "mount")
+    _configure_root(kanban_home, link / "kanban-workspaces")
+    ws = real / kb.DEFAULT_BOARD / "t_deadbeef"
+    ws.mkdir()
+    assert kb._is_managed_scratch_path(ws) is True
+
+
+def test_configured_root_itself_and_non_board_paths_still_refuse(kanban_home, tmp_path):
+    root = tmp_path / "ramscratch" / "kanban-workspaces"
+    _configure_root(kanban_home, root)
+    board_root = root / kb.DEFAULT_BOARD
+    stray = root / "not-a-board" / "t_cafef00d"
+    stray.mkdir(parents=True)
+    board_root.mkdir(parents=True)
+    outside = tmp_path / "ramscratch" / "worktrees" / "t_cafef00d"
+    outside.mkdir(parents=True)
+
+    for refused in (root, board_root, stray, outside):
+        assert kb._is_managed_scratch_path(refused) is False, refused
+        assert kb.safe_remove_workspace_dir(refused, task_id=None, reason="test") is False
+        assert refused.is_dir()

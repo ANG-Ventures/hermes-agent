@@ -17,10 +17,13 @@ spec.loader.exec_module(integ)
 IF = "always() && !cancelled() && needs.generate.result == 'success'"
 MATRIX = ("${{ fromJSON(github.event_name != 'merge_group' && needs.generate.outputs.matrix || "
           "needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && "
-          "needs.placement.outputs.matrix || needs.generate.outputs.local_matrix) }}")
-E2E_RUNS_ON = ("${{ github.event_name != 'merge_group' && fromJSON('[\"ubuntu-latest\"]') || "
-               "fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && "
-               "needs.placement.outputs.e2e_runs_on || '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]') }}")
+          "needs.placement.outputs.matrix || needs.generate.outputs.matrix) }}")
+# t_42bed567: no plan -> the static split (CI_RUNNER_LABELS), never the all-local pool.
+LOCAL_POOL = "'[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]'"
+STATIC_E2E = ("(contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') && "
+              "format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"')) || '[\"ubuntu-latest\"]')")
+E2E_RUNS_ON = ("${{ fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && "
+               "needs.placement.outputs.e2e_runs_on || " + STATIC_E2E + ") }}")
 
 
 def workflow(test_if=IF, matrix=MATRIX, e2e_if=IF, e2e_runs_on=E2E_RUNS_ON):
@@ -44,12 +47,20 @@ def test_p2b_fallback_predicate_passes():
     assert integ.fallback_predicate(workflow())["status"] == "PASS"
 
 
+def test_real_tests_yml_passes_fallback_and_attempt_gates():
+    text = (SCRIPTS.parent / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+    assert integ.fallback_predicate(text)["status"] == "PASS", integ.fallback_predicate(text)
+    assert integ.plan_bound_to_attempt(text)["status"] == "PASS"
+
+
 @pytest.mark.parametrize("mutant", [
     {"test_if": "!cancelled() && needs.generate.result == 'success'"},        # always() dropped
     {"e2e_if": "needs.generate.result == 'success'"},                          # e2e fallback dropped
-    {"matrix": MATRIX.replace(" || needs.generate.outputs.local_matrix", "")},  # no local fallback
+    {"matrix": MATRIX.replace(" || needs.generate.outputs.matrix) }}", ") }}")},  # no static fallback
+    {"matrix": MATRIX.replace("|| needs.generate.outputs.matrix) }}", "|| needs.generate.outputs.local_matrix) }}")},  # all-local
     {"matrix": MATRIX.replace("needs.placement.outputs.plan_valid == 'true' && ", "")},
-    {"e2e_runs_on": E2E_RUNS_ON.replace(" || '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]'", "")},
+    {"e2e_runs_on": E2E_RUNS_ON.replace(" || " + STATIC_E2E, "")},  # no static fallback
+    {"e2e_runs_on": E2E_RUNS_ON.replace(STATIC_E2E, LOCAL_POOL)},  # all-local
 ])
 def test_removing_any_fallback_guard_blocks(mutant):
     assert integ.fallback_predicate(workflow(**mutant))["status"] == "BLOCK"
