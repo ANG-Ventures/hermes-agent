@@ -57,15 +57,6 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
-    # mem0 background-review write helper — resident in tools[] so the
-    # background-review fork (which inherits the parent's tool schemas) can SEE
-    # it; its own toolset "memory_write" keeps it OUT of the fork's default
-    # ["memory","skills"] dispatch whitelist (denied-not-absent), and the
-    # memory.background_review_mem0_write flag adds it to that whitelist when on.
-    # check_mem0_remember_requirements gates it off non-mem0 profiles. Without
-    # this line the schema never reaches the model and the feature is silently
-    # dark (the model cannot call a tool it cannot see).
-    "mem0_remember",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the

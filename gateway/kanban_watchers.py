@@ -928,6 +928,13 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        from gateway.kanban_notify_failures import (
+            LaneFailureDedupe,
+            format_failure_notice,
+        )
+
+        lane_dedupe: LaneFailureDedupe = getattr(self, "_kanban_lane_dedupe", None) or LaneFailureDedupe()
+        self._kanban_lane_dedupe = lane_dedupe
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -1161,6 +1168,8 @@ class GatewayKanbanWatchersMixin:
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
+                # One message per failure event, one per lane-wide cause.
+                lane_dedupe.plan(deliveries)
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -1220,6 +1229,7 @@ class GatewayKanbanWatchersMixin:
                     wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        lane_key = None
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -1289,15 +1299,25 @@ class GatewayKanbanWatchersMixin:
                                     f"<card|PR|sha>`; otherwise re-scope it.{err}"
                                 )
                             else:
-                                msg = (
-                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                    f"after repeated spawn failures{err}"
+                                directive = d["failure_directives"].get(ev.id)
+                                if directive is None:
+                                    continue
+                                msg = format_failure_notice(
+                                    kind, ev.payload, task_id=sub["task_id"],
+                                    board_tag=board_tag, tag=tag,
+                                    assignee=who or "", directive=directive,
                                 )
+                                lane_key = directive.get("lane_key")
                         elif kind == "crashed":
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                            directive = d["failure_directives"].get(ev.id)
+                            if directive is None:
+                                continue
+                            msg = format_failure_notice(
+                                kind, ev.payload, task_id=sub["task_id"],
+                                board_tag=board_tag, tag=tag,
+                                assignee=who or "", directive=directive,
                             )
+                            lane_key = directive.get("lane_key")
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
@@ -1469,6 +1489,7 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                            lane_dedupe.mark_sent(lane_key)
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
