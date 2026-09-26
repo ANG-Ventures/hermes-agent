@@ -5,6 +5,7 @@ import base64
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+import math
 import json
 import re
 import time
@@ -21,6 +22,34 @@ ROW_FIELDS = {"admitted_on", "terminal_on", "jobs", "plan"}
 PLAN_FIELDS = {"jobs", "incidents", "summary"}
 JOB_FIELDS = {"job_id", "labels", "reserved_minutes", "reason", "released_unemitted"}
 RECEIPT = "release_receipt_sha256"
+# Minutes a completed hosted job actually billed (<= its reservation), recorded at reconcile. The
+# unused remainder of the reservation returns to the day's allowance (t_38a419e0: a 580-min plan
+# measured ~65 min actual; charging the flat reservation drained the 6000-min day by 20:45Z).
+HOSTED = "hosted_minutes"
+
+
+def _charge(job):
+    """What one persisted job consumes: nothing once released, else its measured hosted minutes
+    when reconcile recorded them, else the full reservation."""
+    if job.get("released_unemitted", False):
+        return 0
+    return job.get(HOSTED, job["reserved_minutes"])
+
+
+def _billed_minutes(job):
+    """GitHub bills each hosted job rounded UP to the whole minute. None unless the job is a
+    completed hosted execution with a parseable, ordered started_at/completed_at pair."""
+    if (job.get("status") != "completed" or job.get("labels") not in (X64, ARM)
+            or not job.get("runner_name")):
+        return None
+    try:
+        start = datetime.fromisoformat(str(job.get("started_at")).replace("Z", "+00:00"))
+        end = datetime.fromisoformat(str(job.get("completed_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if start.tzinfo is None or end.tzinfo is None or end < start:
+        return None
+    return max(1, math.ceil((end - start).total_seconds() / 60))
 
 
 @dataclass(frozen=True)
@@ -92,8 +121,15 @@ def _validate(state, today):
         for job, planned in zip(jobs, raw["jobs"]):
             if type(job) is not dict or type(planned) is not dict:
                 raise ValueError("corrupt job")
-            if set(job) != JOB_FIELDS | ({RECEIPT} if job.get("released_unemitted") is True else set()):
+            hosted = HOSTED in job
+            if set(job) != (JOB_FIELDS | ({RECEIPT} if job.get("released_unemitted") is True or hosted else set())
+                            | ({HOSTED} if hosted else set())):
                 raise ValueError("corrupt job fields")
+            if hosted and (terminal is None or job.get("released_unemitted") is not False
+                           or type(job[HOSTED]) is not int or type(job.get("reserved_minutes")) is not int
+                           or not 0 < job[HOSTED] <= job["reserved_minutes"]
+                           or type(job.get(RECEIPT)) is not str or not re.fullmatch(r"[0-9a-f]{64}", job[RECEIPT])):
+                raise ValueError("corrupt job")
             name, labels, charge = job.get("job_id"), job.get("labels"), job.get("reserved_minutes")
             if (type(name) is not str or not name or name in seen
                     or set(planned) != {"job_id", "labels", "reserved_minutes", "reason"}
@@ -158,7 +194,7 @@ class Ledger:
             terminal = record["terminal_on"]
             if admitted != day and terminal is not None and terminal < day:
                 continue
-            consumed += sum(j["reserved_minutes"] for j in record["jobs"] if not j.get("released_unemitted", False))
+            consumed += sum(_charge(j) for j in record["jobs"])
         return consumed
 
     @staticmethod
@@ -171,7 +207,7 @@ class Ledger:
         for key, row in list(state["attempts"].items()):
             terminal = row["terminal_on"]
             if terminal and (terminal < day or terminal == row["admitted_on"]):
-                amount = sum(j["reserved_minutes"] for j in row["jobs"] if not j.get("released_unemitted", False))
+                amount = sum(_charge(j) for j in row["jobs"])
                 state["daily_totals"][row["admitted_on"]] = state["daily_totals"].get(row["admitted_on"], 0) + amount
                 del state["attempts"][key]
 
@@ -197,8 +233,11 @@ class Ledger:
                 raw = state["attempts"][ident]["plan"]
                 return Reservation(_plan(raw), True)
             today = self._today()
-            if len(_encode(state)) >= SOFT_LIMIT:
-                self._compact(state, today)
+            # Fold on EVERY admission, not only past SOFT_LIMIT (t_38a419e0): daily_totals[today] then
+            # holds every closed attempt's charge, so it and remaining_allowance describe the same
+            # day (limit - remaining == daily_totals[today] + outstanding rows) instead of
+            # daily_totals reading 0 while unfolded terminal rows carry the whole day.
+            self._compact(state, today)
             if len(_encode(state)) >= HARD_LIMIT:
                 return Refusal("state-capacity")
             remaining = max(0, self.daily_limit - self._consumed(state, today))
@@ -258,7 +297,7 @@ class Ledger:
             if len(names) != len(set(names)) or any(j.get("status") not in {"queued", "in_progress", "completed", "cancelled"} for j in observed):
                 return ReleaseResult(0)
             mapping = {j["name"]: j for j in observed}
-            to_release = []
+            to_release, to_bill = [], []
             for entry in row["jobs"]:
                 if not entry["reserved_minutes"] or entry.get("released_unemitted"):
                     continue
@@ -267,9 +306,13 @@ class Ledger:
                     to_release.append(entry)
                 elif job.get("labels") == POOL and job.get("runner_name"):
                     to_release.append(entry)
-                # Hosted, canceled, or ambiguous runner identity: no refund.
+                elif HOSTED not in entry:
+                    billed = _billed_minutes(job)
+                    if billed is not None and billed < entry["reserved_minutes"]:
+                        to_bill.append((entry, billed))
+                # Canceled, unmeasurable, or ambiguous runner identity: no refund.
             day = self._today()
-            changed = bool(to_release) or row["terminal_on"] is None
+            changed = bool(to_release) or bool(to_bill) or row["terminal_on"] is None
             if not changed:
                 return ReleaseResult(0)
             row["terminal_on"] = day
@@ -279,6 +322,11 @@ class Ledger:
                 entry["released_unemitted"] = True
                 entry["release_receipt_sha256"] = receipt
                 amount += entry["reserved_minutes"]
+            for entry, billed in to_bill:
+                entry[HOSTED] = billed
+                entry[RECEIPT] = receipt
+                amount += entry["reserved_minutes"] - billed
+            self._compact(state, day)
             try:
                 self._write(state, sha)
                 return ReleaseResult(amount)
@@ -286,6 +334,8 @@ class Ledger:
                 try:
                     current, _ = self._read()
                     check = current["attempts"].get(ident)
+                    if check is None and ident not in state["attempts"]:
+                        return ReleaseResult(0)  # folded by our own write: it landed terminal
                     if check and check["terminal_on"] and all(any(
                             j["job_id"] == e["job_id"] and j.get("released_unemitted")
                             for j in check["jobs"]) for e in to_release):
