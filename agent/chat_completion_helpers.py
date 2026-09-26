@@ -225,6 +225,13 @@ def _emit_api_call_record(
         # when it rewrote history on purpose. Consumed here so it tags exactly
         # the first request after the compaction.
         session_key = str(getattr(agent, "session_id", "") or "")
+        # A background-review fork shares the parent's session_id; keyed
+        # together, every fork request became the main lane's baseline and
+        # the next main request was diffed against the fork. Give forks their
+        # own chain, and start it fresh per fork turn.
+        is_review_fork = getattr(agent, "_memory_write_origin", None) == "background_review"
+        if is_review_fork and session_key:
+            session_key = f"{session_key}:review"
         prefix_reset = getattr(agent, "_blackbox_prefix_reset", None)
         if prefix_reset is not None:
             agent._blackbox_prefix_reset = None
@@ -247,6 +254,7 @@ def _emit_api_call_record(
             api_kwargs=api_kwargs if isinstance(api_kwargs, dict) else None,
             session_key=session_key or None,
             prefix_reset=str(prefix_reset) if prefix_reset else None,
+            prefix_compare_across_turns=not is_review_fork,
         )
     except Exception:
         _note_api_call_recording_failure(agent)
