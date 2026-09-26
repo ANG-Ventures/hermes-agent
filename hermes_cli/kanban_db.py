@@ -9366,10 +9366,28 @@ def complete_task(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
         )
         if still_open:
+            # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
+            # DraftPrError, nothing mutated), update a stale head, arm a green
+            # non-milestone PR through fleet-merge.sh.
+            from hermes_cli import kanban_pr_freshness as _fresh
+            try:
+                freshness = _fresh.check(
+                    still_open, task_id=task_id,
+                    allow_arm=not is_milestone_card(conn, task_id),
+                )
+            except _fresh.DraftPrError as draft_err:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_draft_pr",
+                        {"prs": draft_err.prs},
+                    )
+                raise
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])
+            if freshness.get("prs"):
+                routed_meta["handoff_freshness"] = freshness
             routed_summary = "\n".join(filter(None, [note, summary or result]))
             ok = request_review(
                 conn, task_id, summary=routed_summary, metadata=routed_meta,

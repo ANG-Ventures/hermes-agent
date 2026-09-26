@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -4171,6 +4172,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
+            except DraftPrError as draft_err:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
+                continue
             if not done:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -4466,17 +4471,21 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        ok, reason = kb.request_review(
-            conn,
-            tid,
-            summary=summary,
-            metadata=metadata,
-            reviewer=reviewer,
-            expected_run_id=_worker_run_id_for(tid),
-            force=bool(getattr(args, "force", False)),
-            allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
-            with_reason=True,
-        )
+        try:
+            ok, reason = kb.request_review(
+                conn,
+                tid,
+                summary=summary,
+                metadata=metadata,
+                reviewer=reviewer,
+                expected_run_id=_worker_run_id_for(tid),
+                force=bool(getattr(args, "force", False)),
+                allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
+                with_reason=True,
+            )
+        except DraftPrError as draft_err:
+            print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
+            return 1
         if not ok:
             detail = reason or "not running/ready?"
             print(
