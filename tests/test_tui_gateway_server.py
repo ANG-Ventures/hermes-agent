@@ -9751,7 +9751,9 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
         server._sessions.pop("sid", None)
 
 
-@pytest.mark.parametrize("slow_provider_resolution", [False, True])
+@pytest.mark.parametrize(
+    "interleaving", ["fast", "slow_resolution", "request_during_build"]
+)
 @pytest.mark.parametrize(
     ("provider_flag", "failure_text"),
     [
@@ -9760,7 +9762,7 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
     ],
 )
 def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
-    monkeypatch, tmp_path, provider_flag, failure_text, slow_provider_resolution
+    monkeypatch, tmp_path, provider_flag, failure_text, interleaving
 ):
     """Recovery waits for the real failed build and uses its owning profile.
 
@@ -9773,10 +9775,16 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
     test, so the real lookup did a live GET (up to 15s timeout) inside the
     build thread, ahead of the 10s barrier below. A slow models.dev on a CI
     runner failed the first case, and its leaked build thread then ran the
-    second case's fakes. ``slow_provider_resolution`` forces that interleaving
+    second case's fakes. ``slow_resolution`` forces that interleaving
     deterministically: provider resolution stalls ahead of the failure, and the
     sequence below must be driven by the build's own events, not by how fast
     the registry answers.
+
+    ``request_during_build`` sends config.set while that first build is still
+    resolving its provider (started, not ready, ``agent_error`` still None).
+    The switch must wait for the in-flight build and then take the same
+    failed-build recovery, not race it (explicit provider) or return its init
+    error (no provider flag).
     """
     from agent.secret_scope import current_secret_scope
     from hermes_constants import get_hermes_home
@@ -9951,6 +9959,8 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
     release_resolution = threading.Event()
     network_calls = []
 
+    slow_provider_resolution = interleaving != "fast"
+
     def fake_fetch_models_dev(*_args, **_kwargs):
         if slow_provider_resolution and not resolution_entered.is_set():
             resolution_entered.set()
@@ -9993,15 +10003,22 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
             assert resolution_entered.wait(timeout=10)
             assert not old_finally_entered.is_set()
             assert session["agent_error"] is None
+            if interleaving == "request_during_build":
+                request_thread.start()
+                assert old_ready.wait_entered.wait(timeout=2), (
+                    "model switch did not wait for the in-flight build"
+                )
+                assert not switch_called.is_set()
             release_resolution.set()
         assert old_finally_entered.wait(timeout=10)
         assert session["agent_error"] == failure_text
         assert not old_ready.is_set()
 
-        request_thread.start()
-        assert old_ready.wait_entered.wait(timeout=2), (
-            "model recovery did not wait for the failed build generation"
-        )
+        if interleaving != "request_during_build":
+            request_thread.start()
+            assert old_ready.wait_entered.wait(timeout=2), (
+                "model recovery did not wait for the failed build generation"
+            )
         assert not switch_called.is_set()
         release_old_finally.set()
         request_thread.join(timeout=10)
