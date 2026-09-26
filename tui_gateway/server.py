@@ -368,15 +368,6 @@ _LONG_HANDLERS = frozenset(
         "slash.exec",
     }
 )
-_SESSION_DB_HEAVY_METHODS = frozenset(
-    {
-        "insights.get",
-        "projects.project_sessions",
-        "projects.tree",
-        "session.list",
-        "session.most_recent",
-    }
-)
 
 try:
     _rpc_pool_workers = max(
@@ -3027,15 +3018,6 @@ def _err(rid, code: int, msg: str, data: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": error}
 
 
-def is_session_db_heavy_method(method: str | None) -> bool:
-    return method in _SESSION_DB_HEAVY_METHODS
-
-
-def backend_busy_error(rid, exc) -> dict:
-    payload = exc.to_payload() if hasattr(exc, "to_payload") else {"retryable": True}
-    return _err(rid, 5038, "backend busy; retry shortly", payload)
-
-
 def method(name: str):
     def dec(fn):
         _methods[name] = fn
@@ -3171,21 +3153,6 @@ def handle_request(req: dict) -> dict | None:
         _current_rpc_method.reset(token)
         if box is not None and box.get("ticket") is not None:
             box["ticket"].release()
-
-
-def handle_request_bound(req: dict, transport: Optional[Transport] = None) -> dict | None:
-    """Handle one request with dispatch()'s transport binding, synchronously.
-
-    WebSocket heavy-read RPCs call this under an async-side semaphore. Going
-    straight to ``handle_request`` keeps the semaphore held until the DB scan is
-    done instead of releasing after ``dispatch`` merely schedules a pool worker.
-    """
-    t = transport or _stdio_transport
-    token = bind_transport(t)
-    try:
-        return handle_request(req)
-    finally:
-        reset_transport(token)
 
 
 def _current_session_steer_authority(
@@ -6873,53 +6840,6 @@ def _apply_model_switch(
         raise ValueError(result.error_message or "model switch failed")
 
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
-
-    if agent:
-        # A no-op switch — the agent is already on the exact model+provider the
-        # switch resolved to — must short-circuit BEFORE the expensive-model
-        # confirmation gate and BEFORE the commit side effects. Two reasons this
-        # is placed here, ahead of both gates:
-        #   1. Running the commit side effects (agent.switch_model, marker
-        #      append, history_version bump, worker restart, session.info emit)
-        #      on a same-model "switch" injected a synthetic user message and
-        #      tripped the "history_version mismatch — output NOT written" path,
-        #      burning a full API call on brand-new sessions (the desktop
-        #      reconnect junk-session bug).
-        #   2. Detecting the no-op before the expensive-model gate avoids a
-        #      spurious confirmation dialog when a user re-selects the model
-        #      they are already on (an already-active model is never a NEW
-        #      expense to confirm).
-        # The per-turn config sync (_sync_agent_model_with_config) is the common
-        # trigger: config.yaml carries "claude-apr/claude-opus-4-8" while
-        # agent.model is the bare "claude-opus-4-8", so its own early-out misses
-        # and it calls through to here with a target identical to the live
-        # agent. Compare the RESOLVED target (post switch_model parsing) so a
-        # provider-prefixed vs bare spelling of the same model is caught.
-        _cur_model = getattr(agent, "model", "") or ""
-        _cur_provider = getattr(agent, "provider", "") or ""
-        _same_provider = (
-            not result.target_provider or result.target_provider == _cur_provider
-        )
-        if result.new_model == _cur_model and _same_provider:
-            # Mirror the real-switch commit's persistence for the override so a
-            # later rebuild (resume / _reset_session_agent) re-derives the same
-            # model — the ONLY side effects a no-op legitimately performs.
-            if pin_session_override and isinstance(session, dict):
-                session["model_override"] = {
-                    "model": result.new_model,
-                    "provider": result.target_provider,
-                    "base_url": result.base_url,
-                    "api_key": result.api_key,
-                    "api_mode": result.api_mode,
-                }
-                _persist_live_session_runtime(session)
-            if persist_global:
-                _persist_model_switch(result)
-            return {
-                "value": result.new_model,
-                "warning": result.warning_message or "",
-                "confirm_required": False,
-            }
 
     if agent:
         try:
