@@ -3132,6 +3132,9 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Per-tick spawn cap for the dispatcher (gateway tick and
+        # `kanban dispatch`; the CLI --max flag wins over it). None = no cap.
+        "max_spawn": None,
         # Pause dispatcher SPAWNS (reclaims still run) while the host's
         # 1-minute load average is over `pause_above` (default: CPU count);
         # resume once it drops below `resume_below` (default: 0.75 × CPU
@@ -3169,6 +3172,17 @@ DEFAULT_CONFIG = {
         # A present-but-unknown/empty value fails to "none" (never "all")
         # and logs review_policy_invalid.
         "review_policy": "all",
+        # Default reviewer profile for request_review. None/blank = no
+        # default: a review request with no reviewer is refused rather than
+        # leaving the implementer as its own reviewer.
+        "review_assignee": None,
+        # Minutes an unclaimed review card may sit before it is reported
+        # stale. Non-positive/invalid values fall back to 30.
+        "review_stale_minutes": 30,
+        # Cross-session card mutation guard: "refuse" (default) blocks
+        # mutating a card homed in another session; "warn" lets it proceed
+        # with one stderr line. Any other value means "refuse".
+        "home_guard": "refuse",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
