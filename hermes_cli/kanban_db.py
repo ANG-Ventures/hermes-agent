@@ -1699,6 +1699,33 @@ def _worker_log_run_segment(
         return None
 
 
+# A worker that dies on a provider wall BEFORE the model loop can exit 1 with
+# the cause only in its log ("Codex credential is in cooldown." — raised at
+# credential resolve, where the EX_TEMPFAIL sentinel is never reached). Only the
+# run's final lines count, so a stray mention earlier in a real crash does not.
+_STDERR_COOLDOWN_CLASSES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("credential_cooldown", re.compile(r"\bcredentials? (?:is|are) in cooldown\b", re.IGNORECASE)),
+    ("quota", re.compile(
+        r"\b(?:rate[\s_-]?limit(?:ed)?|too many requests|quota (?:exceeded|exhausted)|"
+        r"usage limit (?:reached|exceeded)|(?:HTTP|status|error)[\s:]*429)\b",
+        re.IGNORECASE,
+    )),
+)
+_STDERR_COOLDOWN_TAIL_LINES = 3
+
+
+def _stderr_cooldown_class(segment: Optional[str]) -> Optional[str]:
+    """Name the provider-wall class this run's last log lines show, or None."""
+    if not segment:
+        return None
+    lines = [ln.strip() for ln in segment.splitlines() if ln.strip()]
+    tail = "\n".join(lines[-_STDERR_COOLDOWN_TAIL_LINES:])
+    for name, pattern in _STDERR_COOLDOWN_CLASSES:
+        if pattern.search(tail):
+            return name
+    return None
+
+
 def _run_output_fingerprint(segment: Optional[str]) -> str:
     """Fingerprint ONE run's output; "" when there is nothing comparable.
 
@@ -9374,15 +9401,43 @@ def complete_task(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
         )
         if still_open:
+            # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
+            # DraftPrError, nothing mutated), update a stale head, arm a green
+            # non-milestone PR through fleet-merge.sh.
+            from hermes_cli import kanban_pr_freshness as _fresh
+            try:
+                freshness = _fresh.check(
+                    still_open, task_id=task_id,
+                    allow_arm=not is_milestone_card(conn, task_id),
+                )
+            except _fresh.DraftPrError as draft_err:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_draft_pr",
+                        {"prs": draft_err.prs},
+                    )
+                raise
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])
+            if freshness.get("prs"):
+                routed_meta["handoff_freshness"] = freshness
             routed_summary = "\n".join(filter(None, [note, summary or result]))
-            ok = request_review(
+            ok, route_reason = request_review(
                 conn, task_id, summary=routed_summary, metadata=routed_meta,
-                expected_run_id=expected_run_id, force=True,
+                expected_run_id=expected_run_id, force=True, with_reason=True,
             )
+            if not ok:
+                # complete_task returns a bare bool, so callers can only say
+                # "unknown id or already terminal". Leave the real refusal on
+                # the card where an operator can read it (t_503df7c5).
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_route_refused",
+                        {"open_prs": routed_meta["auto_routed_open_prs"],
+                         "reason": route_reason},
+                    )
             if ok:
                 with write_txn(conn):
                     _append_event(
@@ -12020,6 +12075,7 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        reviewer_from_provenance = False
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -12058,12 +12114,22 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
+                reviewer_from_provenance = True
         # Validate/resolve at the gate: a review assignee must be spawnable
         # (a real profile) or the explicit `human` sentinel. A placeholder
         # string used to be accepted here and parked the card forever.
         reviewer, reviewer_error = resolve_reviewer(
             reviewer, implementer, allow_same_actor=allow_same_actor
         )
+        if reviewer_error is not None and reviewer_from_provenance:
+            # Inherited provenance the gate now refuses (e.g. a same-actor
+            # review drain recorded reviewer == implementer, t_503df7c5):
+            # the worker never chose it, so refusing strands a finished card
+            # behind a generic "unknown id or already terminal". Fall back to
+            # the configured default reviewer instead.
+            reviewer, reviewer_error = resolve_reviewer(
+                None, implementer, allow_same_actor=allow_same_actor
+            )
         if reviewer_error is not None:
             return _ret(False, reviewer_error)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
@@ -16811,6 +16877,13 @@ def detect_crashed_workers(
         for row, pid, kind, code in dead:
             rate_limited_exit = False
             cohort_death = row["id"] in cohort_ids
+            stderr_exit_class = None
+            if kind == "nonzero_exit" and not cohort_death:
+                stderr_exit_class = _stderr_cooldown_class(
+                    _worker_log_run_segment(row["id"], board=board)
+                )
+                if stderr_exit_class is not None:
+                    kind = "rate_limited"
             if cohort_death:
                 protocol_violation = False
                 error_text = (
@@ -16892,8 +16965,12 @@ def detect_crashed_workers(
                 # trip the circuit breaker and permanently block the card.
                 protocol_violation = False
                 rate_limited_exit = True
-                exit_class = _run_exit_class(conn, row["id"], row["current_run_id"])
+                exit_class = (
+                    _run_exit_class(conn, row["id"], row["current_run_id"])
+                    or stderr_exit_class
+                )
                 _wall = {
+                    "credential_cooldown": "credential cooldown",
                     "upstream_capacity": "provider capacity overload",
                     "pool_exhausted": "sub pool capped",
                     "pinned_provider_unavailable": "pinned provider unavailable",
@@ -16917,6 +16994,10 @@ def detect_crashed_workers(
                 }
                 if exit_class:
                     event_payload["exit_class"] = exit_class
+                if stderr_exit_class is not None:
+                    stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
+                    if stderr_tail:
+                        event_payload["stderr_tail"] = stderr_tail
             elif kind == "infra_unavailable":
                 # The worker HARNESS could not be executed (126/127) — the CLI
                 # path was missing or unrunnable, so no worker code ran and the

@@ -57,15 +57,6 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
-    # mem0 background-review write helper — resident in tools[] so the
-    # background-review fork (which inherits the parent's tool schemas) can SEE
-    # it; its own toolset "memory_write" keeps it OUT of the fork's default
-    # ["memory","skills"] dispatch whitelist (denied-not-absent), and the
-    # memory.background_review_mem0_write flag adds it to that whitelist when on.
-    # check_mem0_remember_requirements gates it off non-mem0 profiles. Without
-    # this line the schema never reaches the model and the feature is silently
-    # dark (the model cannot call a tool it cannot see).
-    "mem0_remember",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -364,6 +355,35 @@ TOOLSETS = {
             "spotify_playback", "spotify_devices", "spotify_queue", "spotify_search",
             "spotify_playlists", "spotify_albums", "spotify_library",
         ],
+        "includes": []
+    },
+
+    # ==========================================================================
+    # FORK-CUSTOM toolsets (Kyzcreig fork — NOT present upstream).
+    #
+    # These are a DELIBERATE divergence from upstream and an upstream parity
+    # merge MUST preserve them (they are dropped if the merge blindly takes
+    # upstream's toolsets.py). See tests/agent/test_fork_custom_toolsets.py,
+    # which fails CI if either toolset stops resolving.
+    #
+    #   * messaging — upstream's stance (see the note further down) is that
+    #     agents do NOT get an agent-callable send_message; outbound messaging
+    #     is handled outside the agent loop. THIS FORK intentionally re-enables
+    #     an agent-callable send_message: the fleet's orchestrator sends
+    #     mid-turn status/alerts to the originating channel, and the fork's
+    #     origin-routing work (send_message origin-leak fixes) is built on it.
+    #   * moa — the mixture_of_agents tool (tools/mixture_of_agents_tool.py),
+    #     a fork-only multi-LLM reasoning tool.
+    # ==========================================================================
+    "messaging": {
+        "description": "Cross-platform messaging: send messages to Telegram, Discord, Slack, SMS, etc.",
+        "tools": ["send_message"],
+        "includes": []
+    },
+
+    "moa": {
+        "description": "Advanced reasoning and problem-solving tools",
+        "tools": ["mixture_of_agents"],
         "includes": []
     },
 
