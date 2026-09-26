@@ -210,6 +210,20 @@ _RESET_CHILD_SQL = (f"{_sql_json_extract('{a}.model_config', '$._reset_from')} I
 _LISTABLE_CHILD_SQL = (f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')}"
     f" OR {_RESET_CHILD_SQL.format(a='s')})")
 
+# state_meta marker: every pre-existing session was queued for its first effective_last_active compute.
+SESSION_RECENCY_SEEDED_KEY = "session_recency_seeded"
+
+# Compression-continuation edge ``parent`` -> ``child`` that session recency follows: one logical
+# conversation, so the root's list recency is the MAX over the chain. The ordering CTE in
+# list_sessions_rich and the effective_last_active refresh share this text so they cannot drift.
+_COMPRESSION_CHAIN_EDGE_SQL = (
+    "parent.end_reason = 'compression'"
+    f" AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL"
+    f" AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL"
+    f" AND NOT ({_RESET_CHILD_SQL.format(a='child')})"
+    " AND COALESCE(child.source, '') != 'tool'"
+)
+
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
     """Subagent runs, not branch, reset, or compression children."""
@@ -408,6 +422,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     hidden INTEGER NOT NULL DEFAULT 0,
     last_read_at REAL,
     tool_names TEXT,
+    -- Denormalized list recency: MAX session recency over this row's forward
+    -- compression chain (see _SESSION_RECENCY_REFRESH_SQL). Maintained through
+    -- session_recency_dirty; trusted only once that queue is drained.
+    effective_last_active REAL,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -462,6 +480,13 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     last_seen REAL,
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
+
+-- Sessions whose effective_last_active (or an ancestor's) may be stale. Fed by
+-- the session_recency_* triggers on every write path, drained by
+-- SessionDB._drain_session_recency before the column is used for ordering.
+CREATE TABLE IF NOT EXISTS session_recency_dirty (
+    session_id TEXT PRIMARY KEY
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
@@ -689,6 +714,62 @@ CREATE INDEX IF NOT EXISTS idx_sessions_tool_names
 -- a small candidate set before compression-chain and preview hydration.
 CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity
     ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC);
+-- session.list pages by effective_last_active. The session_recency_* triggers
+-- enqueue every row an input of it touches (the drain walks compression
+-- ancestors from there); changes that can REMOVE a chain edge also enqueue the
+-- old parent, which the upward walk can no longer reach. No comment may sit
+-- directly above a DROP TRIGGER: the settled-trigger skip matches the statement
+-- prefix, and a skipped-by-mistake DROP takes the write lock on every open.
+CREATE INDEX IF NOT EXISTS idx_sessions_effective_last_active
+    ON sessions(effective_last_active DESC, started_at DESC, id DESC);
+DROP TRIGGER IF EXISTS session_recency_message_insert;
+CREATE TRIGGER IF NOT EXISTS session_recency_message_insert
+AFTER INSERT ON messages
+BEGIN
+    INSERT OR IGNORE INTO session_recency_dirty (session_id) VALUES (new.session_id);
+END;
+DROP TRIGGER IF EXISTS session_recency_message_delete;
+CREATE TRIGGER IF NOT EXISTS session_recency_message_delete
+AFTER DELETE ON messages
+BEGIN
+    INSERT OR IGNORE INTO session_recency_dirty (session_id) VALUES (old.session_id);
+END;
+DROP TRIGGER IF EXISTS session_recency_message_update;
+CREATE TRIGGER IF NOT EXISTS session_recency_message_update
+AFTER UPDATE OF session_id, timestamp ON messages
+WHEN new.session_id IS NOT old.session_id OR new.timestamp IS NOT old.timestamp
+BEGIN
+    INSERT OR IGNORE INTO session_recency_dirty (session_id) VALUES (old.session_id);
+    INSERT OR IGNORE INTO session_recency_dirty (session_id) VALUES (new.session_id);
+END;
+DROP TRIGGER IF EXISTS session_recency_session_insert;
+CREATE TRIGGER IF NOT EXISTS session_recency_session_insert
+AFTER INSERT ON sessions
+BEGIN
+    INSERT OR IGNORE INTO session_recency_dirty (session_id) VALUES (new.id);
+END;
+DROP TRIGGER IF EXISTS session_recency_session_update;
+CREATE TRIGGER IF NOT EXISTS session_recency_session_update
+AFTER UPDATE OF parent_session_id, end_reason, model_config, source, session_key,
+                started_at, last_activity_at ON sessions
+WHEN new.parent_session_id IS NOT old.parent_session_id
+  OR new.end_reason IS NOT old.end_reason
+  OR new.model_config IS NOT old.model_config
+  OR new.source IS NOT old.source
+  OR new.session_key IS NOT old.session_key
+  OR new.started_at IS NOT old.started_at
+  OR new.last_activity_at IS NOT old.last_activity_at
+BEGIN
+    INSERT OR IGNORE INTO session_recency_dirty (session_id) VALUES (new.id);
+    INSERT OR IGNORE INTO session_recency_dirty (session_id)
+        SELECT old.parent_session_id WHERE old.parent_session_id IS NOT NULL;
+END;
+DROP TRIGGER IF EXISTS session_recency_session_delete;
+CREATE TRIGGER IF NOT EXISTS session_recency_session_delete
+AFTER DELETE ON sessions WHEN old.parent_session_id IS NOT NULL
+BEGIN
+    INSERT OR IGNORE INTO session_recency_dirty (session_id) VALUES (old.parent_session_id);
+END;
 """
 
 

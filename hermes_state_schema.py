@@ -24,7 +24,7 @@ from hermes_state_common import (
     DEFERRED_INDEX_SQL, FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, FTS_SQL,
     FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL,
-    SCHEMA_VERSION, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, _sql_json_extract, fts_rebuild_admission,
+    SCHEMA_VERSION, SESSION_RECENCY_SEEDED_KEY, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, _sql_json_extract, fts_rebuild_admission,
 )
 from hermes_state_fts import _drop_orphan_fts_shadow_tables
 from hermes_state_holders import _read_proc_argv
@@ -955,6 +955,15 @@ class SessionSchemaMixin:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
+        # Queue every session that predates the recency triggers, once; the first list drain
+        # computes their effective_last_active and the triggers keep it current afterwards.
+        # Probe first: the write lock is only taken on the one open that seeds.
+        with contextlib.suppress(sqlite3.OperationalError):
+            if cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (SESSION_RECENCY_SEEDED_KEY,),
+            ).fetchone() is None:
+                cursor.execute("INSERT OR IGNORE INTO session_recency_dirty (session_id) SELECT id FROM sessions")
+                self.set_meta(SESSION_RECENCY_SEEDED_KEY, "1", cursor=cursor)
 
         # Heal NULL ``active`` rows on every startup: older reconciler builds added ``active``
         # without NOT NULL DEFAULT 1, so ``WHERE active = 1`` loaders hid whole histories. A

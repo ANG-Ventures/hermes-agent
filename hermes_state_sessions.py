@@ -18,7 +18,7 @@ from hermes_startup_watchdog import report_startup_progress
 from hermes_state_common import (
     _LISTABLE_CHILD_SQL, _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL, _RESET_CHILD_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _shape_preview,
-    _sql_in_window, _sql_json_extract, _sql_session_last_active, _sql_session_last_active_by_id,
+    _COMPRESSION_CHAIN_EDGE_SQL, _sql_in_window, _sql_json_extract, _sql_session_last_active, _sql_session_last_active_by_id,
     escape_like as _escape_like, _SQL_IN_CHUNK, _id_chunks, _placeholders as _session_ids_placeholders,
 )
 
@@ -1257,6 +1257,74 @@ class SessionSessionsMixin:
         s.pop("_effective_last_active", None)
         return s
 
+    # Queued rows above which one full pass beats per-row ancestor walks.
+    _SESSION_RECENCY_FULL_REFRESH_AT = 2000
+
+    @staticmethod
+    def _refresh_session_recency(conn: sqlite3.Connection, seed_sql: str) -> None:
+        """Recompute ``effective_last_active`` for the *seed_sql* rows and all their compression
+        ancestors. The value is the list_sessions_rich ordering key: MAX recency over the row's
+        forward compression chain, else its in-window ``started_at``."""
+        conn.execute(f"""
+            WITH RECURSIVE up(id) AS (
+                {seed_sql}
+                UNION
+                SELECT parent.id
+                FROM up
+                JOIN sessions child ON child.id = up.id
+                JOIN sessions parent ON parent.id = child.parent_session_id
+                WHERE {_COMPRESSION_CHAIN_EDGE_SQL}
+            ),
+            chain(root_id, cur_id) AS (
+                SELECT s.id, s.id FROM sessions s WHERE s.id IN (SELECT id FROM up)
+                UNION
+                SELECT c.root_id, child.id
+                FROM chain c
+                JOIN sessions parent ON parent.id = c.cur_id
+                JOIN sessions child ON child.parent_session_id = c.cur_id
+                WHERE {_COMPRESSION_CHAIN_EDGE_SQL}
+            ),
+            chain_max AS (
+                SELECT root_id, MAX({_sql_session_last_active_by_id("cur_id")}) AS value
+                FROM chain
+                GROUP BY root_id
+            )
+            UPDATE sessions
+            SET effective_last_active = COALESCE(
+                (SELECT value FROM chain_max WHERE chain_max.root_id = sessions.id),
+                {_sql_in_window("sessions.started_at")}
+            )
+            WHERE id IN (SELECT root_id FROM chain_max)
+        """)
+
+    def _drain_session_recency(self, conn: sqlite3.Connection) -> None:
+        """Bring every queued row (and its ancestors) current, then clear the queue — one
+        transaction, so a trigger can never enqueue between the refresh and the delete."""
+        queued = conn.execute("SELECT COUNT(*) FROM session_recency_dirty").fetchone()[0]
+        if not queued:
+            return
+        seed_sql = (
+            "SELECT id FROM sessions" if queued > self._SESSION_RECENCY_FULL_REFRESH_AT
+            else "SELECT session_id FROM session_recency_dirty"
+        )
+        self._refresh_session_recency(conn, seed_sql)
+        conn.execute("DELETE FROM session_recency_dirty")
+
+    def _session_recency_current(self) -> bool:
+        """Drain the recency queue. False when ``effective_last_active`` cannot be trusted (a
+        read-only handle with queued rows, a store without the column, a failed drain): the
+        caller then orders with the recursive CTE, which is always correct."""
+        try:
+            if self._read_one("SELECT 1 FROM session_recency_dirty LIMIT 1") is None:
+                return True
+            if self.read_only:
+                return False
+            self._execute_write(self._drain_session_recency)
+            return True
+        except sqlite3.Error as exc:
+            logger.debug("session recency drain skipped; using the chain CTE: %s", exc)
+            return False
+
     def list_sessions_rich(
         self, source: str = None, sources: List[str] = None, exclude_sources: List[str] = None,
         cwd_prefix: str = None, limit: int = 20, offset: int = 0, include_children: bool = False,
@@ -1293,14 +1361,31 @@ class SessionSessionsMixin:
             "" if compact_rows else "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash"
         )
         from_sessions = f"FROM sessions s\n                {prompt_join}"
-        if order_by_last_active:
+        id_needle = (id_query or "").strip().lower()
+        search_needle = (search_query or "").strip().lower()
+        if order_by_last_active and not id_needle and not search_needle and self._session_recency_current():
+            # Indexed path: effective_last_active holds exactly the CTE below's per-row ordering
+            # key, so page by the index first and hydrate previews / last_active for that page only.
+            query = f"""
+                {select_head}{_sql_session_last_active("s")} AS last_active,
+                    s.effective_last_active AS _effective_last_active
+                FROM (
+                    SELECT s.id AS page_id FROM sessions s
+                    {where_sql}
+                    ORDER BY s.effective_last_active DESC, s.started_at DESC, s.id DESC
+                    LIMIT ? OFFSET ?
+                ) page
+                JOIN sessions s ON s.id = page.page_id
+                {prompt_join}
+                ORDER BY s.effective_last_active DESC, s.started_at DESC, s.id DESC
+            """
+            params = params + [limit, offset]
+        elif order_by_last_active:
             # The CTE walks compression-continuation edges forward from the admitted
             # rows; MAX over the chain gives effective_last_active in SQL. Do NOT
             # require child.started_at >= parent.ended_at: races insert the
             # continuation before ended_at is written.
-            outer_where, id_params = self._chain_search_where(
-                where_sql, (id_query or "").strip().lower(), (search_query or "").strip().lower(),
-            )
+            outer_where, id_params = self._chain_search_where(where_sql, id_needle, search_needle)
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
                     SELECT s.id, s.id FROM sessions s {where_sql}
@@ -1309,11 +1394,7 @@ class SessionSessionsMixin:
                     FROM chain c
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
-                    WHERE parent.end_reason = 'compression'
-                      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
-                      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
-                      AND NOT ({_RESET_CHILD_SQL.format(a='child')})
-                      AND COALESCE(child.source, '') != 'tool'
+                    WHERE {_COMPRESSION_CHAIN_EDGE_SQL}
                 ),
                 chain_max AS (
                     SELECT
