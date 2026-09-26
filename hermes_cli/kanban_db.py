@@ -5067,17 +5067,26 @@ def stamp_origin_body(body: Optional[str], origin_line: str) -> str:
 
 
 def _resolve_birth_session(
-    conn: sqlite3.Connection, session_id: Optional[str], parents: Iterable[str]
+    conn: sqlite3.Connection,
+    session_id: Optional[str],
+    parents: Iterable[str],
+    *,
+    explicit: bool = False,
 ) -> tuple[str, Optional[str]]:
     """THE home a new card is born with, plus the ``origin:`` line it inherits.
 
+    0. ``explicit`` (the caller NAMED the session, e.g. ``create --session``):
+       that session wins over every parent.
     1. The first homed parent, then the card the creating kanban worker run
        was dispatched for: fan-out belongs to the HUMAN home of its lineage.
-       A parent's home wins over an explicit ``session_id``.
+       A parent's CURRENT home wins over a defaulted ``session_id`` -- so after
+       a ``--takeover`` re-home, children follow the new home.
     2. Inside a worker run with no homed lineage: ``unhomed`` -- never the
        run's own per-run session id, which no human session reads.
     3. Otherwise the explicit ``session_id``, else ``unhomed``.
     """
+    if explicit and session_id and str(session_id).strip():
+        return str(session_id).strip(), None
     worker_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     for tid in (*(parents or ()), *((worker_tid,) if worker_tid else ())):
         row = conn.execute(
@@ -5662,6 +5671,34 @@ def _mutation_succeeded(result: Any) -> bool:
     return bool(result)
 
 
+# ``--takeover`` on these verbs ADOPTS the card: the taking session becomes its
+# home (children and pings follow). Other verbs stay a one-off foreign action;
+# ``edit --session <sid>`` re-homes without a status change. ``--operator``
+# never re-homes (it applies a relayed ruling, it does not adopt). ``complete``
+# is terminal, so it never adopts either. Sweep actors (cron sessions,
+# delegate children) never re-home: see :func:`_can_adopt_home`.
+REHOME_ON_TAKEOVER_ACTIONS: frozenset[str] = frozenset({
+    "assign", "unblock", "promote", "reclaim", "triage-resolve",
+})
+
+
+def _can_adopt_home(session_id: str) -> bool:
+    """True when *session_id* may become a card's home on ``--takeover``.
+
+    A cron run (``cron_<job>_<ts>``) or a ``delegate_task`` child is a sweep,
+    not a conversation: adopting would pull the card out of its home chat and
+    route its pings nowhere. The takeover event still records the actor.
+    """
+    if session_id.startswith("cron_"):
+        return False
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return not is_delegated_child_process_context()
+    except Exception:
+        return not os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT")
+
+
 def record_foreign_action(
     conn: sqlite3.Connection, task_id: str, action: str, actor: MutationActor
 ) -> None:
@@ -5689,22 +5726,33 @@ def record_foreign_action(
                 },
             )
         return
+    prev_home = home_row["session_id"] if home_row is not None else None
+    new_home = (
+        actor.session_ids[0]
+        if action in REHOME_ON_TAKEOVER_ACTIONS
+        and actor.session_ids
+        and _can_adopt_home(actor.session_ids[0])
+        else None
+    )
+    payload = {
+        "action": action,
+        "reason": actor.foreign_ok,
+        "by_sessions": list(actor.session_ids),
+        "by_profile": actor.profile,
+        "by_chat": _ambient_session_env("HERMES_SESSION_CHAT_NAME")
+        or _ambient_session_env("HERMES_SESSION_CHAT_ID")
+        or None,
+        "home": prev_home,
+    }
+    if new_home:
+        payload["prev_session_id"] = prev_home
+        payload["session_id"] = new_home
     with write_txn(conn, allow_nested=True):
-        _append_event(
-            conn,
-            task_id,
-            "takeover",
-            {
-                "action": action,
-                "reason": actor.foreign_ok,
-                "by_sessions": list(actor.session_ids),
-                "by_profile": actor.profile,
-                "by_chat": _ambient_session_env("HERMES_SESSION_CHAT_NAME")
-                or _ambient_session_env("HERMES_SESSION_CHAT_ID")
-                or None,
-                "home": (home_row["session_id"] if home_row is not None else None),
-            },
-        )
+        if new_home:
+            conn.execute(
+                "UPDATE tasks SET session_id = ? WHERE id = ?", (new_home, task_id)
+            )
+        _append_event(conn, task_id, "takeover", payload)
     session_ref = None
     if actor.session_ids:
         try:
@@ -5718,9 +5766,19 @@ def record_foreign_action(
         body=(
             f"takeover: foreign-session action by {sess} "
             f"({actor.profile or 'unknown'}): {actor.foreign_ok} [{action}]"
+            + (f" -- card re-homed to {new_home}" if new_home else "")
         ),
         session_ref=session_ref,
     )
+    if new_home:
+        # Pings follow the new home: subscribe the taker's chat. Best effort --
+        # notification bookkeeping must never fail the mutation.
+        try:
+            from tools.kanban_tools import subscribe_calling_session
+
+            subscribe_calling_session(conn, task_id)
+        except Exception:
+            pass
 
 
 def _home_session_guarded(action: str, task_param: str = "task_id"):
@@ -5819,6 +5877,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    session_explicit: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -5905,7 +5964,9 @@ def create_task(
     # no card can land without a home (never NULL) or without an origin line.
     parents = tuple(parents or ())
     created_by = created_by or _ambient_session_env("HERMES_SESSION_PROFILE") or None
-    session_id, inherited_origin = _resolve_birth_session(conn, session_id, parents)
+    session_id, inherited_origin = _resolve_birth_session(
+        conn, session_id, parents, explicit=session_explicit
+    )
     body = stamp_origin_body(
         body,
         inherited_origin or format_origin_line(session_id, created_by=created_by),

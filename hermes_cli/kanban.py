@@ -571,7 +571,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--session", default=None, metavar="SESSION_ID",
                           help="Home session to stamp on the card (default: "
-                               "$HERMES_SESSION_ID when set; 'none' = unstamped)")
+                               "$HERMES_SESSION_ID when set; 'none' = unstamped). "
+                               "An explicit --session WINS over a --parent's "
+                               "home; omitted, the child follows the parent's "
+                               "current home.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1581,7 +1584,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                 metavar="REASON",
                 help="Act on a card whose home session is another session "
                      "(or an unhomed card); records a takeover event and "
-                     "posts REASON as a comment the home session sees.",
+                     "posts REASON as a comment the home session sees. On "
+                     "assign/unblock/promote/reclaim/triage-resolve "
+                     "it also RE-HOMES the card to your session (children "
+                     "and pings follow; prev_session_id kept in the event); "
+                     "never on complete, and never for cron/sweep actors. "
+                     "Re-home without a status change: "
+                     "hermes kanban edit <id> --session <sid> --takeover R.",
             )
             _p.add_argument(
                 "--operator",
@@ -2405,6 +2414,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     triage=bool(getattr(args, "triage", False)),
                 ),
                 session_id=_resolve_session_flag(getattr(args, "session", None)),
+                session_explicit=getattr(args, "session", None) is not None,
             )
             task = kb.get_task(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
