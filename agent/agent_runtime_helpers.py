@@ -1816,6 +1816,9 @@ def restore_primary_runtime(agent) -> bool:
         return False
 
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+        from agent import fallback_events as _fbe
+
+        _fbe.record_restore_refused(agent, "cooldown")
         return False  # primary still in rate-limit cooldown, stay on fallback
 
     # ── Reset-aware gate ──
@@ -1885,6 +1888,9 @@ def restore_primary_runtime(agent) -> bool:
                     agent.provider,
                     agent.model,
                 )
+            from agent import fallback_events as _fbe
+
+            _fbe.record_restore_refused(agent, "pool_reset_pending")
             return False
     except Exception:
         logger.debug(
@@ -2165,6 +2171,15 @@ def restore_primary_runtime(agent) -> bool:
                     old_effort=_old_reasoning_config,
                     new_effort=getattr(agent, "reasoning_config", None),
                 )
+                from agent import fallback_events as _fbe
+
+                _fbe.record(
+                    agent, "recovery",
+                    from_provider=_from_provider, from_model=_from_model,
+                    to_provider=_to_route[0], to_model=_to_route[1],
+                    consume=False,
+                )
+                agent._fallback_restore_refused_logged = False
                 _rec_announce = False
                 try:
                     from hermes_cli.config import read_raw_config
