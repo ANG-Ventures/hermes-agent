@@ -7923,7 +7923,8 @@ def _current_profile_name() -> str:
 # checkout), surfacing a one-click "update to align" prompt instead of failing
 # cryptically downstream. Bump whenever the desktop's backend contract changes.
 # v2: adds the file.attach RPC (remote-gateway non-image file upload).
-# v3: adds server-side pinned sessions (`pinned` session rows + session.pin),
+# v3: adds server-side pinned sessions (`pinned` session rows; the fork-only
+#     session.pin RPC was removed — pins are written via the sessions REST router),
 # approvals.mode config RPCs, and session.info reconciliation.
 # v4: session.create fast=false is an explicit per-session normal-tier override.
 # v5: uvicorn ws_max_size raised for one-shot base64 file.attach frames (>16 MiB).
@@ -11586,30 +11587,6 @@ def _live_session_payload(
     if clarify := _pending_clarify_request_payload(sid):
         payload["pending_clarify"] = clarify
     return _attach_todo_state(payload, session)
-
-
-@method("session.pin")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-    assert session is not None
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5007)
-    key = session["session_key"]
-    pinned = bool(params.get("pinned"))
-    try:
-        if not db.set_session_pinned(key, pinned):
-            _ensure_session_db_row(session)
-            with _session_db(session) as scoped_db:
-                if scoped_db is None or not scoped_db.set_session_pinned(key, pinned):
-                    return _err(rid, 5007, "session pin failed")
-        session["pinned"] = pinned
-        _emit_session_info_for_session(params.get("session_id", ""), session)
-        return _ok(rid, {"pinned": pinned, "session_key": key})
-    except Exception as e:
-        return _err(rid, 5007, str(e))
 
 
 def _main_runtime_from_agent(agent) -> dict | None:
