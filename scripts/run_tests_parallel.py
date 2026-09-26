@@ -195,6 +195,18 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 
+
+def scaled_file_timeout(base: float, workers: int, effective_cpus: int) -> float:
+    """Scale the DEFAULT per-file ceiling by worker oversubscription.
+
+    Workers default to 2x the CPU quota, so each file gets roughly half a CPU
+    and its wall time stretches by the same ratio. A fixed 300s wall turned a
+    file that takes ~80s on a quiet box into a "hang" on a 4-vCPU runner with
+    8 workers (merge groups 36213157250/36213163045/36213168317). Never below
+    ``base``. An explicit --file-timeout / env value is used verbatim.
+    """
+    return base * max(1.0, workers / max(1, effective_cpus))
+
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
 # but is loudly reported as FLAKY so it gets fixed rather than hidden.
@@ -822,7 +834,10 @@ def _run_one_file(
         file, pytest_args, repo_root, file_timeout
     )
     attempt = 0
-    while rc != 0 and attempt < retries:
+    # A timed-out attempt is NOT retried here: re-running it at once under the
+    # same load and the same ceiling times out again. main() retries it once
+    # in isolation after the parallel pool drains.
+    while rc != 0 and attempt < retries and not summary.get("timed_out"):
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
@@ -1448,13 +1463,14 @@ def main() -> int:
     parser.add_argument(
         "--file-timeout",
         type=float,
-        default=float(
-            os.environ.get("HERMES_TEST_FILE_TIMEOUT", _DEFAULT_FILE_TIMEOUT_SECONDS)
-        ),
+        default=None,
         help=(
             "Per-file wall-clock cap in seconds. On timeout, the pytest "
-            "subprocess and its full process tree are SIGKILL'd. "
-            f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min), env: HERMES_TEST_FILE_TIMEOUT."
+            "subprocess and its full process tree are SIGKILL'd, then the "
+            "file is retried once in isolation after the pool drains. "
+            f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min) "
+            "scaled by workers/effective_cpus (never below it); an explicit "
+            "value or env HERMES_TEST_FILE_TIMEOUT is used verbatim."
         ),
     )
     parser.add_argument(
@@ -1714,13 +1730,21 @@ def main() -> int:
         _effective_cpus,
         force=os.environ.get("HERMES_TEST_WORKERS_FORCE") == "1",
     )
+    if args.file_timeout is None:
+        _env_timeout = os.environ.get("HERMES_TEST_FILE_TIMEOUT")
+        args.file_timeout = (
+            float(_env_timeout) if _env_timeout
+            else scaled_file_timeout(
+                _DEFAULT_FILE_TIMEOUT_SECONDS, args.jobs, _effective_cpus
+            )
+        )
     print(
         format_worker_sizing_log(
             workers=args.jobs,
             effective_cpus=_effective_cpus,
             requested=_requested,
             source=_cpu_source,
-        ),
+        ) + f" file_timeout={args.file_timeout:.0f}s",
         # stderr, not stdout: `--generate-slices` stdout is captured verbatim
         # by CI (`MATRIX=$(...)` → `fromJSON`), so any extra stdout line kills
         # the generate job. stderr still shows in the job log.
@@ -2008,6 +2032,41 @@ def main() -> int:
         for fut in futures:
             fut.result() if fut.exception() is None else None
 
+    # ── Isolated retry of timed-out files ───────────────────────────────
+    # A file killed at the per-file wall while N workers shared the box may be
+    # slow, not hung. Re-run each one ONCE, alone, now that the pool has
+    # drained. Pass => counted as passed and reported as SLOW (fix it); a file
+    # that times out alone too stays failed. --file-retries 0 disables this.
+    slow_rescued: List[Tuple[Path, float, float]] = []
+    if args.file_retries > 0:
+        for entry in [e for e in failures if e[2].get("timed_out")]:
+            fpath, old_output, old_summary = entry
+            print(
+                f"↻ {_format_file(fpath, repo_root)} timed out under load; "
+                "retried in isolation",
+                flush=True,
+            )
+            _f, rc2, out2, summ2, wall2 = _run_one_file_once(
+                fpath, pytest_passthrough, repo_root, args.file_timeout
+            )
+            idx = next(i for i, (f, s) in enumerate(all_summaries)
+                       if f == fpath and s is old_summary)
+            all_summaries[idx] = (fpath, summ2)
+            tests_passed += summ2.get("passed", 0) - old_summary.get("passed", 0)
+            tests_failed += summ2.get("failed", 0) - old_summary.get("failed", 0)
+            tests_skipped += summ2.get("skipped", 0) - old_summary.get("skipped", 0)
+            tests_collected += sum(
+                summ2.get(k, 0) - old_summary.get(k, 0)
+                for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
+            )
+            failures.remove(entry)
+            if rc2 == 0:
+                fail_count -= 1
+                pass_count += 1
+                slow_rescued.append((fpath, float(old_summary.get("timeout_secs", 0)), wall2))
+            else:
+                failures.append((fpath, f"{old_output}\n--- isolated retry ---\n{out2}", summ2))
+
     elapsed = time.monotonic() - started
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
@@ -2075,6 +2134,14 @@ def main() -> int:
         for f, output in _FLAKY_RESULTS:
             print(f"  {_format_file(f, repo_root)}")
             print(output.rstrip())
+
+    if slow_rescued:
+        print()
+        print(f"=== ⚠ {len(slow_rescued)} SLOW file{'s' if len(slow_rescued) != 1 else ''} "
+              "(timed out under load, passed when retried in isolation — make them faster) ===")
+        for f, ceiling, wall in slow_rescued:
+            print(f"  {_format_file(f, repo_root)}  killed at {ceiling:.0f}s in the pool, "
+                  f"{wall:.1f}s alone")
 
     # Save durations for future --slice runs. Each slice writes its own
     # partial test_durations.json; a CI merge step joins them later.
