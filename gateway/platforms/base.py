@@ -3552,13 +3552,6 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
-        # Per-chat typing OWNERSHIP token. A turn that drives typing claims a
-        # monotonic token via _issue_typing_token() at turn start; the token is
-        # threaded through _keep_typing -> send_typing so a late/stale
-        # send_typing (refresh tick or run.py follow-up) carrying an
-        # already-superseded token refuses to (re)arm an orphaned typing loop.
-        # Fixes the recreate-race stuck-"is typing…" bubble (no 429 involved).
-        self._typing_owner: dict = {}
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
         # by adapters whose typing indicator renders text (Slack's
@@ -5930,7 +5923,6 @@ class BasePlatformAdapter(ABC):
         interval: float = 2.0,
         metadata=None,
         stop_event: asyncio.Event | None = None,
-        token=None,
     ) -> None:
         """
         Continuously send typing indicator until cancelled.
@@ -5956,17 +5948,6 @@ class BasePlatformAdapter(ABC):
         # gated on network health.  Must stay below ``interval`` so a slow
         # call gets abandoned before the next scheduled tick.
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
-        # Only forward the ownership token to adapters whose send_typing
-        # accepts it (Discord). Other adapters keep their unchanged signature;
-        # for them _send_typing_kwargs stays {metadata}.
-        _send_typing_kwargs = {"metadata": metadata}
-        if token is not None:
-            try:
-                import inspect as _inspect
-                if "token" in _inspect.signature(self.send_typing).parameters:
-                    _send_typing_kwargs["token"] = token
-            except (TypeError, ValueError):
-                pass
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
@@ -5974,7 +5955,7 @@ class BasePlatformAdapter(ABC):
                 if chat_id not in self._typing_paused:
                     try:
                         await asyncio.wait_for(
-                            self.send_typing(chat_id, **_send_typing_kwargs),
+                            self.send_typing(chat_id, metadata=metadata),
                             timeout=_send_typing_timeout,
                         )
                     except asyncio.TimeoutError:
@@ -6030,26 +6011,9 @@ class BasePlatformAdapter(ABC):
         metadata=None,
         timeout: float = 0.5,
         stop_attempts: int = 2,
-        token=None,
     ) -> None:
-        """Stop the refresh task and platform typing state as one operation.
-
-        When ``token`` is provided this is OWNER-MATCHED: it relinquishes the
-        typing ownership only if a newer turn hasn't already superseded us, and
-        it is the ONLY site that removes ``_typing_owner`` (single popper —
-        ``stop_typing`` never mutates the owner dict), so the compare below
-        can't be raced (Pass-2 R1).
-        """
+        """Stop the refresh task and platform typing state as one operation."""
         self._typing_paused.add(chat_id)
-        # Forward the token to adapters whose stop_typing accepts it (Discord).
-        _stop_kwargs = {}
-        if token is not None and hasattr(self, "stop_typing"):
-            try:
-                import inspect as _inspect
-                if "token" in _inspect.signature(self.stop_typing).parameters:
-                    _stop_kwargs["token"] = token
-            except (TypeError, ValueError):
-                pass
         try:
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
@@ -6067,17 +6031,11 @@ class BasePlatformAdapter(ABC):
                     if metadata is not None:
                         await self._stop_typing_with_metadata(chat_id, metadata)
                     else:
-                        await self.stop_typing(chat_id, **_stop_kwargs)
+                        await self.stop_typing(chat_id)
                 except Exception:
                     pass
                 if attempt < attempts - 1:
                     await asyncio.sleep(0)
-            # Relinquish ownership only if a NEWER turn hasn't superseded us.
-            # stop_typing did NOT touch _typing_owner, so this compare is
-            # stable (single-writer rule, Pass-2 R1). getattr-guarded so a
-            # partially-initialized test adapter can't AttributeError here.
-            if token is not None and getattr(self, "_typing_owner", {}).get(chat_id) == token:
-                self._typing_owner.pop(chat_id, None)
         finally:
             self._typing_paused.discard(chat_id)
 
@@ -6092,49 +6050,6 @@ class BasePlatformAdapter(ABC):
     def resume_typing_for_chat(self, chat_id: str) -> None:
         """Resume typing indicator for a chat after approval resolves."""
         self._typing_paused.discard(chat_id)
-
-    # ------------------------------------------------------------------
-    # Typing OWNERSHIP token (recreate-race fix).
-    #
-    # A monotonic per-chat token identifies the turn currently entitled to
-    # drive the typing indicator. _issue_typing_token() is the ONLY writer
-    # that INCREMENTS the token (claimed at turn start); _stop_typing_refresh
-    # is the ONLY writer that REMOVES it (on owner-match teardown). stop_typing
-    # never mutates _typing_owner — keeping a single incrementer + single
-    # popper so the owner-match compare can't be raced (Pass-2 R1).
-    #
-    # Growth is bounded to one int per distinct chat_id ever seen: issuance
-    # does get()+1 on the SAME key and never adds keys beyond chat_ids — same
-    # bound as the existing per-chat typing dicts (Pass-2 R4).
-    # ------------------------------------------------------------------
-    def _issue_typing_token(self, chat_id: str) -> int:
-        """Claim typing ownership for a new turn; supersedes any prior owner.
-
-        THE ONLY writer that increments ``_typing_owner``.
-        """
-        # Defensive: some test adapters build via object.__new__ and skip
-        # __init__, so the dict may be absent — create it lazily rather than
-        # AttributeError.
-        owner = getattr(self, "_typing_owner", None)
-        if owner is None:
-            owner = {}
-            self._typing_owner = owner
-        tok = owner.get(chat_id, 0) + 1
-        owner[chat_id] = tok
-        return tok
-
-    def _current_typing_token(self, chat_id: str):
-        """Return the token of the turn currently owning typing (or None)."""
-        return getattr(self, "_typing_owner", {}).get(chat_id)
-
-    def _typing_token_is_current(self, chat_id: str, token) -> bool:
-        """True if ``token`` still owns typing for this chat.
-
-        ``token is None`` => an untokened/legacy caller (other adapters, or
-        unconditional error/interrupt stop paths) => always allowed, so
-        behavior is unchanged for callers that don't opt in.
-        """
-        return token is None or getattr(self, "_typing_owner", {}).get(chat_id) == token
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str, metadata=None) -> None:
         """Signal the active session loop to stop and clear typing immediately."""
@@ -7276,15 +7191,10 @@ class BasePlatformAdapter(ABC):
         # never spawned, so no "typing…" / "is thinking…" status is shown.
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-        # Issue a typing-ownership token for THIS turn (recreate-race fix). A
-        # late/stale send_typing carrying a superseded token can't re-arm an
-        # orphaned typing loop after this turn's teardown. Gated by upstream
-        # d153918f1's typing_indicator config: when off, no token is issued and
-        # no refresh loop spawns (typing_task stays None).
+        # Gated by upstream d153918f1's typing_indicator config: when off, no
+        # refresh loop spawns (typing_task stays None).
         typing_task: Optional[asyncio.Task] = None
-        _typing_token = None
         if getattr(self.config, "typing_indicator", True):
-            _typing_token = self._issue_typing_token(event.source.chat_id)
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -7292,8 +7202,6 @@ class BasePlatformAdapter(ABC):
                 _keep_typing_sig = None
             if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
                 _keep_typing_kwargs["stop_event"] = interrupt_event
-            if _keep_typing_sig is None or "token" in _keep_typing_sig.parameters:
-                _keep_typing_kwargs["token"] = _typing_token
             typing_task = asyncio.create_task(
                 self._keep_typing(
                     event.source.chat_id,
@@ -7305,7 +7213,6 @@ class BasePlatformAdapter(ABC):
             await self._stop_typing_refresh(
                 event.source.chat_id,
                 typing_task,
-                token=_typing_token,
                 metadata=_thread_metadata,
             )
         
