@@ -15,8 +15,7 @@ present AND not a bare `None` literal. A site "fixed" as `reason=None` FAILS
 here. It also asserts the by-design floor sites remain reason-less, so we don't
 over-fix and fabricate a reason where none is classified.
 
-Authoritative site audit (updated 2026-08-19), 11 sites total:
-  SHARED TRANSPORT:         explicit Tailscale-down preflight
+Authoritative site audit (ground-truthed 2026-07-12), 10 sites total:
   THREAD (knowable reason): 1241 rate_limit · 1991 content_policy_blocked ·
                             3935 classified.reason · 4144 classified.reason
   ALREADY THREADED:         1820 · 3386 · 3422
@@ -63,11 +62,10 @@ def _is_bare_none(kw) -> bool:
     return kw is not None and isinstance(kw.value, ast.Constant) and kw.value.value is None
 
 
-# The five sites that MUST thread a real reason. We key on a nearby structural
+# The four sites that MUST thread a real reason. We key on a nearby structural
 # anchor (a distinctive nearby literal) rather than a bare line number so the
 # test survives small line drift in the file.
 _THREAD_ANCHORS = {
-    "shared_transport_preflight": "Shared host-transport preflight",
     "nous_rate_limit_guard": "Nous Portal rate limit active",
     "content_filter_stream_kill": "Content filter terminated stream",
     "client_error_should_fallback": "Non-retryable error (HTTP",
@@ -92,7 +90,7 @@ def _lineno_after_anchor(anchor: str) -> int:
 
 
 class TestKnowableReasonSitesThread:
-    """Each of the 5 knowable-reason sites passes a non-None reason= (RC1 effect gate)."""
+    """Each of the 4 knowable-reason sites passes a non-None reason= (RC1 effect gate)."""
 
     @pytest.mark.parametrize("name,anchor", list(_THREAD_ANCHORS.items()))
     def test_site_threads_non_none_reason(self, name, anchor):
@@ -136,11 +134,11 @@ class TestFloorSitesStayReasonless:
 
 
 class TestSiteCountReconciles:
-    """There are exactly 11 fallback call sites (RC3 reconciliation)."""
+    """There are exactly 10 fallback call sites (RC3 reconciliation)."""
 
-    def test_eleven_sites(self):
-        assert len(_fallback_calls()) == 11, (
-            f"expected 11 _try_activate_fallback sites, found {len(_fallback_calls())} — "
+    def test_ten_sites(self):
+        assert len(_fallback_calls()) == 10, (
+            f"expected 10 _try_activate_fallback sites, found {len(_fallback_calls())} — "
             f"the audit table in the PR must be re-reconciled"
         )
 

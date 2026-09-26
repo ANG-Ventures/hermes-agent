@@ -70,19 +70,12 @@ CostSource = Literal[
 ]
 
 
-# Providers that front the Anthropic API and are priced at official Anthropic
-# API rates (docs snapshot) for fleet cost *visibility*, labelled "estimated".
-# Two flavors, same routing:
-#   • Local subscription proxies / bridges / pools whose marginal cash cost is
-#     $0 (flat Claude subscription / tailnet failover / local relay).
-#   • Third-party Anthropic-compatible resellers billed in real cash but at
-#     their own rate (e.g. `yunwu`, 云雾 API) — priced here at the SAME official
-#     Anthropic snapshot the other Claude rows use, on purpose, so a Yunwu
-#     claude-* turn reconciles against the rest of the fleet rather than getting
-#     a bespoke rate table (the estimate is Anthropic list price, not Yunwu's
-#     actual ⚡-credit cost — same "estimated" caveat as the $0 proxies).
-# Provider names match the `provider:` keys used in ~/.hermes/config.yaml +
-# plugins/model-providers/* across the fleet.
+# Local subscription proxies / bridges / pools that front the Anthropic API.
+# Their marginal cash cost is $0 (flat Claude subscription / tailnet failover /
+# local relay), but we price them at official Anthropic API rates for fleet cost
+# *visibility* and label the result "estimated". Provider names match the
+# `provider:` keys used in ~/.hermes/config.yaml + plugins/model-providers/*
+# across the fleet.
 #
 # This is the set of EXACT BASE names. The numbered failover family
 # (claude-apx-N / claude-bpx-N, any integer N) is matched by PATTERN
@@ -102,7 +95,6 @@ NOTIONAL_ANTHROPIC_PROVIDERS = frozenset({
     "claude-bridge",
     "claude-apr",
     "claude-bpr",
-    "yunwu",
 })
 
 # claude-apx-1, claude-bpx-2, … -<any integer>. Anchored + integer-only so it
@@ -129,64 +121,12 @@ def is_notional_anthropic_provider(provider_name: Optional[str]) -> bool:
     )
 
 
-# Local subscription BRIDGE that fronts the Google AI Ultra sub via the
-# Antigravity CLI (`agy`). Marginal cash cost is $0 (flat $100/mo Ultra sub), but
-# for fleet cost *visibility* we price its turns at the underlying vendors' official
-# rates and label the result "estimated" — mirroring the notional-Anthropic relays.
-# Unlike those single-vendor relays, this bridge is POLY-VENDOR: the one endpoint
-# fronts Gemini 3.x AND Claude Opus/Sonnet 4.6 AND GPT-OSS 120B, so a turn is routed
-# to the vendor INFERRED from its (alias-normalized) model id, not to a fixed vendor.
-NOTIONAL_SUBSCRIPTION_BRIDGE_PROVIDERS = frozenset({
-    "gemini-bridge",
-})
-
-# The gemini-bridge exposes short model ALIASES that are not pricing keys; map each
-# to the canonical (priced) model id of the real model the Ultra sub fronts. Mirrors
-# `_MODEL_ALIASES` in ~/.hermes/gemini-bridge/gemini_bridge.py (kept in sync there).
-# The bridge is Gemini-ONLY (agy also advertises Claude/GPT-OSS tiers, but the
-# bridge deliberately fronts only the Gemini surface — the claude-*/gpt-oss aliases
-# were removed 2026-07-12, never carried spend). If those are ever re-enabled on the
-# bridge, restore the corresponding alias→canonical rows here in lockstep.
-_GEMINI_BRIDGE_MODEL_ALIASES = {
-    "gemini-flash": "gemini-3.5-flash",
-    "gemini-3.5-flash": "gemini-3.5-flash",
-    "gemini-pro": "gemini-3.1-pro",
-    "gemini-3.1-pro": "gemini-3.1-pro",
-}
-
-# The exact set of canonical models the bridge actually fronts (the alias-map
-# values). Only these route to a priced vendor; anything else — including a
-# prefix-shaped typo/unsupported id like "gemini-2.0-flash" that _infer_vendor
-# WOULD map to google — is deliberately routed "unknown" so a misconfigured or
-# unsupported bridge model surfaces in diagnostics instead of masquerading as a
-# valid priced route.
-_GEMINI_BRIDGE_CANONICAL_MODELS = frozenset(_GEMINI_BRIDGE_MODEL_ALIASES.values())
-
-
-def is_notional_subscription_bridge(provider_name: Optional[str]) -> bool:
-    """True if a provider key is a notional (subscription-fronting) poly-vendor bridge.
-
-    Currently just the gemini-bridge (Google AI Ultra sub via agy). Its model id is
-    normalized through ``_GEMINI_BRIDGE_MODEL_ALIASES`` then priced under the vendor
-    inferred from the id (google/anthropic/openai) at official-docs rates.
-    """
-    p = (provider_name or "").strip().lower()
-    return bool(p) and p in NOTIONAL_SUBSCRIPTION_BRIDGE_PROVIDERS
-
-
-def _normalize_gemini_bridge_model(model: str) -> str:
-    """Map a gemini-bridge alias (gemini-flash, gemini-pro, …) to its
-    canonical priced model id. Strips a leading ``gemini-bridge/`` provider prefix
-    first, and passes through an already-canonical id unchanged."""
-    name = (model or "").split("/")[-1].lower().strip()
-    return _GEMINI_BRIDGE_MODEL_ALIASES.get(name, name)
-
 # Notional pricing for the xAI Grok OAuth provider (xai-oauth). Marginal cash
 # cost is $0 (covered by a flat SuperGrok / X Premium+ subscription), but for
 # fleet cost *visibility* we price its turns at xAI's official API rates and
 # label the result "estimated" — mirroring the notional-Anthropic relays above.
 # xAI is SINGLE-vendor (the OAuth provider fronts only Grok models), so a turn
-# routes to a fixed "xai" vendor (unlike the poly-vendor gemini-bridge). The
+# routes to a fixed "xai" vendor. The
 # metered direct-API provider ("xai", api.x.ai key) prices from the SAME snapshot
 # entries below — it just bills real dollars instead of notional ones, so it is
 # routed to the "xai" vendor there too (see resolve_billing_route()).
@@ -236,7 +176,6 @@ def _resolve_notional_custom_lane(provider_name: str) -> Optional[str]:
     if (
         is_notional_anthropic_provider(lane)
         or is_notional_xai_provider(lane)
-        or is_notional_subscription_bridge(lane)
         or lane in NOTIONAL_OPENROUTER_PROVIDERS
     ):
         return lane
@@ -533,25 +472,6 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://openai.com/index/previewing-gpt-5-6-sol/",
         pricing_version="openai-gpt-5.6-2026-07",
-    ),
-    # ── OpenAI GPT-5.5 ──────────────────────────────────────────────────
-    # OpenAI and models.dev/openai: $5 input, $0.50 cached, $30 output / 1M;
-    # >272K prompt: $10/$1/$45 for the whole request. Cache writes are not
-    # separately listed on the official pricing page; do not invent a rate.
-    (
-        "openai",
-        "gpt-5.5",
-    ): PricingEntry(
-        input_cost_per_million=Decimal("5.00"),
-        output_cost_per_million=Decimal("30.00"),
-        cache_read_cost_per_million=Decimal("0.50"),
-        source="official_docs_snapshot",
-        source_url="https://developers.openai.com/api/docs/models/gpt-5.5",
-        pricing_version="openai-gpt-5.5-2026-09",
-        tier_threshold_tokens=272_000,
-        input_cost_per_million_above=Decimal("10.00"),
-        output_cost_per_million_above=Decimal("45.00"),
-        cache_read_cost_per_million_above=Decimal("1.00"),
     ),
     # ── OpenAI GPT-6 Astra ───────────────────────────────────────────────
     # GA 2026-09-04. OpenAI's flagship; replaces gpt-5.6-sol as the codex
@@ -1217,26 +1137,6 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://ai.google.dev/pricing",
         pricing_version="google-pricing-2026-07-07",
-    ),
-    # Gemini 3.x — fronted by the Google AI Ultra subscription (gemini-bridge).
-    # Rates from the OpenRouter catalog (2026-07-05); the AI Studio pricing page
-    # lists the same tiers. Priced here so notional gemini-bridge turns resolve.
-    # parity 2026-08-30: the fork-era gemini-3.5-flash / gemini-3.1-pro entries
-    # (OpenRouter-catalog rates, added before upstream priced these models) were
-    # REMOVED here — upstream now ships canonical entries above WITH the
-    # >200k context-tier rates (#93469); dict later-key-wins made the stale
-    # fork copies shadow them (caught by upstream tier tests).
-    # GPT-OSS 120B — the open-weight model the Ultra sub also fronts via agy.
-    # Rate from the OpenRouter catalog (2026-07-05).
-    (
-        "openai",
-        "gpt-oss-120b",
-    ): PricingEntry(
-        input_cost_per_million=Decimal("0.03"),
-        output_cost_per_million=Decimal("0.15"),
-        source="official_docs_snapshot",
-        source_url="https://openrouter.ai/openai/gpt-oss-120b",
-        pricing_version="openai-pricing-2026-07",
     ),
     # AWS Bedrock — pricing per the Bedrock pricing page.
     # Bedrock charges the same per-token rates as the model provider but
@@ -2010,50 +1910,6 @@ def resolve_billing_route(
             billing_mode="official_docs_snapshot",
         )
 
-    # Notional pricing for the poly-vendor Google AI Ultra bridge (gemini-bridge).
-    # Marginal cash cost is $0 (flat Ultra sub), but for cost *visibility* we
-    # normalize its alias (gemini-flash/claude-opus/gpt-oss/…) to the canonical
-    # model id and route to the vendor INFERRED from that id (google/anthropic/
-    # openai), priced at official-docs rates. A poly-vendor analogue of the
-    # single-vendor notional-Anthropic relays above.
-    if is_notional_subscription_bridge(provider_name):
-        canonical = _normalize_gemini_bridge_model(model)
-        # Only price models the bridge actually fronts. An id that isn't a known
-        # fronted model — even a prefix-valid one like "gemini-2.0-flash" that
-        # _infer_vendor_from_model would map to google — routes as unsupported so a
-        # misconfigured/unsupported bridge model surfaces in diagnostics/rollups
-        # instead of masquerading as a valid priced route.
-        #
-        # Uses the distinct "unsupported_notional" billing_mode (NOT bare
-        # "unknown") so _lookup_official_docs_pricing can suppress its M1 vendor
-        # fallback for THIS case only. A bare "unknown" would be re-priced by M1 —
-        # which infers the vendor from the model id (gemini-2.0-flash → google) and
-        # would resurrect exactly the $0.50-at-Google-rates route we mean to reject.
-        # M1 must keep working for its real job (a vendor-named model on a
-        # mismatched/unknown provider, e.g. a custom localhost endpoint), so we
-        # can't blanket-guard M1 on "unknown"; the sentinel scopes the suppression.
-        if canonical not in _GEMINI_BRIDGE_CANONICAL_MODELS:
-            return BillingRoute(
-                provider="unknown",
-                model=canonical,
-                base_url=base_url or "",
-                billing_mode="unsupported_notional",
-            )
-        vendor = _infer_vendor_from_model(canonical)
-        if not vendor:
-            return BillingRoute(
-                provider="unknown",
-                model=canonical,
-                base_url=base_url or "",
-                billing_mode="unsupported_notional",
-            )
-        return BillingRoute(
-            provider=vendor,
-            model=canonical,
-            base_url=base_url or "",
-            billing_mode="official_docs_snapshot",
-        )
-
     # Notional pricing for ChatGPT-subscription Codex routes. Marginal cash cost
     # is $0, but for cost *visibility* we resolve to the underlying OpenAI model
     # and price it from the live OpenRouter catalog (status "estimated"). The
@@ -2256,16 +2112,6 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
     # guarded by ``vendor != route.provider`` so the inner call (provider == vendor)
     # cannot re-infer-and-recurse (RC-5 termination). Fixes Class A (openai/claude-*)
     # and every future proxy/bridge lane with a vendor-named model.
-    #
-    # EXCEPTION: a notional subscription bridge that already rejected this model as
-    # unsupported (billing_mode "unsupported_notional") must NOT be re-priced here.
-    # M1 would infer the vendor from the id (e.g. gemini-2.0-flash → google) and
-    # resurrect the exact $0.50-at-Google-rates route resolve_billing_route
-    # deliberately refused — masking a misconfigured/unsupported bridge model as a
-    # valid priced route. The bridge's supported set is known and small, so an
-    # unsupported-but-vendor-named id stays unpriced by design.
-    if route.billing_mode == "unsupported_notional":
-        return None
     vendor = _infer_vendor_from_model(route.model)
     if vendor and vendor != route.provider:
         return _lookup_official_docs_pricing(
