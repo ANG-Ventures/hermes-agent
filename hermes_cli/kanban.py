@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -264,6 +265,53 @@ def _check_dispatcher_presence(
 # ---------------------------------------------------------------------------
 # Argparse builder
 # ---------------------------------------------------------------------------
+
+def _intermix_optional_positionals(parser: argparse.ArgumentParser) -> None:
+    """Let options appear before trailing ``*``/``?`` positionals.
+
+    Stock argparse binds an optional positional (``nargs="*"``/``"?"``) to
+    ``[]``/default the moment it meets an option, so
+    ``comment <id> --author X "text"`` failed with ``unrecognized arguments:
+    text`` once ``text`` became ``nargs="*"`` (#1166). Every leaf parser in
+    the kanban tree that owns such a positional is switched to
+    ``parse_known_intermixed_args``; parsers with sub-commands are walked,
+    not converted (intermixed parsing cannot host subparsers).
+    """
+    subparser_actions = [
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    ]
+    if subparser_actions:
+        seen: set[int] = set()
+        for action in subparser_actions:
+            for child in action.choices.values():
+                if id(child) not in seen:
+                    seen.add(id(child))
+                    _intermix_optional_positionals(child)
+        return
+    if not any(
+        not a.option_strings and a.nargs in ("*", "?") for a in parser._actions
+    ):
+        return
+    base = type(parser)
+    if getattr(base, "_kanban_intermixed", False):
+        return
+
+    class _Intermixed(base):  # type: ignore[misc, valid-type]
+        _kanban_intermixed = True
+
+        def parse_known_args(self, args=None, namespace=None):
+            # parse_known_intermixed_args re-enters parse_known_args on
+            # py<3.12; the guard makes those inner passes the stock parser.
+            if getattr(self, "_kanban_in_intermixed", False):
+                return super().parse_known_args(args, namespace)
+            self._kanban_in_intermixed = True
+            try:
+                return self.parse_known_intermixed_args(args, namespace)
+            finally:
+                self._kanban_in_intermixed = False
+
+    parser.__class__ = _Intermixed
+
 
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
@@ -1544,6 +1592,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                      "relayed human decision to a foreign card; records an "
                      "operator_override event, posts no comment.",
             )
+    _intermix_optional_positionals(kanban_parser)
     return kanban_parser
 
 
@@ -3485,6 +3534,12 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
     if provider_error:
         print(f"kanban: {provider_error}", file=sys.stderr)
         return 2
+    from hermes_cli.model_policy import pinned_sub_provider_error
+
+    pin_error = pinned_sub_provider_error(model, provider)
+    if pin_error:
+        print(f"kanban: {pin_error}", file=sys.stderr)
+        return 2
 
     firepower_reason = parsed.firepower if parsed else None
     guard_error = firepower_guard_error(model, firepower_reason)
@@ -4171,6 +4226,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
+            except DraftPrError as draft_err:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
+                continue
             if not done:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -4466,17 +4525,21 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        ok, reason = kb.request_review(
-            conn,
-            tid,
-            summary=summary,
-            metadata=metadata,
-            reviewer=reviewer,
-            expected_run_id=_worker_run_id_for(tid),
-            force=bool(getattr(args, "force", False)),
-            allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
-            with_reason=True,
-        )
+        try:
+            ok, reason = kb.request_review(
+                conn,
+                tid,
+                summary=summary,
+                metadata=metadata,
+                reviewer=reviewer,
+                expected_run_id=_worker_run_id_for(tid),
+                force=bool(getattr(args, "force", False)),
+                allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
+                with_reason=True,
+            )
+        except DraftPrError as draft_err:
+            print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
+            return 1
         if not ok:
             detail = reason or "not running/ready?"
             print(

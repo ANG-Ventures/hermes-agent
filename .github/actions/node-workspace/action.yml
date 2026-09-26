@@ -1,0 +1,54 @@
+name: Node workspace setup
+description: >-
+  Node 26 + npm 12 + the lockfile-keyed installed node_modules tree, shared by
+  every job in js-tests.yml. One definition so the jobs cannot drift onto
+  different cache keys (a drift turns one job's 8s restore into a full
+  `npm ci`). Run actions/checkout first.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: 26
+        cache: npm
+
+    - name: grab npm 12
+      shell: bash
+      run: |
+        # No-op once the bundled npm is already 12.x — saves ~5-15s/job and
+        # keeps the installed major aligned with the npm12 cache-key tag.
+        npm --version | grep -q '^12\.' || npm i -g npm@12
+
+    # The ``cache: npm`` option of ``setup-node`` caches only the ~/.npm
+    # tarball cache. The job then extracts the full workspace node_modules
+    # again and runs the postinstalls again, which includes the Electron
+    # binary fetch. This caches the installed tree itself, keyed on the
+    # lockfile, and skips ``npm ci`` on an exact hit. There are no
+    # restore-keys: a partial hit leaves a stale tree, so anything other
+    # than an exact lockfile match reinstalls from the start.
+    #
+    # This install runs WITH scripts, so the tree holds the postinstall
+    # artifacts. The postinstall of electron unpacks its binary into
+    # node_modules/electron/dist, which is inside the cached tree.
+    #
+    # The ~/.cache/electron download cache stays out of the key on purpose.
+    # ``npm ci`` is skipped on a hit, so nothing reads that cache. It only
+    # makes the archive larger.
+    - name: Restore node_modules
+      id: node-modules-cache
+      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      with:
+        path: |
+          node_modules
+          apps/*/node_modules
+          ui-tui/node_modules
+          ui-tui/packages/*/node_modules
+          tests-js/node_modules
+          web/node_modules
+        key: node-modules-scripts-${{ runner.os }}-node26-npm12-${{ hashFiles('package-lock.json') }}
+
+    - uses: ./.github/actions/retry
+      if: steps.node-modules-cache.outputs.cache-hit != 'true'
+      with:
+        command: npm ci

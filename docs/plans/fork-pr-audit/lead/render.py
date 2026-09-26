@@ -3,15 +3,15 @@ import sys, os, re, json, collections
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import *
 
-ROW = json.load(open(L + 'rows.json'))
-CARDS = json.load(open(L + 'cards.json'))
-IDS = json.load(open(L + 'card_ids.json')) if os.path.exists(L + 'card_ids.json') else {}
+ROW = json.load(open(L + 'rows.json', encoding='utf-8'))
+CARDS = json.load(open(L + 'cards.json', encoding='utf-8'))
+IDS = json.load(open(L + 'card_ids.json', encoding='utf-8')) if os.path.exists(L + 'card_ids.json') else {}
 REG = json.loads(sh('git show origin/main:docs/sync/fork-features.json'))
 key2card = {}
 for c in CARDS:
     for k in c['keys'] + c['followers']:
         key2card[k] = IDS.get(c['name'], 'card:' + c['name'])
-SPLIT = json.load(open(L + 'split_ids.json')) if os.path.exists(L + 'split_ids.json') else {}
+SPLIT = json.load(open(L + 'split_ids.json', encoding='utf-8')) if os.path.exists(L + 'split_ids.json') else {}
 key2card.update(SPLIT)
 ORDER = ['gateway', 'agent', 'hermes_cli', 'plugins', 'cron+tools', 'scripts+misc', 'auto', 'auto-cherry-pick', 'auto-desktop-retired']
 VS = ['KEEP', 'UPSTREAM', 'SUPERSEDED-BY-UPSTREAM', 'DROP', 'UNRESOLVED']
@@ -101,7 +101,7 @@ def rollup_md():
             f'KEEP {loc["KEEP"]:,}, UNRESOLVED {loc["UNRESOLVED"]:,}; all rows {alloc:,}.', '',
             'Real `git diff --shortstat <merge-base> <branch>` of every revert branch on origin (lead run 2026-09-25):', '',
             '| branch | shortstat | status after adversary/lead |', '|---|---|---|']
-    stats = dict(l.split('|', 1) for l in open(L + 'revert_stats.txt').read().splitlines() if '|' in l)
+    stats = dict(l.split('|', 1) for l in open(L + 'revert_stats.txt', encoding='utf-8').read().splitlines() if '|' in l)
     b2k = collections.defaultdict(list)
     for k, v in ROW.items():
         for b in re.findall(r'audit/[\w\-/.]+[\w]', str((v.get('x') or {}).get('branch') or '')):
@@ -187,9 +187,9 @@ def rollup_md():
 
 
 if __name__ == '__main__':
-    open(D + 'FINAL.md', 'w').write(final_md())
-    open(D + 'ROLLUP.md', 'w').write(rollup_md())
-    txt = open(D + 'FINAL.md').read()
+    open(D + 'FINAL.md', 'w', encoding='utf-8').write(final_md())
+    open(D + 'ROLLUP.md', 'w', encoding='utf-8').write(rollup_md())
+    txt = open(D + 'FINAL.md', encoding='utf-8').read()
     keys = [r['key'] for r in census()]
     body = txt.split('## Conflicts')[0]
     lines = [l for l in body.splitlines() if l.startswith('| ') and not l.startswith('| key')]

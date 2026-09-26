@@ -369,22 +369,73 @@ def _dangling_gitfile(path):
     A ``.git`` DIRECTORY, or a gitfile whose target exists, is a repository
     that may hold work, and stays fail-closed.
     """
-    marker = path / ".git"
-    try:
-        if not marker.is_file():
-            return False
-        first = marker.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
-    except OSError:
+    target = _gitfile_target(path)
+    if target is None:
         return False
-    if not first or not first[0].startswith("gitdir:"):
-        return False
-    target = Path(first[0][len("gitdir:"):].strip())
-    if not target.is_absolute():
-        target = path / target
     try:
         return not target.exists()
     except OSError:
         return False
+
+
+def _gitfile_target(path):
+    """The ``gitdir:`` target named by ``path/.git`` when it is a gitfile, else None."""
+    marker = path / ".git"
+    try:
+        if not marker.is_file():
+            return None
+        first = marker.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+    except OSError:
+        return None
+    if not first or not first[0].startswith("gitdir:"):
+        return None
+    target = Path(first[0][len("gitdir:"):].strip())
+    return target if target.is_absolute() else path / target
+
+
+def _explain_dead_worktree_stub(repo, key, bases=()):
+    """Re-raise a failed capture on a dead linked-worktree stub with a remedy.
+
+    A linked worktree whose admin dir (``<main>/.git/worktrees/<name>``) was
+    removed keeps its ``.git`` gitfile, so ``_repos`` still counts it, and the
+    first git call in ``_capture`` exits 128. That surfaced as the bare
+    "survivor_unavailable: git remote failed (rc=128)" -- no path, no cause
+    (t_c41effce, measured on t_2df0cc1d's ``baseline/``).
+
+    The stub has no index and no HEAD left, so git cannot say what in it is
+    new; that is why this stays a refusal rather than a skip. The worktree
+    ``repair`` verb exits 1 on it ("does not reference a repository") and the
+    ``prune`` verb cannot recreate the admin dir (and is fleet-guarded), so the
+    only working remedy is a MOVE after a check. Returns (raising nothing) for
+    any other shape.
+    """
+    target = _gitfile_target(repo)
+    try:
+        if target is None or target.exists():
+            return
+    except OSError:
+        return
+    where = "." if key == "." else f"./{key}"
+    common = target.parent.parent if target.parent.name == "worktrees" else None
+    main = common.parent if common is not None and common.name == ".git" else common
+    owner = f"linked worktree of {_ext.redact(str(main))}" if main else "linked worktree"
+    remedy = (f"git has no index or HEAD for it, so compare its files against "
+              f"{_ext.redact(str(main)) if main else 'the repository it was checked out from'}; "
+              f"if nothing in it is unique, MOVE {where} out of the workspace (never delete it) "
+              "and retry")
+    if key in bases:
+        # Same second gate as `_explain_broken_object_store`: a repo recorded
+        # at dispatch that is no longer present refuses again with "recorded
+        # repository missing", so the remedy has to name both steps.
+        remedy += (f" -- {where} was recorded at dispatch, so the retry must PAIR the move "
+                   "with --survivor-pr <owner/repo#N> or --survivor-ref <repo-url>#<sha> "
+                   "or it will refuse again with 'recorded repository missing'")
+    log.warning("kanban survivor: dead linked worktree stub %s -> %s",
+                _ext.redact(str(repo)), _ext.redact(str(target)))
+    raise SurvivorUnavailable(
+        f"survivor_unavailable: {where} is a dead linked worktree stub ({owner}): its .git "
+        f"points at {_ext.redact(str(target))}, which no longer exists. {remedy}."
+    )
 
 
 def _repos(workspace, prune=None):
@@ -2167,6 +2218,10 @@ def _replaced_orphans(workspace, bases):
             # place would put a `.git` here. A stat, not a spawn: this runs on
             # every completion and reclamation pass (ref-cost gate).
             continue
+        # A dead linked-worktree stub fails every probe below and would be
+        # reported as "replaced in place ... <unreadable>", which it is not:
+        # nothing was re-initialised, the admin dir is gone. Name it instead.
+        _explain_dead_worktree_stub(path, key, bases)
         if _holds_commit_by_stat(path, sha) or \
                 _git(path, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0:
             continue  # same identity (or history still holds the dispatch commit)
@@ -2647,6 +2702,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # bare constant. Classify it before it escapes: if this repo's
                 # store is broken, say WHICH repo, WHICH lender and what to do.
                 # Anything else re-raises unchanged.
+                _explain_dead_worktree_stub(repo, key, bases)
                 _explain_broken_object_store(repo, key, workspace, bases)
                 raise
             if ref:

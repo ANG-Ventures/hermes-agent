@@ -878,6 +878,24 @@ def _run_one_file(
     return file, rc, output, summary, subproc_wall
 
 
+# Per-file junit (CI efficiency spec I4): when set, every file's FINAL attempt
+# writes <dir>/<junit_name(file)>. The flake-quarantine verdict reads these to
+# decide per TEST whether a red slice is fully explained by quarantined tests;
+# a file with no junit (hang, SIGKILL, crash) is gating by construction.
+_JUNIT_DIR: Path | None = None
+
+
+def junit_name(rel_path: str) -> str:
+    """Junit filename for a repo-relative test path (stable, flat, unique)."""
+    return rel_path.replace("\\", "/").replace("/", "__") + ".xml"
+
+
+def _junit_path(file: Path, repo_root: Path) -> Path | None:
+    if _JUNIT_DIR is None:
+        return None
+    return _JUNIT_DIR / junit_name(_format_file(file, repo_root))
+
+
 # Files that failed once and passed on retry, with both attempts' output.
 # Keeping the traceback is load-bearing: a self-healed flake without its
 # failing assertion is only a filename, which forces another expensive full
@@ -949,6 +967,14 @@ def _run_one_file_once(
     if idle_timeout is None:
         idle_timeout = _DEFAULT_IDLE_TIMEOUT_SECONDS
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    junit = _junit_path(file, repo_root)
+    if junit is not None:
+        # One attempt, one junit: a stale file from a failed first attempt
+        # must never describe a retry that hung or passed.
+        junit.unlink(missing_ok=True)
+        # xunit1 carries file= on every testcase, which the verdict uses to
+        # rebuild the exact node ID.
+        cmd += [f"--junitxml={junit}", "-o", "junit_family=xunit1"]
 
     # Give this subprocess its own pytest temp root.
     #
@@ -1042,6 +1068,10 @@ def _run_one_file_once(
             pass
         output = finalize_output()
         rc = 124  # de facto convention for "killed by timeout".
+        if junit is not None:
+            # A junit written before a teardown hang is partial evidence;
+            # a timed-out file must read as "no results" (fail closed).
+            junit.unlink(missing_ok=True)
         if idle_killed:
             output = (
                 f"(no test progress for {idle_timeout:.0f}s -- hang; "
@@ -1713,6 +1743,22 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--junit-dir",
+        default=None,
+        help=(
+            "Write one junit XML per test file (its FINAL attempt) into this "
+            "directory. Used by the CI flake-quarantine verdict."
+        ),
+    )
+    parser.add_argument(
+        "--result-file",
+        default=None,
+        help=(
+            "Write a JSON manifest (runner exit code, no-op verdicts, every "
+            "file's exit code / timeout / junit name) to this path."
+        ),
+    )
+    parser.add_argument(
         "--min-tests",
         metavar="N",
         type=int,
@@ -1779,6 +1825,7 @@ def main() -> int:
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
         "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
         "--min-tests", "--strict-noop", "--no-strict-noop",
+        "--junit-dir", "--result-file",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1820,6 +1867,10 @@ def main() -> int:
         i += 1
 
     args = parser.parse_args(our_args)
+    global _JUNIT_DIR
+    if args.junit_dir:
+        _JUNIT_DIR = Path(args.junit_dir).resolve()
+        _JUNIT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Worker sizing: the CPU QUOTA is the ceiling, not the host core count ─
     # An explicit -j (or $HERMES_TEST_WORKERS) is a REQUEST that can only lower
@@ -2068,6 +2119,9 @@ def main() -> int:
     # aggregate no-op gate can see exit-5→0-coerced zero-collect files that
     # never enter `failures`. Without this the silent no-op is invisible.
     all_summaries: List[Tuple[Path, Dict[str, int]]] = []
+    # Final exit code per file for the --result-file manifest (-1 = the
+    # runner itself crashed on this file: no junit, gating).
+    file_rcs: Dict[Path, int] = {}
     started = time.monotonic()
     files_done = 0
     tests_done = 0
@@ -2095,6 +2149,7 @@ def main() -> int:
                 tests_done += n_tests
                 fail_count += 1
                 failures.append((file, f"runner crashed: {exc!r}", {}))
+                file_rcs[file] = -1
                 _print_progress(
                     tests_done, approx_total_tests, file, 1,
                     time.monotonic() - started_at,
@@ -2116,6 +2171,7 @@ def main() -> int:
             )
             file_times.append((fpath, subproc_wall))
             all_summaries.append((fpath, summary))
+            file_rcs[fpath] = rc
             if rc == 0:
                 pass_count += 1
             else:
@@ -2376,13 +2432,43 @@ def main() -> int:
         repo_root=repo_root,
     )
 
-    if had_failures or noop_red:
-        return 1
+    final_rc = 1 if (had_failures or noop_red or no_tests_ran_at_all) else 0
+    if args.result_file:
+        _write_result_file(
+            Path(args.result_file), final_rc, bool(noop_red),
+            bool(no_tests_ran_at_all), file_rcs, all_summaries, repo_root,
+        )
+    return final_rc
 
-    if no_tests_ran_at_all:
-        return 1
 
-    return 0
+def _write_result_file(
+    path: Path,
+    runner_rc: int,
+    noop_red: bool,
+    no_tests_ran_at_all: bool,
+    file_rcs: Dict[Path, int],
+    all_summaries: List[Tuple[Path, Dict[str, int]]],
+    repo_root: Path,
+) -> None:
+    """Manifest the flake-quarantine verdict reads (schema 1)."""
+    timed_out = {f for f, s in all_summaries if s.get("timed_out")}
+    files = []
+    for f, rc in sorted(file_rcs.items(), key=lambda kv: str(kv[0])):
+        junit = _junit_path(f, repo_root)
+        files.append({
+            "path": _format_file(f, repo_root),
+            "rc": rc,
+            "timed_out": f in timed_out,
+            "junit": junit.name if junit is not None and junit.is_file() else None,
+        })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema": 1,
+        "runner_rc": runner_rc,
+        "noop_red": noop_red,
+        "no_tests_ran_at_all": no_tests_ran_at_all,
+        "files": files,
+    }, indent=1, sort_keys=True), encoding="utf-8")
 
 
 def _noop_guard(

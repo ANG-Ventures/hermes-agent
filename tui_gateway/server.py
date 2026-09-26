@@ -12910,7 +12910,9 @@ def _collect_kanban_notifications(session: dict) -> list:
                 if not events:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
-                for ev in events:
+                from gateway.kanban_notify_failures import collapse_retry_pairs
+
+                for ev in collapse_retry_pairs(list(events)):
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
                         texts.append(text)
