@@ -90,16 +90,54 @@ def test_scan_proposes_entry_that_passes_the_gate():
     assert counts == {"flake": 2}
     assert [e["node_id"] for e in found] == [NODE]
     e = found[0]
-    assert e["owner"] == "flake-ledger" and e["until"] == "2026-10-09"
-    assert fq.lint({"schema": 1, "entries": found}, NOW.date()) == []
+    # A candidate never invents an owner or card (t_162ffd04: never silent).
+    assert "owner" not in e and "card" not in e and e["until"] == "2026-10-09"
+    ready, missing = fl.assign(found, {NODE: {"card": "t_60cbc759", "owner": "daedalus"}})
+    assert missing == [] and ready[0]["card"] == "t_60cbc759" and ready[0]["owner"] == "daedalus"
+    assert fq.lint({"schema": 1, "entries": ready}, NOW.date()) == []
     assert fq.verify_evidence(e, w, REPO, NOW) == []
 
 
-def test_scan_one_day_only_is_not_a_candidate():
+def test_scan_two_pairs_one_day_is_a_candidate():
     w = _two_day_flake()
     w.json[f"repos/{REPO}/actions/runs/22/attempts/1"]["run_started_at"] = "2026-09-20T05:00:00Z"
     found, _ = fl.candidates(w, REPO, NOW, {"entries": []})
+    assert [e["node_id"] for e in found] == [NODE]
+
+
+def test_scan_single_pair_is_not_a_candidate():
+    w = World()
+    w.attempt(11, 1, "failure", "s1", "2026-09-20", "failed", latest=False)
+    w.attempt(11, 2, "success", "s1", "2026-09-20", "passed")
+    w.ancestor("s1")
+    found, _ = fl.candidates(w, REPO, NOW, {"entries": []})
     assert found == []
+
+
+@pytest.mark.parametrize("mapping", [{}, {NODE: {"owner": "daedalus"}}, {NODE: {"card": "t_60cbc759"}},
+                                     {NODE: {"card": "flake-ledger", "owner": "daedalus"}}])
+def test_assign_refuses_candidate_without_card_and_owner(mapping):
+    found = [{"node_id": NODE, "until": "2026-10-09", "evidence": []}]
+    ready, missing = fl.assign(found, mapping)
+    assert ready == [] and missing == [NODE]
+
+
+def test_apply_without_assign_is_refused(tmp_path, monkeypatch):
+    lst = tmp_path / "q.json"
+    lst.write_text('{"schema": 1, "entries": []}')
+    monkeypatch.setattr(fl, "candidates", lambda *a, **k: ([{"node_id": NODE, "until": "2026-10-09", "evidence": []}], {}))
+    assert fl.main(["scan", "--repo", REPO, "--list", str(lst), "--apply"]) == 2
+    assert json.loads(lst.read_text())["entries"] == []
+
+
+def test_rearm_drops_entries_whose_fix_card_closed(tmp_path):
+    lst = tmp_path / "q.json"
+    lst.write_text(json.dumps({"schema": 1, "entries": [
+        {"node_id": "tests/a.py::t1", "card": "t_aaaaaaaa", "owner": "o", "until": "2026-10-01"},
+        {"node_id": "tests/a.py::t2", "card": "t_bbbbbbbb", "owner": "o", "until": "2026-10-01"},
+    ]}))
+    assert fl.main(["rearm", "--list", str(lst), "--closed", "t_aaaaaaaa"]) == 0
+    assert [e["node_id"] for e in json.loads(lst.read_text())["entries"]] == ["tests/a.py::t2"]
 
 
 def test_scan_red_red_is_real_not_candidate():
@@ -121,18 +159,30 @@ def test_scan_non_ancestor_sha_is_skipped():
 
 def test_scan_skips_already_active_entry():
     w = _two_day_flake()
-    existing = {"entries": [{"node_id": NODE, "owner": "x", "until": "2026-10-01", "evidence": []}]}
+    existing = {"entries": [{"node_id": NODE, "card": "t_60cbc759", "owner": "x", "until": "2026-10-01", "evidence": []}]}
     found, _ = fl.candidates(w, REPO, NOW, existing)
     assert found == []
 
 
 def test_digest_warns_three_days_before_expiry():
     data = {"entries": [
-        {"node_id": "tests/a.py::t1", "owner": "o", "until": "2026-09-27"},
-        {"node_id": "tests/a.py::t2", "owner": "o", "until": "2026-10-05"},
-        {"node_id": "tests/a.py::t3", "owner": "o", "until": "2026-09-01"},
+        {"node_id": "tests/a.py::t1", "card": "t_aaaaaaaa", "owner": "o", "until": "2026-09-27"},
+        {"node_id": "tests/a.py::t2", "card": "t_bbbbbbbb", "owner": "o", "until": "2026-10-05"},
+        {"node_id": "tests/a.py::t3", "card": "t_cccccccc", "owner": "o", "until": "2026-09-01"},
     ]}
     lines = fl.digest(data, NOW.date())
     assert len(lines) == 2  # expired entry is not active (it gates again)
     assert "⚠️" in lines[0] and "t1" in lines[0]
     assert "⚠️" not in lines[1]
+    assert "card t_aaaaaaaa" in lines[0] and "owner o" in lines[0]
+
+
+def test_fail_on_candidates_pages_and_quiet_run_is_green(tmp_path, monkeypatch, capsys):
+    lst = tmp_path / "q.json"
+    lst.write_text('{"schema": 1, "entries": []}')
+    cand = {"node_id": NODE, "until": "2026-10-09", "reason": "flake-ledger: 2 pairs", "evidence": []}
+    monkeypatch.setattr(fl, "candidates", lambda *a, **k: ([cand], {}))
+    assert fl.main(["scan", "--repo", REPO, "--list", str(lst), "--fail-on-candidates"]) == 1
+    assert NODE in capsys.readouterr().out
+    monkeypatch.setattr(fl, "candidates", lambda *a, **k: ([], {}))
+    assert fl.main(["scan", "--repo", REPO, "--list", str(lst), "--fail-on-candidates"]) == 0

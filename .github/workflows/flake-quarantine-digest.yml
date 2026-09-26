@@ -1,0 +1,40 @@
+# Fleet-added (t_162ffd04). Weekly "quarantined tests" digest.
+# Lists every active quarantine entry with its fix card, owner and expiry, then
+# re-scans the last 14 days of push / merge_group / schedule CI for flakes that
+# qualify but are not quarantined. A qualifying candidate fails the run, which
+# pages #alerts through fleet-ci-fail-alert: a quarantine is never added
+# silently, a human assigns the card + owner (flake_ledger.py scan --apply --assign).
+name: Flake quarantine digest
+
+on:
+  schedule:
+    - cron: '17 16 * * 1' # Mondays 16:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read # the scan reads runs + slice artifacts
+
+concurrency:
+  group: flake-quarantine-digest
+  cancel-in-progress: true
+
+jobs:
+  digest:
+    if: github.repository == 'ANG-Ventures/hermes-agent'
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Active quarantine entries
+        run: |
+          {
+            echo "## Quarantined tests"
+            echo '```'
+            python3 scripts/ci/flake_ledger.py digest
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Unquarantined flake candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/flake_ledger.py scan --repo "${{ github.repository }}" --fail-on-candidates

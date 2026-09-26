@@ -34,8 +34,8 @@ NOW = dt.datetime(2026, 9, 25, 18, 0, tzinfo=dt.timezone.utc)
 NODE = "tests/ci/test_widget.py::TestW::test_flaky[a-1]"
 
 
-def _entry(node=NODE, until="2026-10-05", owner="daedalus", evidence=None):
-    return {"node_id": node, "owner": owner, "until": until, "reason": "flake",
+def _entry(node=NODE, until="2026-10-05", owner="daedalus", evidence=None, card="t_162ffd04"):
+    return {"node_id": node, "card": card, "owner": owner, "until": until, "reason": "flake",
             "evidence": evidence if evidence is not None else []}
 
 
@@ -51,6 +51,9 @@ def test_lint_accepts_well_formed_entry():
 
 @pytest.mark.parametrize("mut,frag", [
     (lambda e: e.pop("owner"), "missing owner"),
+    (lambda e: e.pop("card"), "malformed card"),
+    (lambda e: e.update(card="flake-ledger"), "malformed card"),
+    (lambda e: e.update(card="t_123"), "malformed card"),
     (lambda e: e.update(owner="  "), "missing owner"),
     (lambda e: e.pop("until"), "until"),
     (lambda e: e.update(until="next week"), "until"),
@@ -209,6 +212,21 @@ def test_entry_without_owner_never_exempts(tmp_path):
     result, jdir = _slice(tmp_path, [FLAKY_FAIL])
     ok, _ = fq.slice_verdict(result, jdir, _qlist(e), TODAY)
     assert not ok
+
+
+@pytest.mark.parametrize("card", [None, "", "flake-ledger", "t_XYZ"])
+def test_entry_without_fix_card_never_exempts(tmp_path, card):
+    # t_162ffd04: never quarantine silently; an entry must name its fix card.
+    e = _entry(card=card)
+    result, jdir = _slice(tmp_path, [FLAKY_FAIL])
+    ok, _ = fq.slice_verdict(result, jdir, _qlist(e), TODAY)
+    assert not ok
+
+
+def test_quarantined_verdict_names_card_and_owner(tmp_path):
+    result, jdir = _slice(tmp_path, [FLAKY_FAIL])
+    ok, msgs = fq.slice_verdict(result, jdir, _qlist(_entry()), TODAY)
+    assert ok and any("card t_162ffd04" in m and "owner daedalus" in m for m in msgs)
 
 
 # ── slice verdict (E2E through the real runner + CLI) ───────────────────────
@@ -374,12 +392,19 @@ def test_d_duplicated_pair_does_not_count_twice():
     assert any("duplicate" in p for p in problems)
 
 
-def test_d_two_pairs_same_day_is_insufficient():
+def test_two_pairs_same_day_is_sufficient():
+    # t_162ffd04: >= 2 same-SHA red->green pairs inside one day qualifies; the
+    # old 2-day floor let a flake eject the merge queue for two days first.
     api, ev = _good_world()
     for rid in (602, 603):
         api.json[f"repos/{REPO}/actions/runs/{rid}/attempts/1"]["run_started_at"] = "2026-09-20T12:00:00Z"
-    problems = fq.verify_evidence(_entry(evidence=ev), api, REPO, NOW)
-    assert any("distinct day" in p for p in problems)
+    assert fq.verify_evidence(_entry(evidence=ev), api, REPO, NOW) == []
+
+
+def test_d_one_pair_is_still_insufficient():
+    api, ev = _good_world()
+    problems = fq.verify_evidence(_entry(evidence=ev[:1]), api, REPO, NOW)
+    assert any(">= 2" in p for p in problems)
 
 
 # ── diff rule (p5 RC-H) ─────────────────────────────────────────────────────
