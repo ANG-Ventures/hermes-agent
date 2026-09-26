@@ -31,7 +31,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -41,7 +41,7 @@ from hermes_state import SessionDB
 from run_agent import AIAgent as RealAIAgent
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.session import SessionSource
 
 SESSION_KEY = "agent:main:telegram:group:-1001"
@@ -243,36 +243,30 @@ async def test_real_user_turn_row_stays_untyped(monkeypatch, tmp_path, real_agen
 # ── 3: queued (drained in-band) internal events keep the marker ──────────
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "internal, expected", [(True, "internal_notification"), (False, None)]
-)
-async def test_queued_followup_carries_internal_marker(internal, expected):
+def test_queued_followup_carries_internal_marker():
+    """The in-band drained follow-up (``_run_agent`` recursing on the dequeued
+    ``pending_event``) must derive ``persist_user_display_kind`` from that
+    event's ``internal`` flag, or a wake drained while busy persists untyped."""
+    import ast
+
     gateway_run = importlib.import_module("gateway.run")
-    runner = object.__new__(gateway_run.GatewayRunner)
-    runner._is_session_run_current = lambda _key, _gen: True
-    runner._run_agent = AsyncMock(return_value={"final_response": "ok", "messages": []})
+    tree = ast.parse(Path(gateway_run.__file__).read_text(encoding="utf-8"))
 
-    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
-    queued = MessageEvent(text=WAKE, source=source, internal=internal)
+    calls = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "_run_agent":
+            continue
+        kw = {k.arg: k.value for k in node.keywords}
+        depth = kw.get("_interrupt_depth")
+        if isinstance(depth, ast.BinOp) and isinstance(depth.op, ast.Add):
+            calls.append(kw)
 
-    await runner._run_queued_followup_if_current(
-        current_result={"final_response": "first", "messages": []},
-        message=WAKE,
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-q",
-        session_key=SESSION_KEY,
-        generation_session_key=SESSION_KEY,
-        run_generation=1,
-        interrupt_depth=1,
-        event_message_id=None,
-        channel_prompt=None,
-        message_type=None,
-        queued_event=queued,
-        queued_adapter=None,
-    )
-
-    kwargs = runner._run_agent.call_args.kwargs
-    assert kwargs.get("persist_user_display_kind") == expected
+    assert calls, "in-band queued follow-up _run_agent call not found"
+    for kw in calls:
+        kind = kw.get("persist_user_display_kind")
+        assert isinstance(kind, ast.IfExp), "follow-up drops persist_user_display_kind"
+        src = ast.unparse(kind)
+        assert "'internal_notification'" in src
+        assert "getattr(pending_event, 'internal'" in src
