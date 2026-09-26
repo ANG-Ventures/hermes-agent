@@ -566,45 +566,11 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
     )
 
 
-def _creation_admission_warnings(job: Dict[str, Any]) -> List[str]:
-    """Return actionable warnings for costly or noisy cron job shapes.
-
-    These are warnings rather than hard failures because both shapes can be
-    intentional: an agent job may deliberately follow the configured default
-    model, and a standing digest may deliberately deliver to its origin forever.
-    Surfacing the risks in the create response lets the caller make that choice
-    explicitly instead of discovering it later via fleet lint alerts.
-    """
-    warnings: List[str] = []
-    if not job.get("no_agent") and not (job.get("model") and job.get("provider")):
-        warnings.append(
-            "Warning: this LLM cron does not explicitly pin both model and provider; "
-            "it follows the configured default inference route (with drift snapshots) "
-            "and may consume primary-model rates. Set both model and provider when "
-            "creating or updating the job."
-        )
-
-    repeat_times = (job.get("repeat") or {}).get("times")
-    schedule_kind = (job.get("schedule") or {}).get("kind")
-    if (
-        job.get("deliver") == "origin"
-        and schedule_kind != "once"
-        and repeat_times is None
-    ):
-        warnings.append(
-            "Warning: this recurring deliver='origin' cron has no finite repeat cap; "
-            "it can append to the originating conversation indefinitely. Set "
-            "repeat=N, or make the job self-pause/remove and verify that behavior."
-        )
-    return warnings
-
-
 # Session-pollution floor for deliver=origin (mirrors cron-config-lint Rule #5
 # I1). A recurring job that delivers into the originating conversation MORE than
 # once an hour spams Ace's live session on every tick — this is never intentional
-# (an ops receipt/heartbeat belongs in #logs, not the session), so unlike the
-# no-cap case in _creation_admission_warnings it is a HARD block at create/update
-# time, not a warning. Caught the rsd-dropbox-finalize job (deliver=origin +
+# (an ops receipt/heartbeat belongs in #logs, not the session), so it is a HARD
+# block at create/update time, not a warning. Caught the rsd-dropbox-finalize job (deliver=origin +
 # every 10m) only AFTER creation via the daily lint, 2026-07-18.
 _ORIGIN_SUBHOURLY_FLOOR_SECONDS = 3600
 
@@ -2272,9 +2238,7 @@ def cronjob(
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
-            _admission_warnings = _creation_admission_warnings(job)
-            if model_spec_warning:
-                _admission_warnings = [model_spec_warning, *_admission_warnings]
+            _admission_warnings = [model_spec_warning] if model_spec_warning else []
             if _admission_warnings:
                 _create_message = f"{_create_message} {' '.join(_admission_warnings)}"
             # Gateway liveness surfacing (#87033): the builtin scheduler's
@@ -2648,9 +2612,7 @@ def cronjob(
             if not updated:
                 return tool_error(f"Failed to update cron job '{job_id}'.", success=False)
             _notify_provider_jobs_changed_safe()
-            _admission_warnings = _creation_admission_warnings(updated)
-            if model_spec_warning:
-                _admission_warnings = [model_spec_warning, *_admission_warnings]
+            _admission_warnings = [model_spec_warning] if model_spec_warning else []
             _update_message = f"Cron job '{updated['name']}' updated."
             if _admission_warnings:
                 _update_message = f"{_update_message} {' '.join(_admission_warnings)}"
