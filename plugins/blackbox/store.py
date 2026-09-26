@@ -564,6 +564,16 @@ def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
                 SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
                                       OR cache_write IS NULL THEN NULL
                             WHEN input_tokens + cache_read + cache_write <= 0 THEN NULL
+                            -- Read-only lanes (xAI, codex, OpenAI-shaped usage with
+                            -- only prompt_tokens_details.cached_tokens) never report
+                            -- a write, so the write rule below is structurally 0
+                            -- there. A cold first call is a read under half the
+                            -- prompt. Anthropic lanes keep the write rule.
+                            WHEN lane_family IS NOT NULL
+                                 AND lane_family NOT IN ('apx/apr', 'bpx/bpr', 'cpx/cpr')
+                                 AND cache_write = 0 THEN
+                                CASE WHEN cache_read * 2 < input_tokens + cache_read
+                                     THEN 1 ELSE 0 END
                             WHEN cache_write * 5 >= 4 *
                                  (input_tokens + cache_read + cache_write) THEN 1
                             ELSE 0 END
