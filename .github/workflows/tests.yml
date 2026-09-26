@@ -92,14 +92,12 @@ jobs:
           # placement controller writes. Rollback: CI_X64_HOSTED_MIN=off.
           CI_X64_HOSTED_MIN: ${{ vars.CI_X64_HOSTED_MIN || '2' }}
           # Paid third rung (free self-hosted -> free GitHub-hosted ->
-          # Blacksmith): N slices move to Blacksmith, same arch. The slices
-          # the controller took OFF self-hosted (K+1..baseline) go first, then
-          # the last hosted slices. Written by the host ci-placement.py
-          # controller only under a measured signal; unset/0 = off. The
-          # generator enforces the trust guard itself: push, merge_group and
-          # same-repo pull_request only — fork PRs never leave GitHub.
+          # Blacksmith): the last N GitHub-hosted slices move to Blacksmith,
+          # same arch. Written by the host ci-placement.py controller only
+          # under measured hosted contention; unset/0 = off. The generator
+          # enforces the trust guard itself: push, merge_group and same-repo
+          # pull_request only — fork PRs never leave GitHub.
           CI_BLACKSMITH_SLICES: ${{ vars.CI_BLACKSMITH_SLICES }}
-          CI_SELF_HOSTED_SLOTS_BASELINE: ${{ vars.CI_SELF_HOSTED_SLOTS_BASELINE }}
           EVENT_NAME: ${{ github.event_name }}
           SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
@@ -111,7 +109,6 @@ jobs:
             --arm-hosted-slices="$CI_ARM_HOSTED_SLICES" \
             --x64-hosted-min="$CI_X64_HOSTED_MIN" \
             --blacksmith-slices="$CI_BLACKSMITH_SLICES" \
-            --self-hosted-baseline="$CI_SELF_HOSTED_SLOTS_BASELINE" \
             --event="$EVENT_NAME" \
             --same-repo="$SAME_REPO")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"

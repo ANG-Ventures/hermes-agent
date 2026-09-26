@@ -618,19 +618,13 @@ def _route_blacksmith_slices(
     raw_count: str | None,
     event: str | None,
     same_repo: str | None,
-    self_hosted_slots: int | None = None,
-    raw_baseline: str | None = None,
 ) -> None:
-    """Move N GitHub-hosted slices to Blacksmith, displaced slices first.
+    """Move the LAST N GitHub-hosted slices (by index) to Blacksmith.
 
     Runs after self-hosted and ARM routing, so it only ever takes slices that
-    would otherwise run on GitHub-hosted runners. Order (Ace 2026-09-25 18:14):
-    first the slices the placement controller took OFF the self-hosted boxes
-    (indices K+1..baseline, where K = ``self_hosted_slots`` and baseline =
-    ``CI_SELF_HOSTED_SLOTS_BASELINE``), then the last hosted slices by index.
-    ``raw_count`` unset/0/invalid, or an untrusted event (fork PR, schedule,
-    dispatch, an unknown event), leaves the matrix untouched. An unset or
-    invalid baseline means nothing counts as displaced (last-N only).
+    would otherwise have queued on GitHub-hosted runners. ``raw_count``
+    unset/0/invalid, or an untrusted event (fork PR, schedule, dispatch, an
+    unknown event), leaves the matrix untouched.
     """
     raw = "" if raw_count is None else str(raw_count).strip()
     if not raw:
@@ -656,24 +650,10 @@ def _route_blacksmith_slices(
         )
         return
     hosted = [s for s in matrix["slice"] if s["runs_on"] in _BLACKSMITH_BY_HOSTED]
-    raw_b = "" if raw_baseline is None else str(raw_baseline).strip()
-    baseline = int(raw_b) if raw_b.isdigit() else None
-    k = self_hosted_slots
-    displaced = sorted(
-        (s for s in hosted
-         if k is not None and baseline is not None and k < s["index"] <= baseline),
-        key=lambda s: s["index"],
-    )
-    tail = sorted((s for s in hosted if s not in displaced),
-                  key=lambda s: s["index"], reverse=True)
-    chosen = (displaced + tail)[:count]
+    chosen = sorted(hosted, key=lambda s: s["index"])[-count:]
     for slice_ in chosen:
         slice_["runs_on"] = _BLACKSMITH_BY_HOSTED[slice_["runs_on"]]
-    print(
-        f"Blacksmith: {len(chosen)} slice(s) routed "
-        f"({min(len(displaced), count)} displaced from self-hosted)",
-        file=sys.stderr,
-    )
+    print(f"Blacksmith: {len(chosen)} slice(s) routed", file=sys.stderr)
 
 
 def _scoped_plugin_matrix(
@@ -1563,16 +1543,6 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--self-hosted-baseline",
-        metavar="B",
-        default=None,
-        help=(
-            "Operator baseline for --self-hosted-slots. Slices K+1..B were taken "
-            "off self-hosted by the placement controller and go to Blacksmith "
-            "first. Env/CI source: vars.CI_SELF_HOSTED_SLOTS_BASELINE."
-        ),
-    )
-    parser.add_argument(
         "--event",
         default=None,
         help="github.event_name, for the Blacksmith trust guard.",
@@ -1675,8 +1645,7 @@ def main() -> int:
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
-        "--x64-hosted-min", "--blacksmith-slices", "--self-hosted-baseline",
-        "--event", "--same-repo",
+        "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
         "--min-tests", "--strict-noop", "--no-strict-noop",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -1834,8 +1803,7 @@ def main() -> int:
                 scoped_matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
             )
             _route_blacksmith_slices(
-                scoped_matrix, args.blacksmith_slices, args.event, args.same_repo,
-                self_hosted_slots, args.self_hosted_baseline,
+                scoped_matrix, args.blacksmith_slices, args.event, args.same_repo
             )
             print(
                 f"Test scope: {args.test_scope} + core smoke"
@@ -1919,8 +1887,7 @@ def main() -> int:
             matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
         )
         _route_blacksmith_slices(
-            matrix, args.blacksmith_slices, args.event, args.same_repo,
-            self_hosted_slots, args.self_hosted_baseline,
+            matrix, args.blacksmith_slices, args.event, args.same_repo
         )
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))

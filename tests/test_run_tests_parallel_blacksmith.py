@@ -25,7 +25,7 @@ WEIGHTS8 = (0.1, 40, 10, 30, 5, 20, 1, 15)
 
 
 def generate(monkeypatch, capsys, *, slots=2, arm="0", x64_min="2", bs=None,
-             event="merge_group", same_repo=None, baseline=None):
+             event="merge_group", same_repo=None):
     spec = importlib.util.spec_from_file_location("bs_runner", SCRIPT)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
@@ -42,8 +42,6 @@ def generate(monkeypatch, capsys, *, slots=2, arm="0", x64_min="2", bs=None,
         args.append(f"--event={event}")
     if same_repo is not None:
         args.append(f"--same-repo={same_repo}")
-    if baseline is not None:
-        args.append(f"--self-hosted-baseline={baseline}")
     monkeypatch.setattr(sys, "argv", args)
     assert mod.main() == 0
     return [s["runs_on"] for s in json.loads(capsys.readouterr().out)["slice"]]
@@ -64,41 +62,6 @@ def test_ladder_takes_the_last_n_hosted_slices_and_never_the_pool(monkeypatch, c
     moved = min(n, len(hosted))
     # Rung 3 is exactly the tail of rung 2.
     assert hosted == [HOSTED] * (len(hosted) - moved) + [BS] * moved
-
-
-def test_displaced_self_hosted_slices_go_to_blacksmith_first(monkeypatch, capsys):
-    # Controller scaled K 6 -> 2 (baseline 6): slices 3..6 were taken off the
-    # boxes. Blacksmith takes those first, lowest index first, not the tail.
-    runs_on = generate(monkeypatch, capsys, slots=2, baseline="6", bs="3")
-    assert runs_on == [POOL, POOL, BS, BS, BS, HOSTED, HOSTED, HOSTED]
-
-
-def test_last_n_hosted_only_beyond_the_displaced(monkeypatch, capsys):
-    # 2 displaced (slices 5, 6), N=4: both displaced + the 2 highest-index hosted.
-    runs_on = generate(monkeypatch, capsys, slots=4, baseline="6", bs="4")
-    assert runs_on == [POOL] * 4 + [BS, BS, BS, BS]
-    runs_on = generate(monkeypatch, capsys, slots=3, baseline="5", bs="3")
-    assert runs_on == [POOL] * 3 + [BS, BS, HOSTED, HOSTED, BS]
-
-
-def test_k_zero_floor_sends_n_of_the_whole_pool_share(monkeypatch, capsys):
-    # K floored at 0 (Blacksmith rung armed), baseline 9 > 8 slices: every
-    # slice is displaced, N=4 of them go to Blacksmith, none stay self-hosted.
-    runs_on = generate(monkeypatch, capsys, slots=0, baseline="9", bs="4")
-    assert runs_on == [BS] * 4 + [HOSTED] * 4
-
-
-@pytest.mark.parametrize("baseline", [None, "", "oops", "-3", "2"])
-def test_no_displacement_without_a_baseline_above_k(monkeypatch, capsys, baseline):
-    # Unset/invalid baseline, or baseline == K: plain last-N-hosted (Phase A).
-    assert (generate(monkeypatch, capsys, slots=2, baseline=baseline, bs="3")
-            == generate(monkeypatch, capsys, slots=2, bs="3"))
-
-
-def test_displacement_obeys_the_trust_guard(monkeypatch, capsys):
-    runs_on = generate(monkeypatch, capsys, slots=0, baseline="9", bs="4",
-                       event="pull_request", same_repo="false")
-    assert BS not in runs_on and BS_ARM not in runs_on
 
 
 def test_arch_is_preserved_under_arm_first_routing(monkeypatch, capsys):
@@ -157,9 +120,7 @@ def test_workflow_binds_variable_event_and_same_repo():
     assert env["CI_BLACKSMITH_SLICES"] == "${{ vars.CI_BLACKSMITH_SLICES }}"
     assert env["EVENT_NAME"] == "${{ github.event_name }}"
     assert env["SAME_REPO"] == "${{ github.event.pull_request.head.repo.full_name == github.repository }}"
-    assert env["CI_SELF_HOSTED_SLOTS_BASELINE"] == "${{ vars.CI_SELF_HOSTED_SLOTS_BASELINE }}"
-    for flag in ('--blacksmith-slices="$CI_BLACKSMITH_SLICES"', '--event="$EVENT_NAME"', '--same-repo="$SAME_REPO"',
-                 '--self-hosted-baseline="$CI_SELF_HOSTED_SLOTS_BASELINE"'):
+    for flag in ('--blacksmith-slices="$CI_BLACKSMITH_SLICES"', '--event="$EVENT_NAME"', '--same-repo="$SAME_REPO"'):
         assert flag in step["run"]
     # Membership never changes: every slice still takes its label from the matrix.
     assert jobs["test"]["runs-on"] == "${{ fromJSON(matrix.slice.runs_on) }}"
