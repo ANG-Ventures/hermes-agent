@@ -196,6 +196,11 @@ if [ "$DEV_SANDBOX_INTERACTIVE" = true ]; then
   dev_mounts=(--dev /dev)
 fi
 
+# Every client reaches the network through proxy.py, which answers TLS with
+# certificates minted from the sandbox CA (ca.pem). Node must trust that CA
+# like curl/git/python do; trusting only real-ca.pem makes npm abort every
+# handshake (UNABLE_TO_VERIFY_LEAF_SIGNATURE, logged by the proxy as
+# SSLEOFError). real-ca.pem is for the proxy's own upstream connections.
 exec bwrap \
   --unshare-pid \
   --die-with-parent --proc /proc --tmpfs /tmp \
@@ -216,7 +221,7 @@ exec bwrap \
   --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
   --setenv SSL_CERT_FILE /work/certs/ca.pem \
   --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
-  --setenv NODE_EXTRA_CA_CERTS /work/certs/real-ca.pem \
+  --setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem \
   --setenv OPENSSL_CONF /work/certs/openssl.cnf \
   --setenv HTTP_PROXY http://127.0.0.1:8080 \
   --setenv HTTPS_PROXY http://127.0.0.1:8080 \
