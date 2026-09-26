@@ -3811,8 +3811,13 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        claim = kb.claim_review_task if args.review else kb.claim_task
-        task = claim(conn, args.task_id, ttl_seconds=args.ttl)
+        if args.review:
+            task = kb.claim_review_task(
+                conn, args.task_id, ttl_seconds=args.ttl,
+                session_ref=_operator_review_session_ref(),
+            )
+        else:
+            task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -3864,6 +3869,10 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     author = args.author or _profile_author()
     run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
+        if run_id is None:
+            # Human review lane: the session holding ``claim --review`` on this
+            # card attests to that review run (the claim is the provenance).
+            run_id = _operator_review_run_id(conn, args.task_id)
         kb.add_comment(
             conn, args.task_id, author, body,
             run_id=run_id, session_ref=session_ref,
@@ -3948,6 +3957,37 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
         return 1
     print(f"Deleted attachment {args.attachment_id} ({removed.filename}) from {removed.task_id}")
     return 0
+
+
+def _operator_review_session_ref() -> Optional[str]:
+    """Session fingerprint that may bind / use a human-lane review claim.
+
+    ``None`` (never bindable) for a delegate_task child, for anything inside a
+    cron job (in-process context flag or a ``cron_*`` session id), and for a
+    caller with no session at all: those cannot prove they are the reviewer
+    session, so they get no review run from :func:`_operator_review_run_id`.
+    """
+    try:
+        from agent.delegation_context import (
+            _NON_DISPATCHER_OWNED_CONTEXT,
+            is_delegated_child_process_context,
+        )
+
+        if is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get():
+            return None
+    except Exception:
+        return None
+    session_id = _caller_session_id()
+    if not session_id or session_id.startswith("cron_"):
+        return None
+    return kb.derive_session_ref(session_id)
+
+
+def _operator_review_run_id(conn, task_id: str) -> Optional[int]:
+    """The active review run on ``task_id`` iff THIS session claimed it."""
+    return kb.review_claim_run_for_session(
+        conn, task_id, _operator_review_session_ref(),
+    )
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
@@ -4413,21 +4453,30 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
+        # The caller must hold the review run: as its dispatcher-owned worker,
+        # or as the operator session that made ``claim --review`` (human lane).
+        worker_run = _worker_run_id_for(tid)
+        held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
+        if held_run is None:
+            print(
+                f"cannot request changes for {tid}: this session does not hold its "
+                f"review run; claim it from the reviewing session first "
+                f"(hermes kanban claim {tid} --review). Delegate children and "
+                f"cron jobs cannot hold a human-lane review claim.",
+                file=sys.stderr,
+            )
+            return 1
         if args.coverage is not None:
-            task = kb.get_task(conn, tid)
-            if task is None or task.status != "running" or task.current_run_id is None:
-                print(f"cannot record coverage for {tid}: no active review run", file=sys.stderr)
-                return 1
             kb.add_comment(
                 conn, tid, _profile_author(),
                 "review_coverage: " + str(kb.redact_review_value(args.coverage)),
-                run_id=task.current_run_id,
+                run_id=held_run,
             )
         ok, detail = kb.request_changes(
             conn,
             tid,
             reason=reason,
-            expected_run_id=_worker_run_id_for(tid),
+            expected_run_id=held_run,
         )
         if not ok:
             print(
@@ -4435,6 +4484,17 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        if worker_run is None:
+            # Human lane: the implementer resumes from the thread, so the
+            # verdict lands there as the rework comment (the run summary
+            # carries it too).
+            _unused_run, session_ref = safe_comment_provenance(tid)
+            kb.add_comment(
+                conn, tid, _profile_author(),
+                "changes requested (human review lane): "
+                + str(kb.redact_review_value(reason)),
+                run_id=held_run, session_ref=session_ref,
+            )
         print(
             f"Requested changes for {tid}"
             + (f"; routed to {detail}" if detail else "")

@@ -8365,8 +8365,14 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    session_ref: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
+
+    ``session_ref`` binds the review run to the operator session that made the
+    claim (``hermes kanban claim <id> --review``). It must be derived from
+    trusted runtime context by the caller, never from model-supplied args; see
+    :func:`review_claim_run_for_session` for the only reader.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``review`` status).
@@ -8454,10 +8460,48 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review",
+             **({"session_ref": session_ref} if session_ref else {})},
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def review_claim_run_for_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    session_ref: Optional[str],
+) -> Optional[int]:
+    """Return the active review run id iff ``session_ref`` made its claim.
+
+    The human review lane claims from one CLI process and comments / returns
+    work from later ones, so the dispatcher env never attests to that run. The
+    claim is the provenance instead: only the session recorded on the current
+    run's ``claimed`` event (``source_status=review``) gets the run id back.
+    ``None`` for any other session, a sessionless claim, or a card that is not
+    in an active review run.
+    """
+    if not session_ref:
+        return None
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running" or row["current_run_id"] is None:
+        return None
+    run_id = int(row["current_run_id"])
+    event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        payload = json.loads(event["payload"]) if event and event["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("source_status") != "review":
+        return None
+    return run_id if payload.get("session_ref") == session_ref else None
 
 
 def _retry_status_for_run(
