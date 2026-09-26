@@ -214,3 +214,6 @@ hermes_cli ×16 (#907 #879 #858 #798 #620 #579 #441 #326 #291 #215 #166 #135 #33
 guards and display fixes with no log, event or DB signal), gateway ×2 (#356 empty-resume guard, #358 empty prompt.submit),
 scripts+misc ×5 (#780 needs a bridge-side counter; nopr:7c3d5cdd0f, #894 and nopr:8dcc69611c are product code that belongs to other
 tranches; #695 merge-queue flake not reproduced), auto ×1 (nopr:08fc3aff65 follows nopr:8dcc69611c).
+
+Post-handoff ruling: #532 stays UPSTREAM and folds into t_cbdab1dc (#521). The DROP proposal from t_552fce3d was
+rejected (see FINAL.md "Post-handoff lead rulings"). Counts are unchanged.

@@ -1293,3 +1293,16 @@ Inputs: auditor branches `audit/<tranche>/verdicts` (latest, incl. post-adversar
 | nopr:4d626ac813 | cron+tools | SUPERSEDED-BY-UPSTREAM | overturned → UPSTREAM | UPSTREAM | adversary overturned: Auditor's 'test module collection error on BOTH trees' was an import path (fork test imports the regex from tools.environments.base; upstream moved it to base_session_env). With that one import fixed, fork tests/tools/test_env_snapshot_session_leak.py on up 1b57acf94a: `2 failed, 2 passed` - test_in |
 | nopr:7e505547a7 | cron+tools | DROP | needs-lead → follows nopr:f504b1c928 | DROP | LEAD: dormant (send_message last tool call 2026-06-23, mixture_of_agents 2026-07-10, 0 since, all 14 profile state.dbs) but registry entry 4 is fork-permanent. DROP is ACE-GATED on retiring entry 4; branch audit/cron_tools/revert-f504b1c928 (+3/-735, 70 passed 6 skipped). If Ace keeps entry 4, row -> KEEP. |
 | nopr:f504b1c928 | cron+tools | DROP | needs-lead → DROP pending Ace ruling on registry entry 4 (fork… | DROP | LEAD: dormant (send_message last tool call 2026-06-23, mixture_of_agents 2026-07-10, 0 since, all 14 profile state.dbs) but registry entry 4 is fork-permanent. DROP is ACE-GATED on retiring entry 4; branch audit/cron_tools/revert-f504b1c928 (+3/-735, 70 passed 6 skipped). If Ace keeps entry 4, row -> KEEP. |
+
+## Post-handoff lead rulings (2026-09-25, after the first review request)
+
+- **#532 stays UPSTREAM, now folded into the #521 upstream PR (t_cbdab1dc, `audit/cron_tools/upstream-521`).**
+  Slice card t_552fce3d proposed UPSTREAM→DROP ("premise absent upstream"): today's upstream/main has no
+  `_reconcile_jobs_after_recovery`, so nothing writes `last_status=error` after a restart. **Proposal rejected.**
+  That holds for upstream only as it stands now. #532 fixes a defect introduced by #521, and the #521 upstream port
+  adds the reconciler verbatim: it calls `mark_job_run(job_id, False, "Interrupted: …")` with no `status=`.
+  Upstream `cron/jobs.py` `_record_run_outcome` (`job["last_status"] = status or ("error" if not success …)`, line 2303
+  at the checked upstream/main) then stores `error`, which is the #532 bug. Once #521 lands upstream, the premise returns.
+  Action for t_cbdab1dc: pass `status="unknown"` in the reconciler's `mark_job_run` call (upstream already has the
+  `status` parameter), and carry #532's `hermes cron` display of `unknown` plus its test in the same PR. Verdict counts
+  are unchanged (the row was UPSTREAM before and after this ruling). If #521 is ever dropped from the upstream set, #532 becomes DROP with it.
