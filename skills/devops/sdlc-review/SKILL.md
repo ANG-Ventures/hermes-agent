@@ -66,7 +66,7 @@ unavailable, do all four personally in the same round and name the limitation.
 Before EVERY `kanban_request_changes`, post a current-run comment containing
 a single JSON line:
 
-`review_coverage: {"lenses":{"contract":"done","execution":"done","cross-vendor":"done","mutation":"done"},"findings":1,"items":["BEHAVIOUR: reproducible finding"],"review_minutes":12,"battery":"battery-v1.zip","batch_id":"delegate batch id"}`
+`review_coverage: {"lenses":{"contract":"done","execution":"done","cross-vendor":"done","mutation":"done"},"findings":1,"items":["BEHAVIOUR: reproducible finding"],"review_minutes":12,"battery":"battery-v1.zip","batch_id":"delegate batch id","head_sha":"9f3c2a1b7e4d"}`
 
 Each lens is `done` or `n/a: <applicability reason>`; inability to run a lens
 requires `kanban_block(kind=capability)`, not n/a. An n/a reason containing an
@@ -77,7 +77,11 @@ and be at least one; each item names the finding (3+ visible characters with a
 letter or digit, not "F1" or "-"). `review_minutes` is 0–1440. Lens keys and
 states are case-insensitive; the newest current-run comment that parses is
 the record. `battery` is optional (CI owns
-suites); when given it must be a nonempty string. The required lens list lives
+suites); when given it must be a nonempty string. `head_sha` is the reviewed PR head
+(7-40 hex) or `n/a: <reason>` for a card with no PR. To APPROVE a PR card, call
+`kanban_complete(metadata={"head_sha": "<reviewed head>"})`: that writes the
+APPROVE record card-sourced land requests need (without it they refuse with
+NO_REVIEW_OF_RECORD). The required lens list lives
 in `hermes_cli/kanban_review_schema.py`. Approval is unaffected by this gate.
 
 ### Lens variation for ad-hoc review fan-outs

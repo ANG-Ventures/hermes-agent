@@ -529,6 +529,23 @@ class TestPinTransition:
 
         assert sig_pinned["honcho.pin_peer_name"] != sig_unpinned["honcho.pin_peer_name"]
 
+    def test_cache_busting_signature_ignores_mtime_tick(self, tmp_path, monkeypatch):
+        """A rewrite that keeps the SAME mtime (coarse-mtime filesystems) must still
+        bust the signature: the memo keys on content, not mtime."""
+        import os
+        from gateway.run import GatewayRunner
+
+        cfg_path = tmp_path / "honcho.json"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": True}))
+        st = os.stat(cfg_path)
+        sig_pinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+        cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": False}))
+        os.utime(cfg_path, ns=(st.st_atime_ns, st.st_mtime_ns))  # same tick as the first write
+        sig_unpinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+        assert sig_pinned["honcho.pin_peer_name"] is True
+        assert sig_unpinned["honcho.pin_peer_name"] is False
+
 
 class TestProfilePeerUniqueness:
     """Each Hermes profile can pin to its own unique peerName.

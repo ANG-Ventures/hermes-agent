@@ -78,6 +78,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import hashlib
 import inspect
@@ -230,6 +231,27 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+def _is_delegated_child() -> bool:
+    """Whether this code runs inside a ``delegate_task`` child context."""
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
+# Set only by :func:`add_comment` for the duration of its own write. The single
+# append-only write a delegated child may perform (t_70fcc2c3): comments carry
+# no status/ownership/claim state, and add_comment stamps the author with
+# :data:`SUBAGENT_AUTHOR_MARKER` so the thread shows who actually wrote it.
+_DELEGATED_CHILD_COMMENT_GRANT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "kanban_delegated_child_comment_grant", default=False
+)
+
+SUBAGENT_AUTHOR_MARKER = " (subagent)"
+
+
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
 
@@ -237,20 +259,48 @@ def _assert_not_delegated_child_mutation() -> None:
     guards for better UX, but neither is a trust boundary: a delegated child can
     still shell out to the CLI or import this module directly. The actual
     invariant belongs at the DB/filesystem mutation layer so every public
-    mutator that uses ``write_txn`` (tasks, runs, comments, attachments,
-    dispatcher claims, repair events, subscriptions, GC, etc.) and every board
-    metadata mutator fails closed before touching durable state.
-    """
-    try:
-        from agent.delegation_context import is_delegated_child_process_context
+    mutator that uses ``write_txn`` (tasks, runs, attachments, dispatcher
+    claims, repair events, subscriptions, GC, etc.) and every board metadata
+    mutator fails closed before touching durable state.
 
-        delegated = is_delegated_child_process_context()
-    except Exception:
-        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
-    if delegated:
+    Reads are allowed: a child's :func:`connect` opens the existing DB with
+    ``PRAGMA query_only=ON`` and skips schema/migration writes. The only write
+    exception is :func:`add_comment` (append-only, author marked as subagent).
+    """
+    if _is_delegated_child() and not _DELEGATED_CHILD_COMMENT_GRANT.get():
         raise PermissionError(
             "delegate_task child contexts cannot mutate Kanban tasks or boards"
         )
+
+
+def _connect_delegated_child(path: Path) -> sqlite3.Connection:
+    """Open an EXISTING board DB for a ``delegate_task`` child, read-only.
+
+    No mkdir, no permission repair, no schema script, no migrations — those are
+    all writes. The connection runs with ``PRAGMA query_only=ON`` so even a
+    direct ``conn.execute("UPDATE ...")`` that bypasses :func:`write_txn` is
+    refused by SQLite itself. :func:`add_comment` lifts it for its own insert.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        raise PermissionError(
+            "delegate_task child contexts cannot initialize a Kanban board "
+            f"(no board DB at {path})"
+        )
+    conn = _sqlite_connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA cell_size_check=ON")
+        conn.execute("PRAGMA query_only=ON")
+        if not _schema_is_present(conn):
+            raise PermissionError(
+                "delegate_task child contexts cannot initialize a Kanban board "
+                f"(no schema in {path})"
+            )
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -1647,6 +1697,33 @@ def _worker_log_run_segment(
     except Exception:
         _log.debug("failed to segment worker log for %s", task_id, exc_info=True)
         return None
+
+
+# A worker that dies on a provider wall BEFORE the model loop can exit 1 with
+# the cause only in its log ("Codex credential is in cooldown." — raised at
+# credential resolve, where the EX_TEMPFAIL sentinel is never reached). Only the
+# run's final lines count, so a stray mention earlier in a real crash does not.
+_STDERR_COOLDOWN_CLASSES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("credential_cooldown", re.compile(r"\bcredentials? (?:is|are) in cooldown\b", re.IGNORECASE)),
+    ("quota", re.compile(
+        r"\b(?:rate[\s_-]?limit(?:ed)?|too many requests|quota (?:exceeded|exhausted)|"
+        r"usage limit (?:reached|exceeded)|(?:HTTP|status|error)[\s:]*429)\b",
+        re.IGNORECASE,
+    )),
+)
+_STDERR_COOLDOWN_TAIL_LINES = 3
+
+
+def _stderr_cooldown_class(segment: Optional[str]) -> Optional[str]:
+    """Name the provider-wall class this run's last log lines show, or None."""
+    if not segment:
+        return None
+    lines = [ln.strip() for ln in segment.splitlines() if ln.strip()]
+    tail = "\n".join(lines[-_STDERR_COOLDOWN_TAIL_LINES:])
+    for name, pattern in _STDERR_COOLDOWN_CLASSES:
+        if pattern.search(tail):
+            return name
+    return None
 
 
 def _run_output_fingerprint(segment: Optional[str]) -> str:
@@ -3968,6 +4045,8 @@ def connect(
     # directly is the same leak through a different door. ``init_db`` routes
     # through here, so it is covered as well.
     _assert_live_board_write_allowed(path)
+    if _is_delegated_child():
+        return _connect_delegated_child(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -4142,6 +4221,12 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    if _is_delegated_child():
+        # A child may not create or migrate a board; it may only confirm the
+        # board exists and is readable (connect raises otherwise).
+        with contextlib.closing(connect(path)):
+            pass
+        return path
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
@@ -5785,9 +5870,13 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    from hermes_cli.model_policy import validate_route_provider
+
+    validate_route_provider(model_override, provider_override)
     model_override, provider_override = _resolve_stored_model_pair(
         model_override, provider_override
     )
+    validate_route_provider(model_override, provider_override)
     from hermes_cli.model_policy import validate_worker_model
 
     flagship_override_reason = validate_worker_model(
@@ -6458,7 +6547,11 @@ def _validate_model_override_args(
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
+    from hermes_cli.model_policy import validate_route_provider
+
+    validate_route_provider(model, provider)
     model, provider = _resolve_stored_model_pair(model, provider)
+    validate_route_provider(model, provider)
     # Main's flagship ban (model_policy) is the one predicate. A flagship
     # route is only writable together with the ``flagship override:`` comment
     # the dispatcher's flagship gate accepts, so a route this layer writes can
@@ -7060,6 +7153,33 @@ def add_comment(
         raise ValueError("comment author is required")
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     now = int(time.time())
+    if _is_delegated_child():
+        # The one write a delegate_task child may make (t_70fcc2c3). Append-only
+        # and attributed: the marker is added here, not by the caller, so an
+        # explicit ``--author`` cannot pass a child's words off as the parent's.
+        if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
+            author = author.strip() + SUBAGENT_AUTHOR_MARKER
+        grant = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
+        conn.execute("PRAGMA query_only=OFF")
+        try:
+            return _add_comment_txn(
+                conn, task_id, author, body, run_id, session_ref, now
+            )
+        finally:
+            conn.execute("PRAGMA query_only=ON")
+            _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
+    return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now)
+
+
+def _add_comment_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    run_id: Optional[int],
+    session_ref: Optional[str],
+    now: int,
+) -> int:
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
@@ -8374,8 +8494,14 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    session_ref: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
+
+    ``session_ref`` binds the review run to the operator session that made the
+    claim (``hermes kanban claim <id> --review``). It must be derived from
+    trusted runtime context by the caller, never from model-supplied args; see
+    :func:`review_claim_run_for_session` for the only reader.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``review`` status).
@@ -8463,10 +8589,48 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review",
+             **({"session_ref": session_ref} if session_ref else {})},
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def review_claim_run_for_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    session_ref: Optional[str],
+) -> Optional[int]:
+    """Return the active review run id iff ``session_ref`` made its claim.
+
+    The human review lane claims from one CLI process and comments / returns
+    work from later ones, so the dispatcher env never attests to that run. The
+    claim is the provenance instead: only the session recorded on the current
+    run's ``claimed`` event (``source_status=review``) gets the run id back.
+    ``None`` for any other session, a sessionless claim, or a card that is not
+    in an active review run.
+    """
+    if not session_ref:
+        return None
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running" or row["current_run_id"] is None:
+        return None
+    run_id = int(row["current_run_id"])
+    event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        payload = json.loads(event["payload"]) if event and event["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("source_status") != "review":
+        return None
+    return run_id if payload.get("session_ref") == session_ref else None
 
 
 def _retry_status_for_run(
@@ -9227,25 +9391,72 @@ def complete_task(
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
+    # A reviewer approval (the active run was claimed from ``review``) that
+    # names the reviewed PR head writes the APPROVE review_coverage record
+    # card-sourced land requests read as the review of record (t_7fee0f83).
+    # Validated here, before any mutation; an implementer run never writes one.
+    approve_head_sha: Optional[str] = None
+    if (
+        isinstance(metadata, dict)
+        and metadata.get("head_sha") is not None
+        and candidate.status == "running"
+        and candidate.current_run_id is not None
+        and _retry_status_for_run(conn, task_id, candidate.current_run_id) == "review"
+    ):
+        approve_head_sha = str(metadata["head_sha"]).strip()
+        if not _REVIEW_HEAD_SHA_RE.fullmatch(approve_head_sha):
+            raise ValueError(
+                "head_sha must be the reviewed PR head (7-40 hex characters)"
+            )
     # A completion whose evidence names a still-OPEN PR is a review handoff,
     # not ``done``: done releases dependants, and an unmerged PR has no owner
     # once the card is terminal (t_1bd02e0b, 2026-09-25). A card already in
-    # ``review`` is a reviewer/human approval and is left alone.
-    if candidate.status != 'review':
+    # ``review`` is a reviewer/human approval and is left alone; so is a
+    # claimed reviewer run approving with ``head_sha`` -- the PR it approved
+    # is OPEN by definition and the land queue merges it from that record.
+    if candidate.status != 'review' and not approve_head_sha:
         from hermes_cli import kanban_open_pr as _open_pr
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
         )
         if still_open:
+            # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
+            # DraftPrError, nothing mutated), update a stale head, arm a green
+            # non-milestone PR through fleet-merge.sh.
+            from hermes_cli import kanban_pr_freshness as _fresh
+            try:
+                freshness = _fresh.check(
+                    still_open, task_id=task_id,
+                    allow_arm=not is_milestone_card(conn, task_id),
+                )
+            except _fresh.DraftPrError as draft_err:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_draft_pr",
+                        {"prs": draft_err.prs},
+                    )
+                raise
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
             ])
+            if freshness.get("prs"):
+                routed_meta["handoff_freshness"] = freshness
             routed_summary = "\n".join(filter(None, [note, summary or result]))
-            ok = request_review(
+            ok, route_reason = request_review(
                 conn, task_id, summary=routed_summary, metadata=routed_meta,
-                expected_run_id=expected_run_id, force=True,
+                expected_run_id=expected_run_id, force=True, with_reason=True,
             )
+            if not ok:
+                # complete_task returns a bare bool, so callers can only say
+                # "unknown id or already terminal". Leave the real refusal on
+                # the card where an operator can read it (t_503df7c5).
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_route_refused",
+                        {"open_prs": routed_meta["auto_routed_open_prs"],
+                         "reason": route_reason},
+                    )
             if ok:
                 with write_txn(conn):
                     _append_event(
@@ -9344,6 +9555,14 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if approve_head_sha:
+            add_comment(
+                conn, task_id, candidate.assignee or "reviewer",
+                "review_coverage: " + json.dumps(
+                    {"verdict": "approve", "head_sha": approve_head_sha}
+                ),
+                run_id=int(candidate.current_run_id),
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -9688,11 +9907,26 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
         home = kanban_home()
     except OSError:
         home = None
+    # ``kanban.workspaces_root`` (e.g. a RAM-disk mount) places scratch dirs
+    # at ``<root>/<board>/<task>``. Those per-board roots are managed exactly
+    # like the legacy ones; the configured root itself and ``<root>/<board>``
+    # stay refused by strict descendancy. Without them every scratch dir under
+    # a configured root was refused forever and never reclaimed (t_bbea6686).
+    try:
+        from hermes_cli.kanban_workspace_policy import configured_root
+        configured, _require_mount = configured_root()
+    except Exception:
+        configured = None
     if home is not None:
         try:
             roots.append(((home / "kanban" / "workspaces").resolve(strict=False), DEFAULT_BOARD))
         except OSError:
             pass
+        if configured is not None:
+            try:
+                roots.append(((configured / DEFAULT_BOARD).resolve(strict=False), DEFAULT_BOARD))
+            except OSError:
+                pass
         try:
             boards_parent = (home / "kanban" / "boards").resolve(strict=False)
         except OSError:
@@ -9712,6 +9946,11 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                     roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
                 except OSError:
                     continue
+                if configured is not None and entry.name != DEFAULT_BOARD:
+                    try:
+                        roots.append(((configured / entry.name).resolve(strict=False), entry.name))
+                    except OSError:
+                        continue
     memo: dict = {}
     for root, board in roots:
         try:
@@ -11863,6 +12102,7 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        reviewer_from_provenance = False
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -11901,12 +12141,22 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
+                reviewer_from_provenance = True
         # Validate/resolve at the gate: a review assignee must be spawnable
         # (a real profile) or the explicit `human` sentinel. A placeholder
         # string used to be accepted here and parked the card forever.
         reviewer, reviewer_error = resolve_reviewer(
             reviewer, implementer, allow_same_actor=allow_same_actor
         )
+        if reviewer_error is not None and reviewer_from_provenance:
+            # Inherited provenance the gate now refuses (e.g. a same-actor
+            # review drain recorded reviewer == implementer, t_503df7c5):
+            # the worker never chose it, so refusing strands a finished card
+            # behind a generic "unknown id or already terminal". Fall back to
+            # the configured default reviewer instead.
+            reviewer, reviewer_error = resolve_reviewer(
+                None, implementer, allow_same_actor=allow_same_actor
+            )
         if reviewer_error is not None:
             return _ret(False, reviewer_error)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
@@ -11983,6 +12233,9 @@ def request_review(
 import unicodedata  # noqa: E402
 
 from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LENSES  # noqa: E402
+from hermes_cli.kanban_review_schema import HEAD_SHA_PATTERN as _HEAD_SHA_PATTERN  # noqa: E402
+
+_REVIEW_HEAD_SHA_RE = re.compile(_HEAD_SHA_PATTERN)
 # An ``n/a: <reason>`` lens value certifies the lens does not APPLY to the
 # deliverable. A reason that reports an INABILITY anywhere in it ("skipped",
 # "the reviewer could not run it", "mutmut missing on host", "budget
@@ -12137,6 +12390,10 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     batch = coverage.get("batch_id")
     if not isinstance(batch, str) or not batch.strip():
         return "batch_id must identify the single delegate_task batch in this comment"
+    head = coverage.get("head_sha")
+    if not (isinstance(head, str) and (_REVIEW_HEAD_SHA_RE.fullmatch(head.strip())
+                                        or _review_na_reason_ok(head))):
+        return "head_sha must be the reviewed PR head (7-40 hex) or 'n/a: <reason>' for a card with no PR"
     return None
 
 
@@ -14223,9 +14480,11 @@ def set_task_model(
     ``task_id`` returns ``0`` (never a silent success), so callers can tell
     a real write from a no-op.
     """
-    resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
-    from hermes_cli.model_policy import validate_worker_model
+    from hermes_cli.model_policy import validate_route_provider, validate_worker_model
 
+    validate_route_provider(model, None)
+    resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
+    validate_route_provider(resolved_model, resolved_provider)
     validate_worker_model(resolved_model)
     if not resolved_model:
         resolved_provider = None
@@ -14484,6 +14743,72 @@ def rate_limit_circuits(
         if tripped_at is not None and now < tripped_at + window:
             open_until[key] = tripped_at + window
     return open_until
+
+
+# A worker that refused its route because the provider's credential is rate
+# limited (``worker_route_pin_refused`` with ``rate_limited: true``, e.g.
+# "Codex credential is in cooldown") is proof the credential is dead for every
+# card, not just that one. Treat the provider as capped for this long after the
+# latest refusal, so the capped-pool fallback does not spawn more workers into
+# it (t_6445986b: a P0 card hit exit 75 three times in 25 min, each one
+# stamping a longer rate_limit backoff). ``kanban.credential_cooldown_seconds``.
+DEFAULT_CREDENTIAL_COOLDOWN_SECONDS = 1800  # 30 minutes
+
+
+def _resolve_credential_cooldown() -> int:
+    """``kanban.credential_cooldown_seconds`` (0 disables)."""
+    try:
+        from hermes_cli.config import load_config
+        value = int(load_config().get("kanban", {}).get(
+            "credential_cooldown_seconds", DEFAULT_CREDENTIAL_COOLDOWN_SECONDS))
+        return value if value >= 0 else DEFAULT_CREDENTIAL_COOLDOWN_SECONDS
+    except Exception:
+        return DEFAULT_CREDENTIAL_COOLDOWN_SECONDS
+
+
+def cooling_providers(
+    conn: sqlite3.Connection, *, now: int, window: int,
+) -> dict[str, int]:
+    """``{provider: cooling_until}`` for providers with a recent rate-limited refusal.
+
+    Keyed by provider name (lower case), not ``pool_key``: ``openai-codex`` is
+    not pool-bound, so the rate-limit circuit can never see it. The events are
+    run-scoped, so only runs still open or closed inside ``window`` are read
+    (``idx_events_run``), never the whole event table.
+    """
+    if window <= 0:
+        return {}
+    from hermes_cli.kanban_worker_route import WORKER_ROUTE_PIN_REFUSED_EVENT
+
+    run_ids = [int(r[0]) for r in conn.execute(
+        "SELECT id FROM task_runs WHERE ended_at IS NULL OR ended_at >= ?",
+        (now - window,),
+    )]
+    until: dict[str, int] = {}
+    for i in range(0, len(run_ids), 500):
+        chunk = run_ids[i:i + 500]
+        for ev in conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE run_id IN ("
+            + ",".join("?" * len(chunk)) + ") AND kind = ? AND created_at >= ?",
+            (*chunk, WORKER_ROUTE_PIN_REFUSED_EVENT, now - window),
+        ):
+            try:
+                payload = json.loads(ev["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("rate_limited") is not True:
+                continue
+            provider = payload.get("provider")
+            if not isinstance(provider, str) or not provider.strip():
+                continue
+            key = provider.strip().lower()
+            until[key] = max(until.get(key, 0), int(ev["created_at"]) + window)
+    return until
+
+
+def _format_skipped_rungs(skipped) -> str:
+    """``openai-codex:credential_cooldown, claude-apr:pool_budget``."""
+    return ", ".join(f"{s.get('provider')}:{s.get('reason')}" for s in skipped or ())
 
 
 def _notify_rate_limit_circuit(
@@ -16586,6 +16911,13 @@ def detect_crashed_workers(
         for row, pid, kind, code in dead:
             rate_limited_exit = False
             cohort_death = row["id"] in cohort_ids
+            stderr_exit_class = None
+            if kind == "nonzero_exit" and not cohort_death:
+                stderr_exit_class = _stderr_cooldown_class(
+                    _worker_log_run_segment(row["id"], board=board)
+                )
+                if stderr_exit_class is not None:
+                    kind = "rate_limited"
             if cohort_death:
                 protocol_violation = False
                 error_text = (
@@ -16667,8 +16999,12 @@ def detect_crashed_workers(
                 # trip the circuit breaker and permanently block the card.
                 protocol_violation = False
                 rate_limited_exit = True
-                exit_class = _run_exit_class(conn, row["id"], row["current_run_id"])
+                exit_class = (
+                    _run_exit_class(conn, row["id"], row["current_run_id"])
+                    or stderr_exit_class
+                )
                 _wall = {
+                    "credential_cooldown": "credential cooldown",
                     "upstream_capacity": "provider capacity overload",
                     "pool_exhausted": "sub pool capped",
                     "pinned_provider_unavailable": "pinned provider unavailable",
@@ -16692,6 +17028,10 @@ def detect_crashed_workers(
                 }
                 if exit_class:
                     event_payload["exit_class"] = exit_class
+                if stderr_exit_class is not None:
+                    stderr_tail = _worker_log_stderr_tail(row["id"], board=board)
+                    if stderr_tail:
+                        event_payload["stderr_tail"] = stderr_tail
             elif kind == "infra_unavailable":
                 # The worker HARNESS could not be executed (126/127) — the CLI
                 # path was missing or unrunnable, so no worker code ran and the
@@ -19103,10 +19443,18 @@ def _dispatch_once_locked(
         # Fail OPEN: a broken circuit query must never halt spawning.
         _log.warning("kanban rate-limit circuit check failed (%s: %s)", type(exc).__name__, exc)
         circuits = {}
+    cooling: dict[str, int] = {}
+    try:
+        cooling = cooling_providers(
+            conn, now=_tick_now, window=_resolve_credential_cooldown())
+    except Exception as exc:
+        # Fail OPEN, same as the circuit query above.
+        _log.warning("kanban credential cooldown check failed (%s: %s)", type(exc).__name__, exc)
+        cooling = {}
 
     def provider_admission(task_id, assignee):
         if (not health_probes and not any(pool_urls.values()) and not box_health
-                and not circuits):
+                and not circuits and not cooling):
             return False, None
         task = get_task(conn, task_id)
         if task is None:
@@ -19123,6 +19471,11 @@ def _dispatch_once_locked(
             # provider_capped: hold unless a rung on another open pool exists.
             payload = {"reason": "rate_limit_circuit", "provider": route_provider,
                        "pool": circuit_pool, "until": circuits[circuit_pool]}
+        elif (route_provider or "").strip().lower() in cooling:
+            # The route's own credential is cooling: spawning would die at
+            # auth (exit 75) and stamp a rate_limit backoff. Same verdict.
+            payload = {"reason": "credential_cooldown", "provider": route_provider,
+                       "until": cooling[(route_provider or "").strip().lower()]}
         else:
             payload = capped_provider(
                 task, health_probes, health_cache, min_eligible=min_eligible,
@@ -19133,11 +19486,15 @@ def _dispatch_once_locked(
         if payload is None:
             admitted_routes[task_id] = circuit_pool
             return False, None
+        skipped: list = []
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
             pool_urls=pool_urls, skip_pools=frozenset(circuits), box_health=box_health,
             budget_available=lambda provider: pool_budget(provider) is None,
+            skip_providers=frozenset(cooling), skipped=skipped,
         )
+        if skipped:
+            payload = {**payload, "fallback_skipped": skipped}
         if fallback is not None and fallback_flagship_banned(task_id, fallback[0]):
             # The flagship gate covers the post-fallback route too: a capped
             # pool must not become a side door onto a banned model. Defer
@@ -19154,6 +19511,13 @@ def _dispatch_once_locked(
             admitted_routes[task_id] = pool_key(fallback[1])
             return False, (fallback, payload)
         result.respawn_guarded.append((task_id, payload["reason"]))
+        if skipped:
+            # Every rung is capped or cooling: HOLD (deferred, no spawn, no
+            # run, so no rate_limited close and no backoff stamp).
+            _log.info(
+                "PHASE=kanban_dispatch_fallback_held task=%s from=%s reason=%s skipped=%s",
+                task_id, route_provider, payload["reason"], _format_skipped_rungs(skipped),
+            )
         if not dry_run:
             with write_txn(conn):
                 _append_event(conn, task_id, "deferred", payload)
@@ -19174,11 +19538,20 @@ def _dispatch_once_locked(
             return
         (model, provider), capped = selection
         claimed.model_override, claimed.provider_override = model, provider
+        event = {"from_provider": capped["provider"], "to_provider": provider,
+                 "to_model": model}
+        if capped.get("fallback_skipped"):
+            event["skipped"] = capped["fallback_skipped"]
         with write_txn(conn):
-            _append_event(conn, claimed.id, "dispatch_provider_fallback", {
-                "from_provider": capped["provider"], "to_provider": provider,
-                "to_model": model,
-            }, run_id=claimed.current_run_id)
+            _append_event(conn, claimed.id, "dispatch_provider_fallback", event,
+                          run_id=claimed.current_run_id)
+
+    def fallback_route_source(source, selection):
+        skipped = selection[1].get("fallback_skipped")
+        if not skipped:
+            return f"dispatch-fallback(capped {source})"
+        return (f"dispatch-fallback(capped {source}; "
+                f"skipped {_format_skipped_rungs(skipped)})")
 
     try:
         from hermes_cli.config import load_config as _load_dispatch_config
@@ -19504,7 +19877,7 @@ def _dispatch_once_locked(
             "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
-            route_source = f"dispatch-fallback(capped {route_source})"
+            route_source = fallback_route_source(route_source, fallback_selection)
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -19702,7 +20075,7 @@ def _dispatch_once_locked(
             "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
-            review_route_source = f"dispatch-fallback(capped {review_route_source})"
+            review_route_source = fallback_route_source(review_route_source, fallback_selection)
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -20300,6 +20673,9 @@ def set_lane_model_override(
     upsert, so an operator extending a window never stacks duplicate rows.
     """
 
+    from hermes_cli.model_policy import validate_route_provider
+
+    validate_route_provider(model, provider)
     created = int(time.time()) if now is None else int(now)
     key = (assignee or "").strip()
     with write_txn(conn):
@@ -20564,6 +20940,14 @@ def _default_spawn(
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # GitHub lane is decided by the worker's PROFILE in the gh shim (spec D3); an inherited lane
+    # (e.g. a dispatcher launched from a laned script) must not ride into the worker.
+    env.pop("HERMES_GH_LANE", None)
+    # The dispatcher's own agent.process_env_files overlay was resolved for ITS
+    # profile (e.g. no bot git identity); the worker re-sources the files for
+    # its own profile at startup, so hand it the pre-overlay env (t_45c11886).
+    from hermes_cli.process_env_files import strip_overlay
+    strip_overlay(env)
 
     # A dispatcher-spawned worker is its OWN single-session process, NOT the
     # gateway. The gateway sets _HERMES_GATEWAY=1 process-wide; copying it into
@@ -20572,6 +20956,16 @@ def _default_spawn(
     # own session-id stamping relies on them). Pop it here — mirrors the restart
     # watcher (gateway/run.py) which pops it for the same reason.
     env.pop("_HERMES_GATEWAY", None)
+
+    # A worker imports the runtime tree its argv's venv points at — never a
+    # dispatcher's PYTHONPATH/PYTHONHOME. sys.path beats the venv's editable
+    # finder, so a gateway pinned to a side-by-side release via its plist
+    # (registry-pins v0.2) silently ran every worker on that release, and
+    # runtime deploys never reached workers (t_e8c867d3: #1075 invisible,
+    # 0 review_skipped). Mirrors the `hermes` shim's load-bearing unset,
+    # which this direct venv exec bypasses.
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root

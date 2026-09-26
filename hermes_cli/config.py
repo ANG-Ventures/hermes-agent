@@ -4303,7 +4303,30 @@ def load_env() -> Dict[str, str]:
     if cache_key is not None:
         _env_cache = (cache_key, dict(env_vars))
 
+    try:
+        from hermes_cli.env_loader import note_dotenv_values
+
+        note_dotenv_values(env_path, env_vars)
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a read
+        pass
+
     return env_vars
+
+
+def dotenv_revoked(key: str, fallback: Optional[str]) -> bool:
+    """True when ``fallback`` for ``key`` is a value the active ``.env`` dropped.
+
+    Removing (or blanking) a credential line in ``.env`` revokes it for the
+    running process on the next read, the same way editing the value rotates
+    it.  Only values that demonstrably came from that file are revoked; a
+    shell/systemd export or external-secret value is left alone.
+    """
+    try:
+        from hermes_cli.env_loader import dotenv_value_revoked
+
+        return dotenv_value_revoked(get_env_path(), key, fallback or "")
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # Module-level memo for load_env(), keyed on (path, mtime, size).
@@ -4782,14 +4805,19 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
             get_secret as _get_secret,
         )
     except Exception:
-        return os.environ.get(key)
-
-    try:
-        return _get_secret(key)
-    except UnscopedSecretError:
-        raise
-    except Exception:
-        return os.environ.get(key)
+        fallback = os.environ.get(key)
+    else:
+        try:
+            fallback = _get_secret(key)
+        except UnscopedSecretError:
+            raise
+        except Exception:
+            fallback = os.environ.get(key)
+    # A value the .env used to carry and no longer does is revoked, not
+    # resurrected from the copy the load left behind (t_8dccb8ef).
+    if fallback and dotenv_revoked(key, fallback):
+        return None
+    return fallback
 
 
 # =============================================================================
@@ -6350,7 +6378,7 @@ def config_command(args):
 # ── Profile-driven env var injection ─────────────────────────────────────────
 # Any provider registered in providers/ with auth_type="api_key" automatically
 # gets its env_vars exposed in OPTIONAL_ENV_VARS without editing this file.
-# Runs once at import time.
+# Runs once, on the first read of OPTIONAL_ENV_VARS.
 
 _profile_env_vars_injected = False
 
@@ -6358,7 +6386,7 @@ _profile_env_vars_injected = False
 def _inject_profile_env_vars() -> None:
     """Populate OPTIONAL_ENV_VARS from provider profiles not already listed.
 
-    Called once at module load time. Idempotent — repeated calls are no-ops.
+    Runs on the first read of OPTIONAL_ENV_VARS. Idempotent — repeated calls are no-ops.
     """
     global _profile_env_vars_injected
     if _profile_env_vars_injected:
@@ -6385,8 +6413,9 @@ def _inject_profile_env_vars() -> None:
         pass
 
 
-# Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
-_inject_profile_env_vars()
+# Deferred to the first read of OPTIONAL_ENV_VARS: provider discovery imports
+# every model-provider plugin, which is far too expensive for import time.
+OPTIONAL_ENV_VARS.add_filler(_inject_profile_env_vars)
 
 
 # ── Platform-plugin env var injection ────────────────────────────────────────
@@ -6415,8 +6444,8 @@ _platform_plugin_env_vars_injected = False
 def _inject_platform_plugin_env_vars() -> None:
     """Populate OPTIONAL_ENV_VARS from bundled platform plugin manifests.
 
-    Called once at module load time. Idempotent — repeated calls are no-ops.
-    Failures are swallowed so a malformed plugin.yaml can't break CLI import.
+    Runs on the first read of OPTIONAL_ENV_VARS. Idempotent — repeated calls
+    are no-ops. Failures are swallowed so a malformed plugin.yaml can't break CLI import.
     """
     global _platform_plugin_env_vars_injected
     if _platform_plugin_env_vars_injected:
@@ -6482,5 +6511,5 @@ def _inject_platform_plugin_env_vars() -> None:
         pass
 
 
-# Eagerly inject so that platform plugin env vars show up in the setup wizard.
-_inject_platform_plugin_env_vars()
+# Deferred like the provider filler (registered after it, so it runs after it).
+OPTIONAL_ENV_VARS.add_filler(_inject_platform_plugin_env_vars)

@@ -46,7 +46,8 @@ def _jobs(workflow_text: str) -> dict:
 
 
 def fallback_predicate(workflow_text: str) -> CheckResult:
-    """merge_group local fallback must survive a dead/failed/timed-out placement (spec §5.1)."""
+    """merge_group fallback must survive a dead/failed/timed-out placement (spec §5.1) and select the
+    STATIC split, never all-local (t_42bed567: all-local wedged the queue on a drained pool)."""
     name = "fallback_predicate_static"
     jobs = _jobs(workflow_text)
     problems = []
@@ -59,14 +60,18 @@ def fallback_predicate(workflow_text: str) -> CheckResult:
         if "placement" not in (job.get("needs") or []):
             problems.append(f"{job_id} does not need placement")
     matrix = str(((jobs.get("test") or {}).get("strategy") or {}).get("matrix", ""))
-    if not matrix.rstrip("} ").endswith("needs.generate.outputs.local_matrix)"):
-        problems.append("test matrix does not end in the generate.local_matrix fallback")
+    if not matrix.rstrip("} ").endswith("|| needs.generate.outputs.matrix)"):
+        problems.append("test matrix does not end in the static generate.matrix fallback")
+    if "local_matrix" in matrix:
+        problems.append("test matrix can select the all-local generate.local_matrix")
     for gate in ("needs.placement.result == 'success'", "needs.placement.outputs.plan_valid == 'true'"):
         if gate not in matrix:
             problems.append(f"placement matrix not gated by {gate!r}")
     e2e_runs_on = str((jobs.get("e2e") or {}).get("runs-on", ""))
-    if json.dumps(LOCAL_LABELS).replace(" ", "") not in e2e_runs_on.replace(" ", "").replace("'", ""):
-        problems.append("e2e runs-on has no fixed local-label fallback")
+    if not e2e_runs_on.rstrip("} ").endswith("|| '[\"ubuntu-latest\"]'))") or "vars.CI_RUNNER_LABELS" not in e2e_runs_on:
+        problems.append("e2e runs-on does not end in the static CI_RUNNER_LABELS fallback")
+    if json.dumps(LOCAL_LABELS).replace(" ", "") in e2e_runs_on.replace(" ", "").replace("'", ""):
+        problems.append("e2e runs-on can select the fixed local pool")
     evidence = {"test_if": str((jobs.get("test") or {}).get("if")), "e2e_if": str((jobs.get("e2e") or {}).get("if")),
                 "problems": problems}
     return check(name, "BLOCK" if problems else "PASS", evidence, "; ".join(problems))

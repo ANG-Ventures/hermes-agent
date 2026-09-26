@@ -456,15 +456,25 @@ def on_pre_llm_call(
         dd = _Bg("dedupe", _persisted_recently_injected, sid, started + PROBE_MAX_S, wake=wake)
         fb = _Bg("index", _read_cards, sid, None, parent, wake=wake)
         exact: Optional[_Bg] = None
-        while True:
-            wake.clear()  # before evaluating: a completion after this re-sets it
-            if dd.done.is_set() and dd.value is True:  # R3 (state.db)
+
+        def _deduped(dd_done: bool) -> bool:  # R3 (state.db)
+            if dd_done and dd.value is True:
                 logger.info("kanban-home-cards: session=%s dedupe=state.db ms=%d %s",
                             sid, _ms(started), _stage_ms(lineage=lin, dedupe=dd))
+                return True
+            return False
+
+        while True:
+            wake.clear()  # before evaluating: a completion after this re-sets it
+            # ONE read of dd.done per pass: the hit check and the exit check
+            # must agree, else dedupe finishing between them exits the loop
+            # with a positive answer never looked at (duplicate block).
+            dd_done = dd.done.is_set()
+            if _deduped(dd_done):
                 return None
             if exact is None and lin.done.is_set() and lin.error is None:
                 exact = _Bg("exact", _read_cards, sid, lin.value, parent, wake=wake)
-            if dd.done.is_set():
+            if dd_done:
                 if exact is not None and exact.done.is_set():
                     break
                 if lin.done.is_set() and lin.error is not None and fb.done.is_set():
@@ -473,6 +483,11 @@ def on_pre_llm_call(
             if remaining <= 0:
                 break
             wake.wait(min(WAIT_SLICE_S, remaining))  # early on any completion
+        # Dedupe may have landed after the last pass (or at the deadline): a
+        # finished positive answer still wins over injecting.
+        dd_done = dd.done.is_set()
+        if _deduped(dd_done):
+            return None
         stages = _stage_ms(lineage=lin, dedupe=dd, index=fb, exact=exact)
         pick = exact if (exact is not None and exact.done.is_set()) else (
             fb if fb.done.is_set() else None)
@@ -486,7 +501,7 @@ def on_pre_llm_call(
             logger.warning("kanban-home-cards: session=%s failed open: %s", sid, pick.error)
             return None
         source, result = pick.value
-        dedupe = "clean" if dd.done.is_set() else "pending"
+        dedupe = "clean" if dd_done else "pending"
         tail = f"lineage={source} dedupe={dedupe} {stages}"
         if result[0] == "no-index":  # fail-open, never scan boards
             logger.info("kanban-home-cards: session=%s unavailable=%s ms=%d %s",

@@ -369,27 +369,141 @@ def _dangling_gitfile(path):
     A ``.git`` DIRECTORY, or a gitfile whose target exists, is a repository
     that may hold work, and stays fail-closed.
     """
-    marker = path / ".git"
-    try:
-        if not marker.is_file():
-            return False
-        first = marker.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
-    except OSError:
+    target = _gitfile_target(path)
+    if target is None:
         return False
-    if not first or not first[0].startswith("gitdir:"):
-        return False
-    target = Path(first[0][len("gitdir:"):].strip())
-    if not target.is_absolute():
-        target = path / target
     try:
         return not target.exists()
     except OSError:
         return False
 
 
+def _gitfile_target(path):
+    """The ``gitdir:`` target named by ``path/.git`` when it is a gitfile, else None."""
+    marker = path / ".git"
+    try:
+        if not marker.is_file():
+            return None
+        first = marker.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+    except OSError:
+        return None
+    if not first or not first[0].startswith("gitdir:"):
+        return None
+    target = Path(first[0][len("gitdir:"):].strip())
+    return target if target.is_absolute() else path / target
+
+
+def _explain_dead_worktree_stub(repo, key, bases=()):
+    """Re-raise a failed capture on a dead linked-worktree stub with a remedy.
+
+    A linked worktree whose admin dir (``<main>/.git/worktrees/<name>``) was
+    removed keeps its ``.git`` gitfile, so ``_repos`` still counts it, and the
+    first git call in ``_capture`` exits 128. That surfaced as the bare
+    "survivor_unavailable: git remote failed (rc=128)" -- no path, no cause
+    (t_c41effce, measured on t_2df0cc1d's ``baseline/``).
+
+    The stub has no index and no HEAD left, so git cannot say what in it is
+    new; that is why this stays a refusal rather than a skip. The worktree
+    ``repair`` verb exits 1 on it ("does not reference a repository") and the
+    ``prune`` verb cannot recreate the admin dir (and is fleet-guarded), so the
+    only working remedy is a MOVE after a check. Returns (raising nothing) for
+    any other shape.
+    """
+    target = _gitfile_target(repo)
+    try:
+        if target is None or target.exists():
+            return
+    except OSError:
+        return
+    where = "." if key == "." else f"./{key}"
+    common = target.parent.parent if target.parent.name == "worktrees" else None
+    main = common.parent if common is not None and common.name == ".git" else common
+    owner = f"linked worktree of {_ext.redact(str(main))}" if main else "linked worktree"
+    remedy = (f"git has no index or HEAD for it, so compare its files against "
+              f"{_ext.redact(str(main)) if main else 'the repository it was checked out from'}; "
+              f"if nothing in it is unique, MOVE {where} out of the workspace (never delete it) "
+              "and retry")
+    if key in bases:
+        # Same second gate as `_explain_broken_object_store`: a repo recorded
+        # at dispatch that is no longer present refuses again with "recorded
+        # repository missing", so the remedy has to name both steps.
+        remedy += (f" -- {where} was recorded at dispatch, so the retry must PAIR the move "
+                   "with --survivor-pr <owner/repo#N> or --survivor-ref <repo-url>#<sha> "
+                   "or it will refuse again with 'recorded repository missing'")
+    log.warning("kanban survivor: dead linked worktree stub %s -> %s",
+                _ext.redact(str(repo)), _ext.redact(str(target)))
+    raise SurvivorUnavailable(
+        f"survivor_unavailable: {where} is a dead linked worktree stub ({owner}): its .git "
+        f"points at {_ext.redact(str(target))}, which no longer exists. {remedy}."
+    )
+
+
 def _repos(workspace, prune=None):
     """Find repos created inside scratch, including linked worktrees; no symlinks."""
-    found = [here for here, is_repo in _walk(workspace, prune) if is_repo]
+    return _with_enclosing(workspace, [here for here, is_repo in _walk(workspace, prune) if is_repo])
+
+
+def _covering_repos(workspace, claims, bases):
+    """Repositories that hold the card's claimed paths or its recorded bases.
+
+    Found without walking: each claim is followed DOWN from ``workspace`` one
+    component at a time, never through a symlink or a derived directory (the
+    same rules as :func:`_walk`), and every repository on that path counts --
+    so a claim inside a repo nested in the root yields both, and the nested
+    refusal in :func:`preserve` fires exactly as it would after a full walk.
+    """
+    found = []
+    targets = [Path(os.path.normpath(workspace / key)) for key in bases]
+    for claim in [*claims, *targets]:
+        try:
+            parts = claim.relative_to(workspace).parts
+        except ValueError:
+            continue
+        here = workspace
+        for part in parts:
+            here = here / part
+            if part in (".git", *_DERIVED_DIRS) or here.is_symlink() or not here.is_dir():
+                break
+            if _is_repo_on_disk(here) and here not in found:
+                found.append(here)
+    return found
+
+
+def _dir_repos(workspace, foreign, bases):
+    """``_repos`` for the completion pass of a shared ``dir`` workspace.
+
+    A ``dir`` workspace rooted at a shared home cannot be enumerated inside the
+    budget even after :class:`_ForeignNested` prunes every other card's
+    subtree (t_67f7a89c: ``~/.hermes`` walked 94,906 directories in 60 s cold
+    after pruning 1,627 foreign ones, and found ONE repository -- the root).
+    On that pass only, running out of budget is not a refusal: the result is
+    what the walk found before stopping, plus every repository covering the
+    card's own ``changed_files`` and recorded ``bases``, plus the root.
+
+    Fail-closed on the card's own work is kept: a claimed path's repository is
+    always captured (and a nested one still refuses), and Git's registered
+    worktrees/submodules were already checked in full before this runs. What
+    is given up is an unclaimed, unregistered hand clone beyond the budget --
+    and this pass never deletes a ``dir`` workspace (the verified-survivor
+    branch of :func:`preserve` already skips discovery entirely for the same
+    reason). The ``cleanup=True`` pass keeps the strict walk.
+    """
+    found = []
+    try:
+        for here, is_repo in _walk(workspace, foreign.prune):
+            if is_repo:
+                found.append(here)
+    except SurvivorUnavailable as exc:
+        log.warning("kanban survivor: %s scoping dir enumeration to claimed repositories: %s",
+                    foreign.own, exc)
+        if (workspace / ".git").exists() and workspace not in found:
+            found.insert(0, workspace)
+        found.extend(r for r in _covering_repos(workspace, foreign.claimed, bases) if r not in found)
+    return _with_enclosing(workspace, found)
+
+
+def _with_enclosing(workspace, found):
+    """Add ``workspace`` itself when an enclosing repository tracks files in it."""
     enclosing = next((p for p in (workspace, *workspace.parents) if (p / ".git").exists()), None)
     if workspace not in found and enclosing is not None:
         # Probe before inspecting: a scratch workspace under the tripwire
@@ -2104,6 +2218,10 @@ def _replaced_orphans(workspace, bases):
             # place would put a `.git` here. A stat, not a spawn: this runs on
             # every completion and reclamation pass (ref-cost gate).
             continue
+        # A dead linked-worktree stub fails every probe below and would be
+        # reported as "replaced in place ... <unreadable>", which it is not:
+        # nothing was re-initialised, the admin dir is gone. Name it instead.
+        _explain_dead_worktree_stub(path, key, bases)
         if _holds_commit_by_stat(path, sha) or \
                 _git(path, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0:
             continue  # same identity (or history still holds the dispatch commit)
@@ -2411,7 +2529,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 f"({str(registered[0].relative_to(workspace))})"
             )
         stage = "_repos workspace scan"
-        repos = _repos(workspace, prune) if prune else _repos(workspace)
+        repos = _dir_repos(workspace, foreign, bases) if foreign else _repos(workspace)
         if foreign:
             repos = [repo for repo in repos if not foreign.foreign(repo)]
             if foreign.skipped:
@@ -2584,6 +2702,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # bare constant. Classify it before it escapes: if this repo's
                 # store is broken, say WHICH repo, WHICH lender and what to do.
                 # Anything else re-raises unchanged.
+                _explain_dead_worktree_stub(repo, key, bases)
                 _explain_broken_object_store(repo, key, workspace, bases)
                 raise
             if ref:

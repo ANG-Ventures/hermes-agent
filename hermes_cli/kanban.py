@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -265,6 +266,53 @@ def _check_dispatcher_presence(
 # Argparse builder
 # ---------------------------------------------------------------------------
 
+def _intermix_optional_positionals(parser: argparse.ArgumentParser) -> None:
+    """Let options appear before trailing ``*``/``?`` positionals.
+
+    Stock argparse binds an optional positional (``nargs="*"``/``"?"``) to
+    ``[]``/default the moment it meets an option, so
+    ``comment <id> --author X "text"`` failed with ``unrecognized arguments:
+    text`` once ``text`` became ``nargs="*"`` (#1166). Every leaf parser in
+    the kanban tree that owns such a positional is switched to
+    ``parse_known_intermixed_args``; parsers with sub-commands are walked,
+    not converted (intermixed parsing cannot host subparsers).
+    """
+    subparser_actions = [
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    ]
+    if subparser_actions:
+        seen: set[int] = set()
+        for action in subparser_actions:
+            for child in action.choices.values():
+                if id(child) not in seen:
+                    seen.add(id(child))
+                    _intermix_optional_positionals(child)
+        return
+    if not any(
+        not a.option_strings and a.nargs in ("*", "?") for a in parser._actions
+    ):
+        return
+    base = type(parser)
+    if getattr(base, "_kanban_intermixed", False):
+        return
+
+    class _Intermixed(base):  # type: ignore[misc, valid-type]
+        _kanban_intermixed = True
+
+        def parse_known_args(self, args=None, namespace=None):
+            # parse_known_intermixed_args re-enters parse_known_args on
+            # py<3.12; the guard makes those inner passes the stock parser.
+            if getattr(self, "_kanban_in_intermixed", False):
+                return super().parse_known_args(args, namespace)
+            self._kanban_in_intermixed = True
+            try:
+                return self.parse_known_intermixed_args(args, namespace)
+            finally:
+                self._kanban_in_intermixed = False
+
+    parser.__class__ = _Intermixed
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
@@ -420,6 +468,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument("--body-file", default=None, metavar="PATH",
+                          help="Read the opening post from PATH ('-' = stdin). Use this instead of --body for text with backticks or $(...): the shell never sees it.")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -803,7 +853,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
     p_comment.add_argument("task_id")
-    p_comment.add_argument("text", nargs="+", help="Comment body")
+    p_comment.add_argument("text", nargs="*", help="Comment body (or use --body-file)")
+    p_comment.add_argument("--body-file", default=None, metavar="PATH",
+                           help="Read the comment body from PATH ('-' = stdin). Use this for "
+                                "text with backticks or $(...): the shell never sees it.")
     p_comment.add_argument("--author", default=None,
                            help="Author name (default: $HERMES_PROFILE or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
@@ -1465,7 +1518,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Kyzcreig/* GitHub URLs the clone uses --reference-if-able "
             "against a bare mirror under <hermes root>/mirrors/, created "
             "lazily, so the checkout stores only objects the mirror lacks. "
-            "Other URLs are cloned normally. Common git-clone options "
+            "A local-path source is cloned with --no-local (never "
+            "hard-linked), borrowing from its origin's mirror when that is a "
+            "fleet repo. Other URLs are cloned normally. Common git-clone options "
             "(-q, -b, --depth, --filter, --no-checkout, --single-branch, "
             "--no-tags, --origin, ...) are forwarded."
         ),
@@ -1537,6 +1592,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                      "relayed human decision to a foreign card; records an "
                      "operator_override event, posts no comment.",
             )
+    _intermix_optional_positionals(kanban_parser)
     return kanban_parser
 
 
@@ -1815,7 +1871,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "link",
     "unlink",
     "claim",
-    "comment",
+    # "comment" is deliberately absent: a child may append a comment (t_70fcc2c3);
+    # kanban_db.add_comment marks the author "(subagent)".
     "attach",
     "attach-rm",
     "complete",
@@ -2267,6 +2324,18 @@ def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
         return False
 
 
+def _read_body_file(path: str) -> str:
+    """Read a card/comment body from ``path`` (``-`` = stdin).
+
+    Shell callers pass markdown through ``--body-file`` / a quoted heredoc
+    instead of a double-quoted argv string, where backticks and ``$(...)``
+    are executed by the shell as command substitution (t_f7e11e44).
+    """
+    if path == "-":
+        return sys.stdin.read()
+    return Path(path).expanduser().read_text(encoding="utf-8")
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_worker_policy as _kwp
 
@@ -2284,6 +2353,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
         return 2
+    body_file = getattr(args, "body_file", None)
+    if body_file is not None:
+        if args.body is not None:
+            print("kanban: --body and --body-file are mutually exclusive", file=sys.stderr)
+            return 2
+        try:
+            args.body = _read_body_file(body_file)
+        except OSError as exc:
+            print(f"kanban: --body-file: {exc}", file=sys.stderr)
+            return 2
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
@@ -2428,7 +2507,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        # A delegate_task child's connection is read-only; promotion is a
+        # status mutation, so it lists the board as-is (the dispatcher promotes).
+        if not kb._is_delegated_child():
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
@@ -3452,6 +3534,12 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
     if provider_error:
         print(f"kanban: {provider_error}", file=sys.stderr)
         return 2
+    from hermes_cli.model_policy import pinned_sub_provider_error
+
+    pin_error = pinned_sub_provider_error(model, provider)
+    if pin_error:
+        print(f"kanban: {pin_error}", file=sys.stderr)
+        return 2
 
     firepower_reason = parsed.firepower if parsed else None
     guard_error = firepower_guard_error(model, firepower_reason)
@@ -3811,8 +3899,13 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        claim = kb.claim_review_task if args.review else kb.claim_task
-        task = claim(conn, args.task_id, ttl_seconds=args.ttl)
+        if args.review:
+            task = kb.claim_review_task(
+                conn, args.task_id, ttl_seconds=args.ttl,
+                session_ref=_operator_review_session_ref(),
+            )
+        else:
+            task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -3853,7 +3946,24 @@ def _cmd_comment(args: argparse.Namespace) -> int:
       Saying "unknown" is the honest answer, and it is what the tri-state
       contract elsewhere in this codebase already does.
     """
-    body = " ".join(args.text).strip()
+    body_file = getattr(args, "body_file", None)
+    if body_file is not None and args.text:
+        print("kanban: pass the comment as TEXT or --body-file, not both", file=sys.stderr)
+        return 2
+    if body_file is None and not args.text:
+        print("kanban: comment body required (TEXT or --body-file)", file=sys.stderr)
+        return 2
+    if body_file is not None:
+        try:
+            body = _read_body_file(body_file).strip()
+        except OSError as exc:
+            print(f"kanban: --body-file: {exc}", file=sys.stderr)
+            return 2
+    else:
+        body = " ".join(args.text).strip()
+    if not body:
+        print("kanban: comment body is empty", file=sys.stderr)
+        return 2
     if args.max_len is not None:
         if args.max_len < 1:
             print("kanban: --max-len must be positive", file=sys.stderr)
@@ -3864,6 +3974,10 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     author = args.author or _profile_author()
     run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
+        if run_id is None:
+            # Human review lane: the session holding ``claim --review`` on this
+            # card attests to that review run (the claim is the provenance).
+            run_id = _operator_review_run_id(conn, args.task_id)
         kb.add_comment(
             conn, args.task_id, author, body,
             run_id=run_id, session_ref=session_ref,
@@ -3948,6 +4062,37 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
         return 1
     print(f"Deleted attachment {args.attachment_id} ({removed.filename}) from {removed.task_id}")
     return 0
+
+
+def _operator_review_session_ref() -> Optional[str]:
+    """Session fingerprint that may bind / use a human-lane review claim.
+
+    ``None`` (never bindable) for a delegate_task child, for anything inside a
+    cron job (in-process context flag or a ``cron_*`` session id), and for a
+    caller with no session at all: those cannot prove they are the reviewer
+    session, so they get no review run from :func:`_operator_review_run_id`.
+    """
+    try:
+        from agent.delegation_context import (
+            _NON_DISPATCHER_OWNED_CONTEXT,
+            is_delegated_child_process_context,
+        )
+
+        if is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get():
+            return None
+    except Exception:
+        return None
+    session_id = _caller_session_id()
+    if not session_id or session_id.startswith("cron_"):
+        return None
+    return kb.derive_session_ref(session_id)
+
+
+def _operator_review_run_id(conn, task_id: str) -> Optional[int]:
+    """The active review run on ``task_id`` iff THIS session claimed it."""
+    return kb.review_claim_run_for_session(
+        conn, task_id, _operator_review_session_ref(),
+    )
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
@@ -4080,6 +4225,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             except kb.EmptySupersedeError as supersede_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
+                continue
+            except DraftPrError as draft_err:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
             if not done:
                 failed.append(tid)
@@ -4376,17 +4525,21 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        ok, reason = kb.request_review(
-            conn,
-            tid,
-            summary=summary,
-            metadata=metadata,
-            reviewer=reviewer,
-            expected_run_id=_worker_run_id_for(tid),
-            force=bool(getattr(args, "force", False)),
-            allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
-            with_reason=True,
-        )
+        try:
+            ok, reason = kb.request_review(
+                conn,
+                tid,
+                summary=summary,
+                metadata=metadata,
+                reviewer=reviewer,
+                expected_run_id=_worker_run_id_for(tid),
+                force=bool(getattr(args, "force", False)),
+                allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
+                with_reason=True,
+            )
+        except DraftPrError as draft_err:
+            print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
+            return 1
         if not ok:
             detail = reason or "not running/ready?"
             print(
@@ -4413,21 +4566,30 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
+        # The caller must hold the review run: as its dispatcher-owned worker,
+        # or as the operator session that made ``claim --review`` (human lane).
+        worker_run = _worker_run_id_for(tid)
+        held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
+        if held_run is None:
+            print(
+                f"cannot request changes for {tid}: this session does not hold its "
+                f"review run; claim it from the reviewing session first "
+                f"(hermes kanban claim {tid} --review). Delegate children and "
+                f"cron jobs cannot hold a human-lane review claim.",
+                file=sys.stderr,
+            )
+            return 1
         if args.coverage is not None:
-            task = kb.get_task(conn, tid)
-            if task is None or task.status != "running" or task.current_run_id is None:
-                print(f"cannot record coverage for {tid}: no active review run", file=sys.stderr)
-                return 1
             kb.add_comment(
                 conn, tid, _profile_author(),
                 "review_coverage: " + str(kb.redact_review_value(args.coverage)),
-                run_id=task.current_run_id,
+                run_id=held_run,
             )
         ok, detail = kb.request_changes(
             conn,
             tid,
             reason=reason,
-            expected_run_id=_worker_run_id_for(tid),
+            expected_run_id=held_run,
         )
         if not ok:
             print(
@@ -4435,6 +4597,17 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        if worker_run is None:
+            # Human lane: the implementer resumes from the thread, so the
+            # verdict lands there as the rework comment (the run summary
+            # carries it too).
+            _unused_run, session_ref = safe_comment_provenance(tid)
+            kb.add_comment(
+                conn, tid, _profile_author(),
+                "changes requested (human review lane): "
+                + str(kb.redact_review_value(reason)),
+                run_id=held_run, session_ref=session_ref,
+            )
         print(
             f"Requested changes for {tid}"
             + (f"; routed to {detail}" if detail else "")

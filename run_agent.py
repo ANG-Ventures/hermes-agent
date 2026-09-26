@@ -247,14 +247,6 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
-    # An internal auto-resume continuation (MessageEvent text="" internal=True,
-    # gateway/run.py) has NO real user message — the resume prompt the model
-    # sees is injected separately. Persisting its empty user row pollutes the
-    # transcript (empty "messages" the user never sent), breaks role alternation
-    # (two consecutive user rows: the handoff row + this empty one), and is what
-    # a later /undo lands on as "your message (no text)". Drop it from
-    # persistence; the resumed turn's assistant reply still persists. (2026-07-16)
-    "_empty_resume_synthetic",
     # kanban worker stop-guard: the synthetic user nudge sent after a narrated
     # exit without kanban_complete/block. Only the nudge carries this flag;
     # the assistant candidate is real output and is persisted with
@@ -2423,25 +2415,6 @@ class AIAgent:
                 # message committed by a mid-turn persist cannot be un-written
                 # when the end-of-turn drop removes it from the in-memory list.
                 if _is_ephemeral_scaffolding(msg):
-                    # Drop-site observability: an empty-resume user row dropped
-                    # HERE (not the other scaffolding types) is the risk vector —
-                    # a wrongful drop of a REAL user row would be silent data
-                    # loss. Log at INFO so a drop on the WRONG turn (a leaked
-                    # flag) is visible at the exact site it happens, not just
-                    # gateway-side on the resume turn. (undo-empty-resume pass-3)
-                    if (
-                        isinstance(msg, dict)
-                        and msg.get("_empty_resume_synthetic")
-                        and msg.get("role") == "user"
-                    ):
-                        logger.info(
-                            "flush: dropped an empty-resume user row for session %s "
-                            "(content_len=%s) — expected on an auto-resume turn; if "
-                            "this fires on a turn with real user text it is a "
-                            "leaked-flag regression",
-                            getattr(self, "session_id", "?"),
-                            len(msg.get("content") or ""),
-                        )
                     continue
                 if msg_id in flushed_ids:
                     # Already persisted by identity. One field can still change
@@ -9157,7 +9130,9 @@ class AIAgent:
 
         from agent.aux_accounting import (
             reset_accounting_context,
+            reset_blackbox_turn,
             set_accounting_context,
+            set_blackbox_turn,
         )
         from agent import relay_runtime
         from agent.conversation_loop import run_conversation
@@ -9196,6 +9171,7 @@ class AIAgent:
         durable_turn_lease_interrupt_message = None
         token = None
         acct_token = None
+        bb_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -9494,6 +9470,10 @@ class AIAgent:
                 getattr(self, "_session_db", None),
                 getattr(self, "session_id", None),
             )
+            # Blackbox per-call ledger for aux calls: bind this turn's id (the
+            # one turn_context adopts from _relay_pending_turn_id) so aux rows
+            # land under it with attribution='aux:<task>' (t_39628ae3).
+            bb_token = set_blackbox_turn(self, relay_turn_id)
             from agent.auxiliary_client import scoped_runtime_main
 
             # The outer token restores the caller's Context even though turn setup
@@ -9622,6 +9602,8 @@ class AIAgent:
                         self._relay_pending_turn_id = None
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
+                    if bb_token is not None:
+                        reset_blackbox_turn(bb_token)
                     if token is not None:
                         reset_conversation_context(token)
 

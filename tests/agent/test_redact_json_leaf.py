@@ -9,6 +9,7 @@ bottom keeps the serialize-then-redact shape from coming back.
 from __future__ import annotations
 
 import ast
+import os
 import json
 from pathlib import Path
 
@@ -157,16 +158,25 @@ def test_guard_detects_the_shapes():
 
 
 def test_no_serialize_then_redact_text_call_sites():
+    # os.walk, not Path.rglob: parallel tests create and delete scratch dirs in the repo root
+    # (e.g. hermes_agent-*), and rglob raises FileNotFoundError when one vanishes mid-walk
+    # (CI 2026-09-26, 5 PRs red on the same slice). os.walk ignores vanished dirs by default.
+    skip_top = {"tests", "venv", ".venv", "node_modules"}
     offenders = []
-    for path in REPO.rglob("*.py"):
-        rel = path.relative_to(REPO)
-        if rel.parts[0] in {"tests", "venv", ".venv", "node_modules"} or ".worktrees" in rel.parts:
-            continue
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-        offenders += [f"{rel}:{ln}" for ln in _violations(tree)]
+    for root, dirs, files in os.walk(REPO):
+        rel_root = Path(root).relative_to(REPO)
+        if rel_root == Path("."):
+            dirs[:] = [d for d in dirs if d not in skip_top]
+        dirs[:] = [d for d in dirs if d != ".worktrees"]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = Path(root) / name
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError, OSError):
+                continue
+            offenders += [f"{path.relative_to(REPO)}:{ln}" for ln in _violations(tree)]
     assert not offenders, (
         "redact serialized JSON per leaf with agent.redact.redact_sensitive_json, "
         f"not redact_sensitive_text(json.dumps(...)): {offenders}"
