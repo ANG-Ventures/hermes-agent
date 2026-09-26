@@ -240,6 +240,78 @@ def call_with_messages(fn, rough_tokens, messages):
     return fn(rough_tokens, messages)
 
 
+def _accepts_kwarg(fn, name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def should_compress_request(
+    compressor, rough_tokens, messages, anchored_tokens=None
+):
+    """Host-side compaction trigger for a request estimate.
+
+    ``rough_tokens`` is the rough (char-based) estimate; ``anchored_tokens`` is
+    the usage-anchored real figure when the provider anchor is valid, else
+    ``None``. The rough-estimator skew applies ONLY to rough input — an anchored
+    figure is already in the provider's accounting and is compared unscaled.
+
+    Engines whose ``should_compress_calibrated`` predates ``anchored_tokens``
+    (third-party plugins) get the plain ``should_compress(anchored_tokens)`` on
+    the anchored path — no skew, which is the correct semantics — and the
+    pre-existing calibrated call otherwise.
+    """
+    gate = getattr(compressor, "should_compress_calibrated", None)
+    if anchored_tokens is not None:
+        if callable(gate) and _accepts_kwarg(gate, "anchored_tokens"):
+            try:
+                verdict = gate(
+                    rough_tokens, messages, anchored_tokens=anchored_tokens
+                )
+            except TypeError:
+                # Signature over-claims (``**kwargs`` wrapper/double) but the
+                # implementation rejects the kwarg: treat as legacy.
+                verdict = None
+            if isinstance(verdict, bool):
+                return verdict
+        # Legacy engine (or a non-bool double): plain threshold on the real
+        # figure, plus the skew-independent raw-rough hard-frac backstop.
+        ctx_len = getattr(compressor, "context_length", 0)
+        hard_frac = getattr(compressor, "_hard_frac", ContextEngine._HARD_FRAC_DEFAULT)
+        ceiling = 0
+        if (
+            isinstance(ctx_len, (int, float))
+            and isinstance(hard_frac, (int, float))
+            and ctx_len > 0
+        ):
+            ceiling = int(ctx_len * hard_frac)
+        if ceiling and rough_tokens >= ceiling:
+            return compressor.should_compress(rough_tokens)
+        return compressor.should_compress(anchored_tokens)
+    if callable(gate):
+        return call_with_messages(gate, rough_tokens, messages)
+    return compressor.should_compress(rough_tokens)
+
+
+def trigger_compare_tokens_for(
+    compressor, rough_tokens, messages, anchored_tokens=None
+) -> int:
+    """The figure ``should_compress_request`` compared, for honest logging."""
+    fn = getattr(compressor, "trigger_compare_tokens", None)
+    if callable(fn) and _accepts_kwarg(fn, "anchored_tokens"):
+        try:
+            value = fn(rough_tokens, messages, anchored_tokens=anchored_tokens)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        except Exception:
+            pass
+    return int(anchored_tokens if anchored_tokens is not None else rough_tokens)
+
+
 def sanitize_memory_context(memory_context: str) -> str:
     """Prepare provider context for a context-engine/LLM egress boundary."""
     sanitized = redact_sensitive_text(
@@ -1053,8 +1125,43 @@ class ContextEngine(ABC):
         cls = self._resolve_content_class(messages)
         return int(round(rough_tokens * self._trigger_skew(cls)))
 
+    def trigger_compare_tokens(
+        self,
+        rough_tokens: int,
+        messages: "list | None" = None,
+        *,
+        anchored_tokens: "int | None" = None,
+    ) -> int:
+        """The token figure ``should_compress_calibrated`` compares to threshold.
+
+        Single source for the trigger's compared value so a caller can log the
+        number the gate actually tested (the printed inequality is then true by
+        construction):
+
+        * RAW rough at/over the window hard-frac ceiling -> raw rough
+          (skew-independent 413 / dense-paste backstop, regardless of anchor);
+        * ``anchored_tokens`` given -> that value UNSCALED. It is the provider's
+          real prompt_tokens (+ completion + rough delta of messages appended
+          since, see ``anchored_context_tokens``), already in the provider's
+          accounting. Multiplying it by the rough-estimator skew double-scales
+          it (2026-09-25: real 488,061 x 1.547 = 755,030 >= 750,000 fired the
+          pre-API arm at 49% of the window, 11/11 fires below threshold);
+        * otherwise -> ``rough x trigger_skew`` (the calibrated rough estimate).
+        """
+        ctx_len = getattr(self, "context_length", 0) or 0
+        hard_frac = getattr(self, "_hard_frac", self._HARD_FRAC_DEFAULT)
+        if ctx_len > 0 and rough_tokens >= int(ctx_len * hard_frac):
+            return rough_tokens
+        if anchored_tokens is not None:
+            return int(anchored_tokens)
+        return self._trigger_calibrated_tokens(rough_tokens, messages)
+
     def should_compress_calibrated(
-        self, rough_tokens: int, messages: "list | None" = None
+        self,
+        rough_tokens: int,
+        messages: "list | None" = None,
+        *,
+        anchored_tokens: "int | None" = None,
     ) -> bool:
         """P2 trigger: compact when CALIBRATED rough ≥ threshold, OR when RAW rough
         reaches the window ceiling (skew-independent 413 / dense-paste guard — a
@@ -1068,13 +1175,16 @@ class ContextEngine(ABC):
         backstop, so the cold-start deferral can never cause a 413.
 
         ``messages`` (optional) is classified so a tool-output-heavy request is
-        compared against the tool-class correction rather than a blended one."""
-        ctx_len = getattr(self, "context_length", 0) or 0
-        hard_frac = getattr(self, "_hard_frac", self._HARD_FRAC_DEFAULT)
-        if ctx_len > 0 and rough_tokens >= int(ctx_len * hard_frac):
-            return self.should_compress(rough_tokens)
+        compared against the tool-class correction rather than a blended one.
+
+        ``anchored_tokens`` (optional) is a usage-anchored REAL figure; when
+        given, the soft threshold compares it unscaled (see
+        ``trigger_compare_tokens``) while the raw-rough hard-frac backstop still
+        applies to ``rough_tokens``."""
         return self.should_compress(
-            self._trigger_calibrated_tokens(rough_tokens, messages)
+            self.trigger_compare_tokens(
+                rough_tokens, messages, anchored_tokens=anchored_tokens
+            )
         )
 
     def get_automatic_compaction_status_message(

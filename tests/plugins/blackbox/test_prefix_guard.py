@@ -62,13 +62,15 @@ def _grow(req: dict, k: int = 2) -> dict:
 
 def _check(seq: int, req: dict, *, session="sess-A", pid=None, model="claude-opus-4-8",
            api_mode="anthropic_messages", cache_read=None, reset=None, allowlist=None,
-           ts=None, provider="claude-apr"):
+           ts=None, provider="claude-apr", turn=None, prompt_tokens=None,
+           compare_across_turns=True):
     return store.record_prefix_check(
-        session_key=session, turn_id=f"turn-{seq}", seq=seq,
+        session_key=session, turn_id=f"turn-{seq}" if turn is None else turn, seq=seq,
         ts=1_000.0 + seq if ts is None else ts, pid=os.getpid() if pid is None else pid,
         provider=provider, model=model, api_mode=api_mode,
         fingerprint=pg.fingerprint_request(req), cache_read=cache_read, reset=reset,
-        allowlist=allowlist,
+        allowlist=allowlist, prompt_tokens=prompt_tokens,
+        compare_across_turns=compare_across_turns,
     )
 
 
@@ -127,6 +129,23 @@ def test_compare_names_first_divergent_index_and_segments():
     assert by_seg["messages"]["first_divergent_index"] == 0  # the msg[0] toggle class
     assert by_seg["messages"]["bytes_before"] != by_seg["messages"]["bytes_after"]
     assert by_seg["system"]["kind"] == pg.KIND_MUTATION and by_seg["tools"]["kind"] == pg.KIND_MUTATION
+
+
+def test_compare_turn_boundary_drops_last_message_exemption():
+    """Within a turn the previous request's last message may still change;
+    across a turn boundary it is persisted history and must be byte-stable."""
+    prev = pg.fingerprint_request(_request(4))
+    tail_rewritten = _grow(_request(4), 2)
+    tail_rewritten["messages"][3]["content"][0]["text"] = "persisted differently"
+    cur = pg.fingerprint_request(tail_rewritten)
+    assert pg.compare(prev, cur) == []
+    out = pg.compare(prev, cur, turn_boundary=True)
+    assert [(v["segment"], v["kind"], v["first_divergent_index"]) for v in out] == [
+        ("messages", pg.KIND_MUTATION, 3)]
+    # a clean append is still clean at a boundary, and a one-shorter history is a shrink
+    assert pg.compare(prev, pg.fingerprint_request(_grow(_request(4), 2)), turn_boundary=True) == []
+    assert [v["kind"] for v in pg.compare(prev, pg.fingerprint_request(_request(3)),
+                                          turn_boundary=True)] == [pg.KIND_SHRINK]
 
 
 def test_compare_reports_shrink_not_mutation():
@@ -244,6 +263,52 @@ def test_store_allowlist_requires_reason_and_live_expiry(db):
     assert pg.allowlist_reason(live, segment="system", session_key="sess-A", now=now) == "SOUL rollout 09-25"
 
 
+def test_store_uses_turn_boundary_mode_only_across_turns(db):
+    _check(0, _request(4), turn="T1", prompt_tokens=235_000)
+    tail = _request(4)
+    tail["messages"][3]["content"][0]["text"] = "tool result, still streaming"
+    # same turn: the last message may change
+    assert _check(1, tail, turn="T1", prompt_tokens=235_100)["violations"] == []
+    nxt = _grow(_request(4), 2)  # turn T2 re-renders msg[3] back to the original bytes
+    r = _check(2, nxt, turn="T2", prompt_tokens=90_000)
+    assert [(v["kind"], v["first_divergent_index"]) for v in r["violations"]] == [
+        (pg.KIND_MUTATION, 3)]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT prompt_tokens_before, prompt_tokens_after FROM prefix_mutations"
+        ).fetchall() == [(235_100, 90_000)]
+        assert conn.execute("SELECT prompt_tokens FROM prefix_sessions").fetchone()[0] == 90_000
+
+
+def test_store_fresh_baseline_per_turn_when_not_comparing_across_turns(db):
+    """Background-review forks: each fork turn replays the parent snapshot, so
+    fork N+1 must not be diffed against the end of fork N's tool loop."""
+    _check(0, _grow(_request(6), 4), session="S:review", turn="F1", compare_across_turns=False)
+    r = _check(0, _request(6), session="S:review", turn="F2", compare_across_turns=False)
+    assert r["violations"] == [] and r["previous"] is None
+    bad = _grow(_request(6))
+    bad["messages"][0]["content"][0]["text"] = "X"
+    r2 = _check(1, bad, session="S:review", turn="F2", compare_across_turns=False)
+    assert [v["first_divergent_index"] for v in r2["violations"]] == [0]  # within a fork: still guarded
+
+
+def test_prompt_token_columns_migrate_onto_existing_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = store._db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:  # pre-change shape of the two guard tables
+        conn.execute("CREATE TABLE prefix_sessions (session_key TEXT PRIMARY KEY, turn_id TEXT,"
+                     " seq INT, ts REAL, pid INT, api_mode TEXT, model TEXT, cache_read INT,"
+                     " fingerprint_json TEXT, updated_at REAL, alerted_at REAL)")
+        conn.execute("CREATE TABLE prefix_mutations (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                     " ts REAL, session_key TEXT)")
+    store._connect().close()
+    with sqlite3.connect(path) as conn:
+        assert "prompt_tokens" in {r[1] for r in conn.execute("PRAGMA table_info(prefix_sessions)")}
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(prefix_mutations)")}
+        assert {"prompt_tokens_before", "prompt_tokens_after"} <= cols
+
+
 # --- plugin entry + chokepoint wiring ------------------------------------------
 
 def test_record_api_call_writes_ledger_then_guard_and_pages_via_notify(db, enabled, monkeypatch):
@@ -323,6 +388,24 @@ def test_chokepoint_passes_session_and_consumes_compaction_marker(monkeypatch):
     # failures carry the request too (it was sent), so the fingerprint chain stays intact
     cch._record_failed_api_call(agent, RuntimeError("529"), req)
     assert rows[-1]["http_status"] is None and rows[-1]["api_kwargs"] is req
+
+
+def test_chokepoint_keys_review_fork_on_its_own_chain(monkeypatch):
+    """The review fork shares session_id with the parent; its requests must not
+    become the main lane's comparison baseline."""
+    rows = []
+    monkeypatch.setattr("plugins.blackbox.record_api_call", lambda **row: rows.append(row))
+    response = SimpleNamespace(usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                               pool_headers={})
+    main = SimpleNamespace(_current_turn_id="S:S:aaaa", provider="p", model="m",
+                           api_mode="anthropic_messages", session_id="S")
+    fork = SimpleNamespace(_current_turn_id="S:uuid:bbbb", provider="p", model="m",
+                           api_mode="anthropic_messages", session_id="S",
+                           _memory_write_origin="background_review")
+    cch._record_successful_api_call(main, response, _request(2))
+    cch._record_successful_api_call(fork, response, _request(2))
+    assert [(r["session_key"], r["prefix_compare_across_turns"]) for r in rows] == [
+        ("S", True), ("S:review", False)]
 
 
 def test_committed_compaction_leaves_one_shot_marker():
