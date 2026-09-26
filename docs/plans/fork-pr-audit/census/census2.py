@@ -13,7 +13,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 REPO = HERE / "fork"
-d = json.load(open(HERE / "census.json"))
+d = json.load(open(HERE / "census.json", encoding="utf-8"))
 rows = d["rows"]
 
 
@@ -116,7 +116,7 @@ for r in out:
     b["code_rows"] += r["kind"] == "code"
 
 json.dump({**{k: v for k, v in d.items() if k != "rows"}, "excluded_sync_prs": sorted(SYNC_PRS),
-           "rows": out}, open(HERE / "census_v2.json", "w"), indent=1)
+           "rows": out}, open(HERE / "census_v2.json", "w", encoding="utf-8"), indent=1)
 
 md = ["| tranche | rows | code rows | loc |", "|---|---|---|---|"]
 for t, b in sorted(by.items(), key=lambda kv: -kv[1]["loc"]):
@@ -126,13 +126,13 @@ print("\ncherry-picked rows:", sum(r["cherry_picked_from_upstream"] for r in out
 print("rows with sync overlap>0:", sum(r["sync_overlap_files"] > 0 for r in out))
 
 # per-tranche markdown tables (+ absorb signal when absorb.json exists)
-absorb = json.load(open(HERE / "absorb.json")) if (HERE / "absorb.json").exists() else {}
+absorb = json.load(open(HERE / "absorb.json", encoding="utf-8")) if (HERE / "absorb.json").exists() else {}
 for r in out:
     a = absorb.get(r["key"])
     if a:
         r["absorb"] = a
 json.dump({**{k: v for k, v in d.items() if k != "rows"}, "excluded_sync_prs": sorted(SYNC_PRS),
-           "rows": out}, open(HERE / "census_v2.json", "w"), indent=1)
+           "rows": out}, open(HERE / "census_v2.json", "w", encoding="utf-8"), indent=1)
 for t in by:
     trs = [r for r in out if r["tranche"] == t]
     trs.sort(key=lambda r: -r["loc"])

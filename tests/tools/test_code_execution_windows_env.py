@@ -256,6 +256,7 @@ def _legacy_posix_scrubber(source_env, is_passthrough):
                           "PASSWD", "AUTH", "DSN", "WEBHOOK")
     _HERMES_CHILD_ALLOWED = frozenset({
         "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV",
+        "HERMES_AGENT",  # agent marker for the gh shim (t_45c11886)
     })
     out = {}
     for k, v in source_env.items():
@@ -305,6 +306,7 @@ class TestPosixEquivalence:
         # every other HERMES_* is dropped (the broad prefix was removed).
         "HERMES_HOME": "/home/alice/.hermes",        # allowlisted → kept
         "HERMES_PROFILE": "default",                 # allowlisted → kept
+        "HERMES_AGENT": "true",                    # agent marker -> kept (t_45c11886)
         "HERMES_INTERACTIVE": "1",                   # not allowlisted → dropped
         "HERMES_BASE_URL": "https://api.internal",   # not allowlisted → dropped
         "HERMES_KANBAN_DB": "postgres://u:p@h/db",   # not allowlisted → dropped
