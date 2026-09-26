@@ -70,6 +70,6 @@ def title(c):
 
 if __name__ == '__main__':
     out = [{'name': c['name'], 'title': title(c), 'assignee': c['assignee'], 'body': body(c)} for c in CARDS]
-    json.dump(out, open(L + 'card_specs.json', 'w'), indent=1)
+    json.dump(out, open(L + 'card_specs.json', 'w', encoding="utf-8"), indent=1)
     print(len(out), max(len(o['body']) for o in out))
     print(out[0]['title']); print(out[0]['body'][:3000])

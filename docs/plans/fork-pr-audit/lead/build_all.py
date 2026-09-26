@@ -68,7 +68,7 @@ for r in rows:
 keys = [r['key'] for r in rows]
 assert len(keys) == len(set(keys)) == 1116, len(keys)
 assert set(ROW) == set(keys)
-json.dump(ROW, open(L + 'rows.json', 'w'), indent=1, default=str)
+json.dump(ROW, open(L + 'rows.json', 'w', encoding='utf-8'), indent=1, default=str)
 if __name__ == '__main__':
     print(collections.Counter(v['final'] for v in ROW.values()))
     print(sorted(collections.Counter((v['census_tranche'], v['final']) for v in ROW.values()).items()))

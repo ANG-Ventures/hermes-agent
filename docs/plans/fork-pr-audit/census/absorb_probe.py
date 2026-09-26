@@ -27,7 +27,7 @@ if not SNAP.exists():
     SNAP.mkdir()
     subprocess.run(f"git archive upstream/main | tar -x -C {SNAP}", shell=True, cwd=REPO, check=True)
 
-d = json.load(open(HERE / "census_v2.json"))
+d = json.load(open(HERE / "census_v2.json", encoding="utf-8"))
 SKIP_LINE = re.compile(r"^\s*(#|//|\"\"\"|'''|import |from |return\b|pass\b|else:|try:|finally:|[\]\)\}\],;]*$)")
 SYM = re.compile(r"^\+\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
 out = {}
@@ -57,7 +57,7 @@ for r in d["rows"]:
             src_lines.add(s)
     res = {"src_total": len(src_lines), "sym_total": len(syms), "src_hit": 0, "sym_hit": 0, "syms_missing": []}
     if src_lines or syms:
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".pat") as f:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".pat") as f:
             pats = sorted(src_lines | syms)
             f.write("\n".join(pats) + "\n")
             pf = f.name
@@ -72,7 +72,7 @@ for r in d["rows"]:
         Path(pf).unlink()
     out[r["key"]] = res
 sys.stderr.write("\n")
-json.dump(out, open(HERE / "absorb.json", "w"), indent=1)
+json.dump(out, open(HERE / "absorb.json", "w", encoding="utf-8"), indent=1)
 
 # summary buckets
 b = {"likely-absorbed(>=80% src)": 0, "partial(20-80%)": 0, "outstanding(<20%)": 0, "no-src-lines": 0}
