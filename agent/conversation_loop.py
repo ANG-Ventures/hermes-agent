@@ -39,7 +39,8 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import (
     automatic_compaction_status_message,
-    call_with_messages as _call_with_messages,
+    should_compress_request as _should_compress_request,
+    trigger_compare_tokens_for as _trigger_compare_tokens_for,
 )
 from agent.display import KawaiiSpinner
 from agent.confab_notice import TOOL_CALL_NOTICE_TEXT, confab_notice_status, is_metadata_only_tool_notice, should_announce_notice
@@ -3259,6 +3260,10 @@ def run_conversation(
         # the provider counted them, so no tools add-on is needed. Falls
         # back to the rough figures above when the anchor is stale/missing
         # (first request, post-compaction, usage-less providers).
+        # Keep the rough figure: the compaction trigger must know which one it
+        # got. Skew calibration applies to ROUGH only; the anchored figure is
+        # already real (t_bd01a34b: real 488K x skew 1.547 false-fired at 49%).
+        _rough_pressure_tokens = request_pressure_tokens
         _anchored_pressure = anchored_context_tokens(
             messages, getattr(agent, "_usage_anchor", None)
         )
@@ -3352,14 +3357,13 @@ def run_conversation(
         # (schema overhead / post-compaction) defers, while a raw-rough window
         # ceiling still fires the 413/dense-paste guard. Fall back to the raw
         # ``should_compress`` only if a plugin engine lacks the calibrated API.
+        # The skew scales ROUGH input only: when the usage anchor is valid the
+        # gate compares the anchored (already real) figure unscaled, and the
+        # raw-rough hard-frac ceiling still backstops a 413.
         #
         # `messages` is threaded through so the calibration can classify the
         # request and apply the per-content-class correction (see
-        # agent/content_class.py); `call_with_messages` degrades to the
-        # single-argument call for engines predating the parameter.
-        _should_compress_preflight = getattr(
-            _compressor, "should_compress_calibrated", _compressor.should_compress
-        )
+        # agent/content_class.py).
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
@@ -3371,8 +3375,11 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _call_with_messages(
-                _should_compress_preflight, request_pressure_tokens, messages
+            and _should_compress_request(
+                _compressor,
+                _rough_pressure_tokens,
+                messages,
+                anchored_tokens=_anchored_pressure,
             )
         ):
             if _moa_prepared_request is not None:
@@ -3387,11 +3394,16 @@ def run_conversation(
             _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
             if callable(_clear_warn):
                 _clear_warn()
+            # Print the figure the gate COMPARED (post-calibration / anchored)
+            # beside the raw inputs, so the logged inequality is true.
             logger.info(
-                "Pre-API compression: ~%s request tokens >= %s threshold "
-                "(context=%s, attempt=%s/%s)",
-                f"{request_pressure_tokens:,}",
+                "Pre-API compression: ~%s compared tokens >= %s threshold "
+                "(basis=%s, request=~%s, rough=~%s, context=%s, attempt=%s/%s)",
+                f"{_trigger_compare_tokens_for(_compressor, _rough_pressure_tokens, messages, _anchored_pressure):,}",
                 f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
+                "anchored" if _anchored_pressure is not None else "rough",
+                f"{request_pressure_tokens:,}",
+                f"{_rough_pressure_tokens:,}",
                 f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
                 if getattr(_compressor, "context_length", 0) else "unknown",
                 compression_attempts,
