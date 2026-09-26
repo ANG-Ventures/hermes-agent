@@ -787,25 +787,18 @@ async def test_cron_profile_scan_runs_off_event_loop(isolated_profiles, monkeypa
     event_loop_thread = threading.get_ident()
     profile_scan_threads = SimpleQueue()
     worker_threads = SimpleQueue()
-    # The profile scan the cron aggregators actually perform is
-    # _cron_profile_names() (fork perf change: the aggregators only need names
-    # to route _call_cron_for_profile, so they no longer pay
-    # _cron_profile_dicts() -> list_profiles()'s config-parse + gateway-PID
-    # probe + skills-rglob per profile). Patching _cron_profile_dicts here
-    # tracked a symbol neither live path calls, so the queue stayed empty and
-    # this probe stopped proving the offload. (parity merge 2026-08-29)
-    original_profile_names = web_server._cron_profile_names
+    original_profile_dicts = web_server._cron_profile_dicts
     original_find = web_server._find_cron_job_profile
 
-    def tracking_profile_names():
+    def tracking_profile_dicts():
         profile_scan_threads.put(threading.get_ident())
-        return original_profile_names()
+        return original_profile_dicts()
 
     def tracking_find(job_id):
         worker_threads.put(threading.get_ident())
         return original_find(job_id)
 
-    monkeypatch.setattr(web_server, "_cron_profile_names", tracking_profile_names)
+    monkeypatch.setattr(web_server, "_cron_profile_dicts", tracking_profile_dicts)
     monkeypatch.setattr(web_server, "_find_cron_job_profile", tracking_find)
 
     jobs = await web_server.list_cron_jobs(profile="all")

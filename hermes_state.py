@@ -272,41 +272,6 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     return False
 
 
-# Process-local ownership supplements the durable TTL. The TTL recovers from
-# process death; it must not let another thread in the SAME live process steal a
-# lease merely because the refresher was starved long enough for wall time to
-# pass. Holder IDs are unique per turn and release unregisters them.
-_ACTIVE_SESSION_TURN_LEASE_HOLDERS: set[str] = set()
-_ACTIVE_SESSION_TURN_LEASE_HOLDERS_LOCK = threading.Lock()
-
-
-def _session_turn_lease_holder_pid(holder: str) -> Optional[int]:
-    match = _COMPRESSION_LOCK_HOLDER_PID_RE.search(holder or "")
-    if match is None:
-        return None
-    try:
-        return int(match.group(1))
-    except (TypeError, ValueError):
-        return None
-
-
-def _register_active_session_turn_lease_holder(holder: str) -> None:
-    with _ACTIVE_SESSION_TURN_LEASE_HOLDERS_LOCK:
-        _ACTIVE_SESSION_TURN_LEASE_HOLDERS.add(holder)
-
-
-def _unregister_active_session_turn_lease_holder(holder: str) -> None:
-    with _ACTIVE_SESSION_TURN_LEASE_HOLDERS_LOCK:
-        _ACTIVE_SESSION_TURN_LEASE_HOLDERS.discard(holder)
-
-
-def _is_active_local_session_turn_lease_holder(holder: str) -> bool:
-    if _session_turn_lease_holder_pid(holder) != os.getpid():
-        return False
-    with _ACTIVE_SESSION_TURN_LEASE_HOLDERS_LOCK:
-        return holder in _ACTIVE_SESSION_TURN_LEASE_HOLDERS
-
-
 def _scrub_surrogates(value: Any) -> Any:
     """Replace lone surrogates when *value* is text; pass anything else through.
 
@@ -8759,12 +8724,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if row is not None:
                 current_holder = row["holder"]
                 if (
-                    (
-                        float(row["expires_at"]) <= now
-                        and not _is_active_local_session_turn_lease_holder(
-                            current_holder
-                        )
-                    )
+                    float(row["expires_at"]) <= now
                     or _compression_lock_holder_process_is_dead(current_holder)
                 ):
                     conn.execute(
@@ -8784,39 +8744,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             return owner is not None and owner["holder"] == holder
 
-        # Register before the durable write so another thread in this process
-        # cannot reclaim the just-expired row in the gap between SQLite commit
-        # and process-local registration. Roll back the registration whenever
-        # admission fails or raises.
-        _register_active_session_turn_lease_holder(holder)
-        try:
-            acquired = bool(self._execute_write(_do, patience_s=patience_s))
-        except Exception:
-            _unregister_active_session_turn_lease_holder(holder)
-            raise
-        if not acquired:
-            _unregister_active_session_turn_lease_holder(holder)
-        return acquired
-
-    def get_session_turn_lease_holder(self, session_id: str) -> Optional[str]:
-        """Return the current turn-lease holder, including expired rows.
-
-        Diagnostic only. Expiry is deliberately included so callers can explain
-        why a process-local active holder was retained beyond its wall-clock TTL.
-        """
-        if not session_id:
-            return None
-        with self._read_ctx() as conn:
-            if conn is None:
-                return None
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            row = conn.execute(
-                "SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+        return bool(self._execute_write(_do, patience_s=patience_s))
 
     def acquire_session_turn_lease(
         self,
@@ -8853,7 +8781,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         deadline = time.monotonic() + max(0.0, float(wait_seconds))
         wait_started = None
         last_notice_at = None
-        same_process_contention_logged = False
         notice_every = max(0.0, float(wait_notice_interval_seconds))
         notice_backoff = max(1.0, float(wait_notice_backoff or 1.0))
         # The cap is a real ceiling: a caller passing a cap below the base
@@ -8885,34 +8812,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # Keep polling until wait_seconds or should_abort.
                 if classify_persistence_error(exc) != "locked":
                     raise
-            if not same_process_contention_logged:
-                try:
-                    current_holder = self.get_session_turn_lease_holder(session_id)
-                    if (
-                        current_holder
-                        and current_holder != holder
-                        and _session_turn_lease_holder_pid(current_holder)
-                        == os.getpid()
-                    ):
-                        logger.error(
-                            "Same-process session turn lease contention: "
-                            "session=%s active_holder=%s waiting_holder=%s",
-                            session_id,
-                            current_holder,
-                            holder,
-                        )
-                        same_process_contention_logged = True
-                except Exception:
-                    # Diagnostics must never fail the wait: not on lock
-                    # pressure (sqlite3.Error) and not on a DB handle that
-                    # cannot serve reads (test doubles, half-initialised or
-                    # closed instances). The acquisition retry above remains
-                    # the only authoritative path. Log once and stop probing.
-                    logger.debug(
-                        "session turn lease contention diagnostic failed",
-                        exc_info=True,
-                    )
-                    same_process_contention_logged = True
             now = time.monotonic()
             remaining = deadline - now
             if remaining <= 0:
@@ -8975,10 +8874,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (conversation_id, holder),
             )
 
-        try:
-            self._execute_write(_do)
-        finally:
-            _unregister_active_session_turn_lease_holder(holder)
+        self._execute_write(_do)
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
@@ -14007,51 +13903,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         if preserve_unparseable_tool_calls
                         else []
                     )
-            if msg.get("display_metadata") is not None:
-                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
-            result.append(msg)
-        return result
-
-    def get_messages_after(
-        self,
-        session_id: str,
-        since_message_id: int,
-        include_inactive: bool = False,
-        limit: int = 500,
-    ) -> List[Dict[str, Any]]:
-        """Load messages committed after ``since_message_id`` in id order."""
-        try:
-            since = int(since_message_id)
-        except (TypeError, ValueError):
-            since = 0
-        if since < 0:
-            since = 0
-        try:
-            row_limit = int(limit)
-        except (TypeError, ValueError):
-            row_limit = 500
-        if row_limit <= 0:
-            row_limit = 500
-
-        active_clause = "" if include_inactive else " AND active = 1"
-        sql = (
-            "SELECT * FROM messages WHERE session_id = ? AND id > ?"
-            f"{active_clause} ORDER BY id LIMIT ?"
-        )
-        with self._read_ctx() as conn:
-            cursor = conn.execute(sql, (session_id, since, row_limit))
-            rows = cursor.fetchall()
-        result = []
-        for row in rows:
-            msg = dict(row)
-            if "content" in msg:
-                msg["content"] = self._decode_content(msg["content"])
-            if msg.get("tool_calls"):
-                try:
-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in get_messages_after, falling back to []")
-                    msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)

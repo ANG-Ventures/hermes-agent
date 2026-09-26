@@ -407,6 +407,12 @@ def _restart_and_hook(sid, db):
                                              repair_alternation=True)
     hist, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
     fresh = _load()  # new process: empty in-memory I1 gate
+    # These tests pin the R3 dedupe PREDICATE over persisted rows, not the I5
+    # latency budget (its own tests below). At the production 0.22 s budget a
+    # loaded CI runner's cold state.db read can miss the deadline, and the hook
+    # then fails open to INJECT by design -- which read as a dedupe regression
+    # (merge_group pr-918, test_R3_K_window_counts_only_active_user_rows).
+    fresh.BUDGET_S = fresh.PROBE_MAX_S
     return hist, fresh.on_pre_llm_call(session_id=sid, platform="discord",
                                        conversation_history=hist)
 
@@ -734,10 +740,51 @@ def test_dedupe_results_are_logged(mod, home, caplog):
         assert mod.on_pre_llm_call(session_id=SID, conversation_history=_hist(1, header_at=0)) is None
     assert any(f"session={SID} dedupe=history" in r.getMessage() for r in caplog.records)
     fresh = _load()
+    fresh.BUDGET_S = fresh.PROBE_MAX_S  # pins the log line, not the I5 latency budget
     _state_db(fresh, FOREIGN, 2, header_at=0)
     with caplog.at_level("INFO", logger=fresh.logger.name):
         assert fresh.on_pre_llm_call(session_id=FOREIGN, conversation_history=[]) is None
     assert any(f"session={FOREIGN} dedupe=state.db" in r.getMessage() for r in caplog.records)
+
+
+class _LateEvent(threading.Event):
+    """Already set, but reads as unset the first ``hide`` times: the answer
+    lands between two reads of ``done`` in one pass of the hook's loop."""
+
+    def __init__(self, hide):
+        super().__init__()
+        self.hide = hide
+
+    def is_set(self):
+        if self.hide > 0:
+            self.hide -= 1
+            return False
+        return super().is_set()
+
+
+@pytest.mark.parametrize("hide", [0, 1, 2, 3])
+def test_R3_dedupe_landing_mid_pass_is_never_dropped(mod, home, caplog, monkeypatch, hide):
+    """t_0c12170e: the loop read dd.done twice per pass. Dedupe finishing
+    between the hit check and the exit check broke out with a positive
+    answer unread, logged dedupe=clean and injected a duplicate block
+    (CI run 36192479175 slice 11). Stages run inline so the interleaving is
+    exact, not a timing race."""
+    _card(_board(home), "t_home0001", session_id=SID)
+    _state_db(mod, SID, 2, header_at=0)
+    real_bg = mod._Bg
+
+    class InlineBg(real_bg):
+        def __init__(self, name, fn, *args, wake=None):
+            self.value, self._wake, self.error, self.ms = None, wake, None, None
+            self.done = _LateEvent(hide) if name == "dedupe" else threading.Event()
+            self._fn, self._args = fn, args
+            self._run()
+
+    monkeypatch.setattr(mod, "_Bg", InlineBg)
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        assert mod.on_pre_llm_call(session_id=SID, conversation_history=[]) is None
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(f"session={SID} dedupe=state.db" in m for m in msgs), msgs
 
 
 def test_only_pre_llm_call_is_registered():
