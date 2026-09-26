@@ -193,7 +193,34 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # files that finish in ~100s on a quiet box. The Docker build matrix jobs
 # take 7-10 min anyway, so this headroom costs nothing on total CI wall
 # time while keeping a genuinely hung file bounded.
-_DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
+_DEFAULT_FILE_TIMEOUT_SECONDS = 1800.0
+
+# The hang detector proper (2026-09-25, t_949655a6). A hung file is one that
+# stops EMITTING test lines, not one that is slow. The 300 s wall ceiling
+# above was a slowness budget wearing a hang detector's name: on a
+# self-hosted runner with a 3-CPU quota and 6 workers (2x oversubscribed by
+# design), CPU-heavy files (test_hermes_state_core.py, 157 tests;
+# test_kanban_home_cards.py at 292 s) legitimately need > 300 s of wall time
+# while streaming a PASSED line every few seconds -- and the ceiling killed
+# them at 93 % with 0 failures, ejecting whole merge groups. So: kill when no
+# ``path::test`` line has arrived for ``--idle-timeout`` seconds (a real hang
+# is silent), and keep ``--file-timeout`` only as a large absolute backstop
+# for a file that streams forever. The child runs with PYTHONUNBUFFERED=1 so
+# progress lines reach the pipe as they happen, not at block-buffer flushes.
+_DEFAULT_IDLE_TIMEOUT_SECONDS = 240.0
+_PROGRESS_LINE_RE = re.compile(r"^\S+::\S+")
+
+
+def scaled_file_timeout(base: float, workers: int, effective_cpus: int) -> float:
+    """Scale the DEFAULT per-file ceiling by worker oversubscription.
+
+    Workers default to 2x the CPU quota, so each file gets roughly half a CPU
+    and its wall time stretches by the same ratio. A fixed 300s wall turned a
+    file that takes ~80s on a quiet box into a "hang" on a 4-vCPU runner with
+    8 workers (merge groups 36213157250/36213163045/36213168317). Never below
+    ``base``. An explicit --file-timeout / env value is used verbatim.
+    """
+    return base * max(1.0, workers / max(1, effective_cpus))
 
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
@@ -522,8 +549,46 @@ def _resolve_self_hosted_slots(raw: str | None) -> int | None:
     return value
 
 
-def _route_arm_slices(matrix: dict, raw_count: str | None, repo_root: Path) -> None:
-    """Opt in the lightest non-core slices; invalid counts leave routing alone."""
+def _resolve_x64_hosted_min(raw: str | None) -> int | None:
+    """Normalize ``--x64-hosted-min``; ``None`` keeps the legacy ARM trial.
+
+    Empty/unset, non-integer and negative all mean "no floor" and fall back to
+    the legacy lightest-N selection, so ``CI_X64_HOSTED_MIN=off`` is the
+    rollback for arm-first routing.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        value = -1
+    if value < 0:
+        print(
+            f"warning: --x64-hosted-min {raw!r} is not a non-negative integer; "
+            "using the legacy --arm-hosted-slices selection",
+            file=sys.stderr,
+        )
+        return None
+    return value
+
+
+def _route_arm_slices(
+    matrix: dict,
+    raw_count: str | None,
+    repo_root: Path,
+    raw_x64_min: str | None = None,
+) -> None:
+    """Route eligible slices to ``ubuntu-24.04-arm``.
+
+    ``raw_count`` unset/0/invalid disables ARM entirely (the kill switch).
+    Without an x64 floor, the N lightest non-core slices move to ARM from
+    either venue (the original trial). With ``raw_x64_min`` = M, routing is
+    arm-first: every GitHub-hosted non-core slice moves to ARM except that at
+    least M hosted slices stay x64 as arch canaries — the count is taken after
+    the self-hosted cap, so no ``CI_SELF_HOSTED_SLOTS`` value the placement
+    controller writes can remove them. Self-hosted slices are never moved.
+    The heaviest hosted slices go to ARM (faster there); the lightest stay x64.
+    """
     try:
         count = int(raw_count or 0)
     except ValueError:
@@ -542,8 +607,82 @@ def _route_arm_slices(matrix: dict, raw_count: str | None, repo_root: Path) -> N
             continue
         weight = sum(durations.get(f, 2.0) for f in files)
         candidates.append((weight, slice_["index"], slice_))
-    for _, _, slice_ in sorted(candidates, key=lambda item: item[:2])[:count]:
+    x64_min = _resolve_x64_hosted_min(raw_x64_min)
+    if x64_min is None:
+        chosen = sorted(candidates, key=lambda item: item[:2])[:count]
+    else:
+        hosted = [s for s in matrix["slice"] if s["runs_on"] == _HOSTED_RUNNER_LABELS]
+        budget = max(0, len(hosted) - x64_min)
+        eligible = [c for c in candidates if c[2]["runs_on"] == _HOSTED_RUNNER_LABELS]
+        chosen = sorted(eligible, key=lambda item: (-item[0], item[1]))[:budget]
+    for _, _, slice_ in chosen:
         slice_["runs_on"] = '["ubuntu-24.04-arm"]'
+
+
+# Paid third rung of the venue ladder: free self-hosted -> free GitHub-hosted
+# -> Blacksmith. Blacksmith is x64-ONLY (t_56b21c1e): its ARM runners are
+# Ampere Neoverse-N1 (~1,340 single-thread vs GitHub ARM N2 ~1,874; our
+# pytest slices ran 299 s vs 204 s), while Blacksmith x64 (~4,259) beats
+# GitHub x64 (2,268-3,500). So only GitHub-hosted x64 slices ever move; ARM,
+# self-hosted, Windows and macOS labels are never touched, and no emitted
+# label may be a Blacksmith ARM label (ci_speed_lint R13 enforces it).
+_BLACKSMITH_RUNNER_LABELS = '["blacksmith-4vcpu-ubuntu-2404"]'
+assert "-arm" not in _BLACKSMITH_RUNNER_LABELS, "Blacksmith is x64-only"
+# Events whose code is trusted to run on a paid third-party runner. A
+# pull_request additionally needs its head in this repository (no forks).
+_BLACKSMITH_TRUSTED_EVENTS = {"push", "merge_group"}
+
+
+def _blacksmith_trusted(event: str | None, same_repo: str | None) -> bool:
+    """Trust guard for the Blacksmith rung; fails closed on anything unknown."""
+    event = (event or "").strip()
+    if event in _BLACKSMITH_TRUSTED_EVENTS:
+        return True
+    return event == "pull_request" and (same_repo or "").strip().lower() == "true"
+
+
+def _route_blacksmith_slices(
+    matrix: dict,
+    raw_count: str | None,
+    event: str | None,
+    same_repo: str | None,
+) -> None:
+    """Move the LAST N GitHub-hosted x64 slices (by index) to Blacksmith x64.
+
+    Runs after self-hosted and ARM routing, so it only ever takes slices that
+    would otherwise have queued on GitHub-hosted x64 runners; ARM slices stay
+    on GitHub ARM (Blacksmith ARM is slower). ``raw_count``
+    unset/0/invalid, or an untrusted event (fork PR, schedule, dispatch, an
+    unknown event), leaves the matrix untouched.
+    """
+    raw = "" if raw_count is None else str(raw_count).strip()
+    if not raw:
+        return
+    try:
+        count = int(raw)
+    except ValueError:
+        count = -1
+    if count < 0:
+        print(
+            f"warning: --blacksmith-slices {raw_count!r} is not a non-negative "
+            "integer; Blacksmith disabled",
+            file=sys.stderr,
+        )
+        return
+    if not count:
+        return
+    if not _blacksmith_trusted(event, same_repo):
+        print(
+            f"Blacksmith: {count} slice(s) requested but event {event!r} "
+            f"(same_repo={same_repo!r}) is not trusted; staying on GitHub-hosted",
+            file=sys.stderr,
+        )
+        return
+    hosted = [s for s in matrix["slice"] if s["runs_on"] == _HOSTED_RUNNER_LABELS]
+    chosen = sorted(hosted, key=lambda s: s["index"])[-count:]
+    for slice_ in chosen:
+        slice_["runs_on"] = _BLACKSMITH_RUNNER_LABELS
+    print(f"Blacksmith: {len(chosen)} slice(s) routed", file=sys.stderr)
 
 
 def _scoped_plugin_matrix(
@@ -675,6 +814,7 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    idle_timeout: float | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -708,15 +848,22 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
+    # idle_timeout is threaded only when set: _run_one_file_once derives the
+    # default itself, and callers/tests that stub it with the historical
+    # 4-positional shape keep working.
+    _extra = () if idle_timeout is None else (idle_timeout,)
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, *_extra
     )
     attempt = 0
-    while rc != 0 and attempt < retries:
+    # A timed-out attempt is NOT retried here: re-running it at once under the
+    # same load and the same ceiling times out again. main() retries it once
+    # in isolation after the parallel pool drains.
+    while rc != 0 and attempt < retries and not summary.get("timed_out"):
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, *_extra
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -731,6 +878,24 @@ def _run_one_file(
     return file, rc, output, summary, subproc_wall
 
 
+# Per-file junit (CI efficiency spec I4): when set, every file's FINAL attempt
+# writes <dir>/<junit_name(file)>. The flake-quarantine verdict reads these to
+# decide per TEST whether a red slice is fully explained by quarantined tests;
+# a file with no junit (hang, SIGKILL, crash) is gating by construction.
+_JUNIT_DIR: Path | None = None
+
+
+def junit_name(rel_path: str) -> str:
+    """Junit filename for a repo-relative test path (stable, flat, unique)."""
+    return rel_path.replace("\\", "/").replace("/", "__") + ".xml"
+
+
+def _junit_path(file: Path, repo_root: Path) -> Path | None:
+    if _JUNIT_DIR is None:
+        return None
+    return _JUNIT_DIR / junit_name(_format_file(file, repo_root))
+
+
 # Files that failed once and passed on retry, with both attempts' output.
 # Keeping the traceback is load-bearing: a self-healed flake without its
 # failing assertion is only a filename, which forces another expensive full
@@ -739,14 +904,77 @@ _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+def _wait_with_progress(
+    proc: "subprocess.Popen[str]",
+    started: float,
+    file_timeout: float,
+    idle_timeout: float,
+) -> Tuple[str, str | None]:
+    """Drain ``proc.stdout`` live; return ``(output, kill_reason, finalize)``.
+
+    ``kill_reason`` is ``None`` when pytest exited on its own, ``"idle"`` when
+    no ``path::test`` progress line arrived for ``idle_timeout`` seconds (the
+    hang signature), or ``"wall"`` when ``file_timeout`` elapsed while the
+    file was still progressing (the absolute backstop). The caller kills the
+    tree; this function never does.
+    """
+    chunks: List[str] = []
+    last_progress = [started]
+
+    def _pump() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            chunks.append(line)
+            if _PROGRESS_LINE_RE.match(line):
+                last_progress[0] = time.monotonic()
+
+    pump = threading.Thread(target=_pump, daemon=True)
+    pump.start()
+    reason: str | None = None
+    while True:
+        try:
+            proc.wait(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        if now - last_progress[0] > idle_timeout:
+            reason = "idle"
+            break
+        if now - started > file_timeout:
+            reason = "wall"
+            break
+    if reason is None:
+        pump.join(timeout=10)
+
+    def _finalize() -> str:
+        # After the caller kills the tree the pipe hits EOF and the pump
+        # yields the in-flight partial line (the nodeid of the hung test).
+        pump.join(timeout=10)
+        return "".join(chunks)
+
+    return "".join(chunks), reason, _finalize
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    idle_timeout: float | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
+    if idle_timeout is None:
+        idle_timeout = _DEFAULT_IDLE_TIMEOUT_SECONDS
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    junit = _junit_path(file, repo_root)
+    if junit is not None:
+        # One attempt, one junit: a stale file from a failed first attempt
+        # must never describe a retry that hung or passed.
+        junit.unlink(missing_ok=True)
+        # xunit1 carries file= on every testcase, which the verdict uses to
+        # rebuild the exact node ID.
+        cmd += [f"--junitxml={junit}", "-o", "junit_family=xunit1"]
 
     # Give this subprocess its own pytest temp root.
     #
@@ -772,6 +1000,10 @@ def _run_one_file_once(
     # skipping writing bytecode because we're running a bunch of parallel
     # python processes on the same code (fork parity)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Progress lines must reach our pipe as pytest prints them (the idle
+    # detector below reads them live); a block-buffered stdout would look
+    # like a hang for the whole buffer's worth of tests.
+    env["PYTHONUNBUFFERED"] = "1"
     private_basetemp: Path | None = None
     if not any(
         arg == "--basetemp" or arg.startswith("--basetemp=")
@@ -817,21 +1049,39 @@ def _run_one_file_once(
         except (ProcessLookupError, PermissionError):
             pgid = None
 
+    idle_killed = False
     try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
+        output, kill_reason, finalize_output = _wait_with_progress(
+            proc, subproc_start, file_timeout, idle_timeout
+        )
+        if kill_reason is None:
+            rc = proc.returncode
+        else:
+            raise subprocess.TimeoutExpired(cmd, file_timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
+        idle_killed = kill_reason == "idle"
         _kill_tree(proc, pgid=pgid)
         try:
-            output, _ = proc.communicate(timeout=10)
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            output = "(file timeout exceeded; output unavailable)"
+            pass
+        output = finalize_output()
         rc = 124  # de facto convention for "killed by timeout".
-        output = (
-            f"({file_timeout:.0f}s exceeded; "
-            f"process tree SIGKILL'd)\n{output}"
-        )
+        if junit is not None:
+            # A junit written before a teardown hang is partial evidence;
+            # a timed-out file must read as "no results" (fail closed).
+            junit.unlink(missing_ok=True)
+        if idle_killed:
+            output = (
+                f"(no test progress for {idle_timeout:.0f}s -- hang; "
+                f"process tree SIGKILL'd)\n{output}"
+            )
+        else:
+            output = (
+                f"({file_timeout:.0f}s absolute ceiling exceeded while still "
+                f"progressing; process tree SIGKILL'd)\n{output}"
+            )
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
@@ -860,6 +1110,9 @@ def _run_one_file_once(
         summary.update(_parse_timeout_progress(output))
         summary["timed_out"] = 1
         summary["timeout_secs"] = int(file_timeout)
+        if idle_killed:
+            summary["idle_killed"] = 1
+            summary["idle_secs"] = int(idle_timeout)
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
         # Treat as a pass (a correctly marker-filtered file SHOULD be a
@@ -933,7 +1186,10 @@ def _format_timeout_verdict(output: str, summary: dict) -> str:
     tests/x.py::test_foo``. Each clause is emitted only when the evidence for
     it is actually present in the captured output — no invented numbers.
     """
-    parts = [f"TIMED OUT after {summary.get('timeout_secs', 0)}s"]
+    if summary.get("idle_killed"):
+        parts = [f"HUNG: no test progress for {summary.get('idle_secs', 0)}s"]
+    else:
+        parts = [f"TIMED OUT after {summary.get('timeout_secs', 0)}s (still progressing)"]
     pct = summary.get("progress_pct")
     if pct is not None:
         parts.append(f"at ~{pct}%")
@@ -1338,13 +1594,29 @@ def main() -> int:
     parser.add_argument(
         "--file-timeout",
         type=float,
+        default=None,
+        help=(
+            "Absolute per-file wall-clock backstop in seconds (a file that keeps "
+            "progressing past this is still killed). Hangs are caught much earlier "
+            "by --idle-timeout. On timeout the pytest subprocess and its full "
+            "process tree are SIGKILL'd, then the file is retried once in "
+            "isolation after the pool drains. "
+            f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min) "
+            "scaled by workers/effective_cpus (never below it); an explicit "
+            "value or env HERMES_TEST_FILE_TIMEOUT is used verbatim."
+        ),
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
         default=float(
-            os.environ.get("HERMES_TEST_FILE_TIMEOUT", _DEFAULT_FILE_TIMEOUT_SECONDS)
+            os.environ.get("CI_TEST_IDLE_TIMEOUT", _DEFAULT_IDLE_TIMEOUT_SECONDS)
         ),
         help=(
-            "Per-file wall-clock cap in seconds. On timeout, the pytest "
-            "subprocess and its full process tree are SIGKILL'd. "
-            f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min), env: HERMES_TEST_FILE_TIMEOUT."
+            "Hang detector: SIGKILL a file's pytest tree when no test progress "
+            "line has been printed for this many seconds. A slow file that keeps "
+            f"passing tests is never killed by this. Default: {_DEFAULT_IDLE_TIMEOUT_SECONDS:.0f}s, "
+            "env: CI_TEST_IDLE_TIMEOUT."
         ),
     )
     parser.add_argument(
@@ -1411,6 +1683,38 @@ def main() -> int:
         help="Route the N lightest non-core slices to ubuntu-24.04-arm (default 0).",
     )
     parser.add_argument(
+        "--x64-hosted-min",
+        metavar="M",
+        default=None,
+        help=(
+            "Arm-first routing: with --arm-hosted-slices > 0, move every "
+            "GitHub-hosted non-core slice to ubuntu-24.04-arm except M, which "
+            "stay x64 as canaries. Unset/invalid keeps the lightest-N trial. "
+            "Env/CI source: vars.CI_X64_HOSTED_MIN (workflow default 2)."
+        ),
+    )
+    parser.add_argument(
+        "--blacksmith-slices",
+        metavar="N",
+        default=None,
+        help=(
+            "Paid overflow rung: move the last N GitHub-hosted slices to "
+            "Blacksmith (same arch). Only for --event push/merge_group, or "
+            "pull_request with --same-repo true. Env/CI source: "
+            "vars.CI_BLACKSMITH_SLICES (written by ci-placement.py)."
+        ),
+    )
+    parser.add_argument(
+        "--event",
+        default=None,
+        help="github.event_name, for the Blacksmith trust guard.",
+    )
+    parser.add_argument(
+        "--same-repo",
+        default=None,
+        help="'true' when a pull_request head is in this repository (not a fork).",
+    )
+    parser.add_argument(
         "--self-hosted-labels",
         metavar="JSON",
         default=_HOSTED_RUNNER_LABELS,
@@ -1436,6 +1740,22 @@ def main() -> int:
             "CI slice scope from --changed-files-scope. A valid isolated "
             "'plugin:<name>' scope emits one plugin slice plus one core-smoke "
             "slice; anything else fails open to the full matrix."
+        ),
+    )
+    parser.add_argument(
+        "--junit-dir",
+        default=None,
+        help=(
+            "Write one junit XML per test file (its FINAL attempt) into this "
+            "directory. Used by the CI flake-quarantine verdict."
+        ),
+    )
+    parser.add_argument(
+        "--result-file",
+        default=None,
+        help=(
+            "Write a JSON manifest (runner exit code, no-op verdicts, every "
+            "file's exit code / timeout / junit name) to this path."
         ),
     )
     parser.add_argument(
@@ -1500,10 +1820,12 @@ def main() -> int:
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
-        "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
+        "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
         "--min-tests", "--strict-noop", "--no-strict-noop",
+        "--junit-dir", "--result-file",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1545,6 +1867,10 @@ def main() -> int:
         i += 1
 
     args = parser.parse_args(our_args)
+    global _JUNIT_DIR
+    if args.junit_dir:
+        _JUNIT_DIR = Path(args.junit_dir).resolve()
+        _JUNIT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Worker sizing: the CPU QUOTA is the ceiling, not the host core count ─
     # An explicit -j (or $HERMES_TEST_WORKERS) is a REQUEST that can only lower
@@ -1571,13 +1897,21 @@ def main() -> int:
         _effective_cpus,
         force=os.environ.get("HERMES_TEST_WORKERS_FORCE") == "1",
     )
+    if args.file_timeout is None:
+        _env_timeout = os.environ.get("HERMES_TEST_FILE_TIMEOUT")
+        args.file_timeout = (
+            float(_env_timeout) if _env_timeout
+            else scaled_file_timeout(
+                _DEFAULT_FILE_TIMEOUT_SECONDS, args.jobs, _effective_cpus
+            )
+        )
     print(
         format_worker_sizing_log(
             workers=args.jobs,
             effective_cpus=_effective_cpus,
             requested=_requested,
             source=_cpu_source,
-        ),
+        ) + f" file_timeout={args.file_timeout:.0f}s",
         # stderr, not stdout: `--generate-slices` stdout is captured verbatim
         # by CI (`MATRIX=$(...)` → `fromJSON`), so any extra stdout line kills
         # the generate job. stderr still shows in the job log.
@@ -1656,7 +1990,12 @@ def main() -> int:
             args.test_scope, repo_root, self_hosted_slots, self_hosted_labels
         )
         if scoped_matrix is not None:
-            _route_arm_slices(scoped_matrix, args.arm_hosted_slices, repo_root)
+            _route_arm_slices(
+                scoped_matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
+            )
+            _route_blacksmith_slices(
+                scoped_matrix, args.blacksmith_slices, args.event, args.same_repo
+            )
             print(
                 f"Test scope: {args.test_scope} + core smoke"
                 f" ({len(scoped_matrix['slice'])} slices)",
@@ -1735,7 +2074,12 @@ def main() -> int:
             f"Test scope: full ({args.generate_slices} slices)",
             file=sys.stderr,
         )
-        _route_arm_slices(matrix, args.arm_hosted_slices, repo_root)
+        _route_arm_slices(
+            matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
+        )
+        _route_blacksmith_slices(
+            matrix, args.blacksmith_slices, args.event, args.same_repo
+        )
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))
         return 0
@@ -1775,6 +2119,9 @@ def main() -> int:
     # aggregate no-op gate can see exit-5→0-coerced zero-collect files that
     # never enter `failures`. Without this the silent no-op is invisible.
     all_summaries: List[Tuple[Path, Dict[str, int]]] = []
+    # Final exit code per file for the --result-file manifest (-1 = the
+    # runner itself crashed on this file: no junit, gating).
+    file_rcs: Dict[Path, int] = {}
     started = time.monotonic()
     files_done = 0
     tests_done = 0
@@ -1802,6 +2149,7 @@ def main() -> int:
                 tests_done += n_tests
                 fail_count += 1
                 failures.append((file, f"runner crashed: {exc!r}", {}))
+                file_rcs[file] = -1
                 _print_progress(
                     tests_done, approx_total_tests, file, 1,
                     time.monotonic() - started_at,
@@ -1823,6 +2171,7 @@ def main() -> int:
             )
             file_times.append((fpath, subproc_wall))
             all_summaries.append((fpath, summary))
+            file_rcs[fpath] = rc
             if rc == 0:
                 pass_count += 1
             else:
@@ -1845,7 +2194,7 @@ def main() -> int:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
+                args.file_timeout, args.file_retries, args.idle_timeout,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -1854,6 +2203,42 @@ def main() -> int:
         # control flow obvious.
         for fut in futures:
             fut.result() if fut.exception() is None else None
+
+    # ── Isolated retry of timed-out files ───────────────────────────────
+    # A file killed at the per-file wall while N workers shared the box may be
+    # slow, not hung. Re-run each one ONCE, alone, now that the pool has
+    # drained. Pass => counted as passed and reported as SLOW (fix it); a file
+    # that times out alone too stays failed. --file-retries 0 disables this.
+    slow_rescued: List[Tuple[Path, float, float]] = []
+    if args.file_retries > 0:
+        for entry in [e for e in failures if e[2].get("timed_out")]:
+            fpath, old_output, old_summary = entry
+            print(
+                f"↻ {_format_file(fpath, repo_root)} timed out under load; "
+                "retried in isolation",
+                flush=True,
+            )
+            _f, rc2, out2, summ2, wall2 = _run_one_file_once(
+                fpath, pytest_passthrough, repo_root, args.file_timeout,
+                args.idle_timeout,
+            )
+            idx = next(i for i, (f, s) in enumerate(all_summaries)
+                       if f == fpath and s is old_summary)
+            all_summaries[idx] = (fpath, summ2)
+            tests_passed += summ2.get("passed", 0) - old_summary.get("passed", 0)
+            tests_failed += summ2.get("failed", 0) - old_summary.get("failed", 0)
+            tests_skipped += summ2.get("skipped", 0) - old_summary.get("skipped", 0)
+            tests_collected += sum(
+                summ2.get(k, 0) - old_summary.get(k, 0)
+                for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
+            )
+            failures.remove(entry)
+            if rc2 == 0:
+                fail_count -= 1
+                pass_count += 1
+                slow_rescued.append((fpath, float(old_summary.get("timeout_secs", 0)), wall2))
+            else:
+                failures.append((fpath, f"{old_output}\n--- isolated retry ---\n{out2}", summ2))
 
     elapsed = time.monotonic() - started
     print()
@@ -1922,6 +2307,14 @@ def main() -> int:
         for f, output in _FLAKY_RESULTS:
             print(f"  {_format_file(f, repo_root)}")
             print(output.rstrip())
+
+    if slow_rescued:
+        print()
+        print(f"=== ⚠ {len(slow_rescued)} SLOW file{'s' if len(slow_rescued) != 1 else ''} "
+              "(timed out under load, passed when retried in isolation — make them faster) ===")
+        for f, ceiling, wall in slow_rescued:
+            print(f"  {_format_file(f, repo_root)}  killed at {ceiling:.0f}s in the pool, "
+                  f"{wall:.1f}s alone")
 
     # Save durations for future --slice runs. Each slice writes its own
     # partial test_durations.json; a CI merge step joins them later.
@@ -2039,13 +2432,43 @@ def main() -> int:
         repo_root=repo_root,
     )
 
-    if had_failures or noop_red:
-        return 1
+    final_rc = 1 if (had_failures or noop_red or no_tests_ran_at_all) else 0
+    if args.result_file:
+        _write_result_file(
+            Path(args.result_file), final_rc, bool(noop_red),
+            bool(no_tests_ran_at_all), file_rcs, all_summaries, repo_root,
+        )
+    return final_rc
 
-    if no_tests_ran_at_all:
-        return 1
 
-    return 0
+def _write_result_file(
+    path: Path,
+    runner_rc: int,
+    noop_red: bool,
+    no_tests_ran_at_all: bool,
+    file_rcs: Dict[Path, int],
+    all_summaries: List[Tuple[Path, Dict[str, int]]],
+    repo_root: Path,
+) -> None:
+    """Manifest the flake-quarantine verdict reads (schema 1)."""
+    timed_out = {f for f, s in all_summaries if s.get("timed_out")}
+    files = []
+    for f, rc in sorted(file_rcs.items(), key=lambda kv: str(kv[0])):
+        junit = _junit_path(f, repo_root)
+        files.append({
+            "path": _format_file(f, repo_root),
+            "rc": rc,
+            "timed_out": f in timed_out,
+            "junit": junit.name if junit is not None and junit.is_file() else None,
+        })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema": 1,
+        "runner_rc": runner_rc,
+        "noop_red": noop_red,
+        "no_tests_ran_at_all": no_tests_ran_at_all,
+        "files": files,
+    }, indent=1, sort_keys=True), encoding="utf-8")
 
 
 def _noop_guard(

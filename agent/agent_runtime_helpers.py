@@ -1815,29 +1815,10 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_index = 0
         return False
 
-    # Opt-out of automatic turn-scoped recovery (model.auto_recovery, default
-    # True = today's behavior). When set False, a session that fell back STAYS
-    # on the fallback across turns (sticky) instead of auto-restoring the
-    # primary — the user switches back manually via /model. This is a deliberate
-    # opt-in for a KNOWN-persistent primary problem (e.g. the current context
-    # keeps tripping the primary's safety filter), where auto-recovery would
-    # cold-rebuild the fallback's prompt cache every turn. Placed AFTER the
-    # no-fallback index-reset above (which must stay first/unconditional, #20465)
-    # and BEFORE the cooldown check, so a disabled toggle short-circuits the
-    # restore without touching index hygiene. Fails toward current behavior
-    # (default True) on any config-read error.
-    _auto_recovery = True
-    try:
-        from hermes_cli.config import read_raw_config
-        _raw = read_raw_config() or {}
-        _mcfg = _raw.get("model", {}) if isinstance(_raw, dict) else {}
-        _auto_recovery = bool(_mcfg.get("auto_recovery", True))
-    except Exception:
-        pass  # config read failure → default-on (restore, current behavior)
-    if not _auto_recovery:
-        return False  # sticky fallback: stay on the fallback this turn
-
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+        from agent import fallback_events as _fbe
+
+        _fbe.record_restore_refused(agent, "cooldown")
         return False  # primary still in rate-limit cooldown, stay on fallback
 
     # ── Reset-aware gate ──
@@ -1907,6 +1888,9 @@ def restore_primary_runtime(agent) -> bool:
                     agent.provider,
                     agent.model,
                 )
+            from agent import fallback_events as _fbe
+
+            _fbe.record_restore_refused(agent, "pool_reset_pending")
             return False
     except Exception:
         logger.debug(
@@ -2187,6 +2171,15 @@ def restore_primary_runtime(agent) -> bool:
                     old_effort=_old_reasoning_config,
                     new_effort=getattr(agent, "reasoning_config", None),
                 )
+                from agent import fallback_events as _fbe
+
+                _fbe.record(
+                    agent, "recovery",
+                    from_provider=_from_provider, from_model=_from_model,
+                    to_provider=_to_route[0], to_model=_to_route[1],
+                    consume=False,
+                )
+                agent._fallback_restore_refused_logged = False
                 _rec_announce = False
                 try:
                     from hermes_cli.config import read_raw_config

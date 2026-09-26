@@ -833,7 +833,7 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
         if issues is not None:
             issues.append(
                 "Repair the CA bundle: run `hermes doctor --fix`, or "
-                f"`{hint_value(sys.executable)} -m pip install --force-reinstall certifi`"
+                f"`{sys.executable} -m pip install --force-reinstall certifi`"
             )
         return
 
@@ -1355,13 +1355,6 @@ def run_doctor(args):
     
     _section("Python Environment")
     py_version = sys.version_info
-    # Surface the ABSOLUTE interpreter path, not just the version. Agents and
-    # scripts writing a cron/launchd job need the canonical runtime interpreter
-    # and otherwise guess it from an old layout (`~/.hermes/venv/bin/python` is a
-    # common stale guess that does not exist), then debug a missing-path error.
-    # `sys.executable` is authoritative: it is the interpreter doctor is running
-    # under, which is by construction the one the CLI uses.
-    check_ok(f"Interpreter: {sys.executable}")
     if py_version >= (3, 11):
         check_ok(f"Python {py_version.major}.{py_version.minor}.{py_version.micro}")
     elif py_version >= (3, 10):
@@ -1918,24 +1911,6 @@ def run_doctor(args):
             )
     except Exception as _xai_check_err:
         check_warn("xAI retirement check skipped", f"({_xai_check_err})")
-
-    # fN provider-alias collision lint (A4 C-2): surface an accidental
-    # duplicate provider name/alias/base_url/env-key — the copy-paste drift
-    # that silently shadows a real failover lane. Edge-triggered: silent when
-    # the registry is clean (no per-boot spam), loud naming both plugins on a
-    # real collision. Does NOT change routing — pure observability.
-    try:
-        from providers import lint_provider_collisions
-
-        _collisions = lint_provider_collisions(emit_log=False)
-        if _collisions:
-            for _c in _collisions:
-                check_warn("Provider collision", _c)
-                manual_issues.append(f"Provider collision: {_c}")
-        else:
-            check_ok("Provider aliases", "(no name/alias/base_url/env-key collisions)")
-    except Exception as _coll_err:
-        check_warn("Provider collision lint", f"(could not check: {_coll_err})")
 
     _section("Auth Providers")
 

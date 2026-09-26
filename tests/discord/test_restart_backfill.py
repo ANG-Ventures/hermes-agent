@@ -568,6 +568,50 @@ async def test_backfill_thread_scoped_to_thread(_tmp_home):
 
 
 @pytest.mark.asyncio
+async def test_straggler_write_from_prior_owner_does_not_double_dispatch(tmp_path, monkeypatch):
+    """t_3d510cad regression: CI flaked with ``[70012, 70012] == [70012]`` and
+    ``[70080, 70080] == [70080]``. Cause: a restart-recovery state owned by an
+    EARLIER test wrote its active_channels map late, after HERMES_HOME had
+    moved to the next test's home; that test's state then loaded a foreign
+    channel id, and because these fakes resolve ANY channel id to the one
+    fake channel, the sweep scanned it twice and dispatched its message twice.
+
+    Forces that interleaving deterministically: owner A marks a channel, the
+    home moves to B, then A's writer flushes (the straggler). The adapter built
+    in B must see only its own channel and dispatch the message exactly once.
+    Fixed at the writer (path resolved at construction, #1197 / t_73d1988f).
+    """
+    from plugins.platforms.discord.adapter import _DiscordRestartRecoveryState
+
+    home_a = tmp_path / "home_a"
+    home_b = tmp_path / "home_b"
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    prior = _DiscordRestartRecoveryState(persist_interval_s=0.0)
+    try:
+        prior.mark_channel_active("987777")  # a channel only owner A knows
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        prior.flush()  # the late write, after the home has moved
+
+        adapter, store, db = _build_adapter_with_store(home_b)
+        author = _FakeAuthor(11111)
+        channel = _FakeChannel(987778, [])
+        channel._messages = [_make_msg(70090, author, channel, content="once")]
+        _seed_session_for_channel(adapter, store, db, channel, author)
+        adapter._restart_recovery.mark_channel_active(str(channel.id))
+        adapter._client = SimpleNamespace(
+            user=_FakeAuthor(99999, "bot", bot=True),
+            get_channel=lambda _id: channel,  # any id -> this channel, as in the flaky tests
+            fetch_channel=AsyncMock(return_value=channel),
+        )
+
+        assert adapter._restart_recovery.recent_channels(900.0) == [str(channel.id)]
+        await adapter._backfill_missed_messages()
+        assert [m.id for m in adapter._dispatched] == [70090]
+    finally:
+        prior._writer.close(flush=False)
+
+
+@pytest.mark.asyncio
 async def test_backfill_no_session_store_skips_entirely(_tmp_home):
     """Greptile P2 / INV-9: with no session store wired, the transcript
     authority is entirely unavailable — the sweep must recover NOTHING (fail

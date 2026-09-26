@@ -631,41 +631,6 @@ def _remove_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwarg
     return json.dumps({"success": True, "message": f"Role {role_id} removed from user {user_id}."})
 
 
-def _react(
-    token: str, channel_id: str, message_id: str, emoji: str,
-    remove: bool = False, **_kwargs: Any,
-) -> str:
-    """Add (or with ``remove=True`` retract) the bot's OWN emoji reaction on a message.
-
-    ``emoji`` is a Unicode emoji (e.g. ``✅``) or a custom emoji as ``name:id``.
-    Discord returns 204 for both add and remove; ``_discord_request`` raises
-    ``DiscordAPIError`` on any non-2xx, so the success line below is reached
-    only on a genuine success (never fabricated).
-    """
-    if not emoji:
-        return json.dumps({"error": "Missing required parameter for 'react': emoji"})
-    # URL-encode the whole emoji token (encodes ':' -> %3A for custom name:id,
-    # '#' -> %23, and every UTF-8 byte for Unicode emoji) so the reaction path
-    # is never corrupted.
-    enc = urllib.parse.quote(emoji, safe="")
-    method = "DELETE" if remove else "PUT"
-    _discord_request(
-        method, f"/channels/{channel_id}/messages/{message_id}/reactions/{enc}/@me", token,
-    )
-    verb = "Removed" if remove else "Added"
-    return json.dumps({
-        "success": True,
-        "message": f"{verb} reaction {emoji} on message {message_id}.",
-    })
-
-
-def _unreact(
-    token: str, channel_id: str, message_id: str, emoji: str, **_kwargs: Any,
-) -> str:
-    """Remove the bot's OWN emoji reaction from a message."""
-    return _react(token, channel_id, message_id, emoji, remove=True)
-
-
 # ---------------------------------------------------------------------------
 # Action dispatch + metadata
 # ---------------------------------------------------------------------------
@@ -686,11 +651,9 @@ _ACTIONS = {
     "create_thread": _create_thread,
     "add_role": _add_role,
     "remove_role": _remove_role,
-    "react": _react,
-    "unreact": _unreact,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread", "react", "unreact"})
+_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -713,8 +676,6 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
-    ("react", "(channel_id, message_id, emoji)", "add an emoji reaction to a message"),
-    ("unreact", "(channel_id, message_id, emoji)", "remove the bot's OWN emoji reaction from a message"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -736,8 +697,6 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
     "create_thread": ["channel_id", "name"],
-    "react": ["channel_id", "message_id", "emoji"],
-    "unreact": ["channel_id", "message_id", "emoji"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
 }
@@ -921,13 +880,6 @@ def _build_schema(
                 "(create_thread, default 10080 = Discord max)."
             ),
         },
-        "emoji": {
-            "type": "string",
-            "description": (
-                "Emoji for react/unreact: a Unicode emoji (e.g. ✅) or a custom "
-                "emoji as 'name:id'."
-            ),
-        },
     }
 
     return {
@@ -988,13 +940,6 @@ _ACTION_403_HINT = {
     ),
     "create_thread": (
         "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it."
-    ),
-    "react": (
-        "Bot needs ADD_REACTIONS and READ_MESSAGE_HISTORY in this channel."
-    ),
-    "unreact": (
-        "Bot needs READ_MESSAGE_HISTORY in this channel (removing its own "
-        "reaction does not require ADD_REACTIONS)."
     ),
     "add_role": (
         "Either the bot lacks MANAGE_ROLES, or the target role sits higher "
@@ -1062,7 +1007,6 @@ def _run_discord_action(
     before: str = "",
     after: str = "",
     auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
-    emoji: str = "",
 ) -> str:
     """Shared handler logic for both discord tools."""
     token = _get_bot_token()
@@ -1094,7 +1038,6 @@ def _run_discord_action(
         "message_id": message_id,
         "query": query,
         "name": name,
-        "emoji": emoji,
     }
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
@@ -1117,7 +1060,6 @@ def _run_discord_action(
             before=before,
             after=after,
             auto_archive_duration=auto_archive_duration,
-            emoji=emoji,
         )
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)
@@ -1148,7 +1090,6 @@ _HANDLER_DEFAULTS = {
     "role_id": "", "message_id": "", "query": "", "name": "",
     "limit": 50, "before": "", "after": "",
     "auto_archive_duration": DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
-    "emoji": "",
 }
 
 

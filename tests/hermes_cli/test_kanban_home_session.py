@@ -187,7 +187,7 @@ def test_foreign_ok_allows_and_leaves_audit_comment(kanban_home):
         assert kb.get_task(conn, tid).status != "blocked"
         assert _comments(conn, tid) == [
             f"takeover: foreign-session action by {OTHER} (apollo): "
-            "home session is gone [unblock]"
+            f"home session is gone [unblock] -- card re-homed to {OTHER}"
         ]
 
 
@@ -642,12 +642,18 @@ def test_run_slash_session_does_not_leak(kanban_home):
 # --- contract: ONE choke point -------------------------------------------
 
 import ast as _ast
+import functools
 import re as _re
 
 # Writers of tasks.status/assignee/priority/session_id or dispatch-intent
 # events that are NOT guarded, each with the reason it is execution lane.
 EXECUTION_LANE = {
     "_migrate_add_optional_columns": "schema migration at connect time",
+    "record_foreign_action": (
+        "callers: _home_session_guarded's wrapper ONLY, after check_home_session "
+        "returned an explicit --takeover/foreign_ok override for this card and "
+        "the guarded mutation succeeded. Re-homes session_id to the taker "
+        "(t_5c908e14); the takeover itself already passed the guard"),
     "backfill_unhomed": (
         "callers: `kanban home-lint --backfill` (operator/cron). Writes ONLY "
         "rows whose session_id IS NULL/empty (WHERE-clause re-checked in the "
@@ -698,13 +704,18 @@ def _module_src(mod):
     return Path(mod.__file__).read_text(encoding="utf-8")
 
 
+@functools.lru_cache(maxsize=None)
 def _writers():
+    # Slice pre-split lines instead of ast.get_source_segment: that call
+    # re-splits the whole ~1 MB kanban_db.py once per function (quadratic),
+    # which cost ~70s per scan and pushed this file past the CI per-file wall.
     src = _module_src(kb)
+    lines = src.split("\n")
     out = {}
     for node in _ast.parse(src).body:
         if not isinstance(node, _ast.FunctionDef):
             continue
-        seg = _ast.get_source_segment(src, node) or ""
+        seg = "\n".join(lines[node.lineno - 1:node.end_lineno])
         dispatch_intent = any(
             isinstance(call, _ast.Call)
             and isinstance(call.func, _ast.Name)
@@ -1002,3 +1013,147 @@ def test_cli_operator_flag(kanban_home, monkeypatch):
         kinds = [e.kind for e in kb.list_events(conn, tid)]
         assert "operator_override" in kinds and "takeover" not in kinds
         assert _comments(conn, tid) == []
+
+
+# --- t_5c908e14: --takeover re-homes; explicit --session beats parent ---
+
+
+@pytest.mark.parametrize("verb,mutate", [
+    ("unblock", lambda c, t: kb.unblock_task(c, t)),
+    ("assign", lambda c, t: kb.assign_task(c, t, "someone-else")),
+])
+def test_takeover_rehomes_card_and_records_prev(kanban_home, verb, mutate):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="home chat is dead"):
+            assert mutate(conn, tid)
+        assert kb.get_task(conn, tid).session_id == OTHER
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "takeover"]
+        assert len(ev) == 1
+        assert ev[0].payload["prev_session_id"] == HOME
+        assert ev[0].payload["session_id"] == OTHER
+        # the taker now owns it: a follow-up needs no override
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo"):
+            kb.set_task_model(conn, tid, "m")
+
+
+def test_takeover_on_non_adopting_verb_does_not_rehome(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="one-off"):
+            assert kb.set_task_model(conn, tid, "m")
+        assert kb.get_task(conn, tid).session_id == HOME
+
+
+def test_complete_takeover_does_not_rehome(kanban_home):
+    # complete is terminal: re-homing a finished card only moves it between
+    # conversations' counts (mq-review-card-closer runs complete --takeover).
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="MQ landing confirmed"):
+            assert kb.complete_task(conn, tid, result="x")
+        assert kb.get_task(conn, tid).session_id == HOME
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "takeover"]
+        assert len(ev) == 1 and "prev_session_id" not in ev[0].payload
+
+
+def test_cron_actor_takeover_does_not_rehome(kanban_home):
+    # Sweeps never re-home: a cron_* session adopting would pull the card out
+    # of its home conversation and route pings nowhere. The takeover event
+    # still records the actor.
+    cron_sid = "cron_1cd274c546db_20260925_205000"
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(cron_sid,), profile="default",
+                               foreign_ok="sweep"):
+            assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).session_id == HOME
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "takeover"]
+        assert len(ev) == 1
+        assert ev[0].payload["by_sessions"] == [cron_sid]
+        assert "prev_session_id" not in ev[0].payload
+
+
+def test_operator_override_does_not_rehome(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_actor_profiles", lambda actor: {"aegis"})
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="aegis",
+                               operator="Ace via Aegis: ruled (a)"):
+            assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).session_id == HOME
+
+
+def test_takeover_resubscribes_taker_chat(kanban_home, monkeypatch):
+    calls = []
+    import tools.kanban_tools as kt
+    monkeypatch.setattr(kt, "subscribe_calling_session",
+                        lambda conn, task_id, **kw: calls.append(task_id) or True)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="adopt"):
+            assert kb.unblock_task(conn, tid)
+    assert calls == [tid]
+
+
+def test_takeover_notify_list_shows_taker_chat(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "#sub-vps-n")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "1550")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="adopt"):
+            assert kb.unblock_task(conn, tid)
+        subs = kb.list_notify_subs(conn, tid)
+    assert [s["chat_id"] for s in subs] == ["1550"]
+
+
+def test_child_created_after_takeover_follows_new_home(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, session_id=HOME)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="adopt"):
+            assert kb.unblock_task(conn, tid)
+        kid = kb.create_task(conn, title="kid", assignee="w", parents=(tid,))
+        assert kb.get_task(conn, kid).session_id == OTHER
+
+
+def test_explicit_session_beats_parent_home(kanban_home):
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="root", assignee="w", session_id=HOME)
+        kid = kb.create_task(conn, title="kid", assignee="w", parents=(root,),
+                             session_id=OTHER, session_explicit=True)
+        t = kb.get_task(conn, kid)
+        assert t.session_id == OTHER
+        assert f"session {OTHER}" in t.body.splitlines()[0]
+        # defaulted (non-explicit) caller session still defers to the parent
+        kid2 = kb.create_task(conn, title="kid2", assignee="w", parents=(root,),
+                              session_id=OTHER)
+        assert kb.get_task(conn, kid2).session_id == HOME
+
+
+def test_cli_create_session_flag_beats_parent(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="root", assignee="w", session_id=HOME)
+    out = kc.run_slash(f"create kid --parent {root} --session {OTHER} --json")
+    kid = json.loads(out[out.index("{"):])["id"]
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    out2 = kc.run_slash(f"create kid2 --parent {root} --json")
+    kid2 = json.loads(out2[out2.index("{"):])["id"]
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, kid).session_id == OTHER
+        assert kb.get_task(conn, kid2).session_id == HOME
+
+
+def test_cli_create_writes_origin_line_when_body_omits_it(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    out = kc.run_slash("create 'no origin here' --body 'just work' --json")
+    tid = json.loads(out[out.index("{"):])["id"]
+    with kb.connect_closing() as conn:
+        first = kb.get_task(conn, tid).body.splitlines()[0]
+    assert first.startswith("origin: ") and f"session {HOME}" in first

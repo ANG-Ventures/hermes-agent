@@ -20,7 +20,7 @@ import yaml
 from scripts.ci_overflow_placement import (PlanInvalid, gate, poll, summary_markdown, validate_record,
                                            write_outputs)
 from scripts.ci_overflow_plan import ARM, POOL, X64, parse_request
-from scripts.ci_overflow_request import build_request, local_matrix
+from scripts.ci_overflow_request import build_request, local_matrix, static_matrix
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -207,7 +207,10 @@ def _ctx(event, placement, runner_labels, enabled=False):
                                                        "CI_OVERFLOW_PLACEMENT_ENABLED": "true" if enabled else ""},
             "needs": {"generate": {"result": "success",
                                    "outputs": {"matrix": json.dumps(GEN_MATRIX),
-                                               "local_matrix": json.dumps(local_matrix(GEN_MATRIX)) if event == "merge_group" and enabled else ""}},
+                                               # not a real output any more (placement's INPUT artifact
+                                               # only); kept here so a local_matrix-fallback mutant
+                                               # selects the wrong matrix instead of erroring.
+                                               "local_matrix": json.dumps(local_matrix(GEN_MATRIX))}},
                       "placement": placement}}
 
 
@@ -225,7 +228,6 @@ def _job_runs(job: dict, ctx: dict) -> bool:
 def check_fallback(doc: dict) -> list[str]:
     """Every placement outcome × event: test/e2e run, on the right matrix/labels."""
     jobs, errors = doc["jobs"], []
-    local = json.dumps(local_matrix(GEN_MATRIX))
     for event in ("pull_request", "push", "merge_group"):
         for enabled in (False, True):
             for outcome, placement in PLACEMENT_OUTCOMES.items():
@@ -255,7 +257,10 @@ def check_fallback(doc: dict) -> list[str]:
                     elif outcome == "valid":
                         want, want_e2e = PLACED, X64
                     else:
-                        want, want_e2e = json.loads(local), POOL
+                        # No validated plan: the STATIC split (CI_RUNNER_LABELS +
+                        # CI_SELF_HOSTED_SLOTS), never all-local. Measured 2026-09-25
+                        # 23:23Z: all-local fallback put 9 slices on a drained pool.
+                        want, want_e2e = static_matrix(GEN_MATRIX), legacy_e2e
                     if matrix != want:
                         errors.append(f"{where}: wrong matrix selected")
                     if e2e != want_e2e:
@@ -300,29 +305,56 @@ def test_mutating_attempt_binding_out_fails_integration(site):
         expr = doc["jobs"]["e2e"]["runs-on"]
         assert clause in expr
         doc["jobs"]["e2e"]["runs-on"] = expr.replace(clause, "")
-        want = "reused-prior-attempt/labels=None: e2e runs-on"
+        # labels unset: plan X64 == static ubuntu-latest, so the mutant shows on the self-hosted variant
+        want = 'reused-prior-attempt/labels=["self-hosted","hermes-ci"]: e2e runs-on'
     assert any(want in e for e in check_fallback(doc)), check_fallback(doc)
 
 
-def test_mutating_managed_fallback_to_legacy_matrix_fails_integration():
+def test_mutating_no_plan_fallback_to_local_matrix_fails_integration():
+    """t_42bed567 mutant: a no-plan merge_group falling back to all-local must go RED."""
     doc = _tests_yml()
-    doc["jobs"]["test"]["strategy"]["matrix"] = doc["jobs"]["test"]["strategy"]["matrix"].replace(
-        "needs.generate.outputs.local_matrix", "needs.generate.outputs.matrix")
-    assert any("wrong matrix" in e for e in check_fallback(doc))
+    expr = doc["jobs"]["test"]["strategy"]["matrix"]
+    tail = "|| needs.generate.outputs.matrix) }}"
+    assert expr.rstrip().endswith(tail)
+    doc["jobs"]["test"]["strategy"]["matrix"] = expr.rstrip()[:-len(tail)] + "|| needs.generate.outputs.local_matrix) }}"
+    assert any("invalid/labels=None: wrong matrix" in e for e in check_fallback(doc)), check_fallback(doc)
+
+
+def test_mutating_no_plan_e2e_fallback_to_local_pool_fails_integration():
+    doc = _tests_yml()
+    expr = doc["jobs"]["e2e"]["runs-on"]
+    static_tail = "|| '[\"ubuntu-latest\"]')) }}"
+    assert expr.rstrip().endswith(static_tail)
+    doc["jobs"]["e2e"]["runs-on"] = (expr.rstrip()[:-len(static_tail)]
+                                     + "|| '[\"ubuntu-latest\"]') && '[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]') }}")
+    assert any("invalid/labels=None: e2e runs-on" in e for e in check_fallback(doc)), check_fallback(doc)
+
+
+def test_no_plan_fallback_honours_runner_labels_and_slots():
+    """No plan + placement enabled: every slice's runs_on is the generator's static split."""
+    split = {"slice": [{"index": i, "name": f"slice {i}/4", "files": f"tests/t{i}.py",
+                        "runs_on": '["self-hosted","hermes-ci"]' if i <= 2 else '["ubuntu-latest"]'}
+                       for i in (1, 2, 3, 4)]}
+    jobs = _tests_yml()["jobs"]
+    status = {"always": True, "cancelled": False, "failure": False, "success": True}
+    for outcome in ("invalid", "failure", "timeout", "reused-prior-attempt", "failure-continue-on-error"):
+        ctx = _ctx("merge_group", copy.deepcopy(PLACEMENT_OUTCOMES[outcome]), '["self-hosted","hermes-ci"]', True)
+        ctx["needs"]["generate"]["outputs"]["matrix"] = json.dumps(split)
+        got = evaluate(jobs["test"]["strategy"]["matrix"], ctx, status)
+        assert [r["runs_on"] for r in got["slice"]] == [r["runs_on"] for r in split["slice"]], outcome
+        assert evaluate(jobs["e2e"]["runs-on"], ctx, status) == ["self-hosted", "hermes-ci", "X64"], outcome
 
 
 def test_static_routing_switch_mutation_fails_integration():
     doc = _tests_yml()
     doc["jobs"]["placement"]["if"] = "github.event_name == 'merge_group'"
     assert any("placement ran unexpectedly" in e for e in check_fallback(doc))
-    doc = _tests_yml()
-    doc["jobs"]["test"]["strategy"]["matrix"] = doc["jobs"]["test"]["strategy"]["matrix"].replace(
-        " || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true'", "")
-    assert any("missing/empty" in e for e in check_fallback(doc))
-    doc = _tests_yml()
-    doc["jobs"]["e2e"]["runs-on"] = doc["jobs"]["e2e"]["runs-on"].replace(
-        " || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true'", "")
-    assert any("e2e runs-on" in e for e in check_fallback(doc))
+    # The consumer-side switch clauses are defence in depth only: with the no-plan
+    # fallback now equal to the static split (t_42bed567), removing them is an
+    # equivalent mutant while placement.if holds, so they are asserted present.
+    jobs = _tests_yml()["jobs"]
+    assert "vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true'" in jobs["test"]["strategy"]["matrix"]
+    assert "vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'" in jobs["e2e"]["runs-on"]
 
 
 def test_if_predicates_exact():
@@ -346,13 +378,15 @@ def test_placement_job_shape_and_permissions_exact():
 
 def test_generate_emits_local_matrix_and_request_artifact():
     gen = _tests_yml()["jobs"]["generate"]
-    assert {"matrix", "local_matrix", "request_digest"} <= set(gen["outputs"])
+    assert {"matrix", "request_digest"} <= set(gen["outputs"])
+    # local_matrix is placement's INPUT artifact only, never a job output a consumer could fall back to.
+    assert "local_matrix" not in gen["outputs"]
     upload = next(s for s in gen["steps"] if s.get("id") == "request")
     assert upload["with"]["name"] == "ci-overflow-request-${{ github.run_id }}-${{ github.run_attempt }}"
     assert upload["with"]["path"] == "ci-overflow/request.json"
     step = next(s for s in gen["steps"] if s.get("id") == "overflow")
     assert step["env"]["MANAGED_PLACEMENT"] == "${{ vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' }}"
-    assert 'if [[ "$EVENT_NAME" == "merge_group" && "$MANAGED_PLACEMENT" == "true" ]]' in step["run"]
+    assert "GITHUB_OUTPUT" not in step["run"]
     local_upload = next(s for s in gen["steps"] if s.get("name") == "Upload local matrix for placement")
     assert local_upload["if"] == _tests_yml()["jobs"]["placement"]["if"]
 
@@ -370,8 +404,10 @@ def test_generate_step_emits_local_output_only_on_managed_merge_group(tmp_path):
         proc = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=tmp_path, env=env,
                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
         assert proc.returncode == 0, proc.stderr
-        assert output.read_text().startswith("local_matrix=") == (event == "merge_group" and enabled == "true")
+        assert "local_matrix=" not in output.read_text()
         assert (tmp_path / "ci-overflow" / "request.json").exists()
+        assert (tmp_path / "ci-overflow" / "local_matrix.json").exists()
+        assert json.loads((tmp_path / "ci-overflow" / "static_matrix.json").read_text()) == GEN_MATRIX
 
 
 def test_static_merge_group_summary_reports_legacy_policy(tmp_path):
@@ -399,14 +435,33 @@ def test_matrices_never_travel_through_env():
                 assert "toJSON(needs" not in value, (key, value)  # measured E2BIG, run 35892732551
 
 
+def _refs(node) -> set[str]:
+    if node[0] == "ref":
+        return {node[1]}
+    if node[0] in ("lit",):
+        return set()
+    if node[0] == "not":
+        return _refs(node[1])
+    if node[0] == "call":
+        return set().union(*[_refs(a) for a in node[2]]) if node[2] else set()
+    return _refs(node[2]) | _refs(node[3])
+
+
 def test_fromjson_never_fed_a_possibly_missing_output():
-    """Every fromJSON over placement/local outputs is guarded or ends in a literal/total output."""
-    text = (WORKFLOWS / "tests.yml").read_text(encoding="utf-8")
-    for expr in re.findall(r"fromJSON\(([^()]*(?:\([^()]*\))*[^()]*)\)", text):
-        if "needs.placement.outputs" in expr:
-            assert "needs.placement.result == 'success'" in expr and "plan_valid == 'true'" in expr
-            assert "needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt)" in expr
-            assert expr.rstrip().endswith(("local_matrix", "'[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]'"))
+    """Each placement consumer is guarded, and its last `||` fallback is the static split: no
+    placement output, no local_matrix, no hard-coded local pool (t_42bed567)."""
+    jobs = _tests_yml()["jobs"]
+    for expr in (jobs["test"]["strategy"]["matrix"], jobs["e2e"]["runs-on"]):
+        assert "needs.placement.result == 'success'" in expr and "plan_valid == 'true'" in expr
+        assert "needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt)" in expr
+        assert "local_matrix" not in expr and "hermes-ci" not in expr
+        node = _Parser(expr.strip()[3:-2]).parse()
+        assert node[0] == "call" and node[1] == "fromJSON", expr
+        arg = node[2][0]
+        assert arg[0] == "op" and arg[1] == "||", expr
+        last = _refs(arg[3])
+        assert last and not any(r.startswith("needs.placement") for r in last), last
+        assert last <= {"needs.generate.outputs.matrix", "vars.CI_RUNNER_LABELS"}, last
 
 
 def test_gate_cli_reads_results_from_env(tmp_path):
@@ -522,6 +577,8 @@ def test_local_matrix_membership_identical_real_generator(tmp_path, scope):
     local = json.loads((out / "local_matrix.json").read_text(encoding="utf-8"))
     assert _file_set(local) == _file_set(original)
     assert {row["runs_on"] for row in local["slice"]} == {json.dumps(POOL, separators=(",", ":"))}
+    # The no-plan fallback: generator's own split, labels untouched (K self-hosted + hosted spill).
+    assert json.loads((out / "static_matrix.json").read_text(encoding="utf-8")) == original
     raw = (out / "request.json").read_bytes()
     req = parse_request(raw)
     assert [s["job_id"] for s in req.slices] == [row["name"] for row in original["slice"]]
@@ -661,7 +718,7 @@ def test_place_without_digest_falls_back_without_network(tmp_path):
                           capture_output=True, text=True, timeout=60, cwd=ROOT)
     assert proc.returncode == 0, proc.stderr
     assert out.read_text(encoding="utf-8") == "plan_valid=false\n"
-    assert "local fallback" in summ.read_text(encoding="utf-8")
+    assert "static fallback" in summ.read_text(encoding="utf-8")
 
 
 def test_summary_table_columns():

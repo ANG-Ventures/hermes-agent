@@ -40,6 +40,22 @@ def board(tmp_path, monkeypatch):
     return tid, run_id
 
 
+@pytest.fixture(autouse=True)
+def _fresh_card_pin_cache():
+    from hermes_cli import kanban_worker_route
+
+    kanban_worker_route._card_pin_cache.clear()
+    yield
+    kanban_worker_route._card_pin_cache.clear()
+
+
+def _unpin_card(tid):
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET model_override=NULL, provider_override=NULL WHERE id=?",
+                     (tid,))
+        conn.commit()
+
+
 def _events(tid, kind):
     with kb.connect_closing() as conn:
         return [(r[0], json.loads(r[1])) for r in conn.execute(
@@ -194,3 +210,38 @@ def test_runtime_failover_is_recorded_on_the_run(board, tmp_path):
     assert [r for r, _ in sub] == [run_id]
     assert sub[0][1]["stage"] == "runtime"
     assert (sub[0][1]["from_provider"], sub[0][1]["to_provider"]) == ("claude-apr", "claude-apx-1")
+
+
+def test_lane_override_worker_keeps_auth_fallback(board, monkeypatch):
+    """t_16642ede: a board-wide lane override spawns ``--provider`` but never
+    writes it to the card, so it is not a pin: a failing primary auth still
+    falls back, and the swap is recorded on the run."""
+    tid, run_id = board
+    _unpin_card(tid)
+    calls = []
+    _resolver(monkeypatch, fail={"openai-codex"}, calls=calls)
+    cli = _CLI("openai-codex")  # --provider from the lane override
+
+    assert cli._ensure_runtime_credentials() is True
+    assert calls == ["openai-codex", "claude-bpr"]
+    assert cli.provider == "claude-bpr"
+    assert cli._kanban_pin_rate_limited is None
+    assert _events(tid, "worker_route_pin_refused") == []
+    sub = _events(tid, "worker_route_substituted")
+    assert [r for r, _ in sub] == [run_id]
+    assert (sub[0][1]["stage"], sub[0][1]["from_provider"], sub[0][1]["to_provider"]) == (
+        "auth", "openai-codex", "claude-bpr")
+
+
+def test_dispatch_rung_off_the_card_pin_keeps_auth_fallback(board, monkeypatch):
+    """A capped-pool rung that spawned the card on a provider other than its
+    pin is already off the pin; like the runtime check, it keeps fallback."""
+    tid, run_id = board  # card pins openai-codex
+    calls = []
+    _resolver(monkeypatch, fail={"claude-apr"}, calls=calls)
+    cli = _CLI("claude-apr")  # --provider from the dispatch fallback rung
+
+    assert cli._ensure_runtime_credentials() is True
+    assert cli.provider == "claude-bpr"
+    assert _events(tid, "worker_route_pin_refused") == []
+    assert [r for r, _ in _events(tid, "worker_route_substituted")] == [run_id]

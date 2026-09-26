@@ -73,7 +73,6 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
-from hermes_cli.cli_hint import hint_value
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from gateway.fork_ext.restart_codec import (
@@ -843,6 +842,18 @@ def _non_conversational_metadata(
     merged = dict(metadata or {})
     merged["non_conversational"] = True
     return merged
+
+
+def _final_send_duplicate_risk(consumer: Any) -> bool:
+    """True when an unsuppressed normal final-send could DUPLICATE a reply.
+
+    Only a stream consumer that itself sent or edited response text
+    (``already_sent``) can have put a copy of the final reply in the chat.
+    Interim commentary deliberately never sets ``already_sent`` (#10454), so an
+    interim-only consumer (platform streaming off) cannot produce a duplicate:
+    the gateway's normal send is the only copy of the final text.
+    """
+    return consumer is not None and bool(getattr(consumer, "already_sent", False))
 
 
 def _interim_metadata(
@@ -4574,7 +4585,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
                 install_path = f"official/{'/'.join(parts)}"
                 return (
                     f"The **{command_name}** skill is available but not installed.\n"
-                    f"Install it with: `hermes skills install {hint_value(install_path)}`"
+                    f"Install it with: `hermes skills install {install_path}`"
                 )
     except Exception:
         pass
@@ -7357,6 +7368,9 @@ class TurnRunner:
         # history and attached to the current addressed message as
         # API-only context, so persisted history stores only the real
         # addressed user turn.
+        # Idle-compaction gap anchor (cached + rebuilt agents): must use the
+        # RAW transcript — _build_gateway_agent_history drops most timestamps.
+        self._runner._stamp_idle_gap_anchor(agent, ctx.history, ctx._interrupt_depth)
         agent_history, observed_group_context = _build_gateway_agent_history(
             ctx.history,
             channel_prompt=ctx.channel_prompt,
@@ -7588,25 +7602,6 @@ class TurnRunner:
                 getattr(_resume_entry, "last_resume_marked_at", None),
                 window_secs=_freshness_window,
             )
-        # 🔴 Defensive reset (pass-2 B1): clear any stale suppress flag from
-        # a PRIOR turn before this turn can set it. A cached/reused agent can
-        # carry _suppress_user_turn_persist=True if a prior resume turn set it
-        # then aborted before build_turn_context consumed it — which would
-        # wrongly drop THIS turn's (possibly real) user row. Reset every turn
-        # so the flag only ever reflects the current turn's resume-pending
-        # decision below.
-        #
-        # Parity note (2026-08-08): upstream has no reference to this flag in
-        # gateway/run.py (it consumes-once inside agent/turn_context.py), so
-        # the merge took upstream's side here and silently dropped the fork's
-        # per-turn reset. turn_context's own docstring still promises "the
-        # gateway additionally resets it at the top of every turn so it never
-        # carries across turns" — consume-once alone does NOT give that: an
-        # aborted resume turn leaves the flag set with nothing to consume it.
-        try:
-            agent._suppress_user_turn_persist = False
-        except Exception:
-            pass
         _is_resume_pending = bool(
             _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
@@ -7626,41 +7621,6 @@ class TurnRunner:
         if _is_resume_pending:
             _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
             _persist_user_message_override = ctx.message
-            # An internal auto-resume continuation with no real user text (the
-            # MessageEvent text="" internal=True trigger — the ONLY path that
-            # produces an empty resume-pending turn) must NOT persist an empty
-            # user row: it pollutes the transcript, breaks role alternation,
-            # and is what /undo lands on as "(no text)". Flag the agent so
-            # build_turn_context stamps the user row ephemeral and the flush
-            # drops it. A resume turn carrying REAL queued user text has
-            # non-empty ``ctx.message`` here, so it still persists (I2). The
-            # model still receives the resume prompt built below (I1).
-            #
-            # Parity note (2026-08-08): upstream has no reference to
-            # _suppress_user_turn_persist in gateway/run.py, so the merge
-            # dropped BOTH halves of the fork's suppression (this set and the
-            # per-turn defensive reset above). agent/turn_context.py still
-            # consumes the flag and its docstring still promises the gateway
-            # sets/resets it — restored here against upstream's ctx shape.
-            if not str(ctx.message or "").strip():
-                # Belt-and-suspenders (pass-1 B1): flag the row ephemeral AND
-                # keep the override forced to empty text, so if the ephemeral
-                # stamp ever misses the persisted row degrades to a benign
-                # EMPTY row — never to a resume-prompt-shaped fake user
-                # message (ctx.message is reassigned to the prompt just below).
-                _persist_user_message_override = ""
-                try:
-                    agent._suppress_user_turn_persist = True
-                    logger.info(
-                        "resume: suppressing empty internal-resume user row "
-                        "for %s (reason=%s) — not persisting an empty user turn",
-                        ctx.session_key, _reason,
-                    )
-                except Exception:
-                    logger.debug(
-                        "resume: could not flag empty-resume user-row suppression",
-                        exc_info=True,
-                    )
             # The empty-message case is the auto-resume startup turn
             # synthesized by _schedule_resume_pending_sessions — there is
             # no NEW user message to address.  Guidance is adapter-aware:
@@ -11031,53 +10991,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return pending_event
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
-        """Total pending /queue items for a session — slot + overflow.
-
-        Counts EVERY queued event, synthetic ones included. This is the
-        resource-accounting number: it backs the ``_BUSY_QUEUE_MAX_PENDING``
-        cap, where a synthetic wake occupies a slot exactly like a user
-        message does. For the number shown to a human, use
-        ``_user_queue_depth`` — see the docstring there.
-        """
+        """Total pending /queue items for a session — slot + overflow."""
         _q_state = self._peek_session_state(session_key)
         depth = len(_q_state.conversation.queued_events) if _q_state else 0
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
-        return depth
-
-    @classmethod
-    def _is_user_queued_event(cls, event: Any) -> bool:
-        """Whether a queued event represents a message the USER sent.
-
-        Synthetic turns share the FIFO with real user messages:
-        ``internal=True`` events (kanban completion wakes, auto-resume
-        continuations, plugin-injected turns) and ``/goal`` continuations.
-        They must occupy queue slots — but they are not something the user
-        typed, so they must not be counted in a user-facing total.
-        """
-        if event is None:
-            return False
-        if getattr(event, "internal", False):
-            return False
-        if cls._is_goal_continuation_event(event):
-            return False
-        return True
-
-    def _user_queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
-        """Pending queue items the USER actually sent — slot + overflow.
-
-        The user-facing counterpart to ``_queue_depth``. ``/queue`` reports
-        this one so a single ``/queue`` issued while a kanban wake (or any
-        other synthetic turn) is already parked doesn't tell the user they
-        queued two things (#queue-depth-overcount).
-        """
-        _q_state = self._peek_session_state(session_key)
-        overflow = _q_state.conversation.queued_events if _q_state else []
-        depth = sum(1 for ev in overflow if self._is_user_queued_event(ev))
-        if adapter is not None:
-            pending_slot = getattr(adapter, "_pending_messages", {}) or {}
-            if self._is_user_queued_event(pending_slot.get(session_key)):
-                depth += 1
         return depth
 
     @staticmethod
@@ -14354,6 +14272,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     old_effort=old_effort,
                     new_effort=new_effort,
                 )
+                from agent import fallback_events as _fbe
+
+                _fbe.record(
+                    agent, "recovery",
+                    from_provider=prev_route[0], from_model=prev_route[1],
+                    to_provider=applied_provider, to_model=applied_model,
+                    consume=False,
+                )
                 announce = False
                 try:
                     from hermes_cli.config import read_raw_config
@@ -16017,11 +15943,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         every existing routing/freshness/authorization gate passes.
         """
         self._auto_resume_decisions = {}
-        self._reconcile_deferred_restarts_at_boot()
+        await asyncio.to_thread(self._reconcile_deferred_restarts_at_boot)
         # The finished-work check is mode-independent: a bystander resume costs
         # a full LLM turn in prompt mode exactly as it does in auto mode, so it
         # must run before the auto-only early return below.
-        self._sweep_resume_requests()
+        await asyncio.to_thread(self._sweep_resume_requests)
         await self._prepare_boot_resume_work_check(platform=platform)
         if _resume_interrupted_turns_mode() not in _RESUME_UNATTENDED_MODES:
             return 0
@@ -17306,19 +17232,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gateway import restart_loop_guard as _rlg
 
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                # 2026-09-22: the per-runner ``_restart_loop_guard_recorded_this_boot``
-                # flag that used to gate this call lived on the GatewayRunner
-                # instance, so it only deduplicated scans routed through this one
-                # object and never reached the on-disk ledger. The guard itself now
-                # records at most once per process boot identity, which covers every
-                # caller and makes restart_loop.json forensically honest. Keeping the
-                # instance flag as well double-suppressed the scans: the module-layer
-                # dedupe became untestable through this path (removing it left the
-                # regression test green). Call the guard unconditionally and let it
-                # own the dedupe.
-                _tripped = _rlg.check_and_record(
-                    _max_restarts, _window, max_gap_seconds=_max_gap
-                )
+                if not getattr(self, "_restart_loop_guard_recorded_this_boot", False):
+                    _tripped = _rlg.check_and_record(
+                        _max_restarts, _window, max_gap_seconds=_max_gap
+                    )
+                    self._restart_loop_guard_recorded_this_boot = True
+                else:
+                    _tripped = _rlg.is_restart_loop_tripped(
+                        _max_restarts, _window, max_gap_seconds=_max_gap
+                    )
                 if _tripped:
                     # F2 is armed whenever the per-session breaker is enabled,
                     # which (given the max(1, ...) clamp) it always is. The
@@ -18298,7 +18220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # history keeps causing the agent to hang).  Auto-suspend it so the
         # user gets a clean slate on the next message.
         try:
-            stuck = self._suspend_stuck_loop_sessions()
+            stuck = await asyncio.to_thread(self._suspend_stuck_loop_sessions)
             if stuck:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
         except Exception as e:
@@ -19706,7 +19628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # long / "never" reset windows, whose cached AIAgents would
                 # otherwise pin memory for the gateway's entire lifetime.
                 try:
-                    _idle_evicted = self._sweep_idle_cached_agents()
+                    _idle_evicted = await asyncio.to_thread(self._sweep_idle_cached_agents)
                     if _idle_evicted:
                         logger.info(
                             "Agent cache idle sweep: evicted %d agent(s)",
@@ -20990,7 +20912,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _agent is _AGENT_PENDING_SENTINEL:
                     continue
                 try:
-                    _marked, _reason, _alert = self._mark_resume_pending_for_shutdown(_sk)
+                    _marked, _reason, _alert = await asyncio.to_thread(
+                        self._mark_resume_pending_for_shutdown, _sk
+                    )
                     if _marked:
                         _pre_drain_keys.append(_sk)
                     if _alert:
@@ -21285,8 +21209,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # 180s drain timed out — genuinely interrupted in-flight work.
                         # A self-initiated restart here becomes restart_consumed_interrupted
                         # (auto-surfaces on boot) instead of restart_consumed (silent).
-                        _marked, _reason, _alert = self._mark_resume_pending_for_shutdown(
-                            _sk, interrupted=True
+                        _marked, _reason, _alert = await asyncio.to_thread(
+                            self._mark_resume_pending_for_shutdown, _sk, interrupted=True
                         )
                         if _alert:
                             await self._notify_restart_loop_suspended(_sk)
@@ -23088,13 +23012,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timestamp=event.timestamp,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
-        # User-facing count: synthetic turns (kanban wakes, /goal
-        # continuations) share this FIFO but are not something the user
-        # queued, so reporting the raw depth told a user who sent ONE
-        # /queue that "(2 queued)".
-        depth = self._user_queue_depth(
-            quick_key, adapter=self._adapter_for_source(source)
-        )
+        depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
         if depth <= 1:
             return "Queued for the next turn."
         return f"Queued for the next turn. ({depth} queued)"
@@ -25935,11 +25853,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # its message_id is already in this session's transcript AND the update
         # is within the restart-recovery scope, suppress the duplicate answer.
         # Fail-OPEN in every uncertain case (never drop a genuine message).
-        if self._is_telegram_boot_redelivered_duplicate(event, session_entry):
+        if await asyncio.to_thread(
+            self._is_telegram_boot_redelivered_duplicate, event, session_entry
+        ):
             return None
         # SPEC INV-6: record companion answerable rows for a multi-update
         # aggregate so a future re-delivery of a non-first constituent suppresses.
-        self._persist_telegram_aggregate_constituents(event, session_entry)
+        await asyncio.to_thread(
+            self._persist_telegram_aggregate_constituents, event, session_entry
+        )
 
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
@@ -27729,7 +27651,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # succeeded and subsequent messages should no longer receive
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
-                self._apply_post_turn_resume_gate(session_key)
+                await asyncio.to_thread(self._apply_post_turn_resume_gate, session_key)
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
@@ -29427,7 +29349,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_id": route.get("user_id", ""),
                         "user_name": route.get("user_name", ""),
                     }
-                    source = self._build_process_event_source(evt_stub)
+                    source = await asyncio.to_thread(self._build_process_event_source, evt_stub)
                     if source is None:
                         continue
                     try:
@@ -29529,7 +29451,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if "pynacl" in err_lower or "nacl" in err_lower or "davey" in err_lower:
                 return (
                     "Voice dependencies are missing (PyNaCl / davey). "
-                    f"Install with: `{hint_value(sys.executable)} -m pip install PyNaCl`"
+                    f"Install with: `{sys.executable} -m pip install PyNaCl`"
                 )
             return f"Failed to join voice channel: {e}"
 
@@ -34691,11 +34613,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
 
             path = resolve_config_path()
+            # Key on the file's BYTES, not its mtime: two writes inside one mtime tick
+            # (coarse-granularity filesystems, e.g. Blacksmith CI runners) kept the same
+            # mtime_ns and served the stale signature, so a pinPeerName flip did not bust
+            # the agent cache. honcho.json is tiny; hashing it is cheaper than parsing it.
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                import hashlib as _hashlib
+                digest = _hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                digest = None
+            memo_key = (str(path), digest)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
@@ -35648,42 +35575,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _generation_at_interrupt = self._invalidate_session_run_generation(
             session_key, reason=invalidation_reason
         )
-        # Explicit stop relinquishes durable ownership even when the executor
-        # thread is still unwinding. Keep the holder on the agent as a late-write
-        # fence, but unregister it process-locally and delete its durable row so
-        # the replacement turn can acquire immediately instead of waiting for
-        # the stopped turn's TTL.
-        _turn_lease_holder = getattr(
-            running_agent, "_active_session_turn_lease_holder", None
-        )
-        if isinstance(_turn_lease_holder, str) and _turn_lease_holder:
-            try:
-                from hermes_state import _unregister_active_session_turn_lease_holder
-
-                _unregister_active_session_turn_lease_holder(_turn_lease_holder)
-            except Exception:
-                logger.warning(
-                    "Failed to unregister stopped session turn lease holder=%s",
-                    _turn_lease_holder,
-                    exc_info=True,
-                )
-            _turn_session_db = getattr(running_agent, "_session_db", None)
-            _turn_session_id = getattr(running_agent, "session_id", None)
-            if _turn_session_db is not None and _turn_session_id:
-                try:
-                    await asyncio.to_thread(
-                        _turn_session_db.release_session_turn_lease,
-                        _turn_session_id,
-                        _turn_lease_holder,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Failed to release stopped session turn lease "
-                        "session=%s holder=%s",
-                        _turn_session_id,
-                        _turn_lease_holder,
-                        exc_info=True,
-                    )
         if _process_task_id and _process_baseline is not None:
             threading.Thread(
                 target=_reap_gateway_turn_processes,
@@ -35779,17 +35670,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key,
                     exc_info=True,
                 )
-        try:
-            await self.async_session_store.clear_resume_pending(session_key)
-        except Exception:
-            logger.warning(
-                "Failed to clear resume-pending state for stopped session %s",
-                session_key,
-                exc_info=True,
-            )
-        else:
-            getattr(self, "_startup_resume_modes", {}).pop(session_key, None)
-            getattr(self, "_resumed_this_boot", set()).discard(session_key)
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         # Cancel any pending clarify prompts NOW, not just in the turn's
@@ -36286,6 +36166,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if interrupt_depth == 0:
             from agent.session_activity import ActivityProvenance
 
+            # Keep the pre-reset clock for the idle-compaction gap: the reset
+            # below would otherwise make every resumed turn look 0s idle.
+            _prev_ts = getattr(agent, "_last_activity_ts", None)
+            agent._idle_gap_anchor_ts = (
+                _prev_ts
+                if isinstance(_prev_ts, (int, float)) and not isinstance(_prev_ts, bool)
+                else None
+            )
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
             agent._last_activity_provenance = ActivityProvenance.UNKNOWN
@@ -36295,6 +36183,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if hasattr(agent, "_last_flushed_db_idx"):
                 agent._last_flushed_db_idx = 0
         agent._api_call_count = 0
+
+    @staticmethod
+    def _stamp_idle_gap_anchor(
+        agent: Any, history: Any, interrupt_depth: int
+    ) -> None:
+        """Anchor the idle-compaction gap to the session's real last activity.
+
+        ``build_turn_context`` measures the idle gap from
+        ``agent._idle_gap_anchor_ts``. Both gateway agent paths zero
+        ``_last_activity_ts`` before the turn: a cached agent is reset by
+        ``_init_cached_agent_for_turn`` and an evicted/rebuilt agent (the idle
+        sweep evicts at the same 1h the idle trigger uses, and every restart
+        rebuilds) starts with a construction-time clock. So the anchor is the
+        latest of the pre-reset clock stashed by ``_init_cached_agent_for_turn``
+        and the newest persisted transcript row timestamp — the latter survives
+        eviction and restart. Interrupt-recursive turns are not resumes and get
+        no anchor.
+        """
+        if interrupt_depth != 0:
+            agent._idle_gap_anchor_ts = None
+            return
+
+        def _num(v: Any) -> Optional[float]:
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                return float(v)
+            return None
+
+        candidates = []
+        stashed = _num(getattr(agent, "_idle_gap_anchor_ts", None))
+        if stashed is not None:
+            candidates.append(stashed)
+        for msg in history or ():
+            if isinstance(msg, dict):
+                ts = _num(msg.get("timestamp"))
+                if ts is not None:
+                    candidates.append(ts)
+        agent._idle_gap_anchor_ts = max(candidates) if candidates else None
 
     def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
         """Fire on_session_end extraction before soft-evicting a live agent.
@@ -36373,58 +36298,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         same task_id inherits them.
         """
         if agent is None:
-            return
-        # /stop force-clears the runner slot while its executor thread may still
-        # be unwinding. Cache-coherence eviction must not then tear down that
-        # live agent merely because _running_agents no longer names it. The
-        # durable turn-lease holder is authoritative across that gap.
-        active_lease_holder = getattr(
-            agent, "_active_session_turn_lease_holder", None
-        )
-        if isinstance(active_lease_holder, str) and active_lease_holder:
-            logger.error(
-                "Refusing soft eviction of agent with active durable turn lease "
-                "holder=%s",
-                active_lease_holder,
-            )
-            if not getattr(agent, "_soft_release_deferred", False):
-                agent._soft_release_deferred = True
-
-                def _release_after_turn_lease() -> None:
-                    deadline = time.monotonic() + 3600.0
-                    while (
-                        getattr(agent, "_active_session_turn_lease_holder", None)
-                        and time.monotonic() < deadline
-                    ):
-                        time.sleep(5.0)
-                    agent._soft_release_deferred = False
-                    if not getattr(
-                        agent, "_active_session_turn_lease_holder", None
-                    ):
-                        self._release_evicted_agent_soft(agent)
-                    else:
-                        logger.warning(
-                            "Deferred soft eviction timed out with active durable "
-                            "turn lease holder=%s",
-                            getattr(
-                                agent, "_active_session_turn_lease_holder", None
-                            ),
-                        )
-
-                try:
-                    threading.Thread(
-                        target=_release_after_turn_lease,
-                        daemon=True,
-                        name="agent-soft-evict-after-turn-lease",
-                    ).start()
-                except Exception:
-                    agent._soft_release_deferred = False
-                    logger.warning(
-                        "Failed to defer soft eviction for active durable turn "
-                        "lease holder=%s",
-                        active_lease_holder,
-                        exc_info=True,
-                    )
             return
         try:
             if hasattr(agent, "release_clients"):
@@ -37262,87 +37135,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 restore_session_vars(session_tokens)
             finally:
                 restore_session_vars(reset_tokens)
-
-    async def _run_queued_followup_if_current(
-        self,
-        *,
-        current_result: Any,
-        message: Any,
-        context_prompt: str,
-        history: List[Dict[str, Any]],
-        source: SessionSource,
-        session_id: str,
-        session_key: str,
-        generation_session_key: str,
-        run_generation: Optional[int],
-        interrupt_depth: int,
-        event_message_id: Optional[str],
-        channel_prompt: Optional[str],
-        message_type: Optional[str],
-        queued_event: Optional[MessageEvent],
-        queued_adapter: Any,
-    ) -> Any:
-        """Run an in-band follow-up only while its parent generation owns it."""
-        if (
-            run_generation is not None
-            and not self._is_session_run_current(
-                generation_session_key, run_generation
-            )
-        ):
-            adapter = queued_adapter
-            if adapter and queued_event is not None:
-                _pending_messages = getattr(adapter, "_pending_messages", None)
-                if isinstance(_pending_messages, dict):
-                    merge_pending_message_event(
-                        _pending_messages, session_key, queued_event
-                    )
-            elif adapter:
-                _queue_message = getattr(adapter, "queue_message", None)
-                if callable(_queue_message):
-                    _queue_message(session_key, message)
-                else:
-                    _pending_messages = getattr(adapter, "_pending_messages", None)
-                    if isinstance(_pending_messages, dict):
-                        merge_pending_message_event(
-                            _pending_messages,
-                            session_key,
-                            MessageEvent(
-                                text=str(message or ""),
-                                message_type=MessageType.TEXT,
-                                source=source,
-                            ),
-                        )
-            logger.info(
-                "Re-queued follow-up for session %s — parent run generation "
-                "%s is no longer current (stopped)",
-                generation_session_key or "?",
-                run_generation,
-            )
-            return current_result
-        followup_result = await self._run_agent(
-            message=message,
-            context_prompt=context_prompt,
-            history=history,
-            source=source,
-            session_id=session_id,
-            session_key=session_key,
-            run_generation=run_generation,
-            _interrupt_depth=interrupt_depth,
-            event_message_id=event_message_id,
-            channel_prompt=channel_prompt,
-            message_type=message_type,
-            # A kanban wake / async-delegation completion that arrived while
-            # this session was busy is drained here instead of through
-            # _handle_message_with_agent; keep its row typed (#82888).
-            persist_user_display_kind=(
-                "internal_notification"
-                if getattr(queued_event, "internal", False)
-                else None
-            ),
-        )
-        return _preserve_queued_followup_history_offset(
-            current_result, followup_result
-        )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -38838,50 +38630,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pending = None
 
             if pending_event or pending:
-                # /stop invalidates the generation before the executor-backed
-                # turn necessarily returns. A queued event can still be visible
-                # while that stopped coroutine unwinds. Never recurse under its
-                # stale generation: the recursive turn is not registered as a
-                # fresh top-level run, so it would run invisibly after /stop and
-                # contend with the next user turn's durable lease.
-                if (
-                    run_generation is not None
-                    and not self._is_session_run_current(session_key, run_generation)
-                ):
-                    if adapter and pending_event is not None:
-                        _pending_messages = getattr(
-                            adapter, "_pending_messages", None
-                        )
-                        if isinstance(_pending_messages, dict):
-                            merge_pending_message_event(
-                                _pending_messages, session_key, pending_event
-                            )
-                    elif adapter:
-                        _queue_message = getattr(adapter, "queue_message", None)
-                        if callable(_queue_message):
-                            _queue_message(session_key, pending)
-                        else:
-                            _pending_messages = getattr(
-                                adapter, "_pending_messages", None
-                            )
-                            if isinstance(_pending_messages, dict):
-                                merge_pending_message_event(
-                                    _pending_messages,
-                                    session_key,
-                                    MessageEvent(
-                                        text=str(pending or ""),
-                                        message_type=MessageType.TEXT,
-                                        source=source,
-                                    ),
-                                )
-                    logger.info(
-                        "Discarding stale queued-follow-up recursion for session %s; "
-                        "re-queued message because run generation %s is no longer "
-                        "current (stopped)",
-                        session_key or "?",
-                        run_generation,
-                    )
-                    return result
                 logger.debug("Processing pending message: '%s...'", pending[:40])
 
                 # Clear the adapter's interrupt event so the next _run_agent call
@@ -39111,23 +38859,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                return await self._run_queued_followup_if_current(
-                    current_result=result,
+                followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=next_source,
                     session_id=session_id,
                     session_key=next_session_key,
-                    generation_session_key=session_key,
                     run_generation=run_generation,
-                    interrupt_depth=_interrupt_depth + 1,
+                    _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
-                    queued_event=pending_event,
-                    queued_adapter=adapter,
+                    # A kanban wake / async-delegation completion that arrived while
+                    # this session was busy is drained here instead of through
+                    # _handle_message_with_agent; keep its row typed (#82888).
+                    persist_user_display_kind=(
+                        "internal_notification"
+                        if getattr(pending_event, "internal", False)
+                        else None
+                    ),
                 )
+                return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
@@ -39367,17 +39120,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # ahead. Log the decision inputs so a recurrence can be pinned to
                 # "signal never set" vs "ack-pending race".
                 # See docs/rca-wecom-stream-final-ack-timeout-duplicate.md.
-                logger.warning(
+                #
+                # A duplicate is only possible when the consumer itself put
+                # response text in the chat (``already_sent``). An interim-only
+                # consumer (platform streaming off; commentary never sets
+                # already_sent) leaves the normal send as the ONLY copy of the
+                # final reply, so that shape is logged at DEBUG, not as a
+                # duplicate warning.
+                _dup_risk = _final_send_duplicate_risk(_sc)
+                (logger.warning if _dup_risk else logger.debug)(
                     "Normal final-send NOT suppressed despite active stream "
                     "consumer for session %s: streamed=%s previewed=%s "
-                    "content_delivered=%s transformed=%s final_len=%d — "
-                    "possible duplicate send (see wecom ack-timeout RCA).",
+                    "content_delivered=%s transformed=%s consumer_sent=%s "
+                    "final_len=%d — %s",
                     session_key or "?",
                     _streamed,
                     _previewed,
                     _content_delivered,
                     _transformed,
+                    _dup_risk,
                     len(_final),
+                    "possible duplicate send (see wecom ack-timeout RCA)."
+                    if _dup_risk
+                    else "consumer sent no response text; normal send is the only copy.",
                 )
 
         # Schedule deletion of tracked temporary progress bubbles after the

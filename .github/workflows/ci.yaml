@@ -28,7 +28,7 @@ name: CI
 #   docker-lint.yml hadolint is a Docker container action; no socket on the pool
 #   js-tests.yml    mid-flight vitest death, not root-caused; see js-tests.yml
 #
-# ``installer-tests``, the ``tests-os`` matrix and ``ci-review-comment`` use a
+# ``installer-tests`` and the ``tests-os`` matrix use a
 # literal ``runs-on`` and are hosted by design. Further hosted pins are listed
 # below. Any PR touching ``.github/workflows/**`` also needs the ``ci-reviewed``
 # label or the Review label gate hard-blocks it.
@@ -131,8 +131,6 @@ jobs:
         id: classify
         uses: ./.github/actions/detect-changes
         with:
-          sparse-checkout: scripts/ci/classify_changes.py
-          sparse-checkout-cone-mode: false
           github-token: ${{ github.token }}
 
   # ─────────────────────────────────────────────────────────────────────
@@ -156,7 +154,20 @@ jobs:
       # and all CI jobs share the 60-concurrent hosted cap: 13 in-flight
       # runs at ~20 jobs held the queue at 0 merges in 40 min. Halving the
       # gate's matrix halves its share of that cap.
-      slice_count: ${{ github.event_name == 'merge_group' && 8 || 16 }}
+      #
+      # 2026-09-25 (t_f447539b, dynamic CI slots): merge_group follows the LIVE
+      # self-hosted slot total, which ci-placement writes to
+      # vars.CI_MERGE_GROUP_SLICES through scripts/ci_routing_ledger.py (the only
+      # sanctioned writer). A 16-slice matrix onto 5 live slots just queues.
+      # Clamped 4..16 here AND in ci-overflow-controller `slice_counts`.
+      #
+      # 2026-09-26 (t_21d0a6cf): unset default 8 -> 16. CI is GitHub-hosted
+      # only now (CI_RUNNER_LABELS=ubuntu-latest, 120 concurrent); 8 was the
+      # self-hosted sizing. merge_group 36217656078 at 8 slices: 341-621 s
+      # per slice; push 36222117773 at 16: 106-322 s. Dynamic slots are
+      # disarmed, so ci-placement never writes the variable and this default
+      # is what merge_group runs. Rollback: set CI_MERGE_GROUP_SLICES=8.
+      slice_count: ${{ github.event_name == 'merge_group' && (vars.CI_MERGE_GROUP_SLICES == '' && 16 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) < 4 && 4 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) > 16 && 16 || fromJSON(vars.CI_MERGE_GROUP_SLICES)))) || 16 }}
       test_scope: ${{ needs.detect.outputs.test_scope }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
@@ -225,7 +236,13 @@ jobs:
     # matching exemption so the skip is declared rather than silent (the #476
     # rule is 'no required job vanishes unnoticed', not 'never skip').
     # Re-enable together with upstream's #76627 fix.
-    if: ${{ false && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true') }}
+    # t_bc0052b9: bare `if: false`, as upstream NousResearch did. The constant-folded
+    # `${{ false && (...) }}` form on this reusable-workflow job is upstream's documented
+    # cause of GitHub startup_failure ("An unexpected error has occurred", 0 jobs). Here it
+    # hit ~1 in 12 `--failed` re-runs (35898441649, 36070097433, 36145913460, 36170775010).
+    # To re-enable, restore:
+    #   if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
+    if: false
     uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
@@ -376,7 +393,7 @@ jobs:
           path: ci-timings-baseline.json
           # Prefix-match: exact key will never hit (run_id differs), so
           # restore-keys finds the most recent baseline from main.
-          key: ci-timings-baseline-never-exact
+          key: ci-timings-baseline-never-exact-${{ github.run_id }}
           restore-keys: |
             ci-timings-baseline-
 

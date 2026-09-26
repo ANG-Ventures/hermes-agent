@@ -13,7 +13,14 @@ from __future__ import annotations
 REQUIRED_REVIEW_LENSES: tuple[str, ...] = ("contract", "execution", "cross-vendor", "mutation")
 
 # Coverage fields the gate requires besides ``lenses``.
-REQUIRED_COVERAGE_FIELDS: tuple[str, ...] = ("findings", "items", "review_minutes", "batch_id")
+REQUIRED_COVERAGE_FIELDS: tuple[str, ...] = ("findings", "items", "review_minutes", "batch_id", "head_sha")
+
+# ``head_sha`` is the reviewed PR head (7-40 hex), or ``n/a: <reason>`` for a
+# card with no PR. Card-sourced land requests take the card's LATEST record as
+# the review of record and need an APPROVE carrying it; a reviewer approval
+# (``kanban_complete`` from a review run) that names ``metadata.head_sha``
+# writes that APPROVE record.
+HEAD_SHA_PATTERN = r"[0-9a-fA-F]{7,40}"
 
 # Coverage fields that may be omitted (or null). ``battery`` is optional: the
 # per-card battery is being retired in favour of CI-owned suites. When

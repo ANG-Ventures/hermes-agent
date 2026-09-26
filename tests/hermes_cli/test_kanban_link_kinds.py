@@ -163,6 +163,50 @@ def test_claim_task_rejects_only_for_blocks(kanban_home):
         assert kb.claim_task(conn, derived) is not None
 
 
+def test_running_child_completes_while_derived_from_parent_is_open(kanban_home):
+    """A claimed child's terminal transitions ignore an open provenance parent.
+
+    Regression shape of t_bab6df79 (t_126f1300): the child is running on its
+    own run and its only parent edge is ``derived-from`` to a card still in
+    ``ready``. Completion must not be refused on that edge.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="survey", assignee="apollo")
+        child = kb.create_task(
+            conn, title="fix", assignee="daedalus",
+            parents=[parent], parents_kind="derived-from",
+        )
+        assert kb.claim_task(conn, child) is not None
+        assert kb.get_task(conn, parent).status == "ready"
+        run_id = kb.get_task(conn, child).current_run_id
+
+        assert kb.complete_task(
+            conn, child, summary="shipped", expected_run_id=run_id,
+        ) is True
+        assert kb.get_task(conn, child).status == "done"
+        assert kb.get_task(conn, parent).status == "ready"
+
+
+def test_running_child_requests_review_while_derived_from_parent_is_open(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="survey", assignee="apollo")
+        child = kb.create_task(
+            conn, title="fix", assignee="daedalus",
+            parents=[parent], parents_kind="derived-from",
+        )
+        assert kb.claim_task(conn, child) is not None
+        run_id = kb.get_task(conn, child).current_run_id
+
+        ok, reason = kb.request_review(
+            conn, child, summary="ready for review",
+            expected_run_id=run_id, with_reason=True,
+        )
+        assert ok is True, reason
+        assert kb.get_task(conn, child).status != "running"
+
+
 def test_promote_task_counts_only_blocking_parents(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")

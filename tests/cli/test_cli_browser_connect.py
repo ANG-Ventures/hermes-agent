@@ -23,8 +23,6 @@ def _assert_chrome_debug_cmd(cmd, expected_chrome, expected_port):
     assert f"--remote-debugging-port={expected_port}" in cmd
     assert "--no-first-run" in cmd
     assert "--no-default-browser-check" in cmd
-    # Chrome 111+ rejects CDP WebSocket handshakes (HTTP 403) without this flag.
-    assert "--remote-allow-origins=*" in cmd
     # macOS: suppress the blocking "Keychain Not Found" Safe-Storage modal that a
     # detached Chromium launch throws onto the user's screen (harmless elsewhere).
     assert "--password-store=basic" in cmd
@@ -42,18 +40,6 @@ class _FakeResponse:
 
     def __exit__(self, exc_type, exc, tb):
         return False
-
-
-def test_manual_command_includes_remote_allow_origins_on_macos():
-    """Chrome 111+ rejects CDP WebSocket handshakes (403) without
-    --remote-allow-origins; the macOS `open -a` fallback must include it so
-    `/browser connect` (Playwright connect_over_cdp) can attach."""
-    with patch(
-        "hermes_cli.browser_connect.get_chrome_debug_candidates", return_value=[]
-    ):
-        command = manual_chrome_debug_command(port=9222, system="Darwin")
-    assert command is not None
-    assert "--remote-allow-origins=*" in command
 
 
 def test_chrome_debug_args_suppress_macos_keychain_modal():

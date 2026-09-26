@@ -250,7 +250,11 @@ class CoalescingJsonWriter:
         name: str = "json-writer",
         **dump_kwargs,
     ):
-        self._path_fn = path_fn
+        # Resolve the target ONCE, here.  A path_fn evaluated on the writer
+        # thread at write time follows whatever HERMES_HOME is current then, so
+        # a late write from one owner could land in another owner's home and
+        # resurrect foreign state on its next load (t_73d1988f).
+        self._path = path_fn() if callable(path_fn) else path_fn
         self._snapshot = snapshot
         self._interval = max(0.0, float(min_interval_s))
         self._name = name
@@ -313,7 +317,7 @@ class CoalescingJsonWriter:
     def _write_now(self) -> None:
         with self._write_lock:
             payload = self._snapshot()
-            atomic_json_write(self._path_fn(), payload, **self._dump_kwargs)
+            atomic_json_write(self._path, payload, **self._dump_kwargs)
             self._last_write_mono = time.monotonic()
             self.writes += 1
 

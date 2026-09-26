@@ -89,12 +89,6 @@ from hermes_cli.config import (
     write_platform_config_field,
     _deep_merge,
 )
-from hermes_cli.session_db_heavy_gate import (
-    SessionDBHeavyReadBusy,
-    session_db_heavy_read_semaphore,
-    session_db_heavy_read_slot,
-    session_db_heavy_read_stats,
-)
 from plugins.memory.config_schema import (
     ProviderConfigSchema,
     ProviderField,
@@ -112,7 +106,7 @@ from gateway.status import (
     read_runtime_status,
     resolve_gateway_liveness,
 )
-from utils import env_var_enabled, is_truthy_value
+from utils import env_var_enabled
 
 try:
     from fastapi import (
@@ -2134,48 +2128,6 @@ async def _status_active_sessions() -> int:
     return 0
 
 
-def _coerce_status_float(value: Any, default: float, *, min_value: float) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    if number < min_value:
-        return default
-    return number
-
-
-def _dashboard_session_sync_status_config(config: dict | None = None) -> dict[str, Any]:
-    root = load_config() if config is None else config
-    dashboard = root.get("dashboard") if isinstance(root, dict) else {}
-    if not isinstance(dashboard, dict):
-        dashboard = {}
-    session_sync = dashboard.get("session_sync")
-    if not isinstance(session_sync, dict):
-        session_sync = {}
-    defaults = DEFAULT_CONFIG["dashboard"]["session_sync"]
-    return {
-        "enabled": is_truthy_value(
-            session_sync.get("enabled"),
-            default=bool(defaults["enabled"]),
-        ),
-        "t_silence": _coerce_status_float(
-            session_sync.get("t_silence"),
-            float(defaults["t_silence"]),
-            min_value=0.0,
-        ),
-        "poll_interval": _coerce_status_float(
-            session_sync.get("poll_interval"),
-            float(defaults["poll_interval"]),
-            min_value=0.1,
-        ),
-        "refocus_debounce": _coerce_status_float(
-            session_sync.get("refocus_debounce"),
-            float(defaults["refocus_debounce"]),
-            min_value=0.0,
-        ),
-    }
-
-
 def _dashboard_state_db_path() -> Path:
     return (Path(get_hermes_home()) / "state.db").expanduser().resolve()
 
@@ -3299,21 +3251,24 @@ async def _blocking_io(fn, *args):
     return await loop.run_in_executor(None, fn, *args)
 
 
+_SESSION_DB_HEAVY_READ_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
+
+
 def _session_db_heavy_read_semaphore() -> asyncio.Semaphore:
-    return session_db_heavy_read_semaphore()
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    semaphore = _SESSION_DB_HEAVY_READ_SEMAPHORES.get(key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(2)
+        _SESSION_DB_HEAVY_READ_SEMAPHORES[key] = semaphore
+    return semaphore
 
 
 async def _session_db_read(fn, *args, heavy: bool = False, **kwargs):
     """Run a blocking SessionDB read off-loop, bounding heavyweight scans."""
     if heavy:
-        try:
-            async with session_db_heavy_read_slot(
-                surface="rest",
-                operation=getattr(fn, "__name__", "session_db_read"),
-            ):
-                return await _blocking_io(lambda: fn(*args, **kwargs))
-        except SessionDBHeavyReadBusy as exc:
-            raise HTTPException(status_code=503, detail=exc.to_payload()) from exc
+        async with _session_db_heavy_read_semaphore():
+            return await _blocking_io(lambda: fn(*args, **kwargs))
     return await _blocking_io(lambda: fn(*args, **kwargs))
 
 
@@ -4093,11 +4048,6 @@ async def get_status(profile: Optional[str] = None):
         except Exception:
             nous_session_valid = "unknown"
 
-        session_sync = _dashboard_session_sync_status_config(load_config())
-        capabilities = {}
-        if session_sync["enabled"]:
-            capabilities["session_changes"] = True
-
         # Always-public liveness + auth-gate shape. Safe for external uptime
         # probes (NAS's wildcard-subdomain liveness probe), the SPA's pre-login
         # bootstrap, and anyone who can curl the host — i.e. exactly the audience
@@ -4118,17 +4068,10 @@ async def get_status(profile: Optional[str] = None):
             "gateway_drainable": gateway_drainable,
             "restart_drain_timeout": restart_drain_timeout,
             "active_sessions": active_sessions,
-            "session_db_heavy_reads": session_db_heavy_read_stats(),
             "auth_required": auth_required,
             "auth_providers": auth_providers,
             "auth_flows": auth_flows,
             "nous_session_valid": nous_session_valid,
-            "capabilities": capabilities,
-            "session_sync": {
-                "t_silence": session_sync["t_silence"],
-                "poll_interval": session_sync["poll_interval"],
-                "refocus_debounce": session_sync["refocus_debounce"],
-            },
         }
 
         # Stable per-install identity (see get_install_id above). First call
@@ -13207,23 +13150,6 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
     return result
 
 
-def _cron_profile_names() -> List[str]:
-    """Profile NAMES only, via the lightweight (name, home) listing.
-
-    The cron job aggregators only need names to route _call_cron_for_profile;
-    going through _cron_profile_dicts() -> list_profiles() paid the full
-    config.yaml-parse + gateway-PID-probe + skills-rglob cost per profile on
-    every /api/cron/jobs call (a boot-path RPC — py-spy showed it stacked on
-    top of the session-list refresh on every sidebar load).
-    """
-    from hermes_cli import profiles as profiles_mod
-    try:
-        return [name for name, _home in profiles_mod.list_profile_homes()]
-    except Exception:
-        _log.exception("Failed to list profile homes for cron; falling back to full listing")
-        return [str(p.get("name") or "") for p in _cron_profile_dicts()]
-
-
 def _notify_cron_provider_for_profile(target_profile: Optional[str]) -> None:
     """Best-effort provider reconcile against one profile's job store.
 
@@ -13292,7 +13218,8 @@ def _mutate_cron_for_profile(
 
 
 def _find_cron_job_profile(job_id: str) -> Optional[str]:
-    for name in _cron_profile_names():
+    for profile in _cron_profile_dicts():
+        name = str(profile.get("name") or "")
         if not name:
             continue
         jobs = _call_cron_for_profile(name, "list_jobs", True)
@@ -13307,7 +13234,8 @@ def _list_cron_jobs_sync(profile: str = "all"):
         return _call_cron_for_profile(requested, "list_jobs", True)
 
     jobs: List[Dict[str, Any]] = []
-    for name in _cron_profile_names():
+    for profile in _cron_profile_dicts():
+        name = str(profile.get("name") or "")
         if not name:
             continue
         try:
