@@ -10960,53 +10960,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return pending_event
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
-        """Total pending /queue items for a session — slot + overflow.
-
-        Counts EVERY queued event, synthetic ones included. This is the
-        resource-accounting number: it backs the ``_BUSY_QUEUE_MAX_PENDING``
-        cap, where a synthetic wake occupies a slot exactly like a user
-        message does. For the number shown to a human, use
-        ``_user_queue_depth`` — see the docstring there.
-        """
+        """Total pending /queue items for a session — slot + overflow."""
         _q_state = self._peek_session_state(session_key)
         depth = len(_q_state.conversation.queued_events) if _q_state else 0
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
-        return depth
-
-    @classmethod
-    def _is_user_queued_event(cls, event: Any) -> bool:
-        """Whether a queued event represents a message the USER sent.
-
-        Synthetic turns share the FIFO with real user messages:
-        ``internal=True`` events (kanban completion wakes, auto-resume
-        continuations, plugin-injected turns) and ``/goal`` continuations.
-        They must occupy queue slots — but they are not something the user
-        typed, so they must not be counted in a user-facing total.
-        """
-        if event is None:
-            return False
-        if getattr(event, "internal", False):
-            return False
-        if cls._is_goal_continuation_event(event):
-            return False
-        return True
-
-    def _user_queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
-        """Pending queue items the USER actually sent — slot + overflow.
-
-        The user-facing counterpart to ``_queue_depth``. ``/queue`` reports
-        this one so a single ``/queue`` issued while a kanban wake (or any
-        other synthetic turn) is already parked doesn't tell the user they
-        queued two things (#queue-depth-overcount).
-        """
-        _q_state = self._peek_session_state(session_key)
-        overflow = _q_state.conversation.queued_events if _q_state else []
-        depth = sum(1 for ev in overflow if self._is_user_queued_event(ev))
-        if adapter is not None:
-            pending_slot = getattr(adapter, "_pending_messages", {}) or {}
-            if self._is_user_queued_event(pending_slot.get(session_key)):
-                depth += 1
         return depth
 
     @staticmethod
@@ -23015,13 +22973,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timestamp=event.timestamp,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
-        # User-facing count: synthetic turns (kanban wakes, /goal
-        # continuations) share this FIFO but are not something the user
-        # queued, so reporting the raw depth told a user who sent ONE
-        # /queue that "(2 queued)".
-        depth = self._user_queue_depth(
-            quick_key, adapter=self._adapter_for_source(source)
-        )
+        depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
         if depth <= 1:
             return "Queued for the next turn."
         return f"Queued for the next turn. ({depth} queued)"
