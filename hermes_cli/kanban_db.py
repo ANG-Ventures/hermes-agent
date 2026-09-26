@@ -681,67 +681,11 @@ def _kanban_path_override(name: str) -> str:
     """Return the raw ``name`` path-pin env value, or ``""`` when sandboxed.
 
     Single choke point for every ``HERMES_KANBAN_*`` path pin so the sandbox
-    flag can't be honoured by some resolvers and silently ignored by others —
-    and, for the same reason, the one place that can see a pin being
-    neutralised and say so (:func:`_warn_if_sandbox_neutralises_pins`).
+    flag can't be honoured by some resolvers and silently ignored by others.
     """
     if kanban_sandbox_enabled():
-        _warn_if_sandbox_neutralises_pins()
         return ""
     return os.environ.get(name, "").strip()
-
-
-# Raw ``(HERMES_HOME, (name, value), ...)`` environments already reported by
-# ``_warn_if_sandbox_neutralises_pins``. Same warn-once + resolve-once role as
-# ``_CHECKED_OVERRIDE_ESCAPES``: the check hangs off ``_kanban_path_override``,
-# which every resolver — including ``kanban_db_path()`` on the ``connect()``
-# hot path — calls, so the root resolution must happen once per distinct
-# environment rather than per call.
-_CHECKED_SANDBOX_NEUTRALISED_PINS: set[tuple] = set()
-
-
-def _warn_if_sandbox_neutralises_pins() -> None:
-    """Log once when ``HERMES_KANBAN_SANDBOX`` overrides an EXPLICIT path pin.
-
-    The mirror image of :func:`_warn_if_override_escapes_hermes_home`, and the
-    same user-visible failure: a process that pinned a throwaway board writes
-    to the live one instead. Measured 2026-09-22 — the escape case logged one
-    warning, this one logged zero, and the escape warning's own remedy text
-    RECOMMENDS the flag that produces it. It cost card t_adec8aba two fixture
-    cards on the live board, claimed by the dispatcher as real work, with
-    nothing printed at any point.
-
-    Resolution is deliberately UNCHANGED — the sandbox flag still wins over
-    every pin, which is the whole point of the flag. Only the silence is fixed.
-    """
-    pinned = tuple(
-        (name, value)
-        for name in _KANBAN_PATH_PIN_ENV_VARS
-        if (value := os.environ.get(name, "").strip())
-    )
-    if not pinned:
-        return  # sandbox on, nothing pinned: nothing was neutralised.
-    key = (os.environ.get("HERMES_HOME", "").strip(), pinned)
-    if key in _CHECKED_SANDBOX_NEUTRALISED_PINS:
-        return
-    _CHECKED_SANDBOX_NEUTRALISED_PINS.add(key)
-    # Under the sandbox flag every pin is already "" here, so the kanban root
-    # IS the HERMES_HOME-derived root. Read it directly rather than calling
-    # ``kanban_home()``, which would re-enter this choke point.
-    try:
-        from hermes_constants import get_default_hermes_root
-        root = get_default_hermes_root()
-    except Exception:  # pragma: no cover - diagnostic only
-        root = "<unresolvable>"
-    _log.warning(
-        "HERMES_KANBAN_SANDBOX=1 NEUTRALISED the explicit kanban path pin(s) "
-        "%s — kanban paths resolve from HERMES_HOME instead, under %s, so "
-        "pinning a throwaway board did NOT isolate this process. Unset "
-        "HERMES_KANBAN_SANDBOX if you meant the pin to win, or point "
-        "HERMES_HOME at a throwaway root if you meant to be sandboxed.",
-        ", ".join(f"{name}={value}" for name, value in pinned),
-        root,
-    )
 
 
 # The ``HERMES_KANBAN_DB`` pin and ``HERMES_HOME`` as they were when this
