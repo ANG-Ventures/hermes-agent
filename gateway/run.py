@@ -34507,7 +34507,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None, int | None], dict[str, Any]] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -34520,11 +34520,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
 
             path = resolve_config_path()
+            # Key on size too: two writes inside one coarse mtime tick (cloud CI
+            # filesystems) share mtime_ns, and a pinPeerName flip must still bust.
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                st = path.stat()
+                mtime_ns, size = st.st_mtime_ns, st.st_size
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                mtime_ns, size = None, None
+            memo_key = (str(path), mtime_ns, size)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
