@@ -67,6 +67,41 @@ def test_incident_anchored_real_is_not_skew_multiplied() -> None:
         assert should_compress_request(e, 314_682, None, anchored_tokens=real) is False
 
 
+# Per-lane real/rough skews measured 2026-09-25 (blackbox turns.db / agent.log,
+# t_80f3cce9). Over-count lanes (>1) false-fired EARLY pre-#1187 (apr floor
+# 750K/1.312 = 572K); under-count lanes (<1) fired LATE (xai 750K/0.758 = 989K,
+# past the window; only the raw hard-frac backstop caught them). The anchored
+# path must be skew-independent in BOTH directions.
+LANE_SKEWS = {
+    "claude-apr": 1.312,
+    "claude-apx": 1.25,
+    "claude-bpr": 1.546,
+    "xai-oauth": 0.758,
+    "openai-codex": 0.842,
+}
+
+
+@pytest.mark.parametrize("lane", sorted(LANE_SKEWS))
+def test_anchored_trigger_is_skew_independent_per_lane(lane: str) -> None:
+    skew = LANE_SKEWS[lane]
+    e = _Engine(skews=(skew,))
+    assert e._trigger_skew() == pytest.approx(skew)
+    below = int(CTX * 0.70)  # 700,000 real: under the 750,000 threshold
+    above = int(CTX * 0.76)  # 760,000 real: over it
+    for anchored, expected in ((below, False), (above, True)):
+        rough = round(anchored / skew)  # the rough figure this lane pairs with
+        assert (
+            should_compress_request(e, rough, None, anchored_tokens=anchored)
+            is expected
+        ), (lane, skew, anchored)
+        # Compared unscaled -- unless the lane's RAW rough already reached the
+        # window hard-frac ceiling (xai at 76%: 760K/0.758 = 1.0M rough), where
+        # the skew-independent 413 backstop compares the raw rough instead.
+        want = rough if rough >= int(CTX * 0.95) else anchored
+        assert e.seen[-1] == want
+        assert trigger_compare_tokens_for(e, rough, None, anchored) == want
+
+
 def test_rough_without_anchor_still_calibrated() -> None:
     e = _Engine()
     # 314,682 x 1.547 = 486,813 -> no fire

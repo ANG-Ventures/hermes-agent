@@ -7,10 +7,13 @@ name: auto-fix lint issues & formatting
 # auto-corrected on merge so PRs aren't blocked by them. The PR-time eslint
 # check in typecheck.yml fails only when un-fixable errors remain.
 #
-# NOTE: The branch push uses the maintainer-owned AUTOFIX_BOT_PAT. Pushes made
-# with secrets.GITHUB_TOKEN identify as github-actions[bot], whose PR workflows
-# this repository queues for maintainer approval instead of running. PR API
-# operations still use the scoped job token. The concurrency group
+# NOTE: The branch push AND the PR API calls use a short-lived installation
+# token minted from the ang-fleet-workers GitHub App (FLEET_WORKERS_APP_ID /
+# FLEET_WORKERS_APP_PRIVATE_KEY). Pushes made with secrets.GITHUB_TOKEN
+# identify as github-actions[bot], whose PR workflows this repository queues
+# for maintainer approval, and the job token may not create PRs here. A
+# personal (Kyzcreig) PAT is refused on ANG-Ventures repos (push 403). The
+# concurrency group
 # (ts-autofix-${{ github.ref }}) with cancel-in-progress: true prevents an
 # infinite loop — a re-triggered run finds no new fixes and exits.
 #
@@ -145,18 +148,16 @@ jobs:
       contents: write # needed to push to bot/js-autofix
       pull-requests: write # needed for PR creation + auto-merge
     steps:
-      - name: Require trusted push token
-        env:
-          AUTOFIX_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT }}
-        run: |
-          if [ -z "$AUTOFIX_TOKEN" ]; then
-            echo "::error::AUTOFIX_BOT_PAT is required so bot PR checks do not await approval."
-            exit 1
-          fi
+      - name: Mint ang-fleet-workers App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.FLEET_WORKERS_APP_ID }}
+          private-key: ${{ secrets.FLEET_WORKERS_APP_PRIVATE_KEY }}
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          token: ${{ secrets.AUTOFIX_BOT_PAT }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Download patch
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -200,7 +201,7 @@ jobs:
 
       - name: Create/update PR and enable auto-merge
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BOT_BRANCH: bot/js-autofix
         run: |
           set -euo pipefail
@@ -227,7 +228,7 @@ jobs:
 
       - name: Wait for merge, auto-close on failure or stale
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           START_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
