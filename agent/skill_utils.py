@@ -60,37 +60,6 @@ SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 # so already-pulled org skills keep working without connectivity; a VERIFIED
 # org change (or personal-org token) rewrites/removes it.
 
-# Work-queue notes are minted as skill *dirs* (a SKILL.md whose only job is to
-# carry a pending-patch payload) by background/curation sessions that cannot
-# write to read-only shared skills — they use the skill index as a poor-man's
-# cross-session work queue. Structurally they satisfy every "is a skill" test
-# ("dir contains SKILL.md", no excluded path component), so ~60-80 of them once
-# rotted inside skills-shared/ and showed up in every agent's skill index as
-# dead, paid-for context. Exclude any dir whose *leaf name* starts with one of
-# these reserved prefixes so a queue note is never indexed or selected as a
-# loadable skill / shared group.
-#
-# DRIFT GUARD: the two standalone /usr/bin/python3 sweep scripts keep their own
-# hardcoded copies of this list (they import zero Hermes deps). Those copies MUST
-# stay byte-identical to this tuple; a parity test asserts it so drift is caught
-# in CI, never at runtime. See pending-queue-sweep.py QUEUE_PREFIXES and
-# oneshot-shared-pending-flush.py PREFIXES.
-QUEUE_NOTE_PREFIXES = (
-    "pending-shared-skill-patches",
-    "pending-shared-patches",
-    "pending-patch-",
-)
-
-
-def is_queue_note_name(name: str) -> bool:
-    """True if *name* (a skill-dir basename) is a reserved work-queue note prefix.
-
-    Name-only test (path-free) so it is safe to call at both the loader/index
-    site and the create site without any filesystem or profile-root dependency.
-    """
-    return bool(name) and name.startswith(QUEUE_NOTE_PREFIXES)
-
-
 ORG_MIRROR_DIR_NAME = "_org"
 ORG_ACTIVE_MARKER = ".active_org"
 ORG_PROVENANCE_FILE = ".org-provenance.json"
@@ -136,8 +105,7 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
 
     Use this on every ``SKILL.md`` path produced by direct ``rglob`` scans to
     prune dependency, virtualenv, VCS, cache, and progressive-disclosure
-    support-package paths, plus ``pending-*`` work-queue notes (see
-    ``QUEUE_NOTE_PREFIXES``). Centralising the check here keeps every
+    support-package paths. Centralising the check here keeps every
     skill-scanning site in sync with the shared exclusion set.
 
     Accepts a Path or string.
@@ -147,16 +115,9 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     except AttributeError:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    if any(part in EXCLUDED_SKILL_DIRS for part in parts):
-        return True
-    # A queue-note dir is the *parent* of the SKILL.md leaf; when the path IS a
-    # SKILL.md file the skill-dir name is parts[-2], otherwise parts[-1].
-    skill_dir_name = parts[-2] if parts and parts[-1] == "SKILL.md" else (
-        parts[-1] if parts else ""
+    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
+        path, root=root
     )
-    if is_queue_note_name(skill_dir_name):
-        return True
-    return is_skill_support_path(path, root=root)
 
 
 def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
