@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from agent.portal_tags import get_conversation_context
+from agent.prompt_cache_scope import is_fork_cache_scope
 from agent.transports.codex import _cache_scope_from_session_id
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -223,6 +224,13 @@ class OpenRouterProfile(ProviderProfile):
         # reading the ambient conversation keeps compression/vision/MoA traffic
         # on the same Grok backend as the conversation it belongs to.
         grok_conv_id = _cache_scope_from_session_id(get_conversation_context() or session_id)
+        # A background-review fork shares the parent's conversation context,
+        # but on xAI's slot-keyed cache that key makes the fork evict the
+        # parent's slot. The resolver hands forks a derived ``<scope>::<tag>``
+        # scope on Grok routes only (agent/prompt_cache_scope.py); honour it.
+        _fork_scope = context.get("cache_scope_id")
+        if is_fork_cache_scope(_fork_scope):
+            grok_conv_id = _fork_scope
         if grok_conv_id and model and model.startswith(("x-ai/grok-", "xai/grok-")):
             extra_headers["x-grok-conv-id"] = grok_conv_id
         if extra_headers:
