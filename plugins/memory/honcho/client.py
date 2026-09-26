@@ -1090,7 +1090,7 @@ def _slot_for(key: tuple) -> SingletonSlot:
 # load_config_readonly() is internally cached on both the user and managed
 # files' signatures, and a bespoke key here would have to duplicate that
 # invalidation logic.
-_honcho_json_timeout_memo: dict[str, tuple[int, float | None]] = {}
+_honcho_json_timeout_memo: dict[str, tuple[str | int, float | None]] = {}
 
 
 def _config_yaml_timeout() -> float | None:
@@ -1114,17 +1114,21 @@ def _honcho_json_timeout() -> float | None:
     try:
         path = resolve_config_path()
         path_key = str(path)
+        # Memo key = content digest, not mtime: a rewrite inside one mtime tick
+        # (coarse-granularity filesystems) kept mtime_ns and served a stale value.
         try:
-            mtime_ns: int = path.stat().st_mtime_ns
+            data = path.read_bytes()
+            mtime_ns = hashlib.sha256(data).hexdigest()
         except OSError:
+            data = None
             mtime_ns = -1
         memo = _honcho_json_timeout_memo.get(path_key)
         if memo is not None and memo[0] == mtime_ns:
             return memo[1]
 
         timeout = None
-        if mtime_ns != -1:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+        if data is not None:
+            raw = json.loads(data.decode("utf-8"))
             host_block = _host_block(raw, resolve_active_host())
             timeout = _resolve_optional_float(
                 host_block.get("timeout"),
