@@ -1354,6 +1354,16 @@ def build_cache_parity_fork(
         # if a future code path bypasses the cache.
         review_agent.session_start = agent.session_start
     review_agent.session_id = agent.session_id
+    # Slot-keyed prompt caches (xAI: x-grok-conv-id / prompt_cache_key pick
+    # ONE server-side conversation slot) must not see the fork under the
+    # parent's key — the fork's divergent bytes evict main and the parent's
+    # next call reads cold (measured 1,152 of ~356k). The resolver appends
+    # this tag to the cache scope ONLY for slot-keyed providers; content-
+    # addressed providers keep the shared scope (see
+    # agent/prompt_cache_scope.py).
+    review_agent._prompt_cache_fork_tag = (
+        "review" if write_origin == "background_review" else str(write_origin or "fork")
+    )
     # The fork shares the parent's live session_id (pinned above for
     # prefix-cache parity). It is single-lifecycle and calls close()
     # right after this run_conversation(); without opting out, close()

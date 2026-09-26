@@ -1831,7 +1831,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "link",
     "unlink",
     "claim",
-    "comment",
+    # "comment" is deliberately absent: a child may append a comment (t_70fcc2c3);
+    # kanban_db.add_comment marks the author "(subagent)".
     "attach",
     "attach-rm",
     "complete",
@@ -2467,7 +2468,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        # A delegate_task child's connection is read-only; promotion is a
+        # status mutation, so it lists the board as-is (the dispatcher promotes).
+        if not kb._is_delegated_child():
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,

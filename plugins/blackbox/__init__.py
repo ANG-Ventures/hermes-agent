@@ -102,6 +102,7 @@ def record_api_call(
     api_kwargs: Any = None,
     session_key: str | None = None,
     prefix_reset: str | None = None,
+    prefix_compare_across_turns: bool = True,
 ) -> None:
     """Persist one completion attempt when Blackbox is enabled.
 
@@ -156,6 +157,12 @@ def record_api_call(
             api_kwargs=api_kwargs,
             cache_read=canonical.cache_read_tokens if usage is not None else None,
             reset=prefix_reset,
+            prompt_tokens=(
+                canonical.input_tokens + canonical.cache_read_tokens
+                + canonical.cache_write_tokens
+                if usage is not None else None
+            ),
+            compare_across_turns=prefix_compare_across_turns,
         )
 
 
@@ -173,6 +180,8 @@ def observe_request_prefix(
     cache_read: int | None,
     reset: str | None = None,
     alert_fn: Any = None,
+    prompt_tokens: int | None = None,
+    compare_across_turns: bool = True,
 ) -> dict[str, Any] | None:
     """Prefix-stability guard entrypoint (card t_c07124ab). NEVER raises.
 
@@ -205,6 +214,8 @@ def observe_request_prefix(
             cache_read=cache_read,
             reset=reset,
             allowlist=cfg.get("prefix_guard_allowlist"),
+            prompt_tokens=prompt_tokens,
+            compare_across_turns=compare_across_turns,
         )
         violations = result.get("violations") or []
         if violations:

@@ -225,6 +225,13 @@ def _emit_api_call_record(
         # when it rewrote history on purpose. Consumed here so it tags exactly
         # the first request after the compaction.
         session_key = str(getattr(agent, "session_id", "") or "")
+        # A background-review fork shares the parent's session_id; keyed
+        # together, every fork request became the main lane's baseline and
+        # the next main request was diffed against the fork. Give forks their
+        # own chain, and start it fresh per fork turn.
+        is_review_fork = getattr(agent, "_memory_write_origin", None) == "background_review"
+        if is_review_fork and session_key:
+            session_key = f"{session_key}:review"
         prefix_reset = getattr(agent, "_blackbox_prefix_reset", None)
         if prefix_reset is not None:
             agent._blackbox_prefix_reset = None
@@ -247,11 +254,55 @@ def _emit_api_call_record(
             api_kwargs=api_kwargs if isinstance(api_kwargs, dict) else None,
             session_key=session_key or None,
             prefix_reset=str(prefix_reset) if prefix_reset else None,
+            prefix_compare_across_turns=not is_review_fork,
         )
     except Exception:
         _note_api_call_recording_failure(agent)
         logger.warning("blackbox API-call attribution insert failed", exc_info=True)
 
+
+
+def _emit_aux_api_call_record(
+    agent: Any,
+    turn_id: str,
+    *,
+    task: str,
+    provider: str,
+    model: str,
+    usage: Any,
+    api_mode: str,
+) -> None:
+    """Ledger one auxiliary-model call under the turn that made it.
+
+    Same row shape as the main-lane record, sharing the turn's sequence
+    allocator so ``(turn_id, seq)`` never collides. ``attribution='aux:<task>'``
+    makes the store tag ``lane_family='aux'``: the row is measurable per aux
+    lane but excluded from the turn's main-lane cache statistics. No sub
+    identity is known on the aux path, so ``sub_key`` stays NULL. Fail-open.
+    """
+    try:
+        if not turn_id:
+            return
+        seq = _next_api_call_seq(agent, turn_id)
+        from plugins.blackbox import record_api_call
+
+        record_api_call(
+            turn_id=turn_id,
+            seq=seq,
+            ts=time.time(),
+            provider=provider,
+            model=model,
+            usage=usage,
+            api_mode=api_mode,
+            sub_key=None,
+            attribution=f"aux:{task}",
+            http_status=200,
+            relay_synthetic=False,
+            route_id=None,
+        )
+    except Exception:
+        _note_api_call_recording_failure(agent)
+        logger.warning("blackbox aux API-call insert failed", exc_info=True)
 
 
 def _note_billed_response(agent: Any, response: Any) -> None:
@@ -3562,20 +3613,10 @@ def try_activate_fallback(
             apply_quota_gate(agent)
         except Exception:
             logger.debug("quota registry gate failed open", exc_info=True)
-    # A safety refusal (content_policy_blocked) is deterministic for the
-    # unchanged prompt, exactly like a rate-limit is deterministic for its
-    # window: restoring the primary next turn just reproduces the refusal and
-    # rebuilds the fallback's prefix cache COLD every turn. So arm the SAME
-    # primary cooldown a 429 arms — a refusal carries no reset_at, so
-    # _primary_cooldown_seconds() returns its 60s default (single source of
-    # truth; no separate constant). Keeps the session sticky on the warm
-    # fallback for the window, then re-probes the primary. Same "only when
-    # leaving the primary" guard so a chain-switch mid-fallback doesn't re-arm.
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing,
-                  FailoverReason.upstream_rate_limit, FailoverReason.content_policy_blocked}:
+    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
-        # source of the 429/refusal so the cooldown should not be reset/extended.
+        # source of the 429 so the cooldown should not be reset/extended.
         fallback_already_active = bool(getattr(agent, "_fallback_activated", False))
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
