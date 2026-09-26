@@ -9751,6 +9751,7 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
         server._sessions.pop("sid", None)
 
 
+@pytest.mark.parametrize("slow_provider_resolution", [False, True])
 @pytest.mark.parametrize(
     ("provider_flag", "failure_text"),
     [
@@ -9759,12 +9760,23 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
     ],
 )
 def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
-    monkeypatch, tmp_path, provider_flag, failure_text
+    monkeypatch, tmp_path, provider_flag, failure_text, slow_provider_resolution
 ):
     """Recovery waits for the real failed build and uses its owning profile.
 
     Both the failed and replacement generations cross the real deferred-build
     boundary. Provider resolution is the only model-switch leaf replaced.
+
+    The deferred build checks whether the persisted ``removed-provider`` is
+    still routable, and an unknown name falls through to the models.dev
+    registry. The registry is pinned empty here: conftest resets its cache per
+    test, so the real lookup did a live GET (up to 15s timeout) inside the
+    build thread, ahead of the 10s barrier below. A slow models.dev on a CI
+    runner failed the first case, and its leaked build thread then ran the
+    second case's fakes. ``slow_provider_resolution`` forces that interleaving
+    deterministically: provider resolution stalls ahead of the failure, and the
+    sequence below must be driven by the build's own events, not by how fast
+    the registry answers.
     """
     from agent.secret_scope import current_secret_scope
     from hermes_constants import get_hermes_home
@@ -9935,6 +9947,25 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
 
+    resolution_entered = threading.Event()
+    release_resolution = threading.Event()
+    network_calls = []
+
+    def fake_fetch_models_dev(*_args, **_kwargs):
+        if slow_provider_resolution and not resolution_entered.is_set():
+            resolution_entered.set()
+            assert release_resolution.wait(timeout=10)
+        return {}
+
+    def no_network(*args, **kwargs):
+        network_calls.append((args, kwargs))
+        raise AssertionError("models.dev network fetch in a hermetic test")
+
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", fake_fetch_models_dev)
+    monkeypatch.setattr(
+        "agent.models_dev._fetch_models_dev_from_network", no_network
+    )
+
     response = {}
 
     def run_request():
@@ -9958,6 +9989,11 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
     try:
         server._start_agent_build("sid", session)
         old_build_thread = session["_agent_build_thread"]
+        if slow_provider_resolution:
+            assert resolution_entered.wait(timeout=10)
+            assert not old_finally_entered.is_set()
+            assert session["agent_error"] is None
+            release_resolution.set()
         assert old_finally_entered.wait(timeout=10)
         assert session["agent_error"] == failure_text
         assert not old_ready.is_set()
@@ -10009,10 +10045,13 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
                 },
             }
         ]
+        assert network_calls == []
     finally:
+        release_resolution.set()
         release_old_finally.set()
         old_ready.set()
-        request_thread.join(timeout=10)
+        if request_thread.ident is not None:
+            request_thread.join(timeout=10)
         if old_build_thread is not None:
             old_build_thread.join(timeout=10)
         new_build_thread = session.get("_agent_build_thread")
