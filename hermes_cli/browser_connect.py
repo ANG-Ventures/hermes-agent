@@ -1173,14 +1173,6 @@ def _chrome_debug_args(port: int) -> list[str]:
     return [
         f"--remote-debugging-port={port}",
         f"--user-data-dir={chrome_debug_data_dir()}",
-        # Chrome/Chromium 111+ rejects CDP WebSocket handshakes with HTTP 403
-        # unless the connecting origin is explicitly allowed. Playwright's
-        # ``connect_over_cdp`` (used by ``/browser connect``) sends an ``Origin``
-        # header, so without this flag the attach fails on modern Chrome. The
-        # debug endpoint binds to loopback on a dedicated profile, so allowing
-        # all origins is scoped to localhost. See:
-        # https://chromium-review.googlesource.com/c/chromium/src/+/4106462
-        "--remote-allow-origins=*",
         # On macOS, a Chromium-family browser launched detached (no Aqua login
         # session — e.g. from a gateway/worker/cron) tries to read its "Safe
         # Storage" key from the macOS Keychain and throws a blocking, on-screen
@@ -1317,7 +1309,7 @@ def manual_chrome_debug_command(port: int = DEFAULT_BROWSER_CDP_PORT, system: st
         # user's screen (see _chrome_debug_args). Keep this branch in sync with it.
         return (
             f'open -a "Google Chrome" --args --remote-debugging-port={port} '
-            f'--user-data-dir="{data_dir}" --remote-allow-origins=* '
+            f'--user-data-dir="{data_dir}" '
             f'--password-store=basic --use-mock-keychain '
             f'--no-first-run --no-default-browser-check'
         )

@@ -108,6 +108,11 @@ class TestCustomProviderBaseUrlPassthrough:
         """CustomProfile.fetch_models passes base_url to super()."""
         server, port = _start_server([{"id": "ollama-model"}])
         try:
+            # ``plugins.model_providers.*`` is the alias bundled discovery
+            # registers; discovery is lazy, so run it before importing.
+            from providers import list_providers
+
+            list_providers()
             from plugins.model_providers.custom import CustomProfile
             profile = CustomProfile(
                 name="custom",

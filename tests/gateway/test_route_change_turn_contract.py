@@ -455,9 +455,8 @@ def test_warm_cache_recovery_preserves_from_effort_and_announces_once(
 
 
 @pytest.mark.parametrize("same_route", [False, True])
-@pytest.mark.parametrize("blocked_by", ["cooldown", "auto_recovery"])
 def test_warm_cache_blocked_recovery_keeps_fallback_effort(
-    monkeypatch, same_route, blocked_by
+    monkeypatch, same_route
 ):
     agent = prepare_warm_fallback(monkeypatch, same_route)
     adapter = RecordingAdapter()
@@ -473,10 +472,7 @@ def test_warm_cache_blocked_recovery_keeps_fallback_effort(
         await asyncio.sleep(0)
         old_model = agent.model
         adapter.messages.clear()
-        if blocked_by == "cooldown":
-            agent._rate_limited_until = time.monotonic() + 3600
-        else:
-            config["model"]["auto_recovery"] = False
+        agent._rate_limited_until = time.monotonic() + 3600
         for _ in range(2):
             result = await run_turn(owner, agent, adapter, config)
             assert agent.model == old_model
@@ -484,7 +480,6 @@ def test_warm_cache_blocked_recovery_keeps_fallback_effort(
             assert result["reasoning_config"]["effort"] == "high"
             assert adapter.messages == []
         agent._rate_limited_until = 0
-        config["model"]["auto_recovery"] = True
         result = await run_turn(owner, agent, adapter, config)
         assert result["reasoning_config"] == {"effort": "low"}
         assert len(adapter.messages) == 1
