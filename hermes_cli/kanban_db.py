@@ -22646,6 +22646,48 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     return Run.from_row(row) if row else None
 
 
+def explain_complete_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int] = None,
+) -> str:
+    """Why ``complete_task`` returned False, in one clause, read after the fact.
+
+    Replaces the generic "unknown id or terminal state": a worker retrying a
+    timed-out complete needs to see "already done by <who> at <when>", not
+    a guess (t_ef1ba08b).
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return "unknown id"
+    if task.status in ("done", "archived"):
+        row = conn.execute(
+            "SELECT profile, outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        who = (row["profile"] if row else None) or task.assignee or "unknown"
+        outcome = f", outcome {row['outcome']}" if row and row["outcome"] else ""
+        when = (
+            time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(task.completed_at))
+            if task.completed_at
+            else "unknown time"
+        )
+        state = "already done" if task.status == "done" else "archived (was done)" if task.completed_at else "archived"
+        return f"{state} by {who} at {when}{outcome}"
+    if task.status not in ("running", "ready", "blocked", "review"):
+        return f"status is {task.status!r}; complete needs running/ready/blocked/review"
+    if expected_run_id is not None and task.current_run_id != expected_run_id:
+        return (
+            f"run {expected_run_id} is no longer the current run "
+            f"(current: {task.current_run_id}); another run owns this card"
+        )
+    if not _parents_satisfied(conn, task_id):
+        return "a parent task is not done"
+    return f"refused while status is {task.status!r} (state changed concurrently?)"
+
+
 def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return the latest non-null ``task_runs.summary`` for ``task_id``.
 

@@ -4173,7 +4173,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 continue
             if not done:
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                print(
+                    f"cannot complete {tid}: "
+                    f"{kb.explain_complete_refusal(conn, tid, expected_run_id=_worker_run_id_for(tid))}",
+                    file=sys.stderr,
+                )
             else:
                 after = kb.get_task(conn, tid)
                 if getattr(after, "status", None) == "review":

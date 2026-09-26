@@ -2992,6 +2992,33 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
+def _pin_fallback_reasoning_effort(chain: Any, effort: str) -> Any:
+    """Copy of a job ``fallback`` chain with every EXPLICIT per-entry
+    ``reasoning_effort`` set to ``effort``; ``None`` when nothing changes.
+
+    Accepts the list form and the single-dict form the scheduler accepts
+    (``cron/scheduler.py`` job-chain resolution). Entries with no effort are
+    left as-is: they already inherit the job pin at fallback time.
+    """
+    single = isinstance(chain, dict)
+    entries = [chain] if single else chain
+    if not isinstance(entries, list):
+        return None
+    out, changed = [], False
+    for entry in entries:
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("reasoning_effort") or "").strip()
+            and entry.get("reasoning_effort") != effort
+        ):
+            entry = {**entry, "reasoning_effort": effort}
+            changed = True
+        out.append(entry)
+    if not changed:
+        return None
+    return out[0] if single else out
+
+
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
@@ -3034,6 +3061,19 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["reasoning_effort"] = _normalize_reasoning_effort(
                     updates["reasoning_effort"]
                 )
+                # The pin must govern the job's OWN fallback chain too: an
+                # entry with an explicit ``reasoning_effort`` overrides the
+                # pin on the fallback turn (chat_completion_helpers #21256),
+                # so `cron edit --reasoning-effort low` used to leave xhigh
+                # fallbacks running xhigh (t_ef1ba08b). Setting a pin rewrites
+                # explicit entry values; entries without one already inherit.
+                # Clearing (None) leaves entries alone; the CLI reports them.
+                if updates["reasoning_effort"] is not None and "fallback" not in updates:
+                    _fb = _pin_fallback_reasoning_effort(
+                        job.get("fallback"), updates["reasoning_effort"]
+                    )
+                    if _fb is not None:
+                        updates["fallback"] = _fb
 
             # Normalize repeat the same way create_job does. Callers pass
             # either the stored dict shape ({"times": N, "completed": M}) or
