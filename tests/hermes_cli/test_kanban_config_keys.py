@@ -70,6 +70,19 @@ def kanban_keys_read(source: str) -> set[str]:
         bound = isinstance(recv, ast.Name) and recv.id in names
         if (bound or _is_get(recv, "kanban")) and node.args[0].value != "kanban":
             keys.add(node.args[0].value)
+    # #1075 routes the board-scoped review knobs through
+    # ``_kanban_review_setting("<key>", default)`` (board home -> profile
+    # config) instead of a direct ``.get`` -- the key is still a kanban.* key.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_kanban_review_setting"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            keys.add(node.args[0].value)
     return keys
 
 
