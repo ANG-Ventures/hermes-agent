@@ -826,6 +826,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 base_url=params.get("base_url"),
                 ollama_num_ctx=params.get("ollama_num_ctx"),
                 session_id=params.get("session_id"),
+                cache_scope_id=params.get("cache_scope_id"),
                 bridge_route_suffix=params.get("bridge_route_suffix"),
             )
         )

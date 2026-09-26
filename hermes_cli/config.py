@@ -4303,7 +4303,30 @@ def load_env() -> Dict[str, str]:
     if cache_key is not None:
         _env_cache = (cache_key, dict(env_vars))
 
+    try:
+        from hermes_cli.env_loader import note_dotenv_values
+
+        note_dotenv_values(env_path, env_vars)
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a read
+        pass
+
     return env_vars
+
+
+def dotenv_revoked(key: str, fallback: Optional[str]) -> bool:
+    """True when ``fallback`` for ``key`` is a value the active ``.env`` dropped.
+
+    Removing (or blanking) a credential line in ``.env`` revokes it for the
+    running process on the next read, the same way editing the value rotates
+    it.  Only values that demonstrably came from that file are revoked; a
+    shell/systemd export or external-secret value is left alone.
+    """
+    try:
+        from hermes_cli.env_loader import dotenv_value_revoked
+
+        return dotenv_value_revoked(get_env_path(), key, fallback or "")
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # Module-level memo for load_env(), keyed on (path, mtime, size).
@@ -4782,14 +4805,19 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
             get_secret as _get_secret,
         )
     except Exception:
-        return os.environ.get(key)
-
-    try:
-        return _get_secret(key)
-    except UnscopedSecretError:
-        raise
-    except Exception:
-        return os.environ.get(key)
+        fallback = os.environ.get(key)
+    else:
+        try:
+            fallback = _get_secret(key)
+        except UnscopedSecretError:
+            raise
+        except Exception:
+            fallback = os.environ.get(key)
+    # A value the .env used to carry and no longer does is revoked, not
+    # resurrected from the copy the load left behind (t_8dccb8ef).
+    if fallback and dotenv_revoked(key, fallback):
+        return None
+    return fallback
 
 
 # =============================================================================
