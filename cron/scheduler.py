@@ -940,6 +940,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
+    LATE_FIRE_KEY,
     AmbiguousJobReference,
     _ensure_cron_dir,
     advance_next_run,
@@ -5031,6 +5032,14 @@ def _run_job_script(
                 "errors": "replace",
             }
         env = build_subprocess_env()
+        # A script child is a plain script, not an agent process. The gateway
+        # advertises itself via AI_AGENT / HERMES_AGENT in its OWN os.environ
+        # (gateway.run.main), so without this every cron script inherited the
+        # agent marker and fleet tooling keyed on it (the gh shim's profile-wins
+        # lane resolution) misclassified laned no_agent crons as the gateway
+        # profile (t_7fee0f83). Any agent a script launches re-advertises itself.
+        for _agent_marker in ("AI_AGENT", "HERMES_AGENT"):
+            env.pop(_agent_marker, None)
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
@@ -5261,6 +5270,11 @@ def _build_job_prompt(
     user_prompt = str(job.get("prompt") or "")
     if extra_prompt:
         user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
+    # One-shot fired late by the restart catch-up (t_9bfdd7e3): say so up
+    # front so the agent re-checks a time-sensitive action before taking it.
+    from cron.jobs import late_fire_note
+    if job.get(LATE_FIRE_KEY):
+        user_prompt = f"{late_fire_note(job[LATE_FIRE_KEY])}\n\n{user_prompt}"
     prompt = user_prompt
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
@@ -7037,6 +7051,15 @@ def run_job(
                 resolve_exc,
             )
             fb_list = get_fallback_chain(_cfg)
+            # A job that declares its OWN ``fallback`` chain must get that chain
+            # here too, not only mid-run. Otherwise a primary that fails at
+            # resolve time (e.g. "Codex credential is in cooldown") walks the
+            # GLOBAL chain and the job's declared, pool-diverse net is never
+            # consulted (debug-log-analysis / weekly-pr-sweep: codex cooldown ->
+            # global claude-bpr rung -> HTTP 503 "no eligible sub", 2026-09-21).
+            # Jobs without their own chain keep the global chain unchanged.
+            if job.get("fallback"):
+                fb_list = _resolve_job_fallback_chain(job, fb_list, job_id) or []
             runtime = None
             for entry in fb_list:
                 if not isinstance(entry, dict):
@@ -7217,12 +7240,6 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
-        # Keep execution identity separate from delivery routing: these fields
-        # label the cron job in telemetry; origin/targets still drive delivery.
-        _cron_chat_id = str(job_id or "").strip()
-        _cron_job_name = str(job.get("name") or "").strip()
-        _cron_chat_label = _cron_job_name or _cron_chat_id
-        _cron_chat_name = f"cron / {_cron_chat_label}" if _cron_chat_label else ""
         # Initialize the SQLite session store so cron job messages are
         # persisted and discoverable via session_search (same pattern as
         # gateway/run.py) — only now, after every early-return path
@@ -7310,8 +7327,6 @@ def run_job(
             skip_memory=False,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
-            chat_id=_cron_chat_id or "",
-            chat_name=_cron_chat_name or "",
             session_id=_cron_session_id,
             session_db=_session_db,
         )
@@ -8825,6 +8840,39 @@ _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
 _last_dead_owner_reap_at: Optional[float] = None
 
 
+def _deliver_missed_oneshot_notices(adapters=None, loop=None) -> int:
+    """Deliver queued MISSED notices for one-shots the due-scan retired.
+
+    The due-scan runs under the jobs lock and only queues them; delivery is
+    framed as a failure (success=False) to the job's own deliver target so a
+    one-shot that never ran is loud, not a success-looking line in
+    cron/output. Best-effort: delivery errors are logged, never raised.
+    """
+    from cron.jobs import drain_missed_oneshot_notices
+
+    delivered = 0
+    for notice in drain_missed_oneshot_notices():
+        job = notice.get("job") or {}
+        try:
+            err = _deliver_result(
+                job, notice.get("text") or "", success=False,
+                adapters=adapters, loop=loop,
+            )
+            if err:
+                logger.error(
+                    "Job '%s': MISSED one-shot notice failed to deliver: %s",
+                    job.get("id", "?"), err,
+                )
+            else:
+                delivered += 1
+        except Exception as exc:
+            logger.error(
+                "Job '%s': MISSED one-shot notice delivery raised: %s",
+                job.get("id", "?"), exc,
+            )
+    return delivered
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -8954,6 +9002,7 @@ def tick(
                 logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 
         due_jobs = get_due_jobs()
+        _deliver_missed_oneshot_notices(adapters=adapters, loop=loop)
 
         # Bound the in-flight set BEFORE the dedup guard is consulted, so a
         # leaked claim is force-released in-cycle rather than silently eating
@@ -9057,6 +9106,10 @@ def tick(
             # compatible; real callers using return_job=True never take it.
             claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
             claimed_job["execution_id"] = job["execution_id"]
+            # The persisted record the CAS returns never carries the transient
+            # late-fire stamp from the due-scan; carry it across.
+            if job.get(LATE_FIRE_KEY):
+                claimed_job[LATE_FIRE_KEY] = job[LATE_FIRE_KEY]
             return run_one_job(
                 claimed_job,
                 adapters=adapters,

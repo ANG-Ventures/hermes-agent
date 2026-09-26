@@ -338,11 +338,12 @@ def _subdirs(here):
     return children, ".git" in names
 
 
-def _walk(workspace):
+def _walk(workspace, prune=None):
     """Directories under ``workspace``, pruned and bounded; depth-first.
 
     Yields ``(path, is_repo)``. Raises :class:`SurvivorUnavailable` rather than
-    running forever when the tree exceeds the entry budget.
+    running forever when the tree exceeds the entry budget. ``prune`` (see
+    :class:`_ForeignNested`) drops subtrees owned by ANOTHER card.
     """
     budget = _walk_budget()
     visited = 0
@@ -354,7 +355,7 @@ def _walk(workspace):
             raise _over_budget("repository enumeration", workspace, visited, budget)
         children, is_repo = _subdirs(here)
         yield here, is_repo
-        stack.extend(children)
+        stack.extend(c for c in children if not (prune and prune(c)))
 
 
 def _dangling_gitfile(path):
@@ -386,9 +387,72 @@ def _dangling_gitfile(path):
         return False
 
 
-def _repos(workspace):
+def _repos(workspace, prune=None):
     """Find repos created inside scratch, including linked worktrees; no symlinks."""
-    found = [here for here, is_repo in _walk(workspace) if is_repo]
+    return _with_enclosing(workspace, [here for here, is_repo in _walk(workspace, prune) if is_repo])
+
+
+def _covering_repos(workspace, claims, bases):
+    """Repositories that hold the card's claimed paths or its recorded bases.
+
+    Found without walking: each claim is followed DOWN from ``workspace`` one
+    component at a time, never through a symlink or a derived directory (the
+    same rules as :func:`_walk`), and every repository on that path counts --
+    so a claim inside a repo nested in the root yields both, and the nested
+    refusal in :func:`preserve` fires exactly as it would after a full walk.
+    """
+    found = []
+    targets = [Path(os.path.normpath(workspace / key)) for key in bases]
+    for claim in [*claims, *targets]:
+        try:
+            parts = claim.relative_to(workspace).parts
+        except ValueError:
+            continue
+        here = workspace
+        for part in parts:
+            here = here / part
+            if part in (".git", *_DERIVED_DIRS) or here.is_symlink() or not here.is_dir():
+                break
+            if _is_repo_on_disk(here) and here not in found:
+                found.append(here)
+    return found
+
+
+def _dir_repos(workspace, foreign, bases):
+    """``_repos`` for the completion pass of a shared ``dir`` workspace.
+
+    A ``dir`` workspace rooted at a shared home cannot be enumerated inside the
+    budget even after :class:`_ForeignNested` prunes every other card's
+    subtree (t_67f7a89c: ``~/.hermes`` walked 94,906 directories in 60 s cold
+    after pruning 1,627 foreign ones, and found ONE repository -- the root).
+    On that pass only, running out of budget is not a refusal: the result is
+    what the walk found before stopping, plus every repository covering the
+    card's own ``changed_files`` and recorded ``bases``, plus the root.
+
+    Fail-closed on the card's own work is kept: a claimed path's repository is
+    always captured (and a nested one still refuses), and Git's registered
+    worktrees/submodules were already checked in full before this runs. What
+    is given up is an unclaimed, unregistered hand clone beyond the budget --
+    and this pass never deletes a ``dir`` workspace (the verified-survivor
+    branch of :func:`preserve` already skips discovery entirely for the same
+    reason). The ``cleanup=True`` pass keeps the strict walk.
+    """
+    found = []
+    try:
+        for here, is_repo in _walk(workspace, foreign.prune):
+            if is_repo:
+                found.append(here)
+    except SurvivorUnavailable as exc:
+        log.warning("kanban survivor: %s scoping dir enumeration to claimed repositories: %s",
+                    foreign.own, exc)
+        if (workspace / ".git").exists() and workspace not in found:
+            found.insert(0, workspace)
+        found.extend(r for r in _covering_repos(workspace, foreign.claimed, bases) if r not in found)
+    return _with_enclosing(workspace, found)
+
+
+def _with_enclosing(workspace, found):
+    """Add ``workspace`` itself when an enclosing repository tracks files in it."""
     enclosing = next((p for p in (workspace, *workspace.parents) if (p / ".git").exists()), None)
     if workspace not in found and enclosing is not None:
         # Probe before inspecting: a scratch workspace under the tripwire
@@ -433,6 +497,121 @@ def _is_repo_on_disk(path):
     try:
         return (path / ".git").exists()
     except OSError:
+        return False
+
+
+_TASK_ID_RE = re.compile(r"(?<![0-9a-z])t_[0-9a-f]{8}(?![0-9a-f])")
+
+
+class _ForeignNested:
+    """Ownership filter for nested repos inside a SHARED ``dir`` workspace.
+
+    A ``dir`` workspace rooted at a shared tree (``~/.hermes``) contains other
+    cards' checkouts -- argus review worktrees under
+    ``.worktrees/argus/<task>-r2``, scratch workspaces under
+    ``kanban/workspaces/<task>`` -- and ``_registered_nested`` refused on the
+    first one it met, so every card with that workspace was HELD for a repo it
+    never touched (t_10e7c7ad: 5 cards on 2026-09-25, all
+    ``.worktrees/argus/t_0c1ebbae-r2``).
+
+    A directory is FOREIGN when, and only when, positive evidence names a
+    different owner:
+
+      * it is another task's recorded ``workspace_path``;
+      * its name carries another task's id (``t_<8 hex>``) and not this one's;
+      * it is ``.worktrees/<profile>`` for a profile other than this card's
+        assignee that has worked this board (a profile's review area);
+      * it is a repository whose ``.git`` was created BEFORE this card was
+        (the card cannot have made it). Birth time where the OS records it,
+        else ctime -- which is never earlier than birth, so the fallback can
+        only under-skip.
+
+    A path that holds (or lies inside) one of the card's own ``changed_files``
+    is never foreign: the card claimed work there, so it is scanned and fails
+    closed as before. So is anything with no evidence either way -- a clone
+    made after the card was created, a worktree called ``nested``.
+
+    Only :func:`preserve` on the completion pass (``cleanup=False``) of a
+    ``dir`` workspace uses this. That pass never deletes the directory (a
+    shared dir is never removed at completion), so skipping another card's
+    subtree cannot hand its bytes to a reaper; the ``cleanup=True`` pass
+    stays strict.
+    """
+
+    def __init__(self, conn, task, workspace, changed=()):
+        self.own = task.id
+        self.workspace = workspace
+        self.created_at = task.created_at
+        self.claimed = []
+        for name in changed:
+            try:
+                claim = Path(name) if Path(name).is_absolute() else workspace / name
+                self.claimed.append(Path(os.path.normpath(claim)))
+            except (TypeError, ValueError):
+                continue
+        self.skipped = {}
+        self.others = {}
+        for tid, path in conn.execute(
+            "SELECT id, workspace_path FROM tasks WHERE workspace_path IS NOT NULL AND id != ?",
+            (task.id,),
+        ):
+            try:
+                resolved = Path(path).resolve()
+            except (OSError, ValueError):
+                continue
+            if resolved != workspace and resolved.is_relative_to(workspace):
+                self.others[resolved] = tid
+        self.profiles = {a for (a,) in conn.execute(
+            "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL")} - {task.assignee}
+
+    def _owner(self, path):
+        """Foreign owner of ``path`` alone (ancestors not consulted), or None."""
+        ids = set(_TASK_ID_RE.findall(path.name))
+        if self.own in ids or any(c.is_relative_to(path) for c in self.claimed):
+            return None
+        if path in self.others:
+            return f"task {self.others[path]}"
+        if ids:
+            return f"task {sorted(ids)[0]}"
+        if path.parent.name == ".worktrees" and path.name in self.profiles:
+            return f"profile {path.name}"
+        if self.created_at:
+            try:
+                st = (path / ".git").stat()
+            except OSError:
+                return None
+            born = getattr(st, "st_birthtime", None) or st.st_ctime
+            if born < self.created_at:
+                return "a repository that predates the card"
+        return None
+
+    def _note(self, path, owner):
+        if path not in self.skipped:
+            self.skipped[path] = owner
+            log.info("kanban survivor: %s skips %s (owned by %s)", self.own, path, owner)
+        return True
+
+    def prune(self, path):
+        """Walk filter: True drops ``path``'s subtree. Ancestors already vetted."""
+        owner = self._owner(path)
+        return self._note(path, owner) if owner else False
+
+    def foreign(self, path):
+        """True when ``path`` or any ancestor below the workspace is foreign."""
+        try:
+            parts = path.relative_to(self.workspace).parts
+        except ValueError:
+            return False
+        here = self.workspace
+        for part in parts:
+            here = here / part
+            if self.own in _TASK_ID_RE.findall(part) or \
+                    any(c.is_relative_to(here) for c in self.claimed):
+                return False
+            owner = self._owner(here)
+            if owner:
+                self._note(path, owner)
+                return True
         return False
 
 
@@ -1693,7 +1872,7 @@ def _reusable(previous):
     return previous if _bound(previous) else None
 
 
-def _loose_files(workspace, repos):
+def _loose_files(workspace, repos, prune=None):
     """True when the workspace holds entries outside every repository.
 
     A remote ref vouches only for the repositories it was resolved from; files
@@ -1739,7 +1918,7 @@ def _loose_files(workspace, repos):
                     children.append(Path(entry.path))
                 continue
             return True
-        stack.extend(children)
+        stack.extend(c for c in children if not (prune and prune(c)))
     return False
 
 
@@ -2277,14 +2456,34 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         # repo proves nothing (a hand-made clone is in neither registry), so
         # that case falls through to the bounded walk exactly as before.
         stage = "registered nested repository scan"
+        foreign = None
+        if task.workspace_kind == "dir" and not cleanup:
+            changed = list((metadata or {}).get("changed_files") or ())
+            for (raw,) in conn.execute("SELECT metadata FROM task_runs WHERE task_id = ? "
+                                       "AND metadata IS NOT NULL", (task_id,)):
+                changed.extend(json.loads(raw).get("changed_files") or ())
+            foreign = _ForeignNested(conn, task, workspace,
+                                     [c for c in changed if isinstance(c, str)])
+        prune = foreign.prune if foreign else None
         registered = _registered_nested(workspace)
+        if foreign:
+            registered = [path for path in registered if not foreign.foreign(path)]
         if registered:
             raise SurvivorUnavailable(
                 "survivor_unavailable: nested repository requires separate recovery "
                 f"({str(registered[0].relative_to(workspace))})"
             )
         stage = "_repos workspace scan"
-        repos = _repos(workspace)
+        repos = _dir_repos(workspace, foreign, bases) if foreign else _repos(workspace)
+        if foreign:
+            repos = [repo for repo in repos if not foreign.foreign(repo)]
+            if foreign.skipped:
+                log.warning(
+                    "kanban survivor: %s skipped %d nested path(s) owned by other cards: %s",
+                    task_id, len(foreign.skipped),
+                    ", ".join(f"{p.relative_to(workspace)} ({o})"
+                              for p, o in list(foreign.skipped.items())[:5]),
+                )
         if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
             # A patch cannot add a gitlink and files below the same path.
             raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
@@ -2498,7 +2697,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # Nothing in-tree to capture: the survivor must live elsewhere. An
             # inferred one vouches only for the repositories it came from, so
             # files beside them make the inference worthless -- HOLD instead.
-            loose = _loose_files(workspace, repos)
+            loose = _loose_files(workspace, repos, prune) if prune else _loose_files(workspace, repos)
             external = _external(conn, task_id, metadata, evidence, _remote_urls(repos), explicit,
                                  discover=not loose, cleanup=cleanup, previous=None if loose else previous)
             if external:

@@ -1,17 +1,17 @@
 name: Label rerun
 
-# When the ``ci-reviewed`` label is added to a PR, rerun all failed jobs in
-# the latest CI run. This re-evaluates ``review-labels`` (which now sees the
-# label) and GitHub reruns the dependent ``all-checks-pass`` gate.
+# When the ``ci-reviewed`` label is added to a PR, rerun the latest CI run.
+# This re-evaluates ``review-labels`` (which now sees the label) and the
+# dependent ``all-checks-pass`` gate. Failed-only reruns of CI's dynamic
+# matrix can fail at startup before creating any jobs.
 #
 # ``gh run rerun`` only works on a completed run. Thus this waits when the
 # run is still in progress. The wait is now short. The two slowest jobs are
 # the 40-minute comment poller and the 45-minute image build. Each one moved
 # to its own workflow, so a CI run ends when its required jobs end.
 #
-# The review comment updates without help. The poller in
-# ci-review-comment.yml watches the CI run through the API. It gets the
-# rerun results.
+# The live review-comment poller (ci-review-comment.yml) was retired on
+# 2026-09-25 (CI efficiency spec L10); it had been disabled since before then.
 
 on:
   pull_request:
@@ -32,18 +32,17 @@ jobs:
     # Pure API poller (`gh run watch` for up to 35 min) — it never checks out
     # or builds the repo, so it must NOT take a self-hosted runner slot: on a
     # small self-hosted pool it sits on one runner waiting for the very CI run
-    # that pool is trying to finish. Pin to GitHub-hosted, same as
-    # ci-review-comment.yml.
+    # that pool is trying to finish. Pin to GitHub-hosted.
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - name: Wait for CI run to finish, then rerun failed jobs
+      - name: Wait for CI run to finish, then rerun CI
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
           # Find the latest CI run for this PR's head SHA.
           RUN_INFO=$(gh run list \
@@ -76,7 +75,7 @@ jobs:
             echo "Run is $STATUS — waiting for completion (this may take a while)..."
             # gh run watch --exit-status exits non-zero if the run fails,
             # which is expected (the label gate fails). Don't let that kill
-            # the workflow — we WANT to rerun failed jobs.
+            # the workflow — we WANT to rerun the completed run.
             timeout 2100 gh run watch "$RUN_ID" --repo "$REPO" --interval 15 || true
 
             # Verify it's actually completed now.
@@ -87,6 +86,6 @@ jobs:
             fi
           fi
 
-          echo "Run completed. Rerunning all failed jobs..."
-          gh run rerun "$RUN_ID" --repo "$REPO" --failed || true
-          echo "Done. GitHub will rerun review-labels and all dependent jobs."
+          echo "Run completed. Rerunning CI..."
+          gh run rerun "$RUN_ID" --repo "$REPO"
+          echo "Done. GitHub will rerun all CI jobs, including review-labels."

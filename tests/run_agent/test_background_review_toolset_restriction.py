@@ -40,6 +40,7 @@ def _make_agent_stub(agent_cls):
     # Non-None so the test catches a missing-kwarg regression.
     agent.enabled_toolsets = ["memory", "skills", "terminal"]
     agent.disabled_toolsets = ["spotify", "feishu_doc"]
+    agent.tools = []
     return agent
 
 

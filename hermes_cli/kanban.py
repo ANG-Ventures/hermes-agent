@@ -420,6 +420,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument("--body-file", default=None, metavar="PATH",
+                          help="Read the opening post from PATH ('-' = stdin). Use this instead of --body for text with backticks or $(...): the shell never sees it.")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -803,7 +805,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
     p_comment.add_argument("task_id")
-    p_comment.add_argument("text", nargs="+", help="Comment body")
+    p_comment.add_argument("text", nargs="*", help="Comment body (or use --body-file)")
+    p_comment.add_argument("--body-file", default=None, metavar="PATH",
+                           help="Read the comment body from PATH ('-' = stdin). Use this for "
+                                "text with backticks or $(...): the shell never sees it.")
     p_comment.add_argument("--author", default=None,
                            help="Author name (default: $HERMES_PROFILE or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
@@ -1261,6 +1266,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "'wake' (wake the agent only, no passive message). Omit to leave an "
              "existing subscription's mode unchanged (new subs default to 'notify').",
     )
+    p_nsub.add_argument(
+        "--wake",
+        action="store_true",
+        help="Shorthand for --delivery-mode notify+wake. Wake is opt-in only: "
+             "each wake is a full agent turn that queues the human's messages.",
+    )
 
     p_nlist = sub.add_parser(
         "notify-list",
@@ -1459,7 +1470,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Kyzcreig/* GitHub URLs the clone uses --reference-if-able "
             "against a bare mirror under <hermes root>/mirrors/, created "
             "lazily, so the checkout stores only objects the mirror lacks. "
-            "Other URLs are cloned normally. Common git-clone options "
+            "A local-path source is cloned with --no-local (never "
+            "hard-linked), borrowing from its origin's mirror when that is a "
+            "fleet repo. Other URLs are cloned normally. Common git-clone options "
             "(-q, -b, --depth, --filter, --no-checkout, --single-branch, "
             "--no-tags, --origin, ...) are forwarded."
         ),
@@ -1479,6 +1492,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_hl.add_argument("--dry-run", action="store_true",
                       help="With --backfill: list what would be stamped")
     p_hl.add_argument("--json", action="store_true")
+    p_hl.add_argument("--open-prs", action="store_true",
+                      help="List done cards (last 7 days) whose result names a "
+                           "still-OPEN GitHub PR (exit 1 when any)")
 
     # --- repair ---
     p_repair = sub.add_parser(
@@ -2258,6 +2274,18 @@ def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
         return False
 
 
+def _read_body_file(path: str) -> str:
+    """Read a card/comment body from ``path`` (``-`` = stdin).
+
+    Shell callers pass markdown through ``--body-file`` / a quoted heredoc
+    instead of a double-quoted argv string, where backticks and ``$(...)``
+    are executed by the shell as command substitution (t_f7e11e44).
+    """
+    if path == "-":
+        return sys.stdin.read()
+    return Path(path).expanduser().read_text(encoding="utf-8")
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_worker_policy as _kwp
 
@@ -2275,6 +2303,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
         return 2
+    body_file = getattr(args, "body_file", None)
+    if body_file is not None:
+        if args.body is not None:
+            print("kanban: --body and --body-file are mutually exclusive", file=sys.stderr)
+            return 2
+        try:
+            args.body = _read_body_file(body_file)
+        except OSError as exc:
+            print(f"kanban: --body-file: {exc}", file=sys.stderr)
+            return 2
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
@@ -2484,6 +2522,19 @@ def _cmd_home_lint(args: argparse.Namespace) -> int:
     Designed for a no_agent cron (empty stdout = nothing delivered). With
     ``--backfill`` stamps the stragglers ``unhomed`` and exits 0.
     """
+    if getattr(args, "open_prs", False):
+        from hermes_cli import kanban_open_pr
+        with kb.connect_closing() as conn:
+            hits = kanban_open_pr.find_done_with_open_pr(conn)
+        if args.json:
+            print(json.dumps({"done_with_open_pr": hits}))
+        else:
+            for hit in hits:
+                print(
+                    f"kanban home-lint: {hit['id']} is DONE but names OPEN PR(s) "
+                    f"{', '.join(hit['open_prs'])} -- {hit['title']}"
+                )
+        return 1 if hits else 0
     with kb.connect_closing() as conn:
         if getattr(args, "backfill", False):
             ids = kb.backfill_unhomed(conn, dry_run=bool(args.dry_run))
@@ -3789,8 +3840,13 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        claim = kb.claim_review_task if args.review else kb.claim_task
-        task = claim(conn, args.task_id, ttl_seconds=args.ttl)
+        if args.review:
+            task = kb.claim_review_task(
+                conn, args.task_id, ttl_seconds=args.ttl,
+                session_ref=_operator_review_session_ref(),
+            )
+        else:
+            task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -3831,7 +3887,24 @@ def _cmd_comment(args: argparse.Namespace) -> int:
       Saying "unknown" is the honest answer, and it is what the tri-state
       contract elsewhere in this codebase already does.
     """
-    body = " ".join(args.text).strip()
+    body_file = getattr(args, "body_file", None)
+    if body_file is not None and args.text:
+        print("kanban: pass the comment as TEXT or --body-file, not both", file=sys.stderr)
+        return 2
+    if body_file is None and not args.text:
+        print("kanban: comment body required (TEXT or --body-file)", file=sys.stderr)
+        return 2
+    if body_file is not None:
+        try:
+            body = _read_body_file(body_file).strip()
+        except OSError as exc:
+            print(f"kanban: --body-file: {exc}", file=sys.stderr)
+            return 2
+    else:
+        body = " ".join(args.text).strip()
+    if not body:
+        print("kanban: comment body is empty", file=sys.stderr)
+        return 2
     if args.max_len is not None:
         if args.max_len < 1:
             print("kanban: --max-len must be positive", file=sys.stderr)
@@ -3842,6 +3915,10 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     author = args.author or _profile_author()
     run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
+        if run_id is None:
+            # Human review lane: the session holding ``claim --review`` on this
+            # card attests to that review run (the claim is the provenance).
+            run_id = _operator_review_run_id(conn, args.task_id)
         kb.add_comment(
             conn, args.task_id, author, body,
             run_id=run_id, session_ref=session_ref,
@@ -3926,6 +4003,37 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
         return 1
     print(f"Deleted attachment {args.attachment_id} ({removed.filename}) from {removed.task_id}")
     return 0
+
+
+def _operator_review_session_ref() -> Optional[str]:
+    """Session fingerprint that may bind / use a human-lane review claim.
+
+    ``None`` (never bindable) for a delegate_task child, for anything inside a
+    cron job (in-process context flag or a ``cron_*`` session id), and for a
+    caller with no session at all: those cannot prove they are the reviewer
+    session, so they get no review run from :func:`_operator_review_run_id`.
+    """
+    try:
+        from agent.delegation_context import (
+            _NON_DISPATCHER_OWNED_CONTEXT,
+            is_delegated_child_process_context,
+        )
+
+        if is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get():
+            return None
+    except Exception:
+        return None
+    session_id = _caller_session_id()
+    if not session_id or session_id.startswith("cron_"):
+        return None
+    return kb.derive_session_ref(session_id)
+
+
+def _operator_review_run_id(conn, task_id: str) -> Optional[int]:
+    """The active review run on ``task_id`` iff THIS session claimed it."""
+    return kb.review_claim_run_for_session(
+        conn, task_id, _operator_review_session_ref(),
+    )
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
@@ -4063,7 +4171,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
-                print(f"Completed {tid}")
+                after = kb.get_task(conn, tid)
+                if getattr(after, "status", None) == "review":
+                    print(f"Routed {tid} to review (handoff names a still-OPEN PR; not done)")
+                else:
+                    print(f"Completed {tid}")
     return 0 if not failed else 1
 
 
@@ -4387,21 +4499,30 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
+        # The caller must hold the review run: as its dispatcher-owned worker,
+        # or as the operator session that made ``claim --review`` (human lane).
+        worker_run = _worker_run_id_for(tid)
+        held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
+        if held_run is None:
+            print(
+                f"cannot request changes for {tid}: this session does not hold its "
+                f"review run; claim it from the reviewing session first "
+                f"(hermes kanban claim {tid} --review). Delegate children and "
+                f"cron jobs cannot hold a human-lane review claim.",
+                file=sys.stderr,
+            )
+            return 1
         if args.coverage is not None:
-            task = kb.get_task(conn, tid)
-            if task is None or task.status != "running" or task.current_run_id is None:
-                print(f"cannot record coverage for {tid}: no active review run", file=sys.stderr)
-                return 1
             kb.add_comment(
                 conn, tid, _profile_author(),
                 "review_coverage: " + str(kb.redact_review_value(args.coverage)),
-                run_id=task.current_run_id,
+                run_id=held_run,
             )
         ok, detail = kb.request_changes(
             conn,
             tid,
             reason=reason,
-            expected_run_id=_worker_run_id_for(tid),
+            expected_run_id=held_run,
         )
         if not ok:
             print(
@@ -4409,6 +4530,17 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        if worker_run is None:
+            # Human lane: the implementer resumes from the thread, so the
+            # verdict lands there as the rework comment (the run summary
+            # carries it too).
+            _unused_run, session_ref = safe_comment_provenance(tid)
+            kb.add_comment(
+                conn, tid, _profile_author(),
+                "changes requested (human review lane): "
+                + str(kb.redact_review_value(reason)),
+                run_id=held_run, session_ref=session_ref,
+            )
         print(
             f"Requested changes for {tid}"
             + (f"; routed to {detail}" if detail else "")
@@ -5255,7 +5387,10 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             thread_id=args.thread_id, user_id=args.user_id,
             user_id_alt=getattr(args, "user_id_alt", None),
             notifier_profile=args.notifier_profile or _profile_author(),
-            delivery_mode=getattr(args, "delivery_mode", None),
+            delivery_mode=(
+                getattr(args, "delivery_mode", None)
+                or ("notify+wake" if getattr(args, "wake", False) else None)
+            ),
         )
     print(f"Subscribed {args.platform}:{args.chat_id}"
           + (f":{args.thread_id}" if args.thread_id else "")

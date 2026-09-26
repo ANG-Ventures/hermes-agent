@@ -1873,6 +1873,10 @@ def create_board(
     return meta
 
 
+# Phantom board dirs already warned about in this process (see list_boards).
+_PHANTOM_BOARD_WARNED: set[str] = set()
+
+
 def _board_db_is_empty(db_path: Path) -> bool:
     """Return True if ``db_path`` is a kanban DB holding zero tasks.
 
@@ -1957,13 +1961,18 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 # is genuinely empty; a dir with real cards is someone's data and
                 # must stay visible even if board.json was lost.
                 if has_db and not has_meta and _board_db_is_empty(child / "kanban.db"):
-                    _log.warning(
-                        "kanban: ignoring phantom board dir %s (kanban.db with 0 "
-                        "tasks and no board.json). If this slug was renamed, add "
-                        "it to %s; otherwise remove the directory.",
-                        child,
-                        board_aliases_path(),
-                    )
+                    # Warn once per process per dir: list_boards() runs on every
+                    # watcher/dispatcher tick (~5 s), and an unchanged phantom
+                    # repeating forever buried real errors in the gateway log.
+                    if str(child) not in _PHANTOM_BOARD_WARNED:
+                        _PHANTOM_BOARD_WARNED.add(str(child))
+                        _log.warning(
+                            "kanban: ignoring phantom board dir %s (kanban.db with 0 "
+                            "tasks and no board.json). If this slug was renamed, add "
+                            "it to %s; otherwise remove the directory.",
+                            child,
+                            board_aliases_path(),
+                        )
                     continue
                 meta = read_board_metadata(normed)
                 if meta.get("archived") and not include_archived:
@@ -8365,8 +8374,14 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    session_ref: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
+
+    ``session_ref`` binds the review run to the operator session that made the
+    claim (``hermes kanban claim <id> --review``). It must be derived from
+    trusted runtime context by the caller, never from model-supplied args; see
+    :func:`review_claim_run_for_session` for the only reader.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``review`` status).
@@ -8454,10 +8469,48 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review",
+             **({"session_ref": session_ref} if session_ref else {})},
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def review_claim_run_for_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    session_ref: Optional[str],
+) -> Optional[int]:
+    """Return the active review run id iff ``session_ref`` made its claim.
+
+    The human review lane claims from one CLI process and comments / returns
+    work from later ones, so the dispatcher env never attests to that run. The
+    claim is the provenance instead: only the session recorded on the current
+    run's ``claimed`` event (``source_status=review``) gets the run id back.
+    ``None`` for any other session, a sessionless claim, or a card that is not
+    in an active review run.
+    """
+    if not session_ref:
+        return None
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running" or row["current_run_id"] is None:
+        return None
+    run_id = int(row["current_run_id"])
+    event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        payload = json.loads(event["payload"]) if event and event["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("source_status") != "review":
+        return None
+    return run_id if payload.get("session_ref") == session_ref else None
 
 
 def _retry_status_for_run(
@@ -9218,6 +9271,32 @@ def complete_task(
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
+    # A completion whose evidence names a still-OPEN PR is a review handoff,
+    # not ``done``: done releases dependants, and an unmerged PR has no owner
+    # once the card is terminal (t_1bd02e0b, 2026-09-25). A card already in
+    # ``review`` is a reviewer/human approval and is left alone.
+    if candidate.status != 'review':
+        from hermes_cli import kanban_open_pr as _open_pr
+        still_open = _open_pr.open_pr_refs(
+            result, summary, metadata=metadata, survivor_pr=survivor_pr,
+        )
+        if still_open:
+            note = _open_pr.route_note(still_open)
+            routed_meta = dict(metadata or {}, auto_routed_open_prs=[
+                f"{r.repo}#{r.number}" for r in still_open
+            ])
+            routed_summary = "\n".join(filter(None, [note, summary or result]))
+            ok = request_review(
+                conn, task_id, summary=routed_summary, metadata=routed_meta,
+                expected_run_id=expected_run_id, force=True,
+            )
+            if ok:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_routed_to_review",
+                        {"open_prs": routed_meta["auto_routed_open_prs"], "note": note},
+                    )
+            return bool(ok)
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,
@@ -9653,11 +9732,26 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
         home = kanban_home()
     except OSError:
         home = None
+    # ``kanban.workspaces_root`` (e.g. a RAM-disk mount) places scratch dirs
+    # at ``<root>/<board>/<task>``. Those per-board roots are managed exactly
+    # like the legacy ones; the configured root itself and ``<root>/<board>``
+    # stay refused by strict descendancy. Without them every scratch dir under
+    # a configured root was refused forever and never reclaimed (t_bbea6686).
+    try:
+        from hermes_cli.kanban_workspace_policy import configured_root
+        configured, _require_mount = configured_root()
+    except Exception:
+        configured = None
     if home is not None:
         try:
             roots.append(((home / "kanban" / "workspaces").resolve(strict=False), DEFAULT_BOARD))
         except OSError:
             pass
+        if configured is not None:
+            try:
+                roots.append(((configured / DEFAULT_BOARD).resolve(strict=False), DEFAULT_BOARD))
+            except OSError:
+                pass
         try:
             boards_parent = (home / "kanban" / "boards").resolve(strict=False)
         except OSError:
@@ -9677,6 +9771,11 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                     roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
                 except OSError:
                     continue
+                if configured is not None and entry.name != DEFAULT_BOARD:
+                    try:
+                        roots.append(((configured / entry.name).resolve(strict=False), entry.name))
+                    except OSError:
+                        continue
     memo: dict = {}
     for root, board in roots:
         try:
@@ -11694,6 +11793,11 @@ def arm_review_stale_alerts(conn: sqlite3.Connection, entries: list[dict]) -> li
     return fresh
 
 
+def _task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row["status"] if row else None
+
+
 @_home_session_guarded("request-review")
 def request_review(
     conn: sqlite3.Connection,
@@ -11782,6 +11886,8 @@ def request_review(
                 conn, task_id, summary=summary, metadata=skip_meta,
                 expected_run_id=expected_run_id,
             )
+            if done and _task_status(conn, task_id) == "review":
+                return _ret(True, "open PR named in the handoff — auto-routed to review instead of done")
             if not done:
                 return _ret(
                     False,
@@ -20522,6 +20628,9 @@ def _default_spawn(
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # GitHub lane is decided by the worker's PROFILE in the gh shim (spec D3); an inherited lane
+    # (e.g. a dispatcher launched from a laned script) must not ride into the worker.
+    env.pop("HERMES_GH_LANE", None)
 
     # A dispatcher-spawned worker is its OWN single-session process, NOT the
     # gateway. The gateway sets _HERMES_GATEWAY=1 process-wide; copying it into
@@ -20530,6 +20639,16 @@ def _default_spawn(
     # own session-id stamping relies on them). Pop it here — mirrors the restart
     # watcher (gateway/run.py) which pops it for the same reason.
     env.pop("_HERMES_GATEWAY", None)
+
+    # A worker imports the runtime tree its argv's venv points at — never a
+    # dispatcher's PYTHONPATH/PYTHONHOME. sys.path beats the venv's editable
+    # finder, so a gateway pinned to a side-by-side release via its plist
+    # (registry-pins v0.2) silently ran every worker on that release, and
+    # runtime deploys never reached workers (t_e8c867d3: #1075 invisible,
+    # 0 review_skipped). Mirrors the `hermes` shim's load-bearing unset,
+    # which this direct venv exec bypasses.
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -21885,6 +22004,22 @@ def remove_notify_sub(
             (task_id, platform, chat_id, thread_id or ""),
         )
     return cur.rowcount > 0
+
+
+# Task statuses at which a notify subscription has served its purpose. The
+# notifier consumers (gateway ``_kanban_notifier_watcher`` and the TUI poller)
+# delete a subscription once it has DELIVERED the events it claimed while the
+# task sits in one of these statuses — so the terminal line still arrives, and
+# nothing is left behind to wake a big-context origin session on later noise.
+# A controller that reopens a ``done`` card re-subscribes explicitly
+# (``hermes kanban notify-subscribe``).
+# Policy: t_6d6e9467 (1,238 of Apollo's 1,295 wake subs sat on done/archived).
+NOTIFY_SUB_FINAL_STATUSES = frozenset({"done", "archived"})
+
+
+def notify_sub_is_final(task: Any) -> bool:
+    """True when ``task`` is in a status that ends notify-sub ownership."""
+    return bool(task) and (getattr(task, "status", "") or "") in NOTIFY_SUB_FINAL_STATUSES
 
 
 def purge_stale_done_notify_subs(

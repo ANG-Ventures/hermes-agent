@@ -4,6 +4,8 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+from hermes_cli.lazy_registry import LazyFilledDict
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -1927,15 +1929,6 @@ DEFAULT_CONFIG = {
     # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
     # Re-homed here from hermes_cli/config.py when upstream extracted
     # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
-        "session_sync": {
-            "enabled": True,
-            "t_silence": 10.0,
-            "poll_interval": 2.5,
-            "refocus_debounce": 1.0,
-        },
-    # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
-    # Re-homed here from hermes_cli/config.py when upstream extracted
-    # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
         # Dormant/default-off desktop/TUI backend restart continuation gate.
         # Config.yaml only: no env override, so the reconnect path remains inert
         # until an operator deliberately flips this key.
@@ -2972,6 +2965,12 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Restart catch-up window (seconds) for one-shot jobs. A one-shot whose
+        # run time fell inside a gateway restart fires late on boot (with a
+        # "fired late by N min" note prepended to its prompt) when it is past
+        # due by at most this much; beyond it the job is removed and a loud
+        # MISSED notice is delivered. 0 = the old 120s grace only. Default 6h.
+        "oneshot_catchup_s": 21600,
         # Timeout (seconds) for a no-agent cron script. Also overridable via
         # HERMES_CRON_SCRIPT_TIMEOUT. Keep this in sync with
         # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
@@ -5555,3 +5554,9 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
 }
+
+
+
+# Provider/platform extensions are registered by the config module as fillers
+# that run on the first read (see lazy_registry for why).
+OPTIONAL_ENV_VARS = LazyFilledDict(OPTIONAL_ENV_VARS)

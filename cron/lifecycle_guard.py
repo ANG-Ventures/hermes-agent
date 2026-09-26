@@ -147,18 +147,68 @@ _SEGMENT_SPLIT_RE = re.compile(r"(?:\|\||&&|;|\||&|\$\(|`)")
 _COMMAND_SUBSTITUTION_RE = re.compile(r"\$\(|`")
 
 
-def _match_is_ssh_remote(text: str, match_start: int) -> bool:
-    """Return True if the lifecycle match at *match_start* sits inside an
-    ssh invocation targeting a non-loopback host."""
-    line_start = text.rfind("\n", 0, match_start) + 1
-    prefix = text[line_start:match_start]
-    # The command context for the match is the last shell segment before it.
-    segment = _SEGMENT_SPLIT_RE.split(prefix)[-1]
+def _segment_is_ssh_remote(segment: str) -> bool:
+    """True if *segment* (the shell segment leading up to a lifecycle match)
+    is an ssh invocation targeting a non-loopback host."""
     if not _SSH_COMMAND_RE.search(segment):
         return False
     if _LOOPBACK_HOST_RE.search(segment):
         return False
     return True
+
+
+def _open_quote_start(s: str) -> Optional[int]:
+    """Index of the quote char that opens the region still OPEN at the end
+    of *s*, or None when all quotes are balanced. Same scan rules as
+    ``_open_quote_at``: inside an active region the other quote char is
+    literal."""
+    active: Optional[str] = None
+    start: Optional[int] = None
+    for i, ch in enumerate(s):
+        if active is None:
+            if ch in _OPENING_QUOTES:
+                active, start = ch, i
+        elif ch == active:
+            active, start = None, None
+    return start
+
+
+def _match_is_ssh_remote(text: str, match_start: int) -> bool:
+    """Return True if the lifecycle match at *match_start* sits inside an
+    ssh invocation targeting a non-loopback host.
+
+    Two shapes count. (1) The match's own shell segment starts with ssh
+    (``ssh ace-ai 'systemctl restart hermes-gateway'``). (2) The match is
+    INSIDE a quoted remote-command string that an ssh invocation opened
+    earlier — on a previous line, or before a ``;`` in the same string
+    (``ssh ace-ai 'cd ~/.hermes<NL>systemctl --user restart hermes-gateway'``).
+    The local shell hands the whole quoted string to ssh, so a newline or
+    separator inside it never starts a new LOCAL segment; the old line-scoped
+    scan mis-read exactly that as a local restart and blocked a legitimate
+    sibling-host fleet op (2026-09-25, ACE-AI's Agora unit, which happens to
+    share the ``hermes-gateway`` unit name with this host's).
+
+    Fail-closed in shape (2): a double-quoted region containing ``$(`` or a
+    backtick before the match executes that substitution LOCALLY before ssh
+    runs, so it is not exempted.
+    """
+    line_start = text.rfind("\n", 0, match_start) + 1
+    prefix = text[line_start:match_start]
+    # The command context for the match is the last shell segment before it.
+    segment = _SEGMENT_SPLIT_RE.split(prefix)[-1]
+    if _segment_is_ssh_remote(segment):
+        return True
+    # Shape (2): inside a quote region opened by an earlier ssh invocation.
+    before = text[:match_start]
+    qstart = _open_quote_start(before)
+    if qstart is None:
+        return False
+    quoted = before[qstart + 1:]
+    if before[qstart] == '"' and _COMMAND_SUBSTITUTION_RE.search(quoted):
+        return False
+    opener_line_start = before.rfind("\n", 0, qstart) + 1
+    opener_segment = _SEGMENT_SPLIT_RE.split(before[opener_line_start:qstart])[-1]
+    return _segment_is_ssh_remote(opener_segment)
 
 
 # Text-only consumer commands: when a lifecycle phrase appears as a QUOTED
@@ -749,10 +799,19 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # _SSH_COMMAND_RE/_LOOPBACK_HOST_RE pair the loop and the tokenized
     # second pass already use, per line so a later local segment is still
     # caught by its own line.
-    for _line in normalized.splitlines() or [normalized]:
+    _offset = 0
+    for _line in normalized.split("\n"):
+        _line_start = _offset
+        _offset += len(_line) + 1
         if not _contains_launchctl_gateway_lifecycle(_line):
             continue
         if _SSH_COMMAND_RE.search(_line) and not _LOOPBACK_HOST_RE.search(_line):
+            continue
+        # 2026-09-25: the line sits inside a quoted remote command that an
+        # ssh invocation opened on an EARLIER line — the whole quoted string
+        # runs under the remote sshd (same rule as _match_is_ssh_remote).
+        _lc = re.search(r"(?i)launchctl", _line)
+        if _lc is not None and _match_is_ssh_remote(normalized, _line_start + _lc.start()):
             continue
         # Self-aware exemption (2026-09-19): this pass is deliberately
         # label-BLIND, so it also caught sibling-only lines. Explicit

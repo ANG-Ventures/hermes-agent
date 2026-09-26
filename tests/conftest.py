@@ -583,14 +583,19 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # resolves to the REAL production path, some import froze the location
     # before the redirect (the DEFAULT_DB_PATH class of bug) — hard-fail the
     # test rather than silently letting the suite contend on prod WAL.
-    import hermes_state as _hs_guard
-    _resolved = _hs_guard.DEFAULT_DB_PATH
-    _real_home = Path(os.environ.get("HERMES_REAL_HOME", str(Path.home() / ".hermes")))
-    if _resolved == _real_home / "state.db":
-        raise RuntimeError(
-            f"HERMETICITY VIOLATION: state.db resolved to PRODUCTION path {_resolved} "
-            "despite HERMES_HOME redirect. See 2026-07-24 incident / t_43d5c42d."
-        )
+    # Only a module that is ALREADY imported can have frozen the path; one
+    # imported later resolves against the redirected home. Skipping the
+    # import here saves ~0.4 s per pytest run for files that never touch
+    # it (t_24f73ced).
+    _hs_guard = sys.modules.get("hermes_state")
+    if _hs_guard is not None:
+        _resolved = _hs_guard.DEFAULT_DB_PATH
+        _real_home = Path(os.environ.get("HERMES_REAL_HOME", str(Path.home() / ".hermes")))
+        if _resolved == _real_home / "state.db":
+            raise RuntimeError(
+                f"HERMETICITY VIOLATION: state.db resolved to PRODUCTION path {_resolved} "
+                "despite HERMES_HOME redirect. See 2026-07-24 incident / t_43d5c42d."
+            )
 
     # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``
     #     at import time. When the module is first imported at collection (any
@@ -654,15 +659,16 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
     #    singleton might still be cached from a previous test).
     try:
-        import hermes_cli.plugins as _plugins_mod
-        monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
-        # Also clear the keyed per-home manager cache (and any plugin
-        # submodules it left in sys.modules) so a manager built for a
-        # previous test's tmp_path HERMES_HOME can't leak forward. Paths
-        # are unique per test, so collisions are unlikely, but a full
-        # reset keeps this fixture the single source of plugin-state
-        # hygiene rather than relying on path uniqueness.
-        _plugins_mod._reset_plugin_managers_for_tests()
+        _plugins_mod = sys.modules.get("hermes_cli.plugins")
+        if _plugins_mod is not None:
+            monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
+            # Also clear the keyed per-home manager cache (and any plugin
+            # submodules it left in sys.modules) so a manager built for a
+            # previous test's tmp_path HERMES_HOME can't leak forward. Paths
+            # are unique per test, so collisions are unlikely, but a full
+            # reset keeps this fixture the single source of plugin-state
+            # hygiene rather than relying on path uniqueness.
+            _plugins_mod._reset_plugin_managers_for_tests()
     except Exception:
         pass
 
@@ -682,10 +688,11 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #     Each ships its own reset entrypoint already (authored "for tests");
     #     we just wire them in, same as the _plugin_manager reset above.
     try:
-        import agent.auxiliary_client as _aux_mod
-        _aux_mod._reset_aux_unhealthy_cache()
-        _aux_mod.clear_runtime_main()
-        _aux_mod._client_cache.clear()
+        _aux_mod = sys.modules.get("agent.auxiliary_client")
+        if _aux_mod is not None:
+            _aux_mod._reset_aux_unhealthy_cache()
+            _aux_mod.clear_runtime_main()
+            _aux_mod._client_cache.clear()
     except Exception:
         pass
 
@@ -701,10 +708,11 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #     test refetches (or stubs) cleanly. Tests that exercise the cache set
     #     it explicitly after this fixture runs, so this does not interfere.
     try:
-        import agent.models_dev as _md_mod
-        _md_mod._models_dev_cache = {}
-        _md_mod._models_dev_cache_time = 0
-        _md_mod._MODELS_DEV_TO_PROVIDER = None
+        _md_mod = sys.modules.get("agent.models_dev")
+        if _md_mod is not None:
+            _md_mod._models_dev_cache = {}
+            _md_mod._models_dev_cache_time = 0
+            _md_mod._MODELS_DEV_TO_PROVIDER = None
     except Exception:
         pass
 
@@ -719,9 +727,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #     each test starts on "default"; tests that need a skin set it
     #     explicitly after this fixture runs.
     try:
-        import hermes_cli.skin_engine as _skin_mod
-        _skin_mod._active_skin = None
-        _skin_mod._active_skin_name = "default"
+        _skin_mod = sys.modules.get("hermes_cli.skin_engine")
+        if _skin_mod is not None:
+            _skin_mod._active_skin = None
+            _skin_mod._active_skin_name = "default"
     except Exception:
         pass
 
@@ -766,8 +775,20 @@ def _isolate_session_contextvars():
 
     Regression guard: tests/tools/test_session_contextvar_isolation.py.
     """
-    import gateway.session_context as sc
-
+    # Not imported yet => every var still holds its declared default, which is
+    # exactly what reset_session_vars() would set. Importing it here costs
+    # ~0.15 s per run (gateway -> hermes_state -> config) for tests that never
+    # touch a session var (t_24f73ced).
+    sc = sys.modules.get("gateway.session_context")
+    if sc is None:
+        # reset_session_vars() also resets the runtime-cwd var; that module
+        # can be imported (and bound) without session_context.
+        rc = sys.modules.get("agent.runtime_cwd")
+        token = rc.reset_session_cwd() if rc is not None else None
+        yield
+        if token is not None:
+            rc._SESSION_CWD.reset(token)
+        return
     tokens = sc.reset_session_vars()
     yield
     sc.restore_session_vars(tokens)
@@ -1630,14 +1651,45 @@ def _live_system_guard(request, monkeypatch):
     # Capture the test process's existing children at fixture start —
     # any *new* children spawned by the test are also allowlisted via
     # the live psutil walk below. Static set keeps the fast path cheap.
+    #
+    # The snapshot is taken LAZILY, on the first guarded signal, and keeps only
+    # children created before this fixture started (t_24f73ced): psutil's
+    # children() walks every pid on the host (~45-110 ms per test on a
+    # 1.1k-process Mac), and almost no test signals anything. Each entry keeps
+    # its create_time, so a recycled pid never matches.
     try:
         import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
     except Exception:
         _psutil = None
-        _initial_children = set()
+    import time as _time
+    _fixture_started_at = _time.time()
+    _initial_children_memo = []
+
+    def _initial_children() -> dict:
+        if not _initial_children_memo:
+            snap = {}
+            if _psutil is not None:
+                try:
+                    for c in _psutil.Process(test_pid).children(recursive=True):
+                        try:
+                            created = c.create_time()
+                        except Exception:
+                            continue
+                        if created <= _fixture_started_at:
+                            snap[c.pid] = created
+                except Exception:
+                    snap = {}
+            _initial_children_memo.append(snap)
+        return _initial_children_memo[0]
+
+    def _is_initial_child(pid: int) -> bool:
+        created = _initial_children().get(pid)
+        if created is None:
+            return False
+        try:
+            return _psutil.Process(pid).create_time() == created
+        except Exception:
+            return True  # gone: the signal is a no-op
     _spawned_children = {}
 
     def _remember_spawned_child(pid: int) -> None:
@@ -1659,7 +1711,7 @@ def _live_system_guard(request, monkeypatch):
             return True
         if pid < 0:
             return False
-        if pid == test_pid or pid in _initial_children:
+        if pid == test_pid or _is_initial_child(pid):
             return True
         if pid in _spawned_children:
             if _psutil is None:
@@ -2061,8 +2113,10 @@ def _isolate_computer_use_approval_state():
     """
     yield
     try:
-        from tools.computer_use import tool as _cu_tool
-
+        # Only a module some test imported can hold leaked approval state.
+        _cu_tool = sys.modules.get("tools.computer_use.tool")
+        if _cu_tool is None:
+            return
         _cu_tool.set_approval_callback(None)
         with _cu_tool._approval_lock:
             _cu_tool._always_allow.clear()
@@ -2081,13 +2135,17 @@ def _moa_caches_isolated():
     monkeypatch resolvers and config paths, so a cache entry leaked from one
     test would poison the next. Clear both around every test.
     """
-    import agent.moa_loop as moa
-
-    moa._preset_cache.clear()
-    moa._runtime_cache.clear()
+    # A module that is not imported has empty caches; one a test imports
+    # mid-run is cleared at teardown (t_24f73ced: skip the import cost).
+    moa = sys.modules.get("agent.moa_loop")
+    if moa is not None:
+        moa._preset_cache.clear()
+        moa._runtime_cache.clear()
     yield
-    moa._preset_cache.clear()
-    moa._runtime_cache.clear()
+    moa = sys.modules.get("agent.moa_loop")
+    if moa is not None:
+        moa._preset_cache.clear()
+        moa._runtime_cache.clear()
 
 
 @pytest.fixture(autouse=True)
