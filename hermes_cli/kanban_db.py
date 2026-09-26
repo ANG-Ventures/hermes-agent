@@ -5760,6 +5760,114 @@ def _origin_line(body: Optional[str]) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Near-duplicate guard (opt-in per create surface: CLI + kanban_create tool)
+# ---------------------------------------------------------------------------
+# Sibling sessions re-filing the same card minutes apart burn worker slots and
+# race competing PRs onto the same files. Similarity is a token-set Jaccard over
+# the title plus the first ``NEAR_DUP_BODY_CHARS`` of the body (``origin:``
+# lines stripped -- every card carries one). Measured on the live board
+# (24h, 773 cards, 2026-09-26): 26 pairs scored >= 0.8; every pair whose title
+# token sets were IDENTICAL was a real duplicate, while every sharded fan-out
+# ("SHARD 2/4" vs "3/4", "agent tranche" vs "gateway tranche") differs in the
+# title. So an identical title + score >= threshold REFUSES; any other pair
+# over the threshold is a WARNING recorded on the new card.
+NEAR_DUP_THRESHOLD = 0.8
+NEAR_DUP_WINDOW_SECONDS = 24 * 3600
+NEAR_DUP_BODY_CHARS = 200
+# Titles shorter than this are too generic to call duplicates ("fix", "test x").
+NEAR_DUP_MIN_TITLE_TOKENS = 3
+_NEAR_DUP_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+class NearDuplicateError(ValueError):
+    """``create_task(duplicate_guard=True)`` refused a near-duplicate card."""
+
+    def __init__(self, message: str, duplicates: list[dict]):
+        super().__init__(message)
+        self.duplicates = duplicates
+
+
+def _near_dup_body(body: Optional[str]) -> str:
+    kept = [
+        line for line in (body or "").splitlines()
+        if not line.strip().lower().startswith("origin:")
+    ]
+    return "\n".join(kept).strip()[:NEAR_DUP_BODY_CHARS]
+
+
+def near_dup_tokens(title: Optional[str], body: Optional[str]) -> frozenset:
+    text = f"{title or ''} {_near_dup_body(body)}".lower()
+    return frozenset(_NEAR_DUP_TOKEN_RE.findall(text))
+
+
+def _title_tokens(title: Optional[str]) -> frozenset:
+    return frozenset(_NEAR_DUP_TOKEN_RE.findall((title or "").lower()))
+
+
+def _jaccard(a: frozenset, b: frozenset) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def find_near_duplicates(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    body: Optional[str],
+    tenant: Optional[str] = None,
+    now: Optional[int] = None,
+    threshold: float = NEAR_DUP_THRESHOLD,
+    window_seconds: int = NEAR_DUP_WINDOW_SECONDS,
+) -> list[dict]:
+    """Non-archived cards created in the window that look like ``title``/``body``.
+
+    Returns ``[{"id", "title", "score", "same_title", "created_at"}]`` sorted
+    by score, best first. ``same_title`` marks the refusal class.
+    """
+    title_toks = _title_tokens(title)
+    if len(title_toks) < NEAR_DUP_MIN_TITLE_TOKENS:
+        return []
+    new_toks = near_dup_tokens(title, body)
+    since = int(now if now is not None else time.time()) - int(window_seconds)
+    rows = conn.execute(
+        # Only the head of a body is compared; don't page whole bodies in.
+        "SELECT id, title, substr(body, 1, 2000) AS body, created_at FROM tasks "
+        "WHERE created_at >= ? AND status != 'archived' AND tenant IS ?",
+        (since, tenant),
+    ).fetchall()
+    hits: list[dict] = []
+    for row in rows:
+        score = _jaccard(new_toks, near_dup_tokens(row["title"], row["body"]))
+        if score < threshold:
+            continue
+        hits.append({
+            "id": row["id"],
+            "title": row["title"],
+            "score": round(score, 3),
+            "same_title": _title_tokens(row["title"]) == title_toks,
+            "created_at": row["created_at"],
+        })
+    hits.sort(key=lambda h: (-h["score"], -int(h["created_at"] or 0)))
+    return hits
+
+
+def near_duplicate_warning(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Payload of the ``near_duplicate_warning`` event on ``task_id``, if any."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'near_duplicate_warning' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        return json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -5792,6 +5900,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    duplicate_guard: bool = False,
+    force_reason: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -5837,7 +5947,15 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``duplicate_guard`` (set by the CLI and ``kanban_create`` tool) runs
+    :func:`find_near_duplicates` inside the write transaction: an identical
+    title scoring >= :data:`NEAR_DUP_THRESHOLD` raises
+    :class:`NearDuplicateError` unless ``force_reason`` is given (ledgered as a
+    ``near_duplicate_forced`` event); other hits are recorded as a
+    ``near_duplicate_warning`` event on the new card.
     """
+    force_reason = (force_reason or "").strip() or None
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -6145,6 +6263,22 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                near_dups: list[dict] = []
+                if duplicate_guard:
+                    near_dups = find_near_duplicates(
+                        conn, title=title, body=body, tenant=tenant, now=now,
+                    )
+                    same = [d for d in near_dups if d["same_title"]]
+                    if same and not force_reason:
+                        best = same[0]
+                        raise NearDuplicateError(
+                            f"near-duplicate: {best['id']} has the same title "
+                            f"(similarity {best['score']:.2f}, created "
+                            f"{max(0, now - int(best['created_at']))}s ago) -- "
+                            "comment on it instead, or re-run with "
+                            "--force <reason> / force_reason to file anyway",
+                            same,
+                        )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -6213,6 +6347,20 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if near_dups:
+                    forced = force_reason and any(d["same_title"] for d in near_dups)
+                    _append_event(
+                        conn,
+                        task_id,
+                        "near_duplicate_forced" if forced else "near_duplicate_warning",
+                        {
+                            "duplicates": [
+                                {k: d[k] for k in ("id", "score", "same_title")}
+                                for d in near_dups[:5]
+                            ],
+                            **({"reason": force_reason} if forced else {}),
+                        },
+                    )
                 if flagship_override_reason:
                     from hermes_cli.model_policy import override_comment
 
