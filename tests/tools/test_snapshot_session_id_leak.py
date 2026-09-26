@@ -112,7 +112,9 @@ def test_export_dump_drops_every_bridged_var_and_the_delegation_marker():
         capture_output=True, text=True, check=True).stdout
     leaked = [n for n in scoped if f"declare -x {n}=" in out]
     assert not leaked, f"persisted into the snapshot: {leaked}"
-    assert 'declare -x HERMES_HOME="/h"' in out
+    # HERMES_HOME is injected per spawn; a persisted value would clobber the next
+    # caller's on ``source`` (a foreign profile home surviving into a later shell).
+    assert 'HERMES_HOME=' not in out
     assert 'declare -x MYVAR="keep"' in out
 
 

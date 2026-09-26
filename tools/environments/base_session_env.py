@@ -27,8 +27,14 @@ from typing import Iterable
 # identity. Used by unit tests as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT)")
+    "^(declare -x |export )(HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT=|"
+    # Per-execution identity: the Kanban dispatcher stamps its task/run/board/claim
+    # vars onto a worker's spawn env, and HERMES_HOME is injected per spawn. Persisted,
+    # they outlive the execution that set them and clobber the next caller's env
+    # on ``source``. The home is matched EXACTLY (``=`` anchored) so lookalike
+    # user vars survive; the delegated-child marker likewise.
+    "HERMES_HOME=|HERMES_KANBAN_)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # mktemp template suffix + the shell variable holding the allocated temp path.
@@ -76,6 +82,9 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # env; a snapshot taken inside that window would re-assert them on every
         # later ``source`` and fence the PARENT session's kanban CLI (#90782).
         "HERMES_DELEGATED_CHILD_CONTEXT HERMES_CRON_SESSION "
+        # Per-execution identity (see _SNAPSHOT_EXCLUDED_ENV_REGEX): the dispatcher's
+        # HERMES_KANBAN_* worker vars and the per-spawn HERMES_HOME.
+        "${!HERMES_KANBAN_*} HERMES_HOME "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")
