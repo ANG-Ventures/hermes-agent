@@ -1,0 +1,161 @@
+name: "Trial T1: Blacksmith x64 vs GitHub x64/ARM (t_a928e796)"
+
+# Measurement-only trial (kanban t_a928e796). Same head, same 16 slices, three
+# venues. Push to this trial branch only; reps = full re-runs of the same run
+# (same SHA). Not wired into ci.yaml; no repo vars read or written.
+on:
+  push:
+    branches: [trial/blacksmith-t1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trial-blacksmith-t1-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: "Generate slices"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Restore duration cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations-restore-${{ github.run_id }}
+          restore-keys: |
+            test-durations-
+      - name: Generate test slices
+        id: matrix
+        run: |
+          MATRIX=$(python3 scripts/run_tests_parallel.py --generate-slices 16 --test-scope full --event push --same-repo true)
+          # Strip routing: each venue job pins its own runs-on.
+          MATRIX=$(printf '%s' "$MATRIX" | python3 -c 'import json,sys; m=json.load(sys.stdin); [s.pop("runs_on",None) for s in m["slice"]]; print(json.dumps(m,separators=(",",":")))')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          printf '%s' "$MATRIX" | python3 -c 'import json,sys; m=json.load(sys.stdin); print(len(m["slice"]), "slices"); [print(s["index"], s["name"], len(s["files"].split(":"))) for s in m["slice"]]'
+
+  bs-x64:
+    name: "Blacksmith x64 ${{ matrix.slice.index }}"
+    needs: generate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.generate.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install ripgrep (prebuilt binary)
+        run: bash .github/scripts/install-ci-tool.sh ripgrep
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+      - name: Run tests
+        run: |
+          source .venv/bin/activate
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}' -- -v
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          HERMES_TEST_WORKERS: "12"
+
+  gh-x64:
+    name: "GitHub x64 ${{ matrix.slice.index }}"
+    needs: generate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.generate.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install ripgrep (prebuilt binary)
+        run: bash .github/scripts/install-ci-tool.sh ripgrep
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+      - name: Run tests
+        run: |
+          source .venv/bin/activate
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}' -- -v
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          HERMES_TEST_WORKERS: "12"
+
+  gh-arm:
+    name: "GitHub ARM ${{ matrix.slice.index }}"
+    needs: generate
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.generate.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install ripgrep (prebuilt binary)
+        run: bash .github/scripts/install-ci-tool.sh ripgrep
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+      - name: Run tests
+        run: |
+          source .venv/bin/activate
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}' -- -v
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          HERMES_TEST_WORKERS: "12"
