@@ -59,6 +59,16 @@ def make_agent(monkeypatch):
     monkeypatch.setattr(
         "agent.conversation_loop.jittered_backoff", lambda *a, **kw: 0.0
     )
+    # Pool-capacity 503s wait via capacity_retry_wait, not jittered_backoff
+    # (~6s real sleep per 503). Keep its give-up decision (None), zero the wait.
+    import agent.conversation_loop as _loop
+
+    _capacity_wait = _loop.capacity_retry_wait
+    monkeypatch.setattr(
+        _loop,
+        "capacity_retry_wait",
+        lambda **kw: None if _capacity_wait(**kw) is None else 0.0,
+    )
     monkeypatch.setattr(
         "agent.model_metadata.get_model_context_length", lambda *a, **kw: 200000
     )
