@@ -4089,6 +4089,9 @@ _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+# Per-job cron fire-fence wait on the shutdown path (t_8d085477). Must stay
+# far inside the launchd teardown reserve (15s at clamp 60).
+_SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S = 2.0
 
 
 def _reap_gateway_turn_processes(
@@ -20415,9 +20418,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # the scheduler can never report that as success (#60432).
                     # No-op when no cron job is in flight.
                     from cron.scheduler import mark_running_jobs_interrupted
+                    # Bounded fence wait (t_8d085477). The job's own thread
+                    # holds its fire fence across delivery, and that delivery
+                    # waits on THIS event loop — so an unbounded wait here was
+                    # a cross-thread deadlock broken only by the delivery
+                    # future's 60s timeout. 4 of the 8 shutdown-watchdog
+                    # force-exits of 2026-09-24/25 dumped the loop thread
+                    # parked in _fire_job_lock under this call.
                     _interrupted = _marked_cron_jobs = mark_running_jobs_interrupted(
                         f"Gateway shutdown ({phase}) killed the job's tool "
-                        "subprocess before the run finished."
+                        "subprocess before the run finished.",
+                        lock_timeout=_SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S,
                     )
                     if _interrupted:
                         logger.warning(
@@ -21038,6 +21049,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
                 )
+                # Per-turn evidence for the timeout (t_8d085477): WHAT each
+                # surviving turn was doing when the drain gave up, so "the
+                # drain never reduces active turns" is attributable (API call
+                # vs tool vs idle) without a thread dump.
+                _now_wall = time.time()
+                for _sk, _agent in list(self._running_agents.items()):
+                    if _agent is _AGENT_PENDING_SENTINEL:
+                        logger.warning(
+                            "PHASE=drain_timeout_turn key=%s state=pending", _sk
+                        )
+                        continue
+                    try:
+                        _act = _agent.get_activity_summary() or {}
+                    except Exception:
+                        _act = {}
+                    _started_ts = self._running_agents_ts.get(_sk)
+                    logger.warning(
+                        "PHASE=drain_timeout_turn key=%s turn_age=%s "
+                        "current_tool=%s api_calls=%s idle=%s last_activity=%r",
+                        _sk,
+                        (
+                            f"{_now_wall - float(_started_ts):.0f}s"
+                            if isinstance(_started_ts, (int, float))
+                            else "?"
+                        ),
+                        _act.get("current_tool"),
+                        _act.get("api_call_count"),
+                        (
+                            f"{float(_act['seconds_since_activity']):.0f}s"
+                            if isinstance(
+                                _act.get("seconds_since_activity"), (int, float)
+                            )
+                            else "?"
+                        ),
+                        str(_act.get("last_activity_desc") or "")[:120],
+                    )
                 # Terminate in-flight cron SCRIPTS. The drain WAITS on them
                 # (_active_cron_job_count) but nothing could ever CANCEL them:
                 # _interrupt_running_agents only covers self._running_agents,
@@ -21176,7 +21223,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # children left behind by an interrupted terminal tool get
                 # killed by systemd instead of us (issue #8202).  The final
                 # catch-all cleanup below still runs for the graceful path.
-                _interrupted_cron_jobs = _kill_tool_subprocesses("post-interrupt")
+                # Off-loop (t_8d085477): every step in here is blocking (a
+                # per-job cron fence, a terminal-env glob sweep, browser
+                # teardown). On the loop it froze the adapters the cron
+                # delivery it was waiting on needed to finish.
+                _interrupted_cron_jobs = await asyncio.to_thread(
+                    _kill_tool_subprocesses, "post-interrupt"
+                )
                 logger.info(
                     "Shutdown phase: post-interrupt tool kill done at +%.2fs",
                     _phase_elapsed(),
@@ -21310,7 +21363,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # where drain succeeded without interrupt, and (b) anything
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
-            _kill_tool_subprocesses("final-cleanup")
+            await asyncio.to_thread(_kill_tool_subprocesses, "final-cleanup")
             logger.info(
                 "Shutdown phase: final-cleanup tool kill done at +%.2fs",
                 _phase_elapsed(),
