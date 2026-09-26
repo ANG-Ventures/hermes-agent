@@ -1,0 +1,69 @@
+name: "Trial T3: npm/node-gyp/electron caches, GitHub vs Blacksmith sticky disk (t_a928e796)"
+
+# Measurement-only (kanban t_a928e796). Replays e2e-desktop.yml's install
+# prefix (apt deps, node 26, npm 12, npm ci) and stops. Reps: run 1 cold,
+# runs 2-3 = full re-runs (same SHA). Metric: the "npm ci" step wall.
+on:
+  push:
+    branches: [trial/blacksmith-t3]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trial-blacksmith-t3-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gh-x64:
+    name: "GitHub x64 npm ci (setup-node npm cache)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install system dependencies for Electron
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+          cache: npm
+      - name: grab npm 12
+        run: npm i -g npm@12
+      - name: npm ci
+        run: npm ci
+      - name: Cache sizes
+        if: always()
+        run: du -sh ~/.npm ~/.cache/node-gyp ~/.cache/electron 2>/dev/null || true
+
+  bs-x64:
+    name: "Blacksmith x64 npm ci (sticky disk npm+node-gyp+electron)"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      npm_config_cache: /home/runner/ci-sticky/npm
+      npm_config_devdir: /home/runner/ci-sticky/node-gyp
+      electron_config_cache: /home/runner/ci-sticky/electron
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Mount sticky disk (npm + node-gyp + electron caches)
+        uses: useblacksmith/stickydisk@94697d49e77d0dd78b77deb85ad3de63a28b4b8a # v1.7.1
+        with:
+          key: ${{ github.repository }}-trial-t3-node-caches
+          path: /home/runner/ci-sticky
+      - name: Install system dependencies for Electron
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+      - name: grab npm 12
+        run: npm i -g npm@12
+      - name: npm ci
+        run: npm ci
+      - name: Cache sizes
+        if: always()
+        run: du -sh /home/runner/ci-sticky/* 2>/dev/null || true
