@@ -568,14 +568,32 @@ def lane_family(provider: str) -> str:
     return "codex" if p == "openai-codex" else "other"
 
 
+# Auxiliary-model calls (compression, title_generation, vision, web_extract, ...)
+# are ledgered with ``attribution='aux:<task>'`` and ``lane_family='aux'``. Their
+# tokens are NOT part of the turn's main-model totals, so every reader that
+# reconciles against the turn or measures the main lane's cache behaviour must
+# exclude this family (card t_39628ae3).
+AUX_LANE_FAMILY = "aux"
+AUX_ATTRIBUTION_PREFIX = "aux:"
+_NOT_AUX = "COALESCE(lane_family, '') != 'aux'"
+
+
+def is_aux_attribution(attribution: Any) -> bool:
+    return (isinstance(attribution, str) and attribution.startswith(AUX_ATTRIBUTION_PREFIX)
+            and len(attribution) > len(AUX_ATTRIBUTION_PREFIX))
+
+
 def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
     """Reconcile calls even when they arrive after the turn row."""
-    conn.execute("""
+    # Main lane only: an aux call (lane_family='aux') is a different model on a
+    # different prompt; letting it be the "first call" or add to the write tiers
+    # would misreport the main conversation's cache behaviour.
+    conn.execute(f"""
         UPDATE turns SET
             cache_write_5m = (SELECT SUM(cache_write_5m) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
             cache_write_1h = (SELECT SUM(cache_write_1h) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
             first_call_cache_miss = (
                 SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
                                       OR cache_write IS NULL THEN NULL
@@ -593,7 +611,7 @@ def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
                             WHEN cache_write * 5 >= 4 *
                                  (input_tokens + cache_read + cache_write) THEN 1
                             ELSE 0 END
-                FROM turn_api_calls WHERE turn_id = turns.turn_id
+                FROM turn_api_calls WHERE turn_id = turns.turn_id AND {_NOT_AUX}
                   -- First SUCCESSFUL call: a 429/5xx/timeout attempt carries
                   -- zero usage and would hide the cold write on the retry.
                   AND (http_status IS NULL OR http_status BETWEEN 200 AND 299)
@@ -841,7 +859,8 @@ def insert_api_call(
     provenance raise rather than silently replacing or dropping ledger rows.
     Calls may arrive before their parent turn is finalized.
     """
-    if attribution not in ("wire", "pinned", "inferred", "external"):
+    aux = is_aux_attribution(attribution)
+    if not aux and attribution not in ("wire", "pinned", "inferred", "external"):
         raise ValueError(f"Invalid API-call attribution: {attribution!r}")
     # SQLite permits NULL in a non-INTEGER PRIMARY KEY column, so the composite
     # key alone does not stop a NULL turn_id/seq row (and NULLs never collide,
@@ -865,7 +884,8 @@ def insert_api_call(
              usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
              usage.reasoning_tokens, attribution, http_status,
              _bool_int(relay_synthetic), route_id, cache_write_5m,
-             cache_write_1h, cache_ttl_requested, lane_family(provider)),
+             cache_write_1h, cache_ttl_requested,
+             AUX_LANE_FAMILY if aux else lane_family(provider)),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():

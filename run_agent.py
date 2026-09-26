@@ -9130,7 +9130,9 @@ class AIAgent:
 
         from agent.aux_accounting import (
             reset_accounting_context,
+            reset_blackbox_turn,
             set_accounting_context,
+            set_blackbox_turn,
         )
         from agent import relay_runtime
         from agent.conversation_loop import run_conversation
@@ -9169,6 +9171,7 @@ class AIAgent:
         durable_turn_lease_interrupt_message = None
         token = None
         acct_token = None
+        bb_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -9467,6 +9470,10 @@ class AIAgent:
                 getattr(self, "_session_db", None),
                 getattr(self, "session_id", None),
             )
+            # Blackbox per-call ledger for aux calls: bind this turn's id (the
+            # one turn_context adopts from _relay_pending_turn_id) so aux rows
+            # land under it with attribution='aux:<task>' (t_39628ae3).
+            bb_token = set_blackbox_turn(self, relay_turn_id)
             from agent.auxiliary_client import scoped_runtime_main
 
             # The outer token restores the caller's Context even though turn setup
@@ -9595,6 +9602,8 @@ class AIAgent:
                         self._relay_pending_turn_id = None
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
+                    if bb_token is not None:
+                        reset_blackbox_turn(bb_token)
                     if token is not None:
                         reset_conversation_context(token)
 
