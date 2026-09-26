@@ -29,6 +29,8 @@ def _coverage(**override) -> str:
         "items": ["F1 boundary test missing"],
         "review_minutes": 5,
         "batch_id": "apollo-r1-sendback",
+        # #1129: coverage names the reviewed PR head.
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
     }
     record.update(override)
     return json.dumps(record)
@@ -161,6 +163,22 @@ def test_send_back_with_incomplete_coverage_rolls_claim_back(board: Path) -> Non
         )
         assert ok is False
         assert f"missing/invalid lens {dropped}" in detail
+        _assert_untouched(conn, tid, before, runs_before)
+
+
+def test_send_back_without_head_sha_rolls_claim_back(board: Path) -> None:
+    # #1129's head_sha requirement is enforced on the parked-review path too.
+    no_head = json.loads(COVERAGE)
+    no_head.pop("head_sha")
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        before, runs_before = _snapshot(conn, tid)
+        ok, detail = kb.request_changes(
+            conn, tid, reason="fix", claimer="apollo",
+            coverage=json.dumps(no_head),
+        )
+        assert ok is False
+        assert "head_sha" in detail
         _assert_untouched(conn, tid, before, runs_before)
 
 
