@@ -611,6 +611,7 @@ export function StatusRule({
     : typeof usage.cache_hit_pct === 'number'
       ? `◎ ${usage.cache_hit_pct}%`
       : ''
+
   const showCacheHit = segs.cacheHit && ok('cache_hit') && !!cacheHitText && fits(SEP + stringWidth(cacheHitText))
   const latencyText = typeof usage.avg_latency_s === 'number' ? `◷ ${usage.avg_latency_s.toFixed(1)}s` : ''
   const showLatency = segs.latency && ok('latency') && !!latencyText && fits(SEP + stringWidth(latencyText))
