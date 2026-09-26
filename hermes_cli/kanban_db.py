@@ -8493,6 +8493,78 @@ def claim_task(
     return claimed
 
 
+# Unguarded helper (EXECUTION_LANE in test_kanban_home_session): its callers
+# carry the policy. claim_review_task is the unguarded claim lane (dispatcher
+# and ``claim --review``); request_changes is guarded before it gets here.
+def _open_review_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    lock: str,
+    expires: int,
+    now: int,
+    session_ref: Optional[str] = None,
+) -> Optional[int]:
+    """CAS ``review -> running`` and open the review run; caller holds the txn.
+
+    Shared by :func:`claim_review_task` (dispatched reviewer) and the
+    reviewer send-back in :func:`request_changes`, so both leave the same
+    ``claimed(source_status=review)`` audit shape. Returns the new run id,
+    or None when the card is no longer an unclaimed ``review`` card.
+    """
+    cur = conn.execute(
+        """
+        UPDATE tasks
+           SET status        = 'running',
+               claim_lock    = ?,
+               claim_expires = ?,
+               started_at    = COALESCE(started_at, ?)
+         WHERE id = ?
+           AND status = 'review'
+           AND claim_lock IS NULL
+        """,
+        (lock, expires, now, task_id),
+    )
+    if cur.rowcount != 1:
+        return None
+    trow = conn.execute(
+        "SELECT assignee, max_runtime_seconds, current_step_key "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    run_cur = conn.execute(
+        """
+        INSERT INTO task_runs (
+            task_id, profile, step_key, status,
+            claim_lock, claim_expires, max_runtime_seconds,
+            started_at
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            trow["assignee"] if trow else None,
+            trow["current_step_key"] if trow else None,
+            lock,
+            expires,
+            trow["max_runtime_seconds"] if trow else None,
+            now,
+        ),
+    )
+    run_id = run_cur.lastrowid
+    conn.execute(
+        "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+        (run_id, task_id),
+    )
+    _append_event(
+        conn, task_id, "claimed",
+        {"lock": lock, "expires": expires, "run_id": run_id,
+         "source_status": "review",
+         **({"session_ref": session_ref} if session_ref else {})},
+        run_id=run_id,
+    )
+    return run_id
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8548,56 +8620,11 @@ def claim_review_task(
                  "source_status": "review", **alive},
             )
             return None
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'review'
-               AND claim_lock IS NULL
-            """,
-            (lock, expires, now, task_id),
-        )
-        if cur.rowcount != 1:
+        if _open_review_run(
+            conn, task_id, lock=lock, expires=expires, now=now,
+            session_ref=session_ref,
+        ) is None:
             return None
-        trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        run_cur = conn.execute(
-            """
-            INSERT INTO task_runs (
-                task_id, profile, step_key, status,
-                claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                trow["assignee"] if trow else None,
-                trow["current_step_key"] if trow else None,
-                lock,
-                expires,
-                trow["max_runtime_seconds"] if trow else None,
-                now,
-            ),
-        )
-        run_id = run_cur.lastrowid
-        conn.execute(
-            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
-            (run_id, task_id),
-        )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review",
-             **({"session_ref": session_ref} if session_ref else {})},
-            run_id=run_id,
-        )
         return get_task(conn, task_id)
 
 
@@ -12344,6 +12371,12 @@ def _latest_review_coverage(rows: list) -> tuple[Optional[dict], Optional[str]]:
     return None, first_error or "missing review_coverage JSON line"
 
 
+_REVIEW_COVERAGE_MISSING = (
+    "missing review_coverage comment on this review run "
+    "(use kanban_block(kind=capability) if a lens cannot run)"
+)
+
+
 def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[str]:
     """Require a current-run, parseable review record before returning work.
 
@@ -12356,7 +12389,7 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
         (task_id, run_id),
     ).fetchall()
     if not rows:
-        return "missing review_coverage comment on this review run (use kanban_block(kind=capability) if a lens cannot run)"
+        return _REVIEW_COVERAGE_MISSING
     coverage, error = _latest_review_coverage(rows)
     if coverage is None:
         return error
@@ -12402,6 +12435,14 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
     return None
 
 
+class _SendBackRefused(Exception):
+    """Roll back a send-back's own review claim when the handoff is refused."""
+
+    def __init__(self, detail: Optional[str]) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 @_home_session_guarded("request-changes")
 def request_changes(
     conn: sqlite3.Connection,
@@ -12409,6 +12450,9 @@ def request_changes(
     *,
     reason: str,
     expected_run_id: Optional[int] = None,
+    claimer: Optional[str] = None,
+    coverage: Optional[str] = None,
+    session_ref: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -12417,12 +12461,39 @@ def request_changes(
     ``review_requested`` event, reapplies parent gating, and emits an auditable
     ``changes_requested`` event.  The second tuple item is the implementer on
     success or a diagnostic reason on failure.
+
+    ``claimer`` is the reviewer send-back for a card parked in ``review``
+    with nobody holding it (human/orchestrator review lane, no dispatched
+    reviewer). When set, and the caller is not a worker run
+    (``expected_run_id`` is None), the review run is opened here as
+    ``claimer`` -- the same ``claimed(source_status=review)`` event a
+    dispatched reviewer leaves -- and the changes are requested in the SAME
+    transaction. Any refusal after that point rolls the claim back, so a
+    refused send-back leaves the card in ``review`` with no orphan run.
+    A card running under a non-review claim is refused exactly as before.
+
+    ``coverage`` is the reviewer's ``review_coverage`` JSON. When given it is
+    recorded as a comment bound to the run being closed (for the send-back,
+    the run opened above) in the same transaction, before the coverage gate
+    reads it -- the only way a parked-review send-back can carry a
+    current-run record. A parked-review send-back without it is refused
+    before any claim is opened.
+
+    ``session_ref`` (trusted runtime context, never model args) is recorded on
+    the opened run's ``claimed`` event, as ``claim_review_task`` does for
+    ``claim --review``.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    coverage_text = str(redact_review_value(coverage or "")).strip()
+    coverage_body = f"review_coverage: {coverage_text}" if coverage_text else None
+    comment_author = str(claimer or "reviewer").strip() or "reviewer"
 
-    with write_txn(conn):
+    opened: list[int] = []
+    posted: list[tuple[int, int, int]] = []  # (comment_id, run_id, created_at)
+
+    def _in_txn() -> tuple[bool, Optional[str]]:
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
@@ -12430,7 +12501,23 @@ def request_changes(
         if task_row is None:
             return False, "task not found"
         current_run_id = task_row["current_run_id"]
-        if task_row["status"] != "running" or current_run_id is None:
+        if claimer and expected_run_id is None and task_row["status"] == "review":
+            if coverage_body is None:
+                # Same message the gate gives; refused before any claim churn.
+                return False, _REVIEW_COVERAGE_MISSING
+            if _prior_worker_still_alive(conn, task_id) is not None:
+                return False, "a prior worker run on this task is still alive"
+            now = int(time.time())
+            run_id = _open_review_run(
+                conn, task_id, lock=str(claimer),
+                expires=now + _resolve_claim_ttl_seconds(None), now=now,
+                session_ref=session_ref,
+            )
+            if run_id is None:
+                return False, "task left review before the review run opened"
+            opened.append(run_id)
+            current_run_id = run_id
+        elif task_row["status"] != "running" or current_run_id is None:
             return False, "task is not in an active review run"
         if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
             return False, "run_id mismatch"
@@ -12475,6 +12562,20 @@ def request_changes(
         implementer = requested_payload.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             return False, "review handoff has no valid implementer provenance"
+        if coverage_body is not None:
+            now = int(time.time())
+            comment_cur = conn.execute(
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (task_id, comment_author, coverage_body, int(current_run_id), now),
+            )
+            _append_event(
+                conn, task_id, "commented",
+                {"author": comment_author, "len": len(coverage_body)},
+                run_id=int(current_run_id),
+            )
+            posted.append((int(comment_cur.lastrowid or 0), int(current_run_id), now))
         coverage_error = _validate_review_coverage(conn, task_id, int(current_run_id))
         if coverage_error:
             return False, coverage_error
@@ -12522,7 +12623,31 @@ def request_changes(
             },
             run_id=run_id,
         )
-    return True, implementer
+        return True, implementer
+
+    try:
+        with write_txn(conn):
+            ok, detail = _in_txn()
+            if not ok and opened:
+                raise _SendBackRefused(detail)
+    except _SendBackRefused as exc:
+        return False, exc.detail
+    # Journal the committed coverage comment (add_comment's content hook),
+    # only after commit so a rolled-back send-back journals nothing.
+    for comment_id, comment_run_id, created_at in posted:
+        try:
+            from hermes_cli import kanban_journal
+
+            kanban_journal.append(
+                _journal_board_slug(), task_id, "comment_body",
+                {"author": comment_author, "body": coverage_body,
+                 "session_ref": None, "created_at": created_at,
+                 "comment_id": comment_id},
+                actor=comment_author, run_id=comment_run_id,
+            )
+        except Exception:  # pragma: no cover - never fail the transition
+            pass
+    return ok, detail
 
 
 @_home_session_guarded("requeue")

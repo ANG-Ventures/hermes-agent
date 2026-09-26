@@ -670,6 +670,9 @@ EXECUTION_LANE = {
         "done, the same result the next dispatcher tick produces"),
     "claim_review_task": (
         "callers: dispatcher only (no CLI verb, tool or slash path)"),
+    "_open_review_run": (
+        "callers: claim_review_task (this lane) and request_changes, whose "
+        "@_home_session_guarded has already run for the send-back"),
     "heartbeat_claim": (
         "callers: kanban_heartbeat tool + worker auto-heartbeat. Writes only "
         "claim_expires (never status/assignee/priority; the regex hit is the "

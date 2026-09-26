@@ -1146,6 +1146,11 @@ def _handle_request_changes(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — describe the changes needed")
     reason = redact_sensitive_text(str(reason), force=True)
+    coverage = args.get("coverage")
+    if isinstance(coverage, dict):
+        coverage = json.dumps(coverage)
+    elif coverage is not None:
+        coverage = str(coverage)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1155,6 +1160,12 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
+                # A non-worker reviewer (human-lane orchestrator) on a parked
+                # review card opens the review run as itself, atomically.
+                # Gateway sessions carry no worker marker: fall back to the
+                # active profile, never a literal that misattributes the verdict.
+                claimer=_caller_profile() or "reviewer",
+                coverage=coverage,
             )
             if not ok:
                 return tool_error(
@@ -2371,6 +2382,15 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
                 "description": (
                     "Specific, actionable changes the implementer must make "
                     "before requesting another review."
+                ),
+            },
+            "coverage": {
+                "type": "string",
+                "description": (
+                    "Optional review_coverage JSON object. Recorded on the "
+                    "review run in the same transaction as the verdict; "
+                    "required when sending back a card parked in review "
+                    "with no active review run."
                 ),
             },
             "board": _board_schema_prop(),
