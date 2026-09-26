@@ -635,8 +635,7 @@ print(json.dumps(evt, sort_keys=True))
 
     acker = f'''
 from tools import async_delegation as ad
-assert ad.claim_completion_delivery({delegation_id!r}, "restart-test-consumer")
-assert ad.complete_completion_delivery({delegation_id!r}, "restart-test-consumer")
+assert ad.mark_completion_delivered({delegation_id!r})
 '''
     subprocess.run(
         [sys.executable, "-c", acker], cwd=repo, env=env,
