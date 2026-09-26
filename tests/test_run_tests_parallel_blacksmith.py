@@ -1,12 +1,14 @@
 """Blacksmith = the paid third rung of the slice venue ladder (t_6804be8c).
 
 Order: free self-hosted -> free GitHub-hosted -> paid Blacksmith. The last N
-GitHub-hosted slices move to Blacksmith with their arch kept, and only for
-trusted events (push, merge_group, same-repo pull_request). Exercised through
+GitHub-hosted x64 slices move to Blacksmith x64, and only for trusted events
+(push, merge_group, same-repo pull_request). Blacksmith is x64-only
+(t_56b21c1e): ARM slices stay on GitHub ARM, never blacksmith-*-arm. Exercised through
 the same CLI entry point and workflow binding CI uses.
 """
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -19,7 +21,7 @@ POOL = '["self-hosted","hermes-ci"]'
 HOSTED = '["ubuntu-latest"]'
 ARM = '["ubuntu-24.04-arm"]'
 BS = '["blacksmith-4vcpu-ubuntu-2404"]'
-BS_ARM = '["blacksmith-4vcpu-ubuntu-2404-arm"]'
+ARM_BS_RE = re.compile(r"blacksmith-.*-arm")
 # core smoke first (lightest), then 7 non-core slices with distinct weights.
 WEIGHTS8 = (0.1, 40, 10, 30, 5, 20, 1, 15)
 
@@ -64,14 +66,29 @@ def test_ladder_takes_the_last_n_hosted_slices_and_never_the_pool(monkeypatch, c
     assert hosted == [HOSTED] * (len(hosted) - moved) + [BS] * moved
 
 
-def test_arch_is_preserved_under_arm_first_routing(monkeypatch, capsys):
+def test_blacksmith_takes_only_x64_hosted_slices_never_arm(monkeypatch, capsys):
     base = generate(monkeypatch, capsys, slots=2, arm="3")
     assert base == [POOL, POOL, ARM, ARM, HOSTED, ARM, HOSTED, ARM]
     runs_on = generate(monkeypatch, capsys, slots=2, arm="3", bs="3")
-    # Last three hosted slices (5, 6, 7 zero-based) move, each keeping its arch.
-    assert runs_on == [POOL, POOL, ARM, ARM, HOSTED, BS_ARM, BS, BS_ARM]
+    # Only the two x64 hosted slices exist to take; every ARM slice stays GitHub ARM.
+    assert runs_on == [POOL, POOL, ARM, ARM, BS, ARM, BS, ARM]
+    assert runs_on.count(ARM) == base.count(ARM)
     # x64 canary count survives: every x64 slice is still x64 (hosted or Blacksmith).
     assert runs_on.count(HOSTED) + runs_on.count(BS) == base.count(HOSTED)
+
+
+@pytest.mark.parametrize("slots", [0, 2, 5])
+@pytest.mark.parametrize("arm", ["0", "3", "9"])
+@pytest.mark.parametrize("x64_min", ["", "0", "2"])
+@pytest.mark.parametrize("bs", ["1", "4", "99"])
+def test_no_emitted_label_is_ever_blacksmith_arm(monkeypatch, capsys, slots, arm, x64_min, bs):
+    runs_on = generate(monkeypatch, capsys, slots=slots, arm=arm, x64_min=x64_min, bs=bs)
+    assert not [r for r in runs_on if ARM_BS_RE.search(r)], runs_on
+    assert set(runs_on) <= {POOL, HOSTED, ARM, BS}
+
+
+def test_generator_source_has_no_blacksmith_arm_label():
+    assert not ARM_BS_RE.search(SCRIPT.read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize("event,same_repo", [

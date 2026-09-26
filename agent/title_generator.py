@@ -747,8 +747,20 @@ def maybe_auto_title(
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
 
+    # A bare thread starts with an empty Context: carry the turn's Blackbox
+    # ledger binding over so the title call is ledgered as aux:title_generation.
+    from agent.aux_accounting import get_blackbox_turn
+
+    _bb_turn = get_blackbox_turn()
+
+    def _titled(*args, **kwargs):
+        if _bb_turn is not None:
+            from agent.aux_accounting import set_blackbox_turn
+            set_blackbox_turn(*_bb_turn)
+        return auto_title_session(*args, **kwargs)
+
     thread = threading.Thread(
-        target=auto_title_session,
+        target=_titled,
         args=(session_db, session_id, user_message),
         kwargs={
             "failure_callback": failure_callback,

@@ -89,6 +89,48 @@ def _home_key(home: Path) -> str:
         return str(home)
 
 
+# (env file path, key) -> every non-blank value this process saw that ``.env``
+# carry (a set: after an in-file rotation the environment may still hold an
+# OLDER file value when nothing re-exported the file).  Read-time revocation: a credential that came FROM the dotenv and has
+# since been removed/blanked there must not be resurrected from the copy that
+# the load left in ``os.environ`` / the secret scope (t_8dccb8ef).  Values from
+# a shell export, systemd or an external secret source never enter this map
+# (or differ from it), so they keep falling through as before.
+_DOTENV_SEEN: dict[tuple[str, str], set[str]] = {}
+_DOTENV_SEEN_LOCK = threading.Lock()
+
+
+def _env_path_key(path: str | os.PathLike) -> str:
+    return os.path.abspath(os.fspath(path))
+
+
+def note_dotenv_values(path: str | os.PathLike, values: dict) -> None:
+    """Record the non-blank values ``path`` currently defines."""
+    pk = _env_path_key(path)
+    with _DOTENV_SEEN_LOCK:
+        for key, value in values.items():
+            value = (value or "").strip()
+            if value:
+                _DOTENV_SEEN.setdefault((pk, key), set()).add(value)
+
+
+def dotenv_value_revoked(path: str | os.PathLike, key: str, fallback: str) -> bool:
+    """True when ``fallback`` is a stale copy of a value ``path`` no longer has.
+
+    Callers ask this only after ``path`` came back without a non-blank ``key``.
+    The fallback is treated as dotenv-sourced (and therefore revoked by the
+    removal) when it equals any value that file carried in this process, or
+    when the file carried an ``op://`` reference whose resolution is what the
+    fallback holds.
+    """
+    fallback = (fallback or "").strip()
+    if not fallback:
+        return False
+    with _DOTENV_SEEN_LOCK:
+        seen = set(_DOTENV_SEEN.get((_env_path_key(path), key), ()))
+    return fallback in seen or any(v.startswith("op://") for v in seen)
+
+
 def _mark_dotenv_loaded(home: Path) -> None:
     """Record that ``home``'s ``.env`` has been read into ``os.environ``."""
     with _DOTENV_LOADED_LOCK:
@@ -579,6 +621,12 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
         _mark_dotenv_loaded(home_path)
+        # Seed the revocation map before external sources can overwrite a key:
+        # right after an override=True load, os.environ holds the file's values.
+        note_dotenv_values(
+            user_env,
+            {k: os.environ.get(k, "") for k in _env_keys_defined_in_dotenv(user_env)},
+        )
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
         # absent from this profile's .env do not leak into the runtime.
         _clear_known_keys_missing_from_dotenv(user_env)

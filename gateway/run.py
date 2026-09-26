@@ -34519,11 +34519,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
 
             path = resolve_config_path()
+            # Key on the file's BYTES, not its mtime: two writes inside one mtime tick
+            # (coarse-granularity filesystems, e.g. Blacksmith CI runners) kept the same
+            # mtime_ns and served the stale signature, so a pinPeerName flip did not bust
+            # the agent cache. honcho.json is tiny; hashing it is cheaper than parsing it.
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                import hashlib as _hashlib
+                digest = _hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                digest = None
+            memo_key = (str(path), digest)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)

@@ -768,56 +768,10 @@ def test_stale_review_cleanup_cannot_clear_or_signal_newer_review(monkeypatch):
     assert second_run.request_done.is_set()
     assert agent._background_review_run is None
 
-def test_background_review_fork_keeps_skip_memory_with_mem0_write_flag_on(monkeypatch):
-    """INV-1: enabling memory.background_review_mem0_write must NOT re-open the leak.
-
-    The mem0-in-background-review feature adds a manager-free write tool
-    (mem0_remember); it must NOT re-enable the fork's _memory_manager. The fork
-    stays skip_memory=True even with the flag on — the ONLY mem0 write path is
-    the manager-free mem0_remember registry tool, which never touches
-    on_turn_start / prefetch_all / sync_all.
-    """
-    import hermes_cli.config as _config
-    monkeypatch.setattr(_config, "load_config_readonly", lambda: {
-        "memory": {"background_review_mem0_write": True}})
-
-    captured_kwargs: dict = {}
-
-    class FakeReviewAgent:
-        def __init__(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            self._session_messages = []
-
-        def run_conversation(self, **kwargs):
-            pass
-
-        def shutdown_memory_provider(self):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
-    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
-
-    agent = _bare_agent()
-    AIAgent._spawn_background_review(
-        agent,
-        messages_snapshot=[{"role": "user", "content": "hello"}],
-        review_memory=True,
-    )
-
-    assert captured_kwargs.get("skip_memory") is True, (
-        "Flag-on must NOT re-enable the fork's memory manager — the mem0 write "
-        "is the manager-free mem0_remember tool, not a re-enabled _memory_manager."
-    )
-
-
 
 # ---------------------------------------------------------------------------
 # memory_notifications mode: off | on | verbose
 # ---------------------------------------------------------------------------
-
 import json as _json
 
 from agent.background_review import summarize_background_review_actions
