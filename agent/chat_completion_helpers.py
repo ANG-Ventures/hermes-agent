@@ -52,7 +52,12 @@ from agent.message_sanitization import (
     _splice_surrogates,
     _repair_tool_call_arguments,
 )
-from agent.fork_ext.relay_headers import _pool_affinity_headers, _pool_lane, _pool_lane_src
+from agent.fork_ext.relay_headers import (
+    _pool_affinity_headers,
+    _pool_lane,
+    _pool_lane_src,
+    merge_pool_capability_headers,
+)
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
@@ -2393,6 +2398,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             _eh = dict(anthropic_kwargs.get("extra_headers") or {})
             _eh.update(_aff)
             anthropic_kwargs["extra_headers"] = _eh
+        # error-class-v2 negotiation (apr and bpr; fallback spec Phase 1b).
+        merge_pool_capability_headers(agent, anthropic_kwargs)
         # Nous Portal reads ``tags`` and ``session_id`` as top-level body fields
         # on its Messages route the same way it does on /chat/completions, but
         # the profile hook that produces them is only consulted by the
@@ -2577,7 +2584,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # registered providers with profiles were bypassing the strip.
         api_messages = agent._prepare_messages_for_non_vision_model(api_messages)
 
-        return _ct.build_kwargs(
+        return merge_pool_capability_headers(agent, _ct.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
@@ -2604,7 +2611,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
-        )
+        ))
 
     # ── Legacy flag path ────────────────────────────────────────────
     # Reached only when get_provider_profile() returns None — i.e. a
@@ -2616,7 +2623,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
-    return _ct.build_kwargs(
+    return merge_pool_capability_headers(agent, _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
         tools=tools_for_api,
@@ -2652,7 +2659,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
-    )
+    ))
 
 
 
@@ -3601,6 +3608,21 @@ def try_activate_fallback(
     # so the explicit-wins / backfill / consume-once invariant is unit-testable
     # without driving the whole provider-resolution path.
     reason = _resolve_failover_reason(agent, reason)
+    # A seat-level quota (`quota_seat`: one seat's 5h / weekly / Fable limit)
+    # on a pool relay is the relay's to rotate around, so it does not bench
+    # the model (fallback spec §4.1 / Phase 1b); apply_quota_gate skips it at
+    # its own entry. Peeked, not consumed: the ledger row still gets it.
+    try:
+        from agent import fallback_events as _fbe_cls
+
+        _relay_quota_seat = _fbe_cls.quota_seat_on_relay(agent)
+    except Exception:
+        _relay_quota_seat = False
+    if _relay_quota_seat:
+        logger.info(
+            "quota_seat on relay %s/%s: no model bench, no quota-registry gate",
+            getattr(agent, "provider", "?"), getattr(agent, "model", "?"),
+        )
     # ── Registry-driven pruning (2026-09-21 cascade) ────────────────────
     # A quota failure means the chain is about to be walked for quota
     # reasons, and the usage-tracking system has already recorded which subs
@@ -3616,7 +3638,8 @@ def try_activate_fallback(
             apply_quota_gate(agent)
         except Exception:
             logger.debug("quota registry gate failed open", exc_info=True)
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    if (reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
+            and not _relay_quota_seat):
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
