@@ -266,6 +266,53 @@ def _check_dispatcher_presence(
 # Argparse builder
 # ---------------------------------------------------------------------------
 
+def _intermix_optional_positionals(parser: argparse.ArgumentParser) -> None:
+    """Let options appear before trailing ``*``/``?`` positionals.
+
+    Stock argparse binds an optional positional (``nargs="*"``/``"?"``) to
+    ``[]``/default the moment it meets an option, so
+    ``comment <id> --author X "text"`` failed with ``unrecognized arguments:
+    text`` once ``text`` became ``nargs="*"`` (#1166). Every leaf parser in
+    the kanban tree that owns such a positional is switched to
+    ``parse_known_intermixed_args``; parsers with sub-commands are walked,
+    not converted (intermixed parsing cannot host subparsers).
+    """
+    subparser_actions = [
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    ]
+    if subparser_actions:
+        seen: set[int] = set()
+        for action in subparser_actions:
+            for child in action.choices.values():
+                if id(child) not in seen:
+                    seen.add(id(child))
+                    _intermix_optional_positionals(child)
+        return
+    if not any(
+        not a.option_strings and a.nargs in ("*", "?") for a in parser._actions
+    ):
+        return
+    base = type(parser)
+    if getattr(base, "_kanban_intermixed", False):
+        return
+
+    class _Intermixed(base):  # type: ignore[misc, valid-type]
+        _kanban_intermixed = True
+
+        def parse_known_args(self, args=None, namespace=None):
+            # parse_known_intermixed_args re-enters parse_known_args on
+            # py<3.12; the guard makes those inner passes the stock parser.
+            if getattr(self, "_kanban_in_intermixed", False):
+                return super().parse_known_args(args, namespace)
+            self._kanban_in_intermixed = True
+            try:
+                return self.parse_known_intermixed_args(args, namespace)
+            finally:
+                self._kanban_in_intermixed = False
+
+    parser.__class__ = _Intermixed
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
@@ -1545,6 +1592,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                      "relayed human decision to a foreign card; records an "
                      "operator_override event, posts no comment.",
             )
+    _intermix_optional_positionals(kanban_parser)
     return kanban_parser
 
 
