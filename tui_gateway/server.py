@@ -14921,6 +14921,21 @@ def _(rid, params: dict) -> dict:
                     )
                 parsed_flags = parse_model_switch_args(value)
                 explicit_provider = parsed_flags.explicit_provider
+                # A build already in flight (started, not ready, no error
+                # yet) must finish before we decide: if it fails, the
+                # failed-build recovery below has to replace it; switching
+                # against agent None while it runs would let it fail later
+                # with the stale overrides and no rebuild.
+                inflight_ready = session.get("agent_ready")
+                if (
+                    session.get("agent") is None
+                    and session.get("agent_error") is None
+                    and session.get("agent_build_started")
+                    and inflight_ready is not None
+                    and not inflight_ready.is_set()
+                ):
+                    if not inflight_ready.wait(timeout=30.0):
+                        return _err(rid, 5032, "agent initialization timed out")
                 failed_agent_init = (
                     session.get("agent") is None
                     and session.get("agent_error") is not None
