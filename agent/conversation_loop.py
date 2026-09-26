@@ -2652,20 +2652,8 @@ def run_conversation(
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
         # this iteration regardless of outcome.
-        #
-        # ``_in_budget_grace`` is recomputed every iteration (default False) and
-        # set True ONLY for the grace turn. The tool dispatchers read it to
-        # refuse side-effecting tools during the grace turn (deny-by-default,
-        # read-only allowlist) — see ``agent/budget_grace_gate.py`` (Guard
-        # D-core). Refusing a call must NOT re-arm ``_budget_grace_call``: the
-        # flag is already cleared here, so the loop exits after this iteration
-        # whether the model's tool calls execute or are refused. A
-        # deny-that-loops would itself be a runaway, so the gate only blocks
-        # execution; it never extends the loop.
-        agent._in_budget_grace = False
         if agent._budget_grace_call:
             agent._budget_grace_call = False
-            agent._in_budget_grace = True
         elif not agent.iteration_budget.consume():
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
@@ -3628,74 +3616,6 @@ def run_conversation(
                     "Operation interrupted before the next model call (stop requested).",
                     effective_task_id=effective_task_id,
                     close_tail=True,
-                )
-            # ── Shared host-transport preflight ───────────────────────
-            # APR/BPR and direct 100.64/10 routes all depend on the local
-            # Tailscale client. If the host-local CLI explicitly says it is
-            # stopped, do not issue a request that can only consume the relay's
-            # full upstream timeout, then walk every route sharing the same
-            # prerequisite. Unknown/ambiguous CLI state fails open, so a lone
-            # provider timeout retains the normal retry and reason label.
-            try:
-                from agent.shared_transport_guard import (
-                    emit_unavailable_summary,
-                    record_unavailable_route,
-                    route_uses_tailscale,
-                    tailscale_status_down,
-                )
-
-                _route_uses_tailscale = route_uses_tailscale(
-                    getattr(agent, "provider", ""),
-                    getattr(agent, "base_url", ""),
-                )
-                _tailscale_down, _tailscale_evidence = (
-                    tailscale_status_down()
-                    if _route_uses_tailscale
-                    else (None, "not_applicable")
-                )
-                if _route_uses_tailscale and _tailscale_down is True:
-                    record_unavailable_route(agent, agent.provider, agent.model)
-                    agent._shared_transport_evidence = _tailscale_evidence
-                    if agent._try_activate_fallback(
-                        reason=FailoverReason.tailscale_down
-                    ):
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt
-                        )
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        # parity 2026-08-30: break to the restart-with-rebuilt-
-                        # messages handler (not a bare continue) so the pre-API
-                        # preflight re-runs against the fallback context window
-                        # (#84733 restart discipline; upstream guard enforces).
-                        _retry.restart_with_rebuilt_messages = True
-                        break
-
-                    emit_unavailable_summary(
-                        agent, evidence=_tailscale_evidence
-                    )
-                    # The terminal result below is the single human-facing
-                    # error. Drop the buffered aggregate here rather than send
-                    # the same Tailscale diagnosis twice; route count/session
-                    # detail remains in the WARNING diagnostic.
-                    agent._clear_status_buffer()
-                    _transport_error = "Tailscale down"
-                    agent._persist_session(messages, conversation_history)
-                    return {
-                        "final_response": _transport_error,
-                        "messages": messages,
-                        "completed": False,
-                        "api_calls": api_call_count,
-                        "error": _transport_error,
-                        "partial": True,
-                        "failed": True,
-                        "shared_transport_unavailable": "tailscale",
-                    }
-            except Exception:
-                logger.debug(
-                    "Shared-transport request preflight failed open",
-                    exc_info=True,
                 )
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
@@ -8352,24 +8272,6 @@ def run_conversation(
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
-
-            # Provider-specific response post-processing (inverse of
-            # ProviderProfile.prepare_messages). Default is pass-through, so
-            # this is a no-op for every provider that does not opt in.
-            # Guarded: a misbehaving profile must not cost a user-visible turn.
-            try:
-                from providers import get_provider_profile as _gpp
-
-                _resp_profile = _gpp(agent.provider)
-                if _resp_profile is not None and isinstance(
-                    getattr(normalized, "content", None), str
-                ):
-                    normalized.content = _resp_profile.process_response_text(
-                        normalized.content
-                    )
-            except Exception:
-                pass
-
             assistant_message = normalized
             finish_reason = normalized.finish_reason
 

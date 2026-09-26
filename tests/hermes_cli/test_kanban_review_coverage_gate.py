@@ -206,7 +206,10 @@ def test_legacy_parked_review_reopen_cannot_bypass_full_review(review):
         assert kb.get_task(conn, parked).status == 'review'
 
 
-def test_human_only_board_can_claim_review_and_return_full_verdict(review):
+def test_human_only_board_can_claim_review_and_return_full_verdict(review, monkeypatch):
+    # The human-lane claim binds to the claiming session (t_088fe9e3); pin one
+    # so the result never depends on the runner's ambient session env.
+    monkeypatch.setenv('HERMES_SESSION_ID', 'human-review-session')
     with kb.connect() as conn:
         parked = kb.create_task(conn, title='human review', assignee='builder')
         assert kb.request_review(conn, parked, summary='ready', reviewer='human')
