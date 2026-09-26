@@ -56,11 +56,15 @@ def test_fork_fields_are_the_default_footer_set():
     [
         # Plain pair.
         ("claude-apr", "claude-opus-4-8", "claude-apr/claude-opus-4-8"),
-        # Model already carries its own prefix — that prefix is AUTHORITATIVE
-        # and the separately-supplied provider is ignored (no "unset/a/b").
-        ("claude-apr", "claude-bridge-f3/claude-opus-4-8",
-         "claude-bridge-f3/claude-opus-4-8"),
+        # Model repeats the provider as a prefix — de-duped, never a doubled
+        # ``provider/provider/model``.
+        ("claude-apr", "claude-apr/claude-opus-4-8", "claude-apr/claude-opus-4-8"),
+        # Provider unset, model carries a prefix — split it (no "unset/a/b").
         (None, "claude-bridge-f3/claude-opus-4-8", "claude-bridge-f3/claude-opus-4-8"),
+        # Aggregator vendor namespace: the slash is part of the MODEL id and the
+        # served provider (who billed the turn) stays in front of it. Regression
+        # 2026-09-25: an OpenRouter turn rendered as bare "moonshotai/kimi-k3".
+        ("openrouter", "moonshotai/kimi-k3", "openrouter/moonshotai/kimi-k3"),
         # Provider unknown, bare model → model alone, never "unset/model".
         (None, "claude-opus-4-8", "claude-opus-4-8"),
         ("", "claude-opus-4-8", "claude-opus-4-8"),

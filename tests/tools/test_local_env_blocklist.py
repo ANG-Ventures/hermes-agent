@@ -732,16 +732,19 @@ class TestPythonpathSelectiveStrip:
         user_b = "/opt/project/lib"
         captured = {}
 
+        class _Captured(RuntimeError):
+            pass
+
         def _fake_popen(cmd, **kwargs):
             captured["env"] = kwargs.get("env", {})
             captured["staging"] = os.path.dirname(cmd[1])
-            proc = MagicMock()
-            proc.stdout.read.return_value = b""
-            proc.stderr.read.return_value = b""
-            proc.wait.return_value = 0
-            proc.returncode = 0
-            proc.poll.return_value = 0
-            return proc
+            # Abort the spawn after capture. A MagicMock proc hands the
+            # session kernel's reader threads a stream whose read1() never
+            # returns b"", so _stderr_reader spins forever (daemon thread,
+            # outlives the test) recording mock calls: ~45 GB RSS in 9 min,
+            # which OOM-killed hosted CI runners mid-slice. Same fix as
+            # test_code_execution_modes.TestPythonPathComposition.
+            raise _Captured()
 
         with patch("tools.code_execution_tool._load_config",
                    return_value={"mode": "strict"}), \
@@ -754,7 +757,11 @@ class TestPythonpathSelectiveStrip:
                  "PYTHONPATH": os.pathsep.join(
                      [hermes_root, venv_sp, user_a, user_b]),
              }):
-            execute_code(code="pass", task_id="test-int", enabled_tools=[])
+            try:
+                execute_code(code="pass", task_id="test-int", enabled_tools=[],
+                             reset=True)
+            except _Captured:
+                pass  # expected: spawn aborted right after env capture
 
         assert "PYTHONPATH" in captured["env"], \
             "execute_code never reached Popen"

@@ -112,6 +112,19 @@ collect_sandbox_logs() {
     cat "$dest/proxy.log" >&2
     echo "--- end proxy.log ---" >&2
   fi
+  # install.sh runs `npm install --silent`, so a failed install prints nothing
+  # of npm's own reason. npm always writes a debug log under the sandbox HOME;
+  # keep it and print its error lines.
+  local npm_logs="$SANDBOX_ROOT/home/.npm/_logs"
+  if [ -d "$npm_logs" ]; then
+    mkdir -p "$dest/npm-logs"
+    cp -a "$npm_logs/." "$dest/npm-logs/" 2>/dev/null || true
+    if grep -hE ' (error|verbose stack) ' "$npm_logs"/*.log >/dev/null 2>&1; then
+      echo "--- sandbox npm debug log errors ---" >&2
+      grep -hE ' (error|verbose stack) ' "$npm_logs"/*.log | head -n 60 >&2 || true
+      echo "--- end npm debug log errors ---" >&2
+    fi
+  fi
 }
 
 # ── preflight ──────────────────────────────────────────────────────────────

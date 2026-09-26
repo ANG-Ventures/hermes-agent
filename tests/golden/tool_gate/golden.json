@@ -1,41 +1,4 @@
 {
-  "0f2e825e647e7033e4e13a52ce3802327d55c7ca5af184e72318781bd4db1365": {
-    "input": {
-      "agent": {
-        "_in_budget_grace": false
-      },
-      "function_name": "read_file",
-      "kind": "pre_block",
-      "name": "no pre block",
-      "tool_scope_block": null
-    },
-    "name": "no pre block",
-    "output": {
-      "db": [],
-      "messages": [],
-      "return": null
-    }
-  },
-  "1a1fb7de9d0abbb6382fc0ff62e3be4dbc86b38896f4c4c36184d9196ad1ee6e": {
-    "input": {
-      "agent": {
-        "_in_budget_grace": false
-      },
-      "function_name": "golden_lookup",
-      "kind": "pre_block",
-      "name": "tool scope outranks plugin path after grace",
-      "tool_scope_block": "'golden_lookup' is not available in this session. Use tool_search to find tools you can call."
-    },
-    "name": "tool scope outranks plugin path after grace",
-    "output": {
-      "db": [],
-      "messages": [],
-      "return": {
-        "error_type": "tool_scope_block",
-        "message": "'golden_lookup' is not available in this session. Use tool_search to find tools you can call."
-      }
-    }
-  },
   "1c60b7f97bf3e72b7a9333ebc9a3faa8cd6cbe9f3fb362d163a142a22716a32b": {
     "input": {
       "kind": "strip_toolsets",
@@ -57,6 +20,21 @@
         "code_execution",
         "skills"
       ]
+    }
+  },
+  "3d3fb4c6c735c9ec69823ef08c385d78fcb14cd20360ca91a979e6a4d3a11a37": {
+    "input": {
+      "agent": {},
+      "function_name": "read_file",
+      "kind": "pre_block",
+      "name": "no pre block",
+      "tool_scope_block": null
+    },
+    "name": "no pre block",
+    "output": {
+      "db": [],
+      "messages": [],
+      "return": null
     }
   },
   "4425881163593b7f8fe4a767ba5ae1643a56f79d48cd08a9d8fc51482330e93c": {
@@ -114,41 +92,22 @@
       }
     }
   },
-  "95d981047ca52a81ad9a5b130d56e9085143cd4076f6f1797d6d5f12d6988c3a": {
+  "a2ae60c8dbf0bb71ec574eb4fb55bad6ac8fa2dd872dd5f0a5f17e31a1a62a0f": {
     "input": {
-      "agent": {
-        "_in_budget_grace": true
-      },
-      "function_name": "terminal",
+      "agent": {},
+      "function_name": "golden_lookup",
       "kind": "pre_block",
-      "name": "budget grace blocks side effect",
-      "tool_scope_block": null
+      "name": "tool scope block surfaces",
+      "tool_scope_block": "'golden_lookup' is not available in this session. Use tool_search to find tools you can call."
     },
-    "name": "budget grace blocks side effect",
+    "name": "tool scope block surfaces",
     "output": {
       "db": [],
       "messages": [],
       "return": {
-        "error_type": "budget_grace_block",
-        "message": "Refused 'terminal': the iteration budget is exhausted and this is the final grace turn. Only read-only tools may run now. Write your final summary/answer directly instead of calling side-effecting tools."
+        "error_type": "tool_scope_block",
+        "message": "'golden_lookup' is not available in this session. Use tool_search to find tools you can call."
       }
-    }
-  },
-  "a70d0db3379feb5e5527653756402b46d6e035feab21dee52fb22b79bf9a362d": {
-    "input": {
-      "agent": {
-        "_in_budget_grace": true
-      },
-      "function_name": "read_file",
-      "kind": "pre_block",
-      "name": "budget grace allows readonly",
-      "tool_scope_block": null
-    },
-    "name": "budget grace allows readonly",
-    "output": {
-      "db": [],
-      "messages": [],
-      "return": null
     }
   },
   "bea7ae4cb4641e17e86966489c0a9f956843a90af94ac97ce17f3ac39e145189": {

@@ -955,6 +955,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
+            after = kb.get_task(conn, tid)
+            if getattr(after, "status", None) == "review":
+                return _ok(
+                    task_id=tid, run_id=run.id if run else None,
+                    status="review",
+                    note=("auto-routed to review: the handoff names a PR that is "
+                          "still OPEN; the card is NOT done and dependants stay gated"),
+                )
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
