@@ -846,8 +846,12 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
+    # idle_timeout is threaded only when set: _run_one_file_once derives the
+    # default itself, and callers/tests that stub it with the historical
+    # 4-positional shape keep working.
+    _extra = () if idle_timeout is None else (idle_timeout,)
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout, idle_timeout
+        file, pytest_args, repo_root, file_timeout, *_extra
     )
     attempt = 0
     # A timed-out attempt is NOT retried here: re-running it at once under the
@@ -857,7 +861,7 @@ def _run_one_file(
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout, idle_timeout
+            file, pytest_args, repo_root, file_timeout, *_extra
         )
         subproc_wall += subproc_wall2
         if rc == 0:
