@@ -26,6 +26,33 @@ RECEIPT = "release_receipt_sha256"
 # unused remainder of the reservation returns to the day's allowance (t_38a419e0: a 580-min plan
 # measured ~65 min actual; charging the flat reservation drained the 6000-min day by 20:45Z).
 HOSTED = "hosted_minutes"
+# D4 amendment 2026-09-26 (t_f459aa52): the timeout ceiling per job kind. Reserving it is the
+# legacy conservative mode; in estimate mode it bounds the reservation, the charge and a sample.
+CEILING = {"slice": 35, "e2e": 20}
+# Rolling billed-minutes samples per job kind, recorded by reconcile; the admission estimate E is
+# their p90. Optional top-level key: absent == no samples yet.
+SAMPLES = "billed_samples"
+SAMPLE_CAP = 200
+MIN_SAMPLES = 20
+
+
+def _kind(job_id):
+    return "e2e" if job_id == "e2e" else "slice"
+
+
+def _estimate(state, kind):
+    """p90 (nearest rank) of the recorded billed minutes for this job kind, clamped to
+    [1, ceiling]. Fewer than MIN_SAMPLES measured jobs means no estimate: reserve the ceiling."""
+    samples = sorted(state.get(SAMPLES, {}).get(kind, []))
+    if len(samples) < MIN_SAMPLES:
+        return CEILING[kind]
+    return max(1, min(CEILING[kind], samples[math.ceil(0.9 * len(samples)) - 1]))
+
+
+def _runnerless_cancel(job):
+    """A hosted job cancelled before any runner picked it up: it never executed (spec 5.3a)."""
+    return (job.get("status") == "completed" and job.get("conclusion") == "cancelled"
+            and not job.get("runner_name") and job.get("steps") == [])
 
 
 def _charge(job):
@@ -95,6 +122,11 @@ def _date(value, today):
 
 
 def _validate(state, today):
+    samples = state.get(SAMPLES, {})
+    if (type(samples) is not dict or not set(samples) <= set(CEILING) or any(
+            type(v) is not list or len(v) > SAMPLE_CAP
+            or any(type(x) is not int or not 1 <= x <= CEILING[k] for x in v) for k, v in samples.items())):
+        raise ValueError("corrupt billed samples")
     for day, total in state["daily_totals"].items():
         _date(day, today)
         if type(total) is not int or total < 0:
@@ -127,7 +159,7 @@ def _validate(state, today):
                 raise ValueError("corrupt job fields")
             if hosted and (terminal is None or job.get("released_unemitted") is not False
                            or type(job[HOSTED]) is not int or type(job.get("reserved_minutes")) is not int
-                           or not 0 < job[HOSTED] <= job["reserved_minutes"]
+                           or not 0 < job[HOSTED] <= CEILING[_kind(job.get("job_id"))]
                            or type(job.get(RECEIPT)) is not str or not re.fullmatch(r"[0-9a-f]{64}", job[RECEIPT])):
                 raise ValueError("corrupt job")
             name, labels, charge = job.get("job_id"), job.get("labels"), job.get("reserved_minutes")
@@ -135,7 +167,7 @@ def _validate(state, today):
                     or set(planned) != {"job_id", "labels", "reserved_minutes", "reason"}
                     or type(labels) is not list or labels not in (POOL, X64, ARM)
                     or type(charge) is not int or charge < 0
-                    or charge != (0 if labels == POOL else 20 if name == "e2e" else 35)
+                    or (charge != 0 if labels == POOL else not 1 <= charge <= CEILING[_kind(name)])
                     or type(job.get("reason")) is not str
                     or type(job.get("released_unemitted")) is not bool
                     or any(job.get(field) != planned.get(field) for field in
@@ -151,9 +183,16 @@ def _validate(state, today):
 
 
 class Ledger:
-    def __init__(self, api, *, daily_limit=0, clock=None):
+    def __init__(self, api, *, daily_limit=0, clock=None, estimate_headroom=None):
         self.api = api
         self.daily_limit = daily_limit if type(daily_limit) is int and daily_limit >= 0 else 0
+        # None: legacy D4 (reserve the timeout ceiling). An int M >= 0: admit each hosted job at its
+        # measured p90 estimate E while consumed + E + M <= daily_limit (D4 amendment, t_f459aa52).
+        # Invalid values fail closed to the whole limit as headroom (no new cloud), never to 0.
+        if estimate_headroom is None or (type(estimate_headroom) is int and estimate_headroom >= 0):
+            self.headroom = estimate_headroom
+        else:
+            self.headroom = self.daily_limit
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def _read(self):
@@ -167,7 +206,7 @@ class Ledger:
         # then decode strictly so any other non-alphabet byte still fails closed.
         # Duplicate keys are refused: last-wins parsing could hide a recorded charge.
         data = json.loads(base64.b64decode("".join(content.split()), validate=True), object_pairs_hook=_object_pairs)
-        if (type(data) is not dict or set(data) != STATE_FIELDS or type(data["version"]) is not int
+        if (type(data) is not dict or set(data) not in (STATE_FIELDS, STATE_FIELDS | {SAMPLES}) or type(data["version"]) is not int
                 or data["version"] != 1 or type(data.get("attempts")) is not dict
                 or type(data.get("daily_totals")) is not dict):
             raise ValueError("corrupt ledger")
@@ -240,12 +279,15 @@ class Ledger:
             self._compact(state, today)
             if len(_encode(state)) >= HARD_LIMIT:
                 return Refusal("state-capacity")
-            remaining = max(0, self.daily_limit - self._consumed(state, today))
+            estimating = self.headroom is not None
+            remaining = max(0, self.daily_limit - (self.headroom or 0) - self._consumed(state, today))
+            cost = {k: _estimate(state, k) if estimating else CEILING[k] for k in CEILING}
             jobs = []
             for job in plan.jobs:
-                if job.reserved_minutes and remaining >= job.reserved_minutes:
-                    remaining -= job.reserved_minutes
-                    jobs.append(job)
+                price = cost[_kind(job.job_id)]
+                if job.reserved_minutes and remaining >= price:
+                    remaining -= price
+                    jobs.append(JobPlacement(job.job_id, job.labels, job.reason, price))
                 elif job.reserved_minutes:
                     reason = "budget-overrides-cloud-only" if plan.summary.get("mode") == "cloud-only" else "budget-queue"
                     jobs.append(JobPlacement(job.job_id, POOL.copy(), reason, 0))
@@ -254,6 +296,9 @@ class Ledger:
             summary = dict(plan.summary)
             summary.update(remaining_allowance=remaining, reserved_minutes=sum(j.reserved_minutes for j in jobs),
                            budget_overrides_cloud_only=any(j.reason == "budget-overrides-cloud-only" for j in jobs))
+            if estimating:
+                summary.update(admission_estimate=dict(cost, headroom=self.headroom, samples={
+                    k: len(state.get(SAMPLES, {}).get(k, [])) for k in CEILING}))
             decided = Plan(jobs, plan.incidents, summary)
             state["attempts"][ident] = {"admitted_on": today, "terminal_on": None,
                 "jobs": [{**asdict(j), "released_unemitted": False} for j in jobs], "plan": asdict(decided)}
@@ -297,7 +342,7 @@ class Ledger:
             if len(names) != len(set(names)) or any(j.get("status") not in {"queued", "in_progress", "completed", "cancelled"} for j in observed):
                 return ReleaseResult(0)
             mapping = {j["name"]: j for j in observed}
-            to_release, to_bill = [], []
+            to_release, to_bill, measured = [], [], []
             for entry in row["jobs"]:
                 if not entry["reserved_minutes"] or entry.get("released_unemitted"):
                     continue
@@ -306,11 +351,18 @@ class Ledger:
                     to_release.append(entry)
                 elif job.get("labels") == POOL and job.get("runner_name"):
                     to_release.append(entry)
+                elif _runnerless_cancel(job):
+                    to_release.append(entry)
                 elif HOSTED not in entry:
+                    # Charge the billed minutes, capped at the timeout ceiling; an executed job with
+                    # no exact measurement (unmeasurable, no runner identity) is charged the ceiling.
+                    ceiling = CEILING[_kind(entry["job_id"])]
                     billed = _billed_minutes(job)
-                    if billed is not None and billed < entry["reserved_minutes"]:
-                        to_bill.append((entry, billed))
-                # Canceled, unmeasurable, or ambiguous runner identity: no refund.
+                    charge = ceiling if billed is None else min(billed, ceiling)
+                    if billed is not None and row["terminal_on"] is None:
+                        measured.append((_kind(entry["job_id"]), charge))
+                    if charge != entry["reserved_minutes"]:
+                        to_bill.append((entry, charge))
             day = self._today()
             changed = bool(to_release) or bool(to_bill) or row["terminal_on"] is None
             if not changed:
@@ -325,7 +377,11 @@ class Ledger:
             for entry, billed in to_bill:
                 entry[HOSTED] = billed
                 entry[RECEIPT] = receipt
-                amount += entry["reserved_minutes"] - billed
+                amount += entry["reserved_minutes"] - billed   # negative: billed above the estimate
+            if measured:
+                samples = state.setdefault(SAMPLES, {})
+                for kind, minutes in measured:
+                    samples[kind] = (samples.get(kind, []) + [minutes])[-SAMPLE_CAP:]
             self._compact(state, day)
             try:
                 self._write(state, sha)
