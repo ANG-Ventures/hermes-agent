@@ -1588,6 +1588,7 @@ def mark_running_jobs_interrupted(
     reason: str,
     *,
     only_owners: Optional[set] = None,
+    lock_timeout: Optional[float] = None,
 ) -> list:
     """Best-effort: mark every currently in-flight cron job interrupted.
 
@@ -1616,6 +1617,14 @@ def mark_running_jobs_interrupted(
     own jobs) are left untouched. Interruption flags are recorded per
     execution token, so a later run of the same job ID never consumes a
     stale flag that targeted its dead predecessor.
+
+    ``lock_timeout``: bound on each job's fire-fence wait. The fence is held
+    by the job's own thread across delivery, and in the gateway that
+    delivery waits on the event loop — so an unbounded wait from a
+    loop-adjacent caller can deadlock until the delivery future times out
+    (t_8d085477). A timed-out mark fails closed exactly like the legacy
+    flock timeout: the in-memory interrupt flag above is still recorded, only
+    the persisted ``last_status`` write is skipped.
 
     Returns the list of job IDs marked, for the caller to log.
     """
@@ -1662,6 +1671,7 @@ def mark_running_jobs_interrupted(
                     False,
                     reason,
                     expected_fire_owner=fire_owner,
+                    lock_timeout=lock_timeout,
                 ):
                     marked.append(job_id)
         except Exception as e:
@@ -5040,6 +5050,12 @@ def _run_job_script(
         # profile (t_7fee0f83). Any agent a script launches re-advertises itself.
         for _agent_marker in ("AI_AGENT", "HERMES_AGENT"):
             env.pop(_agent_marker, None)
+        # Same reason for the gateway's agent.process_env_files overlay (the gh
+        # lane PATH shim + git credential helper, t_45c11886): a script child
+        # keeps the env it had before this gateway sourced those files.
+        from hermes_cli.process_env_files import strip_overlay
+
+        strip_overlay(env)
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).

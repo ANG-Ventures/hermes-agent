@@ -262,6 +262,49 @@ def _emit_api_call_record(
 
 
 
+def _emit_aux_api_call_record(
+    agent: Any,
+    turn_id: str,
+    *,
+    task: str,
+    provider: str,
+    model: str,
+    usage: Any,
+    api_mode: str,
+) -> None:
+    """Ledger one auxiliary-model call under the turn that made it.
+
+    Same row shape as the main-lane record, sharing the turn's sequence
+    allocator so ``(turn_id, seq)`` never collides. ``attribution='aux:<task>'``
+    makes the store tag ``lane_family='aux'``: the row is measurable per aux
+    lane but excluded from the turn's main-lane cache statistics. No sub
+    identity is known on the aux path, so ``sub_key`` stays NULL. Fail-open.
+    """
+    try:
+        if not turn_id:
+            return
+        seq = _next_api_call_seq(agent, turn_id)
+        from plugins.blackbox import record_api_call
+
+        record_api_call(
+            turn_id=turn_id,
+            seq=seq,
+            ts=time.time(),
+            provider=provider,
+            model=model,
+            usage=usage,
+            api_mode=api_mode,
+            sub_key=None,
+            attribution=f"aux:{task}",
+            http_status=200,
+            relay_synthetic=False,
+            route_id=None,
+        )
+    except Exception:
+        _note_api_call_recording_failure(agent)
+        logger.warning("blackbox aux API-call insert failed", exc_info=True)
+
+
 def _note_billed_response(agent: Any, response: Any) -> None:
     """Register a transport-accepted (billed) response for loop accounting.
 
@@ -303,6 +346,9 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
     # Registered BEFORE the pooled-header guard below: a response whose ledger
     # row cannot be attributed was still billed and must still be counted.
     _note_billed_response(agent, response)
+    # A served call means the last stashed API error recovered in place; it
+    # must not be attributed to a later, unrelated failover.
+    agent._pending_fallback_error = None
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
     if provider in _POOLED_PROVIDERS and not hasattr(response, "pool_headers"):
         _note_api_call_recording_failure(agent)
@@ -4200,6 +4246,21 @@ def try_activate_fallback(
             _append_route_change(
                 "failover", old_provider, old_model, fb_provider, fb_model,
                 old_effort=_old_eff, new_effort=_new_eff,
+            )
+            # Fallback ledger row beside the sink line (spec Phase 1): same
+            # best-effort contract; parity between the two is the report's
+            # --check-parity gate.
+            from agent import fallback_events as _fbe
+
+            _cool = None
+            _rl_until = getattr(agent, "_rate_limited_until", 0) or 0
+            if _rl_until:
+                _cool = max(0.0, _rl_until - time.monotonic())
+            _fbe.record(
+                agent, "failover",
+                from_provider=old_provider, from_model=old_model,
+                to_provider=fb_provider, to_model=fb_model,
+                reason=reason, error_context=error_context, cooldown_s=_cool,
             )
             # Kanban worker: put the swap on the card's run (t_4fe0700a) so
             # a pinned route that ended up elsewhere is visible on the board.

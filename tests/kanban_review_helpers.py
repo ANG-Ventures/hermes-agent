@@ -16,7 +16,7 @@ def record_review_coverage(conn, task_id):
             'lenses': {name: 'done' for name in REQUIRED_REVIEW_LENSES},
             'findings': 1, 'items': ['Concrete defect in test fixture'],
             'review_minutes': 1, 'battery': 'battery-fixture.zip' if prior else 'seeded',
-            'batch_id': 'fixture-batch',
+            'batch_id': 'fixture-batch', 'head_sha': 'n/a: fixture card has no PR',
         }), run_id=task.current_run_id)
 
 

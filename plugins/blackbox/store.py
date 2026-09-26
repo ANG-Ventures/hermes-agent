@@ -256,6 +256,45 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             prompt_tokens_before INT,
             prompt_tokens_after INT
         );
+        -- Harness route-change ledger (fallback-cache spec 2026-09-25, Phase
+        -- 1). One row per successful try_activate_fallback (failover), per
+        -- primary restore (recovery), and per refused restore episode
+        -- (restore_refused). failover+recovery rows mirror the lines in
+        -- state/model-route-changes.log (the report's parity check). The
+        -- next_call_* columns are back-filled by insert_api_call when the
+        -- session's next 200 call lands. err_head is scrubbed, <=160 chars,
+        -- and only set for non-2xx error JSON — never model output.
+        CREATE TABLE IF NOT EXISTS fallback_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            session_id TEXT,
+            turn_id TEXT,
+            seq INT,
+            from_provider TEXT,
+            from_model TEXT,
+            to_provider TEXT,
+            to_model TEXT,
+            kind TEXT NOT NULL,
+            reason TEXT,
+            trigger_class TEXT,
+            class_source TEXT,
+            http_status INT,
+            relay_synthetic INT NOT NULL DEFAULT 0,
+            route_id TEXT,
+            err_hash TEXT,
+            err_head TEXT,
+            cooldown_s REAL,
+            sticky_until_epoch REAL,
+            next_call_ts REAL,
+            next_call_cache_read INT,
+            next_call_cache_write INT,
+            next_call_cold INT
+        );
+        CREATE INDEX IF NOT EXISTS idx_blackbox_fallback_events_ts
+            ON fallback_events(ts);
+        CREATE INDEX IF NOT EXISTS idx_blackbox_fallback_events_session
+            ON fallback_events(session_id, next_call_cold);
+
         CREATE INDEX IF NOT EXISTS idx_blackbox_prefix_mutations_ts
             ON prefix_mutations(ts);
         CREATE INDEX IF NOT EXISTS idx_blackbox_prefix_mutations_session
@@ -568,14 +607,32 @@ def lane_family(provider: str) -> str:
     return "codex" if p == "openai-codex" else "other"
 
 
+# Auxiliary-model calls (compression, title_generation, vision, web_extract, ...)
+# are ledgered with ``attribution='aux:<task>'`` and ``lane_family='aux'``. Their
+# tokens are NOT part of the turn's main-model totals, so every reader that
+# reconciles against the turn or measures the main lane's cache behaviour must
+# exclude this family (card t_39628ae3).
+AUX_LANE_FAMILY = "aux"
+AUX_ATTRIBUTION_PREFIX = "aux:"
+_NOT_AUX = "COALESCE(lane_family, '') != 'aux'"
+
+
+def is_aux_attribution(attribution: Any) -> bool:
+    return (isinstance(attribution, str) and attribution.startswith(AUX_ATTRIBUTION_PREFIX)
+            and len(attribution) > len(AUX_ATTRIBUTION_PREFIX))
+
+
 def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
     """Reconcile calls even when they arrive after the turn row."""
-    conn.execute("""
+    # Main lane only: an aux call (lane_family='aux') is a different model on a
+    # different prompt; letting it be the "first call" or add to the write tiers
+    # would misreport the main conversation's cache behaviour.
+    conn.execute(f"""
         UPDATE turns SET
             cache_write_5m = (SELECT SUM(cache_write_5m) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
             cache_write_1h = (SELECT SUM(cache_write_1h) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
             first_call_cache_miss = (
                 SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
                                       OR cache_write IS NULL THEN NULL
@@ -593,7 +650,7 @@ def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
                             WHEN cache_write * 5 >= 4 *
                                  (input_tokens + cache_read + cache_write) THEN 1
                             ELSE 0 END
-                FROM turn_api_calls WHERE turn_id = turns.turn_id
+                FROM turn_api_calls WHERE turn_id = turns.turn_id AND {_NOT_AUX}
                   -- First SUCCESSFUL call: a 429/5xx/timeout attempt carries
                   -- zero usage and would hide the cold write on the retry.
                   AND (http_status IS NULL OR http_status BETWEEN 200 AND 299)
@@ -841,7 +898,8 @@ def insert_api_call(
     provenance raise rather than silently replacing or dropping ledger rows.
     Calls may arrive before their parent turn is finalized.
     """
-    if attribution not in ("wire", "pinned", "inferred", "external"):
+    aux = is_aux_attribution(attribution)
+    if not aux and attribution not in ("wire", "pinned", "inferred", "external"):
         raise ValueError(f"Invalid API-call attribution: {attribution!r}")
     # SQLite permits NULL in a non-INTEGER PRIMARY KEY column, so the composite
     # key alone does not stop a NULL turn_id/seq row (and NULLs never collide,
@@ -865,11 +923,68 @@ def insert_api_call(
              usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
              usage.reasoning_tokens, attribution, http_status,
              _bool_int(relay_synthetic), route_id, cache_write_5m,
-             cache_write_1h, cache_ttl_requested, lane_family(provider)),
+             cache_write_1h, cache_ttl_requested,
+             AUX_LANE_FAMILY if aux else lane_family(provider)),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
             _refresh_served_subs(conn, turn_id)
+        if http_status in (None, 200):
+            _backfill_fallback_next_call(conn, turn_id, ts, usage)
+
+
+_FALLBACK_EVENT_COLUMNS = (
+    "ts", "session_id", "turn_id", "seq", "from_provider", "from_model",
+    "to_provider", "to_model", "kind", "reason", "trigger_class",
+    "class_source", "http_status", "relay_synthetic", "route_id", "err_hash",
+    "err_head", "cooldown_s", "sticky_until_epoch",
+)
+FALLBACK_EVENT_KINDS = ("failover", "recovery", "restore_refused")
+
+
+def insert_fallback_event(row: dict[str, Any]) -> None:
+    """Append one fallback-ledger row. Raises on a bad kind (the caller is
+    fail-open); the err_head is re-scrubbed here so no path can persist an
+    unscrubbed error head."""
+    if row.get("kind") not in FALLBACK_EVENT_KINDS:
+        raise ValueError(f"invalid fallback event kind: {row.get('kind')!r}")
+    values = dict(row)
+    if values.get("err_head"):
+        values["err_head"] = scrub_and_truncate(values["err_head"], 160)
+    values["relay_synthetic"] = _bool_int(values.get("relay_synthetic"))
+    cols = ", ".join(_FALLBACK_EVENT_COLUMNS)
+    marks = ", ".join("?" for _ in _FALLBACK_EVENT_COLUMNS)
+    with _connect() as conn:
+        conn.execute(
+            f"INSERT INTO fallback_events ({cols}) VALUES ({marks})",
+            tuple(values.get(c) for c in _FALLBACK_EVENT_COLUMNS),
+        )
+
+
+def _backfill_fallback_next_call(conn: sqlite3.Connection, turn_id: str,
+                                 ts: float, usage: CanonicalUsage) -> None:
+    """Stamp the cache outcome of the session's first 200 call after each
+    failover/recovery row (the cost of the route change). Cold = cache_read
+    under half the prompt (the evidence scripts' convention)."""
+    try:
+        session_id = str(turn_id).split(":", 1)[0]
+        cr = int(usage.cache_read_tokens or 0)
+        cw = int(usage.cache_write_tokens or 0)
+        prompt = int(usage.input_tokens or 0) + cr + cw
+        if prompt <= 0:
+            return
+        conn.execute(
+            """
+            UPDATE fallback_events
+               SET next_call_ts = ?, next_call_cache_read = ?,
+                   next_call_cache_write = ?, next_call_cold = ?
+             WHERE session_id = ? AND next_call_cold IS NULL
+               AND kind IN ('failover', 'recovery') AND ts <= ?
+            """,
+            (ts, cr, cw, 1 if cr < 0.5 * prompt else 0, session_id, ts),
+        )
+    except Exception:
+        logger.debug("fallback ledger back-fill failed", exc_info=True)
 
 
 def mark_alerted(turn_id: str) -> bool:
@@ -1492,6 +1607,16 @@ def sweep(retention_days: int, max_deletes: int = 10000) -> int:
             )
             """,
             (orphan_cutoff, max_deletes),
+        )
+        # Fallback ledger rows carry their own ts and no parent turn row.
+        conn.execute(
+            """
+            DELETE FROM fallback_events
+            WHERE id IN (
+                SELECT id FROM fallback_events WHERE ts < ? ORDER BY ts LIMIT ?
+            )
+            """,
+            (cutoff, max_deletes),
         )
         deleted = len(turn_ids)
         # Atomic: deletes + sentinel commit together so a crash can't leave the

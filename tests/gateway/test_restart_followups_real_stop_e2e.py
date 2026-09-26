@@ -91,8 +91,12 @@ async def _restart_and_boot(tmp_path, park, events=None):
     boot = _runner(tmp_path, received, events)
     try:
         await asyncio.wait_for(boot.start(), timeout=60)
-        for _ in range(100):
+        for i in range(100):
             if received and not list(rf.spool_dir().glob("*.json")):
+                break
+            # Nothing spooled -> nothing to replay; a 1s window still catches a
+            # stray delivery instead of idling the full 10s.
+            if spooled == 0 and i >= 10:
                 break
             await asyncio.sleep(0.1)
         await asyncio.sleep(0.2)  # a duplicate replay would land here

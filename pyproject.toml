@@ -505,6 +505,10 @@ redundant-cast = "ignore"
 
 [tool.ruff]
 preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
+# docs/ holds one-off audit/census scripts (fork-PR audit roll-up #1128), not shipped
+# code; #1128 landed docs-only past the path-filtered lint and turned `ruff check .` red
+# for every PR (24x PLW1514 in docs/plans/fork-pr-audit/census/). Not runtime, not linted.
+extend-exclude = ["docs/"]
 
 [tool.ruff.lint]
 # All other lints are intentionally disabled (see comment history on this

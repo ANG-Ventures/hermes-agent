@@ -335,19 +335,6 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    # Reject blank submits before any agent work happens. A buggy or stale
-    # client (e.g. a desktop app stuck in a reconnect loop) can fire
-    # prompt.submit with empty text; without this guard the gateway builds a
-    # full agent and burns a complete API call (system prompt + tool schemas,
-    # ~50k tokens) to answer nothing, leaving a junk session row behind.
-    # An empty text IS legitimate when images are attached — the turn runs on
-    # the vision content — so only reject when there is nothing sendable.
-    if (
-        session is not None
-        and (not isinstance(text, str) or not text.strip())
-        and not session.get("attached_images")
-    ):
-        return _err(rid, 4020, "text required (empty prompt rejected)")
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every

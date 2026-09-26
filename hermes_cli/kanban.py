@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -264,6 +265,53 @@ def _check_dispatcher_presence(
 # ---------------------------------------------------------------------------
 # Argparse builder
 # ---------------------------------------------------------------------------
+
+def _intermix_optional_positionals(parser: argparse.ArgumentParser) -> None:
+    """Let options appear before trailing ``*``/``?`` positionals.
+
+    Stock argparse binds an optional positional (``nargs="*"``/``"?"``) to
+    ``[]``/default the moment it meets an option, so
+    ``comment <id> --author X "text"`` failed with ``unrecognized arguments:
+    text`` once ``text`` became ``nargs="*"`` (#1166). Every leaf parser in
+    the kanban tree that owns such a positional is switched to
+    ``parse_known_intermixed_args``; parsers with sub-commands are walked,
+    not converted (intermixed parsing cannot host subparsers).
+    """
+    subparser_actions = [
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    ]
+    if subparser_actions:
+        seen: set[int] = set()
+        for action in subparser_actions:
+            for child in action.choices.values():
+                if id(child) not in seen:
+                    seen.add(id(child))
+                    _intermix_optional_positionals(child)
+        return
+    if not any(
+        not a.option_strings and a.nargs in ("*", "?") for a in parser._actions
+    ):
+        return
+    base = type(parser)
+    if getattr(base, "_kanban_intermixed", False):
+        return
+
+    class _Intermixed(base):  # type: ignore[misc, valid-type]
+        _kanban_intermixed = True
+
+        def parse_known_args(self, args=None, namespace=None):
+            # parse_known_intermixed_args re-enters parse_known_args on
+            # py<3.12; the guard makes those inner passes the stock parser.
+            if getattr(self, "_kanban_in_intermixed", False):
+                return super().parse_known_args(args, namespace)
+            self._kanban_in_intermixed = True
+            try:
+                return self.parse_known_intermixed_args(args, namespace)
+            finally:
+                self._kanban_in_intermixed = False
+
+    parser.__class__ = _Intermixed
+
 
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
@@ -523,7 +571,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--session", default=None, metavar="SESSION_ID",
                           help="Home session to stamp on the card (default: "
-                               "$HERMES_SESSION_ID when set; 'none' = unstamped)")
+                               "$HERMES_SESSION_ID when set; 'none' = unstamped). "
+                               "An explicit --session WINS over a --parent's "
+                               "home; omitted, the child follows the parent's "
+                               "current home.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -864,7 +915,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help="Why --survivor-none has no remote ref; include the follow-up card id.")
     p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
-                                 "gh pr view (state OPEN or MERGED) AND required to name this "
+                                 "the GitHub REST API (state OPEN or MERGED) AND required to name this "
                                  "task; an unverifiable claim refuses the completion. Naming "
                                  "the task in the PR's head BRANCH binds the claim. A match "
                                  "only in the PR title or body is a mention, not a tie to this "
@@ -1533,7 +1584,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                 metavar="REASON",
                 help="Act on a card whose home session is another session "
                      "(or an unhomed card); records a takeover event and "
-                     "posts REASON as a comment the home session sees.",
+                     "posts REASON as a comment the home session sees. On "
+                     "assign/unblock/promote/reclaim/triage-resolve "
+                     "it also RE-HOMES the card to your session (children "
+                     "and pings follow; prev_session_id kept in the event); "
+                     "never on complete, and never for cron/sweep actors. "
+                     "Re-home without a status change: "
+                     "hermes kanban edit <id> --session <sid> --takeover R.",
             )
             _p.add_argument(
                 "--operator",
@@ -1544,6 +1601,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                      "relayed human decision to a foreign card; records an "
                      "operator_override event, posts no comment.",
             )
+    _intermix_optional_positionals(kanban_parser)
     return kanban_parser
 
 
@@ -2356,6 +2414,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     triage=bool(getattr(args, "triage", False)),
                 ),
                 session_id=_resolve_session_flag(getattr(args, "session", None)),
+                session_explicit=getattr(args, "session", None) is not None,
             )
             task = kb.get_task(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
@@ -3485,6 +3544,12 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
     if provider_error:
         print(f"kanban: {provider_error}", file=sys.stderr)
         return 2
+    from hermes_cli.model_policy import pinned_sub_provider_error
+
+    pin_error = pinned_sub_provider_error(model, provider)
+    if pin_error:
+        print(f"kanban: {pin_error}", file=sys.stderr)
+        return 2
 
     firepower_reason = parsed.firepower if parsed else None
     guard_error = firepower_guard_error(model, firepower_reason)
@@ -4083,6 +4148,44 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, conn
     )
 
 
+def _last_event_id(conn, task_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+#: Events ``complete_task`` records when it does NOT close the card. It
+#: returns a bare bool, so the CLI reads the reason back off the card rather
+#: than printing a generic line (or nothing) while the card stays put
+#: (t_1e080b8d: an operator saw rc=0 and no reason, card still in review).
+_COMPLETION_OUTCOME_EVENTS = {
+    "completion_route_refused": "open-PR review route refused",
+    "completion_routed_to_review": "handoff names still-OPEN PR(s)",
+    "workspace_held": "workspace held",
+}
+
+
+def _completion_outcome(conn, task_id: str, after_event: int) -> str:
+    """Why this ``complete`` call did not mark ``task_id`` done, or ''."""
+    kinds = tuple(_COMPLETION_OUTCOME_EVENTS)
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        f"AND kind IN ({','.join('?' * len(kinds))}) ORDER BY id",
+        (task_id, after_event, *kinds),
+    ).fetchall()
+    parts = []
+    for kind, payload in rows:
+        try:
+            data = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        detail = data.get("reason") or ", ".join(data.get("open_prs") or [])
+        label = _COMPLETION_OUTCOME_EVENTS[kind]
+        parts.append(f"{label}: {detail}" if detail else label)
+    return "; ".join(parts)
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -4153,6 +4256,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
+            last_event = _last_event_id(conn, tid)
             try:
                 done = kb.complete_task(
                     conn, tid,
@@ -4171,13 +4275,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
+            except DraftPrError as draft_err:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
+                continue
+            outcome = _completion_outcome(conn, tid, last_event)
             if not done:
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                print(f"cannot complete {tid}: {outcome or '(unknown id or terminal state)'}",
+                      file=sys.stderr)
             else:
                 after = kb.get_task(conn, tid)
                 if getattr(after, "status", None) == "review":
-                    print(f"Routed {tid} to review (handoff names a still-OPEN PR; not done)")
+                    print(f"Routed {tid} to review, NOT done: "
+                          f"{outcome or 'handoff names a still-OPEN PR'}")
                 else:
                     print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -4466,17 +4577,21 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        ok, reason = kb.request_review(
-            conn,
-            tid,
-            summary=summary,
-            metadata=metadata,
-            reviewer=reviewer,
-            expected_run_id=_worker_run_id_for(tid),
-            force=bool(getattr(args, "force", False)),
-            allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
-            with_reason=True,
-        )
+        try:
+            ok, reason = kb.request_review(
+                conn,
+                tid,
+                summary=summary,
+                metadata=metadata,
+                reviewer=reviewer,
+                expected_run_id=_worker_run_id_for(tid),
+                force=bool(getattr(args, "force", False)),
+                allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
+                with_reason=True,
+            )
+        except DraftPrError as draft_err:
+            print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
+            return 1
         if not ok:
             detail = reason or "not running/ready?"
             print(
