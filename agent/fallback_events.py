@@ -289,8 +289,12 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
               to_provider: Any, to_model: Any, reason: Any = None,
               error_context: Optional[Dict[str, Any]] = None,
               cooldown_s: Optional[float] = None,
-              consume: bool = True) -> Dict[str, Any]:
-    """Assemble one ledger row (pure except for consuming the pending slot)."""
+              consume: bool = True,
+              extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Assemble one ledger row (pure except for consuming the pending slot).
+
+    ``extra`` carries the Phase 2 policy fields (``sticky_until_epoch``,
+    ``return_branch``, ``dwell_s``, ``notice_text``, …); its keys win."""
     pending = _consume_pending(agent) if consume else None
     status = pending.get("status") if pending else None
     headers = pending.get("headers") if pending else {}
@@ -338,15 +342,15 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         "err_hash": err_hash(text) if kind == "failover" else None,
         "err_head": err_head,
         "cooldown_s": float(cooldown_s) if isinstance(cooldown_s, (int, float)) else None,
-        # Phase 2 (sticky policy) fills this; no sticky state exists yet.
+        # Phase 2 (sticky policy) fills this through ``extra``.
         "sticky_until_epoch": None,
+        **{k: v for k, v in (extra or {}).items() if k not in ("kind",)},
     }
 
 
-def record(agent: Any, kind: str, **kwargs: Any) -> None:
-    """Best-effort ledger write (I3). Never raises."""
+def write_row(row: Dict[str, Any]) -> None:
+    """Best-effort insert of an already-built row (I3). Never raises."""
     try:
-        row = build_row(agent, kind, **kwargs)
         from plugins.blackbox import record_fallback_event
 
         record_fallback_event(row)
@@ -354,7 +358,18 @@ def record(agent: Any, kind: str, **kwargs: Any) -> None:
         logger.warning("fallback ledger write failed", exc_info=True)
 
 
-def record_restore_refused(agent: Any, why: str) -> None:
+def record(agent: Any, kind: str, **kwargs: Any) -> None:
+    """Best-effort ledger write (I3). Never raises."""
+    try:
+        row = build_row(agent, kind, **kwargs)
+    except Exception:  # noqa: BLE001
+        logger.warning("fallback ledger row build failed", exc_info=True)
+        return
+    write_row(row)
+
+
+def record_restore_refused(agent: Any, why: str,
+                           extra: Optional[Dict[str, Any]] = None) -> None:
     """One `restore_refused` row per fallback episode (not per turn)."""
     try:
         if getattr(agent, "_fallback_restore_refused_logged", False):
@@ -365,6 +380,6 @@ def record_restore_refused(agent: Any, why: str) -> None:
                from_provider=getattr(agent, "provider", None),
                from_model=getattr(agent, "model", None),
                to_provider=rt.get("provider"), to_model=rt.get("model"),
-               reason=why, consume=False)
+               reason=why, consume=False, extra=extra)
     except Exception:  # noqa: BLE001
         logger.debug("restore_refused ledger write failed", exc_info=True)

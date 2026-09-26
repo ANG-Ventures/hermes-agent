@@ -141,3 +141,77 @@ def test_mutation_dropping_a_field_is_caught(monkeypatch):
     monkeypatch.undo()
     monkeypatch.setattr(fp, "_hop_segment", lambda h, s, st: s)
     assert not _HOP_RE.search(fp.format_cause_rider(row, tz=UTC))
+
+
+
+# ── AST guard (§4.8 lint): route-change notices are built in ONE place ──────
+
+import ast as _ast
+import pathlib as _pathlib
+
+_REPO = _pathlib.Path(__file__).resolve().parents[2]
+_NOTICE_WORDS = ("Model fallback", "Model recovery")
+# Recognizers READ a finished notice (prefix match); they never build one.
+_NOTICE_RECOGNIZERS = {("gateway/run.py", "_is_model_route_change_status")}
+_BUILDER = ("agent/chat_completion_helpers.py", "_emit_fallback_announce")
+
+
+def _notice_strings(path, rel):
+    """(lineno, enclosing function) for every non-docstring str constant
+    (f-string pieces included) naming a route-change notice."""
+    tree = _ast.parse(path.read_text(encoding="utf-8"))
+    docstrings = {id(n.value) for n in _ast.walk(tree)
+                  if isinstance(n, _ast.Expr) and isinstance(n.value, _ast.Constant)}
+    out = []
+
+    def visit(node, fn):
+        for child in _ast.iter_child_nodes(node):
+            name = child.name if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef)) else fn
+            if (isinstance(child, _ast.Constant) and isinstance(child.value, str)
+                    and id(child) not in docstrings
+                    and any(w in child.value for w in _NOTICE_WORDS)):
+                out.append((child.lineno, name))
+            visit(child, name)
+
+    visit(tree, None)
+    return out
+
+
+def _violations(files):
+    bad = []
+    for path, rel in files:
+        for lineno, fn in _notice_strings(path, rel):
+            if (rel, fn) == _BUILDER or (rel, fn) in _NOTICE_RECOGNIZERS:
+                continue
+            bad.append(f"{rel}:{lineno} in {fn}")
+    return bad
+
+
+def _scope():
+    for sub in ("agent", "gateway"):
+        for p in sorted((_REPO / sub).rglob("*.py")):
+            yield p, p.relative_to(_REPO).as_posix()
+
+
+def test_ast_guard_notice_strings_live_in_the_announce():
+    assert _violations(_scope()) == []
+
+
+def test_ast_guard_announce_calls_format_cause_rider():
+    rel, fn = _BUILDER
+    tree = _ast.parse((_REPO / rel).read_text(encoding="utf-8"))
+    [func] = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef) and n.name == fn]
+    called = {(c.func.attr if isinstance(c.func, _ast.Attribute) else getattr(c.func, "id", None))
+              for c in _ast.walk(func) if isinstance(c, _ast.Call)}
+    assert "format_cause_rider" in called
+    # and the builder really constructs the verbs (the guard is not vacuous)
+    assert _notice_strings(_REPO / rel, rel)
+
+
+def test_ast_guard_notice_self_test_flags_planted_construction(tmp_path):
+    planted = tmp_path / "planted.py"
+    planted.write_text('def announce(agent, icon, a, b):\n'
+                       '    agent._emit_status(f"{icon} Model fallback: {a} → {b}")\n'
+                       'def other():\n    verb = "Model recovery"\n    return verb\n')
+    assert _violations([(planted, "agent/planted.py")]) == [
+        "agent/planted.py:2 in announce", "agent/planted.py:4 in other"]
