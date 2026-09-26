@@ -13016,23 +13016,6 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
-def _restore_kanban_batch(session: dict, batch: list) -> None:
-    """Put a refused kanban batch back at the FRONT of the pending buffer.
-
-    Kanban notifications are claimed through an atomic subscription cursor
-    (`claim_unseen_events_for_sub`) and are never re-delivered, so once the
-    dispatch moves them out of ``session["_kanban_pending"]`` this buffer holds
-    the only copy. Prepending preserves arrival order against anything queued
-    while the refused turn was in flight.
-    """
-    if not batch:
-        return
-    with session["history_lock"]:
-        session["_kanban_pending"] = list(batch) + list(
-            session.get("_kanban_pending") or []
-        )
-
-
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -13101,26 +13084,13 @@ def _notification_poller_loop(
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        # These events were cursor-claimed and are never
-                        # re-queued, so this buffer is the ONLY copy. A refused
-                        # submit (session closing / replaced) must hand the
-                        # batch back instead of dropping the notification.
-                        # Only an explicit False is a refusal. A None return
-                        # means "submitted" for callers that predate the
-                        # boolean contract; treating it as a refusal would
-                        # re-buffer an ALREADY-DELIVERED batch and duplicate
-                        # the notification on the next idle turn.
-                        if _run_prompt_submit(
-                            rid, sid, session, "\n".join(_batch)
-                        ) is False:
-                            _restore_kanban_batch(session, _batch)
+                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
                             f"{type(exc).__name__}: {exc}",
                             file=sys.stderr,
                         )
-                        _restore_kanban_batch(session, _batch)
                         with session["history_lock"]:
                             session["running"] = False
         try:

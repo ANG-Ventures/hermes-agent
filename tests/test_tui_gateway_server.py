@@ -7029,47 +7029,6 @@ def test_refused_completion_submission_preserves_durable_receipt(
     assert ad.enqueue_pending_outbox(current_boot_id="later-boot", profile_home=tmp_path) == 1
 
 
-@pytest.mark.parametrize("refusal", ["closing", "replaced"])
-def test_refused_kanban_submission_retains_its_batch(monkeypatch, tmp_path, refusal):
-    """A refused kanban turn must KEEP its batch, not silently eat it.
-
-    The kanban notifications are cursor-claimed by
-    `claim_unseen_events_for_sub` and are never re-queued, so the buffer in
-    `session["_kanban_pending"]` is the only copy. The dispatch moves the batch
-    OUT of that buffer before submitting; if `_run_prompt_submit` then refuses
-    (session closing, or the session was replaced), the batch is unrecoverable
-    and the user never sees the notification.
-    """
-    _configure_immediate_prompt_run(monkeypatch, tmp_path)
-    turns = []
-    session = _session(session_key="kanban-parent", agent=_RecordingAgent(turns))
-    sid = "kanban-refusal-sid"
-    monkeypatch.setitem(server._sessions, sid, session)
-    session["_kanban_pending"] = ["kanban note one", "kanban note two"]
-
-    original = server._run_prompt_submit
-    accepted = []
-
-    def refuse(*args, **kwargs):
-        if refusal == "closing":
-            session["_closing"] = True
-        else:
-            monkeypatch.setitem(
-                server._sessions, sid, _session(session_key="kanban-parent"))
-        result = original(*args, **kwargs)
-        accepted.append(result)
-        return result
-
-    monkeypatch.setattr(server, "_run_prompt_submit", refuse)
-    server._notification_poller_loop(_StopAfterOneNotificationPoll(), sid, session)
-
-    assert accepted == [False]
-    assert turns == []
-    assert session["running"] is False
-    # The refused batch must still be buffered for a later, valid turn.
-    assert session.get("_kanban_pending") == ["kanban note one", "kanban note two"]
-
-
 @pytest.mark.parametrize("phase", ["live", "shutdown", "post_turn"])
 @pytest.mark.parametrize("disposition", ["delivered", "dropped"])
 def test_completion_consumer_uses_event_profile(monkeypatch, tmp_path, phase, disposition):
