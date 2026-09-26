@@ -18,6 +18,10 @@ on:
         description: Isolated plugin scope from detect-changes, or full.
         type: string
         default: full
+      changed_files:
+        description: JSON list of changed paths (pull_request only) for test-impact selection.
+        type: string
+        default: "[]"
 
 permissions:
   contents: read
@@ -106,9 +110,33 @@ jobs:
           CI_BLACKSMITH_SLICES: ${{ vars.CI_BLACKSMITH_SLICES }}
           EVENT_NAME: ${{ github.event_name }}
           SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          # pull_request pre-filter (t_e8c5045e): run only the test files that
+          # can observe the diff (scripts/ci/test_impact.py), on a matrix
+          # scaled to their share of the suite. merge_group and push:main are
+          # never narrowed. Any selector failure or ambiguity -> full matrix.
+          # Rollback: vars.CI_PR_TEST_IMPACT=off.
+          CHANGED_FILES: ${{ inputs.changed_files }}
+          PR_TEST_IMPACT: ${{ vars.CI_PR_TEST_IMPACT }}
         run: |
+          SLICES=${{ inputs.slice_count }}
+          IMPACT_ARGS=()
+          if [ "$EVENT_NAME" = pull_request ] && [ '${{ inputs.test_scope }}' = full ] \
+             && [ "$CHANGED_FILES" != '[]' ] && [ "$PR_TEST_IMPACT" != off ]; then
+            IMPACT=$(printf '%s' "$CHANGED_FILES" \
+              | python3 -c 'import json, sys; print("\n".join(json.load(sys.stdin)))' \
+              | python3 scripts/ci/test_impact.py --event "$EVENT_NAME" \
+                  --durations test_durations.json --full-slices "$SLICES" \
+                  --files-out ci-impact-files.txt) || IMPACT='{"slices": 0}'
+            echo "test impact: $IMPACT"
+            N=$(printf '%s' "$IMPACT" | python3 -c 'import json, sys; print(int(json.load(sys.stdin)["slices"]))') || N=0
+            if [ "$N" -gt 0 ] && [ -s ci-impact-files.txt ]; then
+              SLICES=$N
+              IMPACT_ARGS=(--files-from ci-impact-files.txt)
+            fi
+          fi
           MATRIX=$(python3 scripts/run_tests_parallel.py \
-            --generate-slices ${{ inputs.slice_count }} \
+            --generate-slices "$SLICES" \
+            "${IMPACT_ARGS[@]}" \
             --test-scope '${{ inputs.test_scope }}' \
             --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
             --self-hosted-labels "$CI_RUNNER_LABELS" \

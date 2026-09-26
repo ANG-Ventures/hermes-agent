@@ -57,6 +57,11 @@ outputs:
   test_scope:
     description: Isolated plugin test scope, or fail-open full.
     value: ${{ steps.classify.outputs.test_scope }}
+  changed_files:
+    description: >-
+      JSON list of the pull_request's changed paths, for the test-impact
+      pre-filter in tests.yml. Always [] on every other event.
+    value: ${{ steps.classify.outputs.changed_files }}
   ci_review:
     description: Require CI-sensitive file review label.
     value: ${{ steps.classify.outputs.ci_review }}
@@ -235,3 +240,12 @@ runs:
           *) TEST_SCOPE=full ;;
         esac
         echo "test_scope=$TEST_SCOPE" | tee -a "$GITHUB_OUTPUT"
+
+        # pull_request only: the PR run narrows to test-impact-selected files
+        # (scripts/ci/test_impact.py). merge_group and push never get a list,
+        # so the gate always runs the full matrix.
+        CHANGED_JSON='[]'
+        if [ "$EVENT_NAME" = pull_request ] && [ -n "$CHANGED" ]; then
+          CHANGED_JSON="$(printf '%s\n' "$CHANGED" | python3 -c 'import json, sys; print(json.dumps([p for p in sys.stdin.read().splitlines() if p.strip()]))')"
+        fi
+        echo "changed_files=$CHANGED_JSON" >> "$GITHUB_OUTPUT"
