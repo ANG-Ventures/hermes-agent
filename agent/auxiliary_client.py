@@ -10116,6 +10116,9 @@ def call_llm(
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         outcome = "ok"
         _record_aux_call_cost(response, route_info, streamed=bool(stream))
+        if not stream:
+            from agent.aux_accounting import record_aux_api_call
+            record_aux_api_call(response, task, route_info)
         return response
     finally:
         if latency_info is not None:
@@ -11131,6 +11134,8 @@ async def async_call_llm(
             route_info=route_info,
         )
         outcome = "ok"
+        from agent.aux_accounting import record_aux_api_call
+        record_aux_api_call(response, task, route_info)
         return response
     finally:
         # Same duration contract as the sync path: an engine that summarises on the async
