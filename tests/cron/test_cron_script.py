@@ -133,6 +133,37 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    @pytest.mark.parametrize("name", ["agent_marker_probe.py", "agent_marker_probe.sh"])
+    def test_script_child_is_not_an_agent_process(self, cron_env, monkeypatch, name):
+        """A cron script child is a plain script, not an agent process.
+
+        The gateway advertises itself with AI_AGENT / HERMES_AGENT in its OWN
+        os.environ (gateway.run.main); a script child inherited both and was
+        classified as an agent by fleet tooling keyed on that marker (the gh
+        shim resolved every laned no_agent cron to the gateway profile's lane,
+        t_7fee0f83). Profile home must still propagate.
+        """
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setenv("AI_AGENT", "hermes-agent")
+        monkeypatch.setenv("HERMES_AGENT", "true")
+        script = cron_env / "scripts" / name
+        if name.endswith(".sh"):
+            script.write_text(
+                'echo "ai=${AI_AGENT-ABSENT} marker=${HERMES_AGENT-ABSENT} home=${HERMES_HOME:+SET}"\n'
+            )
+        else:
+            script.write_text(
+                "import os\n"
+                "g = os.environ.get\n"
+                "print('ai=%s marker=%s home=%s' % (g('AI_AGENT', 'ABSENT'), "
+                "g('HERMES_AGENT', 'ABSENT'), 'SET' if g('HERMES_HOME') else ''))\n"
+            )
+
+        success, output = _run_job_script(name)
+        assert success is True, output
+        assert output == "ai=ABSENT marker=ABSENT home=SET"
+
     @pytest.mark.windows_only
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         # Windows-only: the fake ``sys.platform`` could not reproduce the

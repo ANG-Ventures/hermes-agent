@@ -164,3 +164,22 @@ def test_script_within_interval_still_succeeds(hermes_env, monkeypatch):
     job = {"id": "q", "name": "quick", "schedule": {"kind": "interval", "minutes": 15}}
     ok, output = sched._run_job_script_with_claim_heartbeat(job, "quick.sh")
     assert ok is True and output == "done"
+
+
+def test_monitor_script_passes_job_ceiling(hermes_env, monkeypatch):
+    # monitor_script shares _run_job_script with the `script` field; it must get the same
+    # per-job ceiling, not only the global cron.script_timeout_seconds.
+    import cron.scheduler as sched
+    from cron.monitor import _run_monitor_source
+
+    calls = []
+
+    def fake(script_path, workdir=None, cancel_event=None, **kwargs):
+        calls.append(kwargs)
+        return True, ""
+
+    monkeypatch.setattr(sched, "_run_job_script", fake)
+    job = {"id": "m1", "name": "monitor-job", "monitor_script": "m.sh", "timeout_s": 45,
+           "schedule": {"kind": "interval", "minutes": 30}}
+    _run_monitor_source(job)
+    assert calls == [{"timeout_seconds": 45, "job_name": "monitor-job"}]

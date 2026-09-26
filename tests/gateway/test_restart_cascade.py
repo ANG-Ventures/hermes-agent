@@ -813,7 +813,10 @@ def test_single_gate_call_site():
     import gateway.run as gr
 
     src = inspect.getsource(gr)
-    n = src.count("self._apply_post_turn_resume_gate(session_key)")
+    # Direct call or offloaded via asyncio.to_thread(self._apply_..., key).
+    n = src.count("self._apply_post_turn_resume_gate(session_key)") + src.count(
+        "self._apply_post_turn_resume_gate, session_key)"
+    )
     assert n == 1, f"expected 1 gate call site, found {n}"
 
 
