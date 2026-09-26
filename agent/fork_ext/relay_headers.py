@@ -81,6 +81,42 @@ def _pool_lane_src(agent, aux_task=None) -> str:
 _POOL_AFFINITY_PROVIDERS = frozenset({"claude-apr"})
 
 
+# Pool relays that speak the error-class-v2 contract (fallback spec 2026-09-25
+# D2 / Phase 1b). Both lanes: the affinity helper above is apr-only, but the
+# capability header must reach bpr too, so it has its own provider set.
+_POOL_CAPABILITY_PROVIDERS = frozenset({"claude-apr", "claude-bpr"})
+POOL_ACCEPTS_HEADER = "x-hermes-accepts"
+POOL_ACCEPTS_VALUE = "error-class-v2"
+
+
+def _pool_capability_headers(agent) -> dict:
+    """Per-request capability negotiation for the claude pool relays.
+
+    ``x-hermes-accepts: error-class-v2`` tells a relay running with
+    ``error_class_v2=true`` that THIS client handles the v2 error contract:
+    ``x-relay-error-class`` / ``relay_error_class`` and a connect failure sent
+    as ``503 + conn`` (retried in place, never an immediate fallback). A relay
+    without the flag, and every other client, keeps today's bytes. Pool-scoped:
+    never sent to a direct pin (claude-bpx-N / claude-apx-N) or any third
+    party; the relay reads it as routing-only and never forwards it upstream.
+    """
+    provider = (getattr(agent, "provider", "") or "").strip().lower()
+    if provider not in _POOL_CAPABILITY_PROVIDERS:
+        return {}
+    return {POOL_ACCEPTS_HEADER: POOL_ACCEPTS_VALUE}
+
+
+def merge_pool_capability_headers(agent, api_kwargs):
+    """Merge :func:`_pool_capability_headers` into ``api_kwargs['extra_headers']``
+    (non-destructive; returns the same dict). Non-dict input is returned as is."""
+    cap = _pool_capability_headers(agent)
+    if cap and isinstance(api_kwargs, dict):
+        eh = dict(api_kwargs.get("extra_headers") or {})
+        eh.update(cap)
+        api_kwargs["extra_headers"] = eh
+    return api_kwargs
+
+
 def _pool_affinity_headers(agent, aux_task=None) -> dict:
     """Return the routing-only headers for the claude relay POOL: the x-hermes-session
     affinity id AND the x-hermes-lane / x-hermes-lane-src lane classification.
