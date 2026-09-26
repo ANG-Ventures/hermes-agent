@@ -183,6 +183,74 @@ def test_milestone_only_policy_skip_still_routes_open_pr_to_review(kanban_home, 
         assert "review_skipped" not in _kinds(conn, tid)
 
 
+def _same_actor_changes_requested(conn, monkeypatch):
+    """Seed t_503df7c5's history: a review drain returned the card with
+    ``changes_requested`` reviewer == implementer, then the worker re-claimed."""
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(kb, "spawnable_reviewer_profiles", lambda: ["worker", "argus"])
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    monkeypatch.setattr(kb, "configured_review_assignee", lambda: "argus")
+    tid = kb.create_task(conn, title="slice", assignee="worker")
+    kb.claim_task(conn, tid)
+    rid = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET outcome='changes_requested', status='ready', "
+                     "ended_at=1 WHERE id=?", (rid,))
+        conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL, "
+                     "claim_lock=NULL WHERE id=?", (tid,))
+        kb._append_event(conn, tid, "changes_requested",
+                         {"reason": "rework", "implementer": "worker",
+                          "reviewer": "worker", "status": "ready"}, run_id=rid)
+    kb.claim_task(conn, tid)
+    run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+    return tid, run_id
+
+
+def test_open_pr_route_survives_same_actor_review_provenance(kanban_home, monkeypatch):
+    """t_503df7c5: status=running, current_run_id == the worker's run id, yet
+    complete_task returned False ('unknown id or already terminal') because the
+    open-PR route inherited reviewer == implementer from changes_requested."""
+    _use_oracle(monkeypatch, {("ang-ventures/example-home", 670): "OPEN"})
+    with kb.connect() as conn:
+        tid, run_id = _same_actor_changes_requested(conn, monkeypatch)
+        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}",
+                                expected_run_id=run_id) is True
+        row = conn.execute("SELECT status, assignee FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert (row["status"], row["assignee"]) == ("review", "argus")
+        assert "completion_routed_to_review" in _kinds(conn, tid)
+
+
+def test_milestone_only_in_place_completion_uses_worker_run_id(kanban_home, monkeypatch):
+    """request_review under milestone_only passes the SAME expected_run_id into
+    complete_task, and completes a same-actor-provenance card in place."""
+    _use_oracle(monkeypatch, {})
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "milestone_only")
+    with kb.connect() as conn:
+        tid, run_id = _same_actor_changes_requested(conn, monkeypatch)
+        ok, reason = kb.request_review(conn, tid, summary="done",
+                                       expected_run_id=run_id + 1, with_reason=True)
+        assert ok is False and "expected_run_id" in reason
+        assert _status(conn, tid) == "running"
+        ok, reason = kb.request_review(conn, tid, summary="done",
+                                       expected_run_id=run_id, with_reason=True)
+        assert ok is True, reason
+        assert _status(conn, tid) == "done"
+
+
+def test_refused_open_pr_route_records_reason_event(kanban_home, monkeypatch):
+    _use_oracle(monkeypatch, {("ang-ventures/example-home", 670): "OPEN"})
+    monkeypatch.setattr(kb, "resolve_reviewer",
+                        lambda *a, **k: (None, "reviewer gate says no"))
+    with kb.connect() as conn:
+        tid, run_id = _same_actor_changes_requested(conn, monkeypatch)
+        assert kb.complete_task(conn, tid, summary=PR_URL, expected_run_id=run_id) is False
+        payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='completion_route_refused'",
+            (tid,)).fetchone()["payload"])
+        assert payload["reason"] == "reviewer gate says no"
+        assert _status(conn, tid) == "running"
+
+
 # --- lint ------------------------------------------------------------------
 
 

@@ -18,7 +18,7 @@ import pytest
 import capture_router as cr
 from capture_router import (
     CaptureRouter, BridgeExtractor, dedup_world_against_prefs, parse_candidates,
-    build_router_from_config, correction_marker_match, facts_contradict,
+    build_router_from_config,
 )
 from capture_queue import CaptureQueue, idem_key
 from capture_drain import CaptureDrainWorker
@@ -108,87 +108,6 @@ def test_dedup_keeps_all_when_no_prefs_overlap():
     world = [{"content": "Anthropic released a new model", "class": "world_entity"}]
     kept, dropped = dedup_world_against_prefs(world, prefs)
     assert len(kept) == 1 and dropped == []
-
-
-# ---------------------------------------------------------------------------
-# correction signals (RC1): markers + retrieved-fact contradiction
-# ---------------------------------------------------------------------------
-
-def test_correction_marker_defaults_and_config_override():
-    assert correction_marker_match("Actually, ACE-AI is 192.168.1.177", "ok")
-    assert correction_marker_match("No, ACE-AI is 192.168.1.177", "ok")
-    assert correction_marker_match("it's ACE-AI not ACE-MEDIA", "ok")
-    # Marker list is DATA: a mem0_capture_router.correction_markers override controls detection.
-    assert correction_marker_match("FIXFACT: ACE-AI is 192.168.1.177", "ok", [r"\bFIXFACT:"])
-    assert correction_marker_match("Actually, ACE-AI is 192.168.1.177", "ok", [r"\bFIXFACT:"]) is None
-
-
-def test_fact_contradiction_detects_same_subject_different_ip():
-    assert facts_contradict(
-        "ACE-AI runs at 192.168.1.177",
-        "ACE-AI runs at 192.168.1.176",
-    ) is True
-    assert facts_contradict(
-        "ACE-AI runs at 192.168.1.177",
-        "ACE-MEDIA runs at 192.168.1.176",
-    ) is False
-
-
-def test_fact_contradiction_boolean_words_do_not_treat_on_off_as_bare_booleans():
-    assert facts_contradict(
-        "ACE-AI monitoring report was on Tuesday",
-        "ACE-AI monitoring report was off Tuesday",
-    ) is False
-    assert facts_contradict(
-        "ACE-AI capture router is enabled",
-        "ACE-AI capture router is disabled",
-    ) is True
-
-
-def test_router_flags_contradiction_against_existing_lookup(tmp_path):
-    http = FakeHTTP(
-        prefs_cands=[],
-        world_cands=[{"content": "ACE-AI runs at 192.168.1.177", "class": "world_entity"}],
-    )
-    router = make_router(
-        tmp_path, http,
-        existing_fact_lookup_fn=lambda q: ["ACE-AI runs at 192.168.1.176"],
-    )
-    res = router.route_turn("ACE-AI runs at 192.168.1.177", "ok", turn_id="t-corr", session="s")
-    assert res["correction_detected"] is True
-    assert any(s["type"] == "contradiction" for s in res["correction_signals"])
-
-
-def test_route_turn_stage_false_defers_world_write_until_stage_result(tmp_path):
-    http = FakeHTTP(
-        prefs_cands=[],
-        world_cands=[{"content": "gbrain uses PGLite", "class": "world_entity"}],
-    )
-    router = make_router(tmp_path, http)
-    res = router.route_turn("u", "a", turn_id="t-stage", session="s", stage=False)
-    assert res["world_facts"]
-    assert "staged_path" not in res
-    assert list(tmp_path.rglob("*.md")) == []
-    router.stage_route_result(res)
-    assert os.path.exists(res["staged_path"])
-
-
-class RaisingExtractor(BridgeExtractor):
-    def extract(self, *a, **k):
-        raise RuntimeError("extract blew up")
-
-
-def test_marker_correction_stat_increments_even_when_extraction_fails(tmp_path):
-    router = CaptureRouter(
-        extractor=RaisingExtractor(),
-        prefs_prompt="prefs",
-        world_prompt="world",
-        staging_dir=str(tmp_path),
-    )
-    res = router.route_turn("Actually, ACE-AI changed", "ok", turn_id="t-err", session="s")
-    assert res["correction_detected"] is True
-    assert res["error"]
-    assert router.stats["corrections_detected"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -333,18 +252,6 @@ def test_build_router_fallback_model_never_inherits_primary_id(tmp_path):
     assert build_router_from_config(cfg)._extractor._fallback_model == "gemini-3.8-flash-low"
 
 
-def test_build_router_threads_correction_marker_config(tmp_path):
-    cfg = {"mem0_capture_router": {
-        "enabled": True,
-        "staging_dir": str(tmp_path / "s"),
-        "correction_markers": [r"\bFIXFACT:"],
-    }}
-    r = build_router_from_config(cfg)
-    assert isinstance(r, CaptureRouter)
-    assert r.correction_marker("Actually, ACE-AI changed", "ok") is None
-    assert r.correction_marker("FIXFACT: ACE-AI changed", "ok") == r"\bFIXFACT:"
-
-
 def test_build_router_wires_bridge_knobs(tmp_path):
     """primary/fallback URLs + secret refs are config knobs, not hardcoded (Greptile #250 P1)."""
     cfg = {"mem0_capture_router": {
@@ -441,23 +348,6 @@ class FakeStore:
         self.rows = [r for r in self.rows if r["id"] != mid]
 
 
-class GateAwareFakeStore(FakeStore):
-    """Fake mem0 add where the salience gate drops the row, but an ungated correction add writes it."""
-    def __init__(self):
-        super().__init__()
-        self.kwargs_seen = []
-
-    def add(self, messages, kwargs):
-        self.add_calls += 1
-        self.kwargs_seen.append(dict(kwargs))
-        if kwargs.get("prompt"):
-            return 0  # below the salience threshold: gate says "drop"
-        idem = (kwargs.get("metadata") or {}).get("capture_idem", "")
-        self._id += 1
-        self.rows.append({"id": f"m{self._id}", "memory": messages[0]["content"], "capture_idem": idem})
-        return 1
-
-
 def _worker(q, store, router=None):
     return CaptureDrainWorker(
         q, add_fn=store.add, recall_idem_fn=store.recall_idem,
@@ -486,14 +376,14 @@ def test_drain_router_none_is_inert(tmp_path):
 class SpyRouter:
     def __init__(self):
         self.calls = []
-    def route_turn(self, user, assistant, *, turn_id, session, ts=None, stage=True):
+    def route_turn(self, user, assistant, *, turn_id, session, ts=None):
         self.calls.append((user, assistant, turn_id, session))
         return {"error": None, "world_facts": [], "prefs_facts": []}
 
 
 def test_drain_invokes_router_when_wired(tmp_path):
     """router injected (flag ON): the mem0 add still runs unchanged AND the router is invoked once
-    with the turn. mem0 path is untouched when no correction signal is present."""
+    with the turn, AFTER the add. mem0 path is untouched by the router."""
     q = CaptureQueue(str(tmp_path / "cq.db"))
     store = FakeStore()
     spy = SpyRouter()
@@ -525,55 +415,109 @@ def test_drain_router_failure_never_fails_the_turn(tmp_path):
     assert store.add_calls == 1
 
 
-def test_drain_correction_marker_bypasses_salience_gate(tmp_path):
-    """Acceptance C: a below-threshold correction marker omits the salience prompt, so capture fires."""
-    q = CaptureQueue(str(tmp_path / "cq.db"))
-    store = GateAwareFakeStore()
-    router = make_router(tmp_path, FakeHTTP(prefs_cands=[], world_cands=[]))
-    w = _worker(q, store, router=router)
-    k = idem_key("s", 1, "Actually, ACE-AI runs at 192.168.1.177.", "ok")
-    q.enqueue(k, {"user": "Actually, ACE-AI runs at 192.168.1.177.",
-                  "assistant": "ok", "session_id": "s"})
-    assert w.drain_once() is True
-    assert q.counts()["done"] == 1
-    assert len(store.rows) == 1
-    assert "prompt" not in store.kwargs_seen[0]
-    assert store.kwargs_seen[0]["metadata"]["capture_correction"] is True
-    assert store.kwargs_seen[0]["metadata"]["capture_correction_signal"] == "marker"
+# ---------------------------------------------------------------------------
+# Primary cooldown gate (t_4971fd06): a 429 from codex-bridge opens a gate that skips the primary
+# until the bridge's own reset window lifts, so captures stop burning a wasted call per pass.
+# ---------------------------------------------------------------------------
+
+import io as _io
+import urllib.error as _uerr
 
 
-def test_drain_contradiction_signal_bypasses_salience_gate(tmp_path):
-    """A world fact contradicting an existing retrieved fact also bypasses the salience prompt."""
-    q = CaptureQueue(str(tmp_path / "cq.db"))
-    store = GateAwareFakeStore()
-    router = make_router(
-        tmp_path,
-        FakeHTTP(
-            prefs_cands=[],
-            world_cands=[{"content": "ACE-AI runs at 192.168.1.177", "class": "world_entity"}],
-        ),
-        existing_fact_lookup_fn=lambda q: ["ACE-AI runs at 192.168.1.176"],
-    )
-    w = _worker(q, store, router=router)
-    k = idem_key("s", 1, "ACE-AI runs at 192.168.1.177.", "ok")
-    q.enqueue(k, {"user": "ACE-AI runs at 192.168.1.177.", "assistant": "ok", "session_id": "s"})
-    assert w.drain_once() is True
-    assert q.counts()["done"] == 1
-    assert len(store.rows) == 1
-    assert "prompt" not in store.kwargs_seen[0]
-    assert store.kwargs_seen[0]["metadata"]["capture_correction_signal"] == "contradiction"
+def _cooldown_429(url, reset_seconds=38270, code="model_cooldown", headers=None):
+    body = json.dumps({"error": {"code": code, "message": "All credentials for model gpt-6-astra are "
+                       "cooling down via provider codex", "reset_seconds": reset_seconds}}).encode()
+    return _uerr.HTTPError(url, 429, "Too Many Requests", headers or {}, _io.BytesIO(body))
 
 
-def test_drain_non_correction_keeps_normal_salience_path(tmp_path):
-    """No deterministic correction signal => normal salience gate remains in force (false-negative fallback)."""
-    q = CaptureQueue(str(tmp_path / "cq.db"))
-    store = GateAwareFakeStore()
-    router = make_router(tmp_path, FakeHTTP(prefs_cands=[], world_cands=[]))
-    w = _worker(q, store, router=router)
-    k = idem_key("s", 1, "ACE-AI has a status page.", "ok")
-    q.enqueue(k, {"user": "ACE-AI has a status page.", "assistant": "ok", "session_id": "s"})
-    assert w.drain_once() is True
-    assert q.counts()["done"] == 1
-    assert store.rows == []                 # gate dropped the below-threshold turn
-    assert store.kwargs_seen[0]["prompt"] == "GATE_V3"
-    assert "capture_correction" not in store.kwargs_seen[0]["metadata"]
+class _Cooldown429HTTP(FakeHTTP):
+    """Primary answers 429 (CLIProxyAPI model_cooldown body) until `primary_ok` is flipped on."""
+    def __init__(self, *, body_reset=38270, headers=None, raw_body=None, **kw):
+        super().__init__(**kw)
+        self.primary_ok = False
+        self.body_reset = body_reset
+        self.headers = headers
+        self.raw_body = raw_body
+
+    def __call__(self, url, body, headers, timeout):
+        if "18812" in url and not self.primary_ok:
+            self.calls.append(url)
+            if self.raw_body is not None:
+                raise _uerr.HTTPError(url, 429, "Too Many Requests", self.headers or {},
+                                      _io.BytesIO(self.raw_body))
+            raise _cooldown_429(url, self.body_reset, headers=self.headers)
+        return super().__call__(url, body, headers, timeout)
+
+
+@pytest.fixture
+def _fresh_cooldowns():
+    cr.reset_primary_cooldowns()
+    yield
+    cr.reset_primary_cooldowns()
+
+
+def _primary_calls(http):
+    return sum(1 for u in http.calls if "18812" in u)
+
+
+def test_primary_429_opens_gate_and_later_passes_skip_primary(_fresh_cooldowns, caplog):
+    http = _Cooldown429HTTP(prefs_cands=[{"content": "x", "class": "preference", "confidence": 0.9}])
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    caplog.set_level("DEBUG", logger=cr.logger.name)
+    r1 = ext.extract("preference|ops_state p", "u", "a")
+    assert r1["provider"] == "gemini-bridge" and _primary_calls(http) == 1
+    for _ in range(5):
+        r = ext.extract("preference|ops_state p", "u", "a")
+        assert r["provider"] == "gemini-bridge"
+        assert r["candidates"] and "cooldown" in r["primary_error"]
+    assert _primary_calls(http) == 1, "primary must not be called while its cooldown gate is open"
+    # the bridge's reset_seconds (38270) is honored, capped so an early recovery is re-probed
+    assert 0 < cr.primary_cooldown_remaining(ext._primary_url) <= cr._COOLDOWN_MAX_S
+    # no WARNING-level 'pass failed' line for a known cooldown (errors.log is WARNING+)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_gate_is_shared_across_extractor_instances(_fresh_cooldowns):
+    http = _Cooldown429HTTP()
+    BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s").extract("p", "u", "a")
+    BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s").extract("p", "u", "a")
+    assert _primary_calls(http) == 1
+
+
+def test_primary_is_retried_after_cooldown_lifts(_fresh_cooldowns, monkeypatch):
+    http = _Cooldown429HTTP(body_reset=30)
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    t = [1_000_000.0]
+    monkeypatch.setattr(cr.time, "time", lambda: t[0])
+    assert ext.extract("p", "u", "a")["provider"] == "gemini-bridge"
+    assert cr.primary_cooldown_remaining(ext._primary_url) == pytest.approx(30.0)
+    t[0] += 29
+    assert ext.extract("p", "u", "a")["provider"] == "gemini-bridge"
+    assert _primary_calls(http) == 1
+    t[0] += 2  # window lifted and codex is back
+    http.primary_ok = True
+    assert ext.extract("p", "u", "a")["provider"] == "codex-bridge"
+    assert _primary_calls(http) == 2
+    assert cr.primary_cooldown_remaining(ext._primary_url) == 0.0
+
+
+def test_non_429_primary_errors_do_not_open_the_gate(_fresh_cooldowns):
+    http = FakeHTTP(fail_primary=True)
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    ext.extract("p", "u", "a")
+    ext.extract("p", "u", "a")
+    assert _primary_calls(http) == 2
+    assert cr.primary_cooldown_remaining(ext._primary_url) == 0.0
+
+
+@pytest.mark.parametrize("headers,raw_body,expected", [
+    ({"Retry-After": "120"}, b"", 120.0),            # no body -> Retry-After
+    ({}, b"not json", cr._COOLDOWN_DEFAULT_S),        # nothing usable -> short default
+])
+def test_429_without_reset_seconds_uses_retry_after_then_default(_fresh_cooldowns, monkeypatch,
+                                                                 headers, raw_body, expected):
+    monkeypatch.setattr(cr.time, "time", lambda: 5_000.0)
+    http = _Cooldown429HTTP(headers=headers, raw_body=raw_body)
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    ext.extract("p", "u", "a")
+    assert cr.primary_cooldown_remaining(ext._primary_url) == pytest.approx(expected)

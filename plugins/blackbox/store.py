@@ -216,7 +216,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             cache_read INT,
             fingerprint_json TEXT,
             updated_at REAL,
-            alerted_at REAL
+            alerted_at REAL,
+            prompt_tokens INT
         );
 
         -- One row per violated segment per request pair. `kind` is
@@ -251,7 +252,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             allowlist_reason TEXT,
             cache_read_before INT,
             cache_read_after INT,
-            alerted INT NOT NULL DEFAULT 0
+            alerted INT NOT NULL DEFAULT 0,
+            prompt_tokens_before INT,
+            prompt_tokens_after INT
         );
         CREATE INDEX IF NOT EXISTS idx_blackbox_prefix_mutations_ts
             ON prefix_mutations(ts);
@@ -277,6 +280,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    # Provider-reported prompt size on the prefix-guard rows: a turn-boundary
+    # prompt that shrinks with NO recorded mutation is a rewrite BELOW the
+    # harness (e.g. a relay bridge reseeding its resident session).
+    for _table, _cols in (("prefix_sessions", ("prompt_tokens",)),
+                          ("prefix_mutations", ("prompt_tokens_before", "prompt_tokens_after"))):
+        _have = {row[1] for row in conn.execute(f"PRAGMA table_info({_table})")}
+        for _col in _cols:
+            if _col not in _have:
+                try:
+                    conn.execute(f"ALTER TABLE {_table} ADD COLUMN {_col} INT")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
     _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
     for col, kind in (("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
                       ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT")):
@@ -552,22 +568,50 @@ def lane_family(provider: str) -> str:
     return "codex" if p == "openai-codex" else "other"
 
 
+# Auxiliary-model calls (compression, title_generation, vision, web_extract, ...)
+# are ledgered with ``attribution='aux:<task>'`` and ``lane_family='aux'``. Their
+# tokens are NOT part of the turn's main-model totals, so every reader that
+# reconciles against the turn or measures the main lane's cache behaviour must
+# exclude this family (card t_39628ae3).
+AUX_LANE_FAMILY = "aux"
+AUX_ATTRIBUTION_PREFIX = "aux:"
+_NOT_AUX = "COALESCE(lane_family, '') != 'aux'"
+
+
+def is_aux_attribution(attribution: Any) -> bool:
+    return (isinstance(attribution, str) and attribution.startswith(AUX_ATTRIBUTION_PREFIX)
+            and len(attribution) > len(AUX_ATTRIBUTION_PREFIX))
+
+
 def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
     """Reconcile calls even when they arrive after the turn row."""
-    conn.execute("""
+    # Main lane only: an aux call (lane_family='aux') is a different model on a
+    # different prompt; letting it be the "first call" or add to the write tiers
+    # would misreport the main conversation's cache behaviour.
+    conn.execute(f"""
         UPDATE turns SET
             cache_write_5m = (SELECT SUM(cache_write_5m) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
             cache_write_1h = (SELECT SUM(cache_write_1h) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
             first_call_cache_miss = (
                 SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
                                       OR cache_write IS NULL THEN NULL
                             WHEN input_tokens + cache_read + cache_write <= 0 THEN NULL
+                            -- Read-only lanes (xAI, codex, OpenAI-shaped usage with
+                            -- only prompt_tokens_details.cached_tokens) never report
+                            -- a write, so the write rule below is structurally 0
+                            -- there. A cold first call is a read under half the
+                            -- prompt. Anthropic lanes keep the write rule.
+                            WHEN lane_family IS NOT NULL
+                                 AND lane_family NOT IN ('apx/apr', 'bpx/bpr', 'cpx/cpr')
+                                 AND cache_write = 0 THEN
+                                CASE WHEN cache_read * 2 < input_tokens + cache_read
+                                     THEN 1 ELSE 0 END
                             WHEN cache_write * 5 >= 4 *
                                  (input_tokens + cache_read + cache_write) THEN 1
                             ELSE 0 END
-                FROM turn_api_calls WHERE turn_id = turns.turn_id
+                FROM turn_api_calls WHERE turn_id = turns.turn_id AND {_NOT_AUX}
                   -- First SUCCESSFUL call: a 429/5xx/timeout attempt carries
                   -- zero usage and would hide the cold write on the retry.
                   AND (http_status IS NULL OR http_status BETWEEN 200 AND 299)
@@ -815,7 +859,8 @@ def insert_api_call(
     provenance raise rather than silently replacing or dropping ledger rows.
     Calls may arrive before their parent turn is finalized.
     """
-    if attribution not in ("wire", "pinned", "inferred", "external"):
+    aux = is_aux_attribution(attribution)
+    if not aux and attribution not in ("wire", "pinned", "inferred", "external"):
         raise ValueError(f"Invalid API-call attribution: {attribution!r}")
     # SQLite permits NULL in a non-INTEGER PRIMARY KEY column, so the composite
     # key alone does not stop a NULL turn_id/seq row (and NULLs never collide,
@@ -839,7 +884,8 @@ def insert_api_call(
              usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
              usage.reasoning_tokens, attribution, http_status,
              _bool_int(relay_synthetic), route_id, cache_write_5m,
-             cache_write_1h, cache_ttl_requested, lane_family(provider)),
+             cache_write_1h, cache_ttl_requested,
+             AUX_LANE_FAMILY if aux else lane_family(provider)),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
@@ -897,9 +943,15 @@ def record_prefix_check(
     *, session_key: str, turn_id: str, seq: int, ts: float, pid: int,
     provider: str, model: str, api_mode: str, fingerprint: dict[str, Any],
     cache_read: int | None, reset: str | None = None,
-    allowlist: Any = None,
+    allowlist: Any = None, prompt_tokens: int | None = None,
+    compare_across_turns: bool = True,
 ) -> dict[str, Any]:
     """Compare one request with the session's previous request and persist.
+
+    When the previous request belongs to another turn the comparison runs in
+    turn-boundary mode (no last-message exemption). ``compare_across_turns``
+    False makes a new turn start a fresh baseline instead (background-review
+    forks: each fork is its own conversation replaying the parent snapshot).
 
     Returns ``{"violations": [...], "alert": bool, "suppressed": int}``.
     ``alert`` is True only on the transition from "this session has never
@@ -925,7 +977,9 @@ def record_prefix_check(
                 prev_fp = json.loads(prev["fingerprint_json"])
             except (TypeError, ValueError):
                 prev_fp = None
-            if isinstance(prev_fp, dict):
+            if isinstance(prev_fp, dict) and (
+                compare_across_turns or prev["turn_id"] == turn_id
+            ):
                 previous = {
                     "turn_id": prev["turn_id"], "seq": prev["seq"], "ts": prev["ts"],
                     "messages": len(prev_fp.get("messages") or []),
@@ -936,7 +990,10 @@ def record_prefix_check(
                 )
                 if context is None and prefix_guard.native_checkpoint_changed(prev_fp, fingerprint):
                     context = "compaction:native"
-                for diff in prefix_guard.compare(prev_fp, fingerprint):
+                turn_boundary = prev["turn_id"] != turn_id
+                for diff in prefix_guard.compare(
+                    prev_fp, fingerprint, turn_boundary=turn_boundary,
+                ):
                     reason = prefix_guard.allowlist_reason(
                         allowlist, segment=diff["segment"], session_key=session_key,
                         now=ts,
@@ -955,8 +1012,9 @@ def record_prefix_check(
                             prev_ts, provider, lane_family, model, segment, kind,
                             first_divergent_index, bytes_before, bytes_after,
                             messages_before, messages_after, context, allowlisted,
-                            allowlist_reason, cache_read_before, cache_read_after
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            allowlist_reason, cache_read_before, cache_read_after,
+                            prompt_tokens_before, prompt_tokens_after
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             ts, session_key, turn_id, seq, prev["turn_id"], prev["seq"],
@@ -967,6 +1025,7 @@ def record_prefix_check(
                             len(fingerprint.get("messages") or []),
                             context, row["allowlisted"], reason,
                             prev["cache_read"], cache_read,
+                            prev["prompt_tokens"], prompt_tokens,
                         ),
                     )
                 pageable = [
@@ -1015,12 +1074,13 @@ def record_prefix_check(
             """
             INSERT OR REPLACE INTO prefix_sessions (
                 session_key, turn_id, seq, ts, pid, api_mode, model, cache_read,
-                fingerprint_json, updated_at, alerted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fingerprint_json, updated_at, alerted_at, prompt_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_key, turn_id, seq, ts, pid, api_mode, model, cache_read,
                 json.dumps(fingerprint, separators=(",", ":")), time.time(), alerted_at,
+                prompt_tokens,
             ),
         )
     return {"violations": violations, "alert": alert, "suppressed": suppressed,

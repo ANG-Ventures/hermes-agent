@@ -225,7 +225,43 @@ _HERMES_CHILD_ALLOWED = frozenset({
     "HERMES_CONFIG",
     "HERMES_ENV",
     "HERMES_DELEGATED_CHILD_CONTEXT",
+    # Agent-process marker ("true"): the gh shim resolves the lane from the
+    # profile home only when it is present (t_45c11886).
+    "HERMES_AGENT",
 })
+
+# Git lane env from agent.process_env_files / gh-lane-env.sh (t_45c11886). The
+# generic scrub drops all of it (GIT_CONFIG_KEY_* and GIT_AUTHOR_* hit the KEY /
+# AUTH secret substrings), which sent sandbox git back to the global
+# ``gh auth git-credential`` helper and the operator's identity. Identity names
+# are not secrets; the GIT_CONFIG_* group passes only when EVERY key is a
+# credential helper (a command, never a secret value) -- anything else (e.g. an
+# http.extraheader carrying a token) drops the whole group.
+_GIT_IDENTITY_VARS = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                      "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")
+_GIT_HELPER_KEY_RE = re.compile(r"^credential\.(?:\S+\.)?helper$")
+
+
+def _carry_git_lane_env(source_env, scrubbed):
+    for name in _GIT_IDENTITY_VARS:
+        if source_env.get(name):
+            scrubbed[name] = source_env[name]
+    try:
+        count = int(source_env.get("GIT_CONFIG_COUNT", ""))
+    except ValueError:
+        return scrubbed
+    if count <= 0 or count > 32:
+        return scrubbed
+    group = {"GIT_CONFIG_COUNT": str(count)}
+    for i in range(count):
+        key = source_env.get(f"GIT_CONFIG_KEY_{i}")
+        if key is None or not _GIT_HELPER_KEY_RE.match(key):
+            return scrubbed
+        group[f"GIT_CONFIG_KEY_{i}"] = key
+        group[f"GIT_CONFIG_VALUE_{i}"] = source_env.get(f"GIT_CONFIG_VALUE_{i}", "")
+    scrubbed.update(group)
+    return scrubbed
+
 
 # Windows-only: a handful of variables are required by the OS/CRT itself.
 # Without them, even stdlib calls like ``socket.socket()`` fail with
@@ -389,6 +425,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             len(_dropped_hermes),
             ", ".join(sorted(_dropped_hermes)),
         )
+
+    _carry_git_lane_env(source_env, scrubbed)
 
     # delegate_task children are marked with a ContextVar, not os.environ, while
     # the execute_code sandbox crosses a process boundary. Bridge that context

@@ -686,6 +686,10 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+# GitHub App identity lanes (hermes-home spec plans/2026-09-25_github-app-identities D3): every
+# hermes process -- gateway, `hermes -p X` child, kanban worker -- is an AGENT whose GitHub lane comes
+# from its profile (gh shim profile_map). An inherited lane env var must never reach its children.
+os.environ.pop("HERMES_GH_LANE", None)
 
 # ---------------------------------------------------------------------------
 # Kanban worker authority — consume the dispatcher's single-use grant.
@@ -13164,6 +13168,22 @@ def _advertise_agent_env() -> None:
     os.environ.setdefault("HERMES_AGENT", "true")
 
 
+def _apply_process_env_files() -> None:
+    """Source ``agent.process_env_files`` into this process's env (fail-open).
+
+    Runs after the profile override and the agent marker, so the files see the
+    same env a terminal shell would. Every child the process later spawns
+    (in-process gh/git, kanban workers, execute_code) inherits the result.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.process_env_files import apply_process_env_files
+
+        apply_process_env_files(load_config_readonly())
+    except Exception:
+        pass
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -13173,6 +13193,7 @@ def main():
     # Let child processes (and tools like huggingface_hub) detect they run
     # under an AI agent harness.
     _advertise_agent_env()
+    _apply_process_env_files()
 
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:

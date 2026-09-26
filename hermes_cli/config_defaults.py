@@ -4,6 +4,8 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+from hermes_cli.lazy_registry import LazyFilledDict
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -54,6 +56,13 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # POSIX-sh files sourced ONCE at agent-process start (gateway, kanban
+        # worker, CLI); their exports land in the process env, so every child
+        # it spawns (in-process gh/git, workers, execute_code) inherits them.
+        # terminal.shell_init_files only reaches terminal shells. Fleet use:
+        # ["~/.hermes/fleet/gh-lane-env.sh"] puts process-spawned gh on the
+        # profile's GitHub lane. Fail-open; [] = off.
+        "process_env_files": [],
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -1927,15 +1936,6 @@ DEFAULT_CONFIG = {
     # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
     # Re-homed here from hermes_cli/config.py when upstream extracted
     # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
-        "session_sync": {
-            "enabled": True,
-            "t_silence": 10.0,
-            "poll_interval": 2.5,
-            "refocus_debounce": 1.0,
-        },
-    # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
-    # Re-homed here from hermes_cli/config.py when upstream extracted
-    # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
         # Dormant/default-off desktop/TUI backend restart continuation gate.
         # Config.yaml only: no env override, so the reconnect path remains inert
         # until an operator deliberately flips this key.
@@ -3080,6 +3080,11 @@ DEFAULT_CONFIG = {
         # 10 min hold that pool's spawns for 10 min (one #logs line per trip).
         # Non-pool providers never count. 0 disables.
         "rate_limit_trip": 5,
+        # After a worker refuses its route because the provider's credential is
+        # rate limited (worker_route_pin_refused rate_limited=true, e.g. "Codex
+        # credential is in cooldown"), treat that provider as capped for this
+        # many seconds: no spawn and no fallback rung onto it. 0 disables.
+        "credential_cooldown_seconds": 1800,
         # CPU scheduling priority for dispatcher-spawned worker gateways, and
         # therefore for everything they spawn (terminal-tool children inherit
         # niceness). "background" (default) runs each worker at nice 19 — and,
@@ -3134,6 +3139,9 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Per-tick spawn cap for the dispatcher (gateway tick and
+        # `kanban dispatch`; the CLI --max flag wins over it). None = no cap.
+        "max_spawn": None,
         # Pause dispatcher SPAWNS (reclaims still run) while the host's
         # 1-minute load average is over `pause_above` (default: CPU count);
         # resume once it drops below `resume_below` (default: 0.75 × CPU
@@ -3171,6 +3179,17 @@ DEFAULT_CONFIG = {
         # A present-but-unknown/empty value fails to "none" (never "all")
         # and logs review_policy_invalid.
         "review_policy": "all",
+        # Default reviewer profile for request_review. None/blank = no
+        # default: a review request with no reviewer is refused rather than
+        # leaving the implementer as its own reviewer.
+        "review_assignee": None,
+        # Minutes an unclaimed review card may sit before it is reported
+        # stale. Non-positive/invalid values fall back to 30.
+        "review_stale_minutes": 30,
+        # Cross-session card mutation guard: "refuse" (default) blocks
+        # mutating a card homed in another session; "warn" lets it proceed
+        # with one stderr line. Any other value means "refuse".
+        "home_guard": "refuse",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
@@ -5561,3 +5580,9 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
 }
+
+
+
+# Provider/platform extensions are registered by the config module as fillers
+# that run on the first read (see lazy_registry for why).
+OPTIONAL_ENV_VARS = LazyFilledDict(OPTIONAL_ENV_VARS)

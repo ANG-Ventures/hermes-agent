@@ -22,6 +22,14 @@ on:
       # Non-gating detector (spec L6): PR runs are paths-scoped, so a flake
       # break from a source-only change first shows on push:main. Page it.
       - "Nix flake check"
+      # Scheduled / dispatch workflows: a red run otherwise pages nobody
+      # (ci-speed-lint R5). The three NousResearch-guarded ones are skipped on
+      # the fork, so they only notify if that guard is ever lifted.
+      - "Install & Update E2E"
+      - "auto-fix lint issues & formatting"
+      - "Deploy Site"
+      - "Build Skills Index"
+      - "Skills Index Freshness Check"
     types:
       - completed
     # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
@@ -29,16 +37,69 @@ on:
 
 permissions:
   contents: read
+  actions: read # route step reads the failed workflow's previous run
 
 jobs:
   notify-on-failure:
     name: notify-on-failure
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     # Only on a genuine failure of the upstream workflow. Success/cancelled/skipped → no-op.
-    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    # startup_failure counts (t_bc0052b9): a run that dies at startup has 0 jobs and no
+    # red check, so without this nobody is told, and a re-run that dies this way leaves the
+    # PR with no required check at all.
+    if: ${{ github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'startup_failure' }}
+    # 2x measured p90 (4 s over 30 runs), floored at 10.
+    timeout-minutes: 10
     steps:
+      # KNOWN-RED workflows are chronically red, so paging #alerts on every red
+      # run is manufactured noise. Their failures go to #logs (the ci-fail-known
+      # receiver route). #alerts fires only on a TRANSITION: the previous
+      # completed run of the same workflow on the same branch was green, so
+      # this red is a real regression. One entry per line, `name|card`. Remove
+      # an entry in the PR that makes its card's workflow green again.
+      # Unknown names, API errors, and "no previous run" all fail LOUD (#alerts).
+      - name: Route (known-red -> #logs unless green->red transition)
+        id: route
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          WF_ID: ${{ github.event.workflow_run.workflow_id }}
+          WF_RUN_ID: ${{ github.event.workflow_run.id }}
+          WF_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WF_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          KNOWN_RED: |
+            Install & Update E2E|t_bab6df79
+        run: |
+          set -uo pipefail
+          CARD=""
+          while IFS='|' read -r name card; do
+            [ -n "$name" ] && [ "$name" = "$WF_NAME" ] && CARD="$card"
+          done <<< "$KNOWN_RED"
+          ROUTE=alerts
+          if [ -n "$CARD" ]; then
+            PREV="$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" --get \
+              --data-urlencode "branch=$WF_BRANCH" --data-urlencode "status=completed" \
+              --data-urlencode "per_page=20" \
+              "https://api.github.com/repos/$REPO/actions/workflows/$WF_ID/runs" \
+              | jq -r --argjson id "$WF_RUN_ID" \
+                '[.workflow_runs[] | select(.id < $id)
+                  | select(.conclusion == "success" or .conclusion == "failure")][0].conclusion // "none"')" \
+              || PREV="error"
+            echo "known-red '$WF_NAME' ($CARD): previous completed run = $PREV"
+            # startup_failure is never demoted: it is a distinct class and always pages.
+            if [ "$WF_CONCLUSION" = "failure" ] && [ "$PREV" = "failure" ]; then
+              ROUTE=logs
+            fi
+          fi
+          echo "route=$ROUTE" | tee -a "$GITHUB_OUTPUT"
+          echo "card=$CARD" >> "$GITHUB_OUTPUT"
+
       - name: Sign and POST CI-failure event
         env:
+          ROUTE: ${{ steps.route.outputs.route }}
+          CARD: ${{ steps.route.outputs.card }}
           CI_FAIL_WEBHOOK_SECRET: ${{ secrets.CI_FAIL_WEBHOOK_SECRET }}
           WEBHOOK_URL: https://hooks.angventures.io/webhooks/ci-fail
           WF_NAME: ${{ github.event.workflow_run.name }}
@@ -54,10 +115,17 @@ jobs:
             echo "::error::CI_FAIL_WEBHOOK_SECRET is not set; cannot sign the alert." >&2
             exit 1
           fi
-          # Build the JSON body. event_type=ci_failure is what the receiver route
-          # filters on (X-GitHub-Event header is also set to the same value).
+          # Build the JSON body. event_type is what the receiver route filters
+          # on (X-GitHub-Event header is also set to the same value):
+          # ci_failure -> /ci-fail (#alerts), ci_failure_known_red -> /ci-fail-known (#logs).
+          EVENT_TYPE=ci_failure
+          if [ "${ROUTE:-alerts}" = "logs" ]; then
+            EVENT_TYPE=ci_failure_known_red
+            WEBHOOK_URL="${WEBHOOK_URL}-known"
+          fi
           BODY="$(jq -nc \
-            --arg event_type "ci_failure" \
+            --arg event_type "$EVENT_TYPE" \
+            --arg card "${CARD:-}" \
             --arg repo "$REPO" \
             --arg workflow "$WF_NAME" \
             --arg branch "$WF_BRANCH" \
@@ -65,20 +133,27 @@ jobs:
             --arg run_url "$WF_URL" \
             --arg actor "$WF_ACTOR" \
             --arg trigger "$WF_EVENT" \
-            '{event_type:$event_type, repo:$repo, workflow:$workflow, branch:$branch, sha:$sha, run_url:$run_url, actor:$actor, trigger:$trigger}')"
+            '{event_type:$event_type, card:$card, repo:$repo, workflow:$workflow, branch:$branch, sha:$sha, run_url:$run_url, actor:$actor, trigger:$trigger}')"
           # Generic HMAC-SHA256 hex over the raw body → X-Webhook-Signature.
           SIG="$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$CI_FAIL_WEBHOOK_SECRET" | sed 's/^.* //')"
           CODE="$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
             -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -H "X-GitHub-Event: ci_failure" \
+            -H "X-GitHub-Event: ${EVENT_TYPE}" \
             -H "X-GitHub-Delivery: ci-fail-${WF_SHA}-${GITHUB_RUN_ID}" \
             -H "X-Webhook-Signature: ${SIG}" \
             --data "$BODY")"
           echo "Receiver responded HTTP $CODE"
           cat /tmp/resp.txt || true
           # 2xx = delivered/accepted. Non-2xx fails the step so the miss is visible.
+          # 2xx = delivered. A #logs (known-red) miss only warns: it must never
+          # turn this workflow red for a failure that is already carded.
           case "$CODE" in
-            2*) echo "CI-failure alert delivered." ;;
-            *) echo "::error::CI-fail alert POST returned HTTP $CODE" >&2; exit 1 ;;
+            2*) echo "CI-failure event delivered (route=${ROUTE:-alerts})." ;;
+            *)
+              if [ "$EVENT_TYPE" = "ci_failure_known_red" ]; then
+                echo "::warning::known-red #logs POST returned HTTP $CODE (card ${CARD})"
+              else
+                echo "::error::CI-fail alert POST returned HTTP $CODE" >&2; exit 1
+              fi ;;
           esac
