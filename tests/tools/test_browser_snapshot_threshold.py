@@ -1,6 +1,9 @@
 """Behavior tests for config-driven browser snapshot thresholds."""
 
+import itertools
 import json
+import os
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -23,11 +26,21 @@ def isolated_snapshot_threshold(tmp_path, monkeypatch):
     browser_tool._snapshot_threshold_resolved = original_resolved
 
 
+_MTIME_STEP = itertools.count(1)
+
+
 def _write_threshold(hermes_home, value):
-    (hermes_home / "config.yaml").write_text(
+    path = hermes_home / "config.yaml"
+    path.write_text(
         f"browser:\n  snapshot_threshold: {value}\n",
         encoding="utf-8",
     )
+    # read_raw_config() caches on (mtime_ns, size). 12000 -> 15001 keeps the size, and
+    # two writes inside one filesystem timestamp tick share an mtime (coarse clock:
+    # 1/HZ). That is deterministic on Blacksmith 4-vCPU arm runners (t_6804be8c,
+    # 2026-09-25, 2/2 runs). Give every write a distinct mtime, as a real edit has.
+    stamp = time.time_ns() + next(_MTIME_STEP) * 1_000_000_000
+    os.utime(path, ns=(stamp, stamp))
 
 
 def _long_snapshot(chars: int) -> str:

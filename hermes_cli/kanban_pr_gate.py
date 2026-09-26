@@ -38,6 +38,16 @@ Deliberate non-actions, each one a fail-safe:
   ONE ``MERGED, awaiting deploy`` comment (t_289e8020: t_2789cbae was
   re-unblocked twice into the same wall while ``~/.hermes`` sat 195 commits
   behind origin/main).
+* a block reason that SAYS the gate is a deploy (``merged but NOT deployed``,
+  ``gate = #401 DEPLOYED``) is a deploy premise even without naming a tree. A
+  mapped repo gets the ancestry check above; an unmapped repo has no provable
+  live SHA, so the card is held with ONE ``awaiting deploy (unverifiable)``
+  comment and a human unblocks it (t_a7287385: t_213f5d63 was re-unblocked
+  three times on the merge of Kyzcreig/pipecat-house-voice#401, which is
+  deployed by Apollo, not into a local tree);
+* a reason that reserves the unblock for an owner (``Apollo owns the
+  unblock``, ``only Apollo should unblock``, ``do not auto-unblock``) is never
+  a gate candidate at all.
 
 Harness safety
 --------------
@@ -183,6 +193,29 @@ DEPLOY_TREES: dict[str, str] = {
 # gate STRICTER — it waits for the deploy — never looser.
 _DEPLOY_TREE_MENTION_RE = re.compile(
     r"(?:~|\$HOME|\$\{HOME\}|/Users/[^/\s]+|/home/[^/\s]+)/\.hermes(?![\w-])"
+)
+
+# A block REASON that states the gate is a deploy. Reason only, never the body:
+# a body saying "deploy the fix" is task prose, and treating it as a premise
+# would pin every merge-gated card on an unmapped repo to a human forever.
+_DEPLOY_WORD_RE = re.compile(r"\b(?:re)?deploy(?:ed|s|ing|ment)?\b", re.IGNORECASE)
+# Explicit "no deploy needed" phrasing is the opposite claim; strip it first.
+_NO_DEPLOY_RE = re.compile(
+    r"\b(?:no|without(?:\s+a)?)\s+(?:re)?deploy(?:ment)?\b"
+    r"|\b(?:re)?deploy(?:ment)?\s+(?:is\s+)?not\s+(?:needed|required)\b",
+    re.IGNORECASE,
+)
+
+# A reason that reserves the unblock for a named owner. The gate must never
+# override that claim, whatever the PR state (t_213f5d63, 04:54 PT 09-25:
+# Apollo's own block "Apollo owns the unblock" was auto-unblocked 63 s later).
+_OWNER_HELD_RE = re.compile(
+    r"\b(?:apollo|ace|a\s+human|human|the\s+operator|operator|the\s+orchestrator)"
+    r"\s+owns\s+the\s+unblock\b"
+    r"|\bdo\s+not\s+auto[- ]?unblock\b"
+    r"|\bonly\s+(?:apollo|ace|a\s+human|the\s+operator|the\s+orchestrator)"
+    r"\s+(?:should|may|can|will)\s+unblock\b",
+    re.IGNORECASE,
 )
 
 
@@ -846,6 +879,18 @@ def names_deploy_tree(*texts: Optional[str]) -> bool:
     )
 
 
+def names_deploy_gate(reason: Optional[str]) -> bool:
+    """True when a block reason states its gate is a DEPLOY, not a merge."""
+    if not isinstance(reason, str):
+        return False
+    return bool(_DEPLOY_WORD_RE.search(_NO_DEPLOY_RE.sub(" ", reason)))
+
+
+def owner_holds_unblock(reason: Optional[str]) -> bool:
+    """True when a block reason reserves the unblock for a named owner."""
+    return isinstance(reason, str) and bool(_OWNER_HELD_RE.search(reason))
+
+
 def deploy_tree_for(repo: str) -> Optional[str]:
     """The ``~``-relative deploy tree for ``repo``, or None (merge-only repo)."""
     return DEPLOY_TREES.get(repo.lower()) if isinstance(repo, str) else None
@@ -880,18 +925,22 @@ _REAL_IS_DEPLOYED = is_deployed
 
 def _deploy_checks(
     refs: Iterable[PrRef], *, reason: Optional[str], body: Optional[str],
-) -> list[tuple[PrRef, str]]:
+) -> list[tuple[PrRef, Optional[str]]]:
     """``(ref, tree)`` pairs whose merge must ALSO be live before unblocking.
 
-    Empty unless the card's reason or body names a deploy tree; then one pair
-    per ref whose repo maps to a tree. Any other repo stays merge-only.
+    Empty unless the card's reason or body names a deploy tree, or the reason
+    states a deploy gate. Then one pair per ref whose repo maps to a tree.
+    When the REASON states a deploy gate, an unmapped ref is included with
+    ``tree=None``: its deploy cannot be proven, so it holds. A tree mention
+    alone keeps unmapped repos merge-only (the pre-t_a7287385 behaviour).
     """
-    if not names_deploy_tree(reason, body):
+    stated = names_deploy_gate(reason)
+    if not stated and not names_deploy_tree(reason, body):
         return []
-    out: list[tuple[PrRef, str]] = []
+    out: list[tuple[PrRef, Optional[str]]] = []
     for ref in refs:
         tree = deploy_tree_for(ref.repo)
-        if tree:
+        if tree or stated:
             out.append((ref, tree))
     return out
 
@@ -901,19 +950,29 @@ def _deploy_marker(pending: Iterable[tuple[str, Optional[str]]]) -> str:
     return "<!-- gate-deploy:" + "|".join(names) + " -->"
 
 
+_UNVERIFIABLE_TREE = "<no deploy tree>"
+
+
 def _awaiting_deploy_sentence(
-    pending: list[tuple[PrRef, "_CacheEntry", str]],
+    pending: list[tuple[PrRef, "_CacheEntry", Optional[str]]],
 ) -> str:
     parts = [
         f"{ref} MERGED, awaiting deploy of {(entry.sha or 'unknown')[:8]} "
-        f"into {tree}"
+        + (f"into {tree}" if tree else "(unverifiable: no deploy tree for this repo)")
         for ref, entry, tree in pending
     ]
-    marker = _deploy_marker((tree, entry.sha) for _, entry, tree in pending)
+    marker = _deploy_marker(
+        (tree or _UNVERIFIABLE_TREE, entry.sha) for _, entry, tree in pending
+    )
+    tail = (
+        " A merge in a repo with no mapped deploy tree cannot be proven live, "
+        "so this gate will NOT auto-resolve: unblock it by hand once deployed."
+        if any(tree is None for _, _, tree in pending) else ""
+    )
     return (
         "gate held: " + "; ".join(parts) + ". The card's premise is the "
         "change being LIVE, so it stays blocked until the merge commit is an "
-        f"ancestor of the tree's HEAD.\n{marker}"
+        f"ancestor of the tree's HEAD.{tail}\n{marker}"
     )
 
 
@@ -1192,6 +1251,11 @@ def _gate_candidates(
         reason, blocked_at = _latest_block_event(conn, row["id"])
         if not reason or ("#" not in reason and "pull/" not in reason):
             continue
+        if owner_holds_unblock(reason):
+            # The blocker reserved the unblock for a named owner. No PR state
+            # can override that, so the card is not a candidate (and burns
+            # no lookup budget).
+            continue
         fingerprint = (row["workspace_path"], row["body"], reason)
         out.append(
             (row["id"], fingerprint, row["workspace_path"], row["body"], reason,
@@ -1204,7 +1268,7 @@ def _blocked_gate_refs(
     conn: sqlite3.Connection,
     *,
     contexts: Optional[dict[str, tuple[tuple, Optional[str]]]] = None,
-) -> list[tuple[str, list[PrRef], list[tuple[PrRef, str]], Optional[float]]]:
+) -> list[tuple[str, list[PrRef], list[tuple[PrRef, Optional[str]]], Optional[float]]]:
     """Snapshot in-scope blocked cards, their resolvable PR refs, deploy checks, and block time.
 
     ``contexts`` is a repo-context snapshot taken by the unlocked prefetch.
@@ -1214,7 +1278,7 @@ def _blocked_gate_refs(
     it is None the caller is the direct, unlocked path and contexts are
     resolved inline.
     """
-    candidates: list[tuple[str, list[PrRef], list[tuple[PrRef, str]], Optional[float]]] = []
+    candidates: list[tuple[str, list[PrRef], list[tuple[PrRef, Optional[str]]], Optional[float]]] = []
     for (
         task_id, fingerprint, workspace_path, body, reason, blocked_at,
     ) in _gate_candidates(conn):
@@ -1259,7 +1323,7 @@ def prefetch_pr_gate_states(
     assert_write_allowed(query_fn, deploy_fn=deploy_fn)
     unique: dict[tuple[str, int], PrRef] = {}
     contexts: dict[str, tuple[tuple, Optional[str]]] = {}
-    deploy_checks: list[tuple[PrRef, str]] = []
+    deploy_checks: list[tuple[PrRef, Optional[str]]] = []
     # Resolve repo context HERE, outside the writer lock: this is the seam that
     # shells out to ``git remote -v`` (same 5 s timeout as ``gh``), and a
     # degraded workspace would otherwise hold the board's single-writer lock
@@ -1317,7 +1381,7 @@ def prefetch_pr_gate_states(
 
 
 def _prefetch_deploys(
-    checks: list[tuple[PrRef, str]],
+    checks: list[tuple[PrRef, Optional[str]]],
     payloads: dict[tuple[str, int], Optional[dict]],
     deploy_fn: Callable[[str, str], bool],
 ) -> dict[tuple[str, str], bool]:
@@ -1330,6 +1394,8 @@ def _prefetch_deploys(
     """
     out: dict[tuple[str, str], bool] = {}
     for ref, tree in checks:
+        if tree is None:
+            continue  # unmapped repo: no tree to probe; the locked pass holds it
         key = (ref.repo.lower(), ref.number)
         sha: Optional[str] = None
         payload = payloads.get(key)
@@ -1443,7 +1509,10 @@ def reevaluate_pr_gates(
         # "#N live in <tree>" after #N merged is waiting on the DEPLOY, which
         # the merge time says nothing about (t_289e8020).
         spent = _previously_resolved_refs(conn, task_id)
-        deploy_keys = {(r.repo.lower(), r.number) for r, _ in deploy_checks}
+        # Only a MAPPED deploy check exempts a ref from history: an unmapped
+        # stated-deploy ref (tree=None, t_a7287385) can never be proven live, so a
+        # merge that predates the block is still just context (t_20b94ef5).
+        deploy_keys = {(r.repo.lower(), r.number) for r, t in deploy_checks if t}
         gating = [
             (r, e) for r, e in resolved
             if (r.repo.lower(), r.number) in deploy_keys
@@ -1483,7 +1552,7 @@ def reevaluate_pr_gates(
         # HEAD. Under a prefetch this is a dict read (no subprocess under the
         # writer lock); a key missing from the snapshot holds silently.
         by_ref = {(r.repo.lower(), r.number): e for r, e in resolved}
-        pending: list[tuple[PrRef, _CacheEntry, str]] = []
+        pending: list[tuple[PrRef, _CacheEntry, Optional[str]]] = []
         unverified = False
         for ref, tree in deploy_checks:
             entry = by_ref.get((ref.repo.lower(), ref.number))
@@ -1491,7 +1560,7 @@ def reevaluate_pr_gates(
                 # Filtered out above as history: it is not the gate, so its
                 # deploy state cannot hold the card either.
                 continue
-            if not entry.sha:
+            if tree is None or not entry.sha:
                 pending.append((ref, entry, tree))
                 continue
             if prefetched is not None:
@@ -1507,7 +1576,9 @@ def reevaluate_pr_gates(
                 pending.append((ref, entry, tree))
         if pending:
             detail = _awaiting_deploy_sentence(pending)
-            marker = _deploy_marker((t, e.sha) for _, e, t in pending)
+            marker = _deploy_marker(
+                (t or _UNVERIFIABLE_TREE, e.sha) for _, e, t in pending
+            )
             if not _has_comment_marker(conn, task_id, marker):
                 _safe_comment(conn, task_id, detail)
             outcomes.append(GateOutcome(
