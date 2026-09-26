@@ -43,6 +43,8 @@ from agent.conversation_compression import (
 from agent.context_engine import (
     automatic_compaction_status_message,
     call_with_messages as _call_with_messages,
+    should_compress_request as _should_compress_request,
+    trigger_compare_tokens_for as _trigger_compare_tokens_for,
 )
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
@@ -108,6 +110,34 @@ def _preflight_request_tokens(
     )
     if anchored is not None:
         return anchored
+    return _preflight_rough_request_tokens(agent, messages, system_prompt)
+
+
+def _preflight_request_tokens_split(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    system_prompt: str,
+) -> "tuple[int, int, Optional[int]]":
+    """``(tokens, rough, anchored)`` for the preflight compaction trigger.
+
+    ``tokens`` is exactly ``_preflight_request_tokens`` (anchored when valid,
+    else rough). The trigger needs the two apart: the rough-estimator skew
+    applies to ``rough`` only; an ``anchored`` figure is already real and is
+    compared unscaled (t_bd01a34b: real x skew false-fired at 49%).
+    """
+    anchored = anchored_context_tokens(
+        messages, getattr(agent, "_usage_anchor", None)
+    )
+    rough = _preflight_rough_request_tokens(agent, messages, system_prompt)
+    return (anchored if anchored is not None else rough), rough, anchored
+
+
+def _preflight_rough_request_tokens(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    system_prompt: str,
+) -> int:
+    """Rough (heuristic) preflight estimate, ignoring the usage anchor."""
     tools = getattr(agent, "tools", None) or None
     try:
         from agent.codex_responses_adapter import (
@@ -1083,7 +1113,11 @@ def build_turn_context(
             agent.context_compressor.threshold_tokens,
         )
     ):
-        _preflight_tokens = _preflight_request_tokens(
+        (
+            _preflight_tokens,
+            _preflight_rough,
+            _preflight_anchored,
+        ) = _preflight_request_tokens_split(
             agent,
             messages,
             active_system_prompt or "",
@@ -1103,10 +1137,15 @@ def build_turn_context(
         # the estimator's miss is a rate error that differs by content. Engines
         # predating the kwarg are called with the old signature by
         # `_call_with_messages`, so the class arm is additive, never required.
-        _call_with_messages(_compressor.note_rough_sent, _preflight_tokens, messages)
-        _calibrated = _call_with_messages(
-            _compressor.calibrated_tokens, _preflight_tokens, messages
-        )
+        # The skew is rough/real: pair the ROUGH figure, and never re-scale an
+        # anchored (already real) figure for the display seed.
+        _call_with_messages(_compressor.note_rough_sent, _preflight_rough, messages)
+        if _preflight_anchored is not None:
+            _calibrated = _preflight_anchored
+        else:
+            _calibrated = _call_with_messages(
+                _compressor.calibrated_tokens, _preflight_rough, messages
+            )
         # Cold-start observability (Greptile PR #392 P2): on an empty skew history the
         # DISPLAY calibration (_calibrated, via _current_skew=1.0 identity) can read
         # >= threshold while the TRIGGER decision correctly DEFERS using the
@@ -1116,8 +1155,8 @@ def build_turn_context(
         # a deferral (empty history); a normal below-threshold skip stays quiet. Pure
         # logging — no effect on the decision below (INV: never perturb control flow).
         try:
-            _trig_cal = _call_with_messages(
-                _compressor._trigger_calibrated_tokens, _preflight_tokens, messages
+            _trig_cal = _trigger_compare_tokens_for(
+                _compressor, _preflight_rough, messages, _preflight_anchored
             )
             _thr = _compressor.threshold_tokens
             if _calibrated >= _thr and _trig_cal < _thr:
@@ -1236,8 +1275,11 @@ def build_turn_context(
             # twin was not). Pin the type the same way the display-snapshot
             # guard below already does, and fall back to the configured
             # `should_compress` when the calibrated answer is not a real bool.
-            _calibrated_verdict = _call_with_messages(
-                _compressor.should_compress_calibrated, _preflight_tokens, messages
+            _calibrated_verdict = _should_compress_request(
+                _compressor,
+                _preflight_rough,
+                messages,
+                anchored_tokens=_preflight_anchored,
             )
             if isinstance(_calibrated_verdict, bool):
                 _should_compress_now = _calibrated_verdict
@@ -1347,7 +1389,11 @@ def build_turn_context(
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
                 # "Cannot compress further". Fixes #39548.
-                _preflight_tokens = _preflight_request_tokens(
+                (
+                    _preflight_tokens,
+                    _preflight_rough,
+                    _preflight_anchored,
+                ) = _preflight_request_tokens_split(
                     agent,
                     messages,
                     active_system_prompt or "",
@@ -1370,11 +1416,15 @@ def build_turn_context(
                 # Fork P2 calibrated re-check (replaces should_defer ratchet): note this
                 # pass's rough so skew pairs correctly, then re-check on the calibrated value.
                 _call_with_messages(
-                    _compressor.note_rough_sent, _preflight_tokens, messages
+                    _compressor.note_rough_sent, _preflight_rough, messages
                 )
-                if not _call_with_messages(
-                    _compressor.should_compress_calibrated, _preflight_tokens, messages
-                ):
+                _recheck = _should_compress_request(
+                    _compressor,
+                    _preflight_rough,
+                    messages,
+                    anchored_tokens=_preflight_anchored,
+                )
+                if not _recheck:
                     break
                 if not _compression_warrants_another_preflight_pass(
                     _orig_tokens,
