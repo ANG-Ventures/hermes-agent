@@ -130,7 +130,9 @@ def history_hash(fingerprint: dict[str, Any]) -> str:
     return _digest("|".join(h for h, _n in fingerprint.get("messages") or []).encode())
 
 
-def compare(prev: dict[str, Any], cur: dict[str, Any]) -> list[dict[str, Any]]:
+def compare(
+    prev: dict[str, Any], cur: dict[str, Any], *, turn_boundary: bool = False,
+) -> list[dict[str, Any]]:
     """Diff two fingerprints of consecutive same-session requests.
 
     Returns one record per violated segment (empty list = invariant holds):
@@ -139,6 +141,11 @@ def compare(prev: dict[str, Any], cur: dict[str, Any]) -> list[dict[str, Any]]:
     (the previous request's LAST message is allowed to change, later ones
     append). A shorter history is reported as ``shrink`` — a rewrite, but not
     the in-place toggle class that collapses cache reads mid-conversation.
+
+    ``turn_boundary=True`` (the two requests belong to different turns) drops
+    that last-message exemption: the previous turn's final request ended on a
+    tool result or user row that is already persisted history, so every one
+    of its messages must reappear byte-identical at the start of the next turn.
     """
     out: list[dict[str, Any]] = []
     for segment in ("system", "tools"):
@@ -151,7 +158,7 @@ def compare(prev: dict[str, Any], cur: dict[str, Any]) -> list[dict[str, Any]]:
         })
     p = prev.get("messages") or []
     c = cur.get("messages") or []
-    stable = max(len(p) - 1, 0)
+    stable = len(p) if turn_boundary else max(len(p) - 1, 0)
     if len(c) < stable:
         out.append({
             "segment": "messages", "kind": KIND_SHRINK, "first_divergent_index": len(c),

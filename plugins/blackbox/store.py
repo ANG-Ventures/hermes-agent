@@ -216,7 +216,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             cache_read INT,
             fingerprint_json TEXT,
             updated_at REAL,
-            alerted_at REAL
+            alerted_at REAL,
+            prompt_tokens INT
         );
 
         -- One row per violated segment per request pair. `kind` is
@@ -251,7 +252,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             allowlist_reason TEXT,
             cache_read_before INT,
             cache_read_after INT,
-            alerted INT NOT NULL DEFAULT 0
+            alerted INT NOT NULL DEFAULT 0,
+            prompt_tokens_before INT,
+            prompt_tokens_after INT
         );
         CREATE INDEX IF NOT EXISTS idx_blackbox_prefix_mutations_ts
             ON prefix_mutations(ts);
@@ -277,6 +280,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+    # Provider-reported prompt size on the prefix-guard rows: a turn-boundary
+    # prompt that shrinks with NO recorded mutation is a rewrite BELOW the
+    # harness (e.g. a relay bridge reseeding its resident session).
+    for _table, _cols in (("prefix_sessions", ("prompt_tokens",)),
+                          ("prefix_mutations", ("prompt_tokens_before", "prompt_tokens_after"))):
+        _have = {row[1] for row in conn.execute(f"PRAGMA table_info({_table})")}
+        for _col in _cols:
+            if _col not in _have:
+                try:
+                    conn.execute(f"ALTER TABLE {_table} ADD COLUMN {_col} INT")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
     _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
     for col, kind in (("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
                       ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT")):
@@ -564,6 +580,16 @@ def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
                 SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
                                       OR cache_write IS NULL THEN NULL
                             WHEN input_tokens + cache_read + cache_write <= 0 THEN NULL
+                            -- Read-only lanes (xAI, codex, OpenAI-shaped usage with
+                            -- only prompt_tokens_details.cached_tokens) never report
+                            -- a write, so the write rule below is structurally 0
+                            -- there. A cold first call is a read under half the
+                            -- prompt. Anthropic lanes keep the write rule.
+                            WHEN lane_family IS NOT NULL
+                                 AND lane_family NOT IN ('apx/apr', 'bpx/bpr', 'cpx/cpr')
+                                 AND cache_write = 0 THEN
+                                CASE WHEN cache_read * 2 < input_tokens + cache_read
+                                     THEN 1 ELSE 0 END
                             WHEN cache_write * 5 >= 4 *
                                  (input_tokens + cache_read + cache_write) THEN 1
                             ELSE 0 END
@@ -897,9 +923,15 @@ def record_prefix_check(
     *, session_key: str, turn_id: str, seq: int, ts: float, pid: int,
     provider: str, model: str, api_mode: str, fingerprint: dict[str, Any],
     cache_read: int | None, reset: str | None = None,
-    allowlist: Any = None,
+    allowlist: Any = None, prompt_tokens: int | None = None,
+    compare_across_turns: bool = True,
 ) -> dict[str, Any]:
     """Compare one request with the session's previous request and persist.
+
+    When the previous request belongs to another turn the comparison runs in
+    turn-boundary mode (no last-message exemption). ``compare_across_turns``
+    False makes a new turn start a fresh baseline instead (background-review
+    forks: each fork is its own conversation replaying the parent snapshot).
 
     Returns ``{"violations": [...], "alert": bool, "suppressed": int}``.
     ``alert`` is True only on the transition from "this session has never
@@ -925,7 +957,9 @@ def record_prefix_check(
                 prev_fp = json.loads(prev["fingerprint_json"])
             except (TypeError, ValueError):
                 prev_fp = None
-            if isinstance(prev_fp, dict):
+            if isinstance(prev_fp, dict) and (
+                compare_across_turns or prev["turn_id"] == turn_id
+            ):
                 previous = {
                     "turn_id": prev["turn_id"], "seq": prev["seq"], "ts": prev["ts"],
                     "messages": len(prev_fp.get("messages") or []),
@@ -936,7 +970,10 @@ def record_prefix_check(
                 )
                 if context is None and prefix_guard.native_checkpoint_changed(prev_fp, fingerprint):
                     context = "compaction:native"
-                for diff in prefix_guard.compare(prev_fp, fingerprint):
+                turn_boundary = prev["turn_id"] != turn_id
+                for diff in prefix_guard.compare(
+                    prev_fp, fingerprint, turn_boundary=turn_boundary,
+                ):
                     reason = prefix_guard.allowlist_reason(
                         allowlist, segment=diff["segment"], session_key=session_key,
                         now=ts,
@@ -955,8 +992,9 @@ def record_prefix_check(
                             prev_ts, provider, lane_family, model, segment, kind,
                             first_divergent_index, bytes_before, bytes_after,
                             messages_before, messages_after, context, allowlisted,
-                            allowlist_reason, cache_read_before, cache_read_after
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            allowlist_reason, cache_read_before, cache_read_after,
+                            prompt_tokens_before, prompt_tokens_after
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             ts, session_key, turn_id, seq, prev["turn_id"], prev["seq"],
@@ -967,6 +1005,7 @@ def record_prefix_check(
                             len(fingerprint.get("messages") or []),
                             context, row["allowlisted"], reason,
                             prev["cache_read"], cache_read,
+                            prev["prompt_tokens"], prompt_tokens,
                         ),
                     )
                 pageable = [
@@ -1015,12 +1054,13 @@ def record_prefix_check(
             """
             INSERT OR REPLACE INTO prefix_sessions (
                 session_key, turn_id, seq, ts, pid, api_mode, model, cache_read,
-                fingerprint_json, updated_at, alerted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fingerprint_json, updated_at, alerted_at, prompt_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_key, turn_id, seq, ts, pid, api_mode, model, cache_read,
                 json.dumps(fingerprint, separators=(",", ":")), time.time(), alerted_at,
+                prompt_tokens,
             ),
         )
     return {"violations": violations, "alert": alert, "suppressed": suppressed,

@@ -55,7 +55,6 @@ from agent.message_sanitization import (
 from agent.fork_ext.relay_headers import _pool_affinity_headers, _pool_lane, _pool_lane_src
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
-from agent.shared_transport_guard import _TAILSCALE_RELAY_PROVIDERS
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -69,7 +68,8 @@ _POOL_HEADER_NAMES = (
     "x-pool-route-id",
     "x-pool-unreachable",
 )
-_POOLED_PROVIDERS = _TAILSCALE_RELAY_PROVIDERS
+# Relay-pool providers whose responses carry the x-pool-* attribution headers.
+_POOLED_PROVIDERS = frozenset({"claude-apr", "claude-bpr"})
 _PINNED_PROVIDER_KEYS = {
     "xai-oauth": "supergrok",
     "gemini-bridge": "gemini",
@@ -225,6 +225,13 @@ def _emit_api_call_record(
         # when it rewrote history on purpose. Consumed here so it tags exactly
         # the first request after the compaction.
         session_key = str(getattr(agent, "session_id", "") or "")
+        # A background-review fork shares the parent's session_id; keyed
+        # together, every fork request became the main lane's baseline and
+        # the next main request was diffed against the fork. Give forks their
+        # own chain, and start it fresh per fork turn.
+        is_review_fork = getattr(agent, "_memory_write_origin", None) == "background_review"
+        if is_review_fork and session_key:
+            session_key = f"{session_key}:review"
         prefix_reset = getattr(agent, "_blackbox_prefix_reset", None)
         if prefix_reset is not None:
             agent._blackbox_prefix_reset = None
@@ -247,6 +254,7 @@ def _emit_api_call_record(
             api_kwargs=api_kwargs if isinstance(api_kwargs, dict) else None,
             session_key=session_key or None,
             prefix_reset=str(prefix_reset) if prefix_reset else None,
+            prefix_compare_across_turns=not is_review_fork,
         )
     except Exception:
         _note_api_call_recording_failure(agent)
@@ -3008,7 +3016,6 @@ _FALLBACK_REASON_LABELS = {
     "overloaded": "provider overloaded",
     "server_error": "provider error",
     "timeout": "connection dropped",
-    "tailscale_down": "Tailscale down",
     "stream_parse": "malformed stream",
     "decode_error": "corrupt response",
     "ssl_cert_verification": "TLS error",
@@ -3563,20 +3570,10 @@ def try_activate_fallback(
             apply_quota_gate(agent)
         except Exception:
             logger.debug("quota registry gate failed open", exc_info=True)
-    # A safety refusal (content_policy_blocked) is deterministic for the
-    # unchanged prompt, exactly like a rate-limit is deterministic for its
-    # window: restoring the primary next turn just reproduces the refusal and
-    # rebuilds the fallback's prefix cache COLD every turn. So arm the SAME
-    # primary cooldown a 429 arms — a refusal carries no reset_at, so
-    # _primary_cooldown_seconds() returns its 60s default (single source of
-    # truth; no separate constant). Keeps the session sticky on the warm
-    # fallback for the window, then re-probes the primary. Same "only when
-    # leaving the primary" guard so a chain-switch mid-fallback doesn't re-arm.
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing,
-                  FailoverReason.upstream_rate_limit, FailoverReason.content_policy_blocked}:
+    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
-        # source of the 429/refusal so the cooldown should not be reset/extended.
+        # source of the 429 so the cooldown should not be reset/extended.
         fallback_already_active = bool(getattr(agent, "_fallback_activated", False))
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
@@ -3607,17 +3604,6 @@ def try_activate_fallback(
                 backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
             )
     if agent._fallback_index >= len(agent._fallback_chain):
-        try:
-            from agent.shared_transport_guard import emit_unavailable_summary
-
-            emit_unavailable_summary(
-                agent,
-                evidence=getattr(
-                    agent, "_shared_transport_evidence", "backend_state=Stopped"
-                ),
-            )
-        except Exception:
-            logger.debug("Could not emit shared-transport fallback summary", exc_info=True)
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
         # their own 60s cooldown above), arm a short cooldown so the next
@@ -3781,61 +3767,6 @@ def try_activate_fallback(
         # not pin api_mode explicitly. An explicit fb.api_mode (even
         # "chat_completions") must never be overridden here.
         fb_base_url = str(fb_client.base_url)
-        try:
-            from agent.shared_transport_guard import (
-                emit_unavailable_summary,
-                record_unavailable_route,
-                route_uses_tailscale,
-                tailscale_status_down,
-            )
-
-            if route_uses_tailscale(fb_provider, fb_base_url):
-                tailscale_down, tailscale_evidence = tailscale_status_down()
-                if tailscale_down is True:
-                    source_uses_tailscale = route_uses_tailscale(
-                        getattr(agent, "provider", ""),
-                        getattr(agent, "base_url", ""),
-                    )
-                    if source_uses_tailscale:
-                        record_unavailable_route(
-                            agent,
-                            getattr(agent, "provider", ""),
-                            getattr(agent, "model", ""),
-                        )
-                    record_unavailable_route(agent, fb_provider, fb_model)
-                    agent._shared_transport_evidence = tailscale_evidence
-                    unavailable.add(fb_key)
-                    try:
-                        fb_client.close()
-                    except Exception:
-                        pass
-                    logger.warning(
-                        "Fallback skip: %s/%s shares unavailable Tailscale "
-                        "transport (%s); suppressing for this session",
-                        fb_provider,
-                        fb_model,
-                        tailscale_evidence,
-                    )
-                    next_reason = (
-                        FailoverReason.tailscale_down
-                        if source_uses_tailscale
-                        or reason == FailoverReason.tailscale_down
-                        else reason
-                    )
-                    return agent._try_activate_fallback(
-                        next_reason, error_context=error_context,
-                        display_reason=display_reason if next_reason == reason else None,
-                    )
-            emit_unavailable_summary(
-                agent,
-                evidence=getattr(
-                    agent, "_shared_transport_evidence", "backend_state=Stopped"
-                ),
-            )
-        except Exception:
-            # Availability detection is an optimization. An unavailable or
-            # malformed local Tailscale CLI must preserve historical routing.
-            logger.debug("Shared-transport fallback preflight failed open", exc_info=True)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
 
         if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
@@ -5924,25 +5855,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         # Build mock response matching non-streaming shape
         full_content = "".join(content_parts) or None
-
-        # Provider-specific response post-processing on the STREAMING path.
-        #
-        # Applied to the ASSEMBLED text, not to individual deltas: a transform
-        # needle can straddle a delta boundary, so a per-delta application would
-        # silently miss it. Buffering deltas to fix that would delay first-token
-        # display, so the persisted/returned text is corrected here while the
-        # live display keeps streaming unbuffered. This is why the hook is
-        # required to be idempotent — display and persistence can both apply it.
-        if full_content:
-            try:
-                from providers import get_provider_profile as _gpp
-
-                _resp_profile = _gpp(agent.provider)
-                if _resp_profile is not None:
-                    full_content = _resp_profile.process_response_text(full_content)
-            except Exception:
-                pass
-
         mock_tool_calls = None
         has_truncated_tool_args = False
         if tool_calls_acc:
