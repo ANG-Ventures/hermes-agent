@@ -52,7 +52,12 @@ from agent.message_sanitization import (
     _splice_surrogates,
     _repair_tool_call_arguments,
 )
-from agent.fork_ext.relay_headers import _pool_affinity_headers, _pool_lane, _pool_lane_src
+from agent.fork_ext.relay_headers import (
+    _pool_affinity_headers,
+    _pool_lane,
+    _pool_lane_src,
+    merge_pool_capability_headers,
+)
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
@@ -360,6 +365,9 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
         )
         return
     headers = getattr(response, "pool_headers", None)
+    from agent import fallback_wiring as _fw
+
+    _fw.note_success(agent, headers if isinstance(headers, dict) else None)
     _emit_api_call_record(
         agent,
         usage=getattr(response, "usage", None),
@@ -2393,6 +2401,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             _eh = dict(anthropic_kwargs.get("extra_headers") or {})
             _eh.update(_aff)
             anthropic_kwargs["extra_headers"] = _eh
+        # error-class-v2 negotiation (apr and bpr; fallback spec Phase 1b).
+        merge_pool_capability_headers(agent, anthropic_kwargs)
         # Nous Portal reads ``tags`` and ``session_id`` as top-level body fields
         # on its Messages route the same way it does on /chat/completions, but
         # the profile hook that produces them is only consulted by the
@@ -2577,7 +2587,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # registered providers with profiles were bypassing the strip.
         api_messages = agent._prepare_messages_for_non_vision_model(api_messages)
 
-        return _ct.build_kwargs(
+        return merge_pool_capability_headers(agent, _ct.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
@@ -2604,7 +2614,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
-        )
+        ))
 
     # ── Legacy flag path ────────────────────────────────────────────
     # Reached only when get_provider_profile() returns None — i.e. a
@@ -2616,7 +2626,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
-    return _ct.build_kwargs(
+    return merge_pool_capability_headers(agent, _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
         tools=tools_for_api,
@@ -2652,7 +2662,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
-    )
+    ))
 
 
 
@@ -3213,6 +3223,7 @@ def _emit_fallback_announce(
     kind: str = "fallback",
     reason: "Any | None" = None,
     recovery_via: "str | None" = None,
+    ledger_row: "dict | None" = None,
 ) -> None:
     """Emit a single, always-visible chat status line when a model route changes
     (an automatic failover OR a recovery back to the primary).
@@ -3245,6 +3256,14 @@ def _emit_fallback_announce(
     emit — never the ``_last_fallback_event`` write, which a compaction consumer
     reads. ``record_event`` is True only for a genuine failover (a recovery must NOT
     stamp the "after model fallback" causality record).
+
+    ``ledger_row`` (fallback spec §4.8) is the ``fallback_events`` row dict the
+    caller writes for this route change. When given, a failover gets the
+    `` — <cause rider>`` (``format_cause_rider``) and the relay-sourced head
+    label override; a recovery with a ``return_branch`` gets the recovery rider.
+    The full line is built BEFORE the dedupe and the ``announce_enabled`` gate
+    and stored in ``ledger_row["notice_text"]``, so AC7 is measurable with
+    announcements off.
     """
     _oe = _effort_label(old_effort)
     _ne = _effort_label(new_effort)
@@ -3260,6 +3279,84 @@ def _emit_fallback_announce(
     if old_provider is None and old_model == new_model and _oe == _ne:
         return
     transition = (old_route, new_route)
+
+    # Reasoning-effort rider: render the (effort) suffix on each side only when
+    # the two resolved labels differ, so an inherited-effort failover reads as a
+    # pure route change. Both labels come pre-normalized from the caller.
+    _show_effort = bool(_oe or _ne) and _oe != _ne
+
+    old_label = _format_model_route_label(old_provider, old_model, _oe if _show_effort else None)
+    new_label = _format_model_route_label(new_provider, new_model, _ne if _show_effort else None)
+    verb = "Model recovery" if kind == "recovery" else "Model fallback"
+    icon = "🔄"
+    # Rider (why/how the route changed). For a FAILOVER: the fault reason —
+    # "safety refusal" vs "rate limit" — so a content-policy refusal (fable
+    # declined → opus answered) is distinguishable from a rate-limit blip.
+    # For a RECOVERY: not a fault, but WHICH recovery mechanism returned the
+    # session to its primary — "new turn" (same cached agent restored) vs
+    # "re-init" (the agent was rebuilt, prompt cache lost — more consequential).
+    if kind == "recovery":
+        _reason_suffix = f" ({recovery_via})" if recovery_via else ""
+    else:
+        _reason_label = _fallback_reason_label(reason)
+        # §4.8 head-label override: a relay-sourced conn / pool_pressure names
+        # the real cause, and the quota-window suffix is not applied.
+        _head_override = None
+        if isinstance(ledger_row, dict):
+            try:
+                from agent.fallback_policy import head_label_override
+
+                _head_override = head_label_override(ledger_row)
+            except Exception:
+                _head_override = None
+        # For a POOL exhaustion, say WHICH model ran out when the pool scoped it
+        # that way. Unconditionally consume the stamp so it can't leak onto a
+        # later failover, but only override the label for pool_exhausted.
+        # Compare on .value like _fallback_reason_label does: FailoverReason is
+        # NOT a str-enum, so callers passing the bare string would silently miss.
+        _scope_label = _pool_scope_label(agent, old_model)
+        if _scope_label and getattr(reason, "value", reason) == "pool_exhausted":
+            _reason_label = _scope_label
+        # For a quota 429, name WHICH window bound (5h vs 7d) and when it
+        # clears — those are opposite decisions ("wait an hour" vs "this sub is
+        # gone for two days") that both used to render as a flat "rate limit".
+        # Silently unchanged for providers that send no unified-quota headers.
+        if _head_override:
+            _quota_window_suffix(agent)  # consume the stamp; never rendered here
+            _reason_label = _head_override
+        elif reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit,
+                        FailoverReason.pool_exhausted}:
+            _window = _quota_window_suffix(agent)
+            if _window:
+                # A bound quota WINDOW means this is subscription usage
+                # exhaustion, not a request-rate throttle — say so, and name
+                # the model whose budget ran out (Ace, 2026-09-19: "rate
+                # limit"/"connection issue" for a spent fable bucket was
+                # "really confusing"). Pool-scoped labels already name it.
+                if reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit}:
+                    _who = (old_model or "").strip()
+                    _reason_label = f"{_who} usage exhausted" if _who else "usage exhausted"
+                _reason_label = f"{_reason_label} · {_window}"
+        _reason_suffix = f" ({_reason_label})" if _reason_label else ""
+    msg = f"{icon} {verb}{_reason_suffix}: {old_label} → {new_label}"
+    old_lbl = _format_context_window(old_window)
+    new_lbl = _format_context_window(new_window)
+    if old_lbl and new_lbl and old_lbl != new_lbl:
+        msg += f" · context window {old_lbl}→{new_lbl}"
+    if isinstance(ledger_row, dict):
+        try:
+            from agent import fallback_policy as _fp
+            from agent.fallback_wiring import announce_seat_names
+
+            _names = announce_seat_names()
+            if kind == "recovery":
+                if ledger_row.get("return_branch"):
+                    msg += " — " + _fp.format_recovery_rider(ledger_row, seat_names=_names)
+            else:
+                msg += " — " + _fp.format_cause_rider(ledger_row, seat_names=_names)
+        except Exception:
+            logger.debug("route-change rider failed", exc_info=True)
+        ledger_row["notice_text"] = msg
     if getattr(agent, "_last_fallback_announced", None) == transition:
         # Already announced THIS transition in the current episode (I5: once per
         # episode). Logged at INFO so "suppressed as a repeat" is distinguishable
@@ -3299,56 +3396,6 @@ def _emit_fallback_announce(
         except Exception:
             pass
 
-    # Reasoning-effort rider: render the (effort) suffix on each side only when
-    # the two resolved labels differ, so an inherited-effort failover reads as a
-    # pure route change. Both labels come pre-normalized from the caller.
-    _show_effort = bool(_oe or _ne) and _oe != _ne
-
-    old_label = _format_model_route_label(old_provider, old_model, _oe if _show_effort else None)
-    new_label = _format_model_route_label(new_provider, new_model, _ne if _show_effort else None)
-    verb = "Model recovery" if kind == "recovery" else "Model fallback"
-    icon = "🔄"
-    # Rider (why/how the route changed). For a FAILOVER: the fault reason —
-    # "safety refusal" vs "rate limit" — so a content-policy refusal (fable
-    # declined → opus answered) is distinguishable from a rate-limit blip.
-    # For a RECOVERY: not a fault, but WHICH recovery mechanism returned the
-    # session to its primary — "new turn" (same cached agent restored) vs
-    # "re-init" (the agent was rebuilt, prompt cache lost — more consequential).
-    if kind == "recovery":
-        _reason_suffix = f" ({recovery_via})" if recovery_via else ""
-    else:
-        _reason_label = _fallback_reason_label(reason)
-        # For a POOL exhaustion, say WHICH model ran out when the pool scoped it
-        # that way. Unconditionally consume the stamp so it can't leak onto a
-        # later failover, but only override the label for pool_exhausted.
-        # Compare on .value like _fallback_reason_label does: FailoverReason is
-        # NOT a str-enum, so callers passing the bare string would silently miss.
-        _scope_label = _pool_scope_label(agent, old_model)
-        if _scope_label and getattr(reason, "value", reason) == "pool_exhausted":
-            _reason_label = _scope_label
-        # For a quota 429, name WHICH window bound (5h vs 7d) and when it
-        # clears — those are opposite decisions ("wait an hour" vs "this sub is
-        # gone for two days") that both used to render as a flat "rate limit".
-        # Silently unchanged for providers that send no unified-quota headers.
-        if reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit,
-                      FailoverReason.pool_exhausted}:
-            _window = _quota_window_suffix(agent)
-            if _window:
-                # A bound quota WINDOW means this is subscription usage
-                # exhaustion, not a request-rate throttle — say so, and name
-                # the model whose budget ran out (Ace, 2026-09-19: "rate
-                # limit"/"connection issue" for a spent fable bucket was
-                # "really confusing"). Pool-scoped labels already name it.
-                if reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit}:
-                    _who = (old_model or "").strip()
-                    _reason_label = f"{_who} usage exhausted" if _who else "usage exhausted"
-                _reason_label = f"{_reason_label} · {_window}"
-        _reason_suffix = f" ({_reason_label})" if _reason_label else ""
-    msg = f"{icon} {verb}{_reason_suffix}: {old_label} → {new_label}"
-    old_lbl = _format_context_window(old_window)
-    new_lbl = _format_context_window(new_window)
-    if old_lbl and new_lbl and old_lbl != new_lbl:
-        msg += f" · context window {old_lbl}→{new_lbl}"
     if not announce_enabled:
         return
     emit = getattr(agent, "_emit_status", None)
@@ -3600,7 +3647,37 @@ def try_activate_fallback(
     # the peer-closed stream-drop class (2026-07-10). Extracted to a pure helper
     # so the explicit-wins / backfill / consume-once invariant is unit-testable
     # without driving the whole provider-resolution path.
-    reason = _resolve_failover_reason(agent, reason)
+    # Phase 2 policy (fallback spec §4.1-4.3): the §4.2 construction-time
+    # resume re-enters here with the chain index preset and must touch no
+    # reason / cooldown / quota-gate / announce state.
+    from agent import fallback_wiring as _fw
+
+    _resuming = getattr(agent, "_sticky_resume_in_progress", False) is True
+    if not _resuming:
+        reason = _resolve_failover_reason(agent, reason)
+    # A seat-level quota (`quota_seat`: one seat's 5h / weekly / Fable limit)
+    # on a pool relay is the relay's to rotate around, so it does not bench
+    # the model (fallback spec §4.1 / Phase 1b); apply_quota_gate skips it at
+    # its own entry. Peeked, not consumed: the ledger row still gets it.
+    try:
+        from agent import fallback_events as _fbe_cls
+
+        _relay_quota_seat = _fbe_cls.quota_seat_on_relay(agent)
+    except Exception:
+        _relay_quota_seat = False
+    if _relay_quota_seat:
+        logger.info(
+            "quota_seat on relay %s/%s: no model bench, no quota-registry gate",
+            getattr(agent, "provider", "?"), getattr(agent, "model", "?"),
+        )
+    # Class-gated quota gate / legacy arm, and the mid-turn fallback_failed
+    # return (evaluated BEFORE the chain walk; on allow the primary is back).
+    if _resuming:
+        _plan = _fw.LEGACY_PLAN._replace(skip_quota_gate=True, skip_legacy_arm=True)
+    else:
+        _plan = _fw.pre_failover(agent, reason, error_context)
+        if _plan.returned:
+            return True
     # ── Registry-driven pruning (2026-09-21 cascade) ────────────────────
     # A quota failure means the chain is about to be walked for quota
     # reasons, and the usage-tracking system has already recorded which subs
@@ -3609,14 +3686,15 @@ def try_activate_fallback(
     # requests. The configured chain stays intact so recovered subs return on
     # the next turn; see agent.quota_registry_gate.
     if reason in {FailoverReason.rate_limit, FailoverReason.billing,
-                  FailoverReason.upstream_rate_limit}:
+                  FailoverReason.upstream_rate_limit} and not _plan.skip_quota_gate:
         try:
             from agent.quota_registry_gate import apply_quota_gate
 
             apply_quota_gate(agent)
         except Exception:
             logger.debug("quota registry gate failed open", exc_info=True)
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    if (reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
+            and not _relay_quota_seat and not _plan.skip_legacy_arm):
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -4218,6 +4296,11 @@ def try_activate_fallback(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
+        if _resuming:
+            # §4.2 resume: no route-change line, ledger failover row, card
+            # substitution or announce (the user-visible route is unchanged).
+            _reset_stale_streak(agent)
+            return True
         # Always-recorded route-change AUDIT + gated chat ANNOUNCE. The chat line
         # reaches the gateway
         # status_callback (Discord/Telegram), not just the CLI, via _emit_status.
@@ -4252,16 +4335,28 @@ def try_activate_fallback(
             # --check-parity gate.
             from agent import fallback_events as _fbe
 
+            # Sticky writer (§4.2; B1 guard inside), then the row. The row is
+            # built now and written AFTER the announce so it carries the
+            # notice_text (§4.8); a failed announce still writes it.
             _cool = None
             _rl_until = getattr(agent, "_rate_limited_until", 0) or 0
             if _rl_until:
                 _cool = max(0.0, _rl_until - time.monotonic())
-            _fbe.record(
-                agent, "failover",
-                from_provider=old_provider, from_model=old_model,
-                to_provider=fb_provider, to_model=fb_model,
-                reason=reason, error_context=error_context, cooldown_s=_cool,
+            _policy_extra = _fw.post_failover(
+                agent, _plan, failing=(old_provider, old_model),
+                fallback=(fb_provider, fb_model), fallback_index=agent._fallback_index - 1,
             )
+            _ledger_row = None
+            try:
+                _ledger_row = _fbe.build_row(
+                    agent, "failover",
+                    from_provider=old_provider, from_model=old_model,
+                    to_provider=fb_provider, to_model=fb_model,
+                    reason=reason, error_context=error_context,
+                    cooldown_s=_cool, extra=_policy_extra,
+                )
+            except Exception:
+                logger.warning("fallback ledger row build failed", exc_info=True)
             # Kanban worker: put the swap on the card's run (t_4fe0700a) so
             # a pinned route that ended up elsewhere is visible on the board.
             from hermes_cli.kanban_worker_route import (
@@ -4281,19 +4376,24 @@ def try_activate_fallback(
                 _announce_on = bool(_model_cfg.get("announce_route_change", True))
             except Exception:
                 pass  # config read failure → default-on
-            _emit_fallback_announce(
-                agent, old_model, fb_model, fb_provider,
-                old_provider=old_provider,
-                old_window=locals().get("_old_ctx_window"),
-                new_window=_new_ctx_window,
-                old_effort=_old_eff,
-                new_effort=_new_eff,
-                announce_enabled=_announce_on,
-                record_event=True,
-                kind="fallback",
-                # Display-only classification must not affect routing/cooldown.
-                reason=display_reason if display_reason is not None else reason,
-            )
+            try:
+                _emit_fallback_announce(
+                    agent, old_model, fb_model, fb_provider,
+                    old_provider=old_provider,
+                    old_window=locals().get("_old_ctx_window"),
+                    new_window=_new_ctx_window,
+                    old_effort=_old_eff,
+                    new_effort=_new_eff,
+                    announce_enabled=_announce_on,
+                    record_event=True,
+                    kind="fallback",
+                    # Display-only classification must not affect routing/cooldown.
+                    reason=display_reason if display_reason is not None else reason,
+                    ledger_row=_ledger_row,
+                )
+            finally:
+                if _ledger_row is not None:
+                    _fbe.write_row(_ledger_row)
         except Exception as _announce_exc:
             # A route change the user cannot see is a real visibility bug, not
             # background chatter — surface it at WARNING so a broken announce

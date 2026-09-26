@@ -653,3 +653,571 @@ def test_recovery_notice_renders_d6_branch_seat_dwell(store, key):
     assert fp.format_recovery_rider(row) == (
         "primary eligible on sub-vps-6, last call 12m ago (expected warm), "
         "after 19m / 7 turns on Opus")
+
+
+
+# ══ Phase 2 WIRING (hot path) — §5 bullets #1264 left open ══════════════════
+#
+# Drives the REAL try_activate_fallback / restore_primary_runtime /
+# gateway pre-run decision + _announce_reinit_recovery against a temp
+# HERMES_HOME (blackbox ledger + model-route-changes.log on disk).
+
+import ast as _ast
+import os as _os
+import pathlib as _pathlib
+import sqlite3 as _sqlite3
+import time as _time
+import types as _types
+
+import agent.auxiliary_client as _ac
+from agent import fallback_events as _fbe
+from agent import fallback_wiring as _fw
+from agent.agent_runtime_helpers import restore_primary_runtime as _restore
+from agent.chat_completion_helpers import try_activate_fallback as _activate
+from agent.error_classifier import FailoverReason as _FR
+
+SID = "20260926_100000_aaaa"
+REPO = _pathlib.Path(__file__).resolve().parents[2]
+ELIG = fp.Eligibility(bound_seat="sub-vps-6", bound_eligible=True, model_eligible=True,
+                      bound_expires_in_s=900.0, bound_idle_s=0.0, bound_expiry=None,
+                      snapshot_age_s=1.0, instance_id="pid:1 port:18811")
+
+
+class _Err(Exception):
+    def __init__(self, msg, status, headers=None, body=None):
+        super().__init__(msg)
+        self.status_code = status
+        self.response = _types.SimpleNamespace(headers=headers or {})
+        self.body = body
+
+
+FABLE_CAP = lambda: _Err("You've reached your Fable limit", 429,  # noqa: E731
+                         body={"error": {"message": "Fable limit"}})
+OPUS_CAP = lambda: _Err("You've reached your Opus limit", 429,  # noqa: E731
+                        body={"error": {"message": "Opus limit"}})
+CONN = lambda: _Err("Connection error.", None)  # noqa: E731
+
+
+@pytest.fixture
+def wired(tmp_path, monkeypatch):
+    """Temp home with blackbox + announces on; resolver + eligibility faked."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "blackbox:\n  enabled: true\n"
+        "model:\n  announce_route_change: true\n  announce_recovery: true\n")
+    _ac.clear_runtime_main()
+    calls = {"resolve": [], "elig": 0, "gate": 0}
+
+    def _resolve(provider, model, **kw):
+        calls["resolve"].append((provider, model))
+        return (_types.SimpleNamespace(api_key="fb-key", base_url="http://127.0.0.1:18811/v1",
+                                       _custom_headers=None, default_headers=None,
+                                       tag=f"{provider}/{model}"), model)
+
+    monkeypatch.setattr(_ac, "resolve_provider_client", _resolve, raising=False)
+    import agent.chat_completion_helpers as cch
+    monkeypatch.setattr(cch, "get_model_context_length", lambda *a, **k: 1_000_000, raising=False)
+
+    def _elig_fn(agent):
+        def _get():
+            calls["elig"] += 1
+            return ELIG
+        return _get
+
+    monkeypatch.setattr(_fw, "_eligibility_fn", _elig_fn)
+    import agent.quota_registry_gate as qrg
+    real_gate = qrg.apply_quota_gate
+
+    def _gate_spy(agent, *a, **k):
+        calls["gate"] += 1
+        return real_gate(agent, *a, **k)
+
+    monkeypatch.setattr(qrg, "apply_quota_gate", _gate_spy)
+    monkeypatch.setattr(qrg, "load_registry_snapshot", lambda *a, **k: {}, raising=False)
+    yield tmp_path, calls
+    _ac.clear_runtime_main()
+
+
+def _wired_agent(sid=SID, provider=FABLE[0], model=FABLE[1]):
+    from tests.agent.test_route_change_sink_e2e import _fake_agent
+
+    base = "http://127.0.0.1:18811/v1"
+    a = _fake_agent(model=model, provider=provider, base_url=base, api_mode="chat_completions")
+    a.session_id = sid
+    a._current_turn_id = f"{sid}:{sid}:t1"
+    a.requested_provider = provider
+    a._fallback_chain = [{"provider": OPUS[0], "model": OPUS[1]}]
+    a._client_kwargs = {"api_key": "primary-key", "base_url": base}
+    a._use_prompt_caching = False
+    a._use_native_cache_layout = False
+    a.request_overrides = {}
+    a._primary_runtime = {
+        "model": model, "provider": provider, "requested_provider": provider,
+        "base_url": base, "api_mode": "chat_completions", "api_key": "primary-key",
+        "request_overrides": {}, "client_kwargs": dict(a._client_kwargs),
+        "use_prompt_caching": False, "use_native_cache_layout": False,
+        "reasoning_echo_flag": False, "compressor_model": model, "compressor_base_url": base,
+        "compressor_api_key": "", "compressor_provider": provider,
+        "compressor_context_length": 1_000_000, "compressor_threshold_tokens": 0,
+    }
+    a._create_openai_client = lambda kw, **k: _types.SimpleNamespace(tag="primary", **{})
+    a._try_activate_fallback = lambda *x, **k: _activate(a, *x, **k)
+    a.client = _types.SimpleNamespace(tag="primary")
+    return a
+
+
+def _rows(home, kind=None):
+    p = _os.path.join(str(home), "blackbox", "turns.db")
+    if not _os.path.exists(p):
+        return []
+    con = _sqlite3.connect(p)
+    con.row_factory = _sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute("select * from fallback_events order by id")]
+    except _sqlite3.OperationalError:
+        rows = []
+    finally:
+        con.close()
+    return [r for r in rows if kind is None or r["kind"] == kind]
+
+
+def _route_lines(home):
+    p = _pathlib.Path(home) / "state" / "model-route-changes.log"
+    return [ln for ln in p.read_text().splitlines() if ln.strip()] if p.exists() else []
+
+
+def _fail(agent, err, reason=_FR.rate_limit):
+    _fbe.stash_api_error(agent, err, err.status_code, {"message": str(err)})
+    return _activate(agent, reason=reason)
+
+
+def _state(agent):
+    return fss.get(_fw.key_for(agent))
+
+
+def _age_episode(agent, *, until_ago=300.0, fallback_idle=None, last_primary_ago=None):
+    """Move the stored episode into the past (no clock patching)."""
+    k = _fw.key_for(agent)
+    st = fss.get(k)
+    now = _time.time()
+    st.until_epoch = now - until_ago
+    if fallback_idle is not None:
+        st.last_fallback_call_epoch = now - fallback_idle
+        st.entered_at = now - fallback_idle - 600
+    if last_primary_ago is not None:
+        st.last_primary_call_epoch = now - last_primary_ago
+    fss.default_store().put(k, st, now)
+    return st
+
+
+def test_wiring_conn_failover_arms_sticky_not_legacy_clock(wired):
+    """§4.1 plumbing: conn skips apply_quota_gate AND the legacy arm; the
+    sticky writer arms (one clock); the row carries sticky_until + rider."""
+    home, calls = wired
+    a = _wired_agent()
+    assert _fail(a, CONN(), reason=_FR.rate_limit) is True
+    assert (a.provider, a.model) == OPUS
+    assert calls["gate"] == 0
+    assert (a._rate_limited_until or 0) <= _time.monotonic()
+    st = _state(a)
+    assert st.active and st.cls == "conn" and st.fallback_model == OPUS[1]
+    [row] = _rows(home, "failover")
+    assert row["trigger_class"] == "conn"
+    assert row["sticky_until_epoch"] == pytest.approx(st.until_epoch)
+    assert row["notice_text"].startswith("🔄 Model fallback")
+    assert " — connection error " in row["notice_text"]
+    assert any(" — connection error " in m for _k, m in a._announced)
+
+
+def test_wiring_b1_fallback_429_does_not_rearm_primary(wired):
+    """B1: a quota_seat on the same-provider fallback (bpr Opus after bpr
+    Fable) does not re-arm or escalate the primary's episode."""
+    home, _ = wired
+    a = _wired_agent()
+    a._fallback_chain = [{"provider": OPUS[0], "model": OPUS[1]},
+                         {"provider": "openai-codex", "model": "gpt-5.5"}]
+    assert _fail(a, CONN()) is True
+    before = _state(a)
+    # pool_pressure on the fallback: not a fallback_failed class -> chain walk
+    assert _fail(a, _Err("pool at capacity", 503), reason=_FR.overloaded) is True
+    assert (a.provider, a.model) == ("openai-codex", "gpt-5.5")
+    after = _state(a)
+    assert (after.cls, after.n, after.until_epoch) == (before.cls, before.n, before.until_epoch)
+
+
+def test_wiring_content_policy_keeps_legacy_60s(wired):
+    """B3: refusal reaches the legacy block unchanged (shared 60 s default)."""
+    home, calls = wired
+    a = _wired_agent()
+    _fbe.stash_api_error(a, _Err("content_policy blocked", 400), 400, {"message": "content_policy"})
+    assert _activate(a, reason=_FR.rate_limit) is True
+    assert calls["gate"] == 1
+    assert a._rate_limited_until > _time.monotonic()
+    assert _state(a) is None
+
+
+def test_wiring_restore_refused_then_fallback_cold_return(wired):
+    """restore_refused while sticky; after until, fallback_cold returns with a
+    recovery row naming the branch, a route-change line and the rider."""
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    assert _restore(a) is False
+    refused = _rows(home, "restore_refused")
+    assert len(refused) == 1 and refused[0]["reason"].startswith("until")
+    _age_episode(a, fallback_idle=61 * 60)
+    assert _restore(a) is True
+    assert (a.provider, a.model) == FABLE
+    [rec] = _rows(home, "recovery")
+    assert rec["return_branch"] == "fallback_cold" and rec["dwell_s"] is not None
+    assert "fallback idle 61m" in rec["notice_text"]
+    assert len(_route_lines(home)) == 2
+    assert _state(a).active is False
+
+
+def test_wiring_failover_fallback_failed_failover(wired):
+    """failover -> fallback_failed -> failover within one turn: 2 failover
+    rows + 1 recovery row, 3 route-change lines, both failovers announced;
+    a second same-class fallback failure does not loop (anti-loop)."""
+    home, calls = wired
+    a = _wired_agent()
+    assert _fail(a, FABLE_CAP()) is True                     # Fable -> Opus
+    assert (a.provider, a.model) == OPUS
+    assert _fail(a, OPUS_CAP()) is True                      # Opus capped, Fable eligible
+    assert (a.provider, a.model) == FABLE                    # returned, no chain walk
+    assert calls["resolve"] == [OPUS]                        # chain was not walked
+    assert _fail(a, FABLE_CAP()) is True                     # Fable fails again -> Opus
+    assert (a.provider, a.model) == OPUS
+    assert [r["kind"] for r in _rows(home)] == ["failover", "recovery", "failover"]
+    assert _rows(home, "recovery")[0]["return_branch"] == "fallback_failed"
+    assert len(_route_lines(home)) == 3
+    fb_lines = [m for _k, m in a._announced if m.startswith("🔄 Model fallback")]
+    assert len(fb_lines) == 2
+    st = _state(a)
+    assert st.ff_disabled_until == pytest.approx(st.until_epoch)
+    # anti-loop: Opus capped again -> no second return, chain walk (exhausted)
+    assert _fail(a, OPUS_CAP()) is False
+    assert (a.provider, a.model) == OPUS
+    assert len(_rows(home, "recovery")) == 1
+
+
+def test_wiring_negative_fallback_capped_primary_ineligible_walks_chain(wired, monkeypatch):
+    """I2: the sticky target is capped and the primary is NOT eligible -> the
+    harness walks the chain."""
+    home, _ = wired
+    monkeypatch.setattr(_fw, "_eligibility_fn", lambda agent: (lambda: None))
+    a = _wired_agent()
+    a._fallback_chain = [{"provider": OPUS[0], "model": OPUS[1]},
+                         {"provider": "openai-codex", "model": "gpt-5.5"}]
+    assert _fail(a, FABLE_CAP()) is True
+    assert _fail(a, OPUS_CAP()) is True
+    assert (a.provider, a.model) == ("openai-codex", "gpt-5.5")
+    assert _rows(home, "recovery") == []
+
+
+def _fresh_rebuild(home, calls, state_before):
+    b = _wired_agent()
+    calls["gate"] = 0
+    lines = len(_route_lines(home))
+    resumes = len(_rows(home, "sticky_resume"))
+    assert _fw.decide_rebuild_for_agent(b) == "resume"
+    # the first outgoing request's client/route is the stored fallback
+    assert (b.provider, b.model) == OPUS and calls["resolve"][-1] == OPUS
+    assert b.client.tag == f"{OPUS[0]}/{OPUS[1]}"
+    assert b._fallback_activated is True and b._fallback_index == 1
+    assert (b._rate_limited_until or 0) == 0 and calls["gate"] == 0
+    assert b._announced == []
+    assert getattr(b, "_last_fallback_event", None) is None
+    assert len(_route_lines(home)) == lines
+    assert len(_rows(home, "sticky_resume")) == resumes + 1
+    st = _state(b)
+    assert (st.until_epoch, st.n, st.cls) == (state_before.until_epoch, state_before.n, state_before.cls)
+    return b
+
+
+def test_wiring_resume_after_three_evictions_and_restart(wired):
+    """resume_sticky_fallback (§4.2 normative): evict 3x -> each rebuilt agent's
+    first call goes to the fallback; until/n_c/_rate_limited_until unchanged,
+    apply_quota_gate not called, one sticky_resume row per rebuild, zero
+    route-change lines, no announce; gateway restart (map empty, DB row) ->
+    same; a later restore returns to the snapshotted primary (B1'c)."""
+    home, calls = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    st0 = _state(a)
+    for _ in range(3):
+        b = _fresh_rebuild(home, calls, st0)
+    fss.default_store().evict_memory()                      # gateway restart
+    b = _fresh_rebuild(home, calls, st0)
+    assert len(_rows(home, "sticky_resume")) == 4
+    _age_episode(b, fallback_idle=61 * 60)
+    assert _restore(b) is True
+    assert (b.provider, b.model) == FABLE and b.client.tag == "primary"
+
+
+def test_wiring_resume_chain_head_when_entry_removed(wired):
+    home, calls = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    b = _wired_agent()
+    b._fallback_chain = [{"provider": "openai-codex", "model": "gpt-5.5"}]
+    assert _fw.decide_rebuild_for_agent(b) == "resume"
+    assert (b.provider, b.model) == ("openai-codex", "gpt-5.5")
+    [row] = _rows(home, "sticky_resume")
+    assert row["reason"] == "chain_head"
+
+
+def test_wiring_b1a_fallback_failed_return_then_evict_stays_on_primary(wired):
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, FABLE_CAP()) is True
+    assert _fail(a, OPUS_CAP()) is True                      # fallback_failed return
+    assert _state(a).active is False
+    lines = len(_route_lines(home))
+    b = _wired_agent()
+    assert _fw.decide_rebuild_for_agent(b) == "primary"
+    assert (b.provider, b.model) == FABLE
+    assert _rows(home, "sticky_resume") == [] and len(_route_lines(home)) == lines
+
+
+def _runner_env(home, last_served):
+    import threading as _th
+    from datetime import datetime, timezone
+
+    import gateway.run as gateway_run
+    from gateway.session import SessionEntry, SessionStore
+
+    store = object.__new__(SessionStore)
+    store._entries = {}
+    store.sessions_dir = home
+    store._lock = _th.RLock()
+    store._loaded = True
+    store._record_gateway_session_peer = lambda *a, **k: None
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.session_store = store
+    now = datetime.now(timezone.utc)
+    e = SessionEntry(session_key="agent:main:telegram:c1:c1", session_id=SID,
+                     created_at=now, updated_at=now)
+    e.last_served_identity = {"provider": last_served[0], "model": last_served[1]}
+    store._entries[e.session_key] = e
+    return runner, e.session_key
+
+
+def _prerun(runner, key, agent):
+    """The gateway pre-run site, in order (gateway/run.py, fresh agent)."""
+    _fw.decide_rebuild_for_agent(agent)
+    runner._announce_reinit_recovery(agent=agent, session_key=key,
+                                     applied_provider=agent.provider, applied_model=agent.model)
+    _fw.flush_unconsumed_recovery_row(agent)
+
+
+def test_wiring_g2_one_decision_one_notice_per_rebuild(wired):
+    """G2: gate true at rebuild -> exactly one recovery row, one route-change
+    line and one Model recovery notice on the bound sink; gate false ->
+    sticky_resume row, zero route-change lines, no recovery notice."""
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    base_lines = len(_route_lines(home))
+    runner, key = _runner_env(home, OPUS)
+    # gate false (inside until) -> resume, silent
+    b = _wired_agent()
+    _prerun(runner, key, b)
+    assert (b.provider, b.model) == OPUS
+    assert b._announced == [] and len(_route_lines(home)) == base_lines
+    assert _rows(home, "recovery") == [] and len(_rows(home, "sticky_resume")) == 1
+    # B1'b: until + 5 min, fallback warm (10 min), binding gone -> stays
+    _age_episode(a, until_ago=300, fallback_idle=600, last_primary_ago=60 * 60)
+    c = _wired_agent()
+    _prerun(runner, key, c)
+    assert (c.provider, c.model) == OPUS and c._announced == []
+    assert "warm_seat" in _rows(home, "restore_refused")[-1]["reason"]
+    # until + 5 min with warm_seat true -> return: 1 row, 1 line, 1 notice
+    _age_episode(a, until_ago=300, fallback_idle=600, last_primary_ago=10 * 60)
+    st = _state(a)
+    st.last_primary_seat = "sub-vps-6"
+    fss.default_store().put(_fw.key_for(a), st, _time.time())
+    d = _wired_agent()
+    _prerun(runner, key, d)
+    assert (d.provider, d.model) == FABLE
+    [rec] = _rows(home, "recovery")
+    assert rec["return_branch"] == "warm_seat" and rec["seat"] == "sub-vps-6"
+    assert len(_route_lines(home)) == base_lines + 1
+    notices = [m for _k, m in d._announced if m.startswith("🔄 Model recovery")]
+    assert len(notices) == 1 and "primary eligible on sub-vps-6" in notices[0]
+    assert rec["notice_text"] == notices[0]
+
+
+def test_wiring_db_only_restart_fallback_cold_and_compaction(wired):
+    """pass-10 G1: map empty, DB row -> fallback_cold at 61 min idle; a rotated
+    session id -> compaction. Dwell in the notice comes from the DB row."""
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    _age_episode(a, until_ago=60, fallback_idle=61 * 60)
+    fss.default_store().evict_memory()
+    runner, key = _runner_env(home, OPUS)
+    b = _wired_agent()
+    _prerun(runner, key, b)
+    assert (b.provider, b.model) == FABLE
+    assert _rows(home, "recovery")[-1]["return_branch"] == "fallback_cold"
+    assert "after " in _rows(home, "recovery")[-1]["notice_text"]
+
+
+def test_wiring_i3_turn_completes_with_db_unwritable(wired):
+    """I3: blackbox dir unwritable -> failover, restore gate and rebuild all
+    complete; nothing raises; the in-process map still holds the episode."""
+    home, _ = wired
+    (home / "blackbox").write_text("not a dir")               # mkdir/connect fails
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    assert _state(a).active is True
+    assert _restore(a) is False                                 # refused (until), no raise
+    b = _wired_agent()
+    assert _fw.decide_rebuild_for_agent(b) == "resume"
+    _fw.note_success(b, {"x-pool-served-by": "sub-vps-6"})
+
+
+def test_wiring_store_unreadable_starts_on_primary(wired, monkeypatch):
+    """RC-4: map miss + DB read raises -> start on primary, counted."""
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    st = fss.default_store()
+    st.evict_memory()
+    monkeypatch.setattr(StickyStore, "_read_db", lambda self, key: (_ for _ in ()).throw(OSError("locked")))
+    b = _wired_agent()
+    assert _fw.decide_rebuild_for_agent(b) == "store_unreadable"
+    assert (b.provider, b.model) == FABLE and st.store_unreadable_count >= 1
+
+
+def test_wiring_cheap_form_chain_refresh_makes_no_eligibility_call(wired):
+    """RC-3: the gateway chain-refresh gate uses probe=False (no I/O) and
+    keeps the chain while the sticky gate refuses."""
+    import gateway.run as gateway_run
+
+    home, calls = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    calls["elig"] = 0
+    old = list(a._fallback_chain)
+    gateway_run.GatewayRunner._apply_fallback_chain_to_agent(a, [{"provider": "x", "model": "y"}])
+    assert a._fallback_chain == old and calls["elig"] == 0
+
+
+def test_wiring_primary_success_records_seat_and_survives_rebuild(wired):
+    """last_primary_call_epoch / last_primary_seat come from x-pool-served-by
+    on success and survive an agent rebuild (lineage-root store)."""
+    from agent.chat_completion_helpers import _record_successful_api_call
+
+    home, _ = wired
+    a = _wired_agent()
+    resp = _types.SimpleNamespace(usage=None, pool_headers={"x-pool-served-by": "sub-vps-6"})
+    _record_successful_api_call(a, resp)
+    fss.default_store().evict_memory()
+    st = _state(_wired_agent())
+    assert st.last_primary_seat == "sub-vps-6" and st.last_primary_call_epoch
+
+
+def test_wiring_sticky_policy_false_purges_and_disables(wired):
+    """§7 rollback: fallback.sticky_policy=false purges the table and the
+    failover keeps today's behaviour (no sticky arm)."""
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    (home / "config.yaml").write_text("blackbox:\n  enabled: true\nfallback:\n  sticky_policy: false\n")
+    assert _fw.sticky_policy_enabled() is False
+    con = _sqlite3.connect(str(home / "blackbox" / "turns.db"))
+    assert con.execute("select count(*) from fallback_sticky").fetchone()[0] == 0
+    con.close()
+    b = _wired_agent()
+    assert _fw.decide_rebuild_for_agent(b) == "primary"
+    c = _wired_agent(sid="20260926_100000_bbbb")
+    assert _fail(c, CONN()) is True
+    assert _state(c) is None
+
+
+# ── AST guard (RC-5): one reader of _sticky / _rate_limited_until ─────────
+
+_READ_ALLOW = {
+    ("agent/chat_completion_helpers.py", "try_activate_fallback"),  # the writer (its own max())
+    ("agent/fallback_wiring.py", "restore_allowed"),                # the one restore predicate
+    ("agent/fallback_policy.py", "restore_allowed"),
+    ("agent/fallback_sticky_store.py", "get"),                     # the store accessor
+}
+_GUARDED_ATTRS = ("_rate_limited_until", "_sticky")
+
+
+def _sticky_reads(path: _pathlib.Path, rel: str):
+    tree = _ast.parse(path.read_text(encoding="utf-8"))
+    out = []
+
+    def visit(node, fn):
+        for child in _ast.iter_child_nodes(node):
+            name = child.name if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef)) else fn
+            hit = None
+            if (isinstance(child, _ast.Attribute) and child.attr in _GUARDED_ATTRS
+                    and isinstance(child.ctx, _ast.Load)):
+                hit = child
+            elif (isinstance(child, _ast.Call) and isinstance(child.func, _ast.Name)
+                  and child.func.id in ("getattr", "hasattr") and len(child.args) >= 2
+                  and isinstance(child.args[1], _ast.Constant)
+                  and child.args[1].value in _GUARDED_ATTRS):
+                hit = child
+            if hit is not None and (rel, name) not in _READ_ALLOW:
+                out.append(f"{rel}:{hit.lineno} in {name}")
+            visit(child, name)
+
+    visit(tree, None)
+    return out
+
+
+def _guard_scope():
+    for sub in ("agent", "gateway"):
+        for p in sorted((REPO / sub).rglob("*.py")):
+            yield p, p.relative_to(REPO).as_posix()
+    yield REPO / "run_agent.py", "run_agent.py"
+
+
+def test_ast_guard_single_reader_of_cooldown_state():
+    bad = [v for p, rel in _guard_scope() for v in _sticky_reads(p, rel)]
+    assert bad == [], "direct read of _rate_limited_until/_sticky outside the accessor: " + ", ".join(bad)
+
+
+def test_ast_guard_single_reader_self_test_flags_planted_read(tmp_path):
+    planted = tmp_path / "planted.py"
+    planted.write_text("def peek(agent):\n    return getattr(agent, '_rate_limited_until', 0)\n"
+                       "def peek2(agent):\n    return agent._sticky\n")
+    assert len(_sticky_reads(planted, "agent/planted.py")) == 2
+
+
+
+def test_replay_script_old_flaps_new_bounded(tmp_path):
+    """§5 replay: a flapping quota_model session (4 return/re-failover pairs
+    inside the cooldown) is > 2 legs under the old policy and <= 2 under the
+    new one; exit 0 against the target."""
+    import importlib.util as _ilu
+
+    spec = _ilu.spec_from_file_location("replay_fp", REPO / "scripts" / "replay-fallback-policy.py")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    t0 = _time.time() - 3600
+    rows = [{"ts": t0, "session_id": "s", "kind": "failover", "trigger_class": "quota_model"}]
+    for i in range(4):
+        rows.append({"ts": t0 + 60 * (2 * i + 1), "session_id": "s", "kind": "recovery", "trigger_class": None})
+        rows.append({"ts": t0 + 60 * (2 * i + 2), "session_id": "s", "kind": "failover", "trigger_class": "quota_model"})
+    res = mod.replay(rows)
+    assert res["quota_model_events"] == 1
+    assert res["max_legs_per_quota_event_old"] == 9
+    assert res["max_legs_per_quota_event"] <= 2
+    db = tmp_path / "turns.db"
+    con = _sqlite3.connect(str(db))
+    con.execute("create table fallback_events (id integer primary key, ts real, session_id text,"
+                " kind text, trigger_class text, from_provider text, from_model text,"
+                " to_provider text, to_model text)")
+    con.executemany("insert into fallback_events (ts, session_id, kind, trigger_class)"
+                    " values (:ts, :session_id, :kind, :trigger_class)", rows)
+    con.commit()
+    con.close()
+    assert mod.main(["--ledger", "48h", "--db", str(db)]) == 0
+    assert mod.main(["--ledger", "48h", "--db", str(db), "--target", "0"]) == 1

@@ -7023,12 +7023,20 @@ class TurnRunner:
             except Exception:
                 logger.warning("turn reasoning-change announce failed", exc_info=True)
         if not reused_cached_agent:
+            # Fallback spec §4.2: ONE construction-time decision for a fresh
+            # agent (primary / resume / return / store_unreadable), before the
+            # re-init announce, which then sees the resumed route (silent) or
+            # announces the return with the stashed recovery row (G2).
+            from agent import fallback_wiring as _fw
+
+            _fw.decide_rebuild_for_agent(agent)
             self._runner._announce_reinit_recovery(
                 agent=agent,
                 session_key=ctx.session_key,
                 applied_provider=getattr(agent, "provider", None),
                 applied_model=getattr(agent, "model", None),
             )
+            _fw.flush_unconsumed_recovery_row(agent)
         agent.service_tier = self._runner._service_tier
         # Merge, never overwrite: init-time request overrides (e.g. a custom
         # provider's extra_body merged at agent construction) must survive
@@ -12296,12 +12304,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if agent is None:
             return
         new_chain = list(chain or [])
-        rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
-        if (
-            getattr(agent, "_fallback_activated", False)
-            and rate_limited_until > time.monotonic()
-        ):
-            return
+        if getattr(agent, "_fallback_activated", False):
+            # One restore predicate (fallback spec §4.2): legacy cooldown AND
+            # the sticky gate, cheap form (no /eligibility I/O).
+            from agent.fallback_wiring import restore_allowed
+
+            if not restore_allowed(agent, probe=False).allowed:
+                return
         old_chain = list(getattr(agent, "_fallback_chain", []) or [])
         agent._fallback_chain = new_chain
         agent._fallback_model = new_chain[0] if new_chain else None
@@ -14191,11 +14200,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 from agent import fallback_events as _fbe
 
-                _fbe.record(
+                # A §4.2 construction-time return stashed its policy fields
+                # (return_branch, seat, dwell); fold them into THE one row.
+                _sticky_row = getattr(agent, "_sticky_recovery_row", None)
+                agent._sticky_recovery_row = None
+                _recovery_row = _fbe.build_row(
                     agent, "recovery",
                     from_provider=prev_route[0], from_model=prev_route[1],
                     to_provider=applied_provider, to_model=applied_model,
                     consume=False,
+                    extra=_sticky_row if isinstance(_sticky_row, dict) else None,
                 )
                 announce = False
                 try:
@@ -14205,16 +14219,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     announce = bool(mcfg.get("announce_recovery", False))
                 except Exception:
                     pass  # config read failure → default-off (silent)
-                _emit_fallback_announce(
-                    agent, prev_route[1], applied_model, applied_provider,
-                    old_provider=prev_route[0],
-                    old_effort=old_effort,
-                    new_effort=new_effort,
-                    announce_enabled=announce,
-                    record_event=False,
-                    kind="recovery",
-                    recovery_via="re-init",
-                )
+                try:
+                    _emit_fallback_announce(
+                        agent, prev_route[1], applied_model, applied_provider,
+                        old_provider=prev_route[0],
+                        old_effort=old_effort,
+                        new_effort=new_effort,
+                        announce_enabled=announce,
+                        record_event=False,
+                        kind="recovery",
+                        recovery_via="re-init",
+                        ledger_row=_recovery_row,
+                    )
+                finally:
+                    _fbe.write_row(_recovery_row)
                 # Per-turn marker (test observability + parity with the inline
                 # restore site's marker).
                 try:
