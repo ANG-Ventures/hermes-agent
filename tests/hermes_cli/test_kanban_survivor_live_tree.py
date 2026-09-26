@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.hermes_cli._survivor_gh_fake import rest_pr
+
 from hermes_cli import kanban_db as kb
 
 
@@ -151,7 +153,7 @@ def test_landed_missing_repo_explicit_rescue_requires_bound_ref_for_cleanup(
             payload = {"state": "OPEN", "headRefOid": "a1" * 20,
                        "mergeCommit": None, "headRefName": f"operator/{tid}-landed",
                        "title": "", "body": ""}
-            return subprocess.CompletedProcess(args, 0, json.dumps(payload).encode(), b"")
+            return subprocess.CompletedProcess(args, 0, json.dumps(rest_pr(payload)).encode(), b"")
         return real_run(args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", remote_pr)

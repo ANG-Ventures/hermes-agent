@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.hermes_cli._survivor_gh_fake import rest_pr
+
 from hermes_cli import kanban_db as kb
 
 HEAD = "a1" * 20
@@ -58,7 +60,7 @@ def unrelated(monkeypatch):
     def run(args, **kwargs):
         if args[0] == "gh":
             calls.append(list(args))
-            return subprocess.CompletedProcess(args, 0, json.dumps(view).encode(), b"")
+            return subprocess.CompletedProcess(args, 0, json.dumps(rest_pr(view)).encode(), b"")
         if "ls-remote" in args and "-C" not in args:
             calls.append(list(args))
             return subprocess.CompletedProcess(args, 0, f"{HEAD}\t{ref}\n".encode(), b"")
@@ -286,7 +288,7 @@ def flaky(monkeypatch):
             if args[0] == "gh":
                 view = {"state": "MERGED", "headRefOid": HEAD, "mergeCommit": {"oid": MERGE},
                         "headRefName": state["branch"], "title": "work", "body": "work"}
-                return subprocess.CompletedProcess(args, 0, json.dumps(view).encode(), b"")
+                return subprocess.CompletedProcess(args, 0, json.dumps(rest_pr(view)).encode(), b"")
             return subprocess.CompletedProcess(
                 args, 0, f"{HEAD}\trefs/heads/{state['branch']}\n".encode(), b"")
         return real(args, **kwargs)
