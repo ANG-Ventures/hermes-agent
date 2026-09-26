@@ -1,0 +1,2841 @@
+[
+ {
+  "name": "undo-redo",
+  "verdict": "DROP",
+  "keys": [
+   "#49",
+   "#353",
+   "#339",
+   "#65",
+   "nopr:14b186d6fa",
+   "nopr:17910311e6"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent",
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/revert-49-undo"
+  ],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 14 'slash commands /undo and /redo (half-turn rewind with redo branch)' lifecycle=fork-permanent",
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "moa-messaging-toolsets",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:f504b1c928",
+   "nopr:091b3f915d",
+   "nopr:7e505547a7"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/revert-f504b1c928"
+  ],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 4 'messaging + moa toolsets present' lifecycle=fork-permanent"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "lcm-armab-campaign",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:0c96621b85",
+   "nopr:15e1d95f14",
+   "nopr:1f8392335e",
+   "nopr:9f0c416088",
+   "nopr:a3fa06a6e4",
+   "nopr:df420d15df",
+   "nopr:fb3008a7ba"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-lcm-campaign-harness"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "lcm-k2-campaign",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:834f0a0111",
+   "nopr:fdee6d93f2"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-lcm-campaign-harness"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "gemini-bridge-pricing",
+  "verdict": "DROP",
+  "keys": [
+   "#207",
+   "#208",
+   "#312"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "delegation-outbox-ack",
+  "verdict": "DROP",
+  "keys": [
+   "#683",
+   "#687"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "session-search-title-lane",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#257",
+   "#303"
+  ],
+  "followers": [
+   "#607"
+  ],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [
+   "audit/agent/revert-pr257"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "boomerang",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#203",
+   "#204"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-203"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "desktop-retired",
+  "verdict": "DROP",
+  "keys": [
+   "#488",
+   "#461",
+   "#450",
+   "#424",
+   "#423",
+   "#421",
+   "#398",
+   "#368",
+   "#367",
+   "#366",
+   "#363",
+   "#362",
+   "#361",
+   "#354",
+   "#340",
+   "#338",
+   "#332",
+   "#331",
+   "#330",
+   "#305",
+   "#296",
+   "#292",
+   "#287",
+   "#283",
+   "#279",
+   "#274",
+   "#187",
+   "#185",
+   "#181",
+   "#167",
+   "nopr:0159f3ec2d",
+   "nopr:427d020ef2",
+   "nopr:51147803c6",
+   "nopr:66989fbeca",
+   "nopr:923516adda",
+   "nopr:9fabd8a3da",
+   "nopr:dd58e242b9"
+  ],
+  "followers": [],
+  "tranches": [
+   "auto-desktop-retired"
+  ],
+  "branches": [
+   "audit/final-revert-desktop-retired"
+  ],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/agent/upstream-1052",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#1052"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [
+   "audit/agent/upstream-1052"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#1025",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#1025"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/agent/revert-pr959",
+  "verdict": "DROP",
+  "keys": [
+   "#959"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [
+   "audit/agent/revert-pr959"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#917",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#917"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/agent/upstream-878",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#878"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [
+   "audit/agent/upstream-878"
+  ],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 26 'model-provider plugin discovery never runs at import (lazy _PROVIDER_P' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#841",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#841"
+  ],
+  "followers": [
+   "#723"
+  ],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#730",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#730"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#671",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#671"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/agent/revert-pr621",
+  "verdict": "DROP",
+  "keys": [
+   "#622",
+   "#621"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [
+   "audit/agent/revert-pr621"
+  ],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 25 'Claude Code CLI subscription usage caps classify as a quota, not a tra' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#602",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#602"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/agent/revert-pr600",
+  "verdict": "DROP",
+  "keys": [
+   "#600"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [
+   "audit/agent/revert-pr600"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#495",
+  "verdict": "DROP",
+  "keys": [
+   "#495"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#324",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#324"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#300",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#300"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/agent/revert-pr236",
+  "verdict": "DROP",
+  "keys": [
+   "#236"
+  ],
+  "followers": [
+   "nopr:a377afe934"
+  ],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [
+   "audit/agent/revert-pr236"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#226",
+  "verdict": "DROP",
+  "keys": [
+   "#226"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#222",
+  "verdict": "DROP",
+  "keys": [
+   "#222"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#109",
+  "verdict": "DROP",
+  "keys": [
+   "#109"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#37",
+  "verdict": "DROP",
+  "keys": [
+   "#37"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#27",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#27"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#352",
+  "verdict": "DROP",
+  "keys": [
+   "#352"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-livesync",
+  "verdict": "DROP",
+  "keys": [
+   "#268",
+   "#272"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-livesync"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#189",
+  "verdict": "DROP",
+  "keys": [
+   "#189"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/agent/revert-pr186",
+  "verdict": "DROP",
+  "keys": [
+   "#186"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [
+   "audit/agent/revert-pr186"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-1027",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#1027"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-1027"
+  ],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 6 'cron scheduler per-job reasoning and script timeout helpers' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-920",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#1017",
+   "#933",
+   "#920"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-920"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-830",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#830"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-830"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-767",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#767"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-767"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-740",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#740"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-740"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-632",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#632"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-632"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-319",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#594",
+   "#319"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-319"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#591",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#591"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#532",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#532"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-521",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#521"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-521"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-477",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#477"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-477"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#473",
+  "verdict": "DROP",
+  "keys": [
+   "#473"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-278",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#278"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-278"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-199",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#199"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-199"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-ssh-116493ff97",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "nopr:10a1424335",
+   "nopr:116493ff97",
+   "nopr:c559189dd2"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-ssh-116493ff97"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#847",
+  "verdict": "DROP",
+  "keys": [
+   "#847"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#805",
+  "verdict": "DROP",
+  "keys": [
+   "#805"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#1031",
+  "verdict": "DROP",
+  "keys": [
+   "#1031"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#1007",
+  "verdict": "DROP",
+  "keys": [
+   "#1007"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#984",
+  "verdict": "DROP",
+  "keys": [
+   "#984"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/gateway/upstream-976",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#976"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-976"
+  ],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-936",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#936"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-936"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-935",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#935"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-935"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#934",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#934"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#906",
+  "verdict": "DROP",
+  "keys": [
+   "#906"
+  ],
+  "followers": [
+   "#481"
+  ],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/gateway/upstream-871",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#871"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-871"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-869",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#869"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-869"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-861",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#861"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-861"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-840",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#840"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-840"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-834",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#834"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-834"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#814",
+  "verdict": "DROP",
+  "keys": [
+   "#814"
+  ],
+  "followers": [
+   "#567"
+  ],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/gateway/upstream-782",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#782"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-782"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#772",
+  "verdict": "DROP",
+  "keys": [
+   "#772"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#694",
+  "verdict": "DROP",
+  "keys": [
+   "#694"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#589",
+  "verdict": "DROP",
+  "keys": [
+   "#589"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#582",
+  "verdict": "DROP",
+  "keys": [
+   "#582"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#581",
+  "verdict": "DROP",
+  "keys": [
+   "#581"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#562",
+  "verdict": "DROP",
+  "keys": [
+   "#562"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#527",
+  "verdict": "DROP",
+  "keys": [
+   "#527"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#493",
+  "verdict": "DROP",
+  "keys": [
+   "#493"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#453",
+  "verdict": "DROP",
+  "keys": [
+   "#453"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#427",
+  "verdict": "DROP",
+  "keys": [
+   "#427"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#401",
+  "verdict": "DROP",
+  "keys": [
+   "#401"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#396",
+  "verdict": "DROP",
+  "keys": [
+   "#396"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#304",
+  "verdict": "DROP",
+  "keys": [
+   "#304"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#301",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#301"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#231",
+  "verdict": "DROP",
+  "keys": [
+   "#231"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#184",
+  "verdict": "DROP",
+  "keys": [
+   "#184"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#170",
+  "verdict": "DROP",
+  "keys": [
+   "#170"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#160",
+  "verdict": "DROP",
+  "keys": [
+   "#160"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 19 'telegram intake sentinel makes silent inbound update drops visible' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#104",
+  "verdict": "DROP",
+  "keys": [
+   "#104"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#96",
+  "verdict": "DROP",
+  "keys": [
+   "#96"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#53",
+  "verdict": "DROP",
+  "keys": [
+   "#53"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#19",
+  "verdict": "DROP",
+  "keys": [
+   "#19"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "nopr:59429f36db",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:59429f36db"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "nopr:6e862490c8",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:6e862490c8"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "nopr:ec4b3176ff",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:ec4b3176ff"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#851",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#851"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-836",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#836"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-836"
+  ],
+  "conflict_syncs": 2,
+  "registry": [
+   "entry 19 'telegram intake sentinel makes silent inbound update drops visible' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-759",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#759"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-759"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#716",
+  "verdict": "DROP",
+  "keys": [
+   "#716"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#69",
+  "verdict": "DROP",
+  "keys": [
+   "#69"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "nopr:4ed79b6dad",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:4ed79b6dad"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#980",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#980"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#890",
+  "verdict": "DROP",
+  "keys": [
+   "#890"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/hermes_cli/revert-760",
+  "verdict": "DROP",
+  "keys": [
+   "#760"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [
+   "audit/hermes_cli/revert-760"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/hermes_cli/revert-712",
+  "verdict": "DROP",
+  "keys": [
+   "#712"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [
+   "audit/hermes_cli/revert-712"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/hermes_cli/revert-619",
+  "verdict": "DROP",
+  "keys": [
+   "#619"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [
+   "audit/hermes_cli/revert-619"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/hermes_cli/upstream-617",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#617"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [
+   "audit/hermes_cli/upstream-617"
+  ],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#492",
+  "verdict": "DROP",
+  "keys": [
+   "#492"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/hermes_cli/upstream-466",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#466"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [
+   "audit/hermes_cli/upstream-466"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#276",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#276"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "nopr:07d219143b",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:07d219143b"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/hermes_cli/revert-36134d8944",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:36134d8944"
+  ],
+  "followers": [],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [
+   "audit/hermes_cli/revert-36134d8944"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "nopr:8f7823887e",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:8f7823887e"
+  ],
+  "followers": [
+   "#4"
+  ],
+  "tranches": [
+   "hermes_cli"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [
+   "entry 26 'model-provider plugin discovery never runs at import (lazy _PROVIDER_P' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/scripts_misc/upstream-728",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#728"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/upstream-728"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-mem0-bgr",
+  "verdict": "DROP",
+  "keys": [
+   "#116",
+   "#118"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-mem0-bgr"
+  ],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 4 'messaging + moa toolsets present' lifecycle=fork-permanent"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-greptile",
+  "verdict": "DROP",
+  "keys": [
+   "#151"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-greptile"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#1054",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#1054"
+  ],
+  "followers": [
+   "nopr:f4056a607a"
+  ],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/agent/revert-pr806",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#806"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [
+   "audit/agent/revert-pr806"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#418",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#418"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#220",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#220"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#217",
+  "verdict": "DROP",
+  "keys": [
+   "#217"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "#216",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#216"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#213",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#213"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [
+   "entry 23 'model/provider transitions announce once on the originating chat surfa' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-ci-overflow-phase0",
+  "verdict": "DROP",
+  "keys": [
+   "#932"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-ci-overflow-phase0"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#443",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#443"
+  ],
+  "followers": [],
+  "tranches": [
+   "agent"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-staging",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:2f33571c20",
+   "nopr:a0a5e8a083"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-staging"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#698",
+  "verdict": "DROP",
+  "keys": [
+   "#698"
+  ],
+  "followers": [
+   "#108",
+   "#145",
+   "#409",
+   "#440",
+   "#789"
+  ],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/gateway/upstream-571",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#571"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-571"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/revert-229",
+  "verdict": "DROP",
+  "keys": [
+   "#229"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/revert-229"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-web-source",
+  "verdict": "DROP",
+  "keys": [
+   "#188"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-web-source"
+  ],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/plugins/upstream-902",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#902"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [
+   "audit/plugins/upstream-902"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#509",
+  "verdict": "DROP",
+  "keys": [
+   "#509"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/plugins/upstream-412",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#412"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [
+   "audit/plugins/upstream-412"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "nopr:051c2076e1",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:051c2076e1"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/plugins/upstream-dc4245ab4c",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "nopr:dc4245ab4c"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [
+   "audit/plugins/upstream-dc4245ab4c"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/plugins/upstream-580",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#580"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [
+   "audit/plugins/upstream-580"
+  ],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#407",
+  "verdict": "DROP",
+  "keys": [
+   "#407"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#320",
+  "verdict": "DROP",
+  "keys": [
+   "#320"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#251",
+  "verdict": "DROP",
+  "keys": [
+   "#251"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "nopr:531f1e8c64",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "nopr:531f1e8c64"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/plugins/upstream-59ed0e41a1",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "nopr:59ed0e41a1"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [
+   "audit/plugins/upstream-59ed0e41a1"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "nopr:5ae50ce919",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "nopr:5ae50ce919"
+  ],
+  "followers": [],
+  "tranches": [
+   "plugins"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#777",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#777"
+  ],
+  "followers": [
+   "#775"
+  ],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#763",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#763"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-635",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#635"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-635"
+  ],
+  "conflict_syncs": 0,
+  "registry": [
+   "entry 19 'telegram intake sentinel makes silent inbound update drops visible' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/upstream-584",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#584"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/upstream-584"
+  ],
+  "conflict_syncs": 0,
+  "registry": [
+   "entry 19 'telegram intake sentinel makes silent inbound update drops visible' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/gateway/revert-129",
+  "verdict": "DROP",
+  "keys": [
+   "#129"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [
+   "audit/gateway/revert-129"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "nopr:ba371ef32f",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:ba371ef32f"
+  ],
+  "followers": [],
+  "tranches": [
+   "gateway"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-desktop-update-test",
+  "verdict": "DROP",
+  "keys": [
+   "#928"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-desktop-update-test"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-ci-review-comment",
+  "verdict": "DROP",
+  "keys": [
+   "#748",
+   "#736"
+  ],
+  "followers": [
+   "#756"
+  ],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-ci-review-comment"
+  ],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-perclass-backfill",
+  "verdict": "DROP",
+  "keys": [
+   "#105",
+   "#87"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-perclass-backfill"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-author-map-stale",
+  "verdict": "DROP",
+  "keys": [
+   "#22",
+   "nopr:40a6040932"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-author-map-stale"
+  ],
+  "conflict_syncs": 2,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-lcm-campaign-harness",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:7ee021200e",
+   "nopr:a0367856d4",
+   "nopr:c2cf19f6fd"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-lcm-campaign-harness"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/scripts_misc/revert-oneshot-probes",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:ae486b7f0a"
+  ],
+  "followers": [],
+  "tranches": [
+   "scripts+misc"
+  ],
+  "branches": [
+   "audit/scripts_misc/revert-oneshot-probes"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#1024",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#1024"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#927",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#927"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#689",
+  "verdict": "DROP",
+  "keys": [
+   "#689"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-662",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#662"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-662"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-641",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#641"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-641"
+  ],
+  "conflict_syncs": 2,
+  "registry": [
+   "entry 20 'cron refuses provably cross-vendor model/provider pairs at create/upda' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-618",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#618"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-618"
+  ],
+  "conflict_syncs": 2,
+  "registry": [
+   "entry 20 'cron refuses provably cross-vendor model/provider pairs at create/upda' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-615",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#615"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-615"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-575",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#577",
+   "#575"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-575"
+  ],
+  "conflict_syncs": 3,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-553",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#553"
+  ],
+  "followers": [
+   "#561"
+  ],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-553"
+  ],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#543",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#543"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-399",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#399"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-399"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#389",
+  "verdict": "DROP",
+  "keys": [
+   "#389"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 2,
+  "registry": [
+   "entry 20 'cron refuses provably cross-vendor model/provider pairs at create/upda' lifecycle=upstream-intended"
+  ],
+  "assignee": "daedalus-opus"
+ },
+ {
+  "name": "audit/cron_tools/revert-387",
+  "verdict": "DROP",
+  "keys": [
+   "#387"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/revert-387"
+  ],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-314",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#314"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-314"
+  ],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/revert-211",
+  "verdict": "DROP",
+  "keys": [
+   "#211"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/revert-211"
+  ],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "#209",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#209"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "audit/cron_tools/upstream-71",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "#71"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [
+   "audit/cron_tools/upstream-71"
+  ],
+  "conflict_syncs": 1,
+  "registry": [
+   "entry 4 'messaging + moa toolsets present' lifecycle=fork-permanent"
+  ],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "nopr:4d626ac813",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "nopr:4d626ac813"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "nopr:9a1db22e58",
+  "verdict": "UPSTREAM",
+  "keys": [
+   "nopr:9a1db22e58"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 0,
+  "registry": [],
+  "assignee": "daedalus"
+ },
+ {
+  "name": "nopr:f578c82019",
+  "verdict": "DROP",
+  "keys": [
+   "nopr:f578c82019"
+  ],
+  "followers": [],
+  "tranches": [
+   "cron+tools"
+  ],
+  "branches": [],
+  "conflict_syncs": 1,
+  "registry": [
+   "entry 4 'messaging + moa toolsets present' lifecycle=fork-permanent"
+  ],
+  "assignee": "daedalus"
+ }
+]
