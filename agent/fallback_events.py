@@ -159,6 +159,65 @@ def classify_trigger(*, text: Optional[str] = None,
                          reason=reason), "text"
 
 
+RELAY_PROVIDERS = frozenset(("claude-apr", "claude-bpr"))
+
+
+def relay_error_class(error: Any) -> Tuple[Optional[str], Optional[str]]:
+    """``(class, source)`` the relay stated on ``error``, else ``(None, None)``.
+
+    Reads the ``x-relay-error-class`` response header first (pre-stream, and
+    also present on a buffered stream error), then ``relay_error_class`` in the
+    error body: top level (Anthropic SDK: the whole SSE event) or inside
+    ``error`` (OpenAI SDK raises with ``body=data["error"]``, the inner object).
+    Unknown values come back verbatim; callers map them. Never raises.
+    """
+    try:
+        response = getattr(error, "response", None)
+        h = _lower_headers(getattr(response, "headers", None))
+        rc = (h.get("x-relay-error-class") or "").strip().lower()
+        if rc:
+            return rc, "relay_header"
+        body = getattr(error, "body", None)
+        if isinstance(body, dict):
+            s = body.get("relay_error_class")
+            if s is None and isinstance(body.get("error"), dict):
+                s = body["error"].get("relay_error_class")
+            if isinstance(s, str) and s.strip():
+                return s.strip().lower(), "relay_stream"
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+def pending_trigger_class(agent: Any) -> Optional[str]:
+    """Peek (do NOT consume) the §4.1 class of the stashed failing call, so
+    the failover arm/gate can branch on class before the ledger row consumes
+    the slot. None when nothing fresh is stashed. Never raises."""
+    try:
+        pending = getattr(agent, "_pending_fallback_error", None)
+        if not isinstance(pending, dict):
+            return None
+        if time.monotonic() - float(pending.get("at") or 0) > _PENDING_MAX_AGE_S:
+            return None
+        cls, _src = classify_trigger(
+            text=pending.get("text"), http_status=pending.get("status"),
+            headers=pending.get("headers"), body=pending.get("body"),
+            exc_name=pending.get("exc"))
+        return cls
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def quota_seat_on_relay(agent: Any) -> bool:
+    """True when the failing call is a seat-level quota (``quota_seat``) on a
+    pool relay provider. Such a limit is the relay's to rotate around: the
+    harness neither benches the model (``_rate_limited_until``) nor runs
+    ``apply_quota_gate`` for it (spec §4.1 / Phase 1b). Direct pins
+    (claude-bpx-N / claude-apx-N) are excluded: there the seat IS the provider."""
+    provider = (getattr(agent, "provider", "") or "").strip().lower()
+    return provider in RELAY_PROVIDERS and pending_trigger_class(agent) == "quota_seat"
+
+
 def _scrub(text: str) -> str:
     try:
         from agent.redact import redact_sensitive_text
