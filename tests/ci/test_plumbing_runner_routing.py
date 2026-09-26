@@ -35,17 +35,31 @@ def test_every_workflow_parses():
         assert isinstance(workflow.get("jobs"), dict), path.name
 
 
+def test_ci_review_label_requests_full_rerun():
+    job = yaml.safe_load((WORKFLOWS / "label-rerun.yml").read_text())["jobs"]["rerun-review-labels"]
+    command = job["steps"][0]["run"]
+    # Failed-only rerun of this dynamic matrix has produced startup_failure / zero jobs.
+    assert command.startswith("set -euo pipefail\n")
+    assert 'gh run rerun "$RUN_ID" --repo "$REPO"\n' in command
+    assert "--failed" not in command
+    assert 'gh run rerun "$RUN_ID" --repo "$REPO" || true' not in command
+
+
 def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
     # Pin the declaration: injecting labels into a test would bypass this binding.
     job = yaml.safe_load((WORKFLOWS / "tests.yml").read_text())["jobs"]["e2e"]
-    # Non-merge_group events and merge_group with managed placement disabled
-    # keep the legacy binding; managed merge_group uses overflow labels.
-    assert job["runs-on"].startswith(
-        "${{ (github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && ("
+    # Every case except a validated, attempt-bound managed plan (non-merge_group,
+    # switch OFF, or NO plan — t_42bed567) ends in the legacy binding; never a
+    # fixed local pool.
+    assert job["runs-on"].startswith("${{ fromJSON(github.event_name == 'merge_group' && "
+                                     "vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && ")
+    assert job["runs-on"].endswith(
+        "&& needs.placement.outputs.e2e_runs_on || ("
         "contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
-        "&& fromJSON(format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"'))) "
-        "|| fromJSON('[\"ubuntu-latest\"]')) || "
+        "&& format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"')) "
+        "|| '[\"ubuntu-latest\"]')) }}"
     )
+    assert "hermes-ci" not in job["runs-on"]
 
 
 def test_e2e_invocation_emits_stacks_before_job_cancellation():

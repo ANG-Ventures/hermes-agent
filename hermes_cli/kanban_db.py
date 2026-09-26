@@ -78,6 +78,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import hashlib
 import inspect
@@ -230,6 +231,27 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+def _is_delegated_child() -> bool:
+    """Whether this code runs inside a ``delegate_task`` child context."""
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
+# Set only by :func:`add_comment` for the duration of its own write. The single
+# append-only write a delegated child may perform (t_70fcc2c3): comments carry
+# no status/ownership/claim state, and add_comment stamps the author with
+# :data:`SUBAGENT_AUTHOR_MARKER` so the thread shows who actually wrote it.
+_DELEGATED_CHILD_COMMENT_GRANT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "kanban_delegated_child_comment_grant", default=False
+)
+
+SUBAGENT_AUTHOR_MARKER = " (subagent)"
+
+
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
 
@@ -237,20 +259,48 @@ def _assert_not_delegated_child_mutation() -> None:
     guards for better UX, but neither is a trust boundary: a delegated child can
     still shell out to the CLI or import this module directly. The actual
     invariant belongs at the DB/filesystem mutation layer so every public
-    mutator that uses ``write_txn`` (tasks, runs, comments, attachments,
-    dispatcher claims, repair events, subscriptions, GC, etc.) and every board
-    metadata mutator fails closed before touching durable state.
-    """
-    try:
-        from agent.delegation_context import is_delegated_child_process_context
+    mutator that uses ``write_txn`` (tasks, runs, attachments, dispatcher
+    claims, repair events, subscriptions, GC, etc.) and every board metadata
+    mutator fails closed before touching durable state.
 
-        delegated = is_delegated_child_process_context()
-    except Exception:
-        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
-    if delegated:
+    Reads are allowed: a child's :func:`connect` opens the existing DB with
+    ``PRAGMA query_only=ON`` and skips schema/migration writes. The only write
+    exception is :func:`add_comment` (append-only, author marked as subagent).
+    """
+    if _is_delegated_child() and not _DELEGATED_CHILD_COMMENT_GRANT.get():
         raise PermissionError(
             "delegate_task child contexts cannot mutate Kanban tasks or boards"
         )
+
+
+def _connect_delegated_child(path: Path) -> sqlite3.Connection:
+    """Open an EXISTING board DB for a ``delegate_task`` child, read-only.
+
+    No mkdir, no permission repair, no schema script, no migrations — those are
+    all writes. The connection runs with ``PRAGMA query_only=ON`` so even a
+    direct ``conn.execute("UPDATE ...")`` that bypasses :func:`write_txn` is
+    refused by SQLite itself. :func:`add_comment` lifts it for its own insert.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        raise PermissionError(
+            "delegate_task child contexts cannot initialize a Kanban board "
+            f"(no board DB at {path})"
+        )
+    conn = _sqlite_connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA cell_size_check=ON")
+        conn.execute("PRAGMA query_only=ON")
+        if not _schema_is_present(conn):
+            raise PermissionError(
+                "delegate_task child contexts cannot initialize a Kanban board "
+                f"(no schema in {path})"
+            )
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -1873,6 +1923,10 @@ def create_board(
     return meta
 
 
+# Phantom board dirs already warned about in this process (see list_boards).
+_PHANTOM_BOARD_WARNED: set[str] = set()
+
+
 def _board_db_is_empty(db_path: Path) -> bool:
     """Return True if ``db_path`` is a kanban DB holding zero tasks.
 
@@ -1957,13 +2011,18 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 # is genuinely empty; a dir with real cards is someone's data and
                 # must stay visible even if board.json was lost.
                 if has_db and not has_meta and _board_db_is_empty(child / "kanban.db"):
-                    _log.warning(
-                        "kanban: ignoring phantom board dir %s (kanban.db with 0 "
-                        "tasks and no board.json). If this slug was renamed, add "
-                        "it to %s; otherwise remove the directory.",
-                        child,
-                        board_aliases_path(),
-                    )
+                    # Warn once per process per dir: list_boards() runs on every
+                    # watcher/dispatcher tick (~5 s), and an unchanged phantom
+                    # repeating forever buried real errors in the gateway log.
+                    if str(child) not in _PHANTOM_BOARD_WARNED:
+                        _PHANTOM_BOARD_WARNED.add(str(child))
+                        _log.warning(
+                            "kanban: ignoring phantom board dir %s (kanban.db with 0 "
+                            "tasks and no board.json). If this slug was renamed, add "
+                            "it to %s; otherwise remove the directory.",
+                            child,
+                            board_aliases_path(),
+                        )
                     continue
                 meta = read_board_metadata(normed)
                 if meta.get("archived") and not include_archived:
@@ -3959,6 +4018,8 @@ def connect(
     # directly is the same leak through a different door. ``init_db`` routes
     # through here, so it is covered as well.
     _assert_live_board_write_allowed(path)
+    if _is_delegated_child():
+        return _connect_delegated_child(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -4133,6 +4194,12 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    if _is_delegated_child():
+        # A child may not create or migrate a board; it may only confirm the
+        # board exists and is readable (connect raises otherwise).
+        with contextlib.closing(connect(path)):
+            pass
+        return path
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
@@ -7051,6 +7118,33 @@ def add_comment(
         raise ValueError("comment author is required")
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     now = int(time.time())
+    if _is_delegated_child():
+        # The one write a delegate_task child may make (t_70fcc2c3). Append-only
+        # and attributed: the marker is added here, not by the caller, so an
+        # explicit ``--author`` cannot pass a child's words off as the parent's.
+        if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
+            author = author.strip() + SUBAGENT_AUTHOR_MARKER
+        grant = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
+        conn.execute("PRAGMA query_only=OFF")
+        try:
+            return _add_comment_txn(
+                conn, task_id, author, body, run_id, session_ref, now
+            )
+        finally:
+            conn.execute("PRAGMA query_only=ON")
+            _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
+    return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now)
+
+
+def _add_comment_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    run_id: Optional[int],
+    session_ref: Optional[str],
+    now: int,
+) -> int:
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
@@ -8365,8 +8459,14 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    session_ref: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
+
+    ``session_ref`` binds the review run to the operator session that made the
+    claim (``hermes kanban claim <id> --review``). It must be derived from
+    trusted runtime context by the caller, never from model-supplied args; see
+    :func:`review_claim_run_for_session` for the only reader.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``review`` status).
@@ -8454,10 +8554,48 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review",
+             **({"session_ref": session_ref} if session_ref else {})},
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def review_claim_run_for_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    session_ref: Optional[str],
+) -> Optional[int]:
+    """Return the active review run id iff ``session_ref`` made its claim.
+
+    The human review lane claims from one CLI process and comments / returns
+    work from later ones, so the dispatcher env never attests to that run. The
+    claim is the provenance instead: only the session recorded on the current
+    run's ``claimed`` event (``source_status=review``) gets the run id back.
+    ``None`` for any other session, a sessionless claim, or a card that is not
+    in an active review run.
+    """
+    if not session_ref:
+        return None
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running" or row["current_run_id"] is None:
+        return None
+    run_id = int(row["current_run_id"])
+    event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        payload = json.loads(event["payload"]) if event and event["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("source_status") != "review":
+        return None
+    return run_id if payload.get("session_ref") == session_ref else None
 
 
 def _retry_status_for_run(
@@ -9679,11 +9817,26 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
         home = kanban_home()
     except OSError:
         home = None
+    # ``kanban.workspaces_root`` (e.g. a RAM-disk mount) places scratch dirs
+    # at ``<root>/<board>/<task>``. Those per-board roots are managed exactly
+    # like the legacy ones; the configured root itself and ``<root>/<board>``
+    # stay refused by strict descendancy. Without them every scratch dir under
+    # a configured root was refused forever and never reclaimed (t_bbea6686).
+    try:
+        from hermes_cli.kanban_workspace_policy import configured_root
+        configured, _require_mount = configured_root()
+    except Exception:
+        configured = None
     if home is not None:
         try:
             roots.append(((home / "kanban" / "workspaces").resolve(strict=False), DEFAULT_BOARD))
         except OSError:
             pass
+        if configured is not None:
+            try:
+                roots.append(((configured / DEFAULT_BOARD).resolve(strict=False), DEFAULT_BOARD))
+            except OSError:
+                pass
         try:
             boards_parent = (home / "kanban" / "boards").resolve(strict=False)
         except OSError:
@@ -9703,6 +9856,11 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
                     roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
                 except OSError:
                     continue
+                if configured is not None and entry.name != DEFAULT_BOARD:
+                    try:
+                        roots.append(((configured / entry.name).resolve(strict=False), entry.name))
+                    except OSError:
+                        continue
     memo: dict = {}
     for root, board in roots:
         try:
@@ -14477,6 +14635,72 @@ def rate_limit_circuits(
     return open_until
 
 
+# A worker that refused its route because the provider's credential is rate
+# limited (``worker_route_pin_refused`` with ``rate_limited: true``, e.g.
+# "Codex credential is in cooldown") is proof the credential is dead for every
+# card, not just that one. Treat the provider as capped for this long after the
+# latest refusal, so the capped-pool fallback does not spawn more workers into
+# it (t_6445986b: a P0 card hit exit 75 three times in 25 min, each one
+# stamping a longer rate_limit backoff). ``kanban.credential_cooldown_seconds``.
+DEFAULT_CREDENTIAL_COOLDOWN_SECONDS = 1800  # 30 minutes
+
+
+def _resolve_credential_cooldown() -> int:
+    """``kanban.credential_cooldown_seconds`` (0 disables)."""
+    try:
+        from hermes_cli.config import load_config
+        value = int(load_config().get("kanban", {}).get(
+            "credential_cooldown_seconds", DEFAULT_CREDENTIAL_COOLDOWN_SECONDS))
+        return value if value >= 0 else DEFAULT_CREDENTIAL_COOLDOWN_SECONDS
+    except Exception:
+        return DEFAULT_CREDENTIAL_COOLDOWN_SECONDS
+
+
+def cooling_providers(
+    conn: sqlite3.Connection, *, now: int, window: int,
+) -> dict[str, int]:
+    """``{provider: cooling_until}`` for providers with a recent rate-limited refusal.
+
+    Keyed by provider name (lower case), not ``pool_key``: ``openai-codex`` is
+    not pool-bound, so the rate-limit circuit can never see it. The events are
+    run-scoped, so only runs still open or closed inside ``window`` are read
+    (``idx_events_run``), never the whole event table.
+    """
+    if window <= 0:
+        return {}
+    from hermes_cli.kanban_worker_route import WORKER_ROUTE_PIN_REFUSED_EVENT
+
+    run_ids = [int(r[0]) for r in conn.execute(
+        "SELECT id FROM task_runs WHERE ended_at IS NULL OR ended_at >= ?",
+        (now - window,),
+    )]
+    until: dict[str, int] = {}
+    for i in range(0, len(run_ids), 500):
+        chunk = run_ids[i:i + 500]
+        for ev in conn.execute(
+            "SELECT payload, created_at FROM task_events WHERE run_id IN ("
+            + ",".join("?" * len(chunk)) + ") AND kind = ? AND created_at >= ?",
+            (*chunk, WORKER_ROUTE_PIN_REFUSED_EVENT, now - window),
+        ):
+            try:
+                payload = json.loads(ev["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("rate_limited") is not True:
+                continue
+            provider = payload.get("provider")
+            if not isinstance(provider, str) or not provider.strip():
+                continue
+            key = provider.strip().lower()
+            until[key] = max(until.get(key, 0), int(ev["created_at"]) + window)
+    return until
+
+
+def _format_skipped_rungs(skipped) -> str:
+    """``openai-codex:credential_cooldown, claude-apr:pool_budget``."""
+    return ", ".join(f"{s.get('provider')}:{s.get('reason')}" for s in skipped or ())
+
+
 def _notify_rate_limit_circuit(
     board: Optional[str], pool: str, until: int, trip: int, *, now: Optional[int] = None,
 ) -> None:
@@ -19094,10 +19318,18 @@ def _dispatch_once_locked(
         # Fail OPEN: a broken circuit query must never halt spawning.
         _log.warning("kanban rate-limit circuit check failed (%s: %s)", type(exc).__name__, exc)
         circuits = {}
+    cooling: dict[str, int] = {}
+    try:
+        cooling = cooling_providers(
+            conn, now=_tick_now, window=_resolve_credential_cooldown())
+    except Exception as exc:
+        # Fail OPEN, same as the circuit query above.
+        _log.warning("kanban credential cooldown check failed (%s: %s)", type(exc).__name__, exc)
+        cooling = {}
 
     def provider_admission(task_id, assignee):
         if (not health_probes and not any(pool_urls.values()) and not box_health
-                and not circuits):
+                and not circuits and not cooling):
             return False, None
         task = get_task(conn, task_id)
         if task is None:
@@ -19114,6 +19346,11 @@ def _dispatch_once_locked(
             # provider_capped: hold unless a rung on another open pool exists.
             payload = {"reason": "rate_limit_circuit", "provider": route_provider,
                        "pool": circuit_pool, "until": circuits[circuit_pool]}
+        elif (route_provider or "").strip().lower() in cooling:
+            # The route's own credential is cooling: spawning would die at
+            # auth (exit 75) and stamp a rate_limit backoff. Same verdict.
+            payload = {"reason": "credential_cooldown", "provider": route_provider,
+                       "until": cooling[(route_provider or "").strip().lower()]}
         else:
             payload = capped_provider(
                 task, health_probes, health_cache, min_eligible=min_eligible,
@@ -19124,11 +19361,15 @@ def _dispatch_once_locked(
         if payload is None:
             admitted_routes[task_id] = circuit_pool
             return False, None
+        skipped: list = []
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
             pool_urls=pool_urls, skip_pools=frozenset(circuits), box_health=box_health,
             budget_available=lambda provider: pool_budget(provider) is None,
+            skip_providers=frozenset(cooling), skipped=skipped,
         )
+        if skipped:
+            payload = {**payload, "fallback_skipped": skipped}
         if fallback is not None and fallback_flagship_banned(task_id, fallback[0]):
             # The flagship gate covers the post-fallback route too: a capped
             # pool must not become a side door onto a banned model. Defer
@@ -19145,6 +19386,13 @@ def _dispatch_once_locked(
             admitted_routes[task_id] = pool_key(fallback[1])
             return False, (fallback, payload)
         result.respawn_guarded.append((task_id, payload["reason"]))
+        if skipped:
+            # Every rung is capped or cooling: HOLD (deferred, no spawn, no
+            # run, so no rate_limited close and no backoff stamp).
+            _log.info(
+                "PHASE=kanban_dispatch_fallback_held task=%s from=%s reason=%s skipped=%s",
+                task_id, route_provider, payload["reason"], _format_skipped_rungs(skipped),
+            )
         if not dry_run:
             with write_txn(conn):
                 _append_event(conn, task_id, "deferred", payload)
@@ -19165,11 +19413,20 @@ def _dispatch_once_locked(
             return
         (model, provider), capped = selection
         claimed.model_override, claimed.provider_override = model, provider
+        event = {"from_provider": capped["provider"], "to_provider": provider,
+                 "to_model": model}
+        if capped.get("fallback_skipped"):
+            event["skipped"] = capped["fallback_skipped"]
         with write_txn(conn):
-            _append_event(conn, claimed.id, "dispatch_provider_fallback", {
-                "from_provider": capped["provider"], "to_provider": provider,
-                "to_model": model,
-            }, run_id=claimed.current_run_id)
+            _append_event(conn, claimed.id, "dispatch_provider_fallback", event,
+                          run_id=claimed.current_run_id)
+
+    def fallback_route_source(source, selection):
+        skipped = selection[1].get("fallback_skipped")
+        if not skipped:
+            return f"dispatch-fallback(capped {source})"
+        return (f"dispatch-fallback(capped {source}; "
+                f"skipped {_format_skipped_rungs(skipped)})")
 
     try:
         from hermes_cli.config import load_config as _load_dispatch_config
@@ -19495,7 +19752,7 @@ def _dispatch_once_locked(
             "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
-            route_source = f"dispatch-fallback(capped {route_source})"
+            route_source = fallback_route_source(route_source, fallback_selection)
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -19693,7 +19950,7 @@ def _dispatch_once_locked(
             "card-override" if claimed.model_override else "profile-default")
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
-            review_route_source = f"dispatch-fallback(capped {review_route_source})"
+            review_route_source = fallback_route_source(review_route_source, fallback_selection)
         from hermes_cli.kanban_workspace_policy import (
             WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
         )
@@ -20555,6 +20812,9 @@ def _default_spawn(
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # GitHub lane is decided by the worker's PROFILE in the gh shim (spec D3); an inherited lane
+    # (e.g. a dispatcher launched from a laned script) must not ride into the worker.
+    env.pop("HERMES_GH_LANE", None)
 
     # A dispatcher-spawned worker is its OWN single-session process, NOT the
     # gateway. The gateway sets _HERMES_GATEWAY=1 process-wide; copying it into
@@ -20563,6 +20823,16 @@ def _default_spawn(
     # own session-id stamping relies on them). Pop it here — mirrors the restart
     # watcher (gateway/run.py) which pops it for the same reason.
     env.pop("_HERMES_GATEWAY", None)
+
+    # A worker imports the runtime tree its argv's venv points at — never a
+    # dispatcher's PYTHONPATH/PYTHONHOME. sys.path beats the venv's editable
+    # finder, so a gateway pinned to a side-by-side release via its plist
+    # (registry-pins v0.2) silently ran every worker on that release, and
+    # runtime deploys never reached workers (t_e8c867d3: #1075 invisible,
+    # 0 review_skipped). Mirrors the `hermes` shim's load-bearing unset,
+    # which this direct venv exec bypasses.
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
