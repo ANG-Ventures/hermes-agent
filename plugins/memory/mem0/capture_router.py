@@ -160,6 +160,60 @@ def dedup_world_against_prefs(
 # Two-pass extraction with primary/fallback provider
 # ---------------------------------------------------------------------------
 
+# Primary-lane cooldown gate. When codex-bridge (CLIProxyAPI) answers 429 it names how long its
+# credentials are cooling down (`{"error": {"code": "model_cooldown", "reset_seconds": N}}`). Every
+# capture fired two passes straight into that 429 (94 wasted calls / 50 min on 2026-09-25, codex
+# capped for days) before falling back. While the reset window is open, route straight to the
+# fallback. Process-wide and keyed by primary URL so every extractor instance (one per mem0 provider
+# instance) shares one view of the lane. Capped so an early recovery (a new credential) is re-probed.
+_COOLDOWN_DEFAULT_S = 60.0
+_COOLDOWN_MAX_S = 1800.0
+_primary_cooldown_until: Dict[str, float] = {}
+_primary_cooldown_lock = threading.Lock()
+
+
+def _cooldown_seconds_from_429(err: urllib.error.HTTPError) -> Tuple[float, str]:
+    """Seconds to skip the primary after a 429, and where that number came from.
+
+    Order: the bridge's `error.reset_seconds` (CLIProxyAPI model_cooldown body), then a numeric
+    Retry-After header, then a short default. Always clamped to (0, _COOLDOWN_MAX_S]."""
+    secs: Optional[float] = None
+    source = "default"
+    try:
+        body = err.read()
+        payload = json.loads(body.decode("utf-8", "replace")) if body else {}
+        inner = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(inner, dict) and inner.get("reset_seconds") is not None:
+            secs = float(inner["reset_seconds"])
+            source = str(inner.get("code") or "reset_seconds")
+    except Exception:
+        secs = None
+    if secs is None:
+        try:
+            ra = (err.headers or {}).get("Retry-After")
+            if ra is not None:
+                secs = float(ra)
+                source = "retry-after"
+        except Exception:
+            secs = None
+    if secs is None or secs <= 0:
+        secs, source = _COOLDOWN_DEFAULT_S, "default"
+    return min(secs, _COOLDOWN_MAX_S), source
+
+
+def primary_cooldown_remaining(url: str, now: Optional[float] = None) -> float:
+    """Seconds left on the primary's cooldown gate (0.0 when the primary may be tried)."""
+    with _primary_cooldown_lock:
+        until = _primary_cooldown_until.get(url, 0.0)
+    return max(0.0, until - (time.time() if now is None else now))
+
+
+def reset_primary_cooldowns() -> None:
+    """Clear every cooldown gate (tests / operator)."""
+    with _primary_cooldown_lock:
+        _primary_cooldown_until.clear()
+
+
 class BridgeExtractor:
     """Runs one extraction pass against codex-bridge (PRIMARY); on ANY error/timeout falls back to
     gemini-bridge. Both are OpenAI-compatible /v1/chat/completions endpoints behind a bearer secret.
@@ -296,13 +350,27 @@ class BridgeExtractor:
         """One pass. Returns {candidates, usage, latency, provider} or {error, ...}. codex PRIMARY,
         gemini FALLBACK on any exception/timeout. Never raises (fail-soft — a pass failure yields no
         candidates rather than breaking the turn)."""
+        cooldown_left = primary_cooldown_remaining(self._primary_url)
         try:
+            if cooldown_left > 0:
+                raise _PrimaryCoolingDown(cooldown_left)
             cands, usage, latency = self._call_with_auth_retry(
                 self._primary_url, self._primary_ref, self._model, system_prompt, user, assistant)
             return {"candidates": cands, "usage": usage, "latency": latency, "provider": "codex-bridge"}
         except Exception as primary_err:
-            logger.warning("capture-router: primary (codex-bridge) pass failed, trying fallback: %s",
-                           primary_err)
+            if isinstance(primary_err, _PrimaryCoolingDown):
+                # Known state, not a failure: no request was sent to the primary.
+                logger.debug("capture-router: primary (codex-bridge) skipped, %s", primary_err)
+            elif isinstance(primary_err, urllib.error.HTTPError) and primary_err.code == 429:
+                secs, source = _cooldown_seconds_from_429(primary_err)
+                with _primary_cooldown_lock:
+                    _primary_cooldown_until[self._primary_url] = max(
+                        _primary_cooldown_until.get(self._primary_url, 0.0), time.time() + secs)
+                logger.info("capture-router: primary (codex-bridge) 429 (%s); routing captures "
+                            "straight to fallback for %.0fs", source, secs)
+            else:
+                logger.warning("capture-router: primary (codex-bridge) pass failed, trying fallback: %s",
+                               primary_err)
             try:
                 cands, usage, latency = self._call_with_auth_retry(
                     self._fallback_url, self._fallback_ref, self._fallback_model,
@@ -314,6 +382,13 @@ class BridgeExtractor:
                                fallback_err)
                 return {"error": f"primary={primary_err}; fallback={fallback_err}",
                         "candidates": [], "usage": {}, "latency": 0.0, "provider": "none"}
+
+
+class _PrimaryCoolingDown(Exception):
+    """Raised (and caught) inside extract() when the primary's cooldown gate is open."""
+
+    def __init__(self, remaining_s: float):
+        super().__init__(f"cooldown gate open for {remaining_s:.0f}s more")
 
 
 # ---------------------------------------------------------------------------

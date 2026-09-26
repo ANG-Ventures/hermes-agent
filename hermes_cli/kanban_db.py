@@ -1873,6 +1873,10 @@ def create_board(
     return meta
 
 
+# Phantom board dirs already warned about in this process (see list_boards).
+_PHANTOM_BOARD_WARNED: set[str] = set()
+
+
 def _board_db_is_empty(db_path: Path) -> bool:
     """Return True if ``db_path`` is a kanban DB holding zero tasks.
 
@@ -1957,13 +1961,18 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 # is genuinely empty; a dir with real cards is someone's data and
                 # must stay visible even if board.json was lost.
                 if has_db and not has_meta and _board_db_is_empty(child / "kanban.db"):
-                    _log.warning(
-                        "kanban: ignoring phantom board dir %s (kanban.db with 0 "
-                        "tasks and no board.json). If this slug was renamed, add "
-                        "it to %s; otherwise remove the directory.",
-                        child,
-                        board_aliases_path(),
-                    )
+                    # Warn once per process per dir: list_boards() runs on every
+                    # watcher/dispatcher tick (~5 s), and an unchanged phantom
+                    # repeating forever buried real errors in the gateway log.
+                    if str(child) not in _PHANTOM_BOARD_WARNED:
+                        _PHANTOM_BOARD_WARNED.add(str(child))
+                        _log.warning(
+                            "kanban: ignoring phantom board dir %s (kanban.db with 0 "
+                            "tasks and no board.json). If this slug was renamed, add "
+                            "it to %s; otherwise remove the directory.",
+                            child,
+                            board_aliases_path(),
+                        )
                     continue
                 meta = read_board_metadata(normed)
                 if meta.get("archived") and not include_archived:
@@ -9218,6 +9227,32 @@ def complete_task(
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
+    # A completion whose evidence names a still-OPEN PR is a review handoff,
+    # not ``done``: done releases dependants, and an unmerged PR has no owner
+    # once the card is terminal (t_1bd02e0b, 2026-09-25). A card already in
+    # ``review`` is a reviewer/human approval and is left alone.
+    if candidate.status != 'review':
+        from hermes_cli import kanban_open_pr as _open_pr
+        still_open = _open_pr.open_pr_refs(
+            result, summary, metadata=metadata, survivor_pr=survivor_pr,
+        )
+        if still_open:
+            note = _open_pr.route_note(still_open)
+            routed_meta = dict(metadata or {}, auto_routed_open_prs=[
+                f"{r.repo}#{r.number}" for r in still_open
+            ])
+            routed_summary = "\n".join(filter(None, [note, summary or result]))
+            ok = request_review(
+                conn, task_id, summary=routed_summary, metadata=routed_meta,
+                expected_run_id=expected_run_id, force=True,
+            )
+            if ok:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_routed_to_review",
+                        {"open_prs": routed_meta["auto_routed_open_prs"], "note": note},
+                    )
+            return bool(ok)
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,
@@ -11694,6 +11729,11 @@ def arm_review_stale_alerts(conn: sqlite3.Connection, entries: list[dict]) -> li
     return fresh
 
 
+def _task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row["status"] if row else None
+
+
 @_home_session_guarded("request-review")
 def request_review(
     conn: sqlite3.Connection,
@@ -11782,6 +11822,8 @@ def request_review(
                 conn, task_id, summary=summary, metadata=skip_meta,
                 expected_run_id=expected_run_id,
             )
+            if done and _task_status(conn, task_id) == "review":
+                return _ret(True, "open PR named in the handoff — auto-routed to review instead of done")
             if not done:
                 return _ret(
                     False,

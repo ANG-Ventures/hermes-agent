@@ -4,6 +4,8 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+from hermes_cli.lazy_registry import LazyFilledDict
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -5561,3 +5563,9 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
 }
+
+
+
+# Provider/platform extensions are registered by the config module as fillers
+# that run on the first read (see lazy_registry for why).
+OPTIONAL_ENV_VARS = LazyFilledDict(OPTIONAL_ENV_VARS)
