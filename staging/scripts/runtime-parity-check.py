@@ -14,7 +14,6 @@ import fcntl
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -41,19 +40,6 @@ REDRIVE_STUCK_AGE_S = int(os.environ.get("RPC_REDRIVE_STUCK_AGE_S", str(6 * 3600
 REDRIVE_STUCK_ATTEMPTS = int(os.environ.get("RPC_REDRIVE_STUCK_ATTEMPTS", "3"))
 DEADMAN_LABEL = "ai.hermes.runtime-parity-deadman"
 AGE_REESCALATE_S = 24 * 3600  # INV-5: re-alert a stable gap every 24h
-
-
-def hint_value(value) -> str:
-    """Render a token so a printed remedy survives being pasted into a shell.
-
-    This is a verbatim local copy of ``hermes_cli.cli_hint.hint_value``. This
-    script deploys STANDALONE to ``~/.hermes/scripts/`` and runs under
-    ``/usr/bin/python3``, where the ``hermes_cli`` package is not importable —
-    so it cannot share the choke point by import the way the in-repo sites do.
-    Keep the two in sync; ``shlex.quote`` is the whole rule.
-    """
-    return shlex.quote(str(value))
-
 
 # pass-4 caution 1: derive the literal kind strings FROM the detector source at runtime, so a
 # rename/hyphen drift in the detector fails our routing loudly instead of silently mis-routing.
@@ -494,7 +480,7 @@ def run() -> int:
         if due:
             if nonff:
                 body = (f"⚠️ runtime tree has DIVERGED (non-FF) from {DEPLOY_REF} — `deploy.sh` will "
-                        f"refuse (exit 4). Manual reconcile: inspect `git -C {hint_value(TREE)} log --oneline "
+                        f"refuse (exit 4). Manual reconcile: inspect `git -C {TREE} log --oneline "
                         f"HEAD...{DEPLOY_REF}`, then `git reset --hard {DEPLOY_REF}` after confirming no "
                         f"uncommitted deploy hotfix.")
             else:
