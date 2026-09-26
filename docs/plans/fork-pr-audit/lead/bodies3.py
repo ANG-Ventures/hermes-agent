@@ -26,8 +26,8 @@ def body(c):
     out.append('Registry D2b: ' + ('; '.join(r[:70] for r in c['registry']) if c['registry'] else 'none'))
     if any('ACE-GATED' in ROW[k]['why'] for k in ks):
         out.append('ACE-GATED: fork-permanent entry; no merge request until Ace retires it.')
-    out.append('Rebase on current origin/main; CI green; then kanban_request_review (slice cards complete on CI under review_policy milestone_only).'
-               + (" Upstream PR only after Ace's go." if c['verdict'] == 'UPSTREAM' else ''))
+    out.append(bodies.UPSTREAM_DONE if c['verdict'] == 'UPSTREAM' else
+               'Rebase on current origin/main; CI green; then kanban_request_review (slice cards complete on CI under review_policy milestone_only).')
     return '\n'.join(out)
 
 

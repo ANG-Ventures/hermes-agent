@@ -37,8 +37,9 @@ def body(c):
                                    if c['registry'] else 'none'))
     if any('ACE-GATED' in ROW[k]['why'] for k in ks):
         L_.append('**ACE-GATED**: fork-permanent registry entry — build + CI only; no merge request until Ace retires it.')
-    L_ += ['', 'Rebase on current origin/main; CI green; then kanban_request_review (slice cards complete on CI under review_policy milestone_only). '
-           + ('Open the upstream PR only after Ace\'s go. ' if c['verdict'] == 'UPSTREAM' else '') + 'Merges via fleet-merge after Ace\'s go.']
+    L_ += ['', (bodies.UPSTREAM_DONE + ' ' if c['verdict'] == 'UPSTREAM' else
+                'Rebase on current origin/main; CI green; then kanban_request_review (slice cards complete on CI under review_policy milestone_only). ')
+           + 'Merges via fleet-merge after Ace\'s go.']
     return '\n'.join(L_)
 
 

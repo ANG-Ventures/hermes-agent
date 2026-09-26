@@ -6,6 +6,9 @@ import render
 ROW, CARDS = render.ROW, render.CARDS
 
 
+
+UPSTREAM_DONE = "UPSTREAM branches are built on NousResearch upstream/main: rebase on current upstream/main, NOT origin/main. Do NOT dispatch fork CI (`gh workflow run ci.yaml --ref audit/*/upstream-*`): it runs upstream's workflows, which pin 32/96-core runner pools ANG-Ventures lacks, so it queues forever (pre-check: `python scripts/ci_runner_label_lint.py --git-ref <ref>` rc=1). Gate = the Verify command via ~/.hermes/scripts/test-gate showing RED on upstream/main -> GREEN on the branch; paste the output in the handoff, then kanban_request_review. Upstream CI judges the upstream PR, opened only after Ace's go."
+
 def verify_cmd(keys):
     out = []
     for k in keys:
@@ -52,8 +55,8 @@ def body(c):
     if any('ACE-GATED' in ROW[k]['why'] for k in ks):
         lines += ['', '**ACE-GATED**: registry entry is fork-permanent. Build + CI only; do NOT request merge until Ace retires the entry.']
     lines += ['', '## Done', '',
-              'Rebase on current origin/main; CI green; then kanban_request_review (slice cards complete on CI under review_policy milestone_only). '
-              + ('Open the upstream PR only after Ace\'s go; the fork-side drop follows the upstream merge. ' if c['verdict'] == 'UPSTREAM' else '')
+              (UPSTREAM_DONE + ' The fork-side drop follows the upstream merge. ' if c['verdict'] == 'UPSTREAM' else
+               'Rebase on current origin/main; CI green; then kanban_request_review (slice cards complete on CI under review_policy milestone_only). ')
               + 'Nothing merges without fleet-merge after Ace\'s go.']
     return '\n'.join(lines)
 
