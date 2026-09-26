@@ -242,7 +242,31 @@ class ProviderConfig:
     base_url_env_var: str = ""
 
 
-PROVIDER_REGISTRY: Dict[str, ProviderConfig] = GuardedDict(__name__, "PROVIDER_REGISTRY", {
+# Plugin auto-extend of PROVIDER_REGISTRY (see _extend_registry_from_provider_profiles
+# below) runs on the first read, not at import: discovery imports every
+# model-provider plugin (1-2 s, pin-factory logging), which taxed every
+# ``hermes kanban`` one-shot and every script that imports kanban helpers.
+_registry_extend_lock = threading.RLock()
+_registry_extend_armed = False  # set once the module body below is initialised
+_registry_extended = False
+_registry_extend_active = False
+
+
+class _LazyProviderRegistry(GuardedDict):
+    """Seam ``GuardedDict`` whose first read triggers the plugin auto-extend.
+
+    Every facade read goes through ``_data()``; writes never trigger the
+    extend. ``provider_seam.snapshot()`` readers latch it via a snapshot hook.
+    """
+
+    __slots__ = ()
+
+    def _data(self):
+        _ensure_registry_extended()
+        return GuardedDict._data(self)
+
+
+PROVIDER_REGISTRY: Dict[str, ProviderConfig] = _LazyProviderRegistry(__name__, "PROVIDER_REGISTRY", {
     "nous": ProviderConfig(
         id="nous",
         name="Nous Portal",
@@ -567,7 +591,8 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = GuardedDict(__name__, "PROVIDER_R
     ),
 })
 
-# ``hermes_cli.config`` discovers model-provider plugins while importing.  A
+# ``hermes_cli.config`` discovers model-provider plugins (on first read of its lazy
+# registries).  A
 # provider plugin may in turn register its auth metadata here.  Keep this import
 # below ProviderConfig and PROVIDER_REGISTRY so that TUI startup never exposes a
 # partially initialized auth module to those plugins.
@@ -581,36 +606,70 @@ from hermes_cli.config import (  # noqa: E402
 # Auto-extend PROVIDER_REGISTRY with any api-key provider registered in
 # providers/ that is not already declared above.  New providers only need a
 # plugins/model-providers/<name>/ plugin — no edits to this file required.
-try:
-    from providers import list_providers as _list_providers_for_registry
-    for _pp in _list_providers_for_registry():
-        if _pp.name in PROVIDER_REGISTRY:
-            continue
-        if _pp.auth_type != "api_key" or not _pp.env_vars:
-            continue
-        # Skip providers that need custom token resolution or are special-cased
-        # in resolve_provider() (copilot/kimi/zai have bespoke token refresh;
-        # openrouter/custom are aggregator/user-supplied and handled outside
-        # the registry — adding them here breaks runtime_provider resolution
-        # that relies on `openrouter not in PROVIDER_REGISTRY`).
-        if _pp.name in {"copilot", "kimi-coding", "kimi-coding-cn", "zai", "openrouter", "custom"}:
-            continue
-        _api_key_vars = tuple(v for v in _pp.env_vars if not v.endswith("_BASE_URL") and not v.endswith("_URL"))
-        _base_url_var = next((v for v in _pp.env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")), None)
-        PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
-            id=_pp.name,
-            name=_pp.display_name or _pp.name,
-            auth_type="api_key",
-            inference_base_url=_pp.base_url,
-            api_key_env_vars=_api_key_vars or _pp.env_vars,
-            base_url_env_var=_base_url_var or "",
-        )
-        # Also register aliases so resolve_provider() resolves them
-        for _alias in _pp.aliases:
-            if _alias not in PROVIDER_REGISTRY:
-                PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
-except Exception:
-    pass
+# Runs on the first read of PROVIDER_REGISTRY, not at import: discovery imports
+# every provider plugin (see lazy_registry).
+def _extend_registry_from_provider_profiles() -> None:
+    try:
+        from providers import list_providers as _list_providers_for_registry
+        for _pp in _list_providers_for_registry():
+            if _pp.name in PROVIDER_REGISTRY:
+                continue
+            if _pp.auth_type != "api_key" or not _pp.env_vars:
+                continue
+            # Skip providers that need custom token resolution or are special-cased
+            # in resolve_provider() (copilot/kimi/zai have bespoke token refresh;
+            # openrouter/custom are aggregator/user-supplied and handled outside
+            # the registry — adding them here breaks runtime_provider resolution
+            # that relies on `openrouter not in PROVIDER_REGISTRY`).
+            if _pp.name in {"copilot", "kimi-coding", "kimi-coding-cn", "zai", "openrouter", "custom"}:
+                continue
+            _api_key_vars = tuple(v for v in _pp.env_vars if not v.endswith("_BASE_URL") and not v.endswith("_URL"))
+            _base_url_var = next((v for v in _pp.env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")), None)
+            PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
+                id=_pp.name,
+                name=_pp.display_name or _pp.name,
+                auth_type="api_key",
+                inference_base_url=_pp.base_url,
+                api_key_env_vars=_api_key_vars or _pp.env_vars,
+                base_url_env_var=_base_url_var or "",
+            )
+            # Also register aliases so resolve_provider() resolves them
+            for _alias in _pp.aliases:
+                if _alias not in PROVIDER_REGISTRY:
+                    PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
+    except Exception:
+        pass
+
+
+def _ensure_registry_extended() -> None:
+    """Run the plugin auto-extend once, on the first read after import."""
+    global _registry_extended, _registry_extend_active
+    if _registry_extended or not _registry_extend_armed:
+        return
+    with _registry_extend_lock:
+        if _registry_extended or _registry_extend_active:
+            # Re-entrant read from inside the extend (or a plugin it imports):
+            # serve the partial registry, do not recurse.
+            return
+        try:
+            from providers import discovery_in_progress as _discovery_in_progress
+            if _discovery_in_progress():
+                # Someone else is mid-discovery and one of its plugins reads the
+                # registry: serve it as-is and do not latch, so the first read
+                # after discovery completes still extends.
+                return
+        except Exception:
+            pass
+        _registry_extend_active = True
+        try:
+            _extend_registry_from_provider_profiles()
+        finally:
+            _registry_extend_active = False
+        _registry_extended = True
+
+
+_registry_extend_armed = True
+provider_seam.add_snapshot_hook(_ensure_registry_extended)
 
 
 # =============================================================================

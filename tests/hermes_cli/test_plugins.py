@@ -617,14 +617,16 @@ class TestPluginLoading:
         assert entry.module is None
         assert "fakeprovider" not in sys.modules
         # Routing contract: classification records the manifest but does
-        # not fabricate activation. providers/ discovery is directory-based
-        # today, so a pip-only provider is not activatable via
-        # get_provider_profile() — and it must not leak into sys.modules
-        # through the providers path either (no double import).
+        # not fabricate activation. Importing an enabled pip provider is
+        # owned by providers/ discovery (step 0, _discover_entry_point_providers),
+        # the only importer, so there is no double import. This fake's
+        # ``register`` target does not exist, so nothing gets registered.
+        # (Discovery is lazy, so it first runs here, under this test's
+        # patched entry points and plugins.enabled.)
         from providers import get_provider_profile
 
         assert get_provider_profile("fakeprovider") is None
-        assert "fakeprovider" not in sys.modules
+
 
     def test_entrypoint_duplicate_does_not_block_directory_provider_activation(
         self, tmp_path, monkeypatch
