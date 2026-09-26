@@ -4,7 +4,7 @@ from common import *
 import render, bodies
 
 ROW, CARDS = render.ROW, render.CARDS
-LIVE_REVERT = {l.split('|')[0].replace('origin/', '') for l in open(L + 'revert_stats.txt').read().splitlines()}
+LIVE_REVERT = {l.split('|')[0].replace('origin/', '') for l in open(L + 'revert_stats.txt', encoding='utf-8').read().splitlines()}
 
 
 def body(c):
@@ -45,6 +45,6 @@ def body(c):
 
 if __name__ == '__main__':
     out = [{'name': c['name'], 'title': bodies.title(c), 'assignee': c['assignee'], 'body': body(c)} for c in CARDS]
-    json.dump(out, open(L + 'card_specs.json', 'w'), indent=1)
+    json.dump(out, open(L + 'card_specs.json', 'w', encoding='utf-8'), indent=1)
     import statistics
     print(len(out), statistics.mean(len(o['body']) for o in out))

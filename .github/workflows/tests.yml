@@ -45,6 +45,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Record executed tree
+        # L2(a) re-run guard (spec §5.1): the Actions API head_sha of a
+        # pull_request run is the PR HEAD, not the refs/pull/N/merge commit
+        # this run checked out. The guard reads tests.yml at THIS sha (from
+        # this annotation) to decide whether "re-run failed jobs" is safe.
+        run: echo "::notice title=ci-executed-sha::${GITHUB_SHA}"
+
       - name: Restore duration cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -282,6 +289,11 @@ jobs:
         run: uv cache prune --ci
 
       - name: Run tests (${{ matrix.slice.name }})
+        id: tests
+        # The slice verdict below decides pass/fail (spec I4): a failure made
+        # only of actively quarantined tests is non-gating; everything else,
+        # including a missing result, stays red.
+        continue-on-error: true
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess
         # with bounded parallelism. No xdist, no shared workers, no
@@ -294,7 +306,8 @@ jobs:
         run: |
           source .venv/bin/activate
           # Verbose pytest output lets timeout verdicts name the last test reached.
-          scripts/run_tests.sh --files '${{ matrix.slice.files }}' -- -v
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}' \
+            --junit-dir ci-junit --result-file ci-junit/slice-result.json -- -v
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -310,6 +323,48 @@ jobs:
           # windows and sqlite busy-timeouts, ejecting merge-queue entries.)
           # HERMES_TEST_WORKERS_FORCE=1 bypasses the clamp.
           HERMES_TEST_WORKERS: "12"
+
+      - name: Upload per-file junit + slice manifest
+        # Evidence for the flake ledger / quarantine gate: the gate re-derives
+        # red->green pairs from THESE artifacts, named per slice AND attempt so
+        # a "re-run failed jobs" attempt never overwrites attempt 1.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-slice-result-${{ matrix.slice.index }}-a${{ github.run_attempt }}
+          path: ci-junit/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Slice verdict (flake quarantine, base-ref list)
+        # Green iff the suite passed, or every failure is a test that is
+        # actively quarantined in the BASE ref's list (never the PR head's —
+        # a PR cannot exempt the test it broke). Checker + list both come
+        # from the base; if the base has neither, any failure gates.
+        if: ${{ !cancelled() }}
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || github.sha }}
+        run: |
+          if [ "$TESTS_OUTCOME" = "success" ]; then
+            echo "tests passed"
+            exit 0
+          fi
+          if [ "$TESTS_OUTCOME" != "failure" ]; then
+            echo "::error::tests step outcome '$TESTS_OUTCOME' — gating"
+            exit 1
+          fi
+          if ! { git fetch --no-tags --depth=1 origin "$BASE_SHA" \
+                 && git show "$BASE_SHA:scripts/ci/flake_quarantine.py" > "$RUNNER_TEMP/fq_base.py" \
+                 && git show "$BASE_SHA:scripts/ci/flake_quarantine.json" > "$RUNNER_TEMP/fq_base.json"; }; then
+            echo "::error::no quarantine checker/list on base $BASE_SHA — the failure gates"
+            exit 1
+          fi
+          .venv/bin/python "$RUNNER_TEMP/fq_base.py" slice-verdict \
+            --tests-outcome "$TESTS_OUTCOME" \
+            --result ci-junit/slice-result.json --junit-dir ci-junit \
+            --quarantine "$RUNNER_TEMP/fq_base.json"
 
       - name: Upload per-slice durations
         # Advisory artifact (feeds slice balancing) — a transient artifact-
@@ -452,11 +507,41 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      # Quarantine evidence gate re-derives red->green pairs from the Actions API.
+      actions: read
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Quarantine list lint + evidence gate
+        # Spec I4 (p4 B1): any added / changed / later-until entry must cite
+        # >= 2 red->green pairs that this step RE-DERIVES from the Actions API
+        # (runs exist here, same head_sha, >= 2 distinct days, push /
+        # merge_group / schedule junit naming the node, SHA an ancestor of
+        # main). The checker runs from the BASE ref when the base has it, so a
+        # PR that edits the checker and the list together is still checked by
+        # the old checker.
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || github.sha }}
+        run: |
+          checker=scripts/ci/flake_quarantine.py
+          base_args=()
+          if git fetch --no-tags --depth=1 origin "$BASE_SHA"; then
+            if git show "$BASE_SHA:scripts/ci/flake_quarantine.json" > "$RUNNER_TEMP/fq_base.json"; then
+              base_args=(--base "$RUNNER_TEMP/fq_base.json")
+            fi
+            if git show "$BASE_SHA:scripts/ci/flake_quarantine.py" > "$RUNNER_TEMP/fq_base.py"; then
+              checker="$RUNNER_TEMP/fq_base.py"
+            fi
+          fi
+          python3 "$checker" check-changes "${base_args[@]}" \
+            --head scripts/ci/flake_quarantine.json --repo "$REPO"
       - name: Fail on skipped or failed required tests
         # Results only: toJSON(needs) carries both matrices (~700 KB) and
         # exceeds the 128 KB per-env-string limit (E2BIG, run 35892732551).

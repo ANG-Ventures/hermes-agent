@@ -27,6 +27,7 @@ def _coverage_json() -> str:
         "lenses": {k: "done" for k in LENSES},
         "findings": 1, "items": ["Missing guard at handler:42"],
         "review_minutes": 5, "batch_id": "batch-human-1",
+        "head_sha": "n/a: fixture card has no PR",
     })
 
 

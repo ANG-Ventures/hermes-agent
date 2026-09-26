@@ -3,7 +3,7 @@ import sys, os, re, json, collections
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import *
 
-ROW = json.load(open(L + 'rows.json'))
+ROW = json.load(open(L + 'rows.json', encoding='utf-8'))
 REG = json.loads(sh('git show origin/main:docs/sync/fork-features.json'))
 GOD = {'gateway/run.py', 'agent/chat_completion_helpers.py', 'agent/agent_runtime_helpers.py', 'hermes_cli/commands.py',
        'cli.py', 'gateway/session.py', 'agent/conversation_loop.py', 'plugins/platforms/discord/adapter.py'}
@@ -65,7 +65,7 @@ def main():
         cards.append({'name': name, 'verdict': fv, 'keys': ks, 'followers': fol, 'tranches': tr, 'branches': brs,
                       'conflict_syncs': cs, 'registry': regs,
                       'assignee': 'daedalus-opus' if (fv == 'DROP' and cs >= 2) else 'daedalus'})
-    json.dump(cards, open(L + 'cards.json', 'w'), indent=1)
+    json.dump(cards, open(L + 'cards.json', 'w', encoding='utf-8'), indent=1)
     return cards
 
 

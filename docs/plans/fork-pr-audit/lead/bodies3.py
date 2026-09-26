@@ -33,6 +33,6 @@ def body(c):
 
 if __name__ == '__main__':
     out = [{'name': c['name'], 'title': bodies.title(c), 'assignee': c['assignee'], 'body': body(c)} for c in CARDS]
-    json.dump(out, open(L + 'card_specs.json', 'w'))
+    json.dump(out, open(L + 'card_specs.json', 'w', encoding='utf-8'))
     import statistics
     print(len(out), statistics.mean(len(o['body']) for o in out))
