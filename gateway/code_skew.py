@@ -108,7 +108,7 @@ def _runtime_python_changed(boot_sha: str, disk_sha: str) -> bool | None:
             ["git", "-C", str(_PROJECT_ROOT), "diff", "--name-only",
              f"{boot_sha}..{disk_sha}"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=5,
             check=False,
         )

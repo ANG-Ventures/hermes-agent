@@ -116,7 +116,7 @@ def _run_phase_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout,
-            text=True,
+            text=True, encoding="utf-8",
             errors="replace",
         )
         output = proc.stdout or ""
@@ -216,7 +216,7 @@ def _run_start_phase(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,  # own process group for clean teardown
-        text=True,
+        text=True, encoding="utf-8",
         errors="replace",
     )
     output = ""

@@ -144,7 +144,7 @@ def pytest_runner(repo: Path, tests: Sequence[str]) -> PytestRun:
         [str(python), "-m", "pytest", *tests, "-q", "-o", "addopts=", "-p", "no:randomly"],
         cwd=repo,
         env=clean_pytest_env(repo, python),
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         check=False,

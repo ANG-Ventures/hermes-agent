@@ -71,7 +71,7 @@ def gh_api(*args: str) -> Optional[dict]:
     try:
         proc = subprocess.run(
             ["gh", "api", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=_TIMEOUT_S, check=False,
+            text=True, encoding="utf-8", errors="replace", timeout=_TIMEOUT_S, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None

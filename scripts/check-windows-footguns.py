@@ -29,10 +29,12 @@ Suppress an intentional use (e.g. tests or platform-gated code) with:
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import subprocess
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -357,9 +359,10 @@ FOOTGUNS: list[Footgun] = [
         # ``encoding=`` on the same line, and (b) skip false positives like
         # ``def text(self, ...)`` or string literals. ``text=True`` is
         # overwhelmingly a subprocess kwarg, so a bare match + filter has a
-        # high signal-to-noise ratio and avoids the complexity of parsing
-        # multi-line subprocess calls (which the line-based scanner can't
-        # reliably attribute to a single line anyway).
+        # high signal-to-noise ratio. This line pass only sees calls whose
+        # ``subprocess.X(`` and ``text=True`` share a physical line; calls
+        # split across lines are covered by the AST pass in scan_file()
+        # (``_multiline_subprocess_text_true``), reported under this rule.
         pattern=re.compile(r"\btext\s*=\s*True\b"),
         message=(
             "subprocess text=True without explicit encoding= decodes "
@@ -545,8 +548,8 @@ def _is_likely_subprocess_call(line: str) -> bool:
     contains a subprocess-shaped call site. This avoids false positives on
     unrelated APIs that accept a ``text`` kwarg (e.g. DataFrame.rename,
     custom library calls). Multi-line calls where the ``subprocess.X(``
-    prefix is on a previous line won't be flagged — that's an acceptable
-    false negative for a line-based scanner.
+    prefix is on a previous line are invisible here; scan_file() covers
+    them with the AST pass in ``_multiline_subprocess_text_true``.
     """
     return any(token in line for token in _SUBPROCESS_METHODS)
 
@@ -589,6 +592,57 @@ def _looks_like_string_literal(line: str, match: "re.Match") -> bool:
             in_d = not in_d
         i += 1
     return in_s or in_d
+
+
+_SUBPROCESS_TEXT_RULE = "subprocess text=True without explicit encoding="
+_SUBPROCESS_CALL_ATTRS = frozenset({"run", "Popen", "call", "check_output", "check_call"})
+
+
+def _multiline_subprocess_text_true(source: str) -> list[tuple[int, int, int]]:
+    """AST pass for the ``text=True`` rule: subprocess calls split over lines.
+
+    The line-based rule needs ``subprocess.X(`` and ``text=True`` on the same
+    physical line, so ``subprocess.run([...],\n    capture_output=True,
+    text=True)`` slipped through (t_5e2ded8f). This walks real Call nodes whose
+    func is ``<subprocess alias>.run/Popen/call/check_output/check_call``, that
+    span more than one line, pass literal ``text=True``, and pass neither
+    ``encoding=`` nor ``**kwargs`` (encoding may be in the dict — same
+    conservative skip as the open() rule). Single-line calls are left to the
+    line rule. Returns ``(text_kw_line, call_first_line, call_last_line)``.
+    Unparseable files return [] — the line rules still run on them.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # SyntaxWarning noise from escapes
+            tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return []
+    aliases = {"subprocess", "_sp"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases.update(a.asname or a.name for a in node.names if a.name == "subprocess")
+    hits: list[tuple[int, int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or node.end_lineno == node.lineno:
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr in _SUBPROCESS_CALL_ATTRS
+            and isinstance(func.value, ast.Name)
+            and func.value.id in aliases
+        ):
+            continue
+        kwargs = {k.arg: k for k in node.keywords}
+        text_kw = kwargs.get("text")
+        if text_kw is None or not (
+            isinstance(text_kw.value, ast.Constant) and text_kw.value.value is True
+        ):
+            continue
+        if "encoding" in kwargs or None in kwargs:
+            continue
+        hits.append((text_kw.lineno, node.lineno, node.end_lineno))
+    return hits
 
 
 def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footgun]]:
@@ -665,6 +719,29 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
                     # Post-filter assumed a named group that isn't there — skip.
                     continue
             matches.append((i, line.rstrip(), fg))
+
+    text_rule = next((fg for fg in footguns if fg.name == _SUBPROCESS_TEXT_RULE), None)
+    # Parse only files that contain ``text=True`` at all: ast.parse on every
+    # file doubled --all wall time and tripped the 60s full-repo-scan test.
+    if text_rule is not None and text_rule.pattern.search(text) and not (
+        text_rule.path_allowlist and any(s in str(path) for s in text_rule.path_allowlist)
+    ):
+        # ast numbers lines on \r\n, \r and \n only; str.splitlines() also
+        # splits on \f, \v, \x1c... and would drift the report line.
+        lines = re.split(r"\r\n|\r|\n", text)
+        seen = {ln for ln, _, fg in matches if fg is text_rule}
+        for kw_line, first, last in _multiline_subprocess_text_true(text):
+            if kw_line in seen:
+                continue
+            # Suppression marker anywhere in the call's span counts.
+            if any(SUPPRESS_MARKER.search(ln) for ln in lines[first - 1:last]):
+                continue
+            line = lines[kw_line - 1]
+            if any(hint in line for hint in GUARD_HINTS):
+                continue
+            seen.add(kw_line)
+            matches.append((kw_line, line.rstrip(), text_rule))
+        matches.sort(key=lambda m: m[0])
     return matches
 
 

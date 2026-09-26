@@ -8230,7 +8230,7 @@ def _pid_create_time(pid: int) -> Optional[float]:
             proc = subprocess.run(
                 ["ps", "-o", "lstart=", "-p", str(int(pid))],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, timeout=1,
+                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", timeout=1,
                 env={**os.environ, "LC_ALL": "C"}, check=False,
             )
             if proc.returncode == 0:
@@ -10224,7 +10224,7 @@ def _scan_process_cwds() -> Optional[frozenset]:
     try:
         result = subprocess.run(
             ["lsof", "-d", "cwd", "-Fn"], capture_output=True,
-            text=True, timeout=30, stdin=subprocess.DEVNULL, check=False,
+            text=True, encoding="utf-8", errors="replace", timeout=30, stdin=subprocess.DEVNULL, check=False,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -13932,7 +13932,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
             switch = subprocess.run(
                 switch_cmd,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=60,
                 check=False,
             )
@@ -15165,7 +15165,7 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=_RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS,
             check=False,
         )

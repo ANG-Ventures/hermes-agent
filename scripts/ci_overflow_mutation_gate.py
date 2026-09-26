@@ -111,7 +111,7 @@ def main():
             # -B: the scratch dir is reused, and two same-size mutants written within one mtime
             # second would otherwise import the PREVIOUS mutant's cached .pyc (false survivor).
             result = subprocess.run([sys.executable, "-B", "-m", "pytest", "-q", "-o", "addopts=", testfile,
-                                     "-k", test], cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                                     "-k", test], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
             print(f"{name}: exit={result.returncode}")
             for line in result.stdout.splitlines():
                 if line.startswith("FAILED ") or line.startswith("E ") or "failed," in line:

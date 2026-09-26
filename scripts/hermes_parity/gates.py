@@ -159,7 +159,7 @@ def gate_manifest_forkdelta(repo: Path, *, base: str | None, fork_ref: str) -> G
                     "-q", "-o", "addopts=", "-p", "no:randomly",
                 ],
                 cwd=repo,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 check=False,
@@ -204,7 +204,7 @@ def gate_tests(repo: Path, *, tests: Sequence[str], full: bool = False) -> GateR
         proc = subprocess.run(
             args,
             cwd=repo,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,

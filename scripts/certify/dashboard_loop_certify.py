@@ -163,7 +163,7 @@ def _certify_client_gone(op, ctl, args):
         child = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--_client-gone-child", title],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
         ready_line = ""
         assert child.stdout is not None

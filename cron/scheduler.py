@@ -3112,7 +3112,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         result = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=_get_bot_chat_delivery_timeout(),
             env=env,
             creationflags=windows_hide_flags(),

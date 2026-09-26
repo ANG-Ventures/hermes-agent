@@ -195,7 +195,7 @@ def run_tier1_scan(skill_dir: Path, timeout: int = SCAN_TIMEOUT_SECONDS) -> Tier
                 [SCANNER_BIN, "validate", str(skill_dir),
                  "--checks", TIER1_CHECKS, "--no-dedup",
                  "-r", "json", "-o", outdir],
-                capture_output=True, text=True, timeout=timeout,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             return Tier1Report(available=False, error=f"scan timed out after {timeout}s")
