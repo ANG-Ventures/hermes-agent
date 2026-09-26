@@ -46,9 +46,11 @@ _last_primary_note: Dict[StickyKey, Tuple[float, Optional[str]]] = {}
 
 def _raw_config() -> Dict[str, Any]:
     try:
-        from hermes_cli.config import read_raw_config_readonly
+        # Same reader as the announce gates (model.announce_*), so one config
+        # source (and one test seam) governs the whole route-change path.
+        from hermes_cli.config import read_raw_config
 
-        cfg = read_raw_config_readonly() or {}
+        cfg = read_raw_config() or {}
         return cfg if isinstance(cfg, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
@@ -105,7 +107,7 @@ def key_for(agent: Any) -> StickyKey:
 
 def on_fallback(agent: Any) -> bool:
     """True when the live route is a fallback, not the primary."""
-    if not getattr(agent, "_fallback_activated", False):
+    if getattr(agent, "_fallback_activated", False) is not True:
         return False
     cur = fp._norm_pm(getattr(agent, "provider", ""), getattr(agent, "model", ""))
     return cur != fp._norm_pm(*primary_route(agent))

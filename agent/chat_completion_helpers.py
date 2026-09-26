@@ -3652,7 +3652,7 @@ def try_activate_fallback(
     # reason / cooldown / quota-gate / announce state.
     from agent import fallback_wiring as _fw
 
-    _resuming = bool(getattr(agent, "_sticky_resume_in_progress", False))
+    _resuming = getattr(agent, "_sticky_resume_in_progress", False) is True
     if not _resuming:
         reason = _resolve_failover_reason(agent, reason)
     # A seat-level quota (`quota_seat`: one seat's 5h / weekly / Fable limit)
