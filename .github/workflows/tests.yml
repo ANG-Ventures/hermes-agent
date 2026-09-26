@@ -60,6 +60,18 @@ jobs:
           restore-keys: |
             test-durations-
 
+      - name: Restore duration history (per-file timeout budgets)
+        # Separate entry from the LPT cache above (t_bf25c6b2): the newest
+        # samples per file, whose p90 sets each file's measured timeout
+        # budget. Absent -> budgets fall back to the single cached value, then
+        # to the 300 s floor (today's behaviour).
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations_history.json
+          key: test-durations-history-restore-${{ github.run_id }}
+          restore-keys: |
+            test-durations-history-
+
       - name: Generate test slices
         id: matrix
         env:
@@ -291,7 +303,10 @@ jobs:
         run: |
           source .venv/bin/activate
           # Verbose pytest output lets timeout verdicts name the last test reached.
-          scripts/run_tests.sh --files '${{ matrix.slice.files }}' -- -v
+          # file_timeouts: measured per-file budgets stamped by the generate job
+          # (3x p90 duration, floor 300 s, cap 900 s; t_bf25c6b2). Empty for
+          # a slice with no heavy file, and for a matrix that lacks the field.
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}' --file-timeouts '${{ matrix.slice.file_timeouts }}' -- -v
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -330,6 +345,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # First, so checkout's clean cannot touch the downloaded durations.
+      - name: Checkout runner script
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/run_tests_parallel.py
+          sparse-checkout-cone-mode: false
+
       - name: Download all slice durations
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -373,6 +396,27 @@ jobs:
         with:
           path: test_durations.json
           key: test-durations-${{ github.run_id }}
+
+      # Rolling per-file history for the measured timeout budgets (see the
+      # generate job): restore the newest entry, append this run, save anew.
+      # Same cache path as the generate job's restore (actions/cache versions
+      # entries by path).
+      - name: Restore previous duration history
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations_history.json
+          key: test-durations-history-restore-${{ github.run_id }}
+          restore-keys: |
+            test-durations-history-
+
+      - name: Append this run to the duration history
+        run: python3 scripts/run_tests_parallel.py --merge-duration-history test_durations.json
+
+      - name: Save duration history
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations_history.json
+          key: test-durations-history-${{ github.run_id }}
 
   e2e:
     needs: [generate, placement]

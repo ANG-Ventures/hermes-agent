@@ -156,7 +156,15 @@ jobs:
       # and all CI jobs share the 60-concurrent hosted cap: 13 in-flight
       # runs at ~20 jobs held the queue at 0 merges in 40 min. Halving the
       # gate's matrix halves its share of that cap.
-      slice_count: ${{ github.event_name == 'merge_group' && 8 || 16 }}
+      #
+      # 2026-09-25 (t_bf25c6b2): merge_group back to 16. At 8 each queue slice
+      # carried ~2x the files and ran 10-12 min, and heavy files sharing a
+      # loaded runner crossed the fixed 300 s per-file wall: 13 of 14 failed
+      # queue runs 15:00-20:30 PT were a per-file timeout (0 assertion
+      # failures), each ejecting its entry and cancelling the builds behind
+      # it. The hosted cap is 120 since 09-25, so the cap-share argument
+      # above no longer binds.
+      slice_count: 16
       test_scope: ${{ needs.detect.outputs.test_scope }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and

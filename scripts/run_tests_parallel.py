@@ -195,6 +195,30 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 
+# Per-file MEASURED budget (t_bf25c6b2). A fixed 300 s ceiling is a coin flip
+# for a file whose cached wall time is 150-280 s: it passes on a fast runner
+# and is SIGKILL'd on a loaded one. Measured 2026-09-25: 13 of 14 failed
+# merge_group runs were two such files, each kill ejecting its queue entry and
+# cancelling every build behind it. The budget is therefore
+#     clamp(_FILE_TIMEOUT_MULTIPLIER x cached_duration, floor, cap)
+# where floor is --file-timeout (default 300 s) and cap is
+# max(floor, _FILE_TIMEOUT_CAP_SECONDS). A genuinely hung file stays bounded
+# by the cap; files with no cached duration keep the floor.
+_FILE_TIMEOUT_MULTIPLIER = 3.0
+_FILE_TIMEOUT_CAP_SECONDS = 900.0
+
+# The duration cache above holds ONE last-observed wall per file, which is a
+# bad budget basis: measured over 399 slice artifacts (2026-09-26 02:24-03:24Z)
+# test_kanban_home_session.py ranged 75-300 s on single attempts and
+# test_execution_flag_detection.py 13-413 s. A budget of 3x a fast sample
+# (75 s -> 300 s floor) kills the next slow run. So the save-durations job also
+# keeps the last _DURATION_HISTORY_KEEP samples per file (main-branch runs) in
+# a separate cache entry, and the budget basis is the p90 of those samples plus
+# the last-observed value. Separate file + cache key so the existing LPT cache
+# entry (and its actions/cache version hash) is untouched.
+_DURATION_HISTORY_FILE = "test_durations_history.json"
+_DURATION_HISTORY_KEEP = 20
+
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
 # but is loudly reported as FLAKY so it gets fixed rather than hidden.
@@ -1282,6 +1306,129 @@ def _load_durations(repo_root: Path) -> dict[str, float]:
         return {}
 
 
+def _load_duration_history(repo_root: Path) -> dict[str, list[float]]:
+    """Read ``test_durations_history.json`` (path -> recent wall samples).
+
+    Missing, corrupt, or wrongly-shaped data -> empty (budgets then fall back
+    to the single-value duration cache, then to the floor)."""
+    path = repo_root / _DURATION_HISTORY_FILE
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[float]] = {}
+    for rel, samples in raw.items():
+        if isinstance(samples, list):
+            vals = [float(v) for v in samples if isinstance(v, (int, float)) and v > 0]
+            if vals:
+                out[str(rel)] = vals
+    return out
+
+
+def _merge_duration_history(
+    history: dict[str, list[float]],
+    new: dict[str, float],
+    keep: int = _DURATION_HISTORY_KEEP,
+) -> dict[str, list[float]]:
+    """Append one run's durations to *history*, keeping the newest *keep*."""
+    merged = {rel: list(samples) for rel, samples in history.items()}
+    for rel, value in new.items():
+        if isinstance(value, (int, float)) and value > 0:
+            merged.setdefault(rel, []).append(round(float(value), 3))
+    return {rel: samples[-keep:] for rel, samples in merged.items() if samples}
+
+
+def _p90(samples: List[float]) -> float:
+    ordered = sorted(samples)
+    return ordered[min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1))))]
+
+
+def _budget_basis(
+    rel: str,
+    durations: dict[str, float],
+    history: dict[str, list[float]] | None = None,
+) -> float | None:
+    """p90 of the file's history samples plus its last-observed duration."""
+    samples = list((history or {}).get(rel, []))
+    last = durations.get(rel)
+    if isinstance(last, (int, float)) and last > 0:
+        samples.append(float(last))
+    return _p90(samples) if samples else None
+
+
+def _measured_file_timeout(duration: float | None, floor: float) -> float:
+    """Return the per-file budget for a file whose basis wall is *duration*.
+
+    ``clamp(3 x duration, floor, max(floor, 900))``. Unknown or non-positive
+    durations get the floor, so an empty cache reproduces the old fixed cap.
+    """
+    cap = max(floor, _FILE_TIMEOUT_CAP_SECONDS)
+    if not isinstance(duration, (int, float)) or duration <= 0:
+        return floor
+    return min(cap, max(floor, _FILE_TIMEOUT_MULTIPLIER * float(duration)))
+
+
+def _file_timeouts_spec(
+    files: List[Path],
+    durations: dict[str, float],
+    repo_root: Path,
+    floor: float = _DEFAULT_FILE_TIMEOUT_SECONDS,
+    history: dict[str, list[float]] | None = None,
+) -> str:
+    """Encode the budgets that exceed *floor* as ``path=secs:path=secs``.
+
+    Only raised budgets are listed, so the string stays tiny (a handful of
+    heavy files) inside the ~350 KB slice matrix. Same separator as
+    ``--files`` so ``_split_pathspec`` parses it.
+    """
+    parts = []
+    for f in files:
+        rel = _format_file(f, repo_root)
+        budget = _measured_file_timeout(
+            _budget_basis(rel, durations, history), floor
+        )
+        if budget > floor:
+            parts.append(f"{rel}={int(round(budget))}")
+    return ":".join(parts)
+
+
+def _parse_file_timeouts(spec: str) -> dict[str, float]:
+    """Parse a ``--file-timeouts`` spec. Malformed entries are ignored
+    (they fall back to the floor, i.e. today's behaviour)."""
+    out: dict[str, float] = {}
+    for item in _split_pathspec(spec or ""):
+        rel, sep, secs = item.rpartition("=")
+        if not sep or not rel:
+            continue
+        try:
+            value = float(secs)
+        except ValueError:
+            continue
+        if value > 0:
+            out[rel] = value
+    return out
+
+
+def _stamp_file_timeouts(
+    matrix: dict, durations: dict[str, float], repo_root: Path
+) -> None:
+    """Stamp each slice row with ``file_timeouts`` (see _file_timeouts_spec).
+
+    The test jobs do not restore the duration cache, so the generate job,
+    which already has it for LPT, carries the budgets to them in the matrix.
+    """
+    history = _load_duration_history(repo_root)
+    for row in matrix.get("slice", []):
+        files = [repo_root / f for f in _split_pathspec(str(row.get("files", "")))]
+        row["file_timeouts"] = _file_timeouts_spec(
+            files, durations, repo_root, history=history
+        )
+
+
 def _save_durations(
     file_times: List[Tuple[Path, float]],
     repo_root: Path,
@@ -1454,7 +1601,31 @@ def main() -> int:
         help=(
             "Per-file wall-clock cap in seconds. On timeout, the pytest "
             "subprocess and its full process tree are SIGKILL'd. "
-            f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min), env: HERMES_TEST_FILE_TIMEOUT."
+            f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min), env: HERMES_TEST_FILE_TIMEOUT. "
+            "This is the FLOOR: a file with a cached duration gets "
+            f"clamp({_FILE_TIMEOUT_MULTIPLIER:g} x duration, floor, "
+            f"max(floor, {_FILE_TIMEOUT_CAP_SECONDS:g}))."
+        ),
+    )
+    parser.add_argument(
+        "--merge-duration-history",
+        metavar="NEW_DURATIONS_JSON",
+        default=None,
+        help=(
+            "CI plumbing (save-durations job): append the per-file durations "
+            f"in NEW_DURATIONS_JSON to {_DURATION_HISTORY_FILE} at the repo "
+            f"root, keep the newest {_DURATION_HISTORY_KEEP} samples per file, "
+            "and exit."
+        ),
+    )
+    parser.add_argument(
+        "--file-timeouts",
+        default="",
+        help=(
+            "Measured per-file budgets as 'path=secs:path=secs' (stamped into "
+            "the slice matrix by --generate-slices). Files not listed use the "
+            "budget computed from the local test_durations.json, else the "
+            "--file-timeout floor. Never lowers a budget below the floor."
         ),
     )
     parser.add_argument(
@@ -1642,7 +1813,9 @@ def main() -> int:
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
-        "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--file-timeout", "--file-timeouts", "--merge-duration-history",
+        "--file-retries", "--slice",
+        "--generate-slices", "--files",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
         "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
@@ -1787,6 +1960,24 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parent.parent
 
+    if args.merge_duration_history:
+        try:
+            new = json.loads(
+                Path(args.merge_duration_history).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"error: cannot read {args.merge_duration_history}: {e}", file=sys.stderr)
+            return 1
+        if not isinstance(new, dict):
+            print("error: durations JSON must be an object", file=sys.stderr)
+            return 1
+        merged = _merge_duration_history(_load_duration_history(repo_root), new)
+        (repo_root / _DURATION_HISTORY_FILE).write_text(
+            json.dumps(merged, indent=1, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(f"duration history: {len(merged)} files", file=sys.stderr)
+        return 0
+
     if args.changed_files_scope:
         print(_plugin_scope_from_changes(sys.stdin.read().splitlines()))
         return 0
@@ -1804,6 +1995,9 @@ def main() -> int:
             )
             _route_blacksmith_slices(
                 scoped_matrix, args.blacksmith_slices, args.event, args.same_repo
+            )
+            _stamp_file_timeouts(
+                scoped_matrix, _load_durations(repo_root), repo_root
             )
             print(
                 f"Test scope: {args.test_scope} + core smoke"
@@ -1889,6 +2083,7 @@ def main() -> int:
         _route_blacksmith_slices(
             matrix, args.blacksmith_slices, args.event, args.same_repo
         )
+        _stamp_file_timeouts(matrix, durations, repo_root)
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))
         return 0
@@ -1992,13 +2187,44 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
+    # Measured per-file budgets: the matrix-stamped spec wins, then the local
+    # duration cache; never below the --file-timeout floor.
+    stamped = _parse_file_timeouts(args.file_timeouts)
+    local_durations = _load_durations(repo_root) if not stamped else {}
+    local_history = _load_duration_history(repo_root) if not stamped else {}
+    file_budgets: dict[Path, float] = {}
+    for file in files:
+        rel = _format_file(file, repo_root)
+        if rel in stamped:
+            budget = min(
+                max(args.file_timeout, _FILE_TIMEOUT_CAP_SECONDS),
+                max(args.file_timeout, stamped[rel]),
+            )
+        else:
+            budget = _measured_file_timeout(
+                _budget_basis(rel, local_durations, local_history),
+                args.file_timeout,
+            )
+        file_budgets[file] = budget
+    raised = sorted(
+        (b, _format_file(f, repo_root))
+        for f, b in file_budgets.items()
+        if b > args.file_timeout
+    )
+    if raised:
+        print(
+            f"Measured per-file budgets above the {args.file_timeout:.0f}s floor: "
+            + ", ".join(f"{rel}={b:.0f}s" for b, rel in reversed(raised)),
+            flush=True,
+        )
+
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures: List[Future] = []
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
+                file_budgets[file], args.file_retries,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
