@@ -957,10 +957,6 @@ def init_agent(
     # tail (the restart-loop backstop / auto-continue signal). Fresh per agent, so
     # the next turn's agent starts unset.
     agent._persist_superseded = False
-    # Set True by the gateway on an internal empty-text auto-resume turn so
-    # build_turn_context stamps the user row ephemeral (dropped from the durable
-    # transcript). Consumed once per turn. Default False = persist normally.
-    agent._suppress_user_turn_persist = False
     # Explicit hard cancellation is separate from redirect/message state. A
     # thread-safe Event makes the cause atomic for auxiliary stream pollers.
     agent._hard_interrupt_requested = threading.Event()
@@ -1084,9 +1080,6 @@ def init_agent(
     # models to "give up" prematurely on complex tasks (#7915).
     agent._budget_exhausted_injected = False
     agent._budget_grace_call = False
-    # True only during the one post-budget grace turn; read by the tool
-    # dispatchers to refuse side-effecting tools then (Guard D-core).
-    agent._in_budget_grace = False
 
     # Optional wall-clock run budget (seconds per run_conversation turn).
     # Explicit constructor arg wins; else resolved from config.yaml
