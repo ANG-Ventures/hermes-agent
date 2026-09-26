@@ -32,9 +32,9 @@ def _load():
 @pytest.mark.parametrize(
     "duration,floor,expected",
     [
-        (None, 300.0, 300.0),   # no cache entry -> today's fixed cap
-        (0.0, 300.0, 300.0),
-        (-5.0, 300.0, 300.0),
+        (None, 300.0, 900.0),   # unmeasured file -> cap (not proven to fit 300)
+        (0.0, 300.0, 900.0),
+        (-5.0, 300.0, 900.0),
         (50.0, 300.0, 300.0),   # 3x below floor -> floor
         (150.0, 300.0, 450.0),  # the edge case that used to be a coin flip
         (240.0, 300.0, 720.0),
@@ -68,6 +68,18 @@ def test_generate_slices_stamps_file_timeouts(monkeypatch, capsys):
     rows = json.loads(capsys.readouterr().out)["slice"]
     by_files = {r["files"]: r["file_timeouts"] for r in rows}
     assert by_files == {HEAVY: f"{HEAVY}=720", LIGHT: ""}
+
+
+def test_unmeasured_file_is_stamped_at_the_cap():
+    mod = _load()
+    spec = mod._file_timeouts_spec([ROOT / HEAVY, ROOT / LIGHT], {LIGHT: 12.0}, ROOT)
+    assert spec == f"{HEAVY}=900"
+
+
+def test_cold_cache_stamps_a_single_default_entry():
+    mod = _load()
+    spec = mod._file_timeouts_spec([ROOT / HEAVY, ROOT / LIGHT], {}, ROOT)
+    assert spec == "*=900"
 
 
 def _run_main(mod, monkeypatch, capsys, extra_args, durations=None):
@@ -105,10 +117,24 @@ def test_runner_never_goes_below_floor_or_above_cap(monkeypatch, capsys):
     assert seen == {HEAVY: 400.0, LIGHT: 900.0}
 
 
+def test_passed_empty_spec_is_authoritative_floor(monkeypatch, capsys):
+    """CI always passes --file-timeouts; '' means 'all measured, all light'.
+    It must NOT fall through to the (absent) local cache -> 900 for all."""
+    mod = _load()
+    seen, _ = _run_main(mod, monkeypatch, capsys, ["--file-timeouts", ""])
+    assert seen == {HEAVY: 300.0, LIGHT: 300.0}
+
+
+def test_runner_applies_default_entry(monkeypatch, capsys):
+    mod = _load()
+    seen, _ = _run_main(mod, monkeypatch, capsys, ["--file-timeouts", f"*=900:{LIGHT}=400"])
+    assert seen == {HEAVY: 900.0, LIGHT: 400.0}
+
+
 def test_runner_uses_local_cache_when_no_spec(monkeypatch, capsys):
     mod = _load()
     seen, _ = _run_main(mod, monkeypatch, capsys, [], durations={HEAVY: 200.0})
-    assert seen == {HEAVY: 600.0, LIGHT: 300.0}
+    assert seen == {HEAVY: 600.0, LIGHT: 900.0}  # LIGHT unmeasured -> cap
 
 
 def test_budget_basis_is_p90_of_history_not_the_last_sample():

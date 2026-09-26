@@ -203,7 +203,8 @@ _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 #     clamp(_FILE_TIMEOUT_MULTIPLIER x cached_duration, floor, cap)
 # where floor is --file-timeout (default 300 s) and cap is
 # max(floor, _FILE_TIMEOUT_CAP_SECONDS). A genuinely hung file stays bounded
-# by the cap; files with no cached duration keep the floor.
+# by the cap. A file with NO measurement (new file, cold cache) gets the cap:
+# nothing proves it fits in the floor, and a false kill ejects a queue entry.
 _FILE_TIMEOUT_MULTIPLIER = 3.0
 _FILE_TIMEOUT_CAP_SECONDS = 900.0
 
@@ -1364,11 +1365,11 @@ def _measured_file_timeout(duration: float | None, floor: float) -> float:
     """Return the per-file budget for a file whose basis wall is *duration*.
 
     ``clamp(3 x duration, floor, max(floor, 900))``. Unknown or non-positive
-    durations get the floor, so an empty cache reproduces the old fixed cap.
+    durations get the cap: an unmeasured file is not known to fit the floor.
     """
     cap = max(floor, _FILE_TIMEOUT_CAP_SECONDS)
     if not isinstance(duration, (int, float)) or duration <= 0:
-        return floor
+        return cap
     return min(cap, max(floor, _FILE_TIMEOUT_MULTIPLIER * float(duration)))
 
 
@@ -1381,10 +1382,14 @@ def _file_timeouts_spec(
 ) -> str:
     """Encode the budgets that exceed *floor* as ``path=secs:path=secs``.
 
-    Only raised budgets are listed, so the string stays tiny (a handful of
-    heavy files) inside the ~350 KB slice matrix. Same separator as
+    Only raised budgets are listed (heavy files + unmeasured files), so the
+    string stays small inside the ~350 KB slice matrix. With no duration data
+    at all (cold cache) every file is unmeasured, so the spec is the single
+    default entry ``*=<cap>`` instead of one entry per file. Same separator as
     ``--files`` so ``_split_pathspec`` parses it.
     """
+    if not durations and not history:
+        return f"*={int(round(max(floor, _FILE_TIMEOUT_CAP_SECONDS)))}"
     parts = []
     for f in files:
         rel = _format_file(f, repo_root)
@@ -1620,12 +1625,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--file-timeouts",
-        default="",
+        default=None,
         help=(
             "Measured per-file budgets as 'path=secs:path=secs' (stamped into "
-            "the slice matrix by --generate-slices). Files not listed use the "
-            "budget computed from the local test_durations.json, else the "
-            "--file-timeout floor. Never lowers a budget below the floor."
+            "the slice matrix by --generate-slices). When passed (even empty) "
+            "it is authoritative: unlisted files use the '*' entry, else the "
+            "--file-timeout floor. When omitted, budgets come from the local "
+            "test_durations.json. Never lowers a budget below the floor."
         ),
     )
     parser.add_argument(
@@ -2189,16 +2195,21 @@ def main() -> int:
 
     # Measured per-file budgets: the matrix-stamped spec wins, then the local
     # duration cache; never below the --file-timeout floor.
-    stamped = _parse_file_timeouts(args.file_timeouts)
-    local_durations = _load_durations(repo_root) if not stamped else {}
-    local_history = _load_duration_history(repo_root) if not stamped else {}
+    # A passed spec (even '') is the generate job's verdict: it lists every
+    # file whose budget is above the floor, so an unlisted file is a measured
+    # light file. The CI test jobs have no local cache, so falling through to
+    # it would make every file "unmeasured".
+    use_stamp = args.file_timeouts is not None
+    stamped = _parse_file_timeouts(args.file_timeouts or "")
+    local_durations = _load_durations(repo_root) if not use_stamp else {}
+    local_history = _load_duration_history(repo_root) if not use_stamp else {}
     file_budgets: dict[Path, float] = {}
     for file in files:
         rel = _format_file(file, repo_root)
-        if rel in stamped:
+        if use_stamp:
             budget = min(
                 max(args.file_timeout, _FILE_TIMEOUT_CAP_SECONDS),
-                max(args.file_timeout, stamped[rel]),
+                max(args.file_timeout, stamped.get(rel, stamped.get("*", 0.0))),
             )
         else:
             budget = _measured_file_timeout(
