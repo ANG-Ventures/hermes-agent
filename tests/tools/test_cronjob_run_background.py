@@ -16,10 +16,69 @@ import json
 import threading
 from unittest.mock import patch
 
+import pytest
+
 from tools.cronjob_tools import (
     _try_dispatch_background_run,
     cronjob,
 )
+
+
+class _BackgroundRuns:
+    """Tracks every runner handed to dispatch_async_delegation in one test.
+
+    The runner executes on the shared daemon executor and resolves
+    ``cron.scheduler.run_one_job`` / ``get_job`` at CALL time. If a test's
+    ``patch()`` blocks exit before the runner has run, a late-scheduled
+    worker fires inside the NEXT test's patches (CI flake 2026-09-26:
+    ``run_one_job`` "Called 2 times", the extra call carrying the previous
+    test's job id). ``join()`` must therefore be called INSIDE the patch
+    scope; teardown fails any test that dispatched without joining.
+    """
+
+    def __init__(self):
+        self._done = []
+        self._joined = 0
+
+    def wrap(self, runner):
+        done = threading.Event()
+        self._done.append(done)
+
+        def _tracked():
+            try:
+                return runner()
+            finally:
+                done.set()
+
+        return _tracked
+
+    def join(self, timeout=10.0):
+        for done in self._done:
+            assert done.wait(timeout), "background cron runner never finished"
+        self._joined = len(self._done)
+
+    def unjoined(self):
+        return len(self._done) - self._joined
+
+
+@pytest.fixture(autouse=True)
+def bg_runs():
+    import tools.async_delegation as ad
+
+    tracker = _BackgroundRuns()
+    real_dispatch = ad.dispatch_async_delegation
+
+    def _dispatch(*args, runner=None, **kwargs):
+        if runner is not None:
+            runner = tracker.wrap(runner)
+        return real_dispatch(*args, runner=runner, **kwargs)
+
+    with patch.object(ad, "dispatch_async_delegation", _dispatch):
+        yield tracker
+    assert tracker.unjoined() == 0, (
+        "test dispatched a background cron run without bg_runs.join() inside "
+        "its patch scope; the runner can fire inside the next test's mocks"
+    )
 
 
 _JOB = {"id": "job-bg-1", "name": "bg run", "prompt": "hi",
@@ -56,7 +115,7 @@ def _bound_session_key(key="agent:main:telegram:dm:123"):
 
 
 class TestBackgroundDispatch:
-    def test_dispatches_and_returns_handle_immediately(self):
+    def test_dispatches_and_returns_handle_immediately(self, bg_runs):
         """With a routable session, run claims sync then dispatches async."""
         run_started = threading.Event()
         run_release = threading.Event()
@@ -72,20 +131,20 @@ class TestBackgroundDispatch:
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
                 res = _try_dispatch_background_run(_job('job-bg-01'))
+                try:
+                    # Returned BEFORE the job finished — that's the whole point.
+                    assert res is not None
+                    assert res["claimed"] is True
+                    assert res["dispatched"] is True
+                    assert res["delegation_id"]
+                    m_claim.assert_called_once_with("job-bg-01", return_job=True)
+                    # The job actually starts on the daemon executor.
+                    assert run_started.wait(timeout=5.0), "job never started in background"
+                finally:
+                    run_release.set()
+                    bg_runs.join()
 
-        try:
-            # Returned BEFORE the job finished — that's the whole point.
-            assert res is not None
-            assert res["claimed"] is True
-            assert res["dispatched"] is True
-            assert res["delegation_id"]
-            m_claim.assert_called_once_with("job-bg-01", return_job=True)
-            # The job actually starts on the daemon executor.
-            assert run_started.wait(timeout=5.0), "job never started in background"
-        finally:
-            run_release.set()
-
-    def test_completion_event_reaches_shared_queue(self):
+    def test_completion_event_reaches_shared_queue(self, bg_runs):
         """The finished run pushes a type='async_delegation' event carrying
         the job outcome onto process_registry.completion_queue."""
         import time
@@ -116,13 +175,14 @@ class TestBackgroundDispatch:
                         break
                     process_registry.completion_queue.put(evt)
                     time.sleep(0.05)
+                bg_runs.join()
         assert found is not None, "completion event never reached the queue"
         assert found["session_key"] == "agent:main:telegram:dm:777"
         assert found["status"] == "completed"
         assert "bg run" in (found.get("summary") or "")
         assert "Next scheduled run" in found["summary"]
 
-    def test_failed_run_reports_error_status_in_event(self):
+    def test_failed_run_reports_error_status_in_event(self, bg_runs):
         import time
 
         from tools.process_registry import process_registry
@@ -148,6 +208,7 @@ class TestBackgroundDispatch:
                         break
                     process_registry.completion_queue.put(evt)
                     time.sleep(0.05)
+                bg_runs.join()
         assert found is not None
         assert found["status"] == "error"
         assert "provider exploded" in (found.get("error") or "")
@@ -274,16 +335,18 @@ class TestInFlightDedupe:
 
 
 class TestCronjobRunToolIntegration:
-    def test_run_action_returns_background_note(self):
+    def test_run_action_returns_background_note(self, bg_runs):
         """cronjob(action='run') surfaces the handle + do-not-wait note."""
         with _bound_session_key():
             with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-12')), \
                  patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
-                 patch("cron.scheduler.run_one_job", return_value=True), \
+                 patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"id": "job-bg-12", "name": "bg run",
                                      "last_status": "ok", "last_error": None}):
                 out = json.loads(cronjob(action="run", job_id="job-bg-12"))
+                bg_runs.join()
+                m_run.assert_called_once()   # ran against THIS test's mock
 
         assert out["success"] is True
         assert out["job"]["executed"] is True
@@ -306,3 +369,39 @@ class TestCronjobRunToolIntegration:
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-bg-13", return_job=True)
         m_run.assert_called_once()
+
+    def test_late_background_runner_stays_inside_its_own_patches(self, bg_runs):
+        """Regression (CI 2026-09-26): a runner the executor schedules late
+        must still fire against the dispatching test's mocks. The worker
+        start is held on a gate until after the dispatch call has returned;
+        join() inside the patch scope is what keeps the run there. Without
+        the join, run_one_job's call_count is 0 at scope exit and the runner
+        fires inside whatever the next test has patched."""
+        import tools.async_delegation as ad
+
+        real_propagate = ad.propagate_context_to_thread
+        start_gate = threading.Event()
+
+        def _late_start(fn):
+            wrapped = real_propagate(fn)
+
+            def _run(*a, **kw):
+                assert start_gate.wait(timeout=10.0)
+                return wrapped(*a, **kw)
+
+            return _run
+
+        with _bound_session_key():
+            with patch.object(ad, "propagate_context_to_thread", _late_start), \
+                 patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-14')), \
+                 patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+                 patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+                 patch("tools.cronjob_tools.get_job",
+                       return_value={"id": "job-bg-14", "last_status": "ok", "last_error": None}):
+                out = json.loads(cronjob(action="run", job_id="job-bg-14"))
+                assert out["job"]["execution_mode"] == "background"
+                assert m_run.call_count == 0   # worker has not started yet
+                start_gate.set()
+                bg_runs.join()
+                m_run.assert_called_once()
+                assert m_run.call_args.args[0]["id"] == "job-bg-14"
