@@ -915,6 +915,18 @@ class TestProviderModelSplit:
         assert "claude-app/claude-app" not in out
         assert "claude-app/claude-opus-4-8" in out
 
+    def test_aggregator_vendor_namespace_keeps_served_provider(self):
+        # openrouter serves "moonshotai/kimi-k3": the slash is part of the model
+        # id, NOT a provider prefix — the banner must name who actually served
+        # (and billed) the turn, same string the runtime footer renders.
+        out = _format_compaction_announce(
+            engine_name="lcm", status="compacted",
+            old_session_id="a", new_session_id="b",
+            old_messages=10, new_messages=3, pre_tokens=1000, post_tokens=100,
+            model="moonshotai/kimi-k3", provider="openrouter",
+        )
+        assert "openrouter/moonshotai/kimi-k3" in out
+
     def test_bare_model_no_provider(self):
         out = _format_compaction_announce(
             engine_name="lcm", status="compacted",
