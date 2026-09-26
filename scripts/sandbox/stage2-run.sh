@@ -48,8 +48,16 @@ fi
 home_mounts+=(--bind "$DEV_SANDBOX_ROOT/home" "$DEV_SANDBOX_HOME")
 
 node_env=()
+# nodedir only helps if node-gyp can read the headers from INSIDE the sandbox.
+# The sandbox mounts its own /usr/local, so a host node under /usr/local (the
+# GitHub runner's) would send node-gyp to a directory that does not exist here
+# ("gyp: /usr/local/common.gypi not found" while building node-pty). Leave it
+# unset then; node-gyp fetches headers for the node it actually runs.
 if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
-  node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
+  case "$DEV_SANDBOX_NODE_DIR" in
+    /usr/local | /usr/local/*) ;;
+    *) node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR") ;;
+  esac
 fi
 electron_env=()
 if [ -n "${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" ]; then
