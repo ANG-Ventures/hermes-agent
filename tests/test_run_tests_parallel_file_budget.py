@@ -134,7 +134,17 @@ def test_runner_applies_default_entry(monkeypatch, capsys):
 def test_runner_uses_local_cache_when_no_spec(monkeypatch, capsys):
     mod = _load()
     seen, _ = _run_main(mod, monkeypatch, capsys, [], durations={HEAVY: 200.0})
-    assert seen == {HEAVY: 600.0, LIGHT: 900.0}  # LIGHT unmeasured -> cap
+    # Local path: LIGHT unmeasured keeps the explicit floor (the stamped CI
+    # path is where unmeasured -> cap); a caller's small floor stays binding.
+    assert seen == {HEAVY: 600.0, LIGHT: 300.0}
+
+
+def test_local_small_floor_still_kills_an_unmeasured_file(monkeypatch, capsys):
+    """Regression: the timeout-verdict self-tests pass --file-timeout 8 on an
+    uncached hanging probe; granting it the 900 s cap hung CI slice 4."""
+    mod = _load()
+    seen, _ = _run_main(mod, monkeypatch, capsys, ["--file-timeout", "8"])
+    assert seen == {HEAVY: 8.0, LIGHT: 8.0}
 
 
 def test_budget_basis_is_p90_of_history_not_the_last_sample():

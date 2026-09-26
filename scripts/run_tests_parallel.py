@@ -2212,9 +2212,15 @@ def main() -> int:
                 max(args.file_timeout, stamped.get(rel, stamped.get("*", 0.0))),
             )
         else:
-            budget = _measured_file_timeout(
-                _budget_basis(rel, local_durations, local_history),
-                args.file_timeout,
+            # Local/no-stamp path: an unmeasured file keeps the explicit
+            # --file-timeout floor (a caller passing a small floor, e.g. the
+            # runner's own kill self-tests, must get that kill). The CI queue
+            # always runs the stamped path, where unmeasured files get the cap.
+            basis = _budget_basis(rel, local_durations, local_history)
+            budget = (
+                args.file_timeout
+                if basis is None
+                else _measured_file_timeout(basis, args.file_timeout)
             )
         file_budgets[file] = budget
     raised = sorted(
