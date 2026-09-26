@@ -1,4 +1,4 @@
-"""A printed remedy must survive a real paste at the six residual hint sites.
+"""A printed remedy must survive a real paste at the residual hint sites.
 
 Residual of the #889/#891 unreachable-remedy class. Each site interpolated a
 ``HERMES_HOME``-derived path (or an interpreter/executable path resolved under
@@ -16,11 +16,11 @@ string's shape -- or simulating the paste with ``shlex`` while the
 implementation decides safety with ``shlex`` -- is the tautology round 1 of the
 grandparent card was blocked for.
 
-The six groups, each measured breaking before the fix:
+The groups, each measured breaking before the fix (group 3, the staged
+runtime-parity-check.py copy, was dropped with ``staging/``):
 
 1. ``tools/self_repo_guard.py``   -- ``git clone --shared <root> <scratch>/<task>``
 2. ``plugins/platforms/whatsapp/adapter.py`` -- ``cd <bridge> && <npm> install``
-3. ``staging/scripts/runtime-parity-check.py`` -- ``git -C <TREE> log ...``
 4. ``hermes_cli/doctor.py`` + ``gateway/run.py`` -- ``<sys.executable> -m pip ...``
 5. ``gateway/run.py``             -- ``hermes skills install <path>``
 6. ``hermes_cli/plugins_cmd.py``  -- ``hermes plugins install <source> ...``
@@ -253,95 +253,6 @@ async def _always_true_async(*args, **kwargs):
 
 
 # --------------------------------------------------------------------------
-# 3. staging/scripts/runtime-parity-check.py -- deploys STANDALONE to
-#    ~/.hermes/scripts/ under /usr/bin/python3, where hermes_cli is not
-#    importable, so it carries a verbatim local copy of hint_value.
-# --------------------------------------------------------------------------
-def _load_parity_check(home: Path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("RPC_TREE", str(home / "runtime" / "hermes-agent"))
-    path = REPO_ROOT / "staging" / "scripts" / "runtime-parity-check.py"
-    spec = importlib.util.spec_from_file_location(f"rpc_{uuid.uuid4().hex}", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _drive_nonff_tick(module) -> str:
-    """The #alerts body from the REAL run() on its non-fast-forward branch."""
-    sent: list[tuple[str, str, str]] = []
-    module._notify = lambda ch, title, body: (sent.append((ch, title, body)), True)[1]
-    for noop in (
-        "_check_wrapper",
-        "_check_gateway_shadows",
-        "_check_stale_gateways",
-        "_redrive_pending_restarts",
-        "_check_dev_tree_lineage",
-        # macOS-only: shells out to `launchctl`, which does not exist on a
-        # Linux CI runner. Unrelated to the message builder under test.
-        "_self_heal_deadman",
-    ):
-        setattr(module, noop, lambda: None)
-    module._detector_kinds = lambda: {
-        "behind": "behind", "ahead": "ahead", "dirty": "dirty"
-    }
-    module._fetch_verified = lambda: (True, "deadbeefcafe")
-    module._detect = lambda: {
-        "ok": True,
-        "findings": [{"kind": "behind", "detail": "3 commits behind"}],
-    }
-    # non-FF: `merge-base --is-ancestor` reports non-zero.
-    module._git = lambda *a: subprocess.CompletedProcess(a, 1, "", "")
-
-    module.run()
-    return next(body for _ch, _t, body in sent if "DIVERGED" in body)
-
-
-@requires_bash
-def test_runtime_parity_nonff_hint_pastes_as_one_tree_path(tmp_path, monkeypatch):
-    home = _spaced_home(tmp_path)
-    (home / "state").mkdir(parents=True, exist_ok=True)
-    (home / "runtime" / "hermes-agent").mkdir(parents=True, exist_ok=True)
-
-    module = _load_parity_check(home, monkeypatch)
-    assert " " in str(module.TREE), f"TREE lost the space: {module.TREE}"
-
-    printed = _span(_drive_nonff_tick(module), "git -C")
-    words = _bash_words(printed, str(tmp_path))
-
-    assert words is not None, f"bash refused the printed remedy {printed!r}"
-    assert words == [
-        "git", "-C", str(module.TREE), "log", "--oneline",
-        f"HEAD...{module.DEPLOY_REF}",
-    ], f"printed {printed!r} produced {words!r}"
-
-
-def test_runtime_parity_hint_value_matches_the_shared_choke_point():
-    """The local copy exists only because hermes_cli is unimportable there.
-
-    Pins the two to the same rule so the copy cannot silently drift into a
-    weaker one.
-    """
-    from hermes_cli.cli_hint import hint_value as shared
-
-    home = Path("/tmp/parity-home")
-    module_path = REPO_ROOT / "staging" / "scripts" / "runtime-parity-check.py"
-    spec = importlib.util.spec_from_file_location(f"rpc_{uuid.uuid4().hex}", module_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    for value in [
-        str(home / "My Drive" / "tree"),
-        "/plain/path",
-        "$(id)",
-        "with'quote",
-        "star*glob",
-        "",
-    ]:
-        assert module.hint_value(value) == shared(value), value
-
-
-# --------------------------------------------------------------------------
 # 4. {sys.executable} -- a venv under a spaced HERMES_HOME splits.
 # --------------------------------------------------------------------------
 @requires_bash
@@ -558,9 +469,6 @@ def test_no_residual_site_reintroduces_a_bare_interpolation():
         "plugins/platforms/whatsapp/adapter.py": {
             # :612 returncode arm and :626 exception arm, byte-identical.
             "cd {hint_value(str(bridge_dir))} && {hint_value(_npm_bin)} install": 2,
-        },
-        "staging/scripts/runtime-parity-check.py": {
-            "git -C {hint_value(TREE)} log --oneline": 1,
         },
         "hermes_cli/doctor.py": {
             "{hint_value(sys.executable)} -m pip install --force-reinstall certifi": 1,

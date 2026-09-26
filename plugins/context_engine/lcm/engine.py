@@ -593,6 +593,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.threshold_tokens = 0
         self.context_threshold = self._config.context_threshold
         self.threshold_percent = self.context_threshold
+        # Duck-type parity with ContextCompressor: gateway/turn callers read
+        # ``summary_target_ratio`` (idle-compaction floor, JIT threshold
+        # correction) off whichever compressor is installed. Mirror the
+        # configured compression.target_ratio so LCMEngine satisfies that
+        # surface instead of raising AttributeError mid-turn.
+        self.summary_target_ratio = float(self._config.target_ratio)
         self._context_threshold_source = (
             self._config.config_sources.get("context_threshold", "manual_or_default")
             if getattr(self._config, "config_sources", None)

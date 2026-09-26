@@ -193,7 +193,22 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # files that finish in ~100s on a quiet box. The Docker build matrix jobs
 # take 7-10 min anyway, so this headroom costs nothing on total CI wall
 # time while keeping a genuinely hung file bounded.
-_DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
+_DEFAULT_FILE_TIMEOUT_SECONDS = 1800.0
+
+# The hang detector proper (2026-09-25, t_949655a6). A hung file is one that
+# stops EMITTING test lines, not one that is slow. The 300 s wall ceiling
+# above was a slowness budget wearing a hang detector's name: on a
+# self-hosted runner with a 3-CPU quota and 6 workers (2x oversubscribed by
+# design), CPU-heavy files (test_hermes_state_core.py, 157 tests;
+# test_kanban_home_cards.py at 292 s) legitimately need > 300 s of wall time
+# while streaming a PASSED line every few seconds -- and the ceiling killed
+# them at 93 % with 0 failures, ejecting whole merge groups. So: kill when no
+# ``path::test`` line has arrived for ``--idle-timeout`` seconds (a real hang
+# is silent), and keep ``--file-timeout`` only as a large absolute backstop
+# for a file that streams forever. The child runs with PYTHONUNBUFFERED=1 so
+# progress lines reach the pipe as they happen, not at block-buffer flushes.
+_DEFAULT_IDLE_TIMEOUT_SECONDS = 240.0
+_PROGRESS_LINE_RE = re.compile(r"^\S+::\S+")
 
 
 def scaled_file_timeout(base: float, workers: int, effective_cpus: int) -> float:
@@ -605,13 +620,14 @@ def _route_arm_slices(
 
 
 # Paid third rung of the venue ladder: free self-hosted -> free GitHub-hosted
-# -> Blacksmith. Keyed on the GitHub-hosted label a slice already holds, so
-# the arch the ARM/x64-floor routing chose is kept and nothing that is not a
-# GitHub-hosted Linux label (self-hosted pool, Windows, macOS) can ever move.
-_BLACKSMITH_BY_HOSTED = {
-    _HOSTED_RUNNER_LABELS: '["blacksmith-4vcpu-ubuntu-2404"]',
-    '["ubuntu-24.04-arm"]': '["blacksmith-4vcpu-ubuntu-2404-arm"]',
-}
+# -> Blacksmith. Blacksmith is x64-ONLY (t_56b21c1e): its ARM runners are
+# Ampere Neoverse-N1 (~1,340 single-thread vs GitHub ARM N2 ~1,874; our
+# pytest slices ran 299 s vs 204 s), while Blacksmith x64 (~4,259) beats
+# GitHub x64 (2,268-3,500). So only GitHub-hosted x64 slices ever move; ARM,
+# self-hosted, Windows and macOS labels are never touched, and no emitted
+# label may be a Blacksmith ARM label (ci_speed_lint R13 enforces it).
+_BLACKSMITH_RUNNER_LABELS = '["blacksmith-4vcpu-ubuntu-2404"]'
+assert "-arm" not in _BLACKSMITH_RUNNER_LABELS, "Blacksmith is x64-only"
 # Events whose code is trusted to run on a paid third-party runner. A
 # pull_request additionally needs its head in this repository (no forks).
 _BLACKSMITH_TRUSTED_EVENTS = {"push", "merge_group"}
@@ -631,10 +647,11 @@ def _route_blacksmith_slices(
     event: str | None,
     same_repo: str | None,
 ) -> None:
-    """Move the LAST N GitHub-hosted slices (by index) to Blacksmith.
+    """Move the LAST N GitHub-hosted x64 slices (by index) to Blacksmith x64.
 
     Runs after self-hosted and ARM routing, so it only ever takes slices that
-    would otherwise have queued on GitHub-hosted runners. ``raw_count``
+    would otherwise have queued on GitHub-hosted x64 runners; ARM slices stay
+    on GitHub ARM (Blacksmith ARM is slower). ``raw_count``
     unset/0/invalid, or an untrusted event (fork PR, schedule, dispatch, an
     unknown event), leaves the matrix untouched.
     """
@@ -661,10 +678,10 @@ def _route_blacksmith_slices(
             file=sys.stderr,
         )
         return
-    hosted = [s for s in matrix["slice"] if s["runs_on"] in _BLACKSMITH_BY_HOSTED]
+    hosted = [s for s in matrix["slice"] if s["runs_on"] == _HOSTED_RUNNER_LABELS]
     chosen = sorted(hosted, key=lambda s: s["index"])[-count:]
     for slice_ in chosen:
-        slice_["runs_on"] = _BLACKSMITH_BY_HOSTED[slice_["runs_on"]]
+        slice_["runs_on"] = _BLACKSMITH_RUNNER_LABELS
     print(f"Blacksmith: {len(chosen)} slice(s) routed", file=sys.stderr)
 
 
@@ -797,6 +814,7 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    idle_timeout: float | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -830,8 +848,12 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
+    # idle_timeout is threaded only when set: _run_one_file_once derives the
+    # default itself, and callers/tests that stub it with the historical
+    # 4-positional shape keep working.
+    _extra = () if idle_timeout is None else (idle_timeout,)
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, *_extra
     )
     attempt = 0
     # A timed-out attempt is NOT retried here: re-running it at once under the
@@ -841,7 +863,7 @@ def _run_one_file(
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, *_extra
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -864,13 +886,68 @@ _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+def _wait_with_progress(
+    proc: "subprocess.Popen[str]",
+    started: float,
+    file_timeout: float,
+    idle_timeout: float,
+) -> Tuple[str, str | None]:
+    """Drain ``proc.stdout`` live; return ``(output, kill_reason, finalize)``.
+
+    ``kill_reason`` is ``None`` when pytest exited on its own, ``"idle"`` when
+    no ``path::test`` progress line arrived for ``idle_timeout`` seconds (the
+    hang signature), or ``"wall"`` when ``file_timeout`` elapsed while the
+    file was still progressing (the absolute backstop). The caller kills the
+    tree; this function never does.
+    """
+    chunks: List[str] = []
+    last_progress = [started]
+
+    def _pump() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            chunks.append(line)
+            if _PROGRESS_LINE_RE.match(line):
+                last_progress[0] = time.monotonic()
+
+    pump = threading.Thread(target=_pump, daemon=True)
+    pump.start()
+    reason: str | None = None
+    while True:
+        try:
+            proc.wait(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        if now - last_progress[0] > idle_timeout:
+            reason = "idle"
+            break
+        if now - started > file_timeout:
+            reason = "wall"
+            break
+    if reason is None:
+        pump.join(timeout=10)
+
+    def _finalize() -> str:
+        # After the caller kills the tree the pipe hits EOF and the pump
+        # yields the in-flight partial line (the nodeid of the hung test).
+        pump.join(timeout=10)
+        return "".join(chunks)
+
+    return "".join(chunks), reason, _finalize
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    idle_timeout: float | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
+    if idle_timeout is None:
+        idle_timeout = _DEFAULT_IDLE_TIMEOUT_SECONDS
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
 
     # Give this subprocess its own pytest temp root.
@@ -897,6 +974,10 @@ def _run_one_file_once(
     # skipping writing bytecode because we're running a bunch of parallel
     # python processes on the same code (fork parity)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Progress lines must reach our pipe as pytest prints them (the idle
+    # detector below reads them live); a block-buffered stdout would look
+    # like a hang for the whole buffer's worth of tests.
+    env["PYTHONUNBUFFERED"] = "1"
     private_basetemp: Path | None = None
     if not any(
         arg == "--basetemp" or arg.startswith("--basetemp=")
@@ -942,21 +1023,35 @@ def _run_one_file_once(
         except (ProcessLookupError, PermissionError):
             pgid = None
 
+    idle_killed = False
     try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
+        output, kill_reason, finalize_output = _wait_with_progress(
+            proc, subproc_start, file_timeout, idle_timeout
+        )
+        if kill_reason is None:
+            rc = proc.returncode
+        else:
+            raise subprocess.TimeoutExpired(cmd, file_timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
+        idle_killed = kill_reason == "idle"
         _kill_tree(proc, pgid=pgid)
         try:
-            output, _ = proc.communicate(timeout=10)
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            output = "(file timeout exceeded; output unavailable)"
+            pass
+        output = finalize_output()
         rc = 124  # de facto convention for "killed by timeout".
-        output = (
-            f"({file_timeout:.0f}s exceeded; "
-            f"process tree SIGKILL'd)\n{output}"
-        )
+        if idle_killed:
+            output = (
+                f"(no test progress for {idle_timeout:.0f}s -- hang; "
+                f"process tree SIGKILL'd)\n{output}"
+            )
+        else:
+            output = (
+                f"({file_timeout:.0f}s absolute ceiling exceeded while still "
+                f"progressing; process tree SIGKILL'd)\n{output}"
+            )
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
@@ -985,6 +1080,9 @@ def _run_one_file_once(
         summary.update(_parse_timeout_progress(output))
         summary["timed_out"] = 1
         summary["timeout_secs"] = int(file_timeout)
+        if idle_killed:
+            summary["idle_killed"] = 1
+            summary["idle_secs"] = int(idle_timeout)
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
         # Treat as a pass (a correctly marker-filtered file SHOULD be a
@@ -1058,7 +1156,10 @@ def _format_timeout_verdict(output: str, summary: dict) -> str:
     tests/x.py::test_foo``. Each clause is emitted only when the evidence for
     it is actually present in the captured output — no invented numbers.
     """
-    parts = [f"TIMED OUT after {summary.get('timeout_secs', 0)}s"]
+    if summary.get("idle_killed"):
+        parts = [f"HUNG: no test progress for {summary.get('idle_secs', 0)}s"]
+    else:
+        parts = [f"TIMED OUT after {summary.get('timeout_secs', 0)}s (still progressing)"]
     pct = summary.get("progress_pct")
     if pct is not None:
         parts.append(f"at ~{pct}%")
@@ -1465,12 +1566,27 @@ def main() -> int:
         type=float,
         default=None,
         help=(
-            "Per-file wall-clock cap in seconds. On timeout, the pytest "
-            "subprocess and its full process tree are SIGKILL'd, then the "
-            "file is retried once in isolation after the pool drains. "
+            "Absolute per-file wall-clock backstop in seconds (a file that keeps "
+            "progressing past this is still killed). Hangs are caught much earlier "
+            "by --idle-timeout. On timeout the pytest subprocess and its full "
+            "process tree are SIGKILL'd, then the file is retried once in "
+            "isolation after the pool drains. "
             f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min) "
             "scaled by workers/effective_cpus (never below it); an explicit "
             "value or env HERMES_TEST_FILE_TIMEOUT is used verbatim."
+        ),
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=float(
+            os.environ.get("CI_TEST_IDLE_TIMEOUT", _DEFAULT_IDLE_TIMEOUT_SECONDS)
+        ),
+        help=(
+            "Hang detector: SIGKILL a file's pytest tree when no test progress "
+            "line has been printed for this many seconds. A slow file that keeps "
+            f"passing tests is never killed by this. Default: {_DEFAULT_IDLE_TIMEOUT_SECONDS:.0f}s, "
+            "env: CI_TEST_IDLE_TIMEOUT."
         ),
     )
     parser.add_argument(
@@ -1658,7 +1774,7 @@ def main() -> int:
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
-        "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
         "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
@@ -2022,7 +2138,7 @@ def main() -> int:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
+                args.file_timeout, args.file_retries, args.idle_timeout,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -2047,7 +2163,8 @@ def main() -> int:
                 flush=True,
             )
             _f, rc2, out2, summ2, wall2 = _run_one_file_once(
-                fpath, pytest_passthrough, repo_root, args.file_timeout
+                fpath, pytest_passthrough, repo_root, args.file_timeout,
+                args.idle_timeout,
             )
             idx = next(i for i, (f, s) in enumerate(all_summaries)
                        if f == fpath and s is old_summary)
