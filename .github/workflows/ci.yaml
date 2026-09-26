@@ -131,8 +131,6 @@ jobs:
         id: classify
         uses: ./.github/actions/detect-changes
         with:
-          sparse-checkout: scripts/ci/classify_changes.py
-          sparse-checkout-cone-mode: false
           github-token: ${{ github.token }}
 
   # ─────────────────────────────────────────────────────────────────────
@@ -395,7 +393,7 @@ jobs:
           path: ci-timings-baseline.json
           # Prefix-match: exact key will never hit (run_id differs), so
           # restore-keys finds the most recent baseline from main.
-          key: ci-timings-baseline-never-exact
+          key: ci-timings-baseline-never-exact-${{ github.run_id }}
           restore-keys: |
             ci-timings-baseline-
 

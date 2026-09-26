@@ -61,6 +61,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: scan
     if: always()
+    # 2x measured p90 (35 s over 10 runs, max 65 s), floored at 10.
+    timeout-minutes: 10
     outputs:
       review_status: ${{ steps.emit.outputs.review_status }}
     steps:
