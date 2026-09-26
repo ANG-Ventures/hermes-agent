@@ -24,6 +24,18 @@ import pytest
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
+def _bump_mtime(path):
+    """Advance *path*'s mtime by a whole second past its current value.
+
+    ``os.utime(path, None)`` sets mtime to "now", which on filesystems with a
+    coarse timestamp tick (cloud CI runners) can equal the value recorded at
+    baseline a few ms earlier -- the EventBridge mtime gate then sees no change
+    and the poll is skipped. An explicit +1 s guarantees the gate opens.
+    """
+    st = os.stat(path)
+    os.utime(path, (st.st_atime + 1, st.st_mtime + 1))
+
 @pytest.fixture(autouse=True)
 def _isolate_hermes_home(tmp_path, monkeypatch):
     """Redirect HERMES_HOME to a temp directory."""
@@ -1259,7 +1271,7 @@ class TestEventBridgePollE2E:
         conn.commit()
         conn.close()
         # Touch the DB file to update mtime (WAL mode may not update mtime on small writes)
-        os.utime(db_path, None)
+        _bump_mtime(db_path)
 
         # Update sessions.json updated_at to trigger re-check
         sessions_data["agent:main:telegram:dm:new"]["updated_at"] = "2026-03-29T15:00:10"
@@ -1374,7 +1386,7 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        _bump_mtime(db_path)  # bump mtime so the poll gate opens
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1412,7 +1424,7 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
+        _bump_mtime(db_path)
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

@@ -482,3 +482,61 @@ def test_explicit_prune_on_mirror_cannot_corrupt_a_dependent(fleet, precious):
         assert head.returncode == 0
     else:
         assert fsck.returncode != 0 or head.returncode != 0, "control arm did not corrupt"
+
+
+# --- local-path sources (card t_e122e9cd) ------------------------------------
+# A plain ``git clone <path>`` hard-links the source's packs; on 2026-09-25 one
+# ~/.hermes pack had 135 links and every git freshen of it emitted ~135 FSEvents.
+
+
+def _pack_links(repo: Path) -> list:
+    return [p.stat().st_nlink for p in (repo / ".git" / "objects" / "pack").glob("*.pack")]
+
+
+def _local_repo(fleet, origin=None):
+    work = fleet / "localsrc"
+    _git("clone", "-q", "https://github.com/someone/other.git", str(work))
+    _git("repack", "-qad", cwd=work)
+    if origin:
+        _git("remote", "set-url", "origin", origin, cwd=work)
+    assert _pack_links(work) == [1], "fixture must start unshared"
+    return work
+
+
+def test_local_path_source_is_never_hard_linked(fleet):
+    src = _local_repo(fleet)
+    assert kc.clone(str(src), "h") == 0
+    assert (fleet / "h" / "big.txt").read_text().startswith("payload")
+    assert _pack_links(fleet / "h") and all(n == 1 for n in _pack_links(fleet / "h"))
+    assert _pack_links(src) == [1], "source pack gained a hard link"
+    assert not (fleet / "h" / ".git" / "objects" / "info" / "alternates").exists()
+
+
+def test_plain_git_clone_of_a_local_path_does_hard_link(fleet):
+    """Control for the test above: proves the fixture CAN hard-link, so a
+    passing no-link assertion is the helper's doing, not the filesystem's."""
+    src = _local_repo(fleet)
+    _git("clone", "-q", str(src), "plain", cwd=fleet)
+    assert _pack_links(src) == [2]
+
+
+def test_local_source_of_a_fleet_repo_borrows_from_its_mirror(fleet):
+    src = _local_repo(fleet, origin="https://github.com/Kyzcreig/demo.git")
+    # an unpushed local commit must still arrive in the clone
+    (src / "local.txt").write_text("only here\n")
+    _git("add", ".", cwd=src)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "local", cwd=src)
+    assert kc.clone(str(src), "m") == 0
+    mirror = fleet / "mirrors" / "Kyzcreig" / "demo.git"
+    alternates = (fleet / "m" / ".git" / "objects" / "info" / "alternates").read_text()
+    assert alternates.strip() == str(mirror / "objects")
+    assert (fleet / "m" / "local.txt").read_text() == "only here\n"
+    assert all(n == 1 for n in _pack_links(fleet / "m"))
+    assert _pack_links(src) == [1]
+
+
+def test_file_url_and_missing_path_are_not_local_sources(fleet):
+    assert kc.local_source(f"file://{fleet}") is None
+    assert kc.local_source(str(fleet / "does-not-exist")) is None
+    assert kc.local_source("https://github.com/someone/other.git") is None
+    assert kc.local_source(str(fleet)) == fleet

@@ -164,6 +164,13 @@ def test_canonical_ledger_control_caps_admission():
     ("unknown-top-level-field", lambda s: s.update(carry={"2026-09-23": -35})),
     ("boolean-version", lambda s: s.update(version=True)),
     ("float-version", lambda s: s.update(version=1.0)),
+    # t_f459aa52: billed samples feed the admission estimate; a forged sample is corruption.
+    ("sample-over-ceiling", lambda s: s.update(billed_samples={"slice": [36]})),
+    ("sample-zero", lambda s: s.update(billed_samples={"slice": [0]})),
+    ("sample-bool", lambda s: s.update(billed_samples={"slice": [True]})),
+    ("sample-unknown-kind", lambda s: s.update(billed_samples={"macos": [5]})),
+    ("sample-overlong", lambda s: s.update(billed_samples={"slice": [5] * 201})),
+    ("reservation-over-ceiling", lambda s: s["attempts"]["123:9:1"]["jobs"][0].update(reserved_minutes=36)),
 ])
 def test_semantically_corrupt_ledger_refuses_without_put(name, change):
     """Corrupt persisted state => ledger-unavailable on EVERY path: new-key reserve, same-key
@@ -446,3 +453,226 @@ def test_merge_queue_volume_stays_under_hard_limit():
         assert isinstance(result, Reservation), (run, result)
         api.state["attempts"][f"123:{run}:1"]["terminal_on"] = day
     assert len(json.dumps(api.state)) < 400 * 1024
+
+
+def _hosted(name, minutes, labels=("ubuntu-latest",)):
+    """A completed hosted job that ran `minutes` wall-clock minutes (GitHub bills ceil per job)."""
+    return {"name": name, "status": "completed", "labels": list(labels), "runner_name": "GitHub Actions 7",
+            "started_at": "2026-09-23T10:00:00Z", "completed_at": f"2026-09-23T10:{minutes - 1:02d}:30Z"}
+
+
+def test_hosted_reconcile_releases_unused_remainder():
+    """t_38a419e0 F2: a hosted job that billed 9 min of a 35-min reservation returns 26 min to today."""
+    api = Contents()
+    assert isinstance(ledger(api, limit=35).reserve(key(), proposed("a")), Reservation)
+    assert ledger(api, limit=35).reserve(key(2), proposed("b")).plan.jobs[0].reserved_minutes == 0
+    result = ledger(api, limit=35).reconcile(key(), evidence(jobs=[_hosted("a", 9)]))
+    assert result == ReleaseResult(26)
+    assert api.state["daily_totals"] == {"2026-09-23": 9}   # folded at its actual charge
+    assert ledger(api, limit=35).reconcile(key(), evidence(jobs=[_hosted("a", 9)])) == ReleaseResult(0)
+    # 35 - 9 = 26 < 35: still no room for a whole slice; a 20-min e2e fits.
+    e2e = Plan([JobPlacement("e2e", ["ubuntu-latest"], "cloud-overflow", 20)], [], {"mode": "overflow"})
+    got = ledger(api, limit=35).reserve(key(3), e2e)
+    assert got.plan.jobs[0].reserved_minutes == 20 and got.plan.summary["remaining_allowance"] == 6
+
+
+@pytest.mark.parametrize("name,job", [
+    ("unmeasurable-no-timestamps", {"name": "a", "status": "completed", "labels": ["ubuntu-latest"],
+                                    "runner_name": "GitHub Actions 7"}),
+    ("no-runner", dict(_hosted("a", 9), runner_name=None)),
+    ("cancelled", dict(_hosted("a", 9), status="cancelled")),
+    ("backwards-clock", dict(_hosted("a", 9), completed_at="2026-09-23T09:00:00Z")),
+    ("overran-reservation", _hosted("a", 50)),
+])
+def test_hosted_reconcile_charges_full_reservation_without_exact_actual(name, job):
+    api = Contents()
+    ledger(api, limit=35).reserve(key(), proposed("a"))
+    assert ledger(api, limit=35).reconcile(key(), evidence(jobs=[job])).released_minutes == 0, name
+    assert ledger(api, limit=35).reserve(key(2), proposed("b")).plan.jobs[0].reserved_minutes == 0, name
+
+
+def test_admit_and_reconcile_n_runs_daily_totals_agree_with_remaining_allowance():
+    """t_38a419e0 F2: after N admit+reconcile cycles, daily_totals[today] + outstanding rows is the
+    exact complement of remaining_allowance, and daily_totals reads the real charge (not 0)."""
+    api = Contents()
+    limit, day = 6000, "2026-09-23"
+    names = [f"slice {i}/8" for i in range(1, 9)] + ["e2e"]
+    actual = {n: 20 if n != "e2e" else 7 for n in names}
+    plan = Plan([JobPlacement(n, ["ubuntu-latest"], "cloud-overflow", 20 if n == "e2e" else 35) for n in names],
+                [], {"mode": "overflow"})
+    charged = 0
+    for run in range(1, 13):
+        got = ledger(api, day=day, limit=limit).reserve(key(run), plan)
+        assert isinstance(got, Reservation) and got.plan.summary["reserved_minutes"] == 300
+        rr = ledger(api, day=day, limit=limit).reconcile(key(run), evidence(
+            run=run, jobs=[_hosted(n, actual[n]) for n in names]))
+        assert rr == ReleaseResult(300 - sum(actual.values()))
+        charged += sum(actual.values())
+        state = api.state
+        outstanding = Ledger._consumed({**state, "daily_totals": {}}, day)
+        assert state["daily_totals"].get(day, 0) + outstanding == Ledger._consumed(state, day) == charged
+    assert api.state["attempts"] == {} and api.state["daily_totals"] == {day: 12 * 167}
+    probe = ledger(api, day=day, limit=limit).reserve(key(99), proposed("probe"))
+    assert probe.plan.summary["remaining_allowance"] == limit - 12 * 167 - 35
+    # The measured failure: flat reservations drained 6000 min in ~20 runs; actual charge leaves 5.3x more.
+    assert limit - 12 * 167 > limit - 12 * 300
+
+
+def test_reserve_folds_closed_rows_below_soft_limit():
+    """daily_totals must not read 0 while small terminal rows carry the whole day (09-25 ledger)."""
+    api = Contents()
+    ledger(api, limit=70).reserve(key(1), proposed("a"))
+    api.state["attempts"]["123:1:1"]["terminal_on"] = "2026-09-23"
+    ledger(api, limit=70).reserve(key(2), proposed("b"))
+    assert "123:1:1" not in api.state["attempts"] and api.state["daily_totals"] == {"2026-09-23": 35}
+
+
+@pytest.mark.parametrize("name,change", [
+    ("hosted-without-receipt", lambda j: j.update(hosted_minutes=9)),
+    ("hosted-over-reservation", lambda j: j.update(hosted_minutes=36, release_receipt_sha256="0" * 64)),
+    ("hosted-zero", lambda j: j.update(hosted_minutes=0, release_receipt_sha256="0" * 64)),
+    ("hosted-bool", lambda j: j.update(hosted_minutes=True, release_receipt_sha256="0" * 64)),
+    ("hosted-and-released", lambda j: j.update(hosted_minutes=9, released_unemitted=True,
+                                               release_receipt_sha256="0" * 64)),
+    ("hosted-on-outstanding-row", "outstanding"),
+])
+def test_corrupt_hosted_minutes_refused(name, change):
+    api = Contents()
+    ledger(api, day="2026-09-22").reserve(key(9), proposed("old"))
+    row = api.state["attempts"]["123:9:1"]
+    if change == "outstanding":
+        row["jobs"][0].update(hosted_minutes=9, release_receipt_sha256="0" * 64)
+    else:
+        row["terminal_on"] = "2026-09-23"
+        change(row["jobs"][0])
+    api.writes = 0
+    r = ledger(api, limit=35).reserve(key(), proposed("a"))
+    assert isinstance(r, Refusal) and r.incident == "ledger-unavailable", name
+    assert api.writes == 0
+
+
+# --- D4 amendment 2026-09-26 (t_f459aa52): admit at the measured estimate E with headroom M -------
+
+NAMES = [f"slice {i}/8" for i in range(1, 9)] + ["e2e"]
+
+
+def run_plan():
+    """What plan() hands reserve(): every job priced at its timeout ceiling."""
+    return Plan([JobPlacement(n, ["ubuntu-latest"], "cloud-overflow", 20 if n == "e2e" else 35) for n in NAMES],
+                [], {"mode": "cloud-only"})
+
+
+def est_ledger(api, *, limit, headroom=1000, day="2026-09-23"):
+    return Ledger(api, daily_limit=limit, estimate_headroom=headroom,
+                  clock=lambda: datetime.fromisoformat(day + "T12:00:00+00:00"))
+
+
+def sampled(slice_minutes=8, e2e_minutes=2, n=20):
+    return Contents({"version": 1, "attempts": {}, "daily_totals": {},
+                     "billed_samples": {"slice": [slice_minutes] * n, "e2e": [e2e_minutes] * n}})
+
+
+def test_estimate_is_p90_of_ledger_samples():
+    from scripts.ci_overflow_ledger import _estimate
+    state = {"billed_samples": {"slice": list(range(1, 21)), "e2e": [1] * 19}}
+    assert _estimate(state, "slice") == 18          # nearest-rank p90 of 1..20
+    assert _estimate(state, "e2e") == 20            # 19 < MIN_SAMPLES: no estimate, reserve the ceiling
+    assert _estimate({}, "slice") == 35
+
+
+def test_admission_at_estimate_within_headroom():
+    """Positive: with M=1000 of a 1100 day, 100 min admit a whole 8-slice+e2e run at E (8*8+2=66),
+    where the D4 ceiling (300) would have put it all local."""
+    api = sampled()
+    got = est_ledger(api, limit=1100).reserve(key(), run_plan())
+    assert isinstance(got, Reservation)
+    assert [j.reserved_minutes for j in got.plan.jobs] == [8] * 8 + [2]
+    assert all(j.labels == ["ubuntu-latest"] for j in got.plan.jobs)
+    assert got.plan.summary["remaining_allowance"] == 100 - 66
+    assert got.plan.summary["admission_estimate"] == {"slice": 8, "e2e": 2, "headroom": 1000,
+                                                     "samples": {"slice": 20, "e2e": 20}}
+    legacy = ledger(sampled(), limit=100).reserve(key(), run_plan())
+    assert sum(j.reserved_minutes for j in legacy.plan.jobs) == 2 * 35 + 20   # ceiling mode unchanged
+
+
+def test_burst_beyond_cap_minus_headroom_goes_local():
+    """Negative: a burst of concurrent attempts never holds more than limit - M in estimates; the
+    job that would cross it is refused to the pool with the budget reason."""
+    api = sampled()
+    held, local = 0, []
+    for run in range(1, 5):
+        got = est_ledger(api, limit=1100).reserve(key(run), run_plan())
+        held += sum(j.reserved_minutes for j in got.plan.jobs)
+        local += [j for j in got.plan.jobs if j.labels == POOL]
+    assert held <= 100 and held == Ledger._consumed(api.state, "2026-09-23")
+    assert local and all(j.reason == "budget-overrides-cloud-only" and j.reserved_minutes == 0 for j in local)
+    # No headroom at all left once the day's folded spend reaches limit - M.
+    api.state["daily_totals"]["2026-09-23"] = 1100 - 1000
+    api.state["attempts"].clear()
+    assert all(j.labels == POOL for j in est_ledger(api, limit=1100).reserve(key(9), run_plan()).plan.jobs)
+
+
+def test_invalid_headroom_admits_no_cloud():
+    for bad in (-1, "1000", 1.5, True):
+        got = est_ledger(sampled(), limit=6000, headroom=bad).reserve(key(), run_plan())
+        assert all(j.labels == POOL for j in got.plan.jobs), bad
+
+
+def test_reconcile_charges_billed_above_estimate_and_records_samples():
+    """Reconcile keeps charging ceil(billed): above E is charged in full (up to the ceiling), below E
+    refunds; every measured job becomes a sample for the next estimate."""
+    api = sampled()
+    est_ledger(api, limit=1100).reserve(key(), run_plan())
+    jobs = [_hosted(n, 12 if n == "slice 1/8" else 50 if n == "slice 2/8" else 5) for n in NAMES]
+    rr = est_ledger(api, limit=1100).reconcile(key(), evidence(jobs=jobs))
+    # slice1 12 (+4), slice2 capped at 35 (+27), six slices 5 (-3 each), e2e 5 (+3): net +16 charged.
+    assert rr == ReleaseResult(-16)
+    assert api.state["daily_totals"] == {"2026-09-23": 66 + 16}
+    assert api.state["billed_samples"]["slice"][-8:] == [12, 35, 5, 5, 5, 5, 5, 5]
+    assert api.state["billed_samples"]["e2e"][-1] == 5
+    assert est_ledger(api, limit=1100).reconcile(key(), evidence(jobs=jobs)) == ReleaseResult(0)
+
+
+def test_billed_samples_are_bounded():
+    api = sampled(n=200)
+    for run in range(1, 4):
+        est_ledger(api, limit=6000).reserve(key(run), run_plan())
+        est_ledger(api, limit=6000).reconcile(key(run), evidence(run=run, jobs=[_hosted(n, 6) for n in NAMES]))
+    assert len(api.state["billed_samples"]["slice"]) == 200 and api.state["billed_samples"]["slice"][-1] == 6
+
+
+def test_unmeasured_executed_job_at_estimate_charges_ceiling():
+    api = sampled()
+    est_ledger(api, limit=1100).reserve(key(), Plan([JobPlacement("slice 1/8", ["ubuntu-latest"], "cloud-overflow", 35)],
+                                                   [], {"mode": "cloud-only"}))
+    job = {"name": "slice 1/8", "status": "completed", "labels": ["ubuntu-latest"], "runner_name": "GitHub Actions 7"}
+    assert est_ledger(api, limit=1100).reconcile(key(), evidence(jobs=[job])) == ReleaseResult(8 - 35)
+    assert api.state["daily_totals"] == {"2026-09-23": 35}
+
+
+@pytest.mark.parametrize("estimate", [False, True])
+def test_runnerless_cancelled_job_releases_reservation(estimate):
+    """Ride-along (spec 5.3a): cancelled before any runner (runner_name empty, steps=[]) never ran."""
+    api = sampled()
+    make = (lambda: est_ledger(api, limit=1100)) if estimate else (lambda: ledger(api, limit=35))
+    make().reserve(key(), proposed("a"))
+    held = api.state["attempts"]["123:1:1"]["jobs"][0]["reserved_minutes"]
+    job = {"name": "a", "status": "completed", "conclusion": "cancelled", "labels": ["ubuntu-latest"],
+           "runner_name": "", "steps": [], "started_at": "2026-09-23T10:00:00Z", "completed_at": "2026-09-23T10:00:01Z"}
+    assert make().reconcile(key(), evidence(jobs=[job])) == ReleaseResult(held)
+    assert api.state["daily_totals"] == {"2026-09-23": 0}
+
+
+@pytest.mark.parametrize("name,change", [
+    ("has-steps", {"steps": [{"name": "Set up job"}]}),
+    ("had-runner", {"runner_name": "GitHub Actions 7"}),
+    ("steps-unknown", {"steps": None}),
+    ("not-cancelled", {"conclusion": "failure"}),
+])
+def test_cancelled_job_with_execution_evidence_is_not_released(name, change):
+    api = Contents()
+    ledger(api, limit=35).reserve(key(), proposed("a"))
+    job = dict({"name": "a", "status": "completed", "conclusion": "cancelled", "labels": ["ubuntu-latest"],
+                "runner_name": "", "steps": []}, **change)
+    assert ledger(api, limit=35).reconcile(key(), evidence(jobs=[job])).released_minutes <= 0, name
+    assert api.state["daily_totals"] == {"2026-09-23": 35}, name

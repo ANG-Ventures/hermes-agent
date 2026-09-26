@@ -2240,3 +2240,205 @@ def test_stubbed_deploy_oracle_against_a_live_board_is_refused(
     with pytest.raises(prg.SandboxEscape):
         prg.assert_write_allowed(None, deploy_fn=lambda tree, sha: True)
     prg.assert_write_allowed(None, deploy_fn=prg._REAL_IS_DEPLOYED)
+
+
+# ---------------------------------------------------------------------------
+# A stated DEPLOY gate and an owner-held unblock are not merge gates (t_a7287385)
+# ---------------------------------------------------------------------------
+#
+# t_213f5d63 (09-25 04:38-05:58 PT) was spawned five times. Every worker
+# correctly re-blocked "gate = #401 DEPLOYED, not merged"; kanban-pr-gate
+# unblocked it three times on the MERGE of Kyzcreig/pipecat-house-voice#401 —
+# a repo with no local deploy tree, whose reasons never named ``~/.hermes`` —
+# including 63 s after Apollo's own "Apollo owns the unblock" block.
+
+_T213_BODY = (
+    "Derived from t_83146aea / Kyzcreig/pipecat-house-voice PR #401.\n\n"
+    "Gate: #401 must be merged and deployed to the calls server, with enough "
+    "real calls afterwards (target 30 or more answered turns)."
+)
+# The four block-family reasons recorded on t_213f5d63, verbatim, in order.
+_T213_BLOCKS = (
+    ("Gate unmet. #401 (822d1dc) is merged but NOT deployed: live pcv-calls is "
+     "at bfd74f9 and calls-server started 09-24 21:40. There are 0 calls since "
+     "the merge, and 0/247 existing rows have turn_stop. Needs an Apollo deploy "
+     "plus 30 or more real answered turns (no PSTN tests allowed), then "
+     "unblock.", "needs_input"),
+    ("Apollo 04:58 PT: correctly blocked; the gate is DEPLOY not merge. "
+     "kanban-pr-gate auto-unblocked on the #401 merge and respawned run 10107, "
+     "which will only re-block. Apollo owns the unblock: #401 deploys in the "
+     "batch right after Ace's live Phase 3 call, then this waits for 30+ real "
+     "answered turns (no synthetic PSTN). Do not re-dispatch before Apollo "
+     "unblocks.", "capability"),
+    ("Still gated at 05:05 PDT: #401 is not deployed (pcv-calls at bfd74f9, "
+     "calls-server up since 09-24 21:40), and there are 0 turns with "
+     "turn_stop. kanban-pr-gate keeps unblocking this card on the merge; only "
+     "Apollo should unblock, after the deploy plus 30 real answered turns.",
+     "capability"),
+    ("Still gated at 05:58 PDT (5th spawn). pcv-calls is at bfd74f9 and does "
+     "not contain 822d1dc (#401 not deployed); calls-server has been up since "
+     "09-24 21:40; 0 outcome files carry turn_stop. The 05:53 "
+     "TRIAGE-RESOLVE→todo sweep re-dispatched this card before the deploy "
+     "gate was met. Unblock only after #401 is deployed and there are 30+ "
+     "real answered turns.", "dependency"),
+)
+_PCV = "Kyzcreig/pipecat-house-voice"
+
+
+def test_names_deploy_gate_truth_table() -> None:
+    assert prg.names_deploy_gate("#401 is merged but NOT deployed")
+    assert prg.names_deploy_gate("gate = #401 DEPLOYED, not merged")
+    assert prg.names_deploy_gate("needs an Apollo deploy of o/r#7")
+    assert prg.names_deploy_gate("waiting on the redeploy of o/r#7")
+    assert not prg.names_deploy_gate("merge o/r#7 then unblock me")
+    assert not prg.names_deploy_gate("merge o/r#7; no deploy needed")
+    assert not prg.names_deploy_gate("merge o/r#7 (deploy not required)")
+    assert not prg.names_deploy_gate("the deployer.py module needs o/r#7")
+    assert not prg.names_deploy_gate(None)
+
+
+def test_owner_holds_unblock_truth_table() -> None:
+    assert prg.owner_holds_unblock("Apollo owns the unblock: #401 deploys later")
+    assert prg.owner_holds_unblock("only Apollo should unblock, after #401")
+    assert prg.owner_holds_unblock("o/r#7 merged; do not auto-unblock")
+    assert prg.owner_holds_unblock("a human owns the unblock once o/r#7 lands")
+    assert not prg.owner_holds_unblock("merge o/r#7 then unblock me")
+    assert not prg.owner_holds_unblock("Apollo: please unblock after o/r#7")
+    assert not prg.owner_holds_unblock(None)
+
+
+def test_stated_deploy_gate_on_an_unmapped_repo_holds_with_one_comment(
+    kanban_home: Path,
+) -> None:
+    oracle = _DeployOracle()
+    query = _stub({("o/r", 7): _merged("c0ffee00" + "0" * 32)})
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="o/r#7 is merged but NOT deployed yet")
+        for _ in range(3):
+            outcomes = prg.reevaluate_pr_gates(conn, query_fn=query, deploy_fn=oracle)
+            assert [o.action for o in outcomes] == ["awaiting_deploy"]
+        assert kb.get_task(conn, tid).status == "blocked"
+        comments = _comments(conn, tid)
+        assert len(comments) == 1
+        assert "o/r#7 MERGED, awaiting deploy of c0ffee00 (unverifiable" in comments[0]
+        assert "will NOT auto-resolve" in comments[0]
+    assert oracle.calls == []  # no tree to probe; never asked
+
+
+def test_stated_deploy_gate_on_a_mapped_repo_uses_the_tree_check(
+    kanban_home: Path,
+) -> None:
+    """The word alone is a premise: no ``~/.hermes`` mention is needed."""
+    oracle = _DeployOracle()
+    query = _stub({("ANG-Ventures/hermes-home", 605): _merged(_HOME_SHA)})
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn, reason="ANG-Ventures/hermes-home#605 merged, not deployed",
+        )
+        outcomes = prg.reevaluate_pr_gates(conn, query_fn=query, deploy_fn=oracle)
+        assert [o.action for o in outcomes] == ["awaiting_deploy"]
+        oracle.live.add(("~/.hermes", _HOME_SHA))
+        outcomes = prg.reevaluate_pr_gates(conn, query_fn=query, deploy_fn=oracle)
+        assert [o.action for o in outcomes] == ["unblocked"]
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_no_deploy_needed_stays_merge_only(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, reason="merge o/r#7 (no deploy needed)")
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 7): _merged()}),
+        )
+        assert [o.action for o in outcomes] == ["unblocked"]
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_owner_held_reason_is_never_a_candidate(kanban_home: Path) -> None:
+    calls: list = []
+    with kb.connect() as conn:
+        tid = _blocked_card(
+            conn, kind="capability",
+            reason="o/r#7 merged. Apollo owns the unblock.",
+        )
+        outcomes = prg.reevaluate_pr_gates(
+            conn, query_fn=_stub({("o/r", 7): _merged()}, calls=calls),
+        )
+        assert outcomes == []
+        assert calls == []  # no lookup budget spent
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_t213f5d63_replay_through_dispatch_spawns_nothing(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay t_213f5d63's four blocks through real ``dispatch_once`` ticks.
+
+    #401 is MERGED throughout (as it was from 04:17 PT). Before t_a7287385 the
+    first, third-of-kind and fourth blocks were each auto-unblocked by the gate
+    and respawned. Now: 0 spawns, 0 gate_auto_resolved, card stays blocked.
+    """
+    monkeypatch.setattr(
+        prg, "repo_exists", lambda slug: slug.lower() == _PCV.lower(),
+    )
+    gh_calls: list = []
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["gh", "api"] and argv[2] == f"repos/{_PCV}/pulls/401":
+            gh_calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({
+                "state": "closed", "merged_at": "2026-09-25T11:17:05Z",
+                "merge_commit_sha": "822d1dc9" + "0" * 32,
+            }), stderr="")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(prg.subprocess, "run", fake_run)
+    spawns: list = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="t_213f5d63 replay", body=_T213_BODY,
+            assignee="daedalus-opus",
+        )
+    for reason, kind in _T213_BLOCKS:
+        with kb.connect() as conn:
+            # Scaffolding: each recorded block was written by a live run. With
+            # the fix the card never leaves ``blocked``, so re-create that run
+            # by hand (a manual unblock + claim; never a dispatcher spawn).
+            # Block 3 repeats block 2's kind, so BLOCK_RECURRENCE_LIMIT escalates
+            # it to triage (block_loop_detected), exactly as on the live card.
+            status = kb.get_task(conn, tid).status
+            if status == "blocked":
+                assert kb.unblock_task(conn, tid)
+            elif status == "triage":
+                ok, _ = kb.triage_resolve_task(
+                    conn, tid, to="todo", reason="replay scaffolding",
+                )
+                assert ok
+                kb.recompute_ready(conn)
+            assert kb.claim_task(conn, tid)
+            assert kb.block_task(
+                conn, tid, reason=reason, kind=kind,
+                expected_run_id=kb.get_task(conn, tid).current_run_id,
+            )
+        for _ in range(3):
+            with kb.connect() as conn:
+                result = kb.dispatch_once(
+                    conn, spawn_fn=lambda *a, **k: spawns.append(a),
+                )
+                assert tid not in result.gate_auto_resolved
+                assert kb.get_task(conn, tid).status in ("blocked", "triage")
+    assert spawns == []
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM task_events "
+            "WHERE task_id = ? AND kind = 'gate_auto_resolved'", (tid,),
+        ).fetchone()["c"] == 0
+        assert not any(
+            c.startswith("gate satisfied") for c in _comments(conn, tid)
+        )
+        held = [c for c in _comments(conn, tid) if "awaiting deploy" in c]
+        # blocks 1 and 4 are deploy-stated. #401 merged before every block and
+        # pcv-calls has no mapped deploy tree, so main's history rule (#1016,
+        # t_20b94ef5) may classify it as context: held silently OR with one
+        # "awaiting deploy" comment. Never more than one; never unblocked.
+        assert len(held) <= 1, _comments(conn, tid)
+    assert gh_calls  # the gate really evaluated the merged PR

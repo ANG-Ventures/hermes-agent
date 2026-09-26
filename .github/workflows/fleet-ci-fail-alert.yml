@@ -19,6 +19,9 @@ on:
       - "Fleet Secret Scan (gitleaks)"
       - "OSV-Scanner"
       - "Supply Chain Audit"
+      # Non-gating detector (spec L6): PR runs are paths-scoped, so a flake
+      # break from a source-only change first shows on push:main. Page it.
+      - "Nix flake check"
     types:
       - completed
     # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).

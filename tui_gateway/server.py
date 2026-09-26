@@ -219,12 +219,6 @@ _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS = 60
 _TURN_SETTLE_BEFORE_CLOSE_SECONDS = 5.0
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
-_SESSION_CHANGES_ROW_LIMIT = 500
-_SESSION_SYNC_ENABLED_DEFAULT = True
-_SESSION_SYNC_T_SILENCE_DEFAULT = 10.0
-_SESSION_SYNC_POLL_INTERVAL_DEFAULT = 2.5
-_SESSION_SYNC_REFOCUS_DEBOUNCE_DEFAULT = 1.0
-_SESSION_CHANGES_DISABLED_ERROR = 4051
 
 # ── Async RPC dispatch (#12546) ──────────────────────────────────────
 # A handful of handlers block the dispatcher loop in entry.py for seconds
@@ -4918,38 +4912,6 @@ def _load_desktop_auto_resume_config(cfg: dict | None = None) -> dict[str, Any]:
             agent_cfg.get("restart_loop_threshold"),
             _DESKTOP_AUTO_RESUME_REPLAY_THRESHOLD,
             min_value=1,
-        ),
-    }
-
-
-def _load_session_sync_config(cfg: dict | None = None) -> dict[str, Any]:
-    """Return dashboard session-sync config with config.yaml-only controls."""
-    root = _load_cfg() if cfg is None else cfg
-    dashboard = root.get("dashboard") if isinstance(root, dict) else {}
-    if not isinstance(dashboard, dict):
-        dashboard = {}
-    session_sync = dashboard.get("session_sync")
-    if not isinstance(session_sync, dict):
-        session_sync = {}
-    return {
-        "enabled": is_truthy_value(
-            session_sync.get("enabled"),
-            default=_SESSION_SYNC_ENABLED_DEFAULT,
-        ),
-        "t_silence": _coerce_float_config_value(
-            session_sync.get("t_silence"),
-            _SESSION_SYNC_T_SILENCE_DEFAULT,
-            min_value=0.0,
-        ),
-        "poll_interval": _coerce_float_config_value(
-            session_sync.get("poll_interval"),
-            _SESSION_SYNC_POLL_INTERVAL_DEFAULT,
-            min_value=0.1,
-        ),
-        "refocus_debounce": _coerce_float_config_value(
-            session_sync.get("refocus_debounce"),
-            _SESSION_SYNC_REFOCUS_DEBOUNCE_DEFAULT,
-            min_value=0.0,
         ),
     }
 
@@ -11704,50 +11666,6 @@ def _live_session_payload(
     if clarify := _pending_clarify_request_payload(sid):
         payload["pending_clarify"] = clarify
     return _attach_todo_state(payload, session)
-
-
-@method("session.changes")
-def _(rid, params: dict) -> dict:
-    sync_cfg = _load_session_sync_config()
-    if not sync_cfg["enabled"]:
-        return _err(
-            rid,
-            _SESSION_CHANGES_DISABLED_ERROR,
-            "session changes disabled",
-        )
-
-    session_key = str(params.get("session_id") or "").strip()
-    if not session_key:
-        return _err(rid, 4044, "session not found")
-    try:
-        since = int(params.get("since_message_id") or 0)
-    except (TypeError, ValueError):
-        since = 0
-    if since < 0:
-        since = 0
-
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5037)
-    try:
-        if db.get_session(session_key) is None:
-            return _err(rid, 4044, "session not found")
-        rows = db.get_messages_after(
-            session_key,
-            since,
-            limit=_SESSION_CHANGES_ROW_LIMIT,
-        )
-    except Exception as e:
-        return _err(rid, 5038, f"session changes unavailable: {e}")
-
-    messages = _history_to_messages(rows)
-    last_id = since
-    for row in rows:
-        try:
-            last_id = max(last_id, int(row.get("id") or last_id))
-        except (TypeError, ValueError):
-            pass
-    return _ok(rid, {"messages": messages, "last_id": last_id})
 
 
 @method("session.pin")
