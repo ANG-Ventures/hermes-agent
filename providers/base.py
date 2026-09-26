@@ -78,6 +78,20 @@ class ProviderProfile:
     # top-level fields rather than ignoring them.
     supports_prompt_cache_key: bool = False
 
+    # owns_transcript: the provider keeps its OWN copy of the conversation
+    # (a relay over a resident CLI session, resumed by a routing key) and
+    # reconciles what the harness sends against it. For such a lane the
+    # harness-authored interrupt-close row (``_interrupt_close``: the
+    # "Operation interrupted." placeholder or a partial reply appended by
+    # ``close_interrupted_tool_sequence`` on a /stop or gateway restart) is a
+    # reply the provider never produced — its coherence gate refuses to
+    # resume and re-sends the whole history into a fresh session (one full
+    # prompt-cache rewrite per restart per session, 2026-09-25). Opt-in:
+    # profiles that set this have the row OMITTED from the wire; persisted
+    # history is untouched and strict-alternation providers (which need the
+    # row, #48879) keep the default.
+    owns_transcript: bool = False
+
     # ── Model catalog ─────────────────────────────────────────
     # fallback_models: curated list shown in /model picker when live fetch fails.
     # Only agentic models that support tool calling should appear here.

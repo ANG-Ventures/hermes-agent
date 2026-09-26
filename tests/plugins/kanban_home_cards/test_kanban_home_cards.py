@@ -407,6 +407,12 @@ def _restart_and_hook(sid, db):
                                              repair_alternation=True)
     hist, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
     fresh = _load()  # new process: empty in-memory I1 gate
+    # These tests pin the R3 dedupe PREDICATE over persisted rows, not the I5
+    # latency budget (its own tests below). At the production 0.22 s budget a
+    # loaded CI runner's cold state.db read can miss the deadline, and the hook
+    # then fails open to INJECT by design -- which read as a dedupe regression
+    # (merge_group pr-918, test_R3_K_window_counts_only_active_user_rows).
+    fresh.BUDGET_S = fresh.PROBE_MAX_S
     return hist, fresh.on_pre_llm_call(session_id=sid, platform="discord",
                                        conversation_history=hist)
 

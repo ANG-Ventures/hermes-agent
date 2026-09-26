@@ -5032,6 +5032,14 @@ def _run_job_script(
                 "errors": "replace",
             }
         env = build_subprocess_env()
+        # A script child is a plain script, not an agent process. The gateway
+        # advertises itself via AI_AGENT / HERMES_AGENT in its OWN os.environ
+        # (gateway.run.main), so without this every cron script inherited the
+        # agent marker and fleet tooling keyed on it (the gh shim's profile-wins
+        # lane resolution) misclassified laned no_agent crons as the gateway
+        # profile (t_7fee0f83). Any agent a script launches re-advertises itself.
+        for _agent_marker in ("AI_AGENT", "HERMES_AGENT"):
+            env.pop(_agent_marker, None)
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
@@ -7043,6 +7051,15 @@ def run_job(
                 resolve_exc,
             )
             fb_list = get_fallback_chain(_cfg)
+            # A job that declares its OWN ``fallback`` chain must get that chain
+            # here too, not only mid-run. Otherwise a primary that fails at
+            # resolve time (e.g. "Codex credential is in cooldown") walks the
+            # GLOBAL chain and the job's declared, pool-diverse net is never
+            # consulted (debug-log-analysis / weekly-pr-sweep: codex cooldown ->
+            # global claude-bpr rung -> HTTP 503 "no eligible sub", 2026-09-21).
+            # Jobs without their own chain keep the global chain unchanged.
+            if job.get("fallback"):
+                fb_list = _resolve_job_fallback_chain(job, fb_list, job_id) or []
             runtime = None
             for entry in fb_list:
                 if not isinstance(entry, dict):

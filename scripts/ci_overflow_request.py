@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate-side CI overflow outputs: the all-local matrix and the placement request.
+"""Generate-side CI overflow outputs: the static and all-local matrices and the placement request.
 
 Runs in tests.yml's ``generate`` job right after ``run_tests_parallel.py
 --generate-slices``. Slice membership is computed ONCE by that generator; this
-script only relabels (``local_matrix``) and summarises (request artifact). The
+script only relabels (``local_matrix``, placement's INPUT), passes the static split
+through (``static_matrix``, the no-plan FALLBACK) and summarises (request artifact). The
 request carries slice ids, the core flag and duration weights — never file
 lists, test contents or shell (spec §5.1, parsed by ci_overflow_plan.parse_request).
 """
@@ -26,6 +27,17 @@ from scripts import run_tests_parallel as rtp  # noqa: E402
 LOCAL_RUNS_ON = json.dumps(POOL, separators=(",", ":"))
 E2E_JOB_ID = "e2e"
 LEGACY_NOTE = "policy=legacy, excluded_from_overflow_budget"
+
+
+def static_matrix(matrix: dict) -> dict:
+    """The no-plan fallback: the generator's own split, labels untouched.
+
+    Honours CI_RUNNER_LABELS + CI_SELF_HOSTED_SLOTS (and the ARM/x64 routing) exactly
+    as the generator stamped them. tests.yml selects this (generate.outputs.matrix)
+    whenever placement has no validated plan — never ``local_matrix``, which pins
+    every slice to the X64 pool and wedged the queue on a drained pool (2026-09-25).
+    """
+    return copy.deepcopy(matrix)
 
 
 def local_matrix(matrix: dict) -> dict:
@@ -69,6 +81,7 @@ def main(argv=None) -> int:
     request = build_request(matrix, durations, e2e_files)
     (args.out_dir / "request.json").write_text(json.dumps(request, separators=(",", ":")) + "\n", encoding="utf-8")
     (args.out_dir / "local_matrix.json").write_text(json.dumps(local_matrix(matrix)), encoding="utf-8")
+    (args.out_dir / "static_matrix.json").write_text(json.dumps(static_matrix(matrix)), encoding="utf-8")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary and (args.event != "merge_group" or args.managed.lower() != "true"):
         with open(summary, "a", encoding="utf-8") as fh:

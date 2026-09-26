@@ -686,6 +686,10 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+# GitHub App identity lanes (hermes-home spec plans/2026-09-25_github-app-identities D3): every
+# hermes process -- gateway, `hermes -p X` child, kanban worker -- is an AGENT whose GitHub lane comes
+# from its profile (gh shim profile_map). An inherited lane env var must never reach its children.
+os.environ.pop("HERMES_GH_LANE", None)
 
 # ---------------------------------------------------------------------------
 # Kanban worker authority — consume the dispatcher's single-use grant.

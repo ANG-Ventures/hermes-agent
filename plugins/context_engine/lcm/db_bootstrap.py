@@ -2711,6 +2711,12 @@ def _record_integrity_failed(
     )
 
 
+_SCAN_DETAIL_STRUCTURAL = "structural repair needed"
+_SCAN_DETAIL_PARITY = "content/index row-count mismatch (parity check)"
+# Flags a parity-only scan is qualified to retract (it re-checks exactly these).
+_PARITY_LEVEL_DETAILS = frozenset({_SCAN_DETAIL_STRUCTURAL, _SCAN_DETAIL_PARITY})
+
+
 def _clear_integrity_failed(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
     ensure_metadata_table(conn)
     conn.execute("DELETE FROM metadata WHERE key = ?", (_integrity_failed_key(spec),))
@@ -2812,12 +2818,9 @@ def _run_background_integrity_scan(
             # check; the deep FTS5 integrity-check itself only runs when ITS
             # (longer) interval is due.
             if _fts_needs_rebuild_structural(scan_conn, spec):
-                result = {"status": "fail", "detail": "structural repair needed"}
+                result = {"status": "fail", "detail": _SCAN_DETAIL_STRUCTURAL}
             elif _fts_count_parity_mismatch(scan_conn, spec):
-                result = {
-                    "status": "fail",
-                    "detail": "content/index row-count mismatch (parity check)",
-                }
+                result = {"status": "fail", "detail": _SCAN_DETAIL_PARITY}
             elif deep:
                 result = check_external_content_fts_integrity(scan_conn, spec)
             else:
@@ -2835,7 +2838,14 @@ def _run_background_integrity_scan(
                 _record_integrity_checked(meta_conn, spec, now=started_at)
                 _clear_integrity_failed(meta_conn, spec)
             elif status == "parity_pass":
-                _clear_integrity_failed(meta_conn, spec)
+                # A parity pass vouches only for what parity can see (structure,
+                # row counts). It must not erase a DEEP integrity-check failure
+                # (same-row-count drift parity is blind to): that flag stays until
+                # a deep pass or a repair. Erasing it made an ordinary open hide
+                # real corruption from `/lcm doctor` whenever this scan ran.
+                prior = load_integrity_failed(meta_conn, spec)
+                if prior is not None and prior["detail"] in _PARITY_LEVEL_DETAILS:
+                    _clear_integrity_failed(meta_conn, spec)
             elif status == "fail":
                 _record_integrity_failed(
                     meta_conn, spec, detail=result.get("detail", ""), now=started_at
