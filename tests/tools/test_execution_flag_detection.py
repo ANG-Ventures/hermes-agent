@@ -379,8 +379,10 @@ def _time_benign_segments(count):
 
 def test_benign_segment_scaling_benchmark():
     """Retain real metrics without making correctness depend on wall-clock ratios."""
-    small, small_result = _time_benign_segments(2_000)
-    large, large_result = _time_benign_segments(4_000)
+    # Detection is super-linear in segment count (measured 1k=14s on a quiet
+    # M3 Ultra); 2k+4k took 233s and hit the CI per-file wall under load.
+    small, small_result = _time_benign_segments(250)
+    large, large_result = _time_benign_segments(500)
 
     assert small_result == (False, None, None)
     assert large_result == (False, None, None)

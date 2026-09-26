@@ -114,67 +114,117 @@ def test_walker_catches_a_direct_call_and_ignores_to_thread_payload():
 
 
 # ---------------------------------------------------------------------------
-# One-hop ratchet: sync GatewayRunner helpers that reach ``self.session_store``
+# One-hop ratchet: sync GatewayRunner helpers that reach a BLOCKING store method
 # ---------------------------------------------------------------------------
 #
 # ``test_async_session_store`` forbids ``self.session_store.X(...)`` directly in
 # an ``async def``.  The t_ac9e21cf stall slipped past it one hop away: an async
 # body called a SYNC runner method, and THAT method called the store (which
 # takes ``SessionStore._lock``).  This ratchet flags every direct call, from an
-# ``async def``, to a sync ``GatewayRunner`` method whose body references
-# ``session_store``.  Existing sites are pinned by name below; the list may only
-# shrink.  A new site must be offloaded (``asyncio.to_thread`` or
-# ``self.async_session_store``) instead of being added here.
+# ``async def``, to a sync ``GatewayRunner`` method that reaches a BLOCKING
+# ``SessionStore`` member: one that takes ``_lock`` or touches ``_db`` (SQLite),
+# directly or through other store methods (computed from gateway/session.py, so
+# it tracks the store as it changes).  Pure helpers such as
+# ``_generate_session_key`` are not blocking and are not flagged (t_cc8533d1:
+# that narrowing retired 14 ``_session_key_for_source`` pins at once).
+#
+# Remaining pins must carry a reason; the list may only shrink.  A new site must
+# be offloaded (``asyncio.to_thread`` or ``self.async_session_store``) instead.
 KNOWN_ONE_HOP_STORE_CALLS = {
-    # (async caller, sync callee) — burn-down tracked on the follow-up card.
-    ("_announce_switch", "_session_key_for_source"),
-    ("_defer_goal_status_notice_after_delivery", "_session_key_for_source"),
-    ("_handle_message", "_session_key_for_source"),
-    ("_handle_message_with_agent_admitted", "_apply_post_turn_resume_gate"),
-    ("_handle_message_with_agent_admitted", "_is_telegram_boot_redelivered_duplicate"),
-    ("_handle_message_with_agent_admitted", "_persist_telegram_aggregate_constituents"),
-    ("_handle_message_with_agent_admitted", "_session_key_for_source"),
-    ("_handler", "_session_key_for_source"),
-    ("_loop_wakeup_watcher", "_build_process_event_source"),
-    ("_loop_wakeup_watcher", "_session_key_for_source"),
-    ("_maybe_confirm_destructive_slash", "_session_key_for_source"),
+    # _schedule_resume_pending_sessions schedules resume tasks through
+    # StartupResumePool.submit -> asyncio.create_task, so it must run on the
+    # loop. It runs only at boot and on platform reconnect. Since t_cc8533d1,
+    # SessionStore._lock never spans SQLite/fsync, so its locked snapshot
+    # waits only on in-memory critical sections.
     ("_platform_reconnect_watcher", "_schedule_resume_pending_sessions"),
-    ("_post_turn_goal_continuation", "_session_key_for_source"),
-    ("_prepare_auto_resume_decisions", "_reconcile_deferred_restarts_at_boot"),
-    ("_prepare_auto_resume_decisions", "_sweep_resume_requests"),
-    ("_prepare_inbound_message_text", "_session_key_for_source"),
-    ("_request_slash_confirm", "_session_key_for_source"),
     ("_restore_resume_pending_sessions_at_startup", "_schedule_resume_pending_sessions"),
-    ("_restore_telegram_topic_session", "_session_key_for_source"),
-    ("_run_agent_admitted", "_session_key_for_source"),
-    ("_run_secondary_profile_reconnect", "_configure_profile_adapter"),
-    ("_session_expiry_watcher", "_sweep_idle_cached_agents"),
-    ("_start_one_profile_adapters", "_configure_profile_adapter"),
-    ("_stop_impl_body", "_mark_resume_pending_for_shutdown"),
     ("start", "_schedule_resume_pending_sessions"),
-    ("start", "_suspend_stuck_loop_sessions"),
 }
 
+_BLOCKING_STORE_SEEDS = {"_lock", "_db"}
 
-def _sync_runner_methods_touching_store(tree: ast.AST) -> set[str]:
+
+def _blocking_store_members(session_tree: ast.AST) -> set[str]:
+    """SessionStore members that take ``_lock`` or reach ``_db``, transitively."""
+    cls = next(
+        n for n in ast.walk(session_tree)
+        if isinstance(n, ast.ClassDef) and n.name == "SessionStore"
+    )
+    methods = {
+        f.name: f for f in cls.body
+        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    calls: dict[str, set[str]] = {}
+    blocking = set(_BLOCKING_STORE_SEEDS)
+    for name, fn in methods.items():
+        refs = set()
+        for n in ast.walk(fn):
+            if (
+                isinstance(n, ast.Attribute)
+                and isinstance(n.value, ast.Name)
+                and n.value.id == "self"
+            ):
+                refs.add(n.attr)
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+                refs.add(n.value)
+        if refs & _BLOCKING_STORE_SEEDS:
+            blocking.add(name)
+        calls[name] = refs & set(methods)
+    changed = True
+    while changed:
+        changed = False
+        for name, refs in calls.items():
+            if name not in blocking and refs & blocking:
+                blocking.add(name)
+                changed = True
+    return blocking
+
+
+def _is_store_expr(node, aliases: set[str]) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "session_store"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    ) or (isinstance(node, ast.Name) and node.id in aliases)
+
+
+def _reaches_blocking_store_member(fn: ast.AST, blocking: set[str]) -> bool:
+    # Local names bound to the store (``store = self.session_store``,
+    # ``_store = getattr(self, "session_store", None)``).
+    aliases: set[str] = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign) and any(
+            (isinstance(v, ast.Attribute) and v.attr == "session_store")
+            or (isinstance(v, ast.Constant) and v.value == "session_store")
+            for v in ast.walk(n.value)
+        ):
+            aliases.update(t.id for t in n.targets if isinstance(t, ast.Name))
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Attribute) and n.attr in blocking and _is_store_expr(n.value, aliases):
+            return True
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id in {"getattr", "hasattr"}
+            and len(n.args) >= 2
+            and _is_store_expr(n.args[0], aliases)
+            and isinstance(n.args[1], ast.Constant)
+            and n.args[1].value in blocking
+        ):
+            return True
+    return False
+
+
+def _sync_runner_methods_touching_store(tree: ast.AST, blocking: set[str]) -> set[str]:
     cls = next(
         n for n in ast.walk(tree)
         if isinstance(n, ast.ClassDef) and n.name == "GatewayRunner"
     )
-    out = set()
-    for fn in cls.body:
-        if not isinstance(fn, ast.FunctionDef):
-            continue
-        for n in ast.walk(fn):
-            if (
-                isinstance(n, ast.Attribute)
-                and n.attr == "session_store"
-                and isinstance(n.value, ast.Name)
-                and n.value.id == "self"
-            ) or (isinstance(n, ast.Constant) and n.value == "session_store"):
-                out.add(fn.name)
-                break
-    return out
+    return {
+        fn.name for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and _reaches_blocking_store_member(fn, blocking)
+    }
 
 
 def _one_hop_store_calls(tree: ast.AST, callees: set[str]) -> set[tuple[str, str]]:
@@ -205,21 +255,37 @@ def _one_hop_store_calls(tree: ast.AST, callees: set[str]) -> set[tuple[str, str
     return hits
 
 
+def _parse(rel: str) -> ast.AST:
+    path = REPO / rel
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
 def test_one_hop_session_store_calls_on_loop_only_shrink():
-    path = REPO / "gateway" / "run.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    hits = _one_hop_store_calls(tree, _sync_runner_methods_touching_store(tree))
+    tree = _parse("gateway/run.py")
+    blocking = _blocking_store_members(_parse("gateway/session.py"))
+    hits = _one_hop_store_calls(tree, _sync_runner_methods_touching_store(tree, blocking))
     new = sorted(hits - KNOWN_ONE_HOP_STORE_CALLS)
     stale = sorted(KNOWN_ONE_HOP_STORE_CALLS - hits)
     assert not new, (
-        "async def calls a sync GatewayRunner method that reaches session_store "
-        "(SessionStore._lock) on the event loop — wrap it in asyncio.to_thread: "
-        + ", ".join(f"{a} -> {c}" for a, c in new)
+        "async def calls a sync GatewayRunner method that reaches a blocking "
+        "SessionStore member (_lock / state.db) on the event loop — wrap it in "
+        "asyncio.to_thread: " + ", ".join(f"{a} -> {c}" for a, c in new)
     )
     assert not stale, (
         "fixed site(s) still pinned in KNOWN_ONE_HOP_STORE_CALLS — remove them "
         "so the ratchet tightens: " + ", ".join(f"{a} -> {c}" for a, c in stale)
     )
+
+
+def test_blocking_store_members_track_the_real_store():
+    """The callee set is derived from SessionStore, not hand-listed."""
+    blocking = _blocking_store_members(_parse("gateway/session.py"))
+    # Lock-takers and SQLite paths, including transitive ones.
+    for name in ("_ensure_loaded", "mark_resume_pending", "clear_resume_pending",
+                 "has_platform_message_id_answerable", "_save"):
+        assert name in blocking, name
+    # Pure key derivation never blocks (t_cc8533d1 narrowing).
+    assert "_generate_session_key" not in blocking
 
 
 def test_one_hop_walker_fires_on_the_t_ac9e21cf_shape():
@@ -228,11 +294,19 @@ def test_one_hop_walker_fires_on_the_t_ac9e21cf_shape():
         "class GatewayRunner:\n"
         "    def _lookup(self, k):\n"
         "        return self.session_store.lookup_persisted_route_identity(k)\n"
+        "    def _alias(self, k):\n"
+        "        store = getattr(self, 'session_store', None)\n"
+        "        return store._ensure_loaded()\n"
+        "    def _pure(self, s):\n"
+        "        return self.session_store._generate_session_key(s)\n"
         "    async def handle(self, k):\n"
         "        a = self._lookup(k)\n"
         "        b = await asyncio.to_thread(self._lookup, k)\n"
-        "        return a, b\n"
+        "        return a, b, self._alias(k), self._pure(k)\n"
     )
-    callees = _sync_runner_methods_touching_store(bad)
-    assert callees == {"_lookup"}
-    assert _one_hop_store_calls(bad, callees) == {("handle", "_lookup")}
+    blocking = {"lookup_persisted_route_identity", "_ensure_loaded"}
+    callees = _sync_runner_methods_touching_store(bad, blocking)
+    assert callees == {"_lookup", "_alias"}
+    assert _one_hop_store_calls(bad, callees) == {
+        ("handle", "_lookup"), ("handle", "_alias"),
+    }

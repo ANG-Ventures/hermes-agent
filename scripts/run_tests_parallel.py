@@ -195,6 +195,18 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 
+
+def scaled_file_timeout(base: float, workers: int, effective_cpus: int) -> float:
+    """Scale the DEFAULT per-file ceiling by worker oversubscription.
+
+    Workers default to 2x the CPU quota, so each file gets roughly half a CPU
+    and its wall time stretches by the same ratio. A fixed 300s wall turned a
+    file that takes ~80s on a quiet box into a "hang" on a 4-vCPU runner with
+    8 workers (merge groups 36213157250/36213163045/36213168317). Never below
+    ``base``. An explicit --file-timeout / env value is used verbatim.
+    """
+    return base * max(1.0, workers / max(1, effective_cpus))
+
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed
 # but is loudly reported as FLAKY so it gets fixed rather than hidden.
@@ -522,8 +534,46 @@ def _resolve_self_hosted_slots(raw: str | None) -> int | None:
     return value
 
 
-def _route_arm_slices(matrix: dict, raw_count: str | None, repo_root: Path) -> None:
-    """Opt in the lightest non-core slices; invalid counts leave routing alone."""
+def _resolve_x64_hosted_min(raw: str | None) -> int | None:
+    """Normalize ``--x64-hosted-min``; ``None`` keeps the legacy ARM trial.
+
+    Empty/unset, non-integer and negative all mean "no floor" and fall back to
+    the legacy lightest-N selection, so ``CI_X64_HOSTED_MIN=off`` is the
+    rollback for arm-first routing.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        value = -1
+    if value < 0:
+        print(
+            f"warning: --x64-hosted-min {raw!r} is not a non-negative integer; "
+            "using the legacy --arm-hosted-slices selection",
+            file=sys.stderr,
+        )
+        return None
+    return value
+
+
+def _route_arm_slices(
+    matrix: dict,
+    raw_count: str | None,
+    repo_root: Path,
+    raw_x64_min: str | None = None,
+) -> None:
+    """Route eligible slices to ``ubuntu-24.04-arm``.
+
+    ``raw_count`` unset/0/invalid disables ARM entirely (the kill switch).
+    Without an x64 floor, the N lightest non-core slices move to ARM from
+    either venue (the original trial). With ``raw_x64_min`` = M, routing is
+    arm-first: every GitHub-hosted non-core slice moves to ARM except that at
+    least M hosted slices stay x64 as arch canaries — the count is taken after
+    the self-hosted cap, so no ``CI_SELF_HOSTED_SLOTS`` value the placement
+    controller writes can remove them. Self-hosted slices are never moved.
+    The heaviest hosted slices go to ARM (faster there); the lightest stay x64.
+    """
     try:
         count = int(raw_count or 0)
     except ValueError:
@@ -542,8 +592,80 @@ def _route_arm_slices(matrix: dict, raw_count: str | None, repo_root: Path) -> N
             continue
         weight = sum(durations.get(f, 2.0) for f in files)
         candidates.append((weight, slice_["index"], slice_))
-    for _, _, slice_ in sorted(candidates, key=lambda item: item[:2])[:count]:
+    x64_min = _resolve_x64_hosted_min(raw_x64_min)
+    if x64_min is None:
+        chosen = sorted(candidates, key=lambda item: item[:2])[:count]
+    else:
+        hosted = [s for s in matrix["slice"] if s["runs_on"] == _HOSTED_RUNNER_LABELS]
+        budget = max(0, len(hosted) - x64_min)
+        eligible = [c for c in candidates if c[2]["runs_on"] == _HOSTED_RUNNER_LABELS]
+        chosen = sorted(eligible, key=lambda item: (-item[0], item[1]))[:budget]
+    for _, _, slice_ in chosen:
         slice_["runs_on"] = '["ubuntu-24.04-arm"]'
+
+
+# Paid third rung of the venue ladder: free self-hosted -> free GitHub-hosted
+# -> Blacksmith. Keyed on the GitHub-hosted label a slice already holds, so
+# the arch the ARM/x64-floor routing chose is kept and nothing that is not a
+# GitHub-hosted Linux label (self-hosted pool, Windows, macOS) can ever move.
+_BLACKSMITH_BY_HOSTED = {
+    _HOSTED_RUNNER_LABELS: '["blacksmith-4vcpu-ubuntu-2404"]',
+    '["ubuntu-24.04-arm"]': '["blacksmith-4vcpu-ubuntu-2404-arm"]',
+}
+# Events whose code is trusted to run on a paid third-party runner. A
+# pull_request additionally needs its head in this repository (no forks).
+_BLACKSMITH_TRUSTED_EVENTS = {"push", "merge_group"}
+
+
+def _blacksmith_trusted(event: str | None, same_repo: str | None) -> bool:
+    """Trust guard for the Blacksmith rung; fails closed on anything unknown."""
+    event = (event or "").strip()
+    if event in _BLACKSMITH_TRUSTED_EVENTS:
+        return True
+    return event == "pull_request" and (same_repo or "").strip().lower() == "true"
+
+
+def _route_blacksmith_slices(
+    matrix: dict,
+    raw_count: str | None,
+    event: str | None,
+    same_repo: str | None,
+) -> None:
+    """Move the LAST N GitHub-hosted slices (by index) to Blacksmith.
+
+    Runs after self-hosted and ARM routing, so it only ever takes slices that
+    would otherwise have queued on GitHub-hosted runners. ``raw_count``
+    unset/0/invalid, or an untrusted event (fork PR, schedule, dispatch, an
+    unknown event), leaves the matrix untouched.
+    """
+    raw = "" if raw_count is None else str(raw_count).strip()
+    if not raw:
+        return
+    try:
+        count = int(raw)
+    except ValueError:
+        count = -1
+    if count < 0:
+        print(
+            f"warning: --blacksmith-slices {raw_count!r} is not a non-negative "
+            "integer; Blacksmith disabled",
+            file=sys.stderr,
+        )
+        return
+    if not count:
+        return
+    if not _blacksmith_trusted(event, same_repo):
+        print(
+            f"Blacksmith: {count} slice(s) requested but event {event!r} "
+            f"(same_repo={same_repo!r}) is not trusted; staying on GitHub-hosted",
+            file=sys.stderr,
+        )
+        return
+    hosted = [s for s in matrix["slice"] if s["runs_on"] in _BLACKSMITH_BY_HOSTED]
+    chosen = sorted(hosted, key=lambda s: s["index"])[-count:]
+    for slice_ in chosen:
+        slice_["runs_on"] = _BLACKSMITH_BY_HOSTED[slice_["runs_on"]]
+    print(f"Blacksmith: {len(chosen)} slice(s) routed", file=sys.stderr)
 
 
 def _scoped_plugin_matrix(
@@ -712,7 +834,10 @@ def _run_one_file(
         file, pytest_args, repo_root, file_timeout
     )
     attempt = 0
-    while rc != 0 and attempt < retries:
+    # A timed-out attempt is NOT retried here: re-running it at once under the
+    # same load and the same ceiling times out again. main() retries it once
+    # in isolation after the parallel pool drains.
+    while rc != 0 and attempt < retries and not summary.get("timed_out"):
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
@@ -1338,13 +1463,14 @@ def main() -> int:
     parser.add_argument(
         "--file-timeout",
         type=float,
-        default=float(
-            os.environ.get("HERMES_TEST_FILE_TIMEOUT", _DEFAULT_FILE_TIMEOUT_SECONDS)
-        ),
+        default=None,
         help=(
             "Per-file wall-clock cap in seconds. On timeout, the pytest "
-            "subprocess and its full process tree are SIGKILL'd. "
-            f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min), env: HERMES_TEST_FILE_TIMEOUT."
+            "subprocess and its full process tree are SIGKILL'd, then the "
+            "file is retried once in isolation after the pool drains. "
+            f"Default: {_DEFAULT_FILE_TIMEOUT_SECONDS}s ({round(_DEFAULT_FILE_TIMEOUT_SECONDS/60)} min) "
+            "scaled by workers/effective_cpus (never below it); an explicit "
+            "value or env HERMES_TEST_FILE_TIMEOUT is used verbatim."
         ),
     )
     parser.add_argument(
@@ -1409,6 +1535,38 @@ def main() -> int:
         metavar="N",
         default=None,
         help="Route the N lightest non-core slices to ubuntu-24.04-arm (default 0).",
+    )
+    parser.add_argument(
+        "--x64-hosted-min",
+        metavar="M",
+        default=None,
+        help=(
+            "Arm-first routing: with --arm-hosted-slices > 0, move every "
+            "GitHub-hosted non-core slice to ubuntu-24.04-arm except M, which "
+            "stay x64 as canaries. Unset/invalid keeps the lightest-N trial. "
+            "Env/CI source: vars.CI_X64_HOSTED_MIN (workflow default 2)."
+        ),
+    )
+    parser.add_argument(
+        "--blacksmith-slices",
+        metavar="N",
+        default=None,
+        help=(
+            "Paid overflow rung: move the last N GitHub-hosted slices to "
+            "Blacksmith (same arch). Only for --event push/merge_group, or "
+            "pull_request with --same-repo true. Env/CI source: "
+            "vars.CI_BLACKSMITH_SLICES (written by ci-placement.py)."
+        ),
+    )
+    parser.add_argument(
+        "--event",
+        default=None,
+        help="github.event_name, for the Blacksmith trust guard.",
+    )
+    parser.add_argument(
+        "--same-repo",
+        default=None,
+        help="'true' when a pull_request head is in this repository (not a fork).",
     )
     parser.add_argument(
         "--self-hosted-labels",
@@ -1503,6 +1661,7 @@ def main() -> int:
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
+        "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
         "--min-tests", "--strict-noop", "--no-strict-noop",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -1571,13 +1730,21 @@ def main() -> int:
         _effective_cpus,
         force=os.environ.get("HERMES_TEST_WORKERS_FORCE") == "1",
     )
+    if args.file_timeout is None:
+        _env_timeout = os.environ.get("HERMES_TEST_FILE_TIMEOUT")
+        args.file_timeout = (
+            float(_env_timeout) if _env_timeout
+            else scaled_file_timeout(
+                _DEFAULT_FILE_TIMEOUT_SECONDS, args.jobs, _effective_cpus
+            )
+        )
     print(
         format_worker_sizing_log(
             workers=args.jobs,
             effective_cpus=_effective_cpus,
             requested=_requested,
             source=_cpu_source,
-        ),
+        ) + f" file_timeout={args.file_timeout:.0f}s",
         # stderr, not stdout: `--generate-slices` stdout is captured verbatim
         # by CI (`MATRIX=$(...)` → `fromJSON`), so any extra stdout line kills
         # the generate job. stderr still shows in the job log.
@@ -1656,7 +1823,12 @@ def main() -> int:
             args.test_scope, repo_root, self_hosted_slots, self_hosted_labels
         )
         if scoped_matrix is not None:
-            _route_arm_slices(scoped_matrix, args.arm_hosted_slices, repo_root)
+            _route_arm_slices(
+                scoped_matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
+            )
+            _route_blacksmith_slices(
+                scoped_matrix, args.blacksmith_slices, args.event, args.same_repo
+            )
             print(
                 f"Test scope: {args.test_scope} + core smoke"
                 f" ({len(scoped_matrix['slice'])} slices)",
@@ -1735,7 +1907,12 @@ def main() -> int:
             f"Test scope: full ({args.generate_slices} slices)",
             file=sys.stderr,
         )
-        _route_arm_slices(matrix, args.arm_hosted_slices, repo_root)
+        _route_arm_slices(
+            matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
+        )
+        _route_blacksmith_slices(
+            matrix, args.blacksmith_slices, args.event, args.same_repo
+        )
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))
         return 0
@@ -1855,6 +2032,41 @@ def main() -> int:
         for fut in futures:
             fut.result() if fut.exception() is None else None
 
+    # ── Isolated retry of timed-out files ───────────────────────────────
+    # A file killed at the per-file wall while N workers shared the box may be
+    # slow, not hung. Re-run each one ONCE, alone, now that the pool has
+    # drained. Pass => counted as passed and reported as SLOW (fix it); a file
+    # that times out alone too stays failed. --file-retries 0 disables this.
+    slow_rescued: List[Tuple[Path, float, float]] = []
+    if args.file_retries > 0:
+        for entry in [e for e in failures if e[2].get("timed_out")]:
+            fpath, old_output, old_summary = entry
+            print(
+                f"↻ {_format_file(fpath, repo_root)} timed out under load; "
+                "retried in isolation",
+                flush=True,
+            )
+            _f, rc2, out2, summ2, wall2 = _run_one_file_once(
+                fpath, pytest_passthrough, repo_root, args.file_timeout
+            )
+            idx = next(i for i, (f, s) in enumerate(all_summaries)
+                       if f == fpath and s is old_summary)
+            all_summaries[idx] = (fpath, summ2)
+            tests_passed += summ2.get("passed", 0) - old_summary.get("passed", 0)
+            tests_failed += summ2.get("failed", 0) - old_summary.get("failed", 0)
+            tests_skipped += summ2.get("skipped", 0) - old_summary.get("skipped", 0)
+            tests_collected += sum(
+                summ2.get(k, 0) - old_summary.get(k, 0)
+                for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
+            )
+            failures.remove(entry)
+            if rc2 == 0:
+                fail_count -= 1
+                pass_count += 1
+                slow_rescued.append((fpath, float(old_summary.get("timeout_secs", 0)), wall2))
+            else:
+                failures.append((fpath, f"{old_output}\n--- isolated retry ---\n{out2}", summ2))
+
     elapsed = time.monotonic() - started
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
@@ -1922,6 +2134,14 @@ def main() -> int:
         for f, output in _FLAKY_RESULTS:
             print(f"  {_format_file(f, repo_root)}")
             print(output.rstrip())
+
+    if slow_rescued:
+        print()
+        print(f"=== ⚠ {len(slow_rescued)} SLOW file{'s' if len(slow_rescued) != 1 else ''} "
+              "(timed out under load, passed when retried in isolation — make them faster) ===")
+        for f, ceiling, wall in slow_rescued:
+            print(f"  {_format_file(f, repo_root)}  killed at {ceiling:.0f}s in the pool, "
+                  f"{wall:.1f}s alone")
 
     # Save durations for future --slice runs. Each slice writes its own
     # partial test_durations.json; a CI merge step joins them later.

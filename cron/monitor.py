@@ -131,10 +131,10 @@ def _run_monitor_source(job: dict) -> tuple[bool, str]:
     monitor_script = (job.get("monitor_script") or "").strip()
     if monitor_script:
         # Same containment + interpreter rules as the existing `script` field.
-        from cron.scheduler import _run_job_script
+        from cron.scheduler import _job_script_kwargs, _run_job_script
 
         workdir = (job.get("workdir") or "").strip() or None
-        return _run_job_script(monitor_script, workdir=workdir)
+        return _run_job_script(monitor_script, workdir=workdir, **_job_script_kwargs(job))
     monitor_url = (job.get("monitor_url") or "").strip()
     if monitor_url:
         return _fetch_monitor_url(monitor_url)

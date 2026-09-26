@@ -642,6 +642,7 @@ def test_run_slash_session_does_not_leak(kanban_home):
 # --- contract: ONE choke point -------------------------------------------
 
 import ast as _ast
+import functools
 import re as _re
 
 # Writers of tasks.status/assignee/priority/session_id or dispatch-intent
@@ -703,13 +704,18 @@ def _module_src(mod):
     return Path(mod.__file__).read_text(encoding="utf-8")
 
 
+@functools.lru_cache(maxsize=None)
 def _writers():
+    # Slice pre-split lines instead of ast.get_source_segment: that call
+    # re-splits the whole ~1 MB kanban_db.py once per function (quadratic),
+    # which cost ~70s per scan and pushed this file past the CI per-file wall.
     src = _module_src(kb)
+    lines = src.split("\n")
     out = {}
     for node in _ast.parse(src).body:
         if not isinstance(node, _ast.FunctionDef):
             continue
-        seg = _ast.get_source_segment(src, node) or ""
+        seg = "\n".join(lines[node.lineno - 1:node.end_lineno])
         dispatch_intent = any(
             isinstance(call, _ast.Call)
             and isinstance(call.func, _ast.Name)
