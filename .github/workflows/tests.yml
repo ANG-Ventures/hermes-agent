@@ -91,6 +91,15 @@ jobs:
           # this many, which stay x64 as arch canaries whatever K the
           # placement controller writes. Rollback: CI_X64_HOSTED_MIN=off.
           CI_X64_HOSTED_MIN: ${{ vars.CI_X64_HOSTED_MIN || '2' }}
+          # Paid third rung (free self-hosted -> free GitHub-hosted ->
+          # Blacksmith): the last N GitHub-hosted slices move to Blacksmith,
+          # same arch. Written by the host ci-placement.py controller only
+          # under measured hosted contention; unset/0 = off. The generator
+          # enforces the trust guard itself: push, merge_group and same-repo
+          # pull_request only — fork PRs never leave GitHub.
+          CI_BLACKSMITH_SLICES: ${{ vars.CI_BLACKSMITH_SLICES }}
+          EVENT_NAME: ${{ github.event_name }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           MATRIX=$(python3 scripts/run_tests_parallel.py \
             --generate-slices ${{ inputs.slice_count }} \
@@ -98,7 +107,10 @@ jobs:
             --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
             --self-hosted-labels "$CI_RUNNER_LABELS" \
             --arm-hosted-slices="$CI_ARM_HOSTED_SLICES" \
-            --x64-hosted-min="$CI_X64_HOSTED_MIN")
+            --x64-hosted-min="$CI_X64_HOSTED_MIN" \
+            --blacksmith-slices="$CI_BLACKSMITH_SLICES" \
+            --event="$EVENT_NAME" \
+            --same-repo="$SAME_REPO")
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           # A full matrix (~350 KB) exceeds Linux's 128 KB per-env-string limit
           # (E2BIG), so overflow tooling reads it from a file, never env/argv.

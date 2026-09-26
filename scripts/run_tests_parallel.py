@@ -592,6 +592,70 @@ def _route_arm_slices(
         slice_["runs_on"] = '["ubuntu-24.04-arm"]'
 
 
+# Paid third rung of the venue ladder: free self-hosted -> free GitHub-hosted
+# -> Blacksmith. Keyed on the GitHub-hosted label a slice already holds, so
+# the arch the ARM/x64-floor routing chose is kept and nothing that is not a
+# GitHub-hosted Linux label (self-hosted pool, Windows, macOS) can ever move.
+_BLACKSMITH_BY_HOSTED = {
+    _HOSTED_RUNNER_LABELS: '["blacksmith-4vcpu-ubuntu-2404"]',
+    '["ubuntu-24.04-arm"]': '["blacksmith-4vcpu-ubuntu-2404-arm"]',
+}
+# Events whose code is trusted to run on a paid third-party runner. A
+# pull_request additionally needs its head in this repository (no forks).
+_BLACKSMITH_TRUSTED_EVENTS = {"push", "merge_group"}
+
+
+def _blacksmith_trusted(event: str | None, same_repo: str | None) -> bool:
+    """Trust guard for the Blacksmith rung; fails closed on anything unknown."""
+    event = (event or "").strip()
+    if event in _BLACKSMITH_TRUSTED_EVENTS:
+        return True
+    return event == "pull_request" and (same_repo or "").strip().lower() == "true"
+
+
+def _route_blacksmith_slices(
+    matrix: dict,
+    raw_count: str | None,
+    event: str | None,
+    same_repo: str | None,
+) -> None:
+    """Move the LAST N GitHub-hosted slices (by index) to Blacksmith.
+
+    Runs after self-hosted and ARM routing, so it only ever takes slices that
+    would otherwise have queued on GitHub-hosted runners. ``raw_count``
+    unset/0/invalid, or an untrusted event (fork PR, schedule, dispatch, an
+    unknown event), leaves the matrix untouched.
+    """
+    raw = "" if raw_count is None else str(raw_count).strip()
+    if not raw:
+        return
+    try:
+        count = int(raw)
+    except ValueError:
+        count = -1
+    if count < 0:
+        print(
+            f"warning: --blacksmith-slices {raw_count!r} is not a non-negative "
+            "integer; Blacksmith disabled",
+            file=sys.stderr,
+        )
+        return
+    if not count:
+        return
+    if not _blacksmith_trusted(event, same_repo):
+        print(
+            f"Blacksmith: {count} slice(s) requested but event {event!r} "
+            f"(same_repo={same_repo!r}) is not trusted; staying on GitHub-hosted",
+            file=sys.stderr,
+        )
+        return
+    hosted = [s for s in matrix["slice"] if s["runs_on"] in _BLACKSMITH_BY_HOSTED]
+    chosen = sorted(hosted, key=lambda s: s["index"])[-count:]
+    for slice_ in chosen:
+        slice_["runs_on"] = _BLACKSMITH_BY_HOSTED[slice_["runs_on"]]
+    print(f"Blacksmith: {len(chosen)} slice(s) routed", file=sys.stderr)
+
+
 def _scoped_plugin_matrix(
     scope: str,
     repo_root: Path,
@@ -1468,6 +1532,27 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--blacksmith-slices",
+        metavar="N",
+        default=None,
+        help=(
+            "Paid overflow rung: move the last N GitHub-hosted slices to "
+            "Blacksmith (same arch). Only for --event push/merge_group, or "
+            "pull_request with --same-repo true. Env/CI source: "
+            "vars.CI_BLACKSMITH_SLICES (written by ci-placement.py)."
+        ),
+    )
+    parser.add_argument(
+        "--event",
+        default=None,
+        help="github.event_name, for the Blacksmith trust guard.",
+    )
+    parser.add_argument(
+        "--same-repo",
+        default=None,
+        help="'true' when a pull_request head is in this repository (not a fork).",
+    )
+    parser.add_argument(
         "--self-hosted-labels",
         metavar="JSON",
         default=_HOSTED_RUNNER_LABELS,
@@ -1560,7 +1645,7 @@ def main() -> int:
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
-        "--x64-hosted-min",
+        "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
         "--min-tests", "--strict-noop", "--no-strict-noop",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -1717,6 +1802,9 @@ def main() -> int:
             _route_arm_slices(
                 scoped_matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
             )
+            _route_blacksmith_slices(
+                scoped_matrix, args.blacksmith_slices, args.event, args.same_repo
+            )
             print(
                 f"Test scope: {args.test_scope} + core smoke"
                 f" ({len(scoped_matrix['slice'])} slices)",
@@ -1797,6 +1885,9 @@ def main() -> int:
         )
         _route_arm_slices(
             matrix, args.arm_hosted_slices, repo_root, args.x64_hosted_min
+        )
+        _route_blacksmith_slices(
+            matrix, args.blacksmith_slices, args.event, args.same_repo
         )
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))
