@@ -3534,6 +3534,12 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
     if provider_error:
         print(f"kanban: {provider_error}", file=sys.stderr)
         return 2
+    from hermes_cli.model_policy import pinned_sub_provider_error
+
+    pin_error = pinned_sub_provider_error(model, provider)
+    if pin_error:
+        print(f"kanban: {pin_error}", file=sys.stderr)
+        return 2
 
     firepower_reason = parsed.firepower if parsed else None
     guard_error = firepower_guard_error(model, firepower_reason)
