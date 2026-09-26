@@ -33,7 +33,14 @@ on:
     types:
       - completed
     # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
-    branches-ignore: [ci-overflow-ledger]
+    # *THROWAWAY* / *repro* branches: a worker proving a red on purpose is not an
+    # alert (t_2afda99d: daedalus/t_bc0052b9-THROWAWAY-repro paged #alerts 8x for
+    # one deliberately red run, once per re-run attempt).
+    branches-ignore:
+      - ci-overflow-ledger
+      - '**THROWAWAY**'
+      - '**throwaway**'
+      - '**repro**'
 
 permissions:
   contents: read
@@ -105,6 +112,11 @@ jobs:
           WF_NAME: ${{ github.event.workflow_run.name }}
           WF_BRANCH: ${{ github.event.workflow_run.head_branch }}
           WF_SHA: ${{ github.event.workflow_run.head_sha }}
+          # The UPSTREAM run id (not this alert run's GITHUB_RUN_ID): a re-run attempt of the
+          # same failed run re-fires workflow_run; keying on it lets the receiver's
+          # X-GitHub-Delivery idempotency drop the duplicate (t_101c01be: run 36170775010
+          # paged twice, 11:09 and 11:21 PT 2026-09-25).
+          WF_RUN_ID: ${{ github.event.workflow_run.id }}
           WF_URL: ${{ github.event.workflow_run.html_url }}
           WF_ACTOR: ${{ github.event.workflow_run.actor.login }}
           REPO: ${{ github.repository }}
@@ -140,7 +152,7 @@ jobs:
             -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -H "X-GitHub-Event: ${EVENT_TYPE}" \
-            -H "X-GitHub-Delivery: ci-fail-${WF_SHA}-${GITHUB_RUN_ID}" \
+            -H "X-GitHub-Delivery: ci-fail-${WF_RUN_ID}" \
             -H "X-Webhook-Signature: ${SIG}" \
             --data "$BODY")"
           echo "Receiver responded HTTP $CODE"
