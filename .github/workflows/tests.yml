@@ -231,8 +231,13 @@ jobs:
       # only with the explicit switch; no validated plan -> the static split.
       matrix: ${{ fromJSON((github.event_name != 'merge_group' || vars.CI_OVERFLOW_PLACEMENT_ENABLED != 'true') && needs.generate.outputs.matrix || needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.matrix || needs.generate.outputs.matrix) }}
     steps:
+      # Checkout is the largest per-slice fixed cost (t_37cf312c: median 6 s,
+      # mean 10 s, max 89 s on blacksmith-4vcpu for a ~1 GB repo). Blacksmith's
+      # fork of actions/checkout keeps a bare git mirror on a sticky disk and
+      # fetches only the delta. Off Blacksmith (hosted / self-hosted slices)
+      # BLACKSMITH_VM_ID is unset and it runs the upstream checkout code path.
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
 
       - name: Install ripgrep (prebuilt binary)
         run: bash .github/scripts/install-ci-tool.sh ripgrep

@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.hermes_cli._survivor_gh_fake import pr_target, rest_pr
+
 HEAD = "a1" * 20
 MERGE = "b2" * 20
 PR = "example/project#68"
@@ -76,7 +78,7 @@ def remote(monkeypatch):
     def run(args, **kwargs):
         if args and args[0] == "gh":
             calls.append(list(args))
-            return subprocess.CompletedProcess(args, 0, json.dumps(state).encode(), b"")
+            return subprocess.CompletedProcess(args, 0, json.dumps(rest_pr(state)).encode(), b"")
         if "ls-remote" in args:
             calls.append(list(args))
             return subprocess.CompletedProcess(
@@ -271,8 +273,7 @@ def remote_multi(monkeypatch):
     def run(args, **kwargs):
         if args and args[0] == "gh":
             calls.append(list(args))
-            number = args[args.index("view") + 1]
-            slug = args[args.index("--repo") + 1]
+            slug, number = pr_target(args)
             # #848 (landed after this fixture was written) requires a live PR to
             # NAME the card it vouches for; corroborate through headRefName the
             # same way the single-repo fixture above does.
@@ -281,7 +282,7 @@ def remote_multi(monkeypatch):
                        "mergeCommit": {"oid": oid(slug, number)},
                        "headRefName": f"operator/{tid}-landed-elsewhere",
                        "title": "", "body": ""}
-            return subprocess.CompletedProcess(args, 0, json.dumps(payload).encode(), b"")
+            return subprocess.CompletedProcess(args, 0, json.dumps(rest_pr(payload)).encode(), b"")
         return real(args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", run)

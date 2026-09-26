@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.hermes_cli._survivor_gh_fake import rest_pr
+
 from hermes_cli import kanban_db as kb
 
 HEAD = "a1" * 20
@@ -63,7 +65,7 @@ def remote(monkeypatch):
             # narrowing the payload here would make `names_card` inert and
             # silently turn the happy-path tests into refusal tests.
             payload = {k: v for k, v in state.items() if k not in ("missing", "tips")}
-            return subprocess.CompletedProcess(args, 0, json.dumps(payload).encode(), b"")
+            return subprocess.CompletedProcess(args, 0, json.dumps(rest_pr(payload)).encode(), b"")
         # `_ext` shells out as `git ls-remote ...`; `_git` always passes `-C`.
         if args[0] == "git" and len(args) > 1 and args[1] == "ls-remote":
             return subprocess.CompletedProcess(args, 0, state["tips"].encode(), b"")

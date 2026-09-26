@@ -571,7 +571,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--session", default=None, metavar="SESSION_ID",
                           help="Home session to stamp on the card (default: "
-                               "$HERMES_SESSION_ID when set; 'none' = unstamped)")
+                               "$HERMES_SESSION_ID when set; 'none' = unstamped). "
+                               "An explicit --session WINS over a --parent's "
+                               "home; omitted, the child follows the parent's "
+                               "current home.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -912,7 +915,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help="Why --survivor-none has no remote ref; include the follow-up card id.")
     p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
-                                 "gh pr view (state OPEN or MERGED) AND required to name this "
+                                 "the GitHub REST API (state OPEN or MERGED) AND required to name this "
                                  "task; an unverifiable claim refuses the completion. Naming "
                                  "the task in the PR's head BRANCH binds the claim. A match "
                                  "only in the PR title or body is a mention, not a tie to this "
@@ -1581,7 +1584,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                 metavar="REASON",
                 help="Act on a card whose home session is another session "
                      "(or an unhomed card); records a takeover event and "
-                     "posts REASON as a comment the home session sees.",
+                     "posts REASON as a comment the home session sees. On "
+                     "assign/unblock/promote/reclaim/triage-resolve "
+                     "it also RE-HOMES the card to your session (children "
+                     "and pings follow; prev_session_id kept in the event); "
+                     "never on complete, and never for cron/sweep actors. "
+                     "Re-home without a status change: "
+                     "hermes kanban edit <id> --session <sid> --takeover R.",
             )
             _p.add_argument(
                 "--operator",
@@ -2405,6 +2414,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     triage=bool(getattr(args, "triage", False)),
                 ),
                 session_id=_resolve_session_flag(getattr(args, "session", None)),
+                session_explicit=getattr(args, "session", None) is not None,
             )
             task = kb.get_task(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
@@ -4138,6 +4148,44 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, conn
     )
 
 
+def _last_event_id(conn, task_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+#: Events ``complete_task`` records when it does NOT close the card. It
+#: returns a bare bool, so the CLI reads the reason back off the card rather
+#: than printing a generic line (or nothing) while the card stays put
+#: (t_1e080b8d: an operator saw rc=0 and no reason, card still in review).
+_COMPLETION_OUTCOME_EVENTS = {
+    "completion_route_refused": "open-PR review route refused",
+    "completion_routed_to_review": "handoff names still-OPEN PR(s)",
+    "workspace_held": "workspace held",
+}
+
+
+def _completion_outcome(conn, task_id: str, after_event: int) -> str:
+    """Why this ``complete`` call did not mark ``task_id`` done, or ''."""
+    kinds = tuple(_COMPLETION_OUTCOME_EVENTS)
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        f"AND kind IN ({','.join('?' * len(kinds))}) ORDER BY id",
+        (task_id, after_event, *kinds),
+    ).fetchall()
+    parts = []
+    for kind, payload in rows:
+        try:
+            data = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        detail = data.get("reason") or ", ".join(data.get("open_prs") or [])
+        label = _COMPLETION_OUTCOME_EVENTS[kind]
+        parts.append(f"{label}: {detail}" if detail else label)
+    return "; ".join(parts)
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -4208,6 +4256,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
+            last_event = _last_event_id(conn, tid)
             try:
                 done = kb.complete_task(
                     conn, tid,
@@ -4230,13 +4279,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
+            outcome = _completion_outcome(conn, tid, last_event)
             if not done:
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                print(f"cannot complete {tid}: {outcome or '(unknown id or terminal state)'}",
+                      file=sys.stderr)
             else:
                 after = kb.get_task(conn, tid)
                 if getattr(after, "status", None) == "review":
-                    print(f"Routed {tid} to review (handoff names a still-OPEN PR; not done)")
+                    print(f"Routed {tid} to review, NOT done: "
+                          f"{outcome or 'handoff names a still-OPEN PR'}")
                 else:
                     print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -4570,16 +4622,25 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         # or as the operator session that made ``claim --review`` (human lane).
         worker_run = _worker_run_id_for(tid)
         held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
+        parked_session = None
         if held_run is None:
-            print(
-                f"cannot request changes for {tid}: this session does not hold its "
-                f"review run; claim it from the reviewing session first "
-                f"(hermes kanban claim {tid} --review). Delegate children and "
-                f"cron jobs cannot hold a human-lane review claim.",
-                file=sys.stderr,
-            )
-            return 1
-        if args.coverage is not None:
+            # Card parked in ``review`` with nobody holding it: the operator
+            # session opens the review run itself and sends back in ONE txn
+            # (same audit as ``claim --review`` + request-changes). Only a
+            # session that could hold that claim may do this.
+            task = kb.get_task(conn, tid)
+            if task is not None and task.status == "review":
+                parked_session = _operator_review_session_ref()
+            if parked_session is None:
+                print(
+                    f"cannot request changes for {tid}: this session does not hold its "
+                    f"review run; claim it from the reviewing session first "
+                    f"(hermes kanban claim {tid} --review). Delegate children and "
+                    f"cron jobs cannot hold a human-lane review claim.",
+                    file=sys.stderr,
+                )
+                return 1
+        elif args.coverage is not None:
             kb.add_comment(
                 conn, tid, _profile_author(),
                 "review_coverage: " + str(kb.redact_review_value(args.coverage)),
@@ -4590,6 +4651,18 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             tid,
             reason=reason,
             expected_run_id=held_run,
+            **(
+                {
+                    # Open the review run as this session, and record the
+                    # coverage on it inside the same transaction so the
+                    # coverage gate can pass.
+                    "claimer": _profile_author(),
+                    "coverage": args.coverage,
+                    "session_ref": parked_session,
+                }
+                if parked_session is not None
+                else {}
+            ),
         )
         if not ok:
             print(
@@ -4606,7 +4679,11 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                 conn, tid, _profile_author(),
                 "changes requested (human review lane): "
                 + str(kb.redact_review_value(reason)),
-                run_id=held_run, session_ref=session_ref,
+                run_id=(
+                    held_run if held_run is not None
+                    else getattr(kb.latest_run(conn, tid), "id", None)
+                ),
+                session_ref=session_ref,
             )
         print(
             f"Requested changes for {tid}"

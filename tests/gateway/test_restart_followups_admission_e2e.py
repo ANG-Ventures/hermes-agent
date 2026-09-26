@@ -134,7 +134,10 @@ async def _boot(home, platforms, before_boot=None):
     try:
         await asyncio.wait_for(boot.start(), timeout=90)
         for _ in range(150):
-            if reached:
+            # Stop on either terminal outcome: delivered, or a refusal
+            # reported lost. Waiting only on ``reached`` burned the full 15s
+            # budget in every refusal test (~15s x 9 tests of pure idle).
+            if reached or any(LOST in ln for ln in _CAP.lines[mark:]):
                 break
             await asyncio.sleep(0.1)
         await asyncio.sleep(0.5)  # a late refusal / duplicate would land here

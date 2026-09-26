@@ -73,7 +73,6 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
-from hermes_cli.cli_hint import hint_value
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 from gateway.fork_ext.restart_codec import (
@@ -4090,6 +4089,9 @@ _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+# Per-job cron fire-fence wait on the shutdown path (t_8d085477). Must stay
+# far inside the launchd teardown reserve (15s at clamp 60).
+_SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S = 2.0
 
 
 def _reap_gateway_turn_processes(
@@ -4537,7 +4539,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
                 install_path = f"official/{'/'.join(parts)}"
                 return (
                     f"The **{command_name}** skill is available but not installed.\n"
-                    f"Install it with: `hermes skills install {hint_value(install_path)}`"
+                    f"Install it with: `hermes skills install {install_path}`"
                 )
     except Exception:
         pass
@@ -14187,6 +14189,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     old_effort=old_effort,
                     new_effort=new_effort,
                 )
+                from agent import fallback_events as _fbe
+
+                _fbe.record(
+                    agent, "recovery",
+                    from_provider=prev_route[0], from_model=prev_route[1],
+                    to_provider=applied_provider, to_model=applied_model,
+                    consume=False,
+                )
                 announce = False
                 try:
                     from hermes_cli.config import read_raw_config
@@ -20408,9 +20418,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # the scheduler can never report that as success (#60432).
                     # No-op when no cron job is in flight.
                     from cron.scheduler import mark_running_jobs_interrupted
+                    # Bounded fence wait (t_8d085477). The job's own thread
+                    # holds its fire fence across delivery, and that delivery
+                    # waits on THIS event loop — so an unbounded wait here was
+                    # a cross-thread deadlock broken only by the delivery
+                    # future's 60s timeout. 4 of the 8 shutdown-watchdog
+                    # force-exits of 2026-09-24/25 dumped the loop thread
+                    # parked in _fire_job_lock under this call.
                     _interrupted = _marked_cron_jobs = mark_running_jobs_interrupted(
                         f"Gateway shutdown ({phase}) killed the job's tool "
-                        "subprocess before the run finished."
+                        "subprocess before the run finished.",
+                        lock_timeout=_SHUTDOWN_CRON_MARK_LOCK_TIMEOUT_S,
                     )
                     if _interrupted:
                         logger.warning(
@@ -21031,6 +21049,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
                 )
+                # Per-turn evidence for the timeout (t_8d085477): WHAT each
+                # surviving turn was doing when the drain gave up, so "the
+                # drain never reduces active turns" is attributable (API call
+                # vs tool vs idle) without a thread dump.
+                _now_wall = time.time()
+                for _sk, _agent in list(self._running_agents.items()):
+                    if _agent is _AGENT_PENDING_SENTINEL:
+                        logger.warning(
+                            "PHASE=drain_timeout_turn key=%s state=pending", _sk
+                        )
+                        continue
+                    try:
+                        _act = _agent.get_activity_summary() or {}
+                    except Exception:
+                        _act = {}
+                    _started_ts = self._running_agents_ts.get(_sk)
+                    logger.warning(
+                        "PHASE=drain_timeout_turn key=%s turn_age=%s "
+                        "current_tool=%s api_calls=%s idle=%s last_activity=%r",
+                        _sk,
+                        (
+                            f"{_now_wall - float(_started_ts):.0f}s"
+                            if isinstance(_started_ts, (int, float))
+                            else "?"
+                        ),
+                        _act.get("current_tool"),
+                        _act.get("api_call_count"),
+                        (
+                            f"{float(_act['seconds_since_activity']):.0f}s"
+                            if isinstance(
+                                _act.get("seconds_since_activity"), (int, float)
+                            )
+                            else "?"
+                        ),
+                        str(_act.get("last_activity_desc") or "")[:120],
+                    )
                 # Terminate in-flight cron SCRIPTS. The drain WAITS on them
                 # (_active_cron_job_count) but nothing could ever CANCEL them:
                 # _interrupt_running_agents only covers self._running_agents,
@@ -21169,7 +21223,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # children left behind by an interrupted terminal tool get
                 # killed by systemd instead of us (issue #8202).  The final
                 # catch-all cleanup below still runs for the graceful path.
-                _interrupted_cron_jobs = _kill_tool_subprocesses("post-interrupt")
+                # Off-loop (t_8d085477): every step in here is blocking (a
+                # per-job cron fence, a terminal-env glob sweep, browser
+                # teardown). On the loop it froze the adapters the cron
+                # delivery it was waiting on needed to finish.
+                _interrupted_cron_jobs = await asyncio.to_thread(
+                    _kill_tool_subprocesses, "post-interrupt"
+                )
                 logger.info(
                     "Shutdown phase: post-interrupt tool kill done at +%.2fs",
                     _phase_elapsed(),
@@ -21303,7 +21363,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # where drain succeeded without interrupt, and (b) anything
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
-            _kill_tool_subprocesses("final-cleanup")
+            await asyncio.to_thread(_kill_tool_subprocesses, "final-cleanup")
             logger.info(
                 "Shutdown phase: final-cleanup tool kill done at +%.2fs",
                 _phase_elapsed(),
@@ -24911,22 +24971,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
                 # receive the transcription.
-                #
-                # Route through the shared once-helper rather than sending
-                # inline: a voice message that interrupted a running turn was
-                # already transcribed AND echoed by the busy/interrupt path,
-                # and reaches this preprocessing step a second time when the
-                # pending event drains. Sending directly here bypassed every
-                # dedupe guard and posted the same transcript twice.
-                await self._echo_pending_stt_transcripts_once(
-                    event,
-                    self._adapter_for_source(source),
-                    source,
-                    _successful_transcripts,
-                    metadata=self._thread_metadata_for_source(
-                        source, self._reply_anchor_for_event(event)
-                    ),
-                )
+                if _successful_transcripts and self._should_echo_stt_transcripts():
+                    _echo_adapter = self._adapter_for_source(source)
+                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    if _echo_adapter:
+                        for _tx in _successful_transcripts:
+                            try:
+                                await _echo_adapter.send(
+                                    source.chat_id,
+                                    f'🎙️ "{_tx}"',
+                                    metadata=_echo_meta,
+                                )
+                            except Exception as _echo_exc:
+                                logger.debug(
+                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
+                                )
                 # NOTE: Previously, when transcription failed (e.g. no STT
                 # provider configured), the gateway also emitted a hardcoded
                 # English notice via `_stt_adapter.send()`. That bypassed the
@@ -29358,7 +29417,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if "pynacl" in err_lower or "nacl" in err_lower or "davey" in err_lower:
                 return (
                     "Voice dependencies are missing (PyNaCl / davey). "
-                    f"Install with: `{hint_value(sys.executable)} -m pip install PyNaCl`"
+                    f"Install with: `{sys.executable} -m pip install PyNaCl`"
                 )
             return f"Failed to join voice channel: {e}"
 
@@ -32838,54 +32897,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
         return enriched_text, successful_transcripts
 
-    def _stt_echo_dedupe_key(self, event, source) -> Optional[str]:
-        """Build a message-scoped key for transcript-echo deduplication.
-
-        The per-event ``_gateway_pending_stt_echo_sent`` flag only dedupes
-        within ONE Python object.  A single platform voice message can reach
-        the echo helper as two DISTINCT ``MessageEvent`` objects — the
-        busy/interrupt path echoes the inbound object, while the drain path
-        later prepares the pending-slot object (which
-        ``merge_pending_message_event`` may have replaced, and whose cached
-        STT attrs ``_invalidate_pending_stt_cache`` deliberately clears).
-        The result was the same transcript posted twice for one voice note.
-
-        Key on the durable identity of the audio instead: the platform
-        message id when present, else the concrete media paths (the same
-        downloaded file backs every copy of the event).
-        """
-        chat_id = str(getattr(source, "chat_id", "") or "")
-        message_id = str(getattr(event, "message_id", "") or "")
-        if message_id:
-            return f"{chat_id}:mid:{message_id}"
-        try:
-            audio_paths = self._pending_event_audio_paths(event)
-        except Exception:
-            audio_paths = []
-        if audio_paths:
-            return f"{chat_id}:audio:" + "|".join(sorted(str(p) for p in audio_paths))
-        return None
-
-    def _stt_echo_already_sent(self, key: Optional[str]) -> bool:
-        """Return True when this message's transcript echo already went out."""
-        if not key:
-            return False
-        sent = getattr(self, "_stt_echo_sent_keys", None)
-        return bool(sent and key in sent)
-
-    def _mark_stt_echo_sent(self, key: Optional[str]) -> None:
-        """Record a delivered transcript echo in a bounded LRU of keys."""
-        if not key:
-            return
-        sent = getattr(self, "_stt_echo_sent_keys", None)
-        if sent is None:
-            sent = OrderedDict()
-            self._stt_echo_sent_keys = sent
-        sent[key] = True
-        sent.move_to_end(key)
-        while len(sent) > self._STT_ECHO_KEY_CACHE_MAX:
-            sent.popitem(last=False)
-
     async def _echo_pending_stt_transcripts_once(
         self,
         event,
@@ -32914,17 +32925,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or adapter is None
         ):
             return
-        dedupe_key = self._stt_echo_dedupe_key(event, source)
-        if self._stt_echo_already_sent(dedupe_key):
-            logger.debug(
-                "%s echo suppressed — already sent for this message (%s)",
-                log_context,
-                dedupe_key,
-            )
-            setattr(event, "_gateway_pending_stt_echo_sent", True)
-            return
         setattr(event, "_gateway_pending_stt_echo_sent", True)
-        self._mark_stt_echo_sent(dedupe_key)
         already_echoed = int(getattr(event, "_gateway_pending_stt_echoed", 0) or 0)
         unsent = transcripts[already_echoed:]
         setattr(event, "_gateway_pending_stt_echoed", already_echoed + len(unsent))
@@ -34460,12 +34461,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.debug("Process watcher ended: %s", session_id)
 
     _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
-
-    # Bound the message-scoped STT transcript-echo dedupe LRU. Entries are
-    # tiny (one string key per voice message) and only need to outlive the
-    # interrupt -> drain hand-off for a given message, so a small cap is
-    # plenty while keeping the runner's memory flat on long-lived gateways.
-    _STT_ECHO_KEY_CACHE_MAX = 256
 
     # Config keys whose values MUST invalidate the gateway's cached agent
     # when they change.  The agent bakes these into its compressor / context

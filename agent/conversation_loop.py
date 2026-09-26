@@ -5843,6 +5843,11 @@ def run_conversation(
 
                 status_code = getattr(api_error, "status_code", None)
                 error_context = agent._extract_api_error_context(api_error)
+                # Fallback ledger evidence (spec Phase 1): consumed by the next
+                # failover, cleared by the next successful call. Never raises.
+                from agent import fallback_events as _fbe
+
+                _fbe.stash_api_error(agent, api_error, status_code, error_context)
                 # Stamp the quota window (5h vs 7d) so the failover announce can
                 # name WHICH limit bound. Consumed once by _quota_window_suffix;
                 # only set when the provider actually told us, so non-Anthropic

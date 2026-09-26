@@ -166,6 +166,19 @@ def record_api_call(
         )
 
 
+def record_fallback_event(row: dict[str, Any]) -> None:
+    """Persist one harness route-change ledger row when Blackbox is enabled.
+
+    Thin boundary like ``record_api_call``: the caller
+    (``agent.fallback_events.record``) owns the fail-open handling.
+    """
+    if _config() is None:
+        return
+    from plugins.blackbox import store
+
+    store.insert_fallback_event(row)
+
+
 def observe_request_prefix(
     cfg: dict[str, Any],
     *,

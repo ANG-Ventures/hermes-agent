@@ -37,6 +37,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.hermes_cli._survivor_gh_fake import pr_target, rest_pr
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_survivor as ks
 from hermes_cli import kanban_external_survivor as ext
@@ -71,11 +73,11 @@ def remote(monkeypatch):
 
     def run(args, **kwargs):
         if args[0] == "gh":
-            slug = args[args.index("--repo") + 1]
+            slug = (pr_target(args) or (None,))[0]
             view = state["prs"].get(slug)
             if view is None:
                 return subprocess.CompletedProcess(args, 1, b"", b"gh: not found")
-            return subprocess.CompletedProcess(args, 0, json.dumps(view).encode(), b"")
+            return subprocess.CompletedProcess(args, 0, json.dumps(rest_pr(view)).encode(), b"")
         if "ls-remote" in args and "-C" not in args:
             body = "".join(f"{line}\n" for line in state["refs"])
             return subprocess.CompletedProcess(args, 0, body.encode(), b"")
