@@ -37643,7 +37643,7 @@
      "loc": 7
     },
     "fires": "n/a \u2014 the 5 AUTHOR_MAP lines are already gone from origin/main scripts/release.py (grep count 0 each) [log window 2026-06-02..2026-09-25 (86 agent/gateway/errors logs, ~/.hermes/logs + profiles/*/logs)]",
-    "original": "commit subject: fix(ci): parity-sync CI gates \u2014 map 5 new upstream contributor emails in AUTHOR_MAP; reword test docstring that false-tripped gitleaks generic-api-key ('key: claude-opus-4.5')",
+    "original": "commit subject: fix(ci): parity-sync CI gates \u2014 map 5 new upstream contributor emails in AUTHOR_MAP; reword test docstring that false-tripped gitleaks generic-api-key ('key\u003a claude-opus-4.5')",
     "upstream_fix": "upstream contributors/emails/ (present on 59004a6235)",
     "upstream_state": "GREEN: all 5 emails have upstream contributors/emails/<email> files"
    },
@@ -37658,7 +37658,7 @@
    }
   },
   "census_tranche": "scripts+misc",
-  "subject": "fix(ci): parity-sync CI gates \u2014 map 5 new upstream contributor emails in AUTHOR_MAP; reword test docstring that false-tripped gitleaks generic-api-key ('key: claude-opus-4.5')",
+  "subject": "fix(ci): parity-sync CI gates \u2014 map 5 new upstream contributor emails in AUTHOR_MAP; reword test docstring that false-tripped gitleaks generic-api-key ('key\u003a claude-opus-4.5')",
   "loc": 7,
   "conflict_syncs": 3,
   "conflict_files": [

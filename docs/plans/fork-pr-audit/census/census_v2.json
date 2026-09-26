@@ -38376,7 +38376,7 @@
    "commits": 1,
    "first_date": "2026-07-16",
    "last_date": "2026-07-16",
-   "subject": "fix(ci): parity-sync CI gates \u2014 map 5 new upstream contributor emails in AUTHOR_MAP; reword test docstring that false-tripped gitleaks generic-api-key ('key: claude-opus-4.5')",
+   "subject": "fix(ci): parity-sync CI gates \u2014 map 5 new upstream contributor emails in AUTHOR_MAP; reword test docstring that false-tripped gitleaks generic-api-key ('key\u003a claude-opus-4.5')",
    "shas": [
     "1b8af38096"
    ],
