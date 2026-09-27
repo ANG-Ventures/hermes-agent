@@ -168,7 +168,7 @@ def forward_http(conn, host, port, request, target):
         relay(upstream, conn)
 
 
-def handle_connect(conn, target):
+def handle_connect(conn, target, where):
     """Intercept a CONNECT tunnel, terminating TLS with a minted cert."""
     host, _, port_text = target.rpartition(':')
     port = int(port_text or '443')
@@ -176,16 +176,21 @@ def handle_connect(conn, target):
     cert, key = cert_for(host)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
+    where['stage'] = 'client TLS handshake'
     with context.wrap_socket(conn, server_side=True) as tls:
+        where['stage'] = 'reading client request'
         nested = read_request(tls)
         if not nested:
             return
         line = nested.split(b'\r\n', 1)[0].decode('iso-8859-1')
+        where['request'] = line
         nested_target = line.split(' ', 2)[1]
         found = file_for(host, nested_target)
         if found is not None:
+            where['stage'] = 'serving fixture'
             respond_fixture(tls, found)
         else:
+            where['stage'] = 'relaying upstream'
             forward_https(tls, host, port, nested)
 
 
@@ -197,15 +202,16 @@ def host_from_headers(request):
     return None
 
 
-def handle_request(conn):
+def handle_request(conn, where):
     with conn:
         request = read_request(conn)
         if not request:
             return
         line = request.split(b'\r\n', 1)[0].decode('iso-8859-1')
+        where['request'] = line
         method, target, _ = line.split(' ', 2)
         if method.upper() == 'CONNECT':
-            handle_connect(conn, target)
+            handle_connect(conn, target, where)
             return
         parsed = urlsplit(target)
         host = parsed.hostname or host_from_headers(request) or 'unknown'
@@ -217,10 +223,16 @@ def handle_request(conn):
 
 
 def handle(conn):
+    # Name the request and how far it got: a bare SSLEOFError says nothing
+    # about which client or upstream host dropped the connection, or when.
+    where = {'request': '?', 'stage': 'reading proxy request'}
     try:
-        handle_request(conn)
+        handle_request(conn, where)
     except Exception as error:
-        print(f'proxy request failed: {error!r}', file=sys.stderr, flush=True)
+        print(
+            f'proxy request failed: {where["request"]} ({where["stage"]}): {error!r}',
+            file=sys.stderr, flush=True,
+        )
 
 
 def main():
