@@ -41,6 +41,20 @@ def normalize_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def _gitfile_target_exists(gitfile: Path) -> bool:
+    """True if a ``.git`` *file*'s ``gitdir:`` target exists."""
+    try:
+        first = gitfile.read_text(errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        return False
+    if not first.startswith("gitdir:"):
+        return False
+    target = Path(first[len("gitdir:"):].strip())
+    if not target.is_absolute():
+        target = gitfile.parent / target
+    return target.exists()
+
+
 def find_git_worktree(start: str) -> Optional[str]:
     """Walk up from ``start`` looking for a ``.git`` entry (file or dir).
 
@@ -72,6 +86,13 @@ def find_git_worktree(start: str) -> Optional[str]:
     for _ in range(64):
         git_marker = cur / ".git"
         try:
+            if git_marker.is_file() and not _gitfile_target_exists(git_marker):
+                # A gitfile pointing nowhere is a repo TRIPWIRE (e.g.
+                # kanban/workspaces/.git -> /nonexistent/...), not a
+                # worktree: git itself stops here with "not a git
+                # repository". Treating it as a root spawned pyright over
+                # every kanban workspace (462 repos) -> V8-OOM every ~4 min.
+                break
             if git_marker.exists():
                 resolved = str(cur)
                 _workspace_cache[str(start_path)] = (resolved, True)
