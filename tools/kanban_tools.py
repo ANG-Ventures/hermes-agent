@@ -1385,6 +1385,14 @@ def _handle_attach(args: dict, **kw) -> str:
         # environment, and the same absolute path on the host may be a
         # different file. Only a digest computed where the file was written
         # proves the host bytes are that file, so fail closed without one.
+        # Resolve the backend the terminal tool will actually use: config.yaml
+        # ``terminal.backend`` is bridged into TERMINAL_ENV lazily, on first
+        # terminal use, and overrides a stale exported value.
+        try:
+            from tools.terminal_tool import _ensure_terminal_env_bridged
+            _ensure_terminal_env_bridged()
+        except Exception:
+            logger.debug("kanban_attach: terminal config bridge unavailable", exc_info=True)
         backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
         if backend not in ("", "local") and expected is None:
             return tool_error(

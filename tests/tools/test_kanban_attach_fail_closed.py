@@ -97,3 +97,22 @@ def test_local_backend_path_needs_no_digest(worker_env, tmp_path):
     src = tmp_path / "artifact.txt"
     src.write_bytes(b"x")
     assert json.loads(kt._handle_attach({"task_id": worker_env, "path": str(src)})).get("ok") is True
+
+
+def test_config_selected_remote_backend_beats_stale_local_env(worker_env, tmp_path, monkeypatch):
+    """FleetReview #1362 (202955d7): config.yaml ``terminal.backend: docker``
+    reaches TERMINAL_ENV only through the terminal's lazy bridge. The guard must
+    run that bridge, not trust a stale ``TERMINAL_ENV=local``."""
+    import os
+    from pathlib import Path
+    from tools import kanban_tools as kt
+    from tools import terminal_tool as tt
+
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text("terminal:\n  backend: docker\n")
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setattr(tt, "_terminal_config_bridge_attempted", False)
+    src = tmp_path / "artifact.txt"
+    src.write_bytes(b"host bytes")
+    out = json.loads(kt._handle_attach({"task_id": worker_env, "path": str(src)}))
+    assert "remote-path-unverified" in out.get("error", ""), out
+    assert _stored(worker_env) == []

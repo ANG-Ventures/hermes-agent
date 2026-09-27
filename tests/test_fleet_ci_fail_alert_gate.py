@@ -204,9 +204,12 @@ done
 echo "$url $event" >> "$FAKE_CURL_LOG"
 : > "$out"
 case "$url" in
-  *-known) printf '%s' "$FAKE_KNOWN_CODE" ;;
-  *) printf '%s' "$FAKE_ALERTS_CODE" ;;
+  *-known) code="$FAKE_KNOWN_CODE" ;;
+  *) code="$FAKE_ALERTS_CODE" ;;
 esac
+# "transport": what real curl does on DNS/refused/timeout: writes 000, exits nonzero.
+if [ "$code" = "transport" ]; then printf '000'; exit 7; fi
+printf '%s' "$code"
 """
 
 
@@ -366,3 +369,20 @@ def test_post_step_puts_pr_summary_on_first_line():
     post = next(s for s in steps if s.get("name", "").startswith("Sign and POST"))
     assert post["env"]["SUMMARY"] == "${{ steps.route.outputs.summary }}"
     assert 'WF_NAME="${WF_NAME} — ${SUMMARY}"' in post["run"]
+
+
+@pytest.mark.skipif(not shutil.which("openssl"), reason="needs openssl")
+def test_known_red_transport_failure_still_falls_back_to_alerts(tmp_path):
+    """FleetReview #1362 (4f3672bf): a transport-level failure (curl exits
+    nonzero) must reach the #alerts fallback, not end the step under set -e."""
+    proc, calls = _post(tmp_path, known_code="transport", alerts_code="200")
+    assert proc.returncode == 0, proc.stderr
+    assert calls[1] == "https://hooks.example/webhooks/ci-fail ci_failure"
+    assert "#alerts fallback delivered" in proc.stdout
+
+
+@pytest.mark.skipif(not shutil.which("openssl"), reason="needs openssl")
+def test_known_red_and_fallback_transport_failures_turn_the_step_red(tmp_path):
+    proc, _ = _post(tmp_path, known_code="transport", alerts_code="transport")
+    assert proc.returncode != 0
+    assert "both failed (HTTP 000)" in proc.stderr

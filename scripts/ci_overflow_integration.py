@@ -115,10 +115,15 @@ def selective_rerun_verdict(original: list[dict], rerun: list[dict], probe_lines
         return check(name, "BLOCK", evidence,
                      "BLOCK ACTIVATION: selective re-run executed hosted work under the prior attempt's plan; "
                      "generate/placement were reused, so no fresh request/reservation exists for the new attempt")
-    if not probed:
-        # No executed job logged a parseable PROBE line: nothing proves which plan attempt ran (C6, #954).
+    # Every executed slice job needs its own PROBE line: an unprobed one proves nothing about
+    # which plan attempt it ran, and one probed job must not certify the rest (C6, #954).
+    # Planner jobs (generate/placement) run no slice and log no PROBE line.
+    unprobed = [n for n in executed if n not in probed and not n.endswith(("Generate slices", "Placement"))]
+    if not probed or unprobed:
+        evidence["unprobed"] = unprobed
         return check(name, "UNVERIFIABLE", evidence,
-                     "no-probe-evidence: no executed re-run job logged a parseable PROBE line")
+                     "no-probe-evidence: executed re-run job(s) logged no parseable PROBE line: "
+                     f"{unprobed or executed}")
     return check(name, "PASS", evidence)
 
 

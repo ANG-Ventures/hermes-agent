@@ -315,7 +315,9 @@ jobs:
             -H "X-GitHub-Event: ${EVENT_TYPE}" \
             -H "X-GitHub-Delivery: ${DELIVERY}" \
             -H "X-Webhook-Signature: ${SIG}" \
-            --data "$BODY")"
+            --data "$BODY")" || CODE="000"
+          # curl exits nonzero on a transport error (DNS, refused, timeout); under
+          # set -e that would end the step before the #alerts fallback below runs.
           echo "Receiver responded HTTP $CODE"
           cat /tmp/resp.txt || true
           # 2xx = delivered/accepted. Non-2xx fails the step so the miss is visible.
@@ -335,7 +337,7 @@ jobs:
                   -H "X-GitHub-Event: ci_failure" \
                   -H "X-GitHub-Delivery: ${DELIVERY}-alerts-fallback" \
                   -H "X-Webhook-Signature: ${SIG}" \
-                  --data "$BODY")"
+                  --data "$BODY")" || CODE="000"
                 case "$CODE" in
                   2*) echo "known-red delivery failed; #alerts fallback delivered." ;;
                   *) echo "::error::known-red POST and #alerts fallback both failed (HTTP $CODE)" >&2; exit 1 ;;
