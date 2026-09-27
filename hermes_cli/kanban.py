@@ -731,6 +731,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "set-model",
         help="Set or clear a task's model/provider/effort override "
              "(takes effect on the next dispatch)",
+        description="Pin a card's worker to a provider + model + effort. "
+                    "Any route is pinnable; a single Claude sub "
+                    "(claude-bpx-N/apx-N) additionally needs --pin-sub "
+                    "\"<reason>\". The pin applies on the next dispatch; no "
+                    "gateway restart. Visible in show/list as [PIN ...] and in "
+                    "the run's 'spawned' event pool. Docs: "
+                    "website/docs/user-guide/features/kanban.md, section "
+                    "'Pinning a kanban card/worker: provider, model, effort'.",
     )
     p_set_model.add_argument(
         "task_ids", nargs="*", metavar="task_id",
@@ -758,7 +766,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--reclaim", action="store_true",
         help="Release the claim on selected RUNNING cards so the next "
              "dispatch respawns them on the new route. Without this a "
-             "running worker keeps its old model until it finishes.",
+             "running worker keeps its old model until it finishes. The "
+             "running worker is terminated; the next run is a FRESH session "
+             "seeded from the card body + comments + the same workspace, so "
+             "post a checkpoint comment before reclaiming mid-task.",
     )
     p_set_model.add_argument(
         "--allow-flagship",
