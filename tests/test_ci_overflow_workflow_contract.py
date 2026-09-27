@@ -10,6 +10,7 @@ import copy
 import fnmatch
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -374,6 +375,25 @@ def test_placement_job_shape_and_permissions_exact():
     assert job["continue-on-error"] is True  # a dead placement must not fail required checks
     assert set(job["outputs"]) == {"matrix", "e2e_runs_on", "plan_valid", "plan_attempt"}
     assert job["outputs"]["plan_attempt"] == "${{ steps.plan.outputs.plan_attempt }}"
+
+
+def test_placement_sparse_checkout_carries_everything_the_plan_read_imports(tmp_path):
+    """The placement checkout is sparse (the full tree was the CB5 latency tail). Invariant: every
+    path the job runs from must be inside the sparse set, and the script must load from a tree that
+    holds ONLY that set -- a new top-level import outside scripts/ would fail here, not in CI."""
+    job = _tests_yml()["jobs"]["placement"]
+    checkout = next(s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout@"))
+    sparse = checkout["with"]["sparse-checkout"].split()
+    assert checkout["with"].get("sparse-checkout-cone-mode", True) is True
+    for step in job["steps"]:
+        for word in str(step.get("run", "")).split():
+            if word.endswith(".py"):
+                assert any(word.startswith(d.rstrip("/") + "/") for d in sparse), (word, sparse)
+    for d in sparse:
+        shutil.copytree(ROOT / d, tmp_path / d)
+    proc = subprocess.run([sys.executable, "-I", str(tmp_path / "scripts/ci_overflow_placement.py"), "--help"],
+                          cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_generate_emits_local_matrix_and_request_artifact():
