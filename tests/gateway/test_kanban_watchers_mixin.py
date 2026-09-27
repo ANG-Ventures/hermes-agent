@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
 KANBAN_METHODS = [
@@ -246,8 +248,9 @@ def test_workspace_refusal_sender_uses_default_profile_error_route(tmp_path, mon
 
     script = tmp_path / ".hermes" / "scripts" / "notify.py"
     script.parent.mkdir(parents=True)
-    script.write_text("")
+    script.write_text("", encoding="utf-8")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(script.parent.parent))  # the active root
     calls = []
 
     def run(argv, **kwargs):
@@ -323,8 +326,9 @@ def test_guard_stuck_sender_routes_to_alerts(tmp_path, monkeypatch):
     from gateway.kanban_watchers import _send_guard_stuck_alert
     script = tmp_path / ".hermes" / "scripts" / "notify.py"
     script.parent.mkdir(parents=True)
-    script.write_text("")
+    script.write_text("", encoding="utf-8")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(script.parent.parent))  # the active root
     calls = []
     monkeypatch.setattr("gateway.kanban_watchers.subprocess.run", lambda argv, **kw: (calls.append((argv, kw)) or SimpleNamespace(returncode=0)))
     assert _send_guard_stuck_alert("default", {"task_id": "t_test", "clear_verb": 'hermes kanban requeue t_test "<reason>"'})
@@ -396,3 +400,39 @@ def test_stall_none_results_bare_stall_is_bad():
     assert _stall_streak_is_bad(True, False, [("b", None)]) is True
 
 
+
+
+@pytest.mark.parametrize("which", ["workspace_refusal", "guard_stuck"])
+def test_dispatcher_alerts_resolve_notify_from_the_active_root(tmp_path, monkeypatch, which):
+    """FleetReview #952: a redirected Hermes home must page through ITS notify.py,
+    never the live home-dir one (and page nothing when it has none)."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import gateway.kanban_watchers as kw
+
+    user_home = tmp_path / "user"
+    for root in (user_home / ".hermes", user_home / ".hermes"):
+        live = root / "scripts" / "notify.py"
+        live.parent.mkdir(parents=True, exist_ok=True)
+        live.write_text("", encoding="utf-8")
+    sandbox = tmp_path / "sandbox"
+    monkeypatch.setattr(Path, "home", lambda: user_home)
+    monkeypatch.setenv("HERMES_HOME", str(sandbox))
+    calls = []
+    monkeypatch.setattr(
+        "gateway.kanban_watchers.subprocess.run",
+        lambda argv, **kw_: calls.append(argv) or SimpleNamespace(returncode=0),
+    )
+
+    def send():
+        if which == "workspace_refusal":
+            return kw._send_workspace_refusal_alert("default", "workspace_refused=1")
+        return kw._send_guard_stuck_alert("default", {"task_id": "t_x", "clear_verb": "v"})
+
+    assert send() is False and calls == []  # sandbox has no notify.py: no live page
+    mine = sandbox / "skills-shared" / "general" / "scheduler" / "scripts" / "notify.py"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("", encoding="utf-8")
+    assert send() is True
+    assert calls[-1][1] == str(mine)
