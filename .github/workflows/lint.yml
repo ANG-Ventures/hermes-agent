@@ -46,8 +46,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 0 # need full history for merge-base + worktree
-          filter: blob:none # blobless: commit graph + trees; worktree at BASE_SHA batch-fetches blobs. Full ~1 GiB pack blows the job timeout on self-hosted
+          # pull_request: the checked-out ref is GitHub's refs/pull/N/merge
+          # commit, whose first parent IS the diff base, so depth 2 (one ref,
+          # full blobs) is all this job needs. The old fetch-depth 0 +
+          # blob:none fetched every branch/tag (~2k refs) then lazy-fetched
+          # the tree's blobs at checkout: 14s typical, 42-164s tail, the
+          # largest part of this job on the PR critical path (t_0c562b56).
+          # merge_group keeps the full blobless history unchanged.
+          fetch-depth: ${{ inputs.event_name == 'pull_request' && 2 || 0 }}
+          filter: ${{ inputs.event_name != 'pull_request' && 'blob:none' || '' }} # blobless on merge_group: commit graph + trees; worktree at BASE_SHA batch-fetches blobs. Full ~1 GiB pack blows the job timeout on self-hosted
 
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
@@ -68,8 +75,18 @@ jobs:
           # For PRs, diff against the merge base with the target branch.
           # For pushes to main, diff against the previous commit on main.
           if [ "${{ inputs.event_name }}" = "pull_request" ]; then
-            BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
             BASE_REF="origin/${{ github.base_ref }}"
+            if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+              # Merge ref: parent 1 is the base tip GitHub merged into, which
+              # is what merge-base(origin/<base>, HEAD) resolved to before.
+              BASE_SHA=$(git rev-parse 'HEAD^1')
+            else
+              # Not a merge ref (unexpected): fail open to the full-history
+              # merge-base the shallow checkout cannot answer on its own.
+              git fetch --no-tags --unshallow --filter=blob:none origin \
+                "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+              BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+            fi
           else
             BASE_SHA=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
             BASE_REF="HEAD~1"
