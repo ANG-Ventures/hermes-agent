@@ -467,6 +467,11 @@ class ComputeHost:
                 session["running"] = True
                 session["_turn_cancel_requested"] = False
                 session["last_active"] = time.time()
+                # Per-turn caller metadata from prompt.submit. Rewritten every
+                # turn (absent -> cleared), same as the in-process path.
+                session["turn_system_context"] = server._turn_system_context(
+                    frame.get("system_context")
+                )
                 server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
             self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
             try:

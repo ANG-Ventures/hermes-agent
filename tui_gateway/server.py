@@ -2743,6 +2743,10 @@ def _compute_host_turn_frame(
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
+        # prompt.submit ``system_context`` lives on the PARENT session; the
+        # child's _run_prompt_submit reads it from its own session record, so
+        # it must ride the frame or isolated turns silently drop it.
+        "system_context": session.get("turn_system_context") or "",
     }
 
 
@@ -8090,6 +8094,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "pinned": _session_live_pinned(session or {}, session_key) if session_key else False,
         "stored_session_id": session_key or "",
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "turn_system_context": True,
         "version": "",
         "release_date": "",
         "update_behind": None,
@@ -11114,6 +11119,7 @@ def _lazy_resume_info(
         "skills": {},
         "lazy": True,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "turn_system_context": True,
         "profile_name": _response_profile_name(profile),
     }
     if provider:
@@ -11478,6 +11484,8 @@ def _fallback_session_info(session: dict) -> dict:
         # a current backend is falsely flagged "out of date" (#68392). The sibling
         # session.create shape (_lazy_resume_info) already carries it (#36112).
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        # prompt.submit ``system_context`` capability; see _session_info.
+        "turn_system_context": True,
     }
 
 

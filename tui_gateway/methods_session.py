@@ -492,6 +492,7 @@ def _(rid, params: dict) -> dict:
                                     "model": _resolve_model(),
                                     "lazy": True,
                                     "profile_name": profile or "",
+                                    "turn_system_context": True,
                                 },
                             },
                             live,
