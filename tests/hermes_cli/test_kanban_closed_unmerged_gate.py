@@ -323,7 +323,9 @@ def test_recorded_pr_refs_reads_every_persisted_key():
     assert op.recorded_pr_refs(md) == [f"ANG-Ventures/r#{i}" for i in range(1, 7)]
     assert op.recorded_pr_refs(None) == []
     # FleetReview #1352: auto_routed_open_prs carries prose mentions too; it is not the card's own PR set.
-    assert op.recorded_pr_refs({"auto_routed_open_prs": ["ANG-Ventures/x#12"]}) == []
+    assert op.recorded_pr_refs({"auto_routed_open_prs": ["ANG-Ventures/x#12"], "own_prs": []}) == []
+    # #1363 review 8b3bef2e5f1b: a legacy routed run (no own_prs key) keeps its only copy of --survivor-pr.
+    assert op.recorded_pr_refs({"auto_routed_open_prs": ["ANG-Ventures/r#5"]}) == ["ANG-Ventures/r#5"]
 
 
 def test_decision_must_name_each_closed_pr_when_card_owns_several():
@@ -474,3 +476,32 @@ def test_previous_token_target_is_not_the_next_tokens_subject():
     assert op._unsuperseded([op.extract_pr_refs("ANG-Ventures/r#9")[0], op.extract_pr_refs("ANG-Ventures/r#6")[0]],
                             "PR #5 SUPERSEDED-BY #9 and PR #6 RE-CARRIED-AS #10", query_fn=q,
                             sha_check=lambda r, s: False) == [op.extract_pr_refs("ANG-Ventures/r#9")[0]]
+
+
+def test_ambiguous_clause_naming_another_pr_never_covers_the_sole_pr():
+    # #1363 review 610e8af06dcf: the card owns closed r#5; the clause is about #6.
+    q = states(n5="CLOSED", n6="CLOSED", n9="MERGED", n10="MERGED")
+    for text in ("PR #6 SUPERSEDED-BY #9 and RE-CARRIED-AS #10", "SUPERSEDED-BY #9 and PR #6 RE-CARRIED-AS #10"):
+        with pytest.raises(op.ClosedUnmergedPrError):
+            op.enforce_not_closed_unmerged("t_x", text, metadata={"pr_url": PR_URL}, query_fn=q,
+                                           sha_check=lambda r, s: False)
+    for d in ("PR #6 CLOSED: STALE and CLOSED: REJECTED",):
+        with pytest.raises(op.ClosedUnmergedPrError):
+            op.enforce_not_closed_unmerged("t_x", "done", recorded=[PR_URL], query_fn=q,
+                                           sha_check=lambda r, s: False, verb="archive", decision_texts=[d])
+    # No other PR named: still an unattributed cover for the sole PR.
+    assert op.enforce_not_closed_unmerged("t_x", "SUPERSEDED-BY #9 and RE-CARRIED-AS #10",
+                                          metadata={"pr_url": PR_URL}, query_fn=q,
+                                          sha_check=lambda r, s: False) != []
+
+
+def test_e2e_legacy_routed_survivor_only_card_still_gated(board, no_survivor, monkeypatch):
+    # A run routed before own_prs existed persisted the survivor PR only in auto_routed_open_prs.
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        monkeypatch.setattr(op, "_default_query", lambda: states(n5="MERGED"))
+        assert kb.complete_task(conn, tid, summary="shipped",
+                                metadata={"auto_routed_open_prs": ["ANG-Ventures/r#5"]}, expected_run_id=run)
+        monkeypatch.setattr(op, "_default_query", lambda: states(n5="CLOSED"))
+        with pytest.raises(op.ClosedUnmergedPrError):
+            kb.archive_task(conn, tid)

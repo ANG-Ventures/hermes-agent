@@ -398,6 +398,7 @@ def names_superseder(closed, *texts: Optional[str], superseded_by: Optional[str]
 # ``PR #5 CLOSED: REJECTED; PR #6 still needs work`` covers #5 only; ``r#5 SUPERSEDED-BY #9`` covers #5 only.
 _CLAUSE_SPLIT_RE = re.compile(r"[;\n]")
 _BARE_REF_RE = re.compile(r"(?<![\w/])#(\d+)\b")
+_NO_PR = ("", -1)  # subject key that matches no PR: an ambiguous clause that names some other PR
 
 
 def _subject_keys(text: str, exclude=()) -> set:
@@ -425,10 +426,13 @@ def _bound_matches(text: Optional[str], pattern) -> list:
         # Several in one clause: each owns ONLY the text between the previous match's end (past its
         # target) and its own start. If any of them names no PR there, the text between two matches
         # could belong to either, so the whole clause is unattributed (covers a sole PR only).
-        subjects = [_subject_keys(clause[(matches[i - 1].end() if i else 0):m.start()])
-                    for i, m in enumerate(matches)]
+        regions = [clause[(matches[i - 1].end() if i else 0):m.start()] for i, m in enumerate(matches)]
+        subjects = [_subject_keys(r) for r in regions]
         if not all(subjects):
-            subjects = [set() for _ in matches]
+            # Ambiguous. If the clause names any PR besides the token targets, it is about THAT PR and
+            # binds nothing (never falls back to a sole PR); otherwise it is unattributed.
+            named = _subject_keys(" ".join(regions + [clause[matches[-1].end():]]))
+            subjects = [{_NO_PR} if named else set() for _ in matches]
         out.extend(zip(matches, subjects))
     return out
 
@@ -482,12 +486,14 @@ def recorded_pr_refs(metadata) -> list:
     own PRs the open-PR route recorded (``own_prs``) and survivor PR evidence (``survivor.refs[].pr`` /
     ``survivor.claims[].pr``). The card's own PR evidence, independent of which key carried it.
 
-    ``auto_routed_open_prs`` is NOT read (FleetReview #1352): it also lists PRs the handoff prose merely
-    mentions, and a mention must never make another team's closed PR gate this card."""
+    ``auto_routed_open_prs`` also lists PRs the handoff prose merely mentions, so a mention must never
+    gate this card (FleetReview #1352). It is read only for a LEGACY routed run (no ``own_prs`` key:
+    routed before the route wrote it), where it is the only persisted copy of a ``--survivor-pr``."""
     if not isinstance(metadata, dict):
         return []
     out: list = []
-    for key in ("pr_url", "pr_urls", "pr", "own_prs"):
+    legacy = "own_prs" not in metadata and "auto_routed_open_prs" in metadata
+    for key in ("pr_url", "pr_urls", "pr", "auto_routed_open_prs" if legacy else "own_prs"):
         out.extend(_iter_strings(metadata.get(key)))
     survivor = metadata.get("survivor")
     if isinstance(survivor, dict):

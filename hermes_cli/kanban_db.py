@@ -9928,8 +9928,8 @@ def complete_task(
             # gated on them; prose mentions in auto_routed_open_prs are not (FleetReview #1352).
             own = _open_pr.split_fleet(_open_pr.extract_pr_refs(
                 metadata=metadata, survivor_pr=survivor_pr))[0]
-            if own:
-                routed_meta["own_prs"] = [f"{r.repo}#{r.number}" for r in own]
+            # Always written (even []): its presence marks the run as post-#1352 (no legacy fallback).
+            routed_meta["own_prs"] = [f"{r.repo}#{r.number}" for r in own]
             if freshness.get("prs"):
                 routed_meta["handoff_freshness"] = freshness
             routed_summary = "\n".join(filter(None, [note, summary or result]))
