@@ -455,6 +455,19 @@ def format_handoff_notice(handoff: Optional[Dict[str, Any]]) -> str:
     )
 
 
+def _redact_tool_text(value: Any) -> str:
+    """Tool arguments/results in the handoff reach chat via /resume-handoff and
+    the next turn's context: redact credentials first (Backfill C3). Fails
+    closed to a placeholder, never to the raw text."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(
+            "" if value is None else str(value), force=True, redact_url_credentials=True)
+    except Exception:
+        return "<redaction unavailable>"
+
+
 def render_handoff_context(handoff: Optional[Dict[str, Any]]) -> str:
     """Render the handoff as context text injected into the next turn."""
     if not handoff or not isinstance(handoff, dict):
@@ -475,9 +488,10 @@ def render_handoff_context(handoff: Optional[Dict[str, Any]]) -> str:
         lines.append("\nTool calls issued this turn:")
         for call in calls:
             status = "completed" if call.get("completed") else "NEVER COMPLETED"
-            lines.append(f"- {call.get('name')}({call.get('arguments')}) [{status}]")
+            args = _redact_tool_text(call.get("arguments"))
+            lines.append(f"- {call.get('name')}({args}) [{status}]")
             if call.get("result_preview"):
-                lines.append(f"  result: {call['result_preview']}")
+                lines.append(f"  result: {_redact_tool_text(call['result_preview'])}")
     todos = handoff.get("open_todos") or []
     if todos:
         lines.append("\nStill open:")
