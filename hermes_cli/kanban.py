@@ -1971,16 +1971,24 @@ def _caller_session_id() -> Optional[str]:
     explicit = (_SLASH_SESSION_ID.get() or "").strip()
     if explicit:
         return explicit
+    in_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
     try:
-        from gateway.session_context import resolve_current_session_id
+        from gateway.session_context import _SESSION_ID, resolve_current_session_id
 
+        if in_gateway:
+            # In-process gateway: ONLY a per-turn contextvar bound in this
+            # context is ours. A plain slash command runs before that bind,
+            # and the resolver's os.environ fallback is process-global --
+            # another chat's session. Sessionless means None, never a
+            # borrowed identity (FleetReview #951).
+            bound = _SESSION_ID.get()
+            return (bound.strip() or None) if isinstance(bound, str) else None
         resolved = (resolve_current_session_id() or "").strip()
         if resolved:
             return resolved
-        if os.environ.get("_HERMES_GATEWAY") == "1":
-            return None  # in-process: env is another session's, never ours
     except Exception:
-        pass
+        if in_gateway:
+            return None
     return (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
 
 

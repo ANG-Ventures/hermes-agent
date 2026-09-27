@@ -5347,14 +5347,22 @@ def session_owner_profile(session_id: Optional[str]) -> Optional[str]:
 
 
 def _actor_profiles(actor: MutationActor) -> frozenset[str]:
-    """Every profile identity the actor legitimately holds: the bound
-    profile plus the owner profile of each caller session."""
-    names = {actor.profile} if actor.profile else set()
-    for sid in actor.session_ids:
-        owner = session_owner_profile(sid)
-        if owner:
-            names.add(owner)
-    return frozenset(names)
+    """Every profile identity the actor legitimately holds.
+
+    The owner profile of each caller session is authoritative. The bound
+    (env-derived) profile counts only when no caller session resolves to an
+    owner: a root-home repoint makes it read ``default`` -- an operator
+    profile -- from inside another profile's session, so keeping both let
+    that caller pass ``--operator`` or mutate a ``default``-assigned card
+    (FleetReview #1074).
+    """
+    owners = {
+        owner for owner in (session_owner_profile(sid) for sid in actor.session_ids)
+        if owner
+    }
+    if owners:
+        return frozenset(owners)
+    return frozenset({actor.profile} if actor.profile else ())
 
 
 def _valid_operator_reason(reason: str) -> bool:
@@ -5605,10 +5613,9 @@ def check_home_session(
         return None
     if home in actor.session_ids:
         return None
-    # Execution lane: the assignee works its card wherever it was born, and a
-    # dispatched worker always owns the card it was spawned for.
-    if actor.profile and (row["assignee"] or "") == actor.profile:
-        return None
+    # Execution lane: a dispatched worker always owns the card it was spawned
+    # for. The assignee match lives below, on :func:`_actor_profiles` (session
+    # owner over env profile), not on the raw env profile (FleetReview #1074).
     if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
         return None
     # ...and the cards it fanned out: item 1 stamps a worker's children with
@@ -8378,8 +8385,11 @@ def _prior_worker_still_alive(
     # An outcome cannot certify exit: operators can write the same outcomes as
     # worker tools, and a newer synthetic row can hide an older live owner.
     runs = conn.execute(
-        "SELECT r.id, r.outcome, r.ended_at, r.started_at, t.max_runtime_seconds "
-        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        # The run's OWN runtime cap, snapshotted at claim: the card's current
+        # cap can be shortened after release while that worker still runs
+        # (FleetReview #956). A run with no snapshot is probed, never skipped.
+        "SELECT r.id, r.outcome, r.ended_at, r.started_at, r.max_runtime_seconds "
+        "FROM task_runs r "
         "WHERE r.task_id = ? ORDER BY r.id DESC",
         (task_id,),
     ).fetchall()
@@ -9875,9 +9885,16 @@ def complete_task(
             # non-milestone PR through fleet-merge.sh.
             from hermes_cli import kanban_pr_freshness as _fresh
             try:
+                # Arm only the card's OWN handoff PR(s), never a PR the prose
+                # merely mentions (FleetReview #1234 finding).
                 freshness = _fresh.check(
                     still_open, task_id=task_id,
                     allow_arm=not is_milestone_card(conn, task_id),
+                    armable={
+                        f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
+                            metadata=metadata, survivor_pr=survivor_pr,
+                        )
+                    },
                 )
             except _fresh.DraftPrError as draft_err:
                 with write_txn(conn):
@@ -12727,8 +12744,8 @@ _REVIEW_HEAD_SHA_RE = re.compile(_HEAD_SHA_PATTERN)
 _REVIEW_NA_INABILITY = re.compile(
     r"\b(?:"
     r"skip(?:ped|ping|s)?|"
-    r"(?:could|can)\s*(?:not|n't)|cannot|unable|"
-    r"(?:did|was|were|does|do)\s*(?:not|n't)\s+(?:run|ran|execute|executed|attempt|attempted|try|tried|finish|finished|complete|completed|get|reach)|"
+    r"(?:could|can)\s*(?:not|n['\u2019]t)|can['\u2019]t|cannot|unable|"
+    r"(?:did|was|were|does|do)\s*(?:not|n['\u2019]t)\s+(?:run|ran|execute|executed|attempt|attempted|try|tried|finish|finished|complete|completed|get|reach)|"
     r"not\s+(?:run|ran|executed|attempted|tried|finished|completed|reached)|"
     r"ran\s+out|out\s+of\s+time|no\s+time\b|timed?\s*out|"
     r"fail(?:ed|s)?\s+to\b|errored|crashed|blocked\s+(?:by|on)\b|"
@@ -16830,6 +16847,19 @@ def _terminate_reclaimed_worker(
 
     if _pid_alive(pid):
         identity = _owner_identity(int(pid), *owner_window)
+        if (
+            identity == "verified"
+            and len(owner_window) >= 3
+            and owner_window[1] is None
+            and owner_window[2] is None
+        ):
+            # No run-scoped ``spawned`` evidence (legacy/migrated run): only
+            # the claim lower bound was applied, so ANY process created after
+            # the claim -- including one that reused the worker's PID --
+            # reads "verified". That is unproven, not proven: never SIGTERM
+            # on it (FleetReview #1021). Liveness callers still treat it as
+            # alive (fail closed), so this only withholds the signal.
+            identity = "unverified"
         info["owner_identity"] = identity
         if identity == "recycled":
             # The recorded worker is gone; this PID now belongs to someone
