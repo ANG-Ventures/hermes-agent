@@ -440,6 +440,48 @@ class TestStreamingFallback:
         # The flag should be set so the main retry loop switches to non-streaming
         assert agent._disable_streaming is True
 
+    @pytest.mark.parametrize(
+        "status,expected_level",
+        [(429, "WARNING"), (503, "WARNING"), (529, "WARNING"), (500, "ERROR"), (None, "ERROR")],
+    )
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_pre_delivery_log_level_by_status(
+        self, mock_close, mock_create, status, expected_level, caplog
+    ):
+        """Capacity statuses are recovered by the main loop's retry/fallback,
+        so the pre-delivery line is WARNING; anything else stays ERROR."""
+        from run_agent import AIAgent
+
+        err = Exception("capacity probe")
+        if status is not None:
+            err.status_code = status
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = err
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        with caplog.at_level("WARNING", logger="agent.chat_completion_helpers"):
+            with pytest.raises(Exception, match="capacity probe"):
+                agent._interruptible_streaming_api_call({})
+
+        recs = [
+            r for r in caplog.records
+            if r.getMessage().startswith("Streaming failed before delivery")
+        ]
+        assert [r.levelname for r in recs] == [expected_level]
+        assert (recs[0].exc_info is not None) == (expected_level == "ERROR")
+
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
