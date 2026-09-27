@@ -1326,8 +1326,10 @@ def resolve_startup_model_arg(
     raw = raw_model.strip()
     if not raw or raw.lower().startswith("moa:") or "://" in raw:
         return None, raw_model
+    # A bare token may itself be a provider name (``-m claude-apx-7``); the refresh
+    # callback decides whether it is one, so pass it as the candidate.
     _typed = re.split(r"[:/]", raw, maxsplit=1)
-    provider_seam.refresh("typed", _typed[0] if len(_typed) > 1 else None)
+    provider_seam.refresh("typed", _typed[0] if len(_typed) > 1 else raw)
     try:
         inline = _parse_inline_provider_model(
             raw, current_provider or "", user_providers, custom_providers
@@ -1820,8 +1822,12 @@ def switch_model(
 
     # Hot registration: publish a newly configured provider before any
     # recognition below consults the registry (requested name only).
+    # A bare token (``/model claude-apx-7``) is passed as the candidate itself: the
+    # callback only accepts provider-name grammar, so a plain model id is a no-op.
     _typed = re.split(r"[:/]", new_model, maxsplit=1)
-    provider_seam.refresh("typed", explicit_provider or (_typed[0] if len(_typed) > 1 else None))
+    provider_seam.refresh(
+        "typed", explicit_provider or (_typed[0] if len(_typed) > 1 else (new_model or None))
+    )
 
     inline_provider = None
     if not explicit_provider:

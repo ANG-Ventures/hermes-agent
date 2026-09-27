@@ -459,6 +459,32 @@ def test_refresh_triggers_run_before_recognition():
     assert ("picker", None) in seen
 
 
+def test_bare_typed_token_is_the_refresh_candidate():
+    # t_4a40af74: `/model claude-apx-N` / `-m claude-apx-N` (no separator) must hand the
+    # bare token to the callback, or a newly configured provider is never hot-registered.
+    seen: list = []
+    provider_seam.register_refresh(lambda reason, name: seen.append((reason, name)))
+
+    from hermes_cli.model_switch import resolve_startup_model_arg, switch_model
+
+    resolve_startup_model_arg("  seam-bare-startup  ", "openrouter")
+    assert ("typed", "seam-bare-startup") in seen
+    try:
+        switch_model("seam-bare-switch", "openrouter", "x", probe_catalog=False)
+    except Exception:  # noqa: BLE001 — only the refresh ordering is under test
+        pass
+    assert ("typed", "seam-bare-switch") in seen
+    # explicit --provider still wins over the bare model token
+    seen.clear()
+    try:
+        switch_model("some-model", "openrouter", "x", explicit_provider="seam-explicit",
+                     probe_catalog=False)
+    except Exception:  # noqa: BLE001
+        pass
+    assert ("typed", "seam-explicit") in seen
+    assert ("typed", "some-model") not in seen
+
+
 # ---------------------------------------------------------------------------
 # providers.list_providers per-generation memo (RC-E2)
 # ---------------------------------------------------------------------------
