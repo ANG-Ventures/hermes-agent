@@ -5442,6 +5442,23 @@ def run_conversation(
                                     aggregator_provider=_agg_cost_provider,
                                     aggregator_base_url=_agg_cost_base_url,
                                 )
+                                # Ledger each physical advisor/aggregator call
+                                # as a child of this composite call's virtual
+                                # turn_api_calls row (card t_02323499).
+                                from agent.chat_completion_helpers import (
+                                    _emit_composite_api_call_records,
+                                )
+
+                                _moa_preset = getattr(
+                                    getattr(getattr(_moa_client, "chat", None), "completions", None),
+                                    "preset_name",
+                                    None,
+                                )
+                                _emit_composite_api_call_records(
+                                    agent,
+                                    _turn_call["pricing_calls"],
+                                    sub_harness=f"moa:{_moa_preset if isinstance(_moa_preset, str) and _moa_preset else agent.model}",
+                                )
                         except Exception:
                             pass  # telemetry must never break the conversation loop
                     cost_result = estimate_usage_cost(
