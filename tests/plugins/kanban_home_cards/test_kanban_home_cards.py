@@ -249,6 +249,20 @@ def test_I1_hook_x5_same_session_one_non_empty(mod, home):
     assert results[0]["context"].startswith(mod.HEADER)
 
 
+def test_multimodal_first_turn_does_not_consume_the_injection(mod, home):
+    """FleetReview #968: core cannot append plugin context to a list-valued
+    (multimodal) user message, so that turn must not mark the session seen;
+    the block goes on the first text turn instead."""
+    _card(_board(home), "t_home0001", session_id=SID)
+    image_turn = [{"type": "text", "text": "look"},
+                  {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]
+    assert mod.on_pre_llm_call(session_id=SID, platform="cli", conversation_history=[],
+                               user_message=image_turn) is None
+    out = mod.on_pre_llm_call(session_id=SID, platform="cli", conversation_history=[],
+                              user_message="hi")
+    assert out and out["context"].startswith(mod.HEADER)
+
+
 def test_I1_seen_mark_happens_before_query(mod, home, monkeypatch):
     calls = []
     def boom(ids, **kw):

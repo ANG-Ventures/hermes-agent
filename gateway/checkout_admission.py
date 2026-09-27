@@ -216,8 +216,14 @@ class HoldStore:
                     fcntl.flock(fh, fcntl.LOCK_UN)
 
     def hold(self, owner: str, expected: Iterable[str], *, mode: str = "drain",
-             reason: str = "", now: Optional[float] = None) -> HoldState:
-        """Engage (or re-engage with a new epoch) the hold. Never opens it."""
+             reason: str = "", now: Optional[float] = None,
+             recover_unreadable: bool = False) -> HoldState:
+        """Engage (or re-engage with a new epoch) the hold. Never opens it.
+
+        An unreadable hold has lost its owner, so replacing it (which lets the
+        new owner release it) requires the explicit ``recover_unreadable``
+        operator override; the unreadable bytes are kept for audit.
+        """
         if not owner:
             raise ValueError("owner token required")
         if mode not in MODES:
@@ -228,7 +234,14 @@ class HoldStore:
         with self._operator_lock():
             try:
                 current = self.read_hold()
-            except HoldUnreadable:
+            except HoldUnreadable as exc:
+                if not recover_unreadable:
+                    raise HoldConflict(
+                        f"{exc}; its owner is unknown -- re-hold with "
+                        "--recover-unreadable to take it over") from exc
+                with contextlib.suppress(OSError):
+                    os.replace(self.hold_path, self.directory / f"hold.unreadable.{int(time.time())}.json")
+                logger.warning("checkout admission: %s took over an unreadable hold", owner)
                 current = None  # re-holding over garbage keeps it CLOSED
             if current is not None and current.owner != owner:
                 raise HoldConflict(f"hold is owned by {current.owner!r}")
@@ -312,6 +325,7 @@ class AdmissionGate:
         self._serving = serving
         self._lock = threading.RLock()
         self._tickets: dict = {}
+        self._foreign: Optional[tuple] = None  # (pid, instance) sharing our name
 
     def set_active_work(self, fn: Optional[ActiveWork]) -> None:
         with self._lock:
@@ -416,8 +430,29 @@ class AdmissionGate:
                 "active_work_error": work_error, "serving": serving,
             }
 
+    def _mark_shared_record(self, record: dict) -> dict:
+        """Flag a consumer name another LIVE process also publishes under.
+
+        Two processes configured with the same name overwrite one record, so
+        an idle snapshot could hide the other's work. Once a foreign live
+        instance is seen the flag stays set while its pid lives (sticky, so
+        our own back-to-back writes cannot clear it) and ``evaluate`` reads
+        the record as UNKNOWN.
+        """
+        try:
+            prev = self.store.read_consumer(self.consumer)
+        except Exception:
+            prev = None
+        if (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
+                and prev.get("host") == self.host and prev.get("pid") != self.pid):
+            self._foreign = (prev.get("pid"), prev.get("instance"))
+        foreign = self._foreign
+        if foreign is not None and _pid_alive(foreign[0]):
+            record["shared_with"] = {"pid": foreign[0], "instance": foreign[1]}
+        return record
+
     def publish(self) -> dict:
-        record = self.snapshot()
+        record = self._mark_shared_record(self.snapshot())
         self.store.write_consumer(self.consumer, record)
         return record
 
@@ -446,6 +481,7 @@ class AdmissionGate:
         while True:
             try:
                 record = self.snapshot()
+                record = await asyncio.to_thread(self._mark_shared_record, record)
                 await asyncio.to_thread(self.store.write_consumer, self.consumer, record)
             except asyncio.CancelledError:
                 raise
@@ -558,6 +594,9 @@ def _consumer_verdict(name: str, rec: Optional[dict], hold: HoldState, *, now: f
     if rec.get("hold_error"):
         out["why"] = f"consumer cannot read hold: {rec['hold_error']}"
         return out
+    if rec.get("shared_with"):
+        out["why"] = f"consumer name shared by another live process {rec['shared_with']!r}"
+        return out
     if rec.get("hold_epoch") != hold.epoch:
         out["why"] = "current hold epoch not yet acknowledged"
         return out
@@ -600,8 +639,11 @@ def evaluate(store: HoldStore, *, now: Optional[float] = None,
             continue
         try:
             rec = store.read_consumer(name)
-        except Exception:
-            rec = None
+        except Exception as exc:
+            # Cannot tell whether an unlisted consumer is live: fail closed.
+            rows.append({"consumer": name, "state": UNKNOWN, "work": None,
+                         "why": f"unexpected consumer record unreadable: {exc}"})
+            continue
         if not rec:
             continue
         fresh = isinstance(rec.get("published_at"), (int, float)) and now - rec["published_at"] <= stale_after
@@ -763,6 +805,8 @@ def main(argv: Optional[list] = None) -> int:
     h.add_argument("--expect", action="append", required=True, help="consumer name; repeat")
     h.add_argument("--mode", choices=MODES, default="drain")
     h.add_argument("--reason", default="")
+    h.add_argument("--recover-unreadable", action="store_true",
+                   help="take over an unreadable hold.json (its owner is unknown)")
     r = sub.add_parser("release", help="explicitly open the hold")
     r.add_argument("--owner", required=True)
     s = sub.add_parser("status", help="one verdict (exit 0 QUIESCENT[freeze], 1 DRAINED[drain], 2 NOT_HELD, 3 BUSY, 4 UNKNOWN)")
@@ -789,7 +833,8 @@ def main(argv: Optional[list] = None) -> int:
         return 0 if res["ok"] else 5
     store = _resolve_store(args)
     if args.cmd == "hold":
-        state = store.hold(args.owner, args.expect, mode=args.mode, reason=args.reason)
+        state = store.hold(args.owner, args.expect, mode=args.mode, reason=args.reason,
+                           recover_unreadable=args.recover_unreadable)
         print(json.dumps(state.to_json(), indent=2))
         return 0
     if args.cmd == "release":
