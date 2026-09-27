@@ -2201,8 +2201,8 @@ KANBAN_COMPLETE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Only when completion was refused because the handoff "
-                    "names a DRAFT PR that is INTENTIONALLY left open (e.g. "
-                    "a CI vehicle for an upstream PR): the reason. Recorded "
+                    "names a DRAFT PR that is INTENTIONALLY left open, e.g. "
+                    "a CI vehicle for an upstream PR: the reason. Recorded "
                     "as an audited completion_draft_override event; the "
                     "draft is not routed to review. Empty is refused."
                 ),

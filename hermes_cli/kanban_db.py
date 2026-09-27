@@ -9762,8 +9762,8 @@ class EmptyDraftOverrideError(ValueError):
         self.task_id = task_id
         super().__init__(
             f"completion blocked: {task_id} passed an empty draft_ok; give the reason "
-            f"the named DRAFT PR is intentionally left open (e.g. 'CI vehicle for "
-            f"upstream PR o/r#N'). {task_id} is still in-flight (no state change)"
+            f"the named DRAFT PR is intentionally left open, e.g. 'CI vehicle for "
+            f"upstream PR o/r#N'. {task_id} is still in-flight (no state change)"
         )
 
 
