@@ -116,6 +116,44 @@ async def test_compress_command_works_when_auto_compaction_disabled():
 
 
 @pytest.mark.asyncio
+async def test_compress_command_runs_compress_context_off_the_event_loop():
+    """``_compress_context`` reaches ``fetch_model_metadata -> requests.get``
+    (and the summary LLM call); /compress must run it on a worker thread."""
+    history = _make_history()
+    compressed = [history[0], {"role": "assistant", "content": "summary"}, history[-1]]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compression_skipped_due_to_lock = False
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    def _compress(*_args, **_kwargs):
+        seen.append(threading.get_ident())
+        return (compressed, "")
+
+    agent_instance._compress_context.side_effect = _compress
+
+    try:
+        with (
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("run_agent.AIAgent", return_value=agent_instance),
+            patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+        ):
+            await runner._handle_compress_command(_make_event())
+    finally:
+        runner._shutdown_executor()
+
+    assert seen, "_compress_context was never called"
+    assert seen[0] != loop_thread, "_compress_context ran on the event-loop thread"
+
+
+@pytest.mark.asyncio
 async def test_compress_command_surfaces_aux_model_failure_even_when_recovered():
     """When the user's configured ``auxiliary.compression.model`` errors out
     but compression recovers by retrying on the main model, /compress must

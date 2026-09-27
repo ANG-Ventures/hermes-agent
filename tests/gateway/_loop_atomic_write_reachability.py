@@ -78,7 +78,16 @@ _ATOMIC_SINK_NAMES = frozenset({
 })
 _OS_SINK_DOTTED = frozenset({"os.replace", "os.rename", "os.fsync"})
 
-_OFFLOAD_ATTRS = frozenset({"to_thread", "run_in_executor"})
+# ``to_thread`` / ``run_in_executor`` plus the GatewayRunner helpers that end
+# in ``loop.run_in_executor`` while carrying contextvars across the hop
+# (pinned by test_offload_helpers_really_hop_to_an_executor).
+_OFFLOAD_ATTRS = frozenset({
+    "to_thread",
+    "run_in_executor",
+    "_run_in_executor_with_context",
+    "_run_housekeeping_in_executor",
+    "_submit_with_context",
+})
 
 _NOQA_TOKEN = "# noqa: atomic-write-on-loop"
 
