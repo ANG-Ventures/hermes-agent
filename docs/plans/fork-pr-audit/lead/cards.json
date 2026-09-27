@@ -488,21 +488,6 @@
   "assignee": "daedalus-opus"
  },
  {
-  "name": "#109",
-  "verdict": "DROP",
-  "keys": [
-   "#109"
-  ],
-  "followers": [],
-  "tranches": [
-   "agent"
-  ],
-  "branches": [],
-  "conflict_syncs": 3,
-  "registry": [],
-  "assignee": "daedalus-opus"
- },
- {
   "name": "#37",
   "verdict": "DROP",
   "keys": [
@@ -1165,21 +1150,6 @@
   "assignee": "daedalus-opus"
  },
  {
-  "name": "#589",
-  "verdict": "DROP",
-  "keys": [
-   "#589"
-  ],
-  "followers": [],
-  "tranches": [
-   "gateway"
-  ],
-  "branches": [],
-  "conflict_syncs": 2,
-  "registry": [],
-  "assignee": "daedalus-opus"
- },
- {
   "name": "#582",
   "verdict": "DROP",
   "keys": [
@@ -1208,21 +1178,6 @@
   "conflict_syncs": 2,
   "registry": [],
   "assignee": "daedalus-opus"
- },
- {
-  "name": "#562",
-  "verdict": "DROP",
-  "keys": [
-   "#562"
-  ],
-  "followers": [],
-  "tranches": [
-   "gateway"
-  ],
-  "branches": [],
-  "conflict_syncs": 1,
-  "registry": [],
-  "assignee": "daedalus"
  },
  {
   "name": "#527",
@@ -1601,21 +1556,6 @@
   "assignee": "daedalus-opus"
  },
  {
-  "name": "nopr:4ed79b6dad",
-  "verdict": "DROP",
-  "keys": [
-   "nopr:4ed79b6dad"
-  ],
-  "followers": [],
-  "tranches": [
-   "gateway"
-  ],
-  "branches": [],
-  "conflict_syncs": 0,
-  "registry": [],
-  "assignee": "daedalus"
- },
- {
   "name": "#980",
   "verdict": "UPSTREAM",
   "keys": [
@@ -1776,23 +1716,6 @@
   "conflict_syncs": 0,
   "registry": [],
   "assignee": "daedalus"
- },
- {
-  "name": "audit/hermes_cli/revert-36134d8944",
-  "verdict": "DROP",
-  "keys": [
-   "nopr:36134d8944"
-  ],
-  "followers": [],
-  "tranches": [
-   "hermes_cli"
-  ],
-  "branches": [
-   "audit/hermes_cli/revert-36134d8944"
-  ],
-  "conflict_syncs": 2,
-  "registry": [],
-  "assignee": "daedalus-opus"
  },
  {
   "name": "nopr:8f7823887e",
@@ -1981,23 +1904,6 @@
   "assignee": "daedalus"
  },
  {
-  "name": "audit/scripts_misc/revert-ci-overflow-phase0",
-  "verdict": "DROP",
-  "keys": [
-   "#932"
-  ],
-  "followers": [],
-  "tranches": [
-   "scripts+misc"
-  ],
-  "branches": [
-   "audit/scripts_misc/revert-ci-overflow-phase0"
-  ],
-  "conflict_syncs": 0,
-  "registry": [],
-  "assignee": "daedalus"
- },
- {
   "name": "#443",
   "verdict": "UPSTREAM",
   "keys": [
@@ -2147,21 +2053,6 @@
   "branches": [
    "audit/plugins/upstream-412"
   ],
-  "conflict_syncs": 0,
-  "registry": [],
-  "assignee": "daedalus"
- },
- {
-  "name": "nopr:051c2076e1",
-  "verdict": "DROP",
-  "keys": [
-   "nopr:051c2076e1"
-  ],
-  "followers": [],
-  "tranches": [
-   "plugins"
-  ],
-  "branches": [],
   "conflict_syncs": 0,
   "registry": [],
   "assignee": "daedalus"
@@ -2453,7 +2344,6 @@
   "name": "audit/scripts_misc/revert-author-map-stale",
   "verdict": "DROP",
   "keys": [
-   "#22",
    "nopr:40a6040932"
   ],
   "followers": [],

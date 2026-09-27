@@ -1,4 +1,5 @@
-"""Assemble all 1,116 FINAL rows -> lead/rows.json. Deterministic; rerunnable."""
+"""Assemble all 1,116 FINAL rows -> lead/rows.json. Deterministic; rerunnable (needs lead/merged.json, not committed:
+lead workspace t_03e35f0e/lead/merged.json)."""
 import sys, os, re, json, collections
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import *
@@ -68,7 +69,8 @@ for r in rows:
 keys = [r['key'] for r in rows]
 assert len(keys) == len(set(keys)) == 1116, len(keys)
 assert set(ROW) == set(keys)
-json.dump(ROW, open(L + 'rows.json', 'w', encoding='utf-8'), indent=1, default=str)
+open(L + 'rows.json', 'w', encoding='utf-8').write(dump_rows(ROW))
+check_cards(ROW, json.load(open(L + 'cards.json', encoding='utf-8')))
 if __name__ == '__main__':
     print(collections.Counter(v['final'] for v in ROW.values()))
     print(sorted(collections.Counter((v['census_tranche'], v['final']) for v in ROW.values()).items()))

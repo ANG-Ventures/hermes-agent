@@ -1,5 +1,5 @@
-import re, json, sys
-sys.path.insert(0, '/Volumes/ramscratch/kanban-workspaces/default/t_03e35f0e/lead')
+import os, re, json, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import *
 import measure, rulings
 
@@ -46,4 +46,7 @@ def build():
             assert fv in VALID, (t, k, fv)
             out[k] = {'tranche': t, 'auditor': x.get('verdict'), 'adv': adv,
                       'adv_new': (x.get('adversary') or {}).get('new_verdict'), 'final': fv, 'why': why, 'x': x}
+    for k, (card, ev) in rulings.POST_RULING_2026_09_27.items():
+        assert out[k]['final'] == 'DROP', (k, out[k]['final'])  # the ruling flips DROP rows only
+        out[k]['final'], out[k]['why'] = 'KEEP', rulings.POST_RULING_TAG + ev + f' (slice card {card})'
     return out

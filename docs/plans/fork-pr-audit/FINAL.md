@@ -1308,6 +1308,9 @@ Inputs: auditor branches `audit/<tranche>/verdicts` (latest, incl. post-adversar
 Ace ruled 2026-09-27 00:39 PT (Discord msg 1553672387516440636, review page calm-ember-1f75.docs.ace) on the 15 blocked
 audit slices. Docs card t_f29230a1. Applied by `lead/post_ruling_2026_09_27.py` (edits `lead/rows.json`, idempotent,
 asserts each row was DROP) and re-rendered with `lead/render.py`; the table rows above carry the evidence inline.
+The table is now canonical in `lead/rulings.py` `POST_RULING_2026_09_27` and applied by `final.build()`, so a
+`lead/build_all.py` rebuild reproduces `lead/rows.json` byte-identically; the 7 slice cards and `#22` are out of
+`lead/cards.json`, and `common.check_cards` fails the build if a card key's row verdict disagrees (t_04cd162a).
 
 **DROP → KEEP (premise falsified by the slice worker):**
 
