@@ -113,6 +113,7 @@ def record_aux_api_call(
     response: Any,
     task: Optional[str],
     route_info: Optional[dict] = None,
+    route_id: Optional[str] = None,
 ) -> None:
     """Ledger one successful auxiliary call in Blackbox ``turn_api_calls``.
 
@@ -153,6 +154,7 @@ def record_aux_api_call(
             agent, turn_id,
             task=str(task or "unspecified"),
             provider=provider, model=model, usage=usage, api_mode=api_mode,
+            route_id=route_id,
         )
     except Exception:
         logger.debug("Aux Blackbox ledger recording failed (non-fatal)", exc_info=True)
