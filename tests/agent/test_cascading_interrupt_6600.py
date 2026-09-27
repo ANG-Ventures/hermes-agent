@@ -117,17 +117,25 @@ def test_anthropic_non_streaming_stale_aborts_request_client_not_shared():
     agent._abort_request_anthropic_client = MagicMock()
     agent._close_request_anthropic_client = MagicMock()
 
+    # The worker must still be blocked when the poll thread's 2.0s join
+    # expires, or the stale detector has no TimeoutError to surface. A fixed
+    # sleep(2.5) left ~0.2s of margin over the poll's 0.3s first tick + join,
+    # which a loaded CI runner ate (t_33cd63ef): the worker returned first and
+    # its result was raised instead. Hold it on an event the test releases.
+    release_worker = threading.Event()
+
     def _create(_api_kwargs, *, client):
         assert client is request_client
-        # Outlive the 0.05s stale timeout AND the worker join (2.0s) so the
-        # stale detector surfaces its TimeoutError.
-        time.sleep(2.5)
-        return object()
+        release_worker.wait(timeout=10)
+        return types.SimpleNamespace()
 
     agent._anthropic_messages_create = MagicMock(side_effect=_create)
 
-    with pytest.raises(TimeoutError):
-        cch.interruptible_api_call(agent, {"model": "x", "messages": []})
+    try:
+        with pytest.raises(TimeoutError):
+            cch.interruptible_api_call(agent, {"model": "x", "messages": []})
+    finally:
+        release_worker.set()
 
     # Shared client untouched from the poll thread.
     agent._anthropic_client.close.assert_not_called()
