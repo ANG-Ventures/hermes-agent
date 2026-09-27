@@ -59,6 +59,11 @@ def test_rider_carries_all_four_fields(cls, hop, seat, attempts):
     assert _TIME_RE.search(rider), rider
     assert bool(_COUNT_RE.match(rider)) is (attempts > 1)
     assert "?" not in rider, rider  # t_246ce7d6: words, never a bare "?"
+    if cls == "pool_pressure" and seat is None and hop in (None, "relay"):
+        # Pool-wide relay refusal: the hop IS the relay and no seat exists (t_e17de574).
+        assert rider.endswith(("relay busy: all subs at capacity (at the relay), 14:02:11",
+                               "relay busy: all subs at capacity (at the relay), 14:02:11-19")), rider
+        return
     if hop is None:
         assert "hop unknown" in rider
     if seat is None and cls != "quota_model":
@@ -80,6 +85,25 @@ def test_pinned_spec_examples():
           "from_provider": "claude-apr"}
     assert fp.format_cause_rider(r3, tz=UTC) == (
         "model budget capped at the relay on all subs, 09:12:03")
+
+
+def test_pool_wide_relay_busy_names_the_relay_not_unknown():
+    """t_e17de574: the 05:44-05:45 rows (pool_pressure, 503, class_source=text,
+    hop/seat NULL, err_head NULL) rendered "relay busy (hop unknown, sub unknown)"."""
+    row = {"trigger_class": "pool_pressure", "class_source": "text", "http_status": 503,
+           "hop": None, "seat": None, "err_head": None, "from_provider": "claude-bpr",
+           "first_err_ts": _ts(12, 45, 27)}
+    assert fp.format_cause_rider(row, tz=UTC) == "relay busy: all subs at capacity (at the relay), 12:45:27"
+    row["err_head"] = "pool at capacity"
+    assert fp.format_cause_rider(row, tz=UTC) == "relay busy: all subs at capacity (at the relay), 12:45:27"
+    # A seat-attributed or upstream pool_pressure keeps its hop/seat fields.
+    over = dict(row, err_head="Overloaded", http_status=529, hop="bridge→anthropic",
+                seat="sub-vps-2")
+    assert fp.format_cause_rider(over, tz=UTC) == (
+        "upstream overloaded (Anthropic 529) on sub-vps-2, 12:45:27")
+    # A genuinely unattributable non-pool-pressure row still says so.
+    unk = dict(row, trigger_class="conn")
+    assert "(hop unknown, sub unknown)" in fp.format_cause_rider(unk, tz=UTC)
 
 
 def test_relay_ascii_hops_normalize():

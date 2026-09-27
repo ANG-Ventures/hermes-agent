@@ -1101,9 +1101,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reopen.add_argument(
         "--to",
         dest="to_status",
-        choices=("ready", "todo"),
+        choices=("ready", "todo", "review"),
         default="ready",
-        help="Status to return the task to (default: ready)",
+        help="Status to return the task to (default: ready; review = done-with-open-PR, owned by kanban.review_assignee)",
     )
     p_reopen.add_argument(
         "--json",
@@ -4359,8 +4359,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             outcome = _completion_outcome(conn, tid, last_event)
             if not done:
                 failed.append(tid)
-                print(f"cannot complete {tid}: {outcome or '(unknown id or terminal state)'}",
-                      file=sys.stderr)
+                print(
+                    f"cannot complete {tid}: "
+                    f"{outcome or kb.explain_complete_refusal(conn, tid, expected_run_id=_worker_run_id_for(tid))}",
+                    file=sys.stderr,
+                )
             else:
                 after = kb.get_task(conn, tid)
                 if getattr(after, "status", None) == "review":

@@ -201,3 +201,101 @@ def test_durable_spec_materializes_inherited_parent_context():
     assert spec is not None
     task = spec["source"]["tasks"][0]
     assert task["materialized_prefill_messages"] == child.prefill_messages
+
+
+# ── t_9fdac10c: a recovered child must keep its NAMED provider ─────────────
+# Ledger signature of the defect: a subagent turn with provider='custom' whose
+# parent config pins a named relay (claude-bpr), unkeyed bpr pool routes, and a
+# cache_read plateau (read stuck at system+tools while cache_write re-grows by
+# the whole history every call) right after async_delegation_redispatched.
+
+_BPR_RUNTIME = {
+    "provider": "claude-bpr",
+    "base_url": "http://127.0.0.1:18811/v1",
+    "api_key": "pool-key",
+    "api_mode": "chat_completions",
+}
+
+
+def _named_provider_record(base_url="http://127.0.0.1:18811/v1"):
+    return {
+        "source": {"kind": "single", "tasks": [{"goal": "finish the research note", "context": None}]},
+        "execution": {
+            "model": "claude-haiku-4-5",
+            "provider": "claude-bpr",
+            "base_url": base_url,
+            "api_mode": "chat_completions",
+            "max_iterations": 10,
+            "credential_ref": {"source": "provider", "provider": "claude-bpr", "custom_provider": None},
+        },
+        "route": {"parent_session_id": "sess-parent"},
+    }
+
+
+def _resolved_recovery_creds(record, runtime):
+    captured = {}
+    real = dt._resolve_delegation_credentials
+
+    def spy(cfg, parent):
+        captured["cfg"] = dict(cfg)
+        captured["creds"] = real(cfg, parent)
+        raise ValueError("stop after credential resolution")
+
+    with patch.object(dt, "_resolve_delegation_credentials", spy), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=dict(runtime)):
+        dt.delegate_task(
+            tasks=record["source"]["tasks"],
+            parent_agent=_parent(),
+            _recovery_spec=record,
+        )
+    return captured
+
+
+def test_recovered_named_provider_child_keeps_provider_identity():
+    got = _resolved_recovery_creds(_named_provider_record(), _BPR_RUNTIME)
+    assert got["creds"]["provider"] == "claude-bpr"
+    assert got["creds"]["base_url"] == "http://127.0.0.1:18811/v1"
+    assert got["creds"]["api_mode"] == "chat_completions"
+
+
+def test_recovered_named_provider_reresolves_moved_endpoint():
+    # The registry moved the sub (tailnet IP change): the persisted URL is stale.
+    moved = dict(_BPR_RUNTIME, provider="claude-bpx-5", base_url="http://100.81.82.111:3556/v1")
+    record = _named_provider_record(base_url="http://100.105.238.33:3556/v1")
+    record["execution"]["provider"] = "claude-bpx-5"
+    record["execution"]["credential_ref"]["provider"] = "claude-bpx-5"
+    got = _resolved_recovery_creds(record, moved)
+    assert got["cfg"]["base_url"] == ""
+    assert got["creds"]["provider"] == "claude-bpx-5"
+    assert got["creds"]["base_url"] == "http://100.81.82.111:3556/v1"
+
+
+def test_recovered_direct_endpoint_still_pins_its_base_url():
+    record = _named_provider_record(base_url="https://direct.invalid/v1")
+    record["execution"]["provider"] = "custom"
+    record["execution"]["credential_ref"] = {"source": "delegation_config", "parent_provider": "openrouter"}
+    got = _resolved_recovery_creds(record, dict(_BPR_RUNTIME, provider="custom", base_url=""))
+    assert got["cfg"]["base_url"] == "https://direct.invalid/v1"
+    assert got["creds"]["provider"] == "custom"
+    assert got["creds"]["base_url"] == "https://direct.invalid/v1"
+
+
+def test_config_provider_plus_its_own_base_url_keeps_provider_identity():
+    # delegation: {provider: claude-bpr, base_url: <claude-bpr's endpoint>} is the
+    # same shape outside recovery; it must not collapse to "custom" either.
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=dict(_BPR_RUNTIME)):
+        creds = dt._resolve_delegation_credentials(
+            {"model": "claude-haiku-4-5", "provider": "claude-bpr",
+             "base_url": "http://127.0.0.1:18811/v1/", "api_key": "k"},
+            _parent(),
+        )
+    assert creds["provider"] == "claude-bpr"
+
+
+def test_config_provider_with_foreign_base_url_stays_custom():
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=dict(_BPR_RUNTIME)):
+        creds = dt._resolve_delegation_credentials(
+            {"model": "m", "provider": "claude-bpr", "base_url": "http://localhost:9999/v1", "api_key": "k"},
+            _parent(),
+        )
+    assert creds["provider"] == "custom"

@@ -2,6 +2,7 @@
 import sys, os, re, json, collections
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import *
+import rulings
 
 ROW = json.load(open(L + 'rows.json', encoding='utf-8'))
 CARDS = json.load(open(L + 'cards.json', encoding='utf-8'))
@@ -13,6 +14,13 @@ for c in CARDS:
         key2card[k] = IDS.get(c['name'], 'card:' + c['name'])
 SPLIT = json.load(open(L + 'split_ids.json', encoding='utf-8')) if os.path.exists(L + 'split_ids.json') else {}
 key2card.update(SPLIT)
+for k, (card, _ev) in rulings.POST_RULING_2026_09_27.items():  # the ruling's slice cards (off cards.json since t_04cd162a)
+    key2card.setdefault(k, card)
+for k, x in rulings.UNRESOLVED_RULINGS.items():  # t_63023f77 slice cards (KEEP rulings have none)
+    if x.get('card'):
+        key2card.setdefault(k, x['card'])
+# Hand-written sections appended after the rendered body; render keeps them from the existing file.
+TAILS = {'FINAL.md': '\n## Post-handoff lead rulings', 'ROLLUP.md': '\n## 8. Slice cards'}
 ORDER = ['gateway', 'agent', 'hermes_cli', 'plugins', 'cron+tools', 'scripts+misc', 'auto', 'auto-cherry-pick', 'auto-desktop-retired']
 VS = ['KEEP', 'UPSTREAM', 'SUPERSEDED-BY-UPSTREAM', 'DROP', 'UNRESOLVED']
 
@@ -122,6 +130,9 @@ def rollup_md():
     for cd in CARDS:
         if cd['verdict'] == 'UPSTREAM':
             out.append(f"| {IDS.get(cd['name'], cd['name'])} | {', '.join(cd['keys'])} | {', '.join(b for b in cd['branches'] if '/revert-' not in b) or 'to build'} |")
+    for k, x in rulings.UNRESOLVED_RULINGS.items():
+        if x['verdict'] == 'UPSTREAM' and ROW[k]['final'] == 'UPSTREAM':
+            out.append(f"| {x['card']} | {k} | to build (t_63023f77) |")
     # conflicts
     led = ledger_sets()
     out += ['', '## 4. Expected reduction in parity-merge conflicts', '',
@@ -162,12 +173,13 @@ def rollup_md():
             'family (boot_resume_scheduled 1,190, dropbox_resume 1,410, turn_slot_acquire 2,208, restart_notice 455 fires), blackbox cost '
             'accounting (19k–47k turns/api-calls priced), relay-lane headers/pricing (16,913 bpx/bpr calls/7d), the footer and route/compaction '
             'announce families (registry 3/22/23/24, live config), Discord restart backfill (425 re-injected messages), cron fallback/pins '
-            '(17 opt-in jobs, 521-job stores). Plus 93 UPSTREAM rows that are needed AND generic — value that should stop being ours.',
+            f'(17 opt-in jobs, 521-job stores). Plus {tot["UPSTREAM"]} UPSTREAM rows that are needed AND generic — value that should stop being ours.',
             '',
             f'**What solves problems that no longer exist.** {tot["SUPERSEDED-BY-UPSTREAM"]} rows are fixed upstream (take theirs at the next sync) '
             f'and {tot["DROP"]} rows DROP: never fired in the window, dormant surfaces (desktop D9 ×37, gemini/yunwu lanes, MoA/send_message '
             'tools dormant since July, /undo 2 uses, /merge 0), one-shot June LCM campaign harnesses, and a write-only reaction journal. '
-            f'{tot["UNRESOLVED"]} rows stay UNRESOLVED (silent guards with no log/DB signal — need a canary, not a guess).',
+            + (f'{tot["UNRESOLVED"]} rows stay UNRESOLVED (silent guards with no log/DB signal — need a canary, not a guess).' if tot['UNRESOLVED'] else
+             f'0 rows stay UNRESOLVED: the {len(rulings.UNRESOLVED_RULINGS)} the lead left were measured and ruled by t_63023f77 (UNRESOLVED.md).'),
             '',
             f'**What the maintenance burden actually is (measured).** {alloc:,} fork lines across 1,116 rows; 795 rows sit on files named in the '
             f'sync ledgers and 458 on files that conflicted in all three syncs. DROP+SUPERSEDED rows carry {cfd:,} of {cft:,} ({100*cfd/cft:.0f}%) '
@@ -186,9 +198,15 @@ def rollup_md():
     return '\n'.join(out) + '\n'
 
 
+def write(name, body):
+    old = open(D + name, encoding='utf-8').read() if os.path.exists(D + name) else ''
+    i = old.find(TAILS[name])
+    open(D + name, 'w', encoding='utf-8').write(body + (old[i:] if i >= 0 else ''))
+
+
 if __name__ == '__main__':
-    open(D + 'FINAL.md', 'w', encoding='utf-8').write(final_md())
-    open(D + 'ROLLUP.md', 'w', encoding='utf-8').write(rollup_md())
+    write('FINAL.md', final_md())
+    write('ROLLUP.md', rollup_md())
     txt = open(D + 'FINAL.md', encoding='utf-8').read()
     keys = [r['key'] for r in census()]
     body = txt.split('## Conflicts')[0]

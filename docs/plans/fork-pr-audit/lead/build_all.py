@@ -69,6 +69,8 @@ for r in rows:
 keys = [r['key'] for r in rows]
 assert len(keys) == len(set(keys)) == 1116, len(keys)
 assert set(ROW) == set(keys)
+bad = [(k, ROW[k]['final'], x['verdict']) for k, x in final.rulings.UNRESOLVED_RULINGS.items() if ROW[k]['final'] != x['verdict']]
+assert not bad, bad  # every t_63023f77 ruling, auto followers included, lands in rows.json
 open(L + 'rows.json', 'w', encoding='utf-8').write(dump_rows(ROW))
 check_cards(ROW, json.load(open(L + 'cards.json', encoding='utf-8')))
 if __name__ == '__main__':

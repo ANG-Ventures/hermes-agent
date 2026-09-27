@@ -1239,6 +1239,7 @@ def set_current_board(slug: str) -> Path:
     if not normed:
         raise ValueError("board slug is required")
     path = current_board_path()
+    _assert_live_board_tree_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(normed + "\n", encoding="utf-8")
     return path
@@ -1247,6 +1248,7 @@ def set_current_board(slug: str) -> Path:
 def clear_current_board() -> None:
     """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
     _assert_not_delegated_child_mutation()
+    _assert_live_board_tree_write_allowed(current_board_path())
     try:
         current_board_path().unlink()
     except FileNotFoundError:
@@ -1851,6 +1853,7 @@ def write_board_metadata(
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
+    _assert_live_board_tree_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
@@ -2033,6 +2036,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
     d = board_dir(normed)
+    _assert_live_board_tree_write_allowed(d)
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
@@ -3413,7 +3417,12 @@ def _assert_live_board_write_allowed(path: Path) -> None:
             break
     if live_root is None:
         return  # not a live board — nothing this guard is about.
+    _refuse_live_kanban_write(target, live_root, "open the live board read-write")
 
+
+def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> None:
+    """Shared R1/R2 decision for :func:`_assert_live_board_write_allowed` and
+    :func:`_assert_live_board_tree_write_allowed`; raises or returns."""
     reason: Optional[str] = None
     if _in_test_context():
         reason = (
@@ -3444,8 +3453,7 @@ def _assert_live_board_write_allowed(path: Path) -> None:
         if os.environ.get(k, "").strip()
     ) or "<none>"
     raise LiveBoardWriteRefused(
-        f"kanban live-system guard: refusing to open the live board "
-        f"read-write — {reason}. Writes from here create REAL cards that the "
+        f"kanban live-system guard: refusing to {action} — {reason}. Writes from here create REAL cards that the "
         f"dispatcher claims and spawns real workers against (3 fixture cards + "
         f"3 burned runs on 2026-09-21). Active path pins: {pins}. To run "
         f"against a throwaway board: HERMES_KANBAN_SANDBOX=1 "
@@ -3454,6 +3462,40 @@ def _assert_live_board_write_allowed(path: Path) -> None:
         f"Read-only inspection of the live board is still allowed via "
         f"connect_readonly()."
     )
+
+
+def _is_live_board_tree_path(resolved: Path, root: Path) -> bool:
+    """True for board-set state of *root* that is not a DB: the ``current``
+    pointer, ``board-aliases.json`` and anything under ``kanban/boards/``."""
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    if len(parts) < 2 or parts[0] != "kanban":
+        return False
+    return parts[1] == "boards" or (len(parts) == 2 and parts[1] in ("current", "board-aliases.json"))
+
+
+def _assert_live_board_tree_write_allowed(path: Path) -> None:
+    """Refuse a test/probe process creating, renaming or re-pointing LIVE boards.
+
+    ``connect()``'s guard only sees ``kanban.db``. ``create_board()`` writes
+    ``board.json`` (and mkdirs the board dir) BEFORE it reaches ``connect()``,
+    so a refused create still left a board that ``list_boards()`` surfaces;
+    ``set_current_board()`` / ``remove_board()`` never touch the DB at all.
+    That is how ten fixture boards (alpha, curr, spawntest, slug-immutable, …)
+    landed in the live ``kanban/boards/`` on 2026-09-22 (card t_216b74e0).
+    Same production-root list and R1/R2 predicate as the DB guard.
+    """
+    try:
+        target = path.expanduser().resolve(strict=False)
+    except OSError:  # pragma: no cover - resolution failure is not a leak
+        return
+    for root in _production_kanban_roots():
+        if _is_live_board_tree_path(target, root):
+            _refuse_live_kanban_write(target, root, f"write live board state {target}")
+            return
 
 
 def connect_readonly(
@@ -4171,6 +4213,7 @@ def init_db(
         with contextlib.closing(connect(path)):
             pass
         return path
+    _assert_live_board_write_allowed(path)  # before the mkdir, not after
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
@@ -9693,6 +9736,9 @@ def complete_task(
                         conn, task_id, "completion_routed_to_review",
                         {"open_prs": routed_meta["auto_routed_open_prs"], "note": note},
                     )
+                # One durable line on the card (t_36d0114e): why it is not done,
+                # and the PR refs the review-card closer resolves on merged=true.
+                add_comment(conn, task_id, "kanban", _open_pr.route_comment(still_open))
             return bool(ok)
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
@@ -12926,8 +12972,8 @@ def reopen_task(
 
     Returns ``(True, None)`` on success, ``(False, reason)`` if refused.
     """
-    if to_status not in ("ready", "todo"):
-        return False, f"invalid target status {to_status!r} (use 'ready' or 'todo')"
+    if to_status not in ("ready", "todo", "review"):
+        return False, f"invalid target status {to_status!r} (use 'ready', 'todo' or 'review')"
     if not (reason or "").strip():
         return False, "a reason is required to reverse a terminal state"
 
@@ -12942,14 +12988,18 @@ def reopen_task(
             f"'done' tasks (use unblock/promote for other states)"
         )
 
+    # ``review`` (t_36d0114e): a card closed ``done`` while its PR is still
+    # OPEN goes back to the review lane -- owned by kanban.review_assignee --
+    # where the review-card closer completes it on REST merged=true.
+    review_assignee = configured_review_assignee() if to_status == "review" else None
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks "
             "   SET status = ?, result = NULL, completed_at = NULL, "
             "       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-            "       current_run_id = NULL "
+            "       current_run_id = NULL, assignee = COALESCE(?, assignee) "
             " WHERE id = ? AND status = 'done'",
-            (to_status, task_id),
+            (to_status, review_assignee, task_id),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} changed state concurrently; retry"
@@ -23476,6 +23526,48 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
         (task_id,),
     ).fetchone()
     return Run.from_row(row) if row else None
+
+
+def explain_complete_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int] = None,
+) -> str:
+    """Why ``complete_task`` returned False, in one clause, read after the fact.
+
+    Replaces the generic "unknown id or terminal state": a worker retrying a
+    timed-out complete needs to see "already done by <who> at <when>", not
+    a guess (t_ef1ba08b).
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return "unknown id"
+    if task.status in ("done", "archived"):
+        row = conn.execute(
+            "SELECT profile, outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        who = (row["profile"] if row else None) or task.assignee or "unknown"
+        outcome = f", outcome {row['outcome']}" if row and row["outcome"] else ""
+        when = (
+            time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(task.completed_at))
+            if task.completed_at
+            else "unknown time"
+        )
+        state = "already done" if task.status == "done" else "archived (was done)" if task.completed_at else "archived"
+        return f"{state} by {who} at {when}{outcome}"
+    if task.status not in ("running", "ready", "blocked", "review"):
+        return f"status is {task.status!r}; complete needs running/ready/blocked/review"
+    if expected_run_id is not None and task.current_run_id != expected_run_id:
+        return (
+            f"run {expected_run_id} is no longer the current run "
+            f"(current: {task.current_run_id}); another run owns this card"
+        )
+    if not _parents_satisfied(conn, task_id):
+        return "a parent task is not done"
+    return f"refused while status is {task.status!r} (state changed concurrently?)"
 
 
 def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
