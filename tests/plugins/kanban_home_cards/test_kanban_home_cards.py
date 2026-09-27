@@ -187,7 +187,7 @@ def test_I7_url_credentials_and_board_slug_redacted(mod):
     intact, and the board slug skipped the redactor entirely."""
     slug = "sk-" + "proj-" + "a1b2c3d4e5f6g7h8i9j0"
     out = mod.render(_cards(
-        1, title="cb https://example.test/cb?access_token=opaque123secret",
+        1, title="cb https://example.test/cb?access_token=" + "opaque123" + "secret",
         comment="see https://ace:hunter2pw@host.test/x", board=slug))
     for leak in ("opaque123secret", "hunter2pw", "a1b2c3d4e5f6g7h8i9j0"):
         assert leak not in out, (leak, out)

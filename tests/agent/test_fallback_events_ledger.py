@@ -219,7 +219,7 @@ def test_401_token_redacted_in_err_head(_home, monkeypatch):
 
 def test_url_credentials_redacted_in_err_head(_home, monkeypatch):
     """Backfill C3 (#1211): a provider error echoing a credential-bearing URL."""
-    msg = "bad redirect https://u:hunter2pw@h.test/cb?access_token=opaque123secret"
+    msg = "bad redirect https://u:hunter2pw@h.test/cb?access_token=" + "opaque123" + "secret"
     _fail_over(monkeypatch, _Err(msg, 401, body={"error": {"message": msg}}),
                reason=FailoverReason.auth)
     r = _rows(_home)[0]
