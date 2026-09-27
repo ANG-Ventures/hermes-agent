@@ -9060,6 +9060,14 @@ def tick(
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
+        # A dying process must not scan for due jobs (t_1f4598ad). Anything it
+        # dispatches is refused ("Skipped: cron scheduler is shutting down"),
+        # which records last_status=error, advances next_run_at a whole period
+        # and consumes a restart_requeue marker the next boot needed. Leave
+        # due jobs and markers untouched for the next process's ticker.
+        if is_shutting_down():
+            logger.debug("Cron tick skipped: scheduler is shutting down")
+            return 0
         # Shared-checkout admission hold (gateway/checkout_admission.py): a
         # gate exposing ``admit()`` returns a release callable that must span
         # the whole dispatch window, so a hold engaged mid-tick still sees
