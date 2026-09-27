@@ -184,6 +184,60 @@ class TestShouldExclude:
         # a FILE literally named "workspaces" is not a directory — keep it
         assert not _should_exclude(Path("kanban/boards/slug/workspaces"))
 
+    def test_excludes_root_scratch_trees(self):
+        """Root-anchored regenerable scratch (2026-09-27: 14.84M-file full tier vs a
+        1.1M baseline). The default board's kanban/workspaces + kanban/worktrees,
+        .worktrees/, var/ramscratch-stage-* and var/subvps-stage are excluded AND
+        pruned from the walk; same-named dirs deeper in the tree are preserved."""
+        from hermes_cli.backup import _matches_path_glob, _should_exclude
+        for p in (
+            "kanban/workspaces/t_124b00a5/repo/a.py",
+            "kanban/workspaces/default/x.txt",
+            "kanban/worktrees/apollo-1055/README.md",
+            ".worktrees/argus/t_064c65a9/head/setup.py",
+            "var/ramscratch-stage-20260925-0512/worktrees/f.txt",
+            "var/subvps-stage/sub-vps-1/etc/hosts",
+            "wt/alerts-day-media-20260911/run_agent.py",
+            "worktrees/compression-refusal/cli.py",
+        ):
+            assert _should_exclude(Path(p)), p
+        # the walk prunes the DIR itself (prune sites pass a trailing "_" sentinel)
+        for d in ("kanban/workspaces", ".worktrees", "var/ramscratch-stage-20260925-0444",
+                  "var/subvps-stage", "kanban/worktrees"):
+            assert _matches_path_glob((*Path(d).parts, "_")), d
+        # board DBs and other var/ content survive
+        assert not _should_exclude(Path("kanban/kanban.db"))
+        assert not _should_exclude(Path("kanban.db"))
+        assert not _should_exclude(Path("var/other-stage/a.txt"))
+        assert not _should_exclude(Path("var/ramscratch-notes.md"))
+        # root-anchored: same names deeper in the tree are kept
+        assert not _should_exclude(Path("skills/x/kanban/workspaces/note.md"))
+        assert not _should_exclude(Path("skills/x/.worktrees/note.md"))
+        assert not _should_exclude(Path("profiles/p/var/subvps-stage/a.txt"))
+        assert not _should_exclude(Path("skills/git/worktrees/SKILL.md"))
+        assert not _should_exclude(Path("plans/wt/notes.md"))
+        # a FILE literally named like the dir is not an ancestor — keep it
+        assert not _should_exclude(Path(".worktrees"))
+        assert not _should_exclude(Path("kanban/workspaces"))
+
+    def test_run_backup_walk_prunes_root_scratch(self, tmp_path, monkeypatch):
+        """E2E: the real full-tier writer never archives root scratch trees."""
+        import zipfile
+        from hermes_cli.backup import _write_full_zip_backup_locked
+        home = tmp_path / "home"
+        for rel in ("config.yaml", "kanban/workspaces/t_1/repo/a.py",
+                    ".worktrees/argus/t_2/f.py", "var/ramscratch-stage-20260925-0444/g.txt",
+                    "var/subvps-stage/sub-vps-1/h.txt", "var/keep.txt", "kanban/meta.json"):
+            f = home / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("x")
+        out = tmp_path / "out.zip"
+        assert _write_full_zip_backup_locked(out, home) == out
+        names = set(zipfile.ZipFile(out).namelist())
+        assert {"config.yaml", "var/keep.txt", "kanban/meta.json"} <= names
+        assert not any(n.startswith((".worktrees/", "kanban/workspaces/", "var/ramscratch-stage-",
+                                     "var/subvps-stage/")) for n in names), names
+
     def test_excludes_cache_forensic_artifacts(self):
         """cache/forensic-*/ holds DELIBERATELY TORN forensic specimens — they are
         expected to fail PRAGMA integrity_check forever, by construction.

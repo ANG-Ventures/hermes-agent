@@ -8,6 +8,7 @@ Backup and import commands for hermes CLI.
 HERMES_HOME root.
 """
 
+import fnmatch
 import json
 import logging
 import os
@@ -153,6 +154,29 @@ _EXCLUDED_PARENT_CHILD = (
 # agree on what a board restore needs: the board DBs + metadata, not the scratch.
 _EXCLUDED_PATH_GLOBS = (
     ("kanban", "boards", None, "workspaces"),   # ephemeral per-task scratch checkouts
+)
+
+# ROOT-anchored scratch trees: each entry is a tuple of fnmatch patterns matched
+# against the FIRST path components only, so a same-named dir deeper in the tree
+# (e.g. a skill's own ``worktrees/`` folder) is still backed up.
+#
+# 2026-09-27: the Sunday full tier grew from 1,111,844 files (09-20) to 14,840,610
+# and was still zipping 3.7 h in (113 GB partial). Measured by ``find``: the default
+# board's ``kanban/workspaces`` 7.4M (the ``kanban/boards/*/workspaces`` glob above
+# does not cover the default board, which lives at the root), ``.worktrees/argus``
+# 4.4M, two dead 09-25 ``var/ramscratch-stage-*`` evacuation copies 5.1M and
+# ``var/subvps-stage`` 0.5M; after those, root ``wt/`` + ``worktrees/`` (ad-hoc git
+# worktrees) were the largest remaining at ~0.25M each. All are regenerable scratch: git checkouts/worktrees
+# created and reaped by the kanban/review runtimes, one-off staging copies, and the
+# sub-VPS rsync stage (its contents are backed up from the boxes by restic).
+_EXCLUDED_ROOT_PATH_GLOBS = (
+    ("kanban", "workspaces"),       # default-board per-task scratch workspaces
+    ("kanban", "worktrees"),        # default-board per-task git worktrees
+    (".worktrees",),                # review/verifier worktrees (argus, per-task)
+    ("var", "ramscratch-stage-*"),  # RAM-disk evacuation staging copies
+    ("var", "subvps-stage"),        # sub-VPS rsync staging mount (restic-covered)
+    ("wt",),                        # ad-hoc operator git worktrees (0.25M files)
+    ("worktrees",),                 # ad-hoc operator git worktrees (0.25M files)
 )
 
 # Root-anchored ``cache/`` rules. ``$HERMES_HOME/cache/`` is the fleet's REGENERABLE
@@ -495,6 +519,11 @@ def _matches_path_glob(parts: tuple[str, ...]) -> bool:
     ancestor-only discipline used for _EXCLUDED_DIR_PREFIXES.
     """
     ancestors = parts[:-1]
+    for pattern in _EXCLUDED_ROOT_PATH_GLOBS:
+        if len(ancestors) >= len(pattern) and all(
+            fnmatch.fnmatchcase(ancestors[j], pat) for j, pat in enumerate(pattern)
+        ):
+            return True
     for pattern in _EXCLUDED_PATH_GLOBS:
         n = len(pattern)
         for i in range(len(ancestors) - n + 1):
