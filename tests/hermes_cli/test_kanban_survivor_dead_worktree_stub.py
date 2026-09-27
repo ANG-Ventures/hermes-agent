@@ -81,9 +81,16 @@ def kill_stub(repo, stub):
     assert probe.returncode == 128
 
 
+def diverge(stub):
+    """Give the stub bytes no commit anywhere holds, so the remote fallback
+    (t_59223001) cannot vouch for it and the HOLD must stand."""
+    (stub / "unique.txt").write_text("only on this disk\n")
+
+
 def test_dead_worktree_stub_is_named_with_a_working_remedy(board, tmp_path):
     tid, ws, repo, stub = stub_workspace(board, tmp_path)
     kill_stub(repo, stub)
+    diverge(stub)
 
     with pytest.raises(ValueError) as excinfo:
         kb.complete_task(board, tid, metadata={"changed_files": ["a.txt"]})
@@ -113,6 +120,7 @@ def test_following_the_remedy_completes(board, tmp_path):
     """The instruction IS the product: doing exactly what it says must work."""
     tid, ws, repo, stub = stub_workspace(board, tmp_path)
     kill_stub(repo, stub)
+    diverge(stub)
     with pytest.raises(ValueError):
         kb.complete_task(board, tid, metadata={"changed_files": ["a.txt"]})
 
@@ -130,6 +138,7 @@ def test_stub_recorded_at_dispatch_is_told_the_MOVE_needs_a_survivor_flag(board,
                       (tid,)).fetchone()[0]
     )
     kill_stub(repo, stub)
+    diverge(stub)
 
     with pytest.raises(ValueError) as excinfo:
         kb.complete_task(board, tid, metadata={"changed_files": ["a.txt"]})
@@ -151,3 +160,88 @@ def test_a_live_linked_worktree_is_not_misclassified(board, tmp_path):
     tid, ws, repo, stub = stub_workspace(board, tmp_path)
     assert kb.complete_task(board, tid, metadata={"changed_files": ["a.txt"]})
     assert kb.get_task(board, tid).status == "done"
+
+
+# --- t_59223001: fall back to the remote before holding --------------------
+
+
+def objects_in(repo):
+    return sorted(p.relative_to(repo) for p in (repo / ".git" / "objects").rglob("*") if p.is_file())
+
+
+def stub_ref(board, tid):
+    survivor = json.loads(board.execute(
+        "SELECT survivor FROM task_workspace_survivors WHERE task_id = ?", (tid,)).fetchone()[0])
+    assert survivor["kind"] == "ref"
+    [ref] = [r for r in survivor["refs"] if r["repository"] == "baseline"]
+    return ref
+
+
+@pytest.mark.parametrize("stub_at_dispatch", [False, True])
+def test_dead_stub_whose_files_are_published_completes_via_remote(board, tmp_path, stub_at_dispatch):
+    tid, ws, repo, stub = stub_workspace(board, tmp_path, stub_at_dispatch=stub_at_dispatch)
+    published = git(repo, "rev-parse", "HEAD")
+    kill_stub(repo, stub)
+    before = objects_in(repo)
+    import hermes_cli.kanban_survivor as survivor
+    assert survivor._dead_stub_survivor(stub, ws.resolve())
+    # The tree was hashed in a throwaway store: the main repo gained nothing.
+    assert objects_in(repo) == before
+
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["a.txt"]})
+    assert kb.get_task(board, tid).status == "done"
+    ref = stub_ref(board, tid)
+    assert ref["matched_by"] == "tree"
+    assert ref["remote"] == "origin" and ref["branch"] == "published"
+    assert ref["head"] == published
+    assert ref["dead_worktree_stub"] == str(repo / ".git" / "worktrees" / "baseline")
+
+
+def test_dead_stub_behind_the_remote_tip_is_verified_by_containment(board, tmp_path):
+    """fork/main moved on after the worktree was cut: the stub's commit is an
+    ancestor of the advertised head, which is exactly `_remote_survivor`'s bar."""
+    tid, ws, repo, stub = stub_workspace(board, tmp_path)
+    old = git(repo, "rev-parse", "HEAD")
+    kill_stub(repo, stub)
+    (repo / "b.txt").write_text("b\n")
+    git(repo, "add", "b.txt")
+    git(repo, "commit", "-m", "b")
+    git(repo, "push", "origin", "HEAD:refs/heads/published")
+
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["a.txt"]})
+    assert stub_ref(board, tid)["head"] == old
+
+
+@pytest.mark.parametrize("on_local_branch", [False, True])
+def test_dead_stub_at_an_unpushed_commit_holds_naming_the_path(board, tmp_path, on_local_branch):
+    """The stub's tree IS a commit in the main repo -- but no remote has it.
+    On a local branch the tree match is FOUND, so only the remote-containment
+    check stands between it and a delete."""
+    tid, ws, repo, stub = stub_workspace(board, tmp_path)
+    if on_local_branch:
+        git(stub, "checkout", "-b", "local-only")
+    (stub / "a.txt").write_text("unpushed\n")
+    git(stub, "commit", "-am", "local only")
+    kill_stub(repo, stub)
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, metadata={"changed_files": ["a.txt"]})
+    message = str(excinfo.value)
+    assert "./baseline" in message and "dead linked worktree stub" in message
+    assert str(repo / ".git" / "worktrees" / "baseline") in message
+    assert "no commit on a durable remote holds its files" in message
+    assert kb.get_task(board, tid).status != "done"
+    assert (stub / "a.txt").read_text() == "unpushed\n"
+
+
+def test_dead_stub_with_unique_files_holds_and_writes_nothing(board, tmp_path):
+    tid, ws, repo, stub = stub_workspace(board, tmp_path)
+    kill_stub(repo, stub)
+    diverge(stub)
+    before = objects_in(repo)
+
+    with pytest.raises(ValueError) as excinfo:
+        kb.complete_task(board, tid, metadata={"changed_files": ["a.txt"]})
+    assert "./baseline" in str(excinfo.value)
+    assert objects_in(repo) == before
+    assert (stub / "unique.txt").exists()
