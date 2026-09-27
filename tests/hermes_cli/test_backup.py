@@ -2239,3 +2239,74 @@ class TestMemoryProviderExternalPaths:
         assert not (hermes_home / "_external").exists()
 
 
+class TestWorktreeUnpushedCommitBundles:
+    """Root ``wt/`` worktrees are linked worktrees whose objects live in a parent
+    repo the walk never archives; the full tier must bundle their unpushed commits
+    so they survive loss of the checkout (t_7ad1f73d)."""
+
+    @staticmethod
+    def _git(cwd, *argv):
+        import subprocess
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t")
+        return subprocess.run(["git", "-C", str(cwd), *argv], check=True,
+                              capture_output=True, text=True, env=env).stdout.strip()
+
+    def test_unpushed_worktree_commits_are_recoverable_from_archive(self, tmp_path, monkeypatch):
+        import shutil as _sh
+        if _sh.which("git") is None:
+            pytest.skip("git not installed")
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        parent = tmp_path / "parent"   # stands in for ~/.hermes/.git: never archived
+        self._git(tmp_path, "init", "-q", "-b", "main", str(parent))
+        (parent / "a.txt").write_text("a\n")
+        self._git(parent, "add", "a.txt")
+        self._git(parent, "commit", "-q", "-m", "base")
+        remote = tmp_path / "remote.git"  # holds only the base commit
+        self._git(tmp_path, "clone", "-q", "--bare", str(parent), str(remote))
+        self._git(parent, "remote", "add", "origin", str(remote))
+        self._git(parent, "fetch", "-q", "origin")
+        # A credential in a remote URL must never reach the archive.
+        self._git(parent, "remote", "add", "mirror", "https://user:s3cret-tok@example.invalid/r.git")
+        dirty = hermes_home / "wt" / "dirty"
+        clean = hermes_home / "wt" / "clean"
+        self._git(parent, "worktree", "add", "-q", "-b", "feat", str(dirty), "main")
+        self._git(parent, "worktree", "add", "-q", "--detach", str(clean), "main")
+        (dirty / "b.txt").write_text("unique\n")
+        self._git(dirty, "add", "b.txt")
+        self._git(dirty, "commit", "-q", "-m", "unpushed work")
+        unique_sha = self._git(dirty, "rev-parse", "HEAD")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        out_zip = tmp_path / "backup.zip"
+        from hermes_cli.backup import run_backup
+        run_backup(Namespace(output=str(out_zip)))
+
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            names = zf.namelist()
+            assert "wt/dirty/b.txt" in names
+            # A credential in a remote URL must never reach the archive.
+            assert not any(b"s3cret-tok" in zf.read(n) for n in names if n.startswith("wt/"))
+            bundle = tmp_path / "restored.bundle"
+            bundle.write_bytes(zf.read("wt/dirty.git-unpushed.bundle"))
+            meta = json.loads(zf.read("wt/dirty.git-unpushed.json"))
+        # A worktree with nothing unpushed gets no bundle.
+        assert [n for n in names if n.endswith(".bundle")] == ["wt/dirty.git-unpushed.bundle"]
+        assert meta["commits"] == 1 and meta["head"] == unique_sha
+        assert meta["branch"] == "refs/heads/feat"
+        assert meta["gitdir"].startswith("gitdir: " + str(parent))
+        assert meta["remotes"] == {"origin": str(remote),
+                                   "mirror": "https://example.invalid/r.git"}
+
+        # Lose the parent repo and worktree entirely; recover from the archive alone.
+        _sh.rmtree(parent)
+        _sh.rmtree(dirty)
+        fresh = tmp_path / "fresh"
+        self._git(tmp_path, "clone", "-q", str(remote), str(fresh))
+        self._git(fresh, "fetch", "-q", str(bundle), "refs/heads/feat:recovered")
+        assert self._git(fresh, "rev-parse", "recovered") == unique_sha
+        assert self._git(fresh, "show", "recovered:b.txt") == "unique"
