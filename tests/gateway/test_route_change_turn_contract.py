@@ -208,11 +208,28 @@ def test_pool_exhaustion_then_429_delivers_each_hop_before_final(
             },
         )
         agent._rate_limited_until = 0
+        # Phase 2 (fallback spec §4.2): the primary's pool-wide quota_model
+        # armed a sticky episode, so the next turn boundary stays put ...
+        await asyncio.to_thread(agent._restore_primary_runtime)
+        await asyncio.sleep(0)
+        assert len(adapter.messages) == 2
+        # ... until the §4.3 gate opens (until passed, fallback idle > 60 min).
+        from agent import fallback_sticky_store as fss
+        from agent import fallback_wiring as fw
+
+        key = fw.key_for(agent)
+        state = fss.get(key)
+        assert state is not None and state.active and state.cls == "quota_model"
+        now = time.time()
+        state.until_epoch = now - 1
+        state.last_fallback_call_epoch = now - 61 * 60
+        fss.default_store().put(key, state, now)
         await asyncio.to_thread(agent._restore_primary_runtime)
         await asyncio.sleep(0)
         assert len(adapter.messages) == 2 + int(announce_recovery)
         if announce_recovery:
             assert "Model recovery" in adapter.messages[-1][1]
+            assert "fallback idle 61m" in adapter.messages[-1][1]
 
     asyncio.run(scenario())
     assert attempts == ["primary/model"] * 3 + ["fallback/one", "fallback/two"]
@@ -439,7 +456,8 @@ def test_warm_cache_recovery_preserves_from_effort_and_announces_once(
         )
         await asyncio.sleep(0)
         assert len(adapter.messages) == 1
-        fallback = adapter.messages[0][1].split(": ", 1)[1]
+        # Strip the §4.8 cause rider (" — <cause> <hop> <sub>, <time>").
+        fallback = adapter.messages[0][1].split(" — ", 1)[0].split(": ", 1)[1]
         assert fallback.endswith("(high)")
         capsys.readouterr()
         adapter.messages.clear()

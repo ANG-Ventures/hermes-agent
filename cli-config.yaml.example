@@ -343,9 +343,15 @@ model:
 #   announce_switch: true         # deliberate /reasoning + /model switches (in-session)
 #   announce_route_change: true   # automatic client-side failover (opus@claude-app → opus@f3)
 #   announce_recovery: false      # recovery back to primary (green event; silent by default)
+#   announce_seat_names: true     # name the relay seat (sub-vps-9) in the notice rider; false → "a sub"
 #
 # Set any to false to silence that class without losing the others (e.g. a heavy
 # /model user can set announce_switch: false).
+#
+# Sticky same-family fallback (a session stays on its fallback until the §4.3
+# return gate allows the primary back; state persists in blackbox turns.db):
+# fallback:
+#   sticky_policy: true           # false = today's per-turn restore AND purges the stored episodes
 
 # =============================================================================
 # Kanban Review Dispatch
