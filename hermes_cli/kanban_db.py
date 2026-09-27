@@ -9852,8 +9852,9 @@ def complete_task(
     # ``review`` is a reviewer/human approval and is left alone; so is a
     # claimed reviewer run approving with ``head_sha`` -- the PR it approved
     # is OPEN by definition and the land queue merges it from that record.
+    from hermes_cli import kanban_open_pr as _open_pr
+    _pr_query = None
     if candidate.status != 'review' and not approve_head_sha:
-        from hermes_cli import kanban_open_pr as _open_pr
         # Foreign-owner PRs (upstream / third-party repos) are mentions, not a
         # gate: the fleet cannot merge them (t_06dccfe3). Record, never route.
         foreign = _open_pr.foreign_pr_refs(
@@ -9916,23 +9917,25 @@ def complete_task(
                 # and the PR refs the review-card closer resolves on merged=true.
                 add_comment(conn, task_id, "kanban", _open_pr.route_comment(still_open))
             return bool(ok)
-        # Closed-unmerged done gate (t_a1550189): the card's own PR was closed
-        # without merge (e.g. auto-closed when its stacked base was deleted), so
-        # the work is not on default. Refuse done unless the handoff names the
-        # superseding merged PR / SHA. Raises before any mutation.
-        try:
-            _open_pr.enforce_not_closed_unmerged(
-                task_id, result, summary, metadata=metadata,
-                survivor_pr=survivor_pr, superseded_by=superseded_by,
-                query_fn=_pr_query,
+    # Closed-unmerged done gate (t_a1550189): the card's own PR was closed
+    # without merge (e.g. auto-closed when its stacked base was deleted), so
+    # the work is not on default. Refuse done unless the handoff carries a
+    # SUPERSEDED-BY / RE-CARRIED-AS token naming merged work for that PR; an
+    # unreadable lookup refuses too. Every completion is gated, including a
+    # reviewer approving a card parked in review. Raises before any mutation.
+    try:
+        _open_pr.enforce_not_closed_unmerged(
+            task_id, result, summary, metadata=metadata,
+            survivor_pr=survivor_pr, superseded_by=superseded_by,
+            query_fn=_pr_query or _open_pr.memo_query(),
+        )
+    except _open_pr.ClosedUnmergedPrError as closed_err:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_closed_unmerged_pr",
+                {"prs": closed_err.closed, "unverified": closed_err.unverified},
             )
-        except _open_pr.ClosedUnmergedPrError as closed_err:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "completion_blocked_closed_unmerged_pr",
-                    {"prs": closed_err.prs},
-                )
-            raise
+        raise
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,
@@ -14241,8 +14244,54 @@ def decompose_triage_task(
     return child_ids
 
 
+def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=None) -> None:
+    """Refuse to archive a card whose own PR was closed without merge (t_a1550189).
+
+    Archiving hides a card the same way ``done`` does, so a card whose PR was auto-closed (stacked base
+    deleted) must not vanish from the board with its content never on default. The card's own refs are
+    every ``pr_url``/``pr_urls``/``pr`` any of its runs recorded. Archive passes when the card's result,
+    run summaries or comments carry a SUPERSEDED-BY / RE-CARRIED-AS token naming merged work, or a card
+    comment records an explicit close decision (``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|
+    DUPLICATE-OF``, the line the close-reason contract says to copy onto the card). Unreadable refuses.
+    """
+    from hermes_cli import kanban_open_pr as _open_pr
+    task = get_task(conn, task_id)
+    if task is None or task.status == "archived":
+        return
+    urls: list = []
+    texts: list = [task.result]
+    for run in list_runs(conn, task_id):
+        md = run.metadata if isinstance(run.metadata, dict) else {}
+        for key in ("pr_url", "pr_urls", "pr"):
+            val = md.get(key)
+            if isinstance(val, str):
+                urls.append(val)
+            elif isinstance(val, (list, tuple)):
+                urls.extend(v for v in val if isinstance(v, str))
+        texts.append(run.summary)
+    if not urls:
+        return
+    comments = [c.body for c in list_comments(conn, task_id)]
+    try:
+        _open_pr.enforce_not_closed_unmerged(
+            task_id, *texts, metadata={"pr_urls": urls},
+            query_fn=query_fn or _open_pr.memo_query(),
+            verb="archive", decision_texts=comments,
+        )
+    except _open_pr.ClosedUnmergedPrError as closed_err:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "archive_blocked_closed_unmerged_pr",
+                {"prs": closed_err.closed, "unverified": closed_err.unverified},
+            )
+        raise
+
+
 @_home_session_guarded("archive")
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Archive ``task_id``. Raises :class:`kanban_open_pr.ClosedUnmergedPrError` (no state change) when
+    the card's own PR is closed-unmerged with no recorded superseder or close decision (t_a1550189)."""
+    _archive_closed_pr_gate(conn, task_id)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "

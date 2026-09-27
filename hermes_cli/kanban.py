@@ -4911,7 +4911,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
                 with_reason=True,
             )
-        except (DraftPrError, StaleBaseError) as draft_err:
+        except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
             print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
             return 1
         if not ok:
@@ -5153,7 +5153,13 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            try:
+                archived = kb.archive_task(conn, tid)
+            except ClosedUnmergedPrError as closed_err:
+                failed.append(tid)
+                print(f"cannot archive {tid}: {closed_err}", file=sys.stderr)
+                continue
+            if not archived:
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:
