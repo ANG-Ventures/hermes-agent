@@ -3366,6 +3366,99 @@ def trigger_job(
     )
 
 
+# Restart re-queue (t_1f4598ad). A gateway restart whose drain outlives the
+# shutdown budget SIGTERMs in-flight cron scripts (terminate_running_scripts);
+# the run is recorded as ``Script exited with code -15`` and, for a daily job,
+# stays last_status=error for a whole day. The dying process stamps this
+# marker AFTER its own completion bookkeeping; the next scheduler to scan the
+# job (the restarted gateway) converts it into a single run-now fire.
+# mark_job_run never touches the marker, so the interrupted run's own
+# last_status/next_run_at write cannot erase it.
+RESTART_REQUEUE_KEY = "restart_requeue"
+RESTART_REQUEUE_COUNT_KEY = "restart_requeue_count"
+# Re-fires allowed per streak without a successful run: a re-fire that is
+# itself killed by another restart is NOT re-queued again.
+RESTART_REQUEUE_MAX = 1
+# A marker older than this is dropped instead of fired (job paused across the
+# restart, gateway down for a day): same window as the one-shot restart
+# catch-up default.
+RESTART_REQUEUE_MAX_AGE_SECONDS = DEFAULT_ONESHOT_CATCHUP_SECONDS
+
+
+def request_restart_requeue(job_id: str, reason: str) -> bool:
+    """Persist a one-shot re-fire request for a run killed by a gateway restart.
+
+    Returns True when the marker was written. Refuses (False) for unknown or
+    non-recurring jobs, and once ``RESTART_REQUEUE_MAX`` re-fires have been
+    spent without an intervening successful run.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            schedule = job.get("schedule")
+            kind = schedule.get("kind") if isinstance(schedule, dict) else None
+            if kind not in {"cron", "interval"}:
+                return False
+            count = int(job.get(RESTART_REQUEUE_COUNT_KEY) or 0)
+            if count >= RESTART_REQUEUE_MAX:
+                logger.warning(
+                    "cron.restart_requeue.refused job='%s' id=%s — already "
+                    "re-queued %d time(s) without a successful run",
+                    job.get("name", job_id), job_id, count,
+                )
+                return False
+            job[RESTART_REQUEUE_COUNT_KEY] = count + 1
+            job[RESTART_REQUEUE_KEY] = {
+                "at": _hermes_now().isoformat(),
+                "reason": str(reason or "")[:500],
+            }
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def _apply_restart_requeue(job: Dict[str, Any], raw_jobs: List[Dict[str, Any]], now: datetime) -> bool:
+    """Turn a pending restart re-queue marker into a run-now fire.
+
+    Mutates ``job`` (scan copy) and its ``raw_jobs`` record in place. Uses the
+    same ``next_run_at == manual_run_at`` shape as ``trigger_job`` so the
+    cron-expression / TZ / stale-grace guards treat it as an explicit run-now.
+    Returns True when storage needs saving.
+    """
+    marker = job.get(RESTART_REQUEUE_KEY)
+    if not marker:
+        return False
+    raw = next((rj for rj in raw_jobs if rj.get("id") == job.get("id")), None)
+    job.pop(RESTART_REQUEUE_KEY, None)
+    if raw is not None:
+        raw.pop(RESTART_REQUEUE_KEY, None)
+    try:
+        stamped = _ensure_aware(datetime.fromisoformat(str(marker.get("at"))))
+        age = (now - stamped).total_seconds()
+    except (AttributeError, TypeError, ValueError):
+        age = None
+    name = job.get("name", job.get("id", "?"))
+    if age is None or age > RESTART_REQUEUE_MAX_AGE_SECONDS:
+        logger.warning(
+            "cron.restart_requeue.expired job='%s' id=%s — dropping re-queue "
+            "marker (age=%s)", name, job.get("id"), age,
+        )
+        return True
+    stamp = now.isoformat()
+    for record in (job, raw):
+        if record is not None:
+            record["next_run_at"] = stamp
+            record["manual_run_at"] = stamp
+    logger.warning(
+        "cron.restart_requeue.fire job='%s' id=%s — previous run was killed by "
+        "a gateway restart (%s); firing once now",
+        name, job.get("id"), str(marker.get("reason") or "")[:200],
+    )
+    return True
+
+
 def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     if not isinstance(claim, dict) or not claim.get("at"):
         return False
@@ -3652,6 +3745,8 @@ def _mark_job_run_locked(
                 if success:
                     job.pop("preflight_alerted", None)
                     job.pop("drift_alerted", None)
+                    # A clean run closes the restart re-queue streak.
+                    job.pop(RESTART_REQUEUE_COUNT_KEY, None)
                     # The fire hand-off demonstrably works again — clear the
                     # forward-failure stamp so it only ever describes the
                     # CURRENT auto-fire health, not a healed past incident.
@@ -4538,6 +4633,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     needs_save = True
                     break
                 continue
+
+            if _apply_restart_requeue(job, raw_jobs, now):
+                needs_save = True
 
             # Cross-process running-claim guard (#59229): if another scheduler
             # process already claimed this one-shot and its run is still in flight
