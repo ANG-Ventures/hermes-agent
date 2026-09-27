@@ -628,6 +628,8 @@ hermes kanban set-model t_abcd --effort xhigh --live      # effort only
 - The worker checks for the event before each provider call and switches at the next one. It re-applies the flagship and pin gates, then calls the same in-place swap `/model` uses. The board records `route_switched {from, to, iteration}`, or `route_switch_refused {reason}` when a gate or credential resolution refuses the switch. The worker then stays on its old route.
 - Cost: a model or provider change means one cold-cache call on the new provider, and the next call is warm again. Switching back to a provider whose prefix is still cached is a hit. Cross-vendor tool history (Claude ↔ Codex) carries over. An effort-only change keeps the same client, model and system prompt; only the request's reasoning parameter changes.
 - A long-running tool call delays the switch until it returns.
+- Only the fields a `--live` write names go live: an effort-only `--live` never activates a model written earlier without `--live`. Repeating a refused `--live` request retries it.
+- Workers on the `codex_app_server` runtime cannot switch in place. For those runs the receipt says `applies=next-dispatch` and any pending live request is recorded as `route_switch_refused`; use `--reclaim`.
 - Clears are refused with `--live` (`none`, `--clear-effort`), because a clear resolves through lane overrides at dispatch time. `--live` cannot be combined with `--reclaim`. A live switch goes straight to the route you name, and the dispatcher's capped-pool fallback does not run. Use `--reclaim` if you want the dispatcher to place the card.
 
 Design and measured costs: `docs/specs/kanban-set-model-live.md`.

@@ -377,3 +377,115 @@ def test_live_switch_only_follows_the_first_top_level_agent(worker_card):
     assert helper.reasoning_config == {"enabled": True, "effort": "medium"}
     kwr.apply_pending_live_route(worker, iteration=2)
     assert worker.reasoning_config == {"enabled": True, "effort": "low"}
+
+
+# ---------------------------------------------------------------------------
+# FleetReview #1331 follow-ups (t_14dcd770)
+# ---------------------------------------------------------------------------
+
+
+def test_live_event_survives_a_transient_card_read_failure(worker_card):
+    """A failed read must not advance the cursor past the live event."""
+    task_id, _ = worker_card
+    agent = _worker_agent()
+    _set_live(task_id, touch_effort=True, effort="low")
+    real_get_task = kb.get_task
+    calls = []
+
+    def flaky(conn, tid):
+        calls.append(tid)
+        if len(calls) == 1:
+            raise RuntimeError("database is locked")
+        return real_get_task(conn, tid)
+
+    with patch.object(kb, "get_task", side_effect=flaky):
+        kwr.apply_pending_live_route(agent, iteration=1)
+        assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+        kwr.apply_pending_live_route(agent, iteration=2)
+    assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+    assert len(_events(task_id, kwr.LIVE_ROUTE_SWITCHED_EVENT)) == 1
+
+
+def test_repeating_a_refused_live_request_retries_the_switch(worker_card):
+    """Same set-model --live twice: the second appends a new event and switches."""
+    task_id, _ = worker_card
+    agent = _worker_agent()
+    refused = SimpleNamespace(success=False, error_message="no credentials for custom-b")
+    resolved = SimpleNamespace(success=True, new_model="model-b", target_provider="custom-b",
+                               api_key="key-b", base_url="https://b.example/v1",
+                               api_mode="chat_completions", error_message="")
+    kw = dict(touch_model=True, model="model-b", provider="custom-b")
+    target = f"{kc.__name__.rsplit('.', 1)[0]}.model_switch.switch_model"
+    _set_live(task_id, **kw)
+    with patch(target, return_value=refused), patch.object(agent, "switch_model") as switch:
+        kwr.apply_pending_live_route(agent, iteration=1)
+    switch.assert_not_called()
+    assert len(_events(task_id, kwr.LIVE_ROUTE_SWITCH_REFUSED_EVENT)) == 1
+
+    _set_live(task_id, **kw)  # identical route: still a fresh run-scoped event
+    assert len(_events(task_id, kb.ROUTE_CHANGED_EVENT)) == 2
+    with patch(target, return_value=resolved), patch.object(agent, "switch_model") as switch:
+        kwr.apply_pending_live_route(agent, iteration=2)
+    switch.assert_called_once()
+    assert switch.call_args.kwargs["new_model"] == "model-b"
+
+
+def test_effort_only_live_event_does_not_activate_a_next_dispatch_model(worker_card):
+    task_id, _ = worker_card
+    agent = _worker_agent()
+    with kb.connect_closing() as conn:  # next-dispatch model write (no --live)
+        kb.apply_batch_route_writes(conn, [kb.BatchRouteWrite(
+            task_id=task_id, touch_model=True, model="model-b", provider="custom-b")])
+    assert _events(task_id, kb.ROUTE_CHANGED_EVENT) == []
+    _set_live(task_id, touch_effort=True, effort="high")
+
+    with patch.object(agent, "switch_model") as switch:
+        kwr.apply_pending_live_route(agent, iteration=1)
+
+    switch.assert_not_called()
+    assert (agent.model, agent.provider) == ("model-a", "custom")
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+    ev = _events(task_id, kwr.LIVE_ROUTE_SWITCHED_EVENT)
+    assert len(ev) == 1 and ev[0][1]["kind"] == "effort"
+
+
+def test_pending_live_events_coalesce_to_their_own_values(worker_card):
+    """live model-b, then next-dispatch model-c, then live effort: run gets b + high."""
+    task_id, _ = worker_card
+    agent = _worker_agent()
+    _set_live(task_id, touch_model=True, model="model-b", provider="custom-b")
+    with kb.connect_closing() as conn:
+        kb.apply_batch_route_writes(conn, [kb.BatchRouteWrite(
+            task_id=task_id, touch_model=True, model="model-c", provider="custom-c")])
+    _set_live(task_id, touch_effort=True, effort="high")
+    resolved = SimpleNamespace(success=True, new_model="model-b", target_provider="custom-b",
+                               api_key="key-b", base_url="https://b.example/v1",
+                               api_mode="chat_completions", error_message="")
+    with patch(f"{kc.__name__.rsplit('.', 1)[0]}.model_switch.switch_model",
+               return_value=resolved) as resolve, \
+            patch.object(agent, "switch_model") as switch:
+        kwr.apply_pending_live_route(agent, iteration=1)
+
+    assert resolve.call_args.kwargs["raw_input"] == "model-b"
+    assert resolve.call_args.kwargs["explicit_provider"] == "custom-b"
+    assert switch.call_args.kwargs["session_reasoning_config"] == {"enabled": True, "effort": "high"}
+
+
+def test_app_server_worker_marks_run_and_live_write_is_not_promised(worker_card):
+    task_id, run_id = worker_card
+    agent = _worker_agent()
+    _set_live(task_id, touch_effort=True, effort="low")  # pending before the turn
+    agent.api_mode = "codex_app_server"
+    with patch.object(agent, "_run_codex_app_server_turn",
+                      return_value={"final_response": "x", "messages": []}) as turn:
+        agent.run_conversation("do the task")
+    turn.assert_called_once()
+    assert [r for r, _ in _events(task_id, kb.ROUTE_LIVE_UNSUPPORTED_EVENT)] == [run_id]
+    refused = _events(task_id, kwr.LIVE_ROUTE_SWITCH_REFUSED_EVENT)
+    assert [r for r, _ in refused] == [run_id]
+    assert "codex_app_server" in refused[0][1]["reason"]
+
+    out = kc.run_slash(f"set-model {task_id} --effort high --live")
+    assert "applies on next dispatch" in out
+    assert "switches at its next turn" not in out
+    assert len(_events(task_id, kb.ROUTE_CHANGED_EVENT)) == 1  # only the pre-turn one
