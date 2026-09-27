@@ -1763,6 +1763,36 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 )
 
 
+# Known non-answer placeholders a provider can hand back as the whole final
+# text (t_887f9584). "No response requested." is the Claude Code CLI's synthetic
+# turn closer; a CLI-backed provider can surface it, and a model that has seen
+# it in its own history can echo it. Delivered verbatim it reads like a reply;
+# it is not one. The backstop routes it into the SAME once-only post-tool nudge
+# the empty-response path already uses, and if the model hands it back again
+# (or there were no tool results to re-process) the user sees a plain notice
+# instead. Genuinely empty text and "[SILENT]" are not placeholders: silent
+# cron / no_agent turns keep their existing path untouched.
+_PLACEHOLDER_FINAL_TEXTS = frozenset({"No response requested."})
+_TURN_ENDED_WITHOUT_REPLY = "(turn ended without a reply)"
+
+
+def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged):
+    """Route a known placeholder final text.
+
+    Returns ``"empty"`` when the placeholder should be treated as an empty
+    post-tool response (the once-only nudge fires), ``"notice"`` when it must
+    be replaced by :data:`_TURN_ENDED_WITHOUT_REPLY`, and ``None`` for every
+    other text — including the empty string, which keeps its own ladder.
+    """
+    if not isinstance(text, str):
+        return None
+    if text.strip() not in _PLACEHOLDER_FINAL_TEXTS:
+        return None
+    if prior_was_tool and not already_nudged:
+        return "empty"
+    return "notice"
+
+
 # Shared recovery hint appended to every content-policy refusal message. Both
 # the HTTP-200 refusal path (``finish_reason=content_filter``) and the
 # exception path (a provider moderation error classified as
@@ -9235,6 +9265,30 @@ def run_conversation(
             else:
                 # Recover dropped calls before the empty-content fallback.
                 final_response = assistant_message.content or ""
+
+                # ── Known placeholder final text (t_887f9584) ─────────
+                _placeholder_route = classify_placeholder_final_text(
+                    final_response,
+                    prior_was_tool=any(m.get("role") == "tool" for m in messages[-5:]),
+                    already_nudged=getattr(agent, "_post_tool_empty_retried", False),
+                )
+                if _placeholder_route is not None:
+                    logger.warning(
+                        "Final text is a known placeholder %r — %s (model=%s provider=%s)",
+                        final_response,
+                        "treating as empty after tool calls" if _placeholder_route == "empty" else "replacing with a visible notice",
+                        agent.model, agent.provider,
+                    )
+                    final_response = "" if _placeholder_route == "empty" else _TURN_ENDED_WITHOUT_REPLY
+                    # The streamed buffer holds the same placeholder; partial-
+                    # stream recovery below must not resurrect it.
+                    agent._current_streamed_assistant_text = ""
+                    try:
+                        assistant_message.content = final_response
+                    except Exception:
+                        pass
+                    if _placeholder_route == "notice":
+                        agent._emit_status("⚠️ Model ended the turn with a placeholder instead of a reply")
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
