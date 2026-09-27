@@ -203,6 +203,21 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
+
+    # Fork-custom (Kyzcreig): read-only subsets for reviewer profiles (Momus)
+    # that must be unable to write by construction. Toolsets are atomic, so
+    # dropping ``file``/``skills`` would also drop the read tools.
+    "file_read": {
+        "description": "Read-only file tools: read and search (no write/patch)",
+        "tools": ["read_file", "search_files"],
+        "includes": []
+    },
+
+    "skills_read": {
+        "description": "Read-only skill tools: list and view (no skill_manage)",
+        "tools": ["skills_list", "skill_view"],
+        "includes": []
+    },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
