@@ -50,7 +50,13 @@ _IS_WINDOWS = platform.system() == "Windows"
 # never let poll() block or busy-loop past these caps.
 _DRAIN_MAX_BYTES = 1_048_576  # 1 MiB — far above any legitimate leftover output
 _DRAIN_DEADLINE_SECONDS = 1.0
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import (
+    _find_shell,
+    _prepend_shell_init,
+    _resolve_safe_cwd,
+    _resolve_shell_init_files,
+    _sanitize_subprocess_env,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -1093,6 +1099,14 @@ class ProcessRegistry:
         from tools.terminal_tool import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
+        # Source terminal.shell_init_files AFTER the login profile, same as
+        # the foreground snapshot does.  macOS /etc/zprofile runs path_helper,
+        # which reorders PATH behind a parent-supplied prefix (e.g. a shim
+        # dir); an init file can put it back.  Explicit files only — bash rc
+        # auto-sourcing does not belong in a zsh ``-lic`` shell.
+        safe_command = _prepend_shell_init(
+            safe_command, _resolve_shell_init_files(explicit_only=True)
+        )
 
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
