@@ -434,8 +434,91 @@ def _explain_dead_worktree_stub(repo, key, bases=()):
                 _ext.redact(str(repo)), _ext.redact(str(target)))
     raise SurvivorUnavailable(
         f"survivor_unavailable: {where} is a dead linked worktree stub ({owner}): its .git "
-        f"points at {_ext.redact(str(target))}, which no longer exists. {remedy}."
+        f"points at {_ext.redact(str(target))}, which no longer exists, and no commit on a "
+        f"durable remote holds its files. {remedy}."
     )
+
+
+_STUB_HISTORY_DEPTH = 2000
+
+
+def _dead_stub_survivor(repo, workspace, dispatch_sha=None):
+    """A remote ref for a dead linked-worktree stub whose files are all published.
+
+    The stub has no index and no HEAD, but its main repository's object store
+    (the common dir its gitfile names) usually survives, and so do that repo's
+    remotes. Hash the stub's files into a THROWAWAY object store borrowing the
+    common one (nothing is written to the main repository) and look for a
+    commit with exactly that tree among the newest ``_STUB_HISTORY_DEPTH``
+    commits reachable from: the dispatch commit recorded for this key, the main
+    repository's HEAD and every local/remote-tracking ref, and every head the
+    durable remotes advertise. A match counts only when that
+    commit is contained in a durable remote's advertised heads -- the same
+    `_remote_survivor` test an intact clean checkout must pass -- so the stub
+    carries nothing a remote does not already hold (t_59223001).
+
+    Returns the ref dict (``matched_by: "tree"``) or None: a live repository,
+    an unreadable main repository, or no published tree match. None keeps the
+    fail-closed HOLD, which ``_explain_dead_worktree_stub`` then names.
+    """
+    target = _gitfile_target(repo)
+    try:
+        if target is None or target.exists() or target.parent.name != "worktrees":
+            return None
+        common = target.parent.parent
+        if not common.is_dir():
+            return None
+    except OSError:
+        return None
+    # Remote URLs (and local `origin` paths) resolve against the checkout, so
+    # ask the main worktree when there is one; a bare common dir answers itself.
+    main = common.parent if common.name == ".git" and (common.parent / ".git").is_dir() else common
+    try:
+        published = list(_published_refs(main, workspace, {}))
+        if not published:
+            return None
+        listed = _git(main, "for-each-ref", "--format=%(objectname)", "refs/heads", "refs/remotes",
+                      check=False).stdout.decode().split()
+        head = _git(main, "rev-parse", "--verify", "-q", "HEAD", check=False).stdout.decode().split()
+        shas = sorted({*(ref["sha"] for ref in published), *listed, *head,
+                       *([dispatch_sha] if dispatch_sha else [])})
+        present = _present_commits(main, shas)
+        if not present:
+            return None
+        # Not only the tips: the stub was usually cut from a commit its branch
+        # has since moved past (fork/main advanced), so walk a bounded window
+        # of recent history below them.
+        trees = _git(main, "log", f"--max-count={_STUB_HISTORY_DEPTH}", "--format=%H %T", "--stdin",
+                     check=False, input="".join(f"{sha}\n" for sha in present).encode())
+        if trees.returncode:
+            return None
+        with tempfile.TemporaryDirectory(prefix="kanban-dead-stub-") as scratch:
+            objects = Path(scratch) / "objects"
+            objects.mkdir()
+            env = dict(os.environ, GIT_DIR=str(common), GIT_WORK_TREE=str(repo),
+                       GIT_INDEX_FILE=str(Path(scratch) / "index"),
+                       GIT_OBJECT_DIRECTORY=str(objects),
+                       GIT_ALTERNATE_OBJECT_DIRECTORIES=str(common / "objects"))
+            env.pop("GIT_COMMON_DIR", None)
+            added = _git(repo, "add", "-A", "--", ".", env=env, check=False, timeout=120)
+            if added.returncode:
+                return None
+            written = _git(repo, "write-tree", env=env, check=False)
+            if written.returncode:
+                return None
+            tree = written.stdout.decode().strip()
+    except (OSError, subprocess.TimeoutExpired, SurvivorUnavailable):
+        return None
+    for line in trees.stdout.decode().splitlines():
+        sha, _, commit_tree = line.partition(" ")
+        if commit_tree != tree:
+            continue
+        ref = _remote_survivor(main, sha, published)
+        if ref:
+            log.warning("kanban survivor: dead linked worktree stub %s matches published %s/%s@%s",
+                        _ext.redact(str(repo)), ref["remote"], ref["branch"], sha)
+            return dict(ref, matched_by="tree", dead_worktree_stub=_ext.redact(str(target)))
+    return None
 
 
 def _repos(workspace, prune=None):
@@ -2220,7 +2303,10 @@ def _replaced_orphans(workspace, bases):
             continue
         # A dead linked-worktree stub fails every probe below and would be
         # reported as "replaced in place ... <unreadable>", which it is not:
-        # nothing was re-initialised, the admin dir is gone. Name it instead.
+        # nothing was re-initialised, the admin dir is gone. A stub whose files
+        # are a published tree holds no unique bytes; otherwise name it.
+        if _dead_stub_survivor(path, workspace, sha):
+            continue
         _explain_dead_worktree_stub(path, key, bases)
         if _holds_commit_by_stat(path, sha) or \
                 _git(path, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0:
@@ -2684,6 +2770,12 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         for repo in repos:
             key = str(repo.relative_to(workspace))
             stage = f"capture repository {key}"
+            stub_ref = _dead_stub_survivor(repo, workspace, (bases or {}).get(key))
+            if stub_ref:
+                # Dead linked-worktree stub (git exits 128 in it) whose files
+                # are exactly a commit a durable remote holds: a ref survivor.
+                refs.append(dict(stub_ref, repository=key))
+                continue
             try:
                 ref, base, data = _capture(repo, key, workspace)
                 irreversible = False
