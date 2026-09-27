@@ -46,6 +46,30 @@ def test_slow_but_progressing_file_survives_a_short_wall_ceiling(tmp_path: Path)
     assert elapsed >= 3.0  # it really ran the slow tests
 
 
+def test_non_verbose_dots_count_as_progress(tmp_path: Path) -> None:
+    """Without ``-v`` pytest prints one dot per test and no ``path::test``
+    line (t_d49393e7). A passing file that runs longer than the idle window
+    while emitting dots must not be killed as HUNG."""
+    probe = _write(tmp_path, "test_dots_probe.py", """
+        import time
+        import pytest
+
+        @pytest.mark.parametrize("i", range(8))
+        def test_slow(i):
+            time.sleep(0.6)
+    """)
+    t0 = time.monotonic()
+    _file, rc, output, summary, _wall = runner._run_one_file(
+        probe, ["-p", "no:cacheprovider"], tmp_path,
+        file_timeout=60, idle_timeout=2,
+    )
+    elapsed = time.monotonic() - t0
+    assert rc == 0, output
+    assert summary.get("passed") == 8, summary
+    assert not summary.get("timed_out"), summary
+    assert elapsed >= 4.0  # total runtime really exceeded the idle window
+
+
 def test_silent_hang_is_killed_at_the_idle_window_not_the_wall(tmp_path: Path) -> None:
     """One test that sleeps 60 s emits nothing: dies at idle_timeout (3 s),
     long before the 60 s wall, and the verdict names it a HANG."""
@@ -99,5 +123,3 @@ def test_defaults_make_idle_the_detector_and_wall_the_backstop() -> None:
     assert runner._DEFAULT_IDLE_TIMEOUT_SECONDS <= 300
     assert runner._DEFAULT_FILE_TIMEOUT_SECONDS >= 900
     assert runner._DEFAULT_IDLE_TIMEOUT_SECONDS < runner._DEFAULT_FILE_TIMEOUT_SECONDS
-    assert runner._PROGRESS_LINE_RE.match("tests/x.py::test_a PASSED [ 50%]")
-    assert not runner._PROGRESS_LINE_RE.match("collected 12 items")
