@@ -8574,8 +8574,9 @@ def _real_pid_started_in_claim(pid, claimed_at, spawned_at,
     window ``[claimed_at - 1 s, spawned_at + 2 s]``.
 
     ``False``: provably not the recorded worker. ``None``: the needed reading
-    is unreadable. A missing bound is simply not applied, so missing evidence
-    never proves a PID recycled.
+    is unreadable, or the ``spawned`` upper bound is missing (identity
+    unproven). Missing evidence never proves a PID recycled, and never proves
+    it is the worker either.
     """
     if start_token is not None:
         try:
@@ -8594,6 +8595,13 @@ def _real_pid_started_in_claim(pid, claimed_at, spawned_at,
         return False
     if spawned_at is not None and created > float(spawned_at) + _OWNER_CREATE_LAG_SECONDS:
         return False
+    if spawned_at is None:
+        # Only the claim lower bound is known (no run-scoped ``spawned``
+        # evidence: legacy/migrated runs). Any process created after the
+        # claim -- including one that reused the worker's PID -- fits, so
+        # this is UNPROVEN, not proven: termination never signals it, while
+        # every liveness caller still treats it as alive (FleetReview #1021).
+        return None
     return True
 
 
@@ -16847,19 +16855,6 @@ def _terminate_reclaimed_worker(
 
     if _pid_alive(pid):
         identity = _owner_identity(int(pid), *owner_window)
-        if (
-            identity == "verified"
-            and len(owner_window) >= 3
-            and owner_window[1] is None
-            and owner_window[2] is None
-        ):
-            # No run-scoped ``spawned`` evidence (legacy/migrated run): only
-            # the claim lower bound was applied, so ANY process created after
-            # the claim -- including one that reused the worker's PID --
-            # reads "verified". That is unproven, not proven: never SIGTERM
-            # on it (FleetReview #1021). Liveness callers still treat it as
-            # alive (fail closed), so this only withholds the signal.
-            identity = "unverified"
         info["owner_identity"] = identity
         if identity == "recycled":
             # The recorded worker is gone; this PID now belongs to someone

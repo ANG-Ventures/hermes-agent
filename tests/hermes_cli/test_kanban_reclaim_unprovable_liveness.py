@@ -513,12 +513,7 @@ def test_reclaim_requeues_when_termination_actually_succeeded(conn, monkeypatch)
     """
     import signal as _signal
 
-    tid, _lock, run_id = _running_card(conn, worker_pid=4242)
-    # The dispatcher's spawn record: termination signals only a worker whose
-    # identity is bounded by it (FleetReview #1021 -- a claim lower bound
-    # alone cannot tell the worker from a process that reused its PID).
-    kb._append_event(conn, tid, "spawned", {"pid": 4242}, run_id=run_id)
-    conn.commit()
+    tid, _lock, _run_id = _running_card(conn, worker_pid=4242)
     state = {"alive": True}
     signals: list[int] = []
 

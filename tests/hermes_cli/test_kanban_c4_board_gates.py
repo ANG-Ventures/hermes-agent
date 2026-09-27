@@ -45,6 +45,9 @@ def board(tmp_path, monkeypatch):
 def _terminate(monkeypatch, owner_window):
     sent = []
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    # The real identity probe (conftest otherwise lets a stubbed _pid_alive
+    # vouch for identity): the PID is this live test process.
+    monkeypatch.setattr(kb, "_pid_started_in_claim", kb._real_pid_started_in_claim)
     monkeypatch.setattr(kb.time, "sleep", lambda _s: None)
     host = kb._claimer_id().split(":", 1)[0]
     info = kb._terminate_reclaimed_worker(
