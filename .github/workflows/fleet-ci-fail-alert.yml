@@ -75,6 +75,8 @@ jobs:
       #   - head_branch == default branch (push, workflow_dispatch on main, ...)
       #   - event merge_group (the queue ejected a PR on its way to main)
       #   - event schedule
+      #   - event release, and a push of a TAG (install-e2e `push: tags`):
+      #     head_branch is the tag name, and no PR surfaces these reds
       # Everything else -- a worker's PR / feature / dispatch branch going red --
       # is that worker's feedback and is already visible on the PR: no page.
       # pull_request* events never page, even when a fork's head branch is
@@ -127,12 +129,34 @@ jobs:
           esac
           if [ "$ROUTE" = alerts ]; then
             case "$WF_EVENT" in
-              merge_group|schedule) ;;
+              merge_group|schedule|release) ;;
               pull_request|pull_request_target)
                 ROUTE=none; echo "no page: $WF_EVENT red is the PR's own feedback" ;;
               *)
                 if [ -z "$DEFAULT_BRANCH" ] || [ "$WF_BRANCH" != "$DEFAULT_BRANCH" ]; then
-                  ROUTE=none; echo "no page: $WF_EVENT red on non-default branch '$WF_BRANCH'"
+                  # A tag push (install-e2e `push: tags: v*`) reports the TAG as
+                  # head_branch. The run payload has no ref, so ask the API whether
+                  # refs/tags/<head_branch> resolves to this run's sha. 404/422 =
+                  # not a tag (worker branch, stays silent); any other error pages.
+                  IS_TAG=0
+                  if [ "$WF_EVENT" = push ] && [ -n "$WF_BRANCH" ]; then
+                    TAG_BODY="$(mktemp)"
+                    TAG_CODE="$(curl -sS -o "$TAG_BODY" -w '%{http_code}' \
+                      -H "Authorization: Bearer $GH_TOKEN" \
+                      -H "Accept: application/vnd.github+json" \
+                      "https://api.github.com/repos/$REPO/commits/refs/tags/$WF_BRANCH")" || TAG_CODE=error
+                    case "$TAG_CODE" in
+                      200) [ "$(jq -r '.sha // ""' "$TAG_BODY")" = "$WF_SHA" ] && IS_TAG=1 ;;
+                      404|422) ;;
+                      *) IS_TAG=1; echo "::warning::tag lookup for '$WF_BRANCH' failed ($TAG_CODE); paging" ;;
+                    esac
+                    rm -f "$TAG_BODY"
+                  fi
+                  if [ "$IS_TAG" = 1 ]; then
+                    echo "page: $WF_EVENT red on tag '$WF_BRANCH'"
+                  else
+                    ROUTE=none; echo "no page: $WF_EVENT red on non-default branch '$WF_BRANCH'"
+                  fi
                 fi ;;
             esac
           fi

@@ -33,20 +33,46 @@ def _route_step() -> dict:
     return next(s for s in steps if s.get("id") == "route")
 
 
+# Hermetic stand-in for curl: answers the tag lookup from FAKE_TAG_CODE/FAKE_TAG_SHA
+# and logs every URL, so no test touches the network.
+_FAKE_CURL = r"""#!/bin/bash
+out=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out="$2"; shift ;; https://*) url="$1" ;; esac; shift
+done
+echo "$url" >> "$FAKE_CURL_LOG"
+case "$url" in
+  */commits/refs/tags/*)
+    [ "$FAKE_TAG_CODE" = error ] && exit 7
+    printf '{"sha":"%s"}' "$FAKE_TAG_SHA" > "$out"; printf '%s' "$FAKE_TAG_CODE" ;;
+  *) exit 22 ;;
+esac
+"""
+
+
 def _route(tmp_path: Path, *, event: str, branch: str, conclusion: str = "failure",
-           name: str = "CI") -> dict:
+           name: str = "CI", tag_code: str = "404", tag_sha: str = "", sha: str = "abc") -> dict:
     step = _route_step()
-    run = {"name": name, "workflow_id": 1, "id": 42, "head_branch": branch, "head_sha": "abc",
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "curl").write_text(_FAKE_CURL)
+    (bindir / "curl").chmod(0o755)
+    log = tmp_path / "curl.log"
+    log.write_text("")
+    run = {"name": name, "workflow_id": 1, "id": 42, "head_branch": branch, "head_sha": sha,
            "conclusion": conclusion, "html_url": "https://x/42", "actor": {"login": "Kyzcreig"},
            "event": event}
     out = tmp_path / "out"
     out.write_text("")
-    env = {"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(log), "FAKE_TAG_CODE": tag_code, "FAKE_TAG_SHA": tag_sha,
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"]}
     proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
-    return dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    got["_curl"] = log.read_text()
+    return got
 
 
 @pytest.mark.parametrize("event,branch", [
@@ -57,6 +83,40 @@ def _route(tmp_path: Path, *, event: str, branch: str, conclusion: str = "failur
 ])
 def test_actionable_reds_page(tmp_path, event, branch):
     assert _route(tmp_path, event=event, branch=branch)["route"] == "alerts"
+
+
+# t_05da39f4: release-tag reds have no PR, so they must page. Shapes taken from
+# real upstream runs: Install & Update E2E 35985783676 (push, head_branch
+# v2026.9.24) and Deploy Site 35985600660 (release, head_branch v2026.9.24).
+TAG_SHA = "f97608f178d1ffeca59860195ab7da295f7c8e5f"
+
+
+def test_tag_push_red_pages(tmp_path):
+    got = _route(tmp_path, event="push", branch="v2026.9.24", sha=TAG_SHA,
+                 tag_code="200", tag_sha=TAG_SHA)
+    assert got["route"] == "alerts"
+    assert got["_curl"].strip().endswith("/repos/o/r/commits/refs/tags/v2026.9.24")
+
+
+def test_release_red_pages_without_lookup(tmp_path):
+    got = _route(tmp_path, event="release", branch="v2026.9.24", sha=TAG_SHA, name="Deploy Site")
+    assert got["route"] == "alerts" and got["_curl"] == ""
+
+
+def test_push_branch_whose_name_is_a_tag_at_another_sha_stays_silent(tmp_path):
+    got = _route(tmp_path, event="push", branch="v2026.9.24", sha="abc",
+                 tag_code="200", tag_sha=TAG_SHA)
+    assert got["route"] == "none"
+
+
+def test_tag_lookup_error_fails_loud(tmp_path):
+    for code in ("500", "error"):
+        assert _route(tmp_path, event="push", branch="feature/x", tag_code=code)["route"] == "alerts"
+
+
+def test_non_push_branch_red_never_queries_tags(tmp_path):
+    got = _route(tmp_path, event="workflow_dispatch", branch="fix/x")
+    assert got["route"] == "none" and got["_curl"] == ""
 
 
 def test_startup_failure_on_main_pages(tmp_path):
