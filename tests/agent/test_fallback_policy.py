@@ -1356,6 +1356,71 @@ def test_warm_return_now_on_enforce(store, key, arm):
     assert row["warm_gate"] == "return_now" and row["warm_eligible"] is True
 
 
+# t_90d3bd12: a warm return is refused while the bound box is full (free==0).
+
+@pytest.mark.parametrize("arm", [True, False])
+def test_warm_return_now_refused_when_bound_box_full(store, key, arm):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 0, "warm_box_free": 2}
+    d = _gate(st, T0 + 200, obj, arm=arm)
+    assert not d.allowed and d.reason == fp.BOX_FULL_REASON == "warm_seat: bound box full"
+    assert d.warm["bound_box_free"] == 0 and d.warm["warm_box_free"] == 2
+
+
+def test_warm_return_now_refused_when_warm_box_full(store, key):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 3, "warm_box_free": 0}
+    d = _gate(st, T0 + 200, obj)
+    assert not d.allowed and d.reason == fp.BOX_FULL_REASON
+
+
+@pytest.mark.parametrize("free", [None, 2])
+def test_warm_return_now_unchanged_when_box_has_room_or_unknown(store, key, free):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": free,
+           "warm_box_free": free}
+    d = _gate(st, T0 + 200, obj)
+    assert d.allowed and d.branch == "warm_seat"
+    assert d.warm["bound_box_free"] == free
+
+
+def test_d6_bound_seat_return_refused_when_bound_box_full(store, key):
+    """warm_rank off: the D6 bound-seat branch (_warm_seat) alone would return."""
+    st = _sticky_on_fallback(store, key)
+    base = {**_warm("off", bound_seat="sub-vps-6"), "warm_seat": None}
+    assert _gate(st, T0 + 200, base).branch == "warm_seat"
+    d = _gate(st, T0 + 200, {**base, "bound_box_free": 0})
+    assert not d.allowed and d.reason == fp.BOX_FULL_REASON
+    ok, why, _ = fp._warm_seat(st, T0 + 200, primary_provider="claude-bpr",
+                               eligibility=_elig({**base, "bound_box_free": 0}),
+                               direct_pin_benched=None)
+    assert not ok and why == fp.BOX_FULL_REASON
+
+
+def test_box_full_still_returns_when_fallback_cold(store, key):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 0}
+    d = _gate(st, T0 + 1 + 61 * 60, obj)
+    assert d.allowed and d.branch == "fallback_cold"
+
+
+def test_box_full_never_blocks_fallback_failed(store, key):
+    st = _sticky_on_fallback(store, key)
+    obj = {**_warm("enforce", eligible="sub-vps-3"), "bound_box_free": 0}
+    d = fp.fallback_failed_allowed(st, "quota_model", T0 + 200, primary_provider="claude-bpr",
+                                   eligibility=_elig(obj))
+    assert d.allowed and d.branch == "fallback_failed"
+
+
+def test_parse_eligibility_box_free_fields():
+    e = fp.parse_eligibility({**_warm(), "bound_box_free": 0, "warm_box_free": "3"})
+    assert (e.bound_box_free, e.warm_box_free) == (0, 3)
+    e = fp.parse_eligibility({**_warm(), "bound_box_free": True, "warm_box_free": "x"})
+    assert (e.bound_box_free, e.warm_box_free) == (None, None)
+    e = fp.parse_eligibility(_warm())
+    assert (e.bound_box_free, e.warm_box_free) == (None, None)
+
+
 def test_warm_return_now_needs_age_under_window(store, key):
     st = _sticky_on_fallback(store, key)
     d = _gate(st, T0 + 200, _warm("enforce", eligible="sub-vps-3", age=3300.0))
