@@ -180,6 +180,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             http_status INT,
             relay_synthetic INT NOT NULL DEFAULT 0,
             route_id TEXT,
+            -- x-hermes-call-id sent on this attempt (bridge lanes only; the
+            -- bridge journal logs it, cachehop joins on it). NULL elsewhere.
+            call_id TEXT,
             PRIMARY KEY(turn_id, seq)
         );
 
@@ -342,7 +345,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                     raise
     _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
     for col, kind in (("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
-                      ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT")):
+                      ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT"),
+                      ("call_id", "TEXT")):
         if col not in _api_existing:
             try:
                 conn.execute(f"ALTER TABLE turn_api_calls ADD COLUMN {col} {kind}")
@@ -899,6 +903,7 @@ def insert_api_call(
     cache_write_5m: int | None = None,
     cache_write_1h: int | None = None,
     cache_ttl_requested: str | None = None,
+    call_id: str | None = None,
 ) -> None:
     """Append one call, including zero-usage failures, without changing turn totals.
 
@@ -924,15 +929,15 @@ def insert_api_call(
                 turn_id, seq, ts, provider, sub_key, model, input_tokens,
                 output_tokens, cache_read, cache_write, reasoning, attribution,
                 http_status, relay_synthetic, route_id, cache_write_5m,
-                cache_write_1h, cache_ttl_requested, lane_family
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cache_write_1h, cache_ttl_requested, lane_family, call_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (turn_id, seq, ts, provider, sub_key, model, usage.input_tokens,
              usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
              usage.reasoning_tokens, attribution, http_status,
              _bool_int(relay_synthetic), route_id, cache_write_5m,
              cache_write_1h, cache_ttl_requested,
-             AUX_LANE_FAMILY if aux else lane_family(provider)),
+             AUX_LANE_FAMILY if aux else lane_family(provider), call_id),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():

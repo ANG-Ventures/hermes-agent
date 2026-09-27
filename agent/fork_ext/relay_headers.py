@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import secrets
 
 
 def _pool_lane(agent, aux_task=None) -> str:
@@ -115,6 +117,58 @@ def merge_pool_capability_headers(agent, api_kwargs):
         eh.update(cap)
         api_kwargs["extra_headers"] = eh
     return api_kwargs
+
+
+# Per-request correlation id (cachehop t_26d3993c). The harness stamps a fresh
+# ``x-hermes-call-id: <profile>:<16 hex>`` on every HTTP attempt to a claude-bpx
+# bridge lane and records the same value on that attempt's ``turn_api_calls``
+# row, so the attributor joins a ledger row to the bridge journal by id
+# instead of by timestamp. Bridge-scoped: the bridge hands the prompt to a
+# spawned CLI, so request headers never egress; direct vendors never get it.
+CALL_ID_HEADER = "x-hermes-call-id"
+_CALL_ID_PROVIDER_RE = re.compile(r"^claude-bpx-\d+$|^claude-bpr$")
+CALL_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}:[0-9a-f]{16}$")
+
+
+def _call_id_profile() -> str:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        name = str(get_active_profile_name() or "")
+    except Exception:
+        name = ""
+    name = re.sub(r"[^a-z0-9_-]", "-", name.strip().lower())[:32].strip("-")
+    return name or "default"
+
+
+def stamp_call_id(agent, api_kwargs):
+    """Stamp a FRESH call id into ``api_kwargs['extra_headers']`` for bridge lanes.
+
+    Call once per HTTP attempt, before the request is sent; the ledger row for
+    that attempt reads it back with :func:`call_id_of`. Returns the id, or None
+    when the provider is out of scope (header removed so a reused kwargs dict
+    never carries a stale id to another lane)."""
+    if not isinstance(api_kwargs, dict):
+        return None
+    provider = (getattr(agent, "provider", "") or "").strip().lower()
+    eh = dict(api_kwargs.get("extra_headers") or {})
+    if not _CALL_ID_PROVIDER_RE.fullmatch(provider):
+        if CALL_ID_HEADER in eh:
+            eh.pop(CALL_ID_HEADER)
+            api_kwargs["extra_headers"] = eh
+        return None
+    call_id = f"{_call_id_profile()}:{secrets.token_hex(8)}"
+    eh[CALL_ID_HEADER] = call_id
+    api_kwargs["extra_headers"] = eh
+    return call_id
+
+
+def call_id_of(api_kwargs):
+    """The call id stamped on ``api_kwargs`` (validated), else None."""
+    if not isinstance(api_kwargs, dict):
+        return None
+    eh = api_kwargs.get("extra_headers")
+    value = eh.get(CALL_ID_HEADER) if isinstance(eh, dict) else None
+    return value if isinstance(value, str) and CALL_ID_RE.fullmatch(value) else None
 
 
 def _pool_affinity_headers(agent, aux_task=None) -> dict:

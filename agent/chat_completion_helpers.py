@@ -57,7 +57,9 @@ from agent.fork_ext.relay_headers import (
     _pool_affinity_headers,
     _pool_lane,
     _pool_lane_src,
+    call_id_of,
     merge_pool_capability_headers,
+    stamp_call_id,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -261,6 +263,7 @@ def _emit_api_call_record(
             relay_synthetic="x-pool-unreachable" in pool_headers,
             route_id=pool_headers.get("x-pool-route-id"),
             cache_ttl_requested=_requested_cache_ttl(api_kwargs),
+            call_id=call_id_of(api_kwargs),
             api_kwargs=api_kwargs if isinstance(api_kwargs, dict) else None,
             session_key=session_key or None,
             prefix_reset=str(prefix_reset) if prefix_reset else None,
@@ -1767,6 +1770,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
+    # One fresh correlation id per HTTP attempt (bridge lanes only); the ledger
+    # row for this attempt reads the same value back off api_kwargs.
+    stamp_call_id(agent, api_kwargs)
     if should_use_direct_api_call(agent):
         try:
             response = direct_api_call(agent, api_kwargs)
@@ -6560,6 +6566,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
                 result["failure_recorded"] = False
+                # Fresh correlation id per stream attempt (bridge lanes only).
+                stamp_call_id(agent, api_kwargs)
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),

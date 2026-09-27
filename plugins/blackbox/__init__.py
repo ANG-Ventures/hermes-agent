@@ -99,6 +99,7 @@ def record_api_call(
     relay_synthetic: bool,
     route_id: str | None,
     cache_ttl_requested: str | None = None,
+    call_id: str | None = None,
     api_kwargs: Any = None,
     session_key: str | None = None,
     prefix_reset: str | None = None,
@@ -143,6 +144,7 @@ def record_api_call(
         cache_write_5m=tier_5m,
         cache_write_1h=tier_1h,
         cache_ttl_requested=cache_ttl_requested,
+        call_id=call_id,
     )
     if api_kwargs is not None and session_key:
         observe_request_prefix(
