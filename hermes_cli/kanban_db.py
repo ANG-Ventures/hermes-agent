@@ -9465,6 +9465,40 @@ class EmptySupersedeError(ValueError):
         )
 
 
+def _enforce_branch_base(
+    conn: sqlite3.Connection, task: "Task", metadata: Optional[dict]
+) -> None:
+    """Branch-base guard on a worker handoff (t_18e781d0).
+
+    Raises :class:`kanban_branch_base.StaleBaseError` -- before any mutation
+    other than one audit event -- when a checkout in the worker's workspace
+    is cut from a stale/foreign base. Fail-open on anything it cannot measure.
+    """
+    from hermes_cli import kanban_branch_base as _bb
+
+    try:
+        checked = _bb.enforce_handoff(
+            task.id,
+            workspace_path=task.workspace_path,
+            workspace_kind=task.workspace_kind,
+            scope=sorted(_extract_explicit_dispatch_file_paths(task.body)),
+            created_at=task.created_at,
+            metadata=metadata,
+        )
+    except _bb.StaleBaseError as err:
+        with write_txn(conn):
+            _append_event(conn, task.id, "completion_blocked_stale_base", {
+                "failures": {r.repo: r.failures for r in err.reports},
+            })
+        raise
+    except Exception as exc:  # the guard must never break a handoff by crashing
+        _log.warning("branch-base guard skipped for %s: %s", task.id, exc)
+        return
+    if checked and checked.get("override"):
+        with write_txn(conn):
+            _append_event(conn, task.id, "base_guard_overridden", checked)
+
+
 @_home_session_guarded("complete")
 def complete_task(
     conn: sqlite3.Connection,
@@ -9599,6 +9633,11 @@ def complete_task(
             raise ValueError(
                 "head_sha must be the reviewed PR head (7-40 hex characters)"
             )
+    # Branch-base guard: an implementer handoff whose branch is cut from a
+    # stale/foreign base is refused here, in the worker's run, not at the
+    # merge pass (t_18e781d0). Reviewer approvals are not implementer work.
+    if candidate.status == 'running' and not approve_head_sha:
+        _enforce_branch_base(conn, candidate, metadata)
     # A completion whose evidence names a still-OPEN PR is a review handoff,
     # not ``done``: done releases dependants, and an unmerged PR has no owner
     # once the card is terminal (t_1bd02e0b, 2026-09-25). A card already in
@@ -12269,6 +12308,12 @@ def request_review(
             _why = "review_policy=none" if _policy == "none" else "non-milestone card"
             return _ret(True, f"review skipped ({_why}, kanban.review_policy={_policy}) — card completed; CI is the gate")
 
+    # Branch-base guard for handoffs that reach a review session (milestone
+    # cards); the policy path above is gated inside complete_task (t_18e781d0).
+    _bb_task = get_task(conn, task_id) if not force else None
+    if _bb_task is not None and _bb_task.status == "running":
+        _enforce_branch_base(conn, _bb_task, metadata)
+
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -14185,9 +14230,21 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
+        # Branch off the freshly fetched remote trunk, never the anchor's
+        # local HEAD: a long-lived anchor checkout lags its remote by hundreds
+        # of commits and can carry local-only commits (t_18e781d0). --no-track
+        # so a bare `git push` can never target the trunk.
+        from hermes_cli.kanban_branch_base import fresh_trunk_ref
+
+        base = fresh_trunk_ref(repo_root)
+        if base is None:
+            _log.warning(
+                "kanban worktree %s: no remote trunk in %s; branching from local HEAD",
+                target, repo_root,
+            )
         cmd = [
-            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            "git", "-C", str(repo_root), "worktree", "add", "--no-track", "-b", branch_name,
+            str(target), base or "HEAD",
         ]
     result = subprocess.run(
         cmd,

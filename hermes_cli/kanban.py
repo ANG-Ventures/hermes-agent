@@ -31,6 +31,7 @@ from typing import Any, Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_pr_freshness import DraftPrError
+from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -1566,6 +1567,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     _add_clone_arguments(p_clone)
 
+    # --- base-check ---
+    p_bc = sub.add_parser(
+        "base-check",
+        help="fail if a worker branch sits on a stale/foreign base (run before push/handback)",
+        description=(
+            "Fetch the checkout's remote trunk and fail (exit 1) when the branch "
+            "does not merge cleanly, carries commits the card did not author, "
+            "changes files outside the card's declared scope, or is more than "
+            "--max-behind commits behind. Prints the re-port remediation."
+        ),
+    )
+    from hermes_cli.kanban_branch_base import add_arguments as _add_base_check_arguments
+
+    _add_base_check_arguments(p_bc)
+
     # --- home-lint ---
     p_hl = sub.add_parser(
         "home-lint",
@@ -1726,6 +1742,10 @@ def kanban_command(args: argparse.Namespace) -> int:
             from hermes_cli.kanban_clone import clone
 
             return clone(args.url, args.dest, args.git_opts)
+        if action == "base-check":
+            from hermes_cli.kanban_branch_base import run as _base_check
+
+            return _base_check(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -4332,7 +4352,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
-            except DraftPrError as draft_err:
+            except (DraftPrError, StaleBaseError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
@@ -4685,7 +4705,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
                 with_reason=True,
             )
-        except DraftPrError as draft_err:
+        except (DraftPrError, StaleBaseError) as draft_err:
             print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
             return 1
         if not ok:
