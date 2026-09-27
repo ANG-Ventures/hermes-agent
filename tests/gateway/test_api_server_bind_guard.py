@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms import api_server as api_server_mod
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import is_network_accessible
 
@@ -170,3 +171,80 @@ class TestBindMechanics:
         finally:
             await first.disconnect()
             await second.disconnect()
+
+
+    @pytest.mark.asyncio
+    async def test_rebind_after_serving_connections_is_never_fatal(self):
+        """Server-side TIME_WAIT from served connections must not make the
+        restart bind permanently fatal.
+
+        On darwin the bind runs without SO_REUSEADDR, so connections the old
+        server closed leave TIME_WAIT sockets that fail the next bind with
+        EADDRINUSE for ~30 s. With no live listener that is transient: the
+        failure must be retryable so the reconnect watcher rebinds it.
+        """
+        import aiohttp
+
+        getattr(api_server_mod, "_BIND_DRAIN_FIRST_SEEN", {}).clear()
+        port = self._free_port()
+        first = self._make_adapter(port)
+        assert await first.connect() is True
+        sessions = []
+        try:
+            for _ in range(5):
+                session = aiohttp.ClientSession()
+                sessions.append(session)
+                resp = await session.get(f"http://127.0.0.1:{port}/health")
+                await resp.read()
+            # Server closes its keep-alive connections first -> server-side
+            # TIME_WAIT on the listening port.
+            await first.disconnect()
+        finally:
+            for session in sessions:
+                await session.close()
+
+        second = self._make_adapter(port)
+        try:
+            if await second.connect() is True:
+                return  # Linux: SO_REUSEADDR rebinds past TIME_WAIT
+            assert second.has_fatal_error is True
+            assert second.fatal_error_retryable is True
+            assert second.fatal_error_code == "api_server_port_draining"
+        finally:
+            await second.disconnect()
+            getattr(api_server_mod, "_BIND_DRAIN_FIRST_SEEN", {}).clear()
+
+    @pytest.mark.asyncio
+    async def test_draining_port_turns_non_retryable_after_window(self):
+        """A port that stays unbindable past the drain window is a real
+        conflict again: non-retryable, so the watcher cannot loop forever
+        (#52132)."""
+        api_server_mod._BIND_DRAIN_FIRST_SEEN.clear()
+        port = self._free_port()
+        holder = self._make_adapter(port)
+        assert await holder.connect() is True
+
+        async def _no_listener(host, port, timeout=1.0):
+            return False
+
+        second = self._make_adapter(port)
+        third = self._make_adapter(port)
+        try:
+            with patch.object(api_server_mod, "_port_has_live_listener", _no_listener):
+                assert await second.connect() is False
+                assert second.fatal_error_retryable is True
+                assert second.fatal_error_code == "api_server_port_draining"
+
+                key = ("127.0.0.1", port)
+                api_server_mod._BIND_DRAIN_FIRST_SEEN[key] -= (
+                    api_server_mod._BIND_DRAIN_WINDOW_SECS + 1
+                )
+                assert await third.connect() is False
+                assert third.fatal_error_retryable is False
+                assert third.fatal_error_code == "api_server_port_in_use"
+                assert key not in api_server_mod._BIND_DRAIN_FIRST_SEEN
+        finally:
+            await holder.disconnect()
+            await second.disconnect()
+            await third.disconnect()
+            api_server_mod._BIND_DRAIN_FIRST_SEEN.clear()

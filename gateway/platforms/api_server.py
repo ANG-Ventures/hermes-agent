@@ -1488,6 +1488,37 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+# EADDRINUSE with no live listener = TIME_WAIT-only (drains in ~2*MSL). Each
+# (host, port) gets this long from its first draining bind failure before the
+# failure is treated as a real, non-retryable conflict (#52132).
+_BIND_DRAIN_WINDOW_SECS = 120.0
+_BIND_DRAIN_FIRST_SEEN: Dict[tuple, float] = {}
+
+
+async def _port_has_live_listener(host: str, port: int, timeout: float = 1.0) -> bool:
+    """True when something accepts TCP connections on ``host:port``.
+
+    A refused connect means no listener (the bind failed on TIME_WAIT
+    sockets only). A timeout or any other error is treated as live, so an
+    unknown state keeps the non-retryable port-conflict path.
+    """
+    target = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(
+        host or "", host
+    )
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(target, port), timeout
+        )
+    except ConnectionRefusedError:
+        return False
+    except Exception:
+        return True
+    writer.close()
+    with suppress(Exception):
+        await writer.wait_closed()
+    return True
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -8580,7 +8611,35 @@ class APIServerAdapter(BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
+                _drain_key = (self._host, self._port)
+                if getattr(exc, "errno", None) == errno.EADDRINUSE and not (
+                    await _port_has_live_listener(self._host, self._port)
+                ):
+                    # No live listener answers: the port is held only by
+                    # TIME_WAIT sockets from connections the previous
+                    # process served (darwin binds without SO_REUSEADDR, so
+                    # these block the bind for ~2*MSL, ~30 s). That drains on
+                    # its own -> retryable, so the reconnect watcher rebinds
+                    # it. Bounded by _BIND_DRAIN_WINDOW_SECS so a port that
+                    # never frees still ends non-retryable (#52132).
+                    _now = time.monotonic()
+                    _first = _BIND_DRAIN_FIRST_SEEN.setdefault(_drain_key, _now)
+                    if _now - _first < _BIND_DRAIN_WINDOW_SECS:
+                        self._set_fatal_error(
+                            "api_server_port_draining",
+                            f"Port {self._port} is held by TIME_WAIT sockets "
+                            f"(no live listener); retrying the bind.",
+                            retryable=True,
+                        )
+                        logger.warning(
+                            "[%s] Could not bind %s:%d yet (%s): no live "
+                            "listener, waiting for TIME_WAIT to drain; the "
+                            "reconnect watcher will retry.",
+                            self.name, self._host, self._port, exc,
+                        )
+                        return False
                 if getattr(exc, "errno", None) == errno.EADDRINUSE:
+                    _BIND_DRAIN_FIRST_SEEN.pop(_drain_key, None)
                     # A port conflict is a configuration error, not a
                     # transient blip — another process holds the port for
                     # its lifetime. A bare ``return False`` makes the
@@ -8606,6 +8665,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 return False
 
+            _BIND_DRAIN_FIRST_SEEN.pop((self._host, self._port), None)
             self._mark_connected()
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
