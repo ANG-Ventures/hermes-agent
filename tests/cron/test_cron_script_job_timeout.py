@@ -104,7 +104,7 @@ def test_unknown_schedule_uses_global(schedule):
 
 def _pid_alive(pid: int) -> bool:
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok — only called from POSIX-skipif tests
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -146,7 +146,7 @@ def test_term_ignoring_script_is_killed_at_its_interval(hermes_env, monkeypatch,
     assert "timed out after 3s" in output
     # Killed at the interval (3 s) + TERM->KILL escalation, not the 7200 s global.
     assert elapsed < 3 + 8, elapsed
-    grandchild = int(pidfile.read_text().strip())
+    grandchild = int(pidfile.read_text(encoding="utf-8").strip())
     deadline = time.monotonic() + 3
     while _pid_alive(grandchild) and time.monotonic() < deadline:
         time.sleep(0.05)
