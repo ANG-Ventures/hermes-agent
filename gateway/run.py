@@ -7726,7 +7726,14 @@ class TurnRunner:
             # attachment, wrap the user turn as an OpenAI-style multimodal
             # content list. Consume-and-clear so subsequent turns on the same
             # runner instance don't re-attach stale images.
-            _native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
+            # Ownership BEFORE consuming session-scoped inbound state: a turn a
+            # /stop already invalidated must not clear the image buffer its
+            # replacement turn filled, then refuse to run (C6, #1007).
+            _native_imgs = (
+                self._runner._consume_pending_native_image_paths(ctx.session_key)
+                if ctx._run_still_current()
+                else []
+            )
             if _native_imgs:
                 try:
                     from agent.image_routing import build_native_content_parts

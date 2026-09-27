@@ -113,3 +113,33 @@ def test_upstream_repository_guard_exempts_job():
             steps: [{run: "true"}]
     """)
     assert lint_mod.lint({"w.yml": wf}) == []
+
+
+def test_upstream_comparison_that_does_not_pin_execution_is_not_exempt():
+    """C6 (#1231 'Unsafe exemption'): ``upstream || dispatch`` still runs here."""
+    wf = _wf("""
+        on: push
+        jobs:
+          a:
+            if: github.repository == 'NousResearch/hermes-agent' || github.event_name == 'workflow_dispatch'
+            runs-on: ubuntu-latest-32-core
+            steps: [{run: "true"}]
+          b:
+            if: "!(github.repository == 'NousResearch/hermes-agent')"
+            runs-on: ubuntu-latest-32-core
+            steps: [{run: "true"}]
+    """)
+    errors = lint_mod.lint({"w.yml": wf})
+    assert len(errors) == 2 and all("ubuntu-latest-32-core" in e for e in errors)
+
+
+def test_upstream_conjunct_around_a_parenthesised_or_still_pins():
+    wf = _wf("""
+        on: push
+        jobs:
+          a:
+            if: github.repository == 'NousResearch/hermes-agent' && (github.event_name == 'push' || github.event_name == 'release')
+            runs-on: ubuntu-latest-32-core
+            steps: [{run: "true"}]
+    """)
+    assert lint_mod.lint({"w.yml": wf}) == []

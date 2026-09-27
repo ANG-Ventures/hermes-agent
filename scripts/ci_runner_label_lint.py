@@ -163,13 +163,63 @@ def _labels(value, job: dict, path: str, wf: dict, workflows: dict[str, dict]) -
     return _expression_tokens(s)
 
 
+def _pinned_upstream(condition: str) -> bool:
+    """True only when the upstream comparison actually PINS the job to the
+    upstream repo: a pure conjunction around it. ``... == 'upstream' || x`` or a
+    negation can still run here, so its labels are linted (C6, #1231)."""
+    if not UPSTREAM_GUARD.search(condition):
+        return False
+    expr = condition.strip()
+    if expr.startswith("${{") and expr.endswith("}}"):
+        expr = expr[3:-2].strip()
+
+    def split_top(text: str, op: str) -> list[str]:
+        parts, depth, quote, start, i = [], 0, None, 0, 0
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                quote = None if ch == quote else quote
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif depth == 0 and text.startswith(op, i):
+                parts.append(text[start:i])
+                start = i + len(op)
+                i += len(op)
+                continue
+            i += 1
+        parts.append(text[start:])
+        return [p.strip() for p in parts]
+
+    def unwrap(text: str) -> str:
+        # Strip parens only when they enclose the WHOLE expression.
+        while text.startswith("(") and text.endswith(")"):
+            depth = 0
+            for i, ch in enumerate(text):
+                depth += (ch == "(") - (ch == ")")
+                if depth == 0 and i < len(text) - 1:
+                    return text
+            text = text[1:-1].strip()
+        return text
+
+    # Pinned iff EVERY top-level disjunct carries the bare comparison as one of
+    # its top-level conjuncts (a negated or OR-ed comparison pins nothing).
+    return all(
+        any(UPSTREAM_GUARD.fullmatch(unwrap(factor)) for factor in split_top(unwrap(term), "&&"))
+        for term in split_top(unwrap(expr), "||")
+    )
+
+
 def lint(workflows: dict[str, dict]) -> list[str]:
     errors: list[str] = []
     for path, wf in sorted(workflows.items()):
         for job_id, job in (wf.get("jobs") or {}).items():
             if not isinstance(job, dict) or "runs-on" not in job:
                 continue
-            if UPSTREAM_GUARD.search(str(job.get("if", ""))):
+            if _pinned_upstream(str(job.get("if", ""))):
                 continue
             bad = sorted({lbl for lbl in _labels(job["runs-on"], job, path, wf, workflows) if not servable(lbl)})
             for lbl in bad:

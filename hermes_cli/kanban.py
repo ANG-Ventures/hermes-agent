@@ -4827,8 +4827,13 @@ def _cmd_workspace(args: argparse.Namespace) -> int:
             else:
                 refused += 1
                 print(f"cannot reset {task_id}: {err}", file=sys.stderr)
-    # --all-stranded is best-effort over candidates; explicit ids must all land.
-    return 1 if refused and not args.all_stranded else 0
+    # --all-stranded keeps sweeping past a refusal, but the exit status must
+    # still say "not every card was reset": a script checking rc must not read
+    # a sweep that reset nothing (e.g. root still unmounted) as done (C6, #1037).
+    if refused:
+        print(f"kanban workspace reset: {refused} card(s) refused", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_requeue(args: argparse.Namespace) -> int:

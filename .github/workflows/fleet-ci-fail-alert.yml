@@ -175,7 +175,8 @@ jobs:
               "https://api.github.com/repos/$REPO/actions/workflows/$WF_ID/runs" \
               | jq -r --argjson id "$WF_RUN_ID" \
                 '[.workflow_runs[] | select(.id < $id)
-                  | select(.conclusion == "success" or .conclusion == "failure")][0].conclusion // "none"')" \
+                  | select(.conclusion == "success" or .conclusion == "failure")]
+                  | sort_by(.updated_at) | last | .conclusion // "none"')" \
               || PREV="error"
             echo "known-red '$WF_NAME' ($CARD): previous completed run = $PREV"
             # startup_failure is never demoted: it is a distinct class and always pages.
@@ -250,13 +251,27 @@ jobs:
           echo "Receiver responded HTTP $CODE"
           cat /tmp/resp.txt || true
           # 2xx = delivered/accepted. Non-2xx fails the step so the miss is visible.
-          # 2xx = delivered. A #logs (known-red) miss only warns: it must never
-          # turn this workflow red for a failure that is already carded.
+          # A #logs (known-red) miss must still reach SOMEONE (C6, #1196): it is
+          # re-sent to the #alerts route once, as a plain ci_failure. Only if that
+          # also fails does the step go red.
           case "$CODE" in
             2*) echo "CI-failure event delivered (route=${ROUTE:-alerts})." ;;
             *)
               if [ "$EVENT_TYPE" = "ci_failure_known_red" ]; then
-                echo "::warning::known-red #logs POST returned HTTP $CODE (card ${CARD})"
+                echo "::warning::known-red #logs POST returned HTTP $CODE (card ${CARD}); falling back to #alerts"
+                BODY="$(jq -c '.event_type = "ci_failure"' <<< "$BODY")"
+                SIG="$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$CI_FAIL_WEBHOOK_SECRET" | sed 's/^.* //')"
+                CODE="$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
+                  -X POST "${WEBHOOK_URL%-known}" \
+                  -H "Content-Type: application/json" \
+                  -H "X-GitHub-Event: ci_failure" \
+                  -H "X-GitHub-Delivery: ${DELIVERY}-alerts-fallback" \
+                  -H "X-Webhook-Signature: ${SIG}" \
+                  --data "$BODY")"
+                case "$CODE" in
+                  2*) echo "known-red delivery failed; #alerts fallback delivered." ;;
+                  *) echo "::error::known-red POST and #alerts fallback both failed (HTTP $CODE)" >&2; exit 1 ;;
+                esac
               else
                 echo "::error::CI-fail alert POST returned HTTP $CODE" >&2; exit 1
               fi ;;

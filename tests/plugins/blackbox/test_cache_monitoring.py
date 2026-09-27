@@ -305,3 +305,51 @@ def test_multiple_compactions_keep_first_before_last_after():
                                 telemetry={"aux_cost_usd": 0.5},
                                 cost_sink={"usd": 0.0, "calls": 1, "unknown": True})
     assert state["compaction_cost_usd"] is None
+
+
+# --- C6 (FleetReview backfill, #978): fail closed on partial evidence -------
+
+
+def test_nonfinite_tier_is_null_and_the_call_row_still_lands(db):
+    usage = SimpleNamespace(input_tokens=10, output_tokens=2, cache_creation_input_tokens=800,
+                            cache_creation={"ephemeral_5m_input_tokens": float("nan"),
+                                            "ephemeral_1h_input_tokens": float("inf")})
+    blackbox.record_api_call(turn_id="nan", seq=0, ts=1, provider="claude-bpr", model="m",
+                             usage=usage, api_mode="anthropic_messages", sub_key="s",
+                             attribution="wire", http_status=200, relay_synthetic=False,
+                             route_id=None, cache_ttl_requested=None)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT input_tokens, cache_write_5m, cache_write_1h "
+                            "FROM turn_api_calls WHERE turn_id='nan'").fetchall() == [(10, None, None)]
+
+
+def test_mixed_shape_turn_keeps_tier_totals_unknown(db):
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO turns (turn_id) VALUES ('mix')")
+        conn.execute("INSERT INTO turn_api_calls (turn_id, seq, cache_write, cache_write_5m, "
+                     "cache_write_1h) VALUES ('mix', 0, 800, 0, 800)")
+        # Flattened bridge shape: a cache write with no tier split.
+        conn.execute("INSERT INTO turn_api_calls (turn_id, seq, cache_write) VALUES ('mix', 1, 500)")
+        store._refresh_cache_monitoring(conn, "mix")
+        assert conn.execute("SELECT cache_write_5m, cache_write_1h FROM turns "
+                            "WHERE turn_id='mix'").fetchone() == (None, None)
+        # Every writing call split -> a real total; zero-write calls don't poison it.
+        conn.execute("DELETE FROM turn_api_calls WHERE turn_id='mix' AND seq=1")
+        conn.execute("INSERT INTO turn_api_calls (turn_id, seq, cache_write) VALUES ('mix', 2, 0)")
+        store._refresh_cache_monitoring(conn, "mix")
+        assert conn.execute("SELECT cache_write_5m, cache_write_1h FROM turns "
+                            "WHERE turn_id='mix'").fetchone() == (0, 800)
+
+
+def test_partial_legacy_call_table_is_migrated_so_refresh_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = store._db_path()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE turn_api_calls (turn_id TEXT NOT NULL, seq INT NOT NULL, "
+                     "ts REAL, sub_key TEXT, provider TEXT, cache_write INT, "
+                     "PRIMARY KEY(turn_id,seq))")
+    with store._connect():
+        pass
+    with sqlite3.connect(db) as conn:
+        store._refresh_cache_monitoring(conn, "any")  # raised 'no such column' before

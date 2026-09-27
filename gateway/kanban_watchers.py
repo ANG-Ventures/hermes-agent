@@ -617,13 +617,19 @@ def _guard_stuck_cards(results) -> tuple[list[tuple[str, dict]], set[str]]:
 
 
 class _GuardStuckNotifier:
-    """Page once per (board, card) until it recovers; retry failed sends."""
+    """Page once per (board, card, guard reason) until it recovers; retry
+    failed sends. The reason is part of the key: each guard carries its own
+    diagnosis and recovery verb, so one must never suppress the other (C6)."""
 
     def __init__(self) -> None:
-        self._delivered: set[tuple[str, str]] = set()
+        self._delivered: set[tuple[str, str, str]] = set()
+
+    @staticmethod
+    def _key(board, item) -> tuple[str, str, str]:
+        return board, item["task_id"], str(item.get("reason") or "")
 
     def observe(self, cards, send, observed_boards=None) -> int:
-        current = {(board, item["task_id"]) for board, item in cards}
+        current = {self._key(board, item) for board, item in cards}
         if observed_boards is None:
             observed_boards = {board for board, _ in cards}
         self._delivered = {
@@ -632,7 +638,7 @@ class _GuardStuckNotifier:
         }
         delivered = 0
         for board, item in cards:
-            key = board, item["task_id"]
+            key = self._key(board, item)
             if key not in self._delivered and send(board, item):
                 self._delivered.add(key)
                 delivered += 1

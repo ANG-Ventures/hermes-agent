@@ -397,3 +397,11 @@ def test_none_with_review_assignee_human_and_reviewer_omitted_completes_in_place
         skipped = _events(conn, tid, "review_skipped")
         assert skipped and skipped[0]["policy"] == "none"
         assert _events(conn, tid, "review_requested") == []
+
+
+def test_resolve_per_profile_cap_matches_mixed_case_config_keys():
+    """C6 (#1002): ``{default: 32, Argus: 4}`` must cap argus at 4, not 32."""
+    spec = {"default": 32, "Argus": 4}
+    assert kb.resolve_per_profile_cap(spec, "argus") == 4
+    assert kb.resolve_per_profile_cap(spec, "Argus") == 4
+    assert kb.resolve_per_profile_cap(spec, "daedalus") == 32

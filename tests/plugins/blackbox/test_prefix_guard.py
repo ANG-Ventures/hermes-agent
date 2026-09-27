@@ -453,3 +453,18 @@ def test_send_alert_targets_logs_not_alerts(monkeypatch, tmp_path):
     argv = calls[0]
     assert argv[argv.index("--target") + 1] == pg.LOGS_CHANNEL_ID == "1480525090331561984"
     assert sentinel.ALERTS_CHANNEL_ID not in argv
+
+
+def test_side_question_fork_gets_its_own_prefix_chain(monkeypatch):
+    """C6 (#1176): a /btw fork shares the parent's session_id like a review
+    fork; it must not be keyed (or compared across turns) with the main lane."""
+    rows = []
+    monkeypatch.setattr("plugins.blackbox.record_api_call", lambda **row: rows.append(row))
+    response = SimpleNamespace(usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                               pool_headers={})
+    fork = SimpleNamespace(_current_turn_id="S:uuid:cccc", provider="p", model="m",
+                           api_mode="anthropic_messages", session_id="S",
+                           _memory_write_origin="side_question")
+    cch._record_successful_api_call(fork, response, _request(2))
+    assert [(r["session_key"], r["prefix_compare_across_turns"]) for r in rows] == [
+        ("S:side_question", False)]

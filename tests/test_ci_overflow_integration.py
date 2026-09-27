@@ -115,3 +115,11 @@ def test_reexecution_on_a_same_named_runner_still_counts_as_executed():
 
 def test_rerun_that_executed_nothing_is_unverifiable_not_pass():
     assert integ.selective_rerun_verdict(A1, [dict(j) for j in A1], {})["status"] == "UNVERIFIABLE"
+
+
+def test_rerun_whose_executed_jobs_logged_no_probe_is_unverifiable_not_pass():
+    # C6 (#954 'False certification'): jobs re-executed but no parseable PROBE line.
+    fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"} for j in A1]
+    result = integ.selective_rerun_verdict(A1, fresh, {j["name"]: "no probe here" for j in fresh})
+    assert result["status"] == "UNVERIFIABLE"
+    assert "no-probe-evidence" in result["reason"]

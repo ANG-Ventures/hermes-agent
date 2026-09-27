@@ -879,7 +879,7 @@ class GatewaySlashCommandsMixin:
         import asyncio
         import re
         import shlex
-        from hermes_cli.kanban import run_slash
+        from hermes_cli.kanban import _HOME_GUARDED_ACTIONS, run_slash
 
         text = (event.text or "").strip()
         # Strip the leading "/kanban" (with or without slash), leaving args.
@@ -928,6 +928,21 @@ class GatewaySlashCommandsMixin:
                 exc,
             )
             invoking_session_id = None
+
+        # Fail CLOSED: without the invoking session a mutation would skip the
+        # home-session guard and ``create`` would leave its card unstamped
+        # (first-contact chat, store not loaded, or a lookup error).
+        if invoking_session_id is None and (
+            is_create or action in _HOME_GUARDED_ACTIONS
+        ):
+            logger.warning(
+                "/kanban %s refused: session-unresolved (no invoking session)", action
+            )
+            return (
+                f"/kanban {action} refused (session-unresolved): this chat's "
+                "session could not be resolved, so the card's home-session "
+                "guard cannot run. Send any message to open the session, then retry."
+            )
 
         if action == "dashboard":
             from gateway.kanban_dashboard_link import dashboard_link

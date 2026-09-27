@@ -355,7 +355,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 if "duplicate column" not in str(e).lower():
                     raise
     _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
-    for col, kind in (("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
+    # The base columns too: an older partial table (key/provider/cache_write
+    # only) is accepted here, and _refresh_cache_monitoring / the call insert
+    # read input_tokens, cache_read and http_status. Missing ones made every
+    # insert_turn raise inside its fail-open catch and drop the turn (C6, #978).
+    for col, kind in (("model", "TEXT"), ("input_tokens", "INT"),
+                      ("output_tokens", "INT"), ("cache_read", "INT"),
+                      ("cache_write", "INT"), ("reasoning", "INT"),
+                      ("attribution", "TEXT"), ("http_status", "INT"),
+                      ("relay_synthetic", "INT NOT NULL DEFAULT 0"),
+                      ("route_id", "TEXT"),
+                      ("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
                       ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT"),
                       ("call_id", "TEXT"), ("parent_call_id", "INT"),
                       ("sub_harness", "TEXT")):
@@ -655,14 +665,23 @@ def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
     # different prompt; letting it be the "first call" or add to the write tiers
     # would misreport the main conversation's cache behaviour. Composite child
     # rows are excluded too: their virtual parent already represents the call.
+    # A tier total is only a TOTAL when every call that wrote cache reported
+    # the split. SQLite SUM skips NULL, so one flattened-shape call (cache_write
+    # > 0, tiers NULL) would turn the sum into an unlabelled subtotal (C6,
+    # #978): keep the turn's tier unknown instead.
+    def _tier_total(col: str) -> str:
+        return f"""(SELECT CASE WHEN SUM(CASE WHEN {col} IS NULL
+                                              AND COALESCE(cache_write, 0) > 0
+                                         THEN 1 ELSE 0 END) > 0 THEN NULL
+                            ELSE SUM({col}) END
+                     FROM turn_api_calls
+                     WHERE turn_id = turns.turn_id AND {_NOT_AUX}
+                       AND {_NOT_COMPOSITE_CHILD})"""
+
     conn.execute(f"""
         UPDATE turns SET
-            cache_write_5m = (SELECT SUM(cache_write_5m) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}
-                                AND {_NOT_COMPOSITE_CHILD}),
-            cache_write_1h = (SELECT SUM(cache_write_1h) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}
-                                AND {_NOT_COMPOSITE_CHILD}),
+            cache_write_5m = {_tier_total("cache_write_5m")},
+            cache_write_1h = {_tier_total("cache_write_1h")},
             first_call_cache_miss = (
                 SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
                                       OR cache_write IS NULL THEN NULL

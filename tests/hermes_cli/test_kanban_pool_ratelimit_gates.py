@@ -1414,3 +1414,18 @@ def test_circuit_lane_then_fallback_charges_the_serving_rung(home, apr, bpr, mon
         print("H1 circuits:", circuits)
         assert set(circuits) == {"sub-vps-16"}, (
             f"5 closes SERVED by claude-bpx-16 charged to {sorted(circuits)}")
+
+
+def test_circuit_charges_the_pool_recorded_at_spawn_not_the_current_pin(home):
+    """C6 (#953 'Misattributed Limits'): five 429s served by claude-apr, then
+    the operator repins the card to claude-bpr. The closes stay charged to
+    the pool the spawn recorded; the healthy new pool must not be held."""
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        tid = _rl_burst(conn, [now - 250, now - 200, now - 150, now - 100, now - 50],
+                        provider="claude-apr")
+        for (run_id,) in conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchall():
+            kb._append_event(conn, tid, "spawned", {"pid": 1, "pool": "claude-apr"}, run_id=run_id)
+        conn.execute("UPDATE tasks SET provider_override='claude-bpr' WHERE id=?", (tid,))
+        conn.commit()
+        assert kb.rate_limit_circuits(conn, now=now, trip=5) == {"claude-apr": now - 50 + 600}

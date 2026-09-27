@@ -26,10 +26,13 @@ def _normalize_call(entry):
     the composition dict itself, so their per-call output is unknown.
     """
     if isinstance(entry, dict) and "output_tokens" in entry:
+        # An unparseable count ("unknown", None) is UNKNOWN, never 0: a zero
+        # here would report a known split with every token unfinished (C6,
+        # #997). Same rule as plugins/blackbox record.py / last_turn.py.
         try:
-            out = int(entry.get("output_tokens") or 0)
+            out = int(entry.get("output_tokens"))
         except (TypeError, ValueError):
-            out = 0
+            out = None
         try:
             reasoning = int(entry.get("reasoning_tokens") or 0)
         except (TypeError, ValueError):

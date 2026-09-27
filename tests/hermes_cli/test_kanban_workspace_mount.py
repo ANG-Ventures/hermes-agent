@@ -677,3 +677,39 @@ def test_auto_unstrand_heals_card_with_recorded_remote_survivor(home, monkeypatc
         # the empty scratch dir and spawns.
         assert task_id in calls
         assert Path(kb.get_task(conn, task_id).workspace_path).is_dir()
+
+
+def test_reset_all_stranded_exits_nonzero_when_a_candidate_is_refused(home, monkeypatch, capsys):
+    """C6 (#1037 'False success'): a sweep where every candidate is refused
+    (e.g. root still unmounted) must not exit 0."""
+    import argparse
+
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        lost, _ = _stranded_card(conn, root, title='a')
+        _lose_mount(root)
+    monkeypatch.setattr(kb, 'reset_stranded_workspace',
+                        lambda conn, task_id, **kw: (False, 'workspace root unmounted'))
+    rc = kc._cmd_workspace(argparse.Namespace(
+        workspace_action='reset', task_ids=[], all_stranded=True,
+        dry_run=False, reason=None))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert f'cannot reset {lost}' in err and '1 card(s) refused' in err
+
+
+def test_survivor_pointer_stops_proving_anything_once_the_recreated_tree_is_used(home, monkeypatch):
+    """C6 (#1037 'Stale survivor evidence'): the pointer survives a reset but
+    describes the PREVIOUS tree. After a worker spawns into the recreated
+    workspace it must not license auto-unstrand of the newer work."""
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, _ = _stranded_card(conn, root)
+        kb._append_event(conn, task_id, 'spawned', {'pid': 4242})
+        conn.execute("UPDATE task_workspace_survivors SET survivor=? WHERE task_id=?",
+                     ('{"kind": "pr", "ref": "o/r#1"}', task_id))
+        assert kb._unstrand_evidence(conn, task_id) == 'survivor_recorded'
+        kb._append_event(conn, task_id, 'workspace_reset', {'actor': 'op'})
+        assert kb._unstrand_evidence(conn, task_id) == 'survivor_recorded'
+        kb._append_event(conn, task_id, 'spawned', {'pid': 4343})
+        assert kb._unstrand_evidence(conn, task_id) is None

@@ -99,19 +99,26 @@ def selective_rerun_verdict(original: list[dict], rerun: list[dict], probe_lines
         prior = by_name.get(job["name"])
         same = prior is not None and prior["started_at"] == job["started_at"] and prior["runner_name"] == job["runner_name"]
         (reused if same else executed).append(job["name"])
-    stale = []
+    stale, probed = [], []
     for job_name in executed:
         m = PROBE_LINE.search(probe_lines.get(job_name, ""))
+        if m:
+            probed.append(job_name)
         if m and m.group(2) != m.group(3):
             stale.append({"job": job_name, "executing_attempt": int(m.group(2)), "planned_attempt": int(m.group(3))})
     planners_reused = [n for n in reused if n.endswith(("Generate slices", "Placement"))]
-    evidence = {"reused": reused, "executed": executed, "stale_executions": stale, "planners_reused": planners_reused}
+    evidence = {"reused": reused, "executed": executed, "stale_executions": stale, "planners_reused": planners_reused,
+                "probed": probed}
     if not executed:
         return check(name, "UNVERIFIABLE", evidence, "no job executed in the re-run attempt; probe has no teeth")
     if stale and planners_reused:
         return check(name, "BLOCK", evidence,
                      "BLOCK ACTIVATION: selective re-run executed hosted work under the prior attempt's plan; "
                      "generate/placement were reused, so no fresh request/reservation exists for the new attempt")
+    if not probed:
+        # No executed job logged a parseable PROBE line: nothing proves which plan attempt ran (C6, #954).
+        return check(name, "UNVERIFIABLE", evidence,
+                     "no-probe-evidence: no executed re-run job logged a parseable PROBE line")
     return check(name, "PASS", evidence)
 
 

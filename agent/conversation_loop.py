@@ -2571,6 +2571,16 @@ def run_conversation(
     # tokens were spent: count them in the session totals now (they carry the
     # old turn id, so they are NOT added to this turn's rollup).
     _settle_unaccepted_billed_responses(agent, _turn_calls, turn_id)
+    # Failing-call evidence is scoped to the turn that stashed it. A turn that
+    # ended in an error with no fallback left it parked; a pre-call failover in
+    # THIS turn (no API call made) would otherwise consume it as its own
+    # trigger and corrupt the fallback ledger's classification (C6, #1211).
+    try:
+        from agent import fallback_events as _fbe_turn
+
+        _fbe_turn.clear_pending(agent)
+    except Exception:
+        pass
     final_response = None
     interrupted = False
     failed = False

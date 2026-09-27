@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 import logging
@@ -80,7 +81,12 @@ def _cache_creation_tiers(usage: Any) -> tuple[int | None, int | None]:
         return None, None
     def value(key: str) -> int | None:
         raw = _field(creation, key)
-        return int(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else None
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            return None
+        # NaN/inf in the bridge's untyped nested dict would raise here and the
+        # fail-open recorder would drop the WHOLE call row (C6, #978): an
+        # unusable tier is unknown (NULL), the rest of the call still lands.
+        return int(raw) if math.isfinite(raw) else None
     return value("ephemeral_5m_input_tokens"), value("ephemeral_1h_input_tokens")
 
 

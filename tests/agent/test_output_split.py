@@ -77,3 +77,13 @@ def test_module_is_stdlib_only():
     mods = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     mods |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
     assert mods <= {"__future__", "json", "typing"}, mods
+
+
+def test_unparseable_call_count_makes_the_split_unknown_not_zero():
+    """C6 (#997 'Invalid Counts'): 'unknown' must not become 0 finished /
+    100 unfinished on a single-call turn."""
+    from agent.output_split import turn_output_split
+
+    assert turn_output_split([{"output_tokens": "unknown"}], 100) == (None, None)
+    assert turn_output_split([{"output_tokens": 5}, {"output_tokens": None}], 100) == (None, None)
+    assert turn_output_split([{"output_tokens": 0}], 100) == (0, 100)
