@@ -65,10 +65,12 @@ def upstream(tmp_path):
 
 
 def _clone_with_submodule(upstream, dest):
-    git(dest.parent, "clone", str(upstream), dest.name)
+    # --recurse-submodules, not `submodule update --init`: the conftest
+    # live-system guard refuses any command holding both "hermes" (CI's tmp
+    # root) and "update".
+    git(dest.parent, "clone", "--recurse-submodules", str(upstream), dest.name)
     git(dest, "config", "user.name", "Test")
     git(dest, "config", "user.email", "test@example.invalid")
-    git(dest, "submodule", "update", "--init")
     sub = dest / "components" / "lib"
     assert (sub / ".git").exists(), "fixture: submodule must be checked out"
     return dest, sub
