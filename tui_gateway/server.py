@@ -10608,6 +10608,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    system_context: str = "",
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -10636,6 +10637,10 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if system_context:
+        # Per-turn system context travels with its prompt; the drain installs
+        # it when this envelope claims the turn (never read from the session).
+        queued["system_context"] = system_context
     existing = session.get("queued_prompt")
     if (
         existing
@@ -10644,6 +10649,7 @@ def _enqueue_prompt(
         and not existing.get("image_paths")
         and not image_paths
         and not session.get("queued_prompts")
+        and (existing.get("system_context") or "") == (system_context or "")
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -10766,7 +10772,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    system_context: str = "",
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -10844,7 +10856,10 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session, text, transport, image_paths=image_paths,
+            system_context=system_context,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -10882,6 +10897,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
+        # Install the context captured with THIS prompt (empty clears the
+        # previous turn's) while the claim holds, so no later submit can race it.
+        session["turn_system_context"] = queued.get("system_context") or ""
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     use_compute_host = _session_uses_compute_host(session)
