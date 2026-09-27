@@ -341,6 +341,7 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
                 getattr(agent, "model", None) == _model
                 and getattr(agent, "provider", None) == _provider
             ),
+            platform=getattr(agent, "platform", None),
         )
     except Exception:
         logger.debug("Turn-start auto-title dispatch failed", exc_info=True)
