@@ -36138,7 +36138,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _release_agent_off_loop(target: Any, *args: Any, name: str) -> None:
-        """Run an evicted-agent release on a daemon thread, never inline.
+        """Run an evicted-agent release on a daemon thread.
 
         Every eviction path funnels here because its callers are mostly
         coroutines (/model, /reasoning, /compress, the config toggles, the
@@ -36147,20 +36147,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         it on the caller's thread can hold the event loop for seconds.
 
         If the thread cannot start (interpreter shutdown, or thread
-        exhaustion: ``RuntimeError: can't start new thread``) the eager
-        release is dropped rather than run inline. The agent is already out
-        of the cache; GC frees it later. A delayed free beats a blocked loop.
+        exhaustion: ``RuntimeError: can't start new thread``) the release
+        runs inline on the caller's thread. Dropping it would lose the
+        pressure valve's end-of-session memory commit (#11205) and its
+        ``trim_memory``; a slow release beats lost memory.
         """
         try:
             threading.Thread(
                 target=target, args=args, daemon=True, name=name,
             ).start()
+            return
         except Exception as exc:
             logger.warning(
-                "Agent release thread %s did not start (%s); skipping the "
-                "eager release so it cannot run on the event loop",
+                "Agent release thread %s did not start (%s); releasing "
+                "inline on the caller's thread",
                 name, exc,
             )
+        try:
+            target(*args)
+        except Exception as exc:
+            logger.debug("Inline agent release %s failed: %s", name, exc)
 
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
