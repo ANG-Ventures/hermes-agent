@@ -20542,6 +20542,36 @@ def _dispatch_once_locked(
     def pool_in_flight(pool):
         return sum(m.get(pool, 0) for m in in_flight_by_board.values())
 
+    # Review-lane POOL reservation (t_becb0042, #985 C4 follow-up): the
+    # spawn-slot reservation above is not enough when the binding limit is a
+    # pool's admission budget. The ready loop runs first and charges every
+    # admission to its pool, so a ready backlog >= eligible*N on pool P left
+    # every review card on P deferred ``pool_budget`` every tick. Mirror the
+    # spawn-slot hold per pool: for each pool that has a spawnable review
+    # card, the ready loop sees one fewer admission. Self-releasing: pools
+    # with no spawnable review work are untouched, and the map is cleared
+    # before the review loop so reviewers see the full pool budget.
+    review_pool_reserve: dict[str, int] = {}
+    if pool_spawns_per_eligible and review_rows:
+        try:
+            from hermes_cli.profiles import profile_exists as _rpp
+        except Exception:
+            _rpp = None
+        for _rrow in review_rows:
+            if not _rrow["assignee"]:
+                continue
+            if _rpp is not None and not _rpp(_rrow["assignee"]):
+                continue
+            _rtask = get_task(conn, _rrow["id"])
+            if _rtask is None:
+                continue
+            _rtask.assignee = _rrow["assignee"]
+            apply_lane_model_override(
+                _rtask, _lane_override_for(_rrow["assignee"]), now=_tick_now)
+            _rpool = pool_key(effective_provider(_rtask))
+            if _rpool is not None:
+                review_pool_reserve[_rpool] = 1
+
     def pool_budget(provider):
         pool = pool_key(provider)
         if pool is None or pool_spawns_per_eligible == 0:
@@ -20552,11 +20582,15 @@ def _dispatch_once_locked(
             return None  # Unknown probe: fail open.
         admitted = admitted_this_tick.get(pool, 0)
         in_flight = pool_in_flight(pool)
-        if in_flight + admitted < eligible * pool_spawns_per_eligible:
+        reserved = review_pool_reserve.get(pool, 0)
+        if in_flight + admitted + reserved < eligible * pool_spawns_per_eligible:
             return None
-        return {"reason": "pool_budget", "provider": provider,
-                "pool": pool, "eligible": eligible, "admitted": admitted,
-                "in_flight": in_flight}
+        payload = {"reason": "pool_budget", "provider": provider,
+                   "pool": pool, "eligible": eligible, "admitted": admitted,
+                   "in_flight": in_flight}
+        if reserved:
+            payload["reserved_for_review"] = reserved
+        return payload
 
     def charge_pool(task_id, run_id=None):
         pool = admitted_routes.pop(task_id, None)
@@ -21177,7 +21211,9 @@ def _dispatch_once_locked(
     # back) so this lane cannot be permanently starved by a sustained
     # ready backlog. The review loop itself still checks the FULL shared
     # ``spawn_budget`` — the reservation caps the ready lane, it does not
-    # grant the review lane extra capacity.
+    # grant the review lane extra capacity. Same for the per-pool hold:
+    # release it so reviewers are judged on the pool's real budget.
+    review_pool_reserve.clear()
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
