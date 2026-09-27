@@ -306,6 +306,16 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         trigger_class, class_source = classify_trigger(
             text=text, http_status=status, headers=headers, body=body,
             exc_name=pending.get("exc") if pending else None, reason=reason_s)
+        # Record the class the policy acted on: on a direct pin the seat IS
+        # the provider, so a seat quota is quota_model (fp.lane_class; the
+        # sticky writer already arms with it). Without this the ledger said
+        # quota_seat while the cooldown was quota_model's (t_246ce7d6).
+        try:
+            from agent.fallback_policy import lane_class
+
+            trigger_class = lane_class(trigger_class, str(from_provider or ""), text)[0]
+        except Exception:  # noqa: BLE001
+            pass
     else:
         trigger_class, class_source = None, None
     err_head = None
@@ -323,7 +333,7 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
             seq = int(counters[turn_id])
     except Exception:  # noqa: BLE001
         seq = None
-    return {
+    row = {
         "seq": seq,
         "ts": time.time(),
         "session_id": session_id,
@@ -346,6 +356,16 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         "sticky_until_epoch": None,
         **{k: v for k, v in (extra or {}).items() if k not in ("kind",)},
     }
+    if kind == "failover":
+        # §4.8: a direct pin's seat and hop are knowable locally (no relay
+        # headers by design, #1260). Pooled rows are left as they are.
+        try:
+            from agent.fallback_policy import fill_pin_evidence
+
+            row = fill_pin_evidence(row, exc_name=pending.get("exc") if pending else None)
+        except Exception:  # noqa: BLE001
+            logger.debug("fallback ledger: pin seat/hop fill failed", exc_info=True)
+    return row
 
 
 def write_row(row: Dict[str, Any]) -> None:

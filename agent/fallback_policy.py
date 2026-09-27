@@ -80,17 +80,142 @@ COOLDOWN_TABLE: Dict[str, ClassCooldown] = {
     "quota_model": ClassCooldown(6 * HOUR, 24 * HOUR),
 }
 
-_DIRECT_PIN_RE = re.compile(r"^claude-([ab])px-(\d+)$")
+_DIRECT_PIN_RE = re.compile(r"^claude-([abc])px-(\d+)$")
 
 
 def direct_pin(provider: Optional[str]) -> Optional[Tuple[str, int]]:
-    """``('b', 16)`` for ``claude-bpx-16``; None for relay / other providers."""
+    """``('b', 16)`` for ``claude-bpx-16`` (``a``/``b``/``c`` = apx/bpx/cpx);
+    None for relay / other providers."""
     m = _DIRECT_PIN_RE.fullmatch(str(provider or "").strip().lower())
     return (m.group(1), int(m.group(2))) if m else None
 
 
 def is_direct_pin(provider: Optional[str]) -> bool:
     return direct_pin(provider) is not None
+
+
+# ── direct-pin seat + hop (§4.8; t_246ce7d6) ──────────────────────────────
+# A direct pin carries no x-relay headers (#1260), but both fields are knowable
+# locally: the seat is the box the pin names, the hop follows from whether the
+# pin's own server answered (status -> it relayed Anthropic's result) or the
+# client never got a response (connect / timeout).
+
+_PIN_ROLE = {"a": "proxy", "b": "bridge", "c": "cli"}
+_PIN_SERVICE_RE = re.compile(r"claude-([ab])px-(\d+)(?:\.service)?$")
+_SUB_KEY_RE = re.compile(r"local|sub-vps-\d+")
+_HOSTS_REL = ("fleet", "hosts.json")
+_hosts_cache: Dict[str, Any] = {"key": None, "map": {}}
+
+
+def _hosts_json_path() -> Optional[str]:
+    """Nearest HERMES_HOME ancestor holding ``fleet/hosts.json`` (a profile
+    home sits under the fleet root)."""
+    import os
+    from pathlib import Path
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = Path(get_hermes_home())
+    except Exception:  # noqa: BLE001
+        return None
+    for cand in (home, *home.parents):
+        f = cand.joinpath(*_HOSTS_REL)
+        if f.is_file():
+            return os.fspath(f)
+    return None
+
+
+def _pin_seat_map(path: Optional[str] = None) -> Dict[Tuple[str, int], str]:
+    """``{('b', 21): 'sub-vps-21', ('a', 0): 'local', ...}`` from the deploy
+    registry's service units. Aliases normalise ``claude-sub-N`` -> ``sub-vps-N``
+    (the registry's own boundary rule). Cached on (path, mtime); {} on error."""
+    import os
+
+    path = path or _hosts_json_path()
+    if not path:
+        return {}
+    try:
+        key = (path, os.stat(path).st_mtime_ns)
+        if _hosts_cache["key"] == key:
+            return _hosts_cache["map"]
+        with open(path, encoding="utf-8") as fh:
+            hosts = json.load(fh).get("hosts") or []
+        out: Dict[Tuple[str, int], str] = {}
+        for h in hosts:
+            alias = str((h or {}).get("alias") or "").strip()
+            if not alias:
+                continue
+            alias = re.sub(r"^claude-sub-(\d+)$", r"sub-vps-\1", alias)
+            # Only subscription identities (``local`` = Sub #0, ``sub-vps-N``):
+            # a deploy-only host (ace-ai-lan) also runs *-0 units but serves
+            # no subscription.
+            if not _SUB_KEY_RE.fullmatch(alias):
+                continue
+            for unit in ((h.get("services") or {}).values()):
+                m = _PIN_SERVICE_RE.search(str(unit or "").split(":")[-1])
+                if m:
+                    out[(m.group(1), int(m.group(2)))] = alias
+        _hosts_cache.update(key=key, map=out)
+        return out
+    except Exception:  # noqa: BLE001
+        logger.debug("hosts.json seat map unreadable", exc_info=True)
+        return {}
+
+
+def pin_seat(provider: Optional[str], *, hosts_path: Optional[str] = None) -> Optional[str]:
+    """Seat (sub name) a direct pin serves from: hosts.json mapping of the
+    pin's service unit; ``sub-vps-N`` only when the registry has no entry.
+    cpx-N runs the CLI on box N, so it shares the bpx-N box."""
+    pin = direct_pin(provider)
+    if pin is None:
+        return None
+    lane, n = pin
+    seats = _pin_seat_map(hosts_path)
+    seat = seats.get(("b" if lane == "c" else lane, n)) or seats.get(("b", n))
+    return seat or f"sub-vps-{n}"
+
+
+_CONN_EXC = frozenset((
+    "APIConnectionError", "APITimeoutError", "ConnectError", "ConnectTimeout",
+    "ReadError", "ReadTimeout", "RemoteProtocolError", "IncompleteRead",
+    "ConnectionError", "ConnectionResetError", "TimeoutError",
+))
+
+
+def pin_hop(provider: Optional[str], *, http_status: Any = None,
+            trigger_class: Optional[str] = None,
+            exc_name: Optional[str] = None) -> Optional[str]:
+    """§4.8 hop inference rules 3/4 for a direct pin: a status response is
+    the pin relaying Anthropic's result (``bridge→anthropic`` …); no response
+    on a connection-class failure is ``client→bridge`` …; else None."""
+    pin = direct_pin(provider)
+    if pin is None:
+        return None
+    role = _PIN_ROLE[pin[0]]
+    if isinstance(http_status, int) and http_status > 0:
+        return f"{role}→anthropic"
+    if trigger_class == "conn" or exc_name in _CONN_EXC:
+        return f"client→{role}"
+    return None
+
+
+def fill_pin_evidence(row: Mapping[str, Any], *, exc_name: Optional[str] = None,
+                      hosts_path: Optional[str] = None) -> Dict[str, Any]:
+    """Copy of ``row`` with ``seat`` / ``hop`` filled for a direct-pin
+    ``from_provider`` when they are missing. Pooled rows pass through."""
+    out = dict(row)
+    prov = out.get("from_provider")
+    if not is_direct_pin(prov):
+        return out
+    if not out.get("seat") or out.get("seat") == "unknown":
+        out["seat"] = pin_seat(prov, hosts_path=hosts_path)
+    if not normalize_hop(out.get("hop")):
+        hop = pin_hop(prov, http_status=out.get("http_status"),
+                      trigger_class=out.get("trigger_class"), exc_name=exc_name)
+        if hop:
+            out["hop"] = hop
+    return out
 
 
 def _norm_pm(provider: Any, model: Any) -> Tuple[str, str]:
@@ -617,7 +742,12 @@ def token_fingerprint(bearer: Optional[str]) -> str:
 # ── §4.8 notice riders ────────────────────────────────────────────────────
 
 HOPS = ("client→relay", "relay", "relay→bridge", "bridge→anthropic",
-        "client→proxy", "proxy→anthropic", "client→bridge")
+        "client→proxy", "proxy→anthropic", "client→bridge",
+        "client→cli", "cli→anthropic")
+# Genuinely unknown fields (pooled lane, no relay attribution). Rendered as
+# words, never a bare "?" (t_246ce7d6: "hop ? on sub ?" was unreadable).
+HOP_UNKNOWN = "hop unknown"
+SUB_UNKNOWN = "sub unknown"
 _RELAY_HOP_ASCII = {"relay": "relay", "relay->bridge": "relay→bridge",
                     "bridge->upstream": "bridge→anthropic"}
 
@@ -683,12 +813,25 @@ def _seat_token(row: Mapping[str, Any], seat_names: bool) -> str:
             and (not seat or row.get("pool_wide"))):
         return "all subs"
     if not seat or seat == "unknown":
-        return "sub ?"
+        return SUB_UNKNOWN
     return str(seat) if seat_names else "a sub"
 
 
 def _hop_segment(hop: Optional[str], seat: str, status: Any) -> str:
     st = status if status else "error"
+    if seat == SUB_UNKNOWN:
+        known = {
+            "client→relay": "to the relay",
+            "relay": "at the relay",
+            "relay→bridge": "to the bridge",
+            "bridge→anthropic": f"(Anthropic {st}) from the bridge",
+            "client→proxy": "to the proxy",
+            "proxy→anthropic": f"(Anthropic {st}) via the proxy",
+            "client→bridge": "to the bridge (direct)",
+            "client→cli": "to the CLI (direct)",
+            "cli→anthropic": f"(Anthropic {st}) via the CLI",
+        }.get(hop or "")
+        return f"{known} ({SUB_UNKNOWN})" if known else f"({HOP_UNKNOWN}, {SUB_UNKNOWN})"
     return {
         "client→relay": f"to the relay for {seat}",
         "relay": f"at the relay on {seat}",
@@ -697,7 +840,9 @@ def _hop_segment(hop: Optional[str], seat: str, status: Any) -> str:
         "client→proxy": f"to {seat} proxy",
         "proxy→anthropic": f"(Anthropic {st}) via {seat} proxy",
         "client→bridge": f"to {seat} bridge (direct)",
-    }.get(hop or "", f"hop ? on {seat}")
+        "client→cli": f"to {seat} CLI (direct)",
+        "cli→anthropic": f"(Anthropic {st}) via {seat} CLI",
+    }.get(hop or "", f"on {seat} ({HOP_UNKNOWN})")
 
 
 def _hms(ts: float, tz: Optional[_dt.tzinfo]) -> _dt.datetime:
@@ -724,9 +869,12 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
                        tz: Optional[_dt.tzinfo] = None) -> str:
     """Four mandatory fields: cause, hop, sub, count+window (§4.8).
 
-    Built from the Phase 1 ``fallback_events`` row dict. Unknown hop/sub
-    render as the literal ``hop ?`` / ``sub ?``, never omitted or guessed.
+    Built from the Phase 1 ``fallback_events`` row dict. A direct pin's
+    missing seat/hop are derived locally (:func:`fill_pin_evidence`); a
+    genuinely unknown hop/sub renders as ``hop unknown`` / ``sub unknown``,
+    never omitted or guessed.
     """
+    row = fill_pin_evidence(row)
     prefix, window = _count_window(row, tz)
     seat = _seat_token(row, seat_names)
     hop = normalize_hop(row.get("hop"))
