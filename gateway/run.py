@@ -32893,10 +32893,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         continue
                     successful_transcripts.append(transcript)
+                    # INFO carries size + latency only: the words are the user's
+                    # speech (passwords, PII) and INFO logs are long-lived (Backfill C3).
                     logger.info(
-                        "stt: chat=%s transcribed %d chars in %.1fs: %r",
+                        "stt: chat=%s transcribed %d chars in %.1fs",
                         _stt_chat, len(transcript), time.monotonic() - _stt_started,
-                        transcript[:60].replace("\n", " "),
                     )
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's

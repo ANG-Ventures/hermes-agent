@@ -60,6 +60,15 @@ def describe_call(name: str, args: Any) -> str:
     elif args is not None:
         text = str(args)
     text = " ".join(text.split())
+    # Redact BEFORE truncating: a cut can leave a key fragment too short for the log
+    # formatter's pattern to recognise, and URL credentials are not redacted there
+    # by default. force=True: this is a safety boundary (Backfill C3).
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
+    except Exception:
+        return f"<{name} args unavailable>"
     if len(text) > MAX_CMD_CHARS:
         text = text[:MAX_CMD_CHARS] + "\u2026"
     return text
