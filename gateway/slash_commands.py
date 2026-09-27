@@ -6173,6 +6173,7 @@ class GatewaySlashCommandsMixin:
                 _seed_hygiene_system_prompt(_a, session_row)
                 return _a
 
+            _compress_sid = session_entry.session_id
             tmp_agent = await asyncio.to_thread(_build_tmp_agent)
             # Keep the real source platform during construction so external
             # context engines bind correctly. If compression has to rebuild the
@@ -6181,6 +6182,20 @@ class GatewaySlashCommandsMixin:
             tmp_agent.platform = _GATEWAY_HYGIENE_PLATFORM
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
+                # C5 #40 (PR #976): a /new or /reset while the agent was being
+                # built (off-loop) rebinds the key to a new session. Do not
+                # compress the stale one and rotate the key back onto it.
+                try:
+                    _bound_sid = await self.async_session_store.peek_session_id(session_key)
+                except Exception:
+                    _bound_sid = None
+                if session_entry.session_id != _compress_sid or (
+                    isinstance(_bound_sid, str) and _bound_sid != _compress_sid
+                ):
+                    return (
+                        "Compression cancelled: the session was reset while "
+                        "/compress was starting. Nothing was compressed."
+                    )
                 # Prevent close() from ending the newly rotated session —
                 # the gateway session entry now points at the new id and
                 # must remain open for the next user turn.
