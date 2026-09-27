@@ -277,6 +277,56 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
+def test_prompt_prefix_boot_check_logs_once_per_identity(caplog, monkeypatch):
+    """t_b6438944: one greppable stable-prefix hash line per process per identity."""
+    import hashlib
+    import logging
+
+    import agent.system_prompt as sp
+
+    monkeypatch.setattr(sp, "_PREFIX_HASH_LOGGED", set())
+    caplog.set_level(logging.INFO, logger="agent.system_prompt")
+
+    def lines():
+        return [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("prompt-prefix boot-check:")]
+
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value="context"),
+    ):
+        a = _make_agent(model="m1", provider="p1", platform="telegram")
+        build_system_prompt(a)
+        build_system_prompt(_make_agent(model="m1", provider="p1", platform="telegram"))
+        assert len(lines()) == 1
+        want = hashlib.sha256(a._cached_system_prompt_static.encode()).hexdigest()[:16]
+        assert f"stable_sha256={want}" in lines()[0]
+        assert "platform=telegram provider=p1 model=m1" in lines()[0]
+        # different runtime identity -> its own line
+        build_system_prompt(_make_agent(model="m2", provider="p1", platform="telegram"))
+        assert len(lines()) == 2
+        assert "model=m2" in lines()[1]
+
+
+def test_prompt_prefix_boot_check_fails_open(monkeypatch):
+    import agent.system_prompt as sp
+
+    class _Boom(set):
+        def __contains__(self, _item):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(sp, "_PREFIX_HASH_LOGGED", _Boom())
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value="context"),
+    ):
+        agent = _make_agent()
+        prompt = build_system_prompt(agent)
+    assert prompt.startswith(agent._cached_system_prompt_static)
+
+
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt

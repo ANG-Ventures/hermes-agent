@@ -1026,6 +1026,39 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     }
 
 
+# Process-lifetime set of (profile, platform, provider, model) keys whose stable
+# prompt prefix has been logged. One line per key per boot: comparing the hash
+# for the same key across pids shows whether a restart changed the
+# cross-session cache prefix (a stale-identity / SOUL / guidance rebuild).
+_PREFIX_HASH_LOGGED: set = set()
+
+
+def _log_prompt_prefix_hash_once(agent: Any, stable: str) -> None:
+    """Log the stable-tier prefix hash once per process per runtime identity."""
+    try:
+        import hashlib
+
+        home = _agent_home(agent)
+        key = (
+            _profile_name_for_home(home) if home else "?",
+            str(getattr(agent, "platform", "") or ""),
+            str(getattr(agent, "provider", "") or ""),
+            str(getattr(agent, "model", "") or ""),
+        )
+        if key in _PREFIX_HASH_LOGGED:
+            return
+        _PREFIX_HASH_LOGGED.add(key)
+        data = (stable or "").encode("utf-8")
+        logger.info(
+            "prompt-prefix boot-check: pid=%d profile=%s platform=%s provider=%s "
+            "model=%s stable_sha256=%s stable_bytes=%d",
+            os.getpid(), key[0], key[1] or "-", key[2] or "-", key[3] or "-",
+            hashlib.sha256(data).hexdigest()[:16], len(data),
+        )
+    except Exception:
+        logger.debug("prompt-prefix boot-check failed (fail-open)", exc_info=True)
+
+
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
     """Assemble the full system prompt from all layers.
 
@@ -1046,6 +1079,7 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     parts = build_system_prompt_parts(agent, system_message=system_message)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
     agent._cached_system_prompt_static = parts["stable"]
+    _log_prompt_prefix_hash_once(agent, parts["stable"])
 
     # Surface context-file truncation warnings through the normal agent status
     # channel so gateway/CLI users see them in chat instead of only in logs.
