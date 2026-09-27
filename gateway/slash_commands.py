@@ -602,7 +602,7 @@ class GatewaySlashCommandsMixin:
         else:
             # Off the loop, same as the `/model reset` door: the setter does a
             # synchronous session-store write.
-            await asyncio.to_thread(self._set_session_model_override, session_key, None)
+            await self._persist_session_model_override(session_key, None)
             self._set_session_reasoning_override(session_key, None)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
@@ -2566,8 +2566,7 @@ class GatewaySlashCommandsMixin:
         # restart cannot resurrect the prior pin.
         if model_input.strip().lower() == "reset" and not explicit_provider:
             try:
-                await asyncio.to_thread(
-                    self._set_session_model_override,
+                await self._persist_session_model_override(
                     session_key,
                     None,
                     require_persistence=True,
@@ -2841,7 +2840,7 @@ class GatewaySlashCommandsMixin:
                         # Off the loop: the persistability check re-resolves
                         # credentials (config load + provider resolution, which
                         # can refresh an OAuth token over the network).
-                        await asyncio.to_thread(_self._set_session_model_override, _session_key, {
+                        await _self._persist_session_model_override(_session_key, {
                             "model": result.new_model,
                             "provider": result.target_provider,
                             "api_key": result.api_key,
@@ -3273,7 +3272,7 @@ class GatewaySlashCommandsMixin:
             # token over the network). On-loop, this chain held Discord for
             # 10 s on 2026-09-24 (PHASE=event_loop_blocked at
             # open_credentialed_url) and expired /model interactions.
-            await asyncio.to_thread(self._set_session_model_override, session_key, {
+            await self._persist_session_model_override(session_key, {
                 "model": result.new_model,
                 "provider": result.target_provider,
                 "api_key": result.api_key,

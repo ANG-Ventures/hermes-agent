@@ -12019,6 +12019,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return identity
 
+    async def _persist_session_model_override(
+        self,
+        session_key: str,
+        override: Optional[dict],
+        *,
+        require_persistence: bool = False,
+    ) -> bool:
+        """Run :meth:`_set_session_model_override` off the loop, serialized per
+        session, last-issued wins (C5 #36, PR #970).
+
+        Each ``to_thread`` write used to race the others, so two /model
+        commands could land in either order. A per-session ticket is taken
+        on the loop at call time; under the per-session lock a write whose
+        ticket is no longer the newest is skipped. Returns False when
+        superseded.
+        """
+        seqs = self.__dict__.setdefault("_model_override_seq", {})
+        ticket = seqs[session_key] = seqs.get(session_key, 0) + 1
+        locks = self.__dict__.setdefault("_model_override_locks", {})
+        lock = locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            if seqs.get(session_key) != ticket:
+                return False
+            await asyncio.to_thread(
+                self._set_session_model_override,
+                session_key,
+                override,
+                require_persistence=require_persistence,
+            )
+            return True
+
     def _set_session_model_override(
         self,
         session_key: str,

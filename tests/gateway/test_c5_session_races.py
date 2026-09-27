@@ -9,6 +9,8 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock
 
+import pytest
+
 from gateway import telegram_redelivery as tgr
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
@@ -132,3 +134,35 @@ def test_stuck_loop_suspend_holds_store_lock(tmp_path, monkeypatch):
     runner.session_store._save = lambda: seen.setdefault("depth", _Lock.depth)
     assert runner._suspend_stuck_loop_sessions() == 1
     assert seen["depth"] == 1
+
+
+
+@pytest.mark.asyncio
+async def test_model_override_writes_land_in_issue_order():
+    """C5 #36 (PR #970): two /model overrides persisted off-loop must not land
+    out of order; the last-issued one wins even when the first write is slow."""
+    import asyncio
+    import threading
+    import time as _time
+
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    landed = []
+    first_started = threading.Event()
+
+    def slow_set(session_key, override, *, require_persistence=False):
+        if override["model"] == "a":
+            first_started.set()
+            _time.sleep(0.3)
+        landed.append(override["model"])
+
+    runner._set_session_model_override = slow_set
+    first = asyncio.ensure_future(runner._persist_session_model_override("k", {"model": "a"}))
+    while not first_started.is_set():
+        await asyncio.sleep(0.01)
+    second = asyncio.ensure_future(runner._persist_session_model_override("k", {"model": "b"}))
+    third = asyncio.ensure_future(runner._persist_session_model_override("k", {"model": "c"}))
+    results = await asyncio.gather(first, second, third)
+    assert landed[-1] == "c"
+    assert results == [True, False, True]      # "b" was superseded before it ran
