@@ -464,23 +464,72 @@ def _format_workspace_refused_summary(refused) -> str:
 
 
 class _WorkspaceRefusalOutageNotifier:
-    """Latch one successfully delivered page per board outage."""
+    """Page each refused card once per refusal episode (post-on-change).
 
-    def __init__(self) -> None:
-        self._delivered: set[str] = set()
+    The latch is durable and per card (``claim_workspace_refusal_pages``):
+    an in-memory per-board latch re-armed whenever a tick happened not to
+    admission-check the card (cap / guard / provider skip), on every gateway
+    restart, and in every failover dispatcher (t_ca81dfe2). If the board DB
+    cannot be reached the claim falls back to an in-process latch so a real
+    outage still pages once instead of every tick.
+    """
+
+    def __init__(self, claim=None, release=None) -> None:
+        self._claim = claim or _claim_refusal_pages
+        self._release = release or _release_refusal_pages
+        self._fallback: set[tuple[str, str, str]] = set()
 
     def observe(self, board: str, refused, send: Callable[[str, str], bool]) -> bool:
-        entries = list(refused or [])
+        entries = [(str(t), str(r)) for t, r in (refused or [])]
         if not entries:
-            self._delivered.discard(board)
             return False
-        if board in self._delivered:
+        try:
+            claimed = self._claim(board, entries)
+            durable = True
+        except Exception:
+            logger.exception(
+                "kanban dispatcher: durable refusal-page latch failed on %s; "
+                "using in-process latch", board,
+            )
+            durable = False
+            claimed = [
+                (t, r, None) for t, r in entries
+                if (board, t, r) not in self._fallback
+            ]
+        if not claimed:
             return False
-        summary = _format_workspace_refused_summary(entries)
+        summary = _format_workspace_refused_summary([(t, r) for t, r, _ in claimed])
+        if len(claimed) < len(entries):
+            summary += f" (+{len(entries) - len(claimed)} already paged)"
+        if len(claimed) == 1:
+            summary += f"\nInspect: `hermes kanban show {claimed[0][0]}`"
         if not send(board, summary):
+            if durable:
+                try:
+                    self._release(board, [eid for _t, _r, eid in claimed])
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: could not release refusal-page claim on %s",
+                        board,
+                    )
             return False
-        self._delivered.add(board)
+        if not durable:
+            self._fallback.update((board, t, r) for t, r, _ in claimed)
         return True
+
+
+def _claim_refusal_pages(board: str, entries):
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing(board=board) as conn:
+        return kb.claim_workspace_refusal_pages(conn, entries)
+
+
+def _release_refusal_pages(board: str, event_ids) -> None:
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing(board=board) as conn:
+        kb.release_workspace_refusal_pages(conn, event_ids)
 
 
 def _send_workspace_refusal_alert(board: str, summary: str) -> bool:
@@ -535,77 +584,6 @@ def _observe_workspace_refusal_outages(notifier, results) -> int:
             notifier.observe(board, refused, _send_workspace_refusal_alert)
         )
     return delivered
-
-
-# Consecutive dispatcher ticks one card may be refused admission before it is
-# paged on its own. The board-level outage page above fires once per outage;
-# a single card refused forever inside an otherwise healthy board (t_4b9809f4,
-# 2.7h 'ready' under a retired root) never produced a second signal.
-WORKSPACE_REFUSAL_CARD_PAGE_TICKS = 10
-
-
-class _WorkspaceRefusalCardNotifier:
-    """Page once per (board, card) after N consecutive refused ticks.
-
-    A board result that is missing or ``skipped_locked`` proves nothing, so
-    its counters are neither advanced nor reset. A failed send is retried
-    next tick; the latch clears once the card stops being refused.
-    """
-
-    def __init__(self, threshold: int = WORKSPACE_REFUSAL_CARD_PAGE_TICKS) -> None:
-        self.threshold = threshold
-        self._streak: dict[tuple[str, str], int] = {}
-        self._delivered: set[tuple[str, str]] = set()
-
-    def observe(self, results, send: Callable[[str, str, str, int], bool]) -> int:
-        delivered = 0
-        for board, result in results or []:
-            if result is None or getattr(result, "skipped_locked", False):
-                continue
-            refused = {
-                str(task_id): str(reason)
-                for task_id, reason in (getattr(result, "workspace_refused", None) or [])
-            }
-            for key in [k for k in self._streak if k[0] == board and k[1] not in refused]:
-                self._streak.pop(key, None)
-                self._delivered.discard(key)
-            for task_id, reason in sorted(refused.items()):
-                key = (board, task_id)
-                self._streak[key] = streak = self._streak.get(key, 0) + 1
-                if streak >= self.threshold and key not in self._delivered:
-                    if send(board, task_id, reason, streak):
-                        self._delivered.add(key)
-                        delivered += 1
-        return delivered
-
-
-def _send_workspace_refusal_card_alert(board: str, task_id: str, reason: str, streak: int) -> bool:
-    """Best-effort #alerts page for one card stuck behind admission."""
-    script = Path.home() / ".hermes" / "scripts" / "notify.py"
-    if not script.is_file():
-        logger.error("kanban dispatcher: notify.py unavailable; refused-card page not delivered")
-        return False
-    message = (
-        "🛑 **Kanban dispatcher** · card refused workspace admission "
-        f"{streak} consecutive ticks (shows as READY but never spawns)\n"
-        f"Board: `{board}` · Card: `{task_id}`\n`{reason}`\n"
-        f"Inspect: `hermes kanban show {task_id}`"
-    )
-    if reason.startswith("stranded_by_mount_loss:"):
-        from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND
-
-        message += f" · Recover: `{STRANDED_RECOVERY_COMMAND}`"
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(script), "--send", message, "--channel", "discord",
-             "--profile", "default", "--sev", "error"],
-            check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=30,
-        )
-    except Exception:
-        logger.exception("kanban dispatcher: refused-card page failed")
-        return False
-    return proc.returncode == 0
 
 
 def _guard_stuck_cards(results) -> tuple[list[tuple[str, dict]], set[str]]:
@@ -2450,7 +2428,6 @@ class GatewayKanbanWatchersMixin:
         last_unwoken_warn_at: dict[str, int] = {}
         last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
         workspace_refusal_notifier = _WorkspaceRefusalOutageNotifier()
-        workspace_refusal_card_notifier = _WorkspaceRefusalCardNotifier()
         guard_stuck_notifier = _GuardStuckNotifier()
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
@@ -2802,18 +2779,13 @@ class GatewayKanbanWatchersMixin:
                     if _ad_enabled:
                         await service(_auto_decompose_tick, _ad_per_tick)
                     results = await service(_tick_once)
-                    # Notification is off-loop. A failed delivery leaves the
-                    # outage unlatched so the next tick retries; an empty
-                    # successful board result rearms after recovery.
+                    # Notification is off-loop. One page per (card, reason)
+                    # per refusal episode, latched on the card; a failed
+                    # delivery releases the claim so the next tick retries.
                     await service(
                         _observe_workspace_refusal_outages,
                         workspace_refusal_notifier,
                         results,
-                    )
-                    await service(
-                        workspace_refusal_card_notifier.observe,
-                        results,
-                        _send_workspace_refusal_card_alert,
                     )
                     any_spawned = False
                     for slug, res in (results or []):
