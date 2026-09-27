@@ -195,6 +195,22 @@ def reset_primary_cooldowns() -> None:
         _primary_cooldown_until.clear()
 
 
+# gemini-bridge records these as CLAIMED fields only (attribution SPEC I5): they never decide auth
+# or consumer. Charset/length match the bridge's claim sanitizer. Sent on the fallback leg only.
+_CLAIM_RE = re.compile(r"[^A-Za-z0-9_.:/-]")
+
+
+def fallback_claim_headers() -> Dict[str, str]:
+    """Claim headers for the gemini-bridge fallback leg. Never raises."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = str(get_active_profile_name() or "")
+    except Exception:
+        profile = ""
+    profile = _CLAIM_RE.sub("-", profile.strip())[:64] or "default"
+    return {"x-hermes-aux-task": "mem0_capture", "x-hermes-profile": profile}
+
+
 class BridgeExtractor:
     """Runs one extraction pass against codex-bridge (PRIMARY); on ANY error/timeout falls back to
     gemini-bridge. Both are OpenAI-compatible /v1/chat/completions endpoints behind a bearer secret.
@@ -291,7 +307,9 @@ class BridgeExtractor:
             return r.read().decode("utf-8")
 
     def _call(self, url: str, secret_ref: str, model: str, system_prompt: str,
-              user: str, assistant: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
+              user: str, assistant: str,
+              extra_headers: Optional[Dict[str, str]] = None,
+              ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
         user_content = f"USER MESSAGE:\n{user}\n\nASSISTANT REPLY:\n{assistant}"
         body = json.dumps({
             "model": model,
@@ -302,6 +320,8 @@ class BridgeExtractor:
         }).encode("utf-8")
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self._secret(secret_ref)}"}
+        if extra_headers:
+            headers.update(extra_headers)
         t0 = time.time()
         raw = self._http(url, body, headers, self._timeout_s)
         latency = time.time() - t0
@@ -314,17 +334,20 @@ class BridgeExtractor:
         return cands, usage, latency
 
     def _call_with_auth_retry(self, url: str, secret_ref: str, model: str, system_prompt: str,
-                              user: str, assistant: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
+                              user: str, assistant: str,
+                              extra_headers: Optional[Dict[str, str]] = None,
+                              ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float]:
         """_call, but on an auth-shaped failure (401/403) drop the cached secret and retry once —
         so a rotated 1Password token heals mid-process instead of failing until restart."""
         try:
-            return self._call(url, secret_ref, model, system_prompt, user, assistant)
+            return self._call(url, secret_ref, model, system_prompt, user, assistant, extra_headers)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 logger.warning("capture-router: auth-shaped %s from %s — refreshing secret and retrying",
                                e.code, url)
                 self.invalidate_secret(secret_ref)
-                return self._call(url, secret_ref, model, system_prompt, user, assistant)
+                return self._call(url, secret_ref, model, system_prompt, user, assistant,
+                                  extra_headers)
             raise
 
     def extract(self, system_prompt: str, user: str, assistant: str) -> Dict[str, Any]:
@@ -355,7 +378,7 @@ class BridgeExtractor:
             try:
                 cands, usage, latency = self._call_with_auth_retry(
                     self._fallback_url, self._fallback_ref, self._fallback_model,
-                    system_prompt, user, assistant)
+                    system_prompt, user, assistant, fallback_claim_headers())
                 return {"candidates": cands, "usage": usage, "latency": latency,
                         "provider": "gemini-bridge", "primary_error": str(primary_err)[:200]}
             except Exception as fallback_err:

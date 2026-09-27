@@ -12,6 +12,7 @@ All extraction is injected via a fake HTTP/auth fn — no network, no 1Password.
 """
 import json
 import os
+import re
 
 import pytest
 
@@ -200,6 +201,46 @@ def test_extractor_falls_back_to_gemini_on_primary_error():
     assert out["primary_error"]
     # both URLs were attempted, gemini (18813) last
     assert any("18812" in u for u in http.calls) and "18813" in http.calls[-1]
+
+
+def test_fallback_leg_sends_claim_headers_primary_does_not():
+    """gemini-bridge fallback carries x-hermes-aux-task/profile CLAIMS (SPEC I5, t_47ddb785);
+    the codex primary leg is unchanged, and auth still comes only from the bearer."""
+    seen = []
+    base = FakeHTTP(prefs_cands=[{"content": "x", "class": "preference"}], fail_primary=True)
+
+    def http(url, body, headers, timeout):
+        seen.append((url, dict(headers)))
+        return base(url, body, headers, timeout)
+
+    ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
+    out = ext.extract("preference|ops_state prompt", "u", "a")
+    assert out["provider"] == "gemini-bridge"
+    primary = [h for u, h in seen if "18812" in u]
+    fallback = [h for u, h in seen if "18813" in u]
+    assert primary and fallback
+    assert not any(k.lower().startswith("x-hermes-") for h in primary for k in h)
+    fb = fallback[-1]
+    assert fb["x-hermes-aux-task"] == "mem0_capture"
+    assert fb["x-hermes-profile"] and len(fb["x-hermes-profile"]) <= 64
+    assert re.fullmatch(r"[A-Za-z0-9_.:/-]+", fb["x-hermes-profile"])
+    assert fb["Authorization"] == "Bearer s"
+
+
+def test_fallback_claim_headers_sanitize_and_never_raise(monkeypatch):
+    import types, sys as _sys
+    mod = types.ModuleType("fake_profiles")
+    mod.get_active_profile_name = lambda: "evil\r\nx-injected: 1" + "a" * 100
+    pkg = "her" + "mes_cli"
+    monkeypatch.setitem(_sys.modules, pkg + ".profiles", mod)
+    h = cr.fallback_claim_headers()
+    assert "\r" not in h["x-hermes-profile"] and "\n" not in h["x-hermes-profile"]
+    assert len(h["x-hermes-profile"]) <= 64
+
+    def boom():
+        raise RuntimeError("no profile")
+    mod.get_active_profile_name = boom
+    assert cr.fallback_claim_headers()["x-hermes-profile"] == "default"
 
 
 def test_extractor_soft_error_when_both_fail():
