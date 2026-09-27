@@ -50,6 +50,8 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import codecs
+import io
 import json
 import os
 import re
@@ -203,12 +205,14 @@ _DEFAULT_FILE_TIMEOUT_SECONDS = 1800.0
 # test_kanban_home_cards.py at 292 s) legitimately need > 300 s of wall time
 # while streaming a PASSED line every few seconds -- and the ceiling killed
 # them at 93 % with 0 failures, ejecting whole merge groups. So: kill when no
-# ``path::test`` line has arrived for ``--idle-timeout`` seconds (a real hang
-# is silent), and keep ``--file-timeout`` only as a large absolute backstop
+# output has arrived for ``--idle-timeout`` seconds (a real hang is silent),
+# and keep ``--file-timeout`` only as a large absolute backstop
 # for a file that streams forever. The child runs with PYTHONUNBUFFERED=1 so
 # progress lines reach the pipe as they happen, not at block-buffer flushes.
+# Progress is ANY output byte, not a ``path::test`` line (t_d49393e7): without
+# ``-v`` pytest prints one dot per test with no newline until the file ends,
+# so a line-regex detector saw nothing and killed passing files as HUNG.
 _DEFAULT_IDLE_TIMEOUT_SECONDS = 240.0
-_PROGRESS_LINE_RE = re.compile(r"^\S+::\S+")
 
 
 def scaled_file_timeout(base: float, workers: int, effective_cpus: int) -> float:
@@ -913,8 +917,8 @@ def _wait_with_progress(
     """Drain ``proc.stdout`` live; return ``(output, kill_reason, finalize)``.
 
     ``kill_reason`` is ``None`` when pytest exited on its own, ``"idle"`` when
-    no ``path::test`` progress line arrived for ``idle_timeout`` seconds (the
-    hang signature), or ``"wall"`` when ``file_timeout`` elapsed while the
+    no output byte arrived for ``idle_timeout`` seconds (the hang
+    signature), or ``"wall"`` when ``file_timeout`` elapsed while the
     file was still progressing (the absolute backstop). The caller kills the
     tree; this function never does.
     """
@@ -922,11 +926,24 @@ def _wait_with_progress(
     last_progress = [started]
 
     def _pump() -> None:
+        # Read the raw fd, not lines: non-verbose pytest dots arrive without a
+        # newline, and line iteration would block until the file finished.
+        # Nothing else reads proc.stdout, so bypassing its TextIOWrapper is
+        # safe; the decoder reproduces text=True semantics (utf-8, replace,
+        # universal newlines).
         assert proc.stdout is not None
-        for line in proc.stdout:
-            chunks.append(line)
-            if _PROGRESS_LINE_RE.match(line):
-                last_progress[0] = time.monotonic()
+        fd = proc.stdout.fileno()
+        decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder("utf-8")(errors="replace"),
+            translate=True,
+        )
+        while True:
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            last_progress[0] = time.monotonic()
+            chunks.append(decoder.decode(data))
+        chunks.append(decoder.decode(b"", final=True))
 
     pump = threading.Thread(target=_pump, daemon=True)
     pump.start()
