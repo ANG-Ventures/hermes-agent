@@ -17,8 +17,10 @@ rotated), the branches a ledger replay can evaluate.
     python3 scripts/replay-fallback-policy.py --ledger 48h [--db PATH] [--json]
 
 Exit 0 when ``max_legs_per_quota_event <= 2`` (``--target``), else 1. With no
-``quota_model`` events in the window the result is printed as VACUOUS (exit 0):
-there is nothing to replay, which is not evidence the policy works.
+``quota_model`` events in the window the result is printed as VACUOUS and exits
+3: there is nothing to replay, which is not evidence the policy works. A missing
+or unreadable DB (or no ``fallback_events`` table) exits 2 with the error on
+stderr; neither case ever prints PASS.
 """
 
 from __future__ import annotations
@@ -39,6 +41,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent import fallback_policy as fp  # noqa: E402
 
 FALLBACK_COLD_S = fp.FALLBACK_COLD_S
+RC_PASS, RC_FAIL, RC_UNREADABLE, RC_VACUOUS = 0, 1, 2, 3
+
+
+class LedgerUnreadable(Exception):
+    pass
 
 
 def parse_window(text: str) -> float:
@@ -54,17 +61,20 @@ def default_db() -> Path:
 
 
 def load_rows(db: Path, since: float) -> List[Dict[str, Any]]:
-    if not db.exists():
-        return []
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    if not db.is_file():
+        raise LedgerUnreadable(f"ledger DB not found: {db}")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise LedgerUnreadable(f"cannot open ledger DB {db}: {exc}") from exc
     con.row_factory = sqlite3.Row
     try:
         return [dict(r) for r in con.execute(
             "SELECT ts, session_id, kind, trigger_class, from_provider, from_model,"
             " to_provider, to_model FROM fallback_events"
             " WHERE ts >= ? AND kind IN ('failover','recovery') ORDER BY ts, id", (since,))]
-    except sqlite3.OperationalError:
-        return []
+    except sqlite3.Error as exc:
+        raise LedgerUnreadable(f"cannot read fallback_events from {db}: {exc}") from exc
     finally:
         con.close()
 
@@ -85,7 +95,12 @@ def replay_session(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         last_ts = ts
         if r["kind"] == "failover" and r.get("trigger_class") == "quota_model":
             if cur is not None and not cur["_closed"]:
-                cur["old_legs"] += 1   # old policy re-failed over; new stays sticky
+                cur["old_legs"] += 1
+                if cur["_suppressed_return"]:
+                    # re-failover caused by a return the new policy suppressed
+                    cur["_suppressed_return"] = False
+                else:
+                    cur["new_legs"] += 1   # fb -> fb2 hop: a real leg under both
                 continue
             if (cur is not None and cur["_returned_at"] is not None
                     and ts - cur["_returned_at"] <= fp.N_C_WINDOW_S):
@@ -94,7 +109,8 @@ def replay_session(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 n_c = 0
             until = ts + (fp.compute_cooldown_s("quota_model", n_c) or 0.0)
             cur = {"ts": ts, "old_legs": 1, "new_legs": 1, "_until": until,
-                   "_on_fallback_new": True, "_closed": False, "_returned_at": None}
+                   "_on_fallback_new": True, "_closed": False, "_returned_at": None,
+                   "_suppressed_return": False}
             events.append(cur)
             continue
         if cur is None:
@@ -112,7 +128,13 @@ def replay_session(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 cur["_on_fallback_new"] = False
                 cur["_closed"] = True
                 cur["_returned_at"] = ts
-            # else: suppressed (stays sticky); its re-failover is suppressed too
+            else:
+                # suppressed (stays sticky); its re-failover is suppressed too
+                cur["_suppressed_return"] = True
+        elif cur["_suppressed_return"]:
+            cur["_suppressed_return"] = False   # re-failover of a suppressed return
+        else:
+            cur["new_legs"] += 1   # fb -> fb2 hop while sticky: a real leg
     for e in events:
         for k in [k for k in e if k.startswith("_")]:
             e.pop(k)
@@ -147,7 +169,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     db = args.db or default_db()
-    res = replay(load_rows(db, time.time() - args.ledger))
+    try:
+        rows = load_rows(db, time.time() - args.ledger)
+    except LedgerUnreadable as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return RC_UNREADABLE
+    res = replay(rows)
     res["db"] = str(db)
     res["window_s"] = args.ledger
     ok = res["max_legs_per_quota_event"] <= args.target
@@ -160,8 +187,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"max_legs_per_quota_event={res['max_legs_per_quota_event']} (target <= {args.target})")
         if res["vacuous"]:
             print("VACUOUS: no quota_model failover rows in the window; nothing was replayed")
-        print("PASS" if ok else "FAIL")
-    return 0 if ok else 1
+        else:
+            print("PASS" if ok else "FAIL")
+    if res["vacuous"]:
+        return RC_VACUOUS
+    return RC_PASS if ok else RC_FAIL
 
 
 if __name__ == "__main__":
