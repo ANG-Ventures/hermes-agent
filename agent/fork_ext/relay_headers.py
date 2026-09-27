@@ -149,8 +149,12 @@ def stamp_call_id(agent, api_kwargs):
     never carries a stale id to another lane)."""
     if not isinstance(api_kwargs, dict):
         return None
-    provider = (getattr(agent, "provider", "") or "").strip().lower()
-    eh = dict(api_kwargs.get("extra_headers") or {})
+    provider = getattr(agent, "provider", "")
+    provider = provider.strip().lower() if isinstance(provider, str) else ""
+    try:
+        eh = dict(api_kwargs.get("extra_headers") or {})
+    except (TypeError, ValueError):
+        return None  # unusual extra_headers shape: leave the request exactly as built
     if not _CALL_ID_PROVIDER_RE.fullmatch(provider):
         if CALL_ID_HEADER in eh:
             eh.pop(CALL_ID_HEADER)

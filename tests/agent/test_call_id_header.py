@@ -92,6 +92,15 @@ def test_vendors_and_non_bridge_lanes_never_get_the_header(recorded, monkeypatch
     assert recorded[0]["call_id"] is None
 
 
+def test_non_string_provider_is_out_of_scope_and_never_raises():
+    """Tests (and odd embeddings) hand in MagicMock agents; stamping must stay fail-open."""
+    from unittest.mock import MagicMock
+
+    kwargs = {"model": "m"}
+    assert rh.stamp_call_id(MagicMock(), kwargs) is None
+    assert rh.CALL_ID_HEADER not in (kwargs.get("extra_headers") or {})
+
+
 def test_call_id_of_rejects_malformed_values():
     assert rh.call_id_of({"extra_headers": {rh.CALL_ID_HEADER: "apollo:0123456789abcdef"}})
     for bad in ("apollo:XYZ", "a b:0123456789abcdef", "apollo:0123456789abcdef0", 7):
@@ -141,9 +150,9 @@ def test_store_persists_call_id_and_migrates_old_ledger(tmp_path, monkeypatch):
     old.commit()
     old.close()
 
-    common = dict(ts=1.0, provider="claude-bpx-21", model="m",
-                  usage=CanonicalUsage(10, 1, 0, 0, 0), sub_key="claude-bpx-21",
-                  attribution="pinned")
+    lane = "claude-bpx-21"
+    common = dict(ts=1.0, provider=lane, model="m", usage=CanonicalUsage(10, 1, 0, 0, 0),
+                  sub_key=lane, attribution="pinned")
     store.insert_api_call("t", 0, call_id="apollo:0123456789abcdef", **common)
     store.insert_api_call("t", 1, **common)
 
