@@ -80,6 +80,16 @@ def sticky_policy_enabled() -> bool:
     return False
 
 
+def warm_refusal_arm(key: StickyKey) -> bool:
+    """Warm-seat spec §5 P3 A/B: ``fallback.warm_refusal_ab_pct`` (default 50)
+    of sessions, hashed on the lineage root (stable across compaction)."""
+    fb = _raw_config().get("fallback")
+    pct: Any = fp.WARM_REFUSAL_AB_PCT_DEFAULT
+    if isinstance(fb, dict) and "warm_refusal_ab_pct" in fb:
+        pct = fb.get("warm_refusal_ab_pct")
+    return fp.warm_refusal_arm(key.lineage_root, pct)
+
+
 def announce_seat_names() -> bool:
     model = _raw_config().get("model")
     if isinstance(model, dict) and "announce_seat_names" in model:
@@ -184,6 +194,7 @@ def restore_allowed(agent: Any, *, probe: bool, now: Optional[float] = None) -> 
             primary_provider=key.primary_provider,
             eligibility=_eligibility_fn(agent) if probe else None,
             direct_pin_benched=_bench_fn(agent, key, now) if probe else None,
+            refusal_arm=warm_refusal_arm(key) if probe else False,
         )
     except Exception:  # noqa: BLE001
         logger.debug("restore_allowed failed open", exc_info=True)
@@ -414,12 +425,14 @@ def decide_rebuild_for_agent(agent: Any) -> str:
         sid = str(getattr(agent, "session_id", "") or "") or None
         rd = fp.decide_rebuild(store(), key, now, live_session_id=sid,
                                eligibility=_eligibility_fn(agent),
-                               direct_pin_benched=_bench_fn(agent, key, now))
+                               direct_pin_benched=_bench_fn(agent, key, now),
+                               refusal_arm=warm_refusal_arm(key))
         if rd.action == "resume" and rd.state is not None:
             if rd.decision is not None:
                 from agent import fallback_events as fbe
 
                 fbe.record_restore_refused(agent, rd.decision.reason, extra={
+                    **(rd.decision.warm or {}),
                     "gate_bound_expires_in_s": rd.decision.gate_bound_expires_in_s,
                     "sticky_until_epoch": rd.state.until_epoch,
                     "from_provider": rd.state.fallback_provider,

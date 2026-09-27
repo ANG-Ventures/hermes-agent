@@ -950,13 +950,20 @@ _FALLBACK_EVENT_COLUMNS = (
     "hop", "seat", "attempts", "first_err_ts", "last_err_ts", "return_branch",
     "expected_warm", "dwell_s", "dwell_turns", "notice_text",
     "gate_bound_expires_in_s",
+    # Warm-seat spec §4.4 / §5 P3: the /eligibility warm poll behind a
+    # return or refusal (doomed / warm_return_raced / cap_expiry reporting).
+    "warm_rank_effective", "warm_refusal", "warm_seat", "warm_age_s",
+    "warm_window_s", "warm_eligible", "warm_refusal_arm", "warm_gate",
 )
-# Additive columns on fallback_events (Phase 2); migrated per column.
+# Additive columns on fallback_events (Phase 2 + warm-seat P3); migrated per column.
 _FALLBACK_EVENT_PHASE2_COLUMNS = (
     ("hop", "TEXT"), ("seat", "TEXT"), ("attempts", "INT"), ("first_err_ts", "REAL"),
     ("last_err_ts", "REAL"), ("return_branch", "TEXT"), ("expected_warm", "INT"),
     ("dwell_s", "REAL"), ("dwell_turns", "INT"), ("notice_text", "TEXT"),
     ("gate_bound_expires_in_s", "REAL"),
+    ("warm_rank_effective", "TEXT"), ("warm_refusal", "TEXT"), ("warm_seat", "TEXT"),
+    ("warm_age_s", "REAL"), ("warm_window_s", "REAL"), ("warm_eligible", "INT"),
+    ("warm_refusal_arm", "INT"), ("warm_gate", "TEXT"),
 )
 FALLBACK_EVENT_KINDS = ("failover", "recovery", "restore_refused", "sticky_resume")
 
@@ -971,8 +978,9 @@ def insert_fallback_event(row: dict[str, Any]) -> None:
     if values.get("err_head"):
         values["err_head"] = scrub_and_truncate(values["err_head"], 160)
     values["relay_synthetic"] = _bool_int(values.get("relay_synthetic"))
-    if values.get("expected_warm") is not None:
-        values["expected_warm"] = _bool_int(values.get("expected_warm"))
+    for _flag in ("expected_warm", "warm_eligible", "warm_refusal_arm"):
+        if values.get(_flag) is not None:
+            values[_flag] = _bool_int(values.get(_flag))
     cols = ", ".join(_FALLBACK_EVENT_COLUMNS)
     marks = ", ".join("?" for _ in _FALLBACK_EVENT_COLUMNS)
     with _connect() as conn:

@@ -352,6 +352,7 @@ model:
 # return gate allows the primary back; state persists in blackbox turns.db):
 # fallback:
 #   sticky_policy: true           # false = today's per-turn restore AND purges the stored episodes
+#   warm_refusal_ab_pct: 50       # % of sessions (lineage hash) in the warm-seat refusal arm (§4.4)
 
 # =============================================================================
 # Kanban Review Dispatch

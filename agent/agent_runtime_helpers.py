@@ -1831,6 +1831,7 @@ def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None)
             from agent import fallback_events as _fbe
 
             _fbe.record_restore_refused(agent, _decision.reason, extra={
+                **(_decision.warm or {}),
                 "gate_bound_expires_in_s": _decision.gate_bound_expires_in_s,
             })
             return False  # primary still gated (cooldown / sticky), stay on fallback
