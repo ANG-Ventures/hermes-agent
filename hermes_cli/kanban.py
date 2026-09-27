@@ -1161,10 +1161,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--coverage", default=None,
         help="Review coverage JSON; records a run-attributed comment before transition (human CLI)",
     )
+    # ``--operator "<who: why>"`` is added by the home-guard loop below; on
+    # request-changes it is also the operator send-back (coverage waived).
 
     p_reopen_review = sub.add_parser(
         "reopen-review",
-        help="Retired: claim review and request-changes with a full coverage comment instead",
+        help="Retired: claim review and request-changes with a full coverage comment "
+             "instead (operators: request-changes --operator \"<who: why>\")",
     )
     p_reopen_review.add_argument("task_ids", nargs="+")
     p_reopen_review.add_argument(
@@ -4736,10 +4739,19 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
+    operator = (getattr(args, "operator", None) or "").strip() or None
     with kb.connect_closing() as conn:
         # The caller must hold the review run: as its dispatcher-owned worker,
         # or as the operator session that made ``claim --review`` (human lane).
         worker_run = _worker_run_id_for(tid)
+        if operator is not None and worker_run is not None:
+            # A dispatched reviewer run always carries full coverage.
+            print(
+                f"cannot request changes for {tid}: --operator is not for a "
+                f"dispatched review run; post the review_coverage record",
+                file=sys.stderr,
+            )
+            return 1
         held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
         parked_session = None
         if held_run is None:
@@ -4770,6 +4782,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             tid,
             reason=reason,
             expected_run_id=held_run,
+            operator=operator,
             **(
                 {
                     # Open the review run as this session, and record the
@@ -4796,7 +4809,10 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             _unused_run, session_ref = safe_comment_provenance(tid)
             kb.add_comment(
                 conn, tid, _profile_author(),
-                "changes requested (human review lane): "
+                (
+                    f"changes requested (operator send-back, {operator}): "
+                    if operator else "changes requested (human review lane): "
+                )
                 + str(kb.redact_review_value(reason)),
                 run_id=(
                     held_run if held_run is not None
@@ -4820,7 +4836,12 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             kb.reopen_review_task(conn, tid)
-            print(f"cannot reopen {tid}: legacy bypass retired; claim review and use request-changes with full coverage", file=sys.stderr)
+            print(
+                f"cannot reopen {tid}: legacy bypass retired; claim review and use "
+                f"request-changes with full coverage (operator send-back: "
+                f"hermes kanban request-changes {tid} \"<reason>\" --operator \"<who: why>\")",
+                file=sys.stderr,
+            )
     return 1
 
 
