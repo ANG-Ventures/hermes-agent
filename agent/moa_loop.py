@@ -150,6 +150,8 @@ def _redact_trace_accounting(acct: Any) -> Any:
         model=acct.model,
         provider=acct.provider,
         temperature=acct.temperature,
+        http_status=acct.http_status,
+        pool_headers=acct.pool_headers,
     )
 
 
@@ -210,6 +212,11 @@ class _RefAccounting:
         "provider",
         "base_url",
         "temperature",
+        # Physical-call provenance for the Blackbox per-call ledger: the HTTP
+        # outcome of this advisor call and the relay identity headers (e.g.
+        # ``x-pool-served-by``) when the route stamped them. Both optional.
+        "http_status",
+        "pool_headers",
     )
 
     def __init__(
@@ -225,6 +232,8 @@ class _RefAccounting:
         provider: str | None = None,
         base_url: str | None = None,
         temperature: Any = None,
+        http_status: int | None = None,
+        pool_headers: dict[str, str] | None = None,
     ):
         self.usage = usage
         self.cost_usd = cost_usd
@@ -236,6 +245,56 @@ class _RefAccounting:
         self.provider = provider
         self.base_url = base_url
         self.temperature = temperature
+        self.http_status = http_status
+        self.pool_headers = pool_headers
+
+
+def _exc_http_status(exc: BaseException) -> int | None:
+    """HTTP status carried by a provider error, or None when it has none."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
+def _pricing_call_from_accounting(acct: Any) -> dict[str, Any] | None:
+    """One physical advisor call as a Blackbox pricing/ledger record.
+
+    Shared by the fresh fan-out and the late-completing interrupted-reference
+    path so both describe a physical call identically. None when the object
+    carries no attributable route (no model) or no canonical usage.
+    """
+    from agent.usage_pricing import CanonicalUsage
+
+    if not isinstance(acct, _RefAccounting) or not acct.model:
+        return None
+    if not isinstance(acct.usage, CanonicalUsage):
+        return None
+    headers = acct.pool_headers if isinstance(acct.pool_headers, dict) else None
+    return {
+        **{key: bool(getattr(acct.usage, key)) for key in USAGE_UNKNOWN_FIELDS},
+        "model": acct.model,
+        "provider": acct.provider,
+        "base_url": acct.base_url,
+        "input_tokens": acct.usage.input_tokens,
+        "output_tokens": acct.usage.output_tokens,
+        "cache_read_tokens": acct.usage.cache_read_tokens,
+        "cache_write_tokens": acct.usage.cache_write_tokens,
+        "reasoning_tokens": acct.usage.reasoning_tokens,
+        # This advisor's OWN pricing verdict, from the estimate_usage_cost
+        # call `_run_reference` already made at its own route. Carried so the
+        # session lane can see a MEASURED-but-unpriceable advisor — an
+        # uncatalogued route returns amount_usd=None with fully measured
+        # tokens, so no unknown FLAG is set and the advisor's real dollars
+        # silently never enter the session total (r6 round-4 finding 1).
+        # Ignored by plugins/blackbox/cost.py, which re-prices these calls.
+        "cost_usd": acct.cost_usd,
+        "cost_status": acct.cost_status,
+        # Ledger provenance (turn_api_calls child rows): the call's HTTP
+        # outcome and relay identity headers, when known.
+        "http_status": acct.http_status,
+        "pool_headers": dict(headers) if headers else None,
+    }
 
 # Per-tool-result character budget for the advisory reference view. Tool
 # results can be huge (a full diff, a 5000-line file dump); replaying them
@@ -652,6 +711,12 @@ def _run_reference(
             provider=runtime.get("provider") or slot.get("provider"),
             base_url=runtime.get("base_url"),
             temperature=temperature,
+            http_status=200,
+            pool_headers=(
+                getattr(response, "pool_headers", None)
+                if isinstance(getattr(response, "pool_headers", None), dict)
+                else None
+            ),
         )
         return label, _output_text, acct
     except Exception as exc:
@@ -664,6 +729,7 @@ def _run_reference(
             provider=runtime.get("provider") or slot.get("provider"),
             base_url=runtime.get("base_url"),
             temperature=temperature,
+            http_status=_exc_http_status(exc),
         )
 
 
@@ -1601,6 +1667,11 @@ class MoAChatCompletions:
         self._pending_reference_usage: Any = CanonicalUsage()
         self._pending_reference_cost: Any = None
         self._pending_reference_pricing_calls: list[dict[str, Any]] = []
+        # Physical calls of interrupted references that completed AFTER the
+        # fan-out returned (see _record_late_reference_accounting). Kept apart
+        # from the fresh list above: a cache MISS overwrites that list and a
+        # cache HIT clears it, and neither may drop a late call's real spend.
+        self._pending_late_pricing_calls: list[dict[str, Any]] = []
         # Guards pending usage/cost against concurrent late-accounting
         # callbacks (see _record_late_reference_accounting), which fire on
         # executor worker threads after an interrupted fan-out returns.
@@ -1650,9 +1721,17 @@ class MoAChatCompletions:
         return usage, cost
 
     def consume_reference_pricing_calls(self) -> list[dict[str, Any]]:
-        """Pop physical advisor calls for mixed-model Blackbox pricing."""
-        calls = list(self._pending_reference_pricing_calls)
-        self._pending_reference_pricing_calls = []
+        """Pop physical advisor calls for mixed-model Blackbox pricing.
+
+        Fresh fan-out calls first, then any late-completing interrupted
+        reference calls deposited since the last pick-up. Both lists are
+        cleared, so each physical call is emitted exactly once.
+        """
+        with self._accounting_lock:
+            calls = list(self._pending_reference_pricing_calls)
+            calls.extend(self._pending_late_pricing_calls)
+            self._pending_reference_pricing_calls = []
+            self._pending_late_pricing_calls = []
         return calls
 
     def last_reference_metrics(self) -> Any:
@@ -1688,6 +1767,12 @@ class MoAChatCompletions:
                 self._pending_reference_cost = (
                     self._pending_reference_cost or 0
                 ) + accounting.cost_usd
+            # The late call is a real physical call: give it a pricing/ledger
+            # record too, or its usage is in the turn totals with no row.
+            _late_call = _pricing_call_from_accounting(accounting)
+            if _late_call is not None:
+                _late_call["late"] = True
+                self._pending_late_pricing_calls.append(_late_call)
         logger.debug(
             "MoA: recorded late accounting for interrupted reference %s", label
         )
@@ -2136,8 +2221,9 @@ class MoAChatCompletions:
             # a repeat (cache-HIT) iteration must not re-emit them or advisor
             # billing multiplies by the tool-iteration count. Clear them here
             # (usage/cost are intentionally NOT zeroed above — a late-completing
-            # interrupted reference may still deposit real spend — but pricing
-            # calls receive no late deposits, so clearing is unconditional).
+            # interrupted reference may still deposit real spend — and late
+            # pricing calls live in _pending_late_pricing_calls, which this
+            # clear leaves alone).
             with self._accounting_lock:
                 self._pending_reference_pricing_calls = []
         else:
@@ -2197,31 +2283,9 @@ class MoAChatCompletions:
                         # Fork feature: keep a per-advisor pricing call record so
                         # each advisor's tokens are priced at its OWN model rate
                         # (advisors may be cheaper/pricier than the aggregator).
-                        if _acct.model:
-                            _ref_pricing_calls.append({
-                                **{key: bool(getattr(_acct.usage, key)) for key in USAGE_UNKNOWN_FIELDS},
-                                "model": _acct.model,
-                                "provider": _acct.provider,
-                                "base_url": _acct.base_url,
-                                "input_tokens": _acct.usage.input_tokens,
-                                "output_tokens": _acct.usage.output_tokens,
-                                "cache_read_tokens": _acct.usage.cache_read_tokens,
-                                "cache_write_tokens": _acct.usage.cache_write_tokens,
-                                "reasoning_tokens": _acct.usage.reasoning_tokens,
-                                # This advisor's OWN pricing verdict, from the
-                                # estimate_usage_cost call `_run_reference`
-                                # already made at its own route. Carried so the
-                                # session lane can see a MEASURED-but-unpriceable
-                                # advisor — an uncatalogued route returns
-                                # amount_usd=None with fully measured tokens, so
-                                # no unknown FLAG is set and the advisor's real
-                                # dollars silently never enter the session total
-                                # (r6 round-4 finding 1). Ignored by
-                                # plugins/blackbox/cost.py, which re-prices these
-                                # calls itself.
-                                "cost_usd": _acct.cost_usd,
-                                "cost_status": _acct.cost_status,
-                            })
+                        _pcall = _pricing_call_from_accounting(_acct)
+                        if _pcall is not None:
+                            _ref_pricing_calls.append(_pcall)
                     if _acct.cost_usd is not None:
                         _ref_cost = (_ref_cost or 0) + _acct.cost_usd
             with self._accounting_lock:
@@ -2235,10 +2299,10 @@ class MoAChatCompletions:
                     self._pending_reference_cost = (
                         self._pending_reference_cost or 0
                     ) + _ref_cost
-                # Pricing calls are OVERWRITTEN (not folded): unlike usage/cost,
-                # the late-accounting hook (_record_late_reference_accounting)
-                # never deposits pricing_calls, so there is no prior-turn
-                # residue to preserve. A fresh cache MISS fully re-emits the
+                # Pricing calls are OVERWRITTEN (not folded): late-completing
+                # references deposit into the separate
+                # _pending_late_pricing_calls list, so there is no prior-turn
+                # residue in this one to preserve. A fresh cache MISS fully re-emits the
                 # per-advisor pricing rows for THIS turn; folding here would
                 # double-count advisor billing across turns (the cache-HIT path
                 # below zeroes them for the same reason).

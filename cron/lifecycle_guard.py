@@ -1992,10 +1992,12 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
 # recognised; anything else keeps the conservative shell-reference scan.
 #
 # Soundness argument: with no class/def/lambda, no dunder access, no
-# reflective builtins and no import beyond json/subprocess/pathlib.Path, every
-# value in the body is a built-in data value (str/list/dict/set/file/
-# CompletedProcess), so the allowlisted methods below are data operations and
-# cannot reach or replace a callable the loop recognizer trusts.
+# reflective builtins, no import beyond json/subprocess/pathlib.Path, imported
+# names loaded ONLY as the callee of an allowlisted call, and callback keywords
+# limited to constants/pure data builtins, every value in the body is a
+# built-in data value (str/list/dict/set/file/CompletedProcess), so the
+# allowlisted methods below are data operations and cannot reach or replace a
+# callable the loop recognizer trusts.
 _MASK_SAFE_NODE_TYPES = (
     ast.Module, ast.Import, ast.ImportFrom, ast.alias,
     ast.Assign, ast.AugAssign, ast.Expr, ast.For, ast.If, ast.Try,
@@ -2026,6 +2028,16 @@ _MASK_SAFE_METHODS = frozenset({
     "extend", "count", "find", "encode", "decode", "isdigit",
 })
 _MASK_SUBPROCESS_KEYWORDS = frozenset({"capture_output", "text", "check", "timeout", "encoding", "errors"})
+# Keywords whose value is CALLED by the callee (sorted/min/max key, json hooks,
+# print file=). Allowed values: a constant or one of the pure data builtins.
+_MASK_CALLBACK_KEYWORDS = frozenset({
+    "key", "default", "cls", "object_hook", "object_pairs_hook",
+    "parse_float", "parse_int", "parse_constant", "file", "opener",
+})
+_MASK_PURE_CALLBACKS = frozenset({
+    "len", "str", "int", "float", "bool", "abs", "round", "sorted",
+    "list", "tuple", "set", "dict", "min", "max", "sum",
+})
 _MASK_FORBIDDEN_NAMES = frozenset({
     "sys", "builtins", "importlib", "types", "object", "type", "os",
     "getattr", "setattr", "delattr", "exec", "eval", "compile",
@@ -2081,11 +2093,38 @@ def _python_body_is_mask_safe(tree: ast.AST) -> bool:
     if bound & protected:
         return False
     known = bound | imported | _MASK_SAFE_BUILTINS | _MASK_SAFE_EXCEPTIONS
+    # An imported name may be loaded ONLY as the callee of an allowlisted call:
+    # ``Path(...)`` or the receiver of ``json.loads``/``json.dumps``/
+    # ``subprocess.run``. Anywhere else it leaks a callable as a value
+    # (``sorted(out, key=subprocess.os.system)``, ``s = subprocess``).
+    callee_uses: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "Path":
+            callee_uses.add(id(func))
+        elif (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+              and (func.value.id, func.attr) in _MASK_SAFE_MODULE_CALLS):
+            callee_uses.add(id(func.value))
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in known:
             return False
+        if (isinstance(node, ast.Name) and node.id in imported
+                and id(node) not in callee_uses):
+            return False
         if not isinstance(node, ast.Call):
             continue
+        # Every call's keywords: no ``**`` splat, and a callback keyword gets a
+        # constant or a pure data builtin, never a callable reference.
+        for kw in node.keywords:
+            if kw.arg is None:
+                return False
+            if kw.arg in _MASK_CALLBACK_KEYWORDS and not (
+                isinstance(kw.value, ast.Constant)
+                or (isinstance(kw.value, ast.Name) and kw.value.id in _MASK_PURE_CALLBACKS)
+            ):
+                return False
         func = node.func
         if isinstance(func, ast.Name):
             if func.id == "Path":

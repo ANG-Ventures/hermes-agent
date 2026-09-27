@@ -637,6 +637,9 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    # Per-session scratch dir (card t_f4377203), keyed on the session id bridged just above.
+    from hermes_constants import apply_session_scratch_env
+    apply_session_scratch_env(sanitized)
 
     # Filter PYTHONPATH before removing VIRTUAL_ENV: legacy Windows launchers
     # can run the gateway under a base interpreter while VIRTUAL_ENV identifies
@@ -1488,6 +1491,9 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    # Per-session scratch dir (card t_f4377203), keyed on the session id bridged just above.
+    from hermes_constants import apply_session_scratch_env
+    apply_session_scratch_env(run_env)
 
     _strip_hermes_owned_pythonpath_and_runtime_markers(run_env)
 

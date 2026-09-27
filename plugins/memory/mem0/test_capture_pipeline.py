@@ -108,6 +108,48 @@ def test_enqueue_then_drain_e2e(tmp_path):
     p.stop()
 
 
+def test_enqueue_stamps_profile_for_drain_thread_fallback_claims(tmp_path, monkeypatch):
+    """E2E, real ContextVar: a turn enqueued under an in-process profile override is drained by the
+    background drain thread (which does NOT inherit the override), and the gemini fallback claim
+    still names the turn's profile, not the process default (#1340 review P1)."""
+    import threading
+    import time
+    hc = pytest.importorskip("hermes_constants")
+    pytest.importorskip("hermes_cli.profiles")
+    from capture_router import BridgeExtractor, CaptureRouter
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    prof_home = tmp_path / ".hermes" / "profiles" / "coder"
+    prof_home.mkdir(parents=True)
+
+    claims, done = [], threading.Event()
+
+    def http(url, body, headers, timeout):
+        if "18812" in url:
+            raise TimeoutError("primary down")
+        claims.append(headers.get("x-hermes-profile"))
+        if len(claims) >= 2:
+            done.set()
+        return '{"choices": [{"message": {"content": "{\\"candidates\\": []}"}}]}'
+
+    router = CaptureRouter(
+        extractor=BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s"),
+        prefs_prompt="p", world_prompt="w",
+        staging_dir=str(tmp_path / "staged"), brain_inbox_dir=str(tmp_path / "inbox"))
+    store = FakeStore()
+    p = make_pipeline(tmp_path, store, capture_on=True, router=router)
+    tok = hc.set_hermes_home_override(str(prof_home))
+    try:
+        assert p.enqueue_turn("User prefers dark mode.", "ok", session_id="s", turn_ordinal=1)
+    finally:
+        hc.reset_hermes_home_override(tok)
+    try:
+        assert done.wait(10), f"drain thread never reached the fallback leg: {claims}"
+        assert claims == ["coder", "coder"]
+    finally:
+        p.stop()
+
+
 def test_duplicate_turn_enqueue_is_noop(tmp_path):
     store = FakeStore()
     p = make_pipeline(tmp_path, store, capture_on=True)

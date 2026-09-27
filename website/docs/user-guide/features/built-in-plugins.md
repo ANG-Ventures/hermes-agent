@@ -142,7 +142,7 @@ The file is still written. The model reads the warning in the next turn's tool m
 
 ### kanban-home-cards
 
-On the first turn a process runs for a session (new session, restart-resume, `/new`), a `pre_llm_call` hook adds a compact block to the user message listing that session's OPEN home kanban cards (id, status, title, last activity, board, last comment) across all boards. The block rides the user-message `api_content` sidecar, so it is cached once and replayed byte-for-byte; the system prompt is untouched.
+On the first turn a process runs for a session (new session, restart-resume, `/new`), a `pre_llm_call` hook adds a compact block to the user message listing that session's OPEN home kanban cards (id, status, title, last activity, board, last comment) across all boards. The block rides the user-message `api_content` sidecar, so where the replay forwards that sidecar (CLI resume, gateway with message timestamps off) it is cached once and replayed byte-for-byte; with gateway message timestamps on, the replay rewrites the row and drops the sidecar, so the block is seen for that one turn only. A multimodal first turn (e.g. an image) does not carry the block; it is added on the first text turn instead. The system prompt is untouched.
 
 - Capped: at most 8 cards, 180 chars per line, 900 chars total, then `(+N more: hermes kanban list --home)`. An empty home adds nothing.
 - Read-only (`mode=ro`), 750 ms total budget, fails open.

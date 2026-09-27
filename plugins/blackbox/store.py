@@ -183,6 +183,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             -- x-hermes-call-id sent on this attempt (bridge lanes only; the
             -- bridge journal logs it, cachehop joins on it). NULL elsewhere.
             call_id TEXT,
+            -- Composite sub-harness calls (MoA, card t_02323499). A composite
+            -- call (provider 'moa') is ONE virtual row plus one child row per
+            -- PHYSICAL call (each advisor + the aggregator) at its real
+            -- provider/model/route. Children carry parent_call_id = the
+            -- virtual row's seq in the same turn_id; both carry sub_harness
+            -- ('moa:<preset>'). The virtual parent (sub_harness NOT NULL,
+            -- parent_call_id NULL) holds the SUM of its children's usage and
+            -- is a grouping key: a reader counts EITHER the parent OR its
+            -- children, never both. NULL on every ordinary row.
+            parent_call_id INT,
+            sub_harness TEXT,
             PRIMARY KEY(turn_id, seq)
         );
 
@@ -346,7 +357,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _api_existing = {row[1] for row in conn.execute("PRAGMA table_info(turn_api_calls)")}
     for col, kind in (("cache_write_5m", "INT"), ("cache_write_1h", "INT"),
                       ("cache_ttl_requested", "TEXT"), ("lane_family", "TEXT"),
-                      ("call_id", "TEXT")):
+                      ("call_id", "TEXT"), ("parent_call_id", "INT"),
+                      ("sub_harness", "TEXT")):
         if col not in _api_existing:
             try:
                 conn.execute(f"ALTER TABLE turn_api_calls ADD COLUMN {col} {kind}")
@@ -627,6 +639,9 @@ def lane_family(provider: str) -> str:
 AUX_LANE_FAMILY = "aux"
 AUX_ATTRIBUTION_PREFIX = "aux:"
 _NOT_AUX = "COALESCE(lane_family, '') != 'aux'"
+# Composite (MoA) child rows repeat usage their virtual parent already sums, so
+# readers that reconcile against the turn from the parent side exclude them.
+_NOT_COMPOSITE_CHILD = "parent_call_id IS NULL"
 
 
 def is_aux_attribution(attribution: Any) -> bool:
@@ -638,13 +653,16 @@ def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
     """Reconcile calls even when they arrive after the turn row."""
     # Main lane only: an aux call (lane_family='aux') is a different model on a
     # different prompt; letting it be the "first call" or add to the write tiers
-    # would misreport the main conversation's cache behaviour.
+    # would misreport the main conversation's cache behaviour. Composite child
+    # rows are excluded too: their virtual parent already represents the call.
     conn.execute(f"""
         UPDATE turns SET
             cache_write_5m = (SELECT SUM(cache_write_5m) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}
+                                AND {_NOT_COMPOSITE_CHILD}),
             cache_write_1h = (SELECT SUM(cache_write_1h) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}
+                                AND {_NOT_COMPOSITE_CHILD}),
             first_call_cache_miss = (
                 SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
                                       OR cache_write IS NULL THEN NULL
@@ -663,6 +681,7 @@ def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
                                  (input_tokens + cache_read + cache_write) THEN 1
                             ELSE 0 END
                 FROM turn_api_calls WHERE turn_id = turns.turn_id AND {_NOT_AUX}
+                  AND {_NOT_COMPOSITE_CHILD}
                   -- First SUCCESSFUL call: a 429/5xx/timeout attempt carries
                   -- zero usage and would hide the cold write on the retry.
                   AND (http_status IS NULL OR http_status BETWEEN 200 AND 299)
@@ -944,6 +963,96 @@ def insert_api_call(
             _refresh_served_subs(conn, turn_id)
         if http_status in (None, 200):
             _backfill_fallback_next_call(conn, turn_id, ts, usage)
+
+
+_USAGE_SUM_COLUMNS = ("input_tokens", "output_tokens", "cache_read",
+                      "cache_write", "reasoning")
+
+
+def insert_composite_calls(
+    turn_id: str, parent_seq: int, *, sub_harness: str,
+    calls: list[dict[str, Any]],
+) -> None:
+    """Explode one composite (MoA) call into physical child rows.
+
+    ``parent_seq`` is the virtual row the transport chokepoint already wrote
+    for the composite call. Each entry of ``calls`` becomes one child row
+    (``parent_call_id = parent_seq``) at its own provider/model/route; the
+    parent is stamped with ``sub_harness`` and its usage columns are set to
+    the SUM of its children, so the parent-only view and the physical view
+    of the turn total the same tokens. One transaction: a half-written
+    composite never lands. Raises (caller is fail-open) when the parent row
+    is missing, is itself a child, or already has children.
+
+    Entry keys: ``seq`` (allocated by the caller from the turn's shared
+    allocator), ``ts``, ``provider``, ``model``, ``usage`` (CanonicalUsage),
+    ``sub_key``, ``attribution``, ``http_status``, ``route_id``.
+    """
+    if not sub_harness:
+        raise ValueError("composite calls need a sub_harness")
+    if turn_id is None or parent_seq is None:
+        raise ValueError("composite parent key must not be None")
+    with _connect() as conn:
+        parent = conn.execute(
+            "SELECT parent_call_id FROM turn_api_calls WHERE turn_id = ? AND seq = ?",
+            (turn_id, parent_seq),
+        ).fetchone()
+        if parent is None:
+            raise ValueError(
+                f"composite parent row missing (turn_id={turn_id!r}, seq={parent_seq!r})"
+            )
+        if parent[0] is not None:
+            raise ValueError("composite parent is itself a child row")
+        if conn.execute(
+            "SELECT 1 FROM turn_api_calls WHERE turn_id = ? AND parent_call_id = ?",
+            (turn_id, parent_seq),
+        ).fetchone():
+            raise ValueError("composite parent already has children")
+        totals = dict.fromkeys(_USAGE_SUM_COLUMNS, 0)
+        for call in calls:
+            attribution = call.get("attribution") or "wire"
+            if attribution not in ("wire", "pinned", "inferred", "external"):
+                raise ValueError(f"Invalid API-call attribution: {attribution!r}")
+            seq = call.get("seq")
+            if seq is None:
+                raise ValueError("composite child seq must not be None")
+            usage = call["usage"]
+            provider = str(call.get("provider") or "")
+            values = {
+                "input_tokens": int(usage.input_tokens or 0),
+                "output_tokens": int(usage.output_tokens or 0),
+                "cache_read": int(usage.cache_read_tokens or 0),
+                "cache_write": int(usage.cache_write_tokens or 0),
+                "reasoning": int(usage.reasoning_tokens or 0),
+            }
+            for key, value in values.items():
+                totals[key] += value
+            conn.execute(
+                """
+                INSERT INTO turn_api_calls (
+                    turn_id, seq, ts, provider, sub_key, model, input_tokens,
+                    output_tokens, cache_read, cache_write, reasoning,
+                    attribution, http_status, relay_synthetic, route_id,
+                    lane_family, parent_call_id, sub_harness
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                """,
+                (turn_id, seq, call.get("ts"), provider, call.get("sub_key"),
+                 str(call.get("model") or ""), values["input_tokens"],
+                 values["output_tokens"], values["cache_read"],
+                 values["cache_write"], values["reasoning"], attribution,
+                 call.get("http_status"), call.get("route_id"),
+                 lane_family(provider), parent_seq, sub_harness),
+            )
+        conn.execute(
+            "UPDATE turn_api_calls SET sub_harness = ?, "
+            + ", ".join(f"{col} = ?" for col in _USAGE_SUM_COLUMNS)
+            + " WHERE turn_id = ? AND seq = ?",
+            (sub_harness, *(totals[col] for col in _USAGE_SUM_COLUMNS),
+             turn_id, parent_seq),
+        )
+        _refresh_cache_monitoring(conn, turn_id)
+        if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
+            _refresh_served_subs(conn, turn_id)
 
 
 _FALLBACK_EVENT_COLUMNS = (

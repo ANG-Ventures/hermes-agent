@@ -2648,6 +2648,14 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        # No loop boundary here, so ``set-model --live`` cannot apply in
+        # place: mark the run so the write side stops promising it.
+        from hermes_cli.kanban_worker_route import mark_live_route_unsupported
+
+        mark_live_route_unsupported(
+            agent, reason="codex_app_server runtime has no in-run switch point; "
+            "the route applies on the next dispatch (use --reclaim to apply now)",
+        )
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -2667,6 +2675,16 @@ def run_conversation(
                     f"User correction during the turn: {_redirect_text}"
                 )
             agent._persist_session(messages, conversation_history)
+
+        # Kanban ``set-model --live`` (t_033a3bb1): switch this worker's
+        # provider/model/effort in place between two provider calls. No-op
+        # (one env read) outside a kanban worker; never raises.
+        from hermes_cli.kanban_worker_route import apply_pending_live_route
+
+        active_system_prompt = apply_pending_live_route(
+            agent, iteration=api_call_count + 1,
+            active_system_prompt=active_system_prompt,
+        )
 
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
@@ -5449,6 +5467,23 @@ def run_conversation(
                                     aggregator_model=_agg_cost_model,
                                     aggregator_provider=_agg_cost_provider,
                                     aggregator_base_url=_agg_cost_base_url,
+                                )
+                                # Ledger each physical advisor/aggregator call
+                                # as a child of this composite call's virtual
+                                # turn_api_calls row (card t_02323499).
+                                from agent.chat_completion_helpers import (
+                                    _emit_composite_api_call_records,
+                                )
+
+                                _moa_preset = getattr(
+                                    getattr(getattr(_moa_client, "chat", None), "completions", None),
+                                    "preset_name",
+                                    None,
+                                )
+                                _emit_composite_api_call_records(
+                                    agent,
+                                    _turn_call["pricing_calls"],
+                                    sub_harness=f"moa:{_moa_preset if isinstance(_moa_preset, str) and _moa_preset else agent.model}",
                                 )
                         except Exception:
                             pass  # telemetry must never break the conversation loop

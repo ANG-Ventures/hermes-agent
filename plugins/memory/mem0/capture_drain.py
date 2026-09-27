@@ -429,7 +429,8 @@ class CaptureDrainWorker:
             session = payload.get("session_id") or "default"
             res = self._router.route_turn(
                 payload.get("user", ""), payload.get("assistant", ""),
-                turn_id=key[:16], session=session, ts=payload.get("ts"))
+                turn_id=key[:16], session=session, ts=payload.get("ts"),
+                profile=payload.get("profile"))
             if res.get("error"):
                 logger.warning("capture-router: turn %s routed with extract error: %s",
                                key[:16], res["error"])

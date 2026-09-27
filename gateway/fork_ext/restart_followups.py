@@ -20,6 +20,7 @@ spool failure is logged LOUDLY by the caller, never raised into the turn.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -30,6 +31,11 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+try:  # POSIX; without it rotation falls back to the unlocked recheck
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +81,13 @@ NOT_CARRIED_FIELDS = {
 # record with an HMAC keyed by a per-home secret (``SPOOL_KEY_NAME``, 0600,
 # created by the gateway itself). On load:
 #   * MAC verifies  -> the admission flags are restored exactly as parked;
-#     the live policy (ALLOW_BOTS / ALLOWED_ROLES / relay adapter) is still
-#     re-evaluated by the normal intake, so a gate closed during the restart
-#     still refuses.
+#     the live policy is still re-evaluated by the normal intake, so a gate
+#     closed during the restart still refuses: ``is_bot`` needs a live
+#     ``{PLATFORM}_ALLOW_BOTS``; on a replay (``_restart_followup_session``)
+#     ``role_authorized`` needs a live role allowlist (authz_mixin);
+#     ``delivered_via_upstream_relay`` is delivered only through the live
+#     relay adapter (``_adapter_for_source``). Per-member role revocation during the restart is
+#     NOT re-verified: that needs a Discord member fetch the replay lacks.
 #   * MAC missing / wrong (hand-written, edited, copied from another home, or
 #     written by a pre-fix build) -> NO trust flag is restored; only the
 #     fail-closed ``profile_route_rejected`` is honoured, since it can only
@@ -126,6 +136,18 @@ def _read_spool_key(path: Path) -> Tuple[Optional[bytes], bool]:
     return key, True
 
 
+@contextlib.contextmanager
+def _key_rotation_lock(path: Path):
+    """Exclusive cross-process lock for rotating an invalid spool key."""
+    fd = os.open(str(path.with_name(f".{SPOOL_KEY_NAME}.lock")), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the flock
+
+
 def _spool_key(home: Optional[Path] = None, *, create: bool) -> Optional[bytes]:
     """The per-home spool MAC key, or None (fail closed: nothing is trusted).
 
@@ -149,8 +171,13 @@ def _spool_key(home: Optional[Path] = None, *, create: bool) -> Optional[bytes]:
             fh.flush()
             os.fsync(fh.fileno())
         if present:
-            os.replace(tmp, path)  # heal an invalid key
-            logger.warning("PHASE=restart_followup_key_replaced path=%s", path)
+            # Heal an invalid key, serialized and rechecked under a lock: two
+            # writers that both saw the invalid key must not both rotate it,
+            # or the later rotation voids records the earlier one signed.
+            with _key_rotation_lock(path):
+                if _read_spool_key(path)[0] is None:
+                    os.replace(tmp, path)
+                    logger.warning("PHASE=restart_followup_key_replaced path=%s", path)
         else:
             try:
                 os.link(tmp, path)

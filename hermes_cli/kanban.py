@@ -32,6 +32,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
+from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -770,6 +771,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "running worker is terminated; the next run is a FRESH session "
              "seeded from the card body + comments + the same workspace, so "
              "post a checkpoint comment before reclaiming mid-task.",
+    )
+    p_set_model.add_argument(
+        "--live", action="store_true",
+        help="Switch selected RUNNING workers to the new route/effort at "
+             "their next loop iteration, WITHOUT aborting them: same process, "
+             "same conversation, same workspace. Costs one prompt-cache miss "
+             "on a model/provider change (effort-only is near-free). Cards "
+             "that are not running just get the next-dispatch write. Needs an "
+             "explicit model and/or --effort (clears are refused); cannot be "
+             "combined with --reclaim.",
     )
     p_set_model.add_argument(
         "--allow-flagship",
@@ -1767,6 +1778,11 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    refusal = _non_owner_lifecycle_refusal(args)
+    if refusal:
+        print(f"kanban: {refusal}", file=sys.stderr)
+        return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1960,16 +1976,24 @@ def _caller_session_id() -> Optional[str]:
     explicit = (_SLASH_SESSION_ID.get() or "").strip()
     if explicit:
         return explicit
+    in_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
     try:
-        from gateway.session_context import resolve_current_session_id
+        from gateway.session_context import _SESSION_ID, resolve_current_session_id
 
+        if in_gateway:
+            # In-process gateway: ONLY a per-turn contextvar bound in this
+            # context is ours. A plain slash command runs before that bind,
+            # and the resolver's os.environ fallback is process-global --
+            # another chat's session. Sessionless means None, never a
+            # borrowed identity (FleetReview #951).
+            bound = _SESSION_ID.get()
+            return (bound.strip() or None) if isinstance(bound, str) else None
         resolved = (resolve_current_session_id() or "").strip()
         if resolved:
             return resolved
-        if os.environ.get("_HERMES_GATEWAY") == "1":
-            return None  # in-process: env is another session's, never ours
     except Exception:
-        pass
+        if in_gateway:
+            return None
     return (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
 
 
@@ -2069,6 +2093,59 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
         return is_delegated_child_process_context()
     except Exception:
         return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
+#: Terminal/lifecycle writes a worker makes on its OWN card. Each one passes
+#: ``expected_run_id=_worker_run_id_for(tid)``, which is ``None`` for a process
+#: that does not own the grant, and ``None`` means "operator, no run guard".
+_WORKER_LIFECYCLE_ACTIONS: frozenset[str] = frozenset({
+    "complete",
+    "block",
+    "schedule",
+    "request-review",
+})
+
+
+def _lifecycle_target_ids(args: argparse.Namespace) -> list[str]:
+    ids = list(getattr(args, "task_ids", None) or [])
+    if getattr(args, "task_id", None):
+        ids.append(args.task_id)
+    ids.extend(getattr(args, "ids", None) or [])
+    return ids
+
+
+def _non_owner_lifecycle_refusal(args: argparse.Namespace) -> Optional[str]:
+    """Refuse a lifecycle write on the ambient worker card by a non-owner.
+
+    A process that inherited a worker's ``HERMES_KANBAN_TASK`` but does not hold
+    the owner grant (``HERMES_KANBAN_OWNER_PID`` names another pid) gets
+    ``expected_run_id=None`` from :func:`_worker_run_id_for`, which
+    ``complete_task``/``block_task`` read as an operator override with no run
+    guard. Without this gate such a process closes the live worker's card
+    (2026-08-12, t_09b90233: a nested process closed its parent's card).
+
+    Scope is the card the inherited env names. A shell with no worker env is an
+    operator and is unaffected; so is the owning worker, and a hand-driven
+    worker with no owner marker (``owns_kanban_worker_authority`` fails open).
+    """
+    if getattr(args, "kanban_action", None) not in _WORKER_LIFECYCLE_ACTIONS:
+        return None
+    ambient = os.environ.get("HERMES_KANBAN_TASK")
+    if not ambient or ambient not in _lifecycle_target_ids(args):
+        return None
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if is_dispatcher_owned_worker_context():
+            return None
+    except Exception:
+        return None
+    return (
+        f"this process inherited worker env for {ambient} but does not hold "
+        f"its owner grant; only the dispatcher's worker may "
+        f"{args.kanban_action} that card (run it from a shell without the "
+        f"worker env to act as an operator)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3414,6 +3491,18 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     all_active = bool(getattr(args, "all_active", False))
     task_ids = list(getattr(args, "task_ids", None) or [])
     reclaim = bool(getattr(args, "reclaim", False))
+    live = bool(getattr(args, "live", False))
+    if live and reclaim:
+        print("kanban: --live and --reclaim are exclusive (--live keeps the "
+              "running worker; --reclaim aborts it)", file=sys.stderr)
+        return 2
+    if live and (clear_effort or (touch_model and not model and not provider)):
+        # A clear resolves through lane overrides / the capped-pool ladder at
+        # dispatch time, which a running worker cannot reproduce. Name the
+        # route to switch to, or clear without --live (next dispatch).
+        print("kanban: --live needs an explicit route or --effort level; "
+              "clears apply on the next dispatch (drop --live)", file=sys.stderr)
+        return 2
     if task_ids and (where or all_active):
         print(
             "kanban: pass task ids OR a selector (--where/--all-active), not both",
@@ -3430,6 +3519,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     cleared_routes: dict[str, str] = {}
     reclaim_errors: dict[str, str] = {}
     skipped: dict[str, str] = {}
+    live_runs: dict[str, int] = {}
     batch_error: Optional[str] = None
     committed = False
     try:
@@ -3489,6 +3579,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     require_statuses=require_statuses,
                     require_assignees=require_assignees,
                     skip_if_unmatched=not task_ids,
+                    live=live,
                 )
                 if touch_model:
                     effective_model = model or inherited_models.get(task.id)
@@ -3512,7 +3603,9 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.effort = None if clear_effort else effort
                 writes.append(write)
 
-            written = set(kb.apply_batch_route_writes(conn, writes, skipped=skipped))
+            written = set(kb.apply_batch_route_writes(
+                conn, writes, skipped=skipped, live_runs=live_runs,
+            ))
             # PAST THIS LINE THE ROUTES ARE DURABLE. Nothing below may let an
             # exception escape without the operator learning which cards
             # moved — that is the whole honest-partial contract, and it is
@@ -3575,12 +3668,19 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         # `applies=next-dispatch` alone is technically true but reads as
         # normal — the refusal line below is what names it, and this keeps
         # the two consistent.
-        applies = "redispatch" if redispatched else "next-dispatch"
+        live_run = live_runs.get(task_id)
+        applies = (
+            "redispatch" if redispatched
+            else f"live(run {live_run})" if live_run is not None
+            else "next-dispatch"
+        )
         if single:
             if touch_model and (model or provider):
                 label = f"{provider}:{model or inherited_models[task_id]}" if provider else model
                 suffix = (
                     " (reclaimed; redispatches now)" if redispatched
+                    else f" (live: run {live_run} switches at its next turn, "
+                         "context kept)" if live_run is not None
                     else " (applies on next dispatch)"
                 )
                 print(f"Set model override on {task_id}: {label}{suffix}")
@@ -3591,8 +3691,11 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 print(f"Cleared reasoning effort on {task_id} "
                       "(worker uses its profile's agent.reasoning_effort)")
             elif effort is not None:
-                print(f"Set reasoning effort on {task_id}: {effort} "
-                      "(applies on next dispatch)")
+                when = (
+                    f"live: run {live_run} switches at its next turn"
+                    if live_run is not None else "applies on next dispatch"
+                )
+                print(f"Set reasoning effort on {task_id}: {effort} ({when})")
             continue
         if touch_model and (model or provider):
             route = f"{provider}/{model or inherited_models[task_id]}" if provider else model
@@ -4518,7 +4621,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
-            except (DraftPrError, StaleBaseError) as draft_err:
+            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
@@ -4874,7 +4977,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
                 with_reason=True,
             )
-        except (DraftPrError, StaleBaseError) as draft_err:
+        except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
             print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
             return 1
         if not ok:
@@ -5116,7 +5219,13 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            try:
+                archived = kb.archive_task(conn, tid)
+            except ClosedUnmergedPrError as closed_err:
+                failed.append(tid)
+                print(f"cannot archive {tid}: {closed_err}", file=sys.stderr)
+                continue
+            if not archived:
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:
