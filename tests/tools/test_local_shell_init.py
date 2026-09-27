@@ -227,3 +227,72 @@ class TestSnapshotEndToEnd:
         assert str(fake_n_bin) in output
         # bashrc short-circuited on the interactive guard — its export never ran
         assert "FROM_BASHRC=bashrc-should-not-appear" not in output
+
+
+class TestBackgroundSpawnShellInit:
+    """``process_registry.spawn_local`` runs ``$SHELL -lic``; on macOS the
+    login profile's path_helper reorders PATH, so terminal.shell_init_files
+    must be sourced inside the background command too (both PTY and pipe)."""
+
+    def _spawn_capture(self, tmp_path, config, use_pty):
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        from tools.process_registry import ProcessRegistry
+
+        captured = {}
+
+        class _FakePty:
+            @staticmethod
+            def spawn(argv, **kwargs):
+                captured["pty"] = list(argv)
+                raise OSError("fake pty: fall back to pipe")
+
+        def fake_popen(cmd, **kwargs):
+            captured["pipe"] = list(cmd)
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        registry = ProcessRegistry()
+        fake_ptyprocess = types.SimpleNamespace(PtyProcess=_FakePty)
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=config,
+        ), patch.dict(sys.modules, {"ptyprocess": fake_ptyprocess}), \
+                patch("tools.process_registry._find_shell", return_value="/bin/zsh"), \
+                patch("tools.process_registry._is_supervised_gateway_process", return_value=False), \
+                patch("subprocess.Popen", side_effect=fake_popen), \
+                patch("threading.Thread", return_value=MagicMock()), \
+                patch.object(registry, "_write_checkpoint"):
+            registry.spawn_local("command -v gh", cwd=str(tmp_path), use_pty=use_pty)
+        return captured
+
+    @pytest.mark.parametrize("use_pty", [False, True])
+    def test_init_files_sourced_before_user_command(self, tmp_path, use_pty):
+        init = tmp_path / "gh-lane-env.sh"
+        init.write_text("export PATH=/shim:$PATH\n")
+
+        captured = self._spawn_capture(tmp_path, ([str(init)], True), use_pty)
+
+        paths = ["pipe", "pty"] if use_pty else ["pipe"]
+        for key in paths:
+            argv = captured[key]
+            assert argv[:2] == ["/bin/zsh", "-lic"], (key, argv)
+            script = argv[2]
+            assert script.startswith("set +m; ")
+            src = script.index(f". '{init}'")
+            assert src < script.index("command -v gh"), (key, script)
+
+    def test_auto_bashrc_not_sourced_in_background_shell(self, tmp_path, monkeypatch):
+        (tmp_path / ".bashrc").write_text("export MARKER=seen\n")
+        (tmp_path / ".bash_profile").write_text("exec /bin/zsh -l\n")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        captured = self._spawn_capture(tmp_path, ([], True), use_pty=False)
+
+        assert captured["pipe"][2] == "set +m; command -v gh"

@@ -1798,20 +1798,25 @@ def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
         return [], True
 
 
-def _resolve_shell_init_files() -> list[str]:
+def _resolve_shell_init_files(explicit_only: bool = False) -> list[str]:
     """Resolve the list of files to source before the login-shell snapshot.
 
     Expands ``~`` and ``${VAR}`` references and drops anything that doesn't
     exist on disk, so a missing ``~/.bashrc`` never breaks the snapshot.
     The ``auto_source_bashrc`` path runs only when the user hasn't supplied
     an explicit list — once they have, Hermes trusts them.
+
+    ``explicit_only`` skips the ``auto_source_bashrc`` fallback.  Background
+    spawns run under the user's ``$SHELL`` (often zsh), where sourcing bash
+    rc files is wrong and a ``~/.bash_profile`` ``exec zsh -l`` would swallow
+    the command; only files the user listed explicitly apply there.
     """
     explicit, auto_bashrc = _read_terminal_shell_init_config()
 
     candidates: list[str] = []
     if explicit:
         candidates.extend(explicit)
-    elif auto_bashrc and not _IS_WINDOWS:
+    elif auto_bashrc and not _IS_WINDOWS and not explicit_only:
         # Build a login-shell-ish source list so tools like n / nvm / asdf /
         # pyenv that self-install into the user's shell rc land on PATH in
         # the captured snapshot.
