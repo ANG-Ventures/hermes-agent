@@ -135,16 +135,21 @@ collect_sandbox_logs() {
 
 diagnose_node_gyp() {
   local dest="$1"
-  local pkg
-  pkg="$(grep -hE ' error path .*/node_modules/' "$SANDBOX_ROOT/home/.npm/_logs"/*.log \
-    | tail -n 1 | sed -E 's/.* error path //')"
-  [ -n "$pkg" ] || return 0
+  # npm rolls the failed package back out of node_modules, so rebuild the
+  # same name@version in a scratch dir with the same node, npm and sandbox env.
+  local pkgid
+  pkgid="$(grep -hE ' verbose pkgid [^ ]+@[0-9]' "$SANDBOX_ROOT/home/.npm/_logs"/*.log \
+    | tail -n 1 | sed -E 's/.* verbose pkgid //')"
+  [ -n "$pkgid" ] || return 0
+  local name="${pkgid%@*}"
   local node_home='/home/hermes/.hermes/node'
   local gyp="$node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js"
-  echo "--- node-gyp rebuild --loglevel=verbose in $pkg ---" >&2
-  in_sandbox "cd '$pkg' && timeout 600 '$node_home/bin/node' '$gyp' rebuild --loglevel=verbose" \
+  echo "--- node-gyp rebuild --loglevel=verbose for $pkgid ---" >&2
+  in_sandbox "set -e; d=\$(mktemp -d); cd \"\$d\"; npm init -y >/dev/null; \
+npm install --ignore-scripts --no-audit --no-fund '$pkgid'; cd 'node_modules/$name'; \
+timeout 600 '$node_home/bin/node' '$gyp' rebuild --loglevel=verbose" \
     >"$dest/node-gyp-verbose.log" 2>&1 || true
-  grep -E 'gyp (ERR!|http|verb (download|install|get node dir))|UNCAUGHT|stack' \
+  grep -E 'gyp (ERR!|http|info ok|verb (download|install|get node dir))|UNCAUGHT|npm (ERR!|error)' \
     "$dest/node-gyp-verbose.log" | head -n 80 >&2 || true
   echo "--- end node-gyp (full log: node-gyp-verbose.log) ---" >&2
 }
