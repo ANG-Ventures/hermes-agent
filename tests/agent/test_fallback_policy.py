@@ -259,7 +259,8 @@ def test_unknown_seat_never_matches(store, key):
 def test_warm_rank_enforce_widens_to_warm_eligible(store, key):
     st = _sticky_on_fallback(store, key)
     elig = {"instance_id": "x", "bound_seat": "sub-vps-1", "bound_eligible": True,
-            "model_eligible": True, "warm_eligible": True, "warm_rank_effective": "enforce"}
+            "model_eligible": True, "warm_eligible": "sub-vps-1", "warm_rank_effective": "enforce",
+            "warm_seat": "sub-vps-1", "warm_age_s": 120, "warm_window_s": 3300}
     assert fp.restore_allowed(st, T0 + 200, probe=True, primary_provider="claude-bpr",
                               eligibility=_elig(elig)).branch == "warm_seat"
     shadow = dict(elig, warm_rank_effective="shadow")
@@ -1221,3 +1222,205 @@ def test_replay_script_old_flaps_new_bounded(tmp_path):
     con.close()
     assert mod.main(["--ledger", "48h", "--db", str(db)]) == 0
     assert mod.main(["--ledger", "48h", "--db", str(db), "--target", "0"]) == 1
+
+
+# ── warm-seat spec §4.4 / §5 P3: harness return gate (-k warm) ────────────
+
+def _warm(mode="enforce", *, eligible=None, age=600.0, window=3300.0, refusal="on",
+          bound_seat="sub-vps-1", bound_eligible=True, seat="sub-vps-3"):
+    """/eligibility as claude-pool P1 serves it. The bound seat differs from the
+    last primary seat, so D6's bound-seat branch alone would not return."""
+    return {"instance_id": "1:18811", "bound_seat": bound_seat, "bound_eligible": bound_eligible,
+            "model_eligible": True, "snapshot_age_s": 1, "warm_rank_effective": mode,
+            "warm_refusal": refusal, "warm_seat": seat if age is not None else None,
+            "warm_age_s": age, "warm_window_s": window if age is not None else None,
+            "warm_eligible": eligible}
+
+
+def _gate(st, now, obj, *, arm=True, sid=None):
+    return fp.restore_allowed(st, now, probe=True, primary_provider="claude-bpr",
+                              live_session_id=sid, eligibility=_elig(obj), refusal_arm=arm)
+
+
+@pytest.mark.parametrize("arm", [True, False])
+def test_warm_return_now_on_enforce(store, key, arm):
+    st = _sticky_on_fallback(store, key)
+    d = _gate(st, T0 + 200, _warm("enforce", eligible="sub-vps-3"), arm=arm)
+    assert d.allowed and d.branch == "warm_seat"
+    assert d.warm["warm_gate"] == "return_now" and d.warm["warm_seat"] == "sub-vps-3"
+    row = fp.recovery_row(st, d, T0 + 200)
+    assert row["warm_gate"] == "return_now" and row["warm_eligible"] is True
+
+
+def test_warm_return_now_needs_age_under_window(store, key):
+    st = _sticky_on_fallback(store, key)
+    d = _gate(st, T0 + 200, _warm("enforce", eligible="sub-vps-3", age=3300.0))
+    assert d.branch != "warm_seat"
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_warm_refusal_while_fallback_warm(store, key, mode):
+    st = _sticky_on_fallback(store, key)
+    d = _gate(st, T0 + 200, _warm(mode, eligible=None))
+    assert not d.allowed and d.reason == "no_warm_primary_seat"
+    assert d.warm["warm_gate"] == "refuse" and d.warm["warm_refusal_arm"] is True
+
+
+def test_warm_refusal_overrides_d6_bound_seat_branch(store, key):
+    """The bound seat is eligible (D6 would return) but no WARM seat is."""
+    st = _sticky_on_fallback(store, key)
+    obj = _warm("shadow", eligible=None, bound_seat="sub-vps-6")
+    assert _gate(st, T0 + 200, obj, arm=False).branch == "warm_seat"   # control arm: D6
+    d = _gate(st, T0 + 200, obj, arm=True)
+    assert not d.allowed and d.reason == "no_warm_primary_seat"
+
+
+def test_warm_refusal_returns_when_fallback_cold(store, key):
+    st = _sticky_on_fallback(store, key)
+    d = _gate(st, T0 + 1 + 61 * 60, _warm("enforce", eligible=None, age=100.0))
+    assert d.allowed and d.branch == "fallback_cold"
+
+
+def test_warm_refusal_returns_on_compaction(store, key):
+    st = _sticky_on_fallback(store, key)
+    d = _gate(st, T0 + 200, _warm("shadow", eligible=None), sid="sid-b")
+    assert d.allowed and d.branch == "compaction"
+
+
+@pytest.mark.parametrize("age", [3300.0, 4000.0, None])
+def test_warm_hard_cap_primary_copy_expired_or_absent(store, key, age):
+    st = _sticky_on_fallback(store, key)
+    d = _gate(st, T0 + 200, _warm("shadow", eligible=None, age=age, bound_eligible=False))
+    assert d.allowed and d.branch == "cap_expiry"
+    assert fp.recovery_row(st, d, T0 + 200)["expected_warm"] is False
+    assert "expired" in fp.format_recovery_rider(fp.recovery_row(st, d, T0 + 200))
+
+
+def test_warm_hard_cap_active_session_returns_within_55_min(store, key):
+    """Fallback called every 2 min for 3h (never cold); the relay's warm copy
+    of the primary ages from the last primary call with a 1h-tier window
+    (3300 s). The return lands no later than 55 min after that call."""
+    last_primary = T0 - 60
+    st = _sticky_on_fallback(store, key, last_primary=last_primary)
+    returned_at = None
+    t = T0 + 120
+    while t <= T0 + 3 * 3600:
+        fp.note_fallback_success(store, key, t, "sid-a")
+        st = store.get(key)
+        age = t - last_primary
+        obj = _warm("enforce", eligible=None, age=age if age < 3300 else None,
+                    bound_eligible=False)
+        d = _gate(st, t + 1, obj)
+        if d.allowed:
+            returned_at = t + 1
+            assert d.branch == "cap_expiry"
+            break
+        assert d.reason == "no_warm_primary_seat"
+        t += 120
+    assert returned_at is not None
+    assert returned_at - last_primary <= 55 * 60 + 120  # first boundary after expiry
+
+
+@pytest.mark.parametrize("obj", [
+    None,                                                        # relay unreachable
+    {"instance_id": "x", "bound_seat": "sub-vps-1", "bound_eligible": True,
+     "model_eligible": True},                                    # old relay, no warm fields
+    "off", "refusal_off",
+])
+def test_warm_fail_open_to_fallback_spec_rule(store, key, obj):
+    st = _sticky_on_fallback(store, key)
+    if obj == "off":
+        obj = dict(_warm("off", eligible=None), warm_seat=None, warm_age_s=None,
+                   warm_window_s=None)
+    elif obj == "refusal_off":
+        obj = _warm("enforce", eligible=None, refusal="off")
+    elig = (lambda: None) if obj is None else _elig(obj)
+    d = fp.restore_allowed(st, T0 + 200, probe=True, primary_provider="claude-bpr",
+                           eligibility=elig, refusal_arm=True)
+    base = fp.restore_allowed(st, T0 + 200, probe=True, primary_provider="claude-bpr",
+                              eligibility=elig, refusal_arm=False)
+    assert (d.allowed, d.branch) == (base.allowed, base.branch)
+    assert d.reason != "no_warm_primary_seat"
+    # the hard cap is part of the refusal half: absent/off never forces a return
+    assert not d.allowed
+
+
+def test_warm_shadow_eligible_uses_fallback_spec_rule(store, key):
+    st = _sticky_on_fallback(store, key)
+    d = _gate(st, T0 + 200, _warm("shadow", eligible="sub-vps-3"))
+    assert not d.allowed and d.reason != "no_warm_primary_seat"   # no return-now on shadow
+    d = _gate(st, T0 + 200, _warm("shadow", eligible="sub-vps-3", bound_seat="sub-vps-6"))
+    assert d.allowed and d.branch == "warm_seat" and d.warm["warm_gate"] is None
+
+
+def test_warm_control_arm_never_refuses(store, key):
+    st = _sticky_on_fallback(store, key)
+    d = _gate(st, T0 + 200, _warm("enforce", eligible=None), arm=False)
+    assert d.reason != "no_warm_primary_seat" and d.warm["warm_refusal_arm"] is False
+
+
+def test_warm_fallback_failure_restores_regardless(store, key):
+    st = _sticky_on_fallback(store, key)
+    obj = _warm("enforce", eligible=None)
+    assert _gate(st, T0 + 200, obj).reason == "no_warm_primary_seat"
+    d = fp.fallback_failed_allowed(st, "quota_seat", T0 + 200, primary_provider="claude-bpr",
+                                   eligibility=_elig(obj))
+    assert d.allowed and d.branch == "fallback_failed"
+
+
+def test_warm_gate_polls_eligibility_once(store, key):
+    st = _sticky_on_fallback(store, key)
+    calls = []
+    parsed = fp.parse_eligibility(_warm("shadow", eligible=None, bound_seat="sub-vps-6"))
+
+    def fetch():
+        calls.append(1)
+        return parsed
+    fp.restore_allowed(st, T0 + 200, probe=True, primary_provider="claude-bpr",
+                       eligibility=fetch, refusal_arm=True)
+    assert len(calls) == 1
+
+
+def test_warm_refusal_arm_hash_and_pct():
+    sids = [f"root-{i}" for i in range(2000)]
+    share = sum(fp.warm_refusal_arm(s, 50) for s in sids) / len(sids)
+    assert 0.4 < share < 0.6
+    assert not any(fp.warm_refusal_arm(s, 0) for s in sids)
+    assert all(fp.warm_refusal_arm(s, 100) for s in sids)
+    assert fp.warm_refusal_arm("root-7", 50) == fp.warm_refusal_arm("root-7", 50)
+    assert not fp.warm_refusal_arm("", 100) and not fp.warm_refusal_arm("x", "junk")
+
+
+def test_warm_rebuild_site_passes_refusal_arm(store, key):
+    _sticky_on_fallback(store, key)
+    rd = fp.decide_rebuild(store, key, T0 + 200, live_session_id="sid-a",
+                           eligibility=_elig(_warm("shadow", eligible=None)), refusal_arm=True)
+    assert rd.action == "resume" and rd.decision.reason == "no_warm_primary_seat"
+
+
+def test_wiring_warm_refusal_arm_config_and_ledger_columns(wired, monkeypatch):
+    """E2E through restore_primary_runtime: fallback.warm_refusal_ab_pct=100
+    refuses with reason no_warm_primary_seat and persists the warm poll on the
+    restore_refused row; pct=0 (control arm) keeps the D6 bound-seat return."""
+    home, _ = wired
+    warm = fp.parse_eligibility(_warm("shadow", eligible=None, bound_seat="sub-vps-6"))
+    monkeypatch.setattr(_fw, "_eligibility_fn", lambda agent: (lambda: warm))
+    (home / "config.yaml").write_text(
+        "blackbox:\n  enabled: true\nfallback:\n  warm_refusal_ab_pct: 100\n")
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    st = _age_episode(a, until_ago=300, fallback_idle=600, last_primary_ago=10 * 60)
+    st.last_primary_seat = "sub-vps-6"
+    fss.default_store().put(_fw.key_for(a), st, _time.time())
+    assert _restore(a) is False
+    [row] = _rows(home, "restore_refused")
+    assert row["reason"] == "no_warm_primary_seat"
+    assert row["warm_gate"] == "refuse" and row["warm_refusal_arm"] == 1
+    assert row["warm_rank_effective"] == "shadow" and row["warm_seat"] == "sub-vps-3"
+    assert row["warm_age_s"] == 600.0 and row["warm_window_s"] == 3300.0
+    assert row["warm_eligible"] == 0
+    (home / "config.yaml").write_text(
+        "blackbox:\n  enabled: true\nfallback:\n  warm_refusal_ab_pct: 0\n")
+    assert _restore(a) is True
+    [rec] = _rows(home, "recovery")
+    assert rec["return_branch"] == "warm_seat" and rec["warm_refusal_arm"] == 0

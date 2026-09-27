@@ -11,7 +11,9 @@ agent's client or provider.
   anti-loop (``ff_disabled_until``), fallback-side write-through fields.
 * §4.3 the single return gate :func:`restore_allowed` (``warm_seat``,
   ``fallback_cold``, ``compaction`` after ``until``; ``fallback_failed``
-  mid-turn), D6 warm-seat return included.
+  mid-turn), D6 warm-seat return included, plus the warm-seat spec §4.4 gate
+  (:func:`warm_gate`: return-now half on enforce, refusal half + hard cap on
+  shadow/enforce in the ``warm_refusal_ab_pct`` session arm).
 * The rebuild decision (:func:`decide_rebuild`) behind
   ``resume_sticky_fallback`` and the target-entry lookup.
 * §4.8 cause and recovery riders (:func:`format_cause_rider`,
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import hashlib
 import json
 import logging
 import random
@@ -58,6 +61,7 @@ FALLBACK_COLD_S = 60 * MIN
 BOUND_EXPIRES_MIN_S = 60.0
 ELIGIBILITY_STALE_S = 300.0
 ELIGIBILITY_TIMEOUT_S = 0.5
+WARM_REFUSAL_AB_PCT_DEFAULT = 50.0
 N_C_WINDOW_S = HOUR          # consecutive failures within 1h of the previous restore
 N_C_RESET_AFTER_S = 30 * MIN  # primary served successfully for 30 min
 LEGACY_DEFAULT_COOLDOWN_S = 60.0
@@ -489,6 +493,10 @@ class Eligibility:
     instance_id: str
     warm_eligible: bool = False
     warm_rank_effective: Optional[str] = None
+    warm_seat: Optional[str] = None
+    warm_age_s: Optional[float] = None
+    warm_window_s: Optional[float] = None
+    warm_refusal: Optional[str] = None
 
 
 def _opt_float(v: Any) -> Optional[float]:
@@ -517,6 +525,10 @@ def parse_eligibility(obj: Any) -> Optional[Eligibility]:
         instance_id=str(obj.get("instance_id")),
         warm_eligible=bool(obj.get("warm_eligible")),
         warm_rank_effective=obj.get("warm_rank_effective"),
+        warm_seat=str(obj.get("warm_seat")) if obj.get("warm_seat") else None,
+        warm_age_s=_opt_float(obj.get("warm_age_s")),
+        warm_window_s=_opt_float(obj.get("warm_window_s")),
+        warm_refusal=obj.get("warm_refusal"),
     )
 
 
@@ -573,6 +585,7 @@ class Decision(NamedTuple):
     branch: Optional[str]
     reason: str
     gate_bound_expires_in_s: Optional[float] = None
+    warm: Optional[Dict[str, Any]] = None   # warm-seat §4.4 poll snapshot (ledger rows)
 
 
 EligibilityFn = Callable[[], Optional[Eligibility]]
@@ -602,8 +615,6 @@ def _warm_seat(state: StickyState, now: float, *, primary_provider: str,
     ttl_ok = exp is None or exp >= BOUND_EXPIRES_MIN_S
     if seat_ok and elig.bound_eligible and ttl_ok:
         return True, f"warm_seat: bound seat {seat} eligible", exp
-    if elig.warm_rank_effective == "enforce" and elig.warm_eligible:
-        return True, "warm_seat: warm eligible seat (warm_rank=enforce)", exp
     why = []
     if not seat_ok:
         why.append(f"bound_seat {elig.bound_seat!r} != last_primary_seat {seat!r}")
@@ -614,17 +625,68 @@ def _warm_seat(state: StickyState, now: float, *, primary_provider: str,
     return False, "warm_seat: " + "; ".join(why), exp
 
 
+def warm_refusal_arm(session_key: Optional[str], pct: Any = WARM_REFUSAL_AB_PCT_DEFAULT) -> bool:
+    """Warm-seat spec §5 P3 A/B: sha1(session_key) % 100 < pct -> refusal arm
+    (the relay's ``warm_ab_enforce_arm`` hash, harness-side knob)."""
+    if not session_key:
+        return False
+    try:
+        pct = float(pct)
+    except (TypeError, ValueError):
+        return False
+    return int(hashlib.sha1(session_key.encode("utf-8")).hexdigest(), 16) % 100 < pct
+
+
+def _warm_snapshot(elig: Eligibility, arm: bool, verdict: Optional[str]) -> Dict[str, Any]:
+    return {"warm_rank_effective": elig.warm_rank_effective, "warm_refusal": elig.warm_refusal,
+            "warm_seat": elig.warm_seat, "warm_age_s": elig.warm_age_s,
+            "warm_window_s": elig.warm_window_s, "warm_eligible": elig.warm_eligible,
+            "warm_refusal_arm": arm, "warm_gate": verdict}
+
+
+def warm_gate(elig: Optional[Eligibility], *, refusal_arm: bool) -> Optional[str]:
+    """Warm-seat spec §4.4 verdict at a restore boundary, keyed only on
+    ``warm_rank_effective`` and ``warm_refusal``:
+
+    * ``"return_now"`` - enforce, ``warm_eligible`` and age < window;
+    * ``"refuse"``     - refusal half (shadow|enforce, ``warm_refusal`` on,
+      session in the A/B arm): a warm copy exists but no warm seat is eligible;
+    * ``"cap"``        - refusal half, but the primary's warm copy has expired
+      or has no entry: waiting saves nothing (hard cap, pass-1 B1);
+    * ``None``         - the fallback spec rule unchanged (relay unreachable, no
+      warm fields, ``off``, ``warm_refusal=off``, control arm, or shadow with a
+      warm eligible seat).
+    """
+    if elig is None:
+        return None
+    mode = elig.warm_rank_effective
+    if mode not in ("shadow", "enforce"):
+        return None
+    age, win = elig.warm_age_s, elig.warm_window_s
+    has_copy = age is not None and win is not None and age < win
+    if mode == "enforce" and elig.warm_eligible and has_copy:
+        return "return_now"
+    if elig.warm_refusal == "off" or not refusal_arm:
+        return None
+    if not has_copy:
+        return "cap"
+    return None if elig.warm_eligible else "refuse"
+
+
 def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = False,
                     live_session_id: Optional[str] = None,
                     primary_provider: str = "",
                     eligibility: Optional[EligibilityFn] = None,
                     direct_pin_benched: Optional[BenchFn] = None,
-                    sticky_policy: bool = True) -> Decision:
+                    sticky_policy: bool = True,
+                    refusal_arm: bool = False) -> Decision:
     """§4.3: return iff (now >= until AND (warm_seat|fallback_cold|compaction)).
 
     ``probe=False`` is the cheap form (no network I/O): until, active,
-    fallback_cold, compaction. ``probe=True`` adds warm_seat. The mid-turn
-    ``fallback_failed`` branch is :func:`fallback_failed_allowed`.
+    fallback_cold, compaction. ``probe=True`` adds warm_seat and the warm-seat
+    spec §4.4 gate (:func:`warm_gate`; relay primaries only). The mid-turn
+    ``fallback_failed`` branch is :func:`fallback_failed_allowed` and never
+    consults the warm gate (a failing fallback is never stranded).
     """
     if not sticky_policy or state is None or not state.active:
         return Decision(True, None, "no active sticky state")
@@ -632,23 +694,51 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
         return Decision(False, None, f"until: {state.until_epoch - now:.0f}s remaining")
     reasons: List[str] = []
     exp: Optional[float] = None
+    verdict: Optional[str] = None
+    warm: Optional[Dict[str, Any]] = None
     if probe:
-        ok, why, exp = _warm_seat(state, now, primary_provider=primary_provider or state.primary_provider,
-                                  eligibility=eligibility, direct_pin_benched=direct_pin_benched)
-        if ok:
-            return Decision(True, "warm_seat", why, exp)
-        reasons.append(why)
+        provider = primary_provider or state.primary_provider
+        if eligibility is not None:
+            _once: List[Optional[Eligibility]] = []
+            _fetch = eligibility
+
+            def eligibility() -> Optional[Eligibility]:  # one poll per gate call
+                if not _once:
+                    _once.append(_fetch())
+                return _once[0]
+
+        if eligibility is not None and not is_direct_pin(provider):
+            elig = eligibility()
+            verdict = warm_gate(elig, refusal_arm=refusal_arm)
+            if elig is not None and elig.warm_rank_effective in ("shadow", "enforce"):
+                warm = _warm_snapshot(elig, refusal_arm, verdict)
+            if verdict == "return_now":
+                return Decision(True, "warm_seat",
+                                f"warm_seat: warm eligible seat {elig.warm_seat} "
+                                f"(warm_rank=enforce, age {elig.warm_age_s}s < {elig.warm_window_s}s)",
+                                elig.bound_expires_in_s, warm)
+        if verdict != "refuse":
+            ok, why, exp = _warm_seat(state, now, primary_provider=provider,
+                                      eligibility=eligibility, direct_pin_benched=direct_pin_benched)
+            if ok:
+                return Decision(True, "warm_seat", why, exp, warm)
+            reasons.append(why)
+        if verdict == "cap":
+            return Decision(True, "cap_expiry",
+                            "cap_expiry: primary warm copy expired or absent", exp, warm)
     last_fb = state.last_fallback_call_epoch
     if last_fb is None:
         last_fb = state.entered_at
     if last_fb is not None and now - last_fb > FALLBACK_COLD_S:
-        return Decision(True, "fallback_cold", f"fallback idle {now - last_fb:.0f}s", exp)
+        return Decision(True, "fallback_cold", f"fallback idle {now - last_fb:.0f}s", exp, warm)
     reasons.append("fallback_cold: last fallback call <= 60 min ago")
     if (live_session_id and state.last_fallback_session_id
             and live_session_id != state.last_fallback_session_id):
-        return Decision(True, "compaction", "session_id rotated since last fallback call", exp)
+        return Decision(True, "compaction", "session_id rotated since last fallback call", exp, warm)
     reasons.append("compaction: no session_id rotation")
-    return Decision(False, None, " | ".join(reasons), exp)
+    if verdict == "refuse":
+        return Decision(False, None, "no_warm_primary_seat", exp, warm)
+    return Decision(False, None, " | ".join(reasons), exp, warm)
 
 
 def fallback_failed_allowed(state: Optional[StickyState], failed_class: str, now: float, *,
@@ -702,7 +792,8 @@ def decide_rebuild(store: StickyStore, key: StickyKey, now: float, *,
                    live_session_id: Optional[str],
                    eligibility: Optional[EligibilityFn] = None,
                    direct_pin_benched: Optional[BenchFn] = None,
-                   sticky_policy: bool = True) -> RebuildDecision:
+                   sticky_policy: bool = True,
+                   refusal_arm: bool = False) -> RebuildDecision:
     """The single construction-time decision (gateway pre-run site)."""
     if not sticky_policy:
         return RebuildDecision("primary", None, None)
@@ -716,7 +807,7 @@ def decide_rebuild(store: StickyStore, key: StickyKey, now: float, *,
         return RebuildDecision("primary", state, None)
     d = restore_allowed(state, now, probe=True, live_session_id=live_session_id,
                         primary_provider=key.primary_provider, eligibility=eligibility,
-                        direct_pin_benched=direct_pin_benched)
+                        direct_pin_benched=direct_pin_benched, refusal_arm=refusal_arm)
     if d.allowed:
         return RebuildDecision("return", record_return(store, key, now, d.branch or ""), d)
     return RebuildDecision("resume", state, d)
@@ -924,6 +1015,8 @@ def format_recovery_rider(row: Mapping[str, Any], *, seat_names: bool = True) ->
     if branch == "compaction":
         return (f"compaction rewrote the prefix; both caches cold, one full cache write "
                 f"({expect}) on {seat}, {dwell}")
+    if branch == "cap_expiry":
+        return (f"primary warm copy expired; one full cache write ({expect}) on {seat}, {dwell}")
     if branch == "fallback_failed":
         return (f"fallback failed ({row.get('trigger_class') or 'quota'}), primary eligible on "
                 f"{seat} ({expect}), {dwell}")
@@ -951,4 +1044,5 @@ def recovery_row(state: StickyState, decision: Decision, now: float, *,
         "trigger_class": state.cls,
         "gate_bound_expires_in_s": decision.gate_bound_expires_in_s,
         "session_id": live_session_id,
+        **(decision.warm or {}),
     }
