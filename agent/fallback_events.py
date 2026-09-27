@@ -285,6 +285,21 @@ def _reason_value(reason: Any) -> Optional[str]:
     return str(getattr(reason, "value", reason))
 
 
+_ROUTE_KEYS = frozenset({"kind", "session_id", "from_provider", "from_model",
+                         "to_provider", "to_model"})
+
+
+def policy_fields(row: Any) -> Optional[Dict[str, Any]]:
+    """A ``fp.recovery_row`` minus its route/identity keys, for ``extra``.
+
+    The policy row's from-route is ``state.fallback_*`` (the route the sticky
+    episode armed on), which is stale after a fallback#1->#2 walk (B1 skips the
+    re-arm). The caller's live served route must win (t_abad4e80)."""
+    if not isinstance(row, dict):
+        return None
+    return {k: v for k, v in row.items() if k not in _ROUTE_KEYS}
+
+
 def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
               to_provider: Any, to_model: Any, reason: Any = None,
               error_context: Optional[Dict[str, Any]] = None,

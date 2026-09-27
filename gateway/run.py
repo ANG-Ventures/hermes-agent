@@ -14295,7 +14295,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from_provider=prev_route[0], from_model=prev_route[1],
                     to_provider=applied_provider, to_model=applied_model,
                     consume=False,
-                    extra=_sticky_row if isinstance(_sticky_row, dict) else None,
+                    extra=_fbe.policy_fields(_sticky_row),
                 )
                 announce = False
                 try:
