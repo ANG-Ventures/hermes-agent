@@ -2369,6 +2369,7 @@ class GatewayKanbanWatchersMixin:
         # decision can legitimately sit for hours; warn every 5 min per board
         # rather than every tick.
         last_stranded_warn_at: dict[str, int] = {}
+        last_unwoken_warn_at: dict[str, int] = {}
         last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
         workspace_refusal_notifier = _WorkspaceRefusalOutageNotifier()
         guard_stuck_notifier = _GuardStuckNotifier()
@@ -2776,6 +2777,22 @@ class GatewayKanbanWatchersMixin:
                                     ", ".join(parents), ", ".join(children),
                                 )
                                 last_stranded_warn_at[slug] = now_s
+                        # Scheduled cards with NO timed wake, parked > 24h: the
+                        # dispatcher will never move them (t_6915068e). Same
+                        # STRANDED channel, hourly — the condition is day-scale.
+                        unwoken = (
+                            getattr(res, "unwoken_scheduled", None)
+                            if res is not None else None
+                        )
+                        if unwoken:
+                            now_s = int(time.time())
+                            if now_s - last_unwoken_warn_at.get(slug, 0) >= 3600:
+                                from hermes_cli.kanban_db import format_unwoken_scheduled
+                                logger.warning(
+                                    "kanban dispatcher [%s]: %s",
+                                    slug, format_unwoken_scheduled(unwoken).replace("\n", " "),
+                                )
+                                last_unwoken_warn_at[slug] = now_s
                     # Health telemetry (aggregate across boards).
                     #
                     # A tick with ready work but zero spawns is only a REAL stall
