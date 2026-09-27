@@ -9751,6 +9751,22 @@ class EmptySupersedeError(ValueError):
         )
 
 
+class EmptyDraftOverrideError(ValueError):
+    """Raised by ``complete_task`` when ``draft_ok`` is given but blank.
+
+    ``draft_ok`` lifts the DRAFT-PR completion refusal for ONE card
+    (t_f38605be); the reason is the audit record, so an empty one is refused.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: {task_id} passed an empty draft_ok; give the reason "
+            f"the named DRAFT PR is intentionally left open (e.g. 'CI vehicle for "
+            f"upstream PR o/r#N'). {task_id} is still in-flight (no state change)"
+        )
+
+
 def _enforce_branch_base(
     conn: sqlite3.Connection, task: "Task", metadata: Optional[dict]
 ) -> None:
@@ -9802,8 +9818,16 @@ def complete_task(
     survivor_none: bool = False,
     survivor_reason: Optional[str] = None,
     superseded_by: Optional[str] = None,
+    draft_ok: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``draft_ok`` is the audited per-card override for the DRAFT-PR refusal
+    (t_f38605be): a non-empty reason lets a handoff name an intentionally-open
+    draft PR. The draft is dropped from the open-PR route, and a
+    ``completion_draft_override`` event records the PRs and the reason. A blank
+    reason is refused (:class:`EmptyDraftOverrideError`); without it the
+    default :class:`DraftPrError` refusal is unchanged.
 
     ``superseded_by`` closes a card whose premise is ALREADY SATISFIED on
     current main — the sibling card, PR or sha that did the work. The closing
@@ -9868,6 +9892,15 @@ def complete_task(
                 )
             raise EmptySupersedeError(task_id)
     run_outcome = "superseded" if superseded_by else "completed"
+    if draft_ok is not None:
+        draft_ok = str(draft_ok).strip()[:_SUPERSEDED_POINTER_MAX]
+        if not draft_ok:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_empty_draft_override",
+                    {"reason": "empty_draft_ok"},
+                )
+            raise EmptyDraftOverrideError(task_id)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -9963,6 +9996,7 @@ def complete_task(
                             metadata=metadata, survivor_pr=survivor_pr,
                         )
                     },
+                    draft_ok=draft_ok is not None,
                 )
             except _fresh.DraftPrError as draft_err:
                 with write_txn(conn):
@@ -9971,6 +10005,19 @@ def complete_task(
                         {"prs": draft_err.prs},
                     )
                 raise
+            overridden = freshness.get("draft_override") or []
+            if overridden:
+                # Audited, never silent (t_f38605be): the intentionally-open
+                # draft is a mention, not a route to review that would wait
+                # on a merge nobody intends.
+                override = {"prs": list(overridden), "reason": draft_ok}
+                with write_txn(conn):
+                    _append_event(conn, task_id, "completion_draft_override", override)
+                metadata = dict(metadata or {}, draft_override=override)
+                still_open = [
+                    r for r in still_open if f"{r.repo}#{r.number}" not in overridden
+                ]
+        if still_open:
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
                 f"{r.repo}#{r.number}" for r in still_open
