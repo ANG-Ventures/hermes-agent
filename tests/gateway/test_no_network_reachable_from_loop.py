@@ -118,8 +118,11 @@ REACHABLE_BASELINE = frozenset({
     "gateway/run.py _stop_impl -> requests.get",
     "gateway/run.py start -> urlopen",
     "gateway/run.py stop -> requests.get",
-    "gateway/slash_commands.py _handle_btw_command -> urlopen",
-    "gateway/slash_commands.py _handle_compress_command_inner -> urlopen",
+    # _handle_btw_command: gone -- its runtime resolve is offloaded (t_515b7fce).
+    # _handle_compress_command_inner: the runtime-resolve urlopen is offloaded
+    # (t_515b7fce); the DFS now surfaces the pre-existing metadata fetch under
+    # _compress_context, untouched by that change.
+    "gateway/slash_commands.py _handle_compress_command_inner -> requests.get",
     "gateway/slash_commands.py _handle_context_command -> requests.get",
     "gateway/slash_commands.py _handle_debug_command -> urlopen",
     "gateway/slash_commands.py _handle_merge_command -> httpx.get",
