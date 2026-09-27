@@ -392,9 +392,10 @@ def names_superseder(closed, *texts: Optional[str], superseded_by: Optional[str]
 
 
 # A token/decision is bound to the PR(s) named in its own clause (FleetReview #1352): clauses split on
-# ``;`` and newlines, and within a clause each token owns the text since the previous token (or, when
-# that names no PR, the text up to the next one). ``PR #5 CLOSED: REJECTED; PR #6 still needs work``
-# covers #5 only; ``r#5 SUPERSEDED-BY #9`` covers #5 only.
+# ``;`` and newlines. A lone token owns its clause (the PR before it, else the PR after it); several
+# tokens in one clause each own only the text since the previous token's target, and if any of them
+# names no PR there the clause is ambiguous and binds nothing but a sole PR (#1363 review).
+# ``PR #5 CLOSED: REJECTED; PR #6 still needs work`` covers #5 only; ``r#5 SUPERSEDED-BY #9`` covers #5 only.
 _CLAUSE_SPLIT_RE = re.compile(r"[;\n]")
 _BARE_REF_RE = re.compile(r"(?<![\w/])#(\d+)\b")
 
@@ -414,16 +415,21 @@ def _bound_matches(text: Optional[str], pattern) -> list:
     out = []
     for clause in _CLAUSE_SPLIT_RE.split(text):
         matches = list(pattern.finditer(clause))
-        for i, m in enumerate(matches):
-            prev_end = matches[i - 1].end() if i else 0
-            next_start = matches[i + 1].start() if i + 1 < len(matches) else len(clause)
-            exclude = ()
-            if m.groups():  # a token: its own target is not its subject
-                exclude = _subject_keys(m.group(1))
-            subject = _subject_keys(clause[prev_end:m.start()], exclude)
-            if not subject:
-                subject = _subject_keys(clause[m.end():next_start], exclude)
+        if len(matches) == 1:  # one token/decision: its subject precedes it, else follows it
+            m = matches[0]
+            exclude = _subject_keys(m.group(1)) if m.groups() else ()  # a token's target is not its subject
+            subject = (_subject_keys(clause[:m.start()], exclude)
+                       or _subject_keys(clause[m.end():], exclude))
             out.append((m, subject))
+            continue
+        # Several in one clause: each owns ONLY the text between the previous match's end (past its
+        # target) and its own start. If any of them names no PR there, the text between two matches
+        # could belong to either, so the whole clause is unattributed (covers a sole PR only).
+        subjects = [_subject_keys(clause[(matches[i - 1].end() if i else 0):m.start()])
+                    for i, m in enumerate(matches)]
+        if not all(subjects):
+            subjects = [set() for _ in matches]
+        out.extend(zip(matches, subjects))
     return out
 
 

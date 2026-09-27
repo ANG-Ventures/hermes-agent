@@ -452,3 +452,25 @@ def test_e2e_survivor_pr_only_route_still_gates_approval(board, monkeypatch):
         with pytest.raises(op.ClosedUnmergedPrError):
             kb.complete_task(conn, tid, summary="approved")
         assert _status(conn, tid) == "review"
+
+
+def test_mixed_style_tokens_in_one_clause_bind_nothing_for_several_prs():
+    # #1363 review cd058b2a2992: the post-style subject of token 1 must not swallow token 2's PR.
+    two = [PR_URL, "https://github.com/ANG-Ventures/r/pull/6"]
+    q = states(n5="CLOSED", n6="CLOSED", n9="MERGED", n10="OPEN")
+    with pytest.raises(op.ClosedUnmergedPrError):
+        op.enforce_not_closed_unmerged("t_x", "SUPERSEDED-BY #9 (was #5) and ANG-Ventures/r#6 RE-CARRIED-AS #10",
+                                       recorded=two, query_fn=q, sha_check=lambda r, s: False)
+
+
+def test_previous_token_target_is_not_the_next_tokens_subject():
+    # #1363 review 11069765a188: the card owns closed #9 and #6; only #6's re-carry (#10) merged.
+    own = ["https://github.com/ANG-Ventures/r/pull/9", "https://github.com/ANG-Ventures/r/pull/6"]
+    q = states(n5="CLOSED", n6="CLOSED", n9="CLOSED", n10="MERGED")
+    with pytest.raises(op.ClosedUnmergedPrError) as exc:
+        op.enforce_not_closed_unmerged("t_x", "PR #5 SUPERSEDED-BY #9 and PR #6 RE-CARRIED-AS #10",
+                                       recorded=own, query_fn=q, sha_check=lambda r, s: False)
+    assert exc.value.closed == ["ANG-Ventures/r#9", "ANG-Ventures/r#6"]
+    assert op._unsuperseded([op.extract_pr_refs("ANG-Ventures/r#9")[0], op.extract_pr_refs("ANG-Ventures/r#6")[0]],
+                            "PR #5 SUPERSEDED-BY #9 and PR #6 RE-CARRIED-AS #10", query_fn=q,
+                            sha_check=lambda r, s: False) == [op.extract_pr_refs("ANG-Ventures/r#9")[0]]
