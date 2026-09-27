@@ -724,7 +724,44 @@ def cron_edit(args):
         print("  Continuity: on (each run sees the previous run's output)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if getattr(args, "reasoning_effort", None) is not None:
+        from cron.jobs import get_job
+
+        after = get_job(job["id"]) or {}
+        print(f"  Reasoning effort: {after.get('reasoning_effort') or 'config default (pin cleared)'}")
+        for line in _fallback_effort_lines(job, after):
+            print(line)
     return 0
+
+
+def _fallback_effort_lines(before: dict, after: dict) -> list:
+    """One line per job-level fallback entry saying what the effort edit did.
+
+    An entry with its own ``reasoning_effort`` overrides the job pin on the
+    fallback turn, so an edit that leaves one behind must say so (t_ef1ba08b).
+    """
+    def _chain(job):
+        fb = job.get("fallback")
+        return [fb] if isinstance(fb, dict) else (fb if isinstance(fb, list) else [])
+
+    prev_chain, lines = _chain(before), []
+    for i, entry in enumerate(_chain(after)):
+        if not isinstance(entry, dict):
+            continue
+        label = f"{entry.get('provider') or '?'}/{entry.get('model') or '?'}"
+        prev_entry = prev_chain[i] if i < len(prev_chain) and isinstance(prev_chain[i], dict) else {}
+        prev, cur = prev_entry.get("reasoning_effort"), entry.get("reasoning_effort")
+        if not str(cur or "").strip():
+            lines.append(f"  Fallback[{i}] {label}: inherits the job effort")
+        elif prev != cur:
+            lines.append(f"  Fallback[{i}] {label}: reasoning_effort {prev} -> {cur}")
+        elif cur == after.get("reasoning_effort"):
+            lines.append(f"  Fallback[{i}] {label}: reasoning_effort {cur} (unchanged)")
+        else:
+            lines.append(
+                f"  Fallback[{i}] {label}: NOT touched, keeps its own reasoning_effort {cur!r}"
+            )
+    return lines
 
 
 def _job_action(action: str, job_id: str, success_verb: str) -> int:
