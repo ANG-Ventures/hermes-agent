@@ -27,6 +27,9 @@ BODY_B = (
     "private repos (hosted minutes cost money there) but NEVER tonight's stall."
 )
 
+# Per-day dedup tokens from the documented nightly automation pattern.
+NIGHTLY_D1 = "nightly-ops-2026-09-26"
+NIGHTLY_D2 = "nightly-ops-2026-09-27"
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -84,17 +87,17 @@ def test_fresh_idempotency_key_bypasses_refusal_but_warns(kanban_home):
     with kb.connect_closing() as conn:
         first = kb.create_task(
             conn, title=TITLE, body=BODY_A, assignee="daedalus",
-            idempotency_key="nightly-ops-2026-09-26",
+            idempotency_key=NIGHTLY_D1,
         )
         second = kb.create_task(
             conn, title=TITLE, body=BODY_B, assignee="daedalus",
-            idempotency_key="nightly-ops-2026-09-27", duplicate_guard=True,
+            idempotency_key=NIGHTLY_D2, duplicate_guard=True,
         )
         warned = _events(conn, second, "near_duplicate_warning")
         # Same key still dedups to the existing card, guard or not.
         again = kb.create_task(
             conn, title=TITLE, body=BODY_B, assignee="daedalus",
-            idempotency_key="nightly-ops-2026-09-27", duplicate_guard=True,
+            idempotency_key=NIGHTLY_D2, duplicate_guard=True,
         )
     assert second != first and again == second
     assert warned[0]["duplicates"][0] == {
