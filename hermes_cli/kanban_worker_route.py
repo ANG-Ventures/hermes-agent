@@ -273,3 +273,239 @@ def apply_pin_refusal_to_result(agent, result):
     )
     result["failure_reason"] = PINNED_PROVIDER_FAILURE_REASON
     return result
+
+
+# ---------------------------------------------------------------------------
+# Live route switch: ``hermes kanban set-model <card> ... --live`` (t_033a3bb1)
+# ---------------------------------------------------------------------------
+#
+# ``set-model --live`` writes the new route onto the card AND, in the same
+# transaction, a ``route_changed`` event scoped to the card's live run. The
+# worker's conversation loop calls :func:`apply_pending_live_route` at the top
+# of every iteration (the turn boundary between two provider calls). When a new
+# event exists for this run, the worker re-reads the CARD ROW (the authority),
+# re-applies the same gates as at write/spawn time, and swaps the provider
+# in-process through ``AIAgent.switch_model`` -- the mid-session ``/model``
+# path, which already round-trips history across vendors. The process, the
+# message list and the workspace are untouched. An effort-only change only
+# replaces ``agent.reasoning_config`` (a per-request parameter).
+
+LIVE_ROUTE_SWITCHED_EVENT = "route_switched"
+LIVE_ROUTE_SWITCH_REFUSED_EVENT = "route_switch_refused"
+# One indexed board read per provider call (the loop boundary); negligible
+# next to the call itself, and it keeps "switches at the NEXT iteration" exact.
+_live_state: dict = {"agent": None, "cursor": 0}
+
+
+def _effort_label(reasoning_config) -> Optional[str]:
+    if not isinstance(reasoning_config, dict):
+        return None
+    if reasoning_config.get("enabled") is False:
+        return "none"
+    return reasoning_config.get("effort") or None
+
+
+def _route_snapshot(agent) -> dict:
+    return {
+        "provider": getattr(agent, "provider", None) or None,
+        "model": getattr(agent, "model", None) or None,
+        "effort": _effort_label(getattr(agent, "reasoning_config", None)),
+    }
+
+
+def _live_route_gate_error(conn, task, model, provider) -> Optional[str]:
+    """The write/spawn gates, re-applied to the route about to go live.
+
+    Flagship: a flagship model needs the card's ``flagship override:`` comment
+    (the dispatcher's spawn gate). Pin: a single-sub route needs the card's
+    ``--pin-sub`` reason and an admitted sub; pre-rename aliases stay refused
+    (the write gate). ``set-model`` already enforced both before writing, so a
+    refusal here means the board changed underneath (comment deleted, sub
+    disabled) and the worker must not drift onto an unauthorized route.
+    """
+    if not model:
+        return None
+    from hermes_cli.model_policy import (
+        FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+        flagship_model_match,
+        validate_route_provider,
+    )
+
+    try:
+        from hermes_cli.config import load_config
+
+        policy_config = load_config()
+    except Exception:
+        policy_config = {}
+    if flagship_model_match(model, policy_config):
+        authorized = conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? "
+            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
+            (task.id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
+        ).fetchone()
+        if not authorized:
+            return f"flagship model {model!r} has no 'flagship override:' comment on the card"
+    try:
+        validate_route_provider(model, provider, pin_sub_reason=getattr(task, "pin_sub_reason", None))
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def _bound_live_agent(agent) -> bool:
+    """Only the worker's own top-level agent follows the card route.
+
+    Delegation children, review forks and compaction helpers run their own
+    ``run_conversation`` in the same process; the first top-level agent to
+    poll is the worker's and is the only one ever switched.
+    """
+    if getattr(agent, "_delegate_depth", 0):
+        return False
+    import weakref
+
+    ref = _live_state.get("agent")
+    bound = ref() if ref is not None else None
+    if bound is None:
+        _live_state.update(agent=weakref.ref(agent), cursor=0)
+        return True
+    return bound is agent
+
+
+def _refuse_live(task_id, run_id, event_id, reason, target) -> None:
+    logger.warning(
+        "PHASE=kanban_worker_route_switch_refused task=%s run=%s event=%s reason=%s",
+        task_id, run_id, event_id, reason,
+    )
+    _append_run_event(LIVE_ROUTE_SWITCH_REFUSED_EVENT, {
+        "event_id": event_id, "to": target, "reason": str(reason)[:300],
+    })
+
+
+def apply_pending_live_route(agent, *, iteration: int, active_system_prompt=None):
+    """Apply a pending ``set-model --live`` to this worker; loop-boundary hook.
+
+    Returns the system prompt the loop should use from here on: unchanged
+    unless the model/provider switched, in which case only its ``Model:`` /
+    ``Provider:`` identity lines are rewritten (the same rewrite a provider
+    failover does). Never raises: a failed poll or switch leaves the worker on
+    its current route and is recorded as ``route_switch_refused``.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id or not _is_owning_worker() or not _bound_live_agent(agent):
+        return active_system_prompt
+    try:
+        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or 0) or None
+    except (TypeError, ValueError):
+        run_id = None
+    if run_id is None:
+        return active_system_prompt
+
+    try:
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            row = conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind = ? AND id > ? ORDER BY id DESC LIMIT 1",
+                (task_id, run_id, kb.ROUTE_CHANGED_EVENT, int(_live_state["cursor"])),
+            ).fetchone()
+            if row is None:
+                return active_system_prompt
+            event_id = int(row["id"] if hasattr(row, "keys") else row[0])
+            _live_state["cursor"] = event_id
+            task = kb.get_task(conn, task_id)
+            if task is None or task.current_run_id != run_id:
+                return active_system_prompt
+            model, provider = (None, None)
+            if task.model_override:
+                from hermes_cli.kanban_provider_health import model_override
+
+                model, provider = model_override(task)
+            effort = task.reasoning_effort
+            target = {"provider": provider or None, "model": model or None, "effort": effort or None}
+            gate_error = _live_route_gate_error(conn, task, model, provider)
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("kanban live route poll failed for %s", task_id, exc_info=True)
+        return active_system_prompt
+    if gate_error:
+        _refuse_live(task_id, run_id, event_id, gate_error, target)
+        return active_system_prompt
+
+    before = _route_snapshot(agent)
+    from hermes_constants import parse_reasoning_effort  # noqa: E402
+
+    new_reasoning = parse_reasoning_effort(effort) if effort else None
+    route_changes = bool(model) and (
+        model != (agent.model or "")
+        or bool(provider) and provider.strip().lower() != (agent.provider or "").strip().lower()
+    )
+    effort_changes = bool(effort) and new_reasoning != getattr(agent, "reasoning_config", None)
+    if not route_changes and not effort_changes:
+        return active_system_prompt  # already on it (e.g. written before spawn)
+
+    if route_changes:
+        try:
+            from hermes_cli.model_switch import switch_model as resolve_switch
+
+            api_key = agent.api_key if isinstance(getattr(agent, "api_key", ""), str) else ""
+            result = resolve_switch(
+                raw_input=model,
+                current_provider=agent.provider or "",
+                current_model=agent.model or "",
+                current_base_url=agent.base_url or "",
+                current_api_key=api_key,
+                explicit_provider=provider or "",
+                probe_catalog=False,
+            )
+            if not result.success:
+                _refuse_live(task_id, run_id, event_id, result.error_message or "route did not resolve", target)
+                return active_system_prompt
+            prompt_before = getattr(agent, "_cached_system_prompt", None)
+            extra = {"session_reasoning_config": new_reasoning} if effort else {}
+            agent.switch_model(
+                new_model=result.new_model,
+                new_provider=result.target_provider,
+                api_key=result.api_key,
+                base_url=result.base_url,
+                api_mode=result.api_mode,
+                **extra,
+            )
+        except Exception as exc:  # switch_model rolls the agent back itself
+            _refuse_live(task_id, run_id, event_id, f"{exc.__class__.__name__}: {exc}", target)
+            return active_system_prompt
+        # switch_model drops the cached prompt so the NEXT session turn
+        # rebuilds it; mid-loop, keep it byte-stable apart from the identity
+        # lines (the failover rewrite), which is what the loop is sending.
+        from agent.chat_completion_helpers import _rewrite_identity_lines
+
+        if isinstance(prompt_before, str) and prompt_before:
+            agent._cached_system_prompt = _rewrite_identity_lines(
+                prompt_before, agent.model, agent.provider,
+            )
+        if isinstance(active_system_prompt, str) and active_system_prompt:
+            active_system_prompt = _rewrite_identity_lines(
+                active_system_prompt, agent.model, agent.provider,
+            )
+    else:
+        agent.reasoning_config = new_reasoning
+        primary = getattr(agent, "_primary_runtime", None)
+        if isinstance(primary, dict):
+            primary["reasoning_config"] = dict(new_reasoning) if new_reasoning else None
+
+    _card_pin_cache.pop(task_id, None)  # the pin may have moved with the route
+    after = _route_snapshot(agent)
+    logger.warning(
+        "PHASE=kanban_worker_route_switched task=%s run=%s iteration=%s %s -> %s",
+        task_id, run_id, iteration, before, after,
+    )
+    _append_run_event(LIVE_ROUTE_SWITCHED_EVENT, {
+        "event_id": event_id,
+        "from": before,
+        "to": after,
+        "iteration": int(iteration),
+        "kind": "route" if route_changes else "effort",
+    })
+    return active_system_prompt
