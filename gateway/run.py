@@ -12025,30 +12025,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         override: Optional[dict],
         *,
         require_persistence: bool = False,
-    ) -> bool:
+    ) -> None:
         """Run :meth:`_set_session_model_override` off the loop, serialized per
-        session, last-issued wins (C5 #36, PR #970).
+        session in issue order (C5 #36, PR #970).
 
         Each ``to_thread`` write used to race the others, so two /model
-        commands could land in either order. A per-session ticket is taken
-        on the loop at call time; under the per-session lock a write whose
-        ticket is no longer the newest is skipped. Returns False when
-        superseded.
+        commands could land in either order. The per-session asyncio.Lock is
+        acquired with no await before it, and asyncio.Lock wakes waiters FIFO,
+        so writes land in the order the commands were issued; every write
+        runs (none is skipped, so no caller reports a write that never landed).
         """
-        seqs = self.__dict__.setdefault("_model_override_seq", {})
-        ticket = seqs[session_key] = seqs.get(session_key, 0) + 1
         locks = self.__dict__.setdefault("_model_override_locks", {})
         lock = locks.setdefault(session_key, asyncio.Lock())
         async with lock:
-            if seqs.get(session_key) != ticket:
-                return False
-            await asyncio.to_thread(
+            # Hold the lock until the worker thread has FINISHED, even when
+            # this coroutine is cancelled: a cancelled to_thread keeps
+            # writing, and a newer override must not land before it.
+            fut = asyncio.ensure_future(asyncio.to_thread(
                 self._set_session_model_override,
                 session_key,
                 override,
                 require_persistence=require_persistence,
-            )
-            return True
+            ))
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(fut)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if fut.done():
+                        break
+            fut.result()
+            if cancelled:
+                raise asyncio.CancelledError()
 
     def _set_session_model_override(
         self,

@@ -907,7 +907,15 @@ async def test_cancelled_disconnect_mid_flush_still_closes_client(monkeypatch):
         entered.set()
         release.wait(5)
 
-    adapter._restart_recovery = SimpleNamespace(flush=slow_flush)
+    flushed = []
+
+    def slow_flush_recorded(**_kw):
+        slow_flush()
+        flushed.append("recovery")
+
+    adapter._restart_recovery = SimpleNamespace(flush=slow_flush_recorded)
+    adapter._nonconversational_messages = SimpleNamespace(flush=lambda: flushed.append("noncon"))
+    adapter._dead_channels = SimpleNamespace(flush=lambda: flushed.append("dead"))
     zombie = asyncio.create_task(asyncio.Event().wait())
     adapter._bot_task = zombie
     client = AsyncMock()
@@ -926,6 +934,8 @@ async def test_cancelled_disconnect_mid_flush_still_closes_client(monkeypatch):
         await task
     client.close.assert_awaited_once()
     assert zombie.cancelled() and adapter._client is None
+    # The in-flight flush finished and the remaining flushes still ran.
+    assert flushed == ["recovery", "noncon", "dead"]
 
 
 @pytest.mark.asyncio

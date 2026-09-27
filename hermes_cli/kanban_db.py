@@ -4854,10 +4854,18 @@ _PENDING_HOME_CHECK: ContextVar[Optional[dict]] = ContextVar(
 )
 
 
-def _recheck_pending_home_session(conn: sqlite3.Connection) -> None:
+_GUARDED_COLUMNS_SQL = (
+    "SELECT status, assignee, priority, session_id FROM tasks WHERE id = ?"
+)
+
+
+def _recheck_pending_home_session(conn: sqlite3.Connection) -> Optional[tuple]:
+    """Re-run the pending home check under the write lock. Returns the target's
+    guarded columns as of txn start when a foreign override is pending (the
+    baseline :func:`_record_pending_foreign_action` compares against)."""
     pending = _PENDING_HOME_CHECK.get()
     if pending is None or pending["done"]:
-        return
+        return None
     pending["done"] = True
     token = _MUTATION_ACTOR.set(pending["actor"])
     try:
@@ -4866,25 +4874,30 @@ def _recheck_pending_home_session(conn: sqlite3.Connection) -> None:
         )
     finally:
         _MUTATION_ACTOR.reset(token)
-    if pending["result"] is not None:
-        pending["home_before"] = _read_home_session(conn, pending["task_id"])
+    if pending["result"] is None:
+        return None
+    pending["home_before"] = _read_home_session(conn, pending["task_id"])
+    row = conn.execute(_GUARDED_COLUMNS_SQL, (pending["task_id"],)).fetchone()
+    return tuple(row) if row is not None else ()
 
 
-def _record_pending_foreign_action(conn: sqlite3.Connection, changes_at_begin: int) -> None:
+def _record_pending_foreign_action(conn: sqlite3.Connection, guarded_before: tuple) -> None:
     """Write a guarded mutator's takeover/override audit in the SAME
     transaction as the mutation (C5 #23, PR #951 review): a crash or a
     concurrent reader between two commits can no longer see the foreign
-    mutation without its takeover event and comment. Only a transaction
-    that actually changed rows records it; a refused (no-op) mutation
-    leaves no audit, matching ``_mutation_succeeded``."""
+    mutation without its takeover event and comment.
+
+    Only when this transaction changed the target card's guarded columns
+    (status/assignee/priority/session_id): that is the foreign mutation
+    itself, so the audit is owed whatever the mutator later returns. A txn
+    that only wrote side rows (a ``reclaim_refused`` event, a claim-expiry
+    bump) records nothing here; the wrapper then falls back to the
+    post-commit record gated on ``_mutation_succeeded(result)``."""
     pending = _PENDING_HOME_CHECK.get()
-    if (
-        pending is None
-        or not pending["done"]
-        or pending.get("recorded")
-        or pending["result"] is None
-        or conn.total_changes == changes_at_begin
-    ):
+    if pending is None or pending.get("recorded") or pending["result"] is None:
+        return
+    row = conn.execute(_GUARDED_COLUMNS_SQL, (pending["task_id"],)).fetchone()
+    if row is None or tuple(row) == guarded_before:
         return
     pending["recorded"] = True
     pending["new_home"] = record_foreign_action(
@@ -4942,10 +4955,10 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
-        _recheck_pending_home_session(conn)
-        changes_at_begin = conn.total_changes
+        guarded_before = _recheck_pending_home_session(conn)
         yield conn
-        _record_pending_foreign_action(conn, changes_at_begin)
+        if guarded_before is not None:
+            _record_pending_foreign_action(conn, guarded_before)
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -6564,6 +6577,21 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                # C5 #44 (PR #987): a parent re-homed between the birth
+                # resolution above and this write lock must still be the
+                # home the child is born with. Re-resolve under the lock,
+                # BEFORE every check that reads the final home or body.
+                rebirth = _resolve_birth_session(
+                    conn, requested_session_id, parents, explicit=session_explicit
+                )
+                if rebirth != birth:
+                    birth = rebirth
+                    session_id, inherited_origin = rebirth
+                    body = stamp_origin_body(
+                        unstamped_body,
+                        inherited_origin
+                        or format_origin_line(session_id, created_by=created_by),
+                    )
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -6656,20 +6684,6 @@ def create_task(
                             "--force <reason> / force_reason to file anyway",
                             same,
                         )
-                # C5 #44 (PR #987): a parent re-homed between the birth
-                # resolution above and this write lock must still be the
-                # home the child is born with. Re-resolve under the lock.
-                rebirth = _resolve_birth_session(
-                    conn, requested_session_id, parents, explicit=session_explicit
-                )
-                if rebirth != birth:
-                    birth = rebirth
-                    session_id, inherited_origin = rebirth
-                    body = stamp_origin_body(
-                        unstamped_body,
-                        inherited_origin
-                        or format_origin_line(session_id, created_by=created_by),
-                    )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -13458,15 +13472,18 @@ def request_changes(
         if claimed_payload.get("source_status") != "review":
             return False, "active run was not claimed from review"
         if claimer and expected_run_id is None and not opened:
-            # C5 #70 (PR #1081): a claimer send-back with no run id must not
-            # close ANOTHER reviewer's live run. Only its own claim, or a run
-            # whose claim has lapsed with no live owner, may be closed here.
-            holder = task_row["claim_lock"]
-            if holder != str(claimer) and (
-                (holder and int(task_row["claim_expires"] or 0) > int(time.time()))
-                or _prior_worker_still_alive(conn, task_id) is not None
-            ):
-                return False, "another reviewer's live review run holds this task"
+            # C5 #70 (PR #1081): a send-back with no run id carries no proof
+            # of which run it owns (``claimer`` is a reusable profile name, not
+            # a run credential), so it may close only a lapsed run: claim
+            # expired and no live owner. A live run is closed with its run id.
+            if (
+                task_row["claim_lock"]
+                and int(task_row["claim_expires"] or 0) > int(time.time())
+            ) or _prior_worker_still_alive(conn, task_id) is not None:
+                return False, (
+                    "a live review run holds this task; pass its run id "
+                    "(expected_run_id) to close it"
+                )
 
         requested_event = conn.execute(
             "SELECT payload FROM task_events "

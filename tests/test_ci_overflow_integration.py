@@ -213,7 +213,9 @@ def test_variable_write_probe_never_writes_an_existing_variable():
     assert [m for m, _ in calls] == ["PATCH"]
 
 
-@pytest.mark.parametrize("code", [404, 200, 204, 500])
+# 429: cioc.github raises RateLimited(429) for a secondary-limit 403, so a
+# rate-limited probe never reads as a permission denial.
+@pytest.mark.parametrize("code", [404, 200, 204, 429, 500])
 def test_variable_write_probe_fails_closed_unless_403(code):
     denied, _ = integ.variable_write_denied(lambda m, p, b=None: (code, None))
     assert denied is False

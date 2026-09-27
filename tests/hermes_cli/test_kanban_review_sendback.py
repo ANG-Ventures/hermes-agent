@@ -635,8 +635,14 @@ def test_claimer_without_run_id_cannot_close_another_reviewers_live_run(board: P
         assert ok is False and "live review run" in detail
         task = kb.get_task(conn, tid)
         assert task.status == "running" and task.current_run_id == review.current_run_id
-        # The holder itself may still close its own run without a run id.
+        # A matching profile name is not proof of run ownership: refused too.
         ok, detail = kb.request_changes(
             conn, tid, reason="fix", claimer="argus:1", coverage=COVERAGE,
+        )
+        assert ok is False and "live review run" in detail
+        # The run's owner closes it with its run id.
+        ok, detail = kb.request_changes(
+            conn, tid, reason="fix", claimer="argus:1", coverage=COVERAGE,
+            expected_run_id=review.current_run_id,
         )
         assert (ok, detail) == (True, "builder")

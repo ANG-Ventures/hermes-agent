@@ -163,6 +163,37 @@ async def test_model_override_writes_land_in_issue_order():
         await asyncio.sleep(0.01)
     second = asyncio.ensure_future(runner._persist_session_model_override("k", {"model": "b"}))
     third = asyncio.ensure_future(runner._persist_session_model_override("k", {"model": "c"}))
-    results = await asyncio.gather(first, second, third)
-    assert landed[-1] == "c"
-    assert results == [True, False, True]      # "b" was superseded before it ran
+    await asyncio.gather(first, second, third)
+    assert landed == ["a", "b", "c"]           # every write lands, in issue order
+
+
+@pytest.mark.asyncio
+async def test_cancelled_model_override_keeps_the_lock_until_its_write_lands():
+    """FleetReview on #1361: a /model cancelled mid-write must not let a newer
+    override land first and then be overwritten by the old thread."""
+    import asyncio
+    import threading
+    import time as _time
+
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    landed = []
+    first_started = threading.Event()
+
+    def slow_set(session_key, override, *, require_persistence=False):
+        if override["model"] == "old":
+            first_started.set()
+            _time.sleep(0.3)
+        landed.append(override["model"])
+
+    runner._set_session_model_override = slow_set
+    first = asyncio.ensure_future(runner._persist_session_model_override("k", {"model": "old"}))
+    while not first_started.is_set():
+        await asyncio.sleep(0.01)
+    first.cancel()
+    second = asyncio.ensure_future(runner._persist_session_model_override("k", {"model": "new"}))
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await second
+    assert landed == ["old", "new"]

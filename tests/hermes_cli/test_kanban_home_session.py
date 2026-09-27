@@ -1296,3 +1296,24 @@ def test_parent_rehomed_before_child_insert_is_the_childs_home(kanban_home, monk
         monkeypatch.setattr(kb, "_resolve_birth_session", racing)
         child = kb.create_task(conn, title="child", assignee="worker-a", parents=[parent])
         assert kb.get_task(conn, child).session_id == OTHER
+
+
+def test_refused_guarded_mutation_with_side_write_records_no_takeover(kanban_home):
+    """FleetReview on #1361: a guarded mutator that writes a side event in its
+    txn and then refuses (reclaim_refused shape) must not record the takeover
+    or re-home the card."""
+    @kb._home_session_guarded("reclaim")
+    def refusing(conn, task_id):
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "reclaim_refused", {"why": "owner alive"})
+        return False
+
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        with kb.mutation_actor(session_ids=(OTHER,), profile="apollo",
+                               foreign_ok="adopting"):
+            assert refusing(conn, tid) is False
+        assert kb.get_task(conn, tid).session_id == HOME
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "reclaim_refused" in kinds and "takeover" not in kinds
+        assert _comments(conn, tid) == []

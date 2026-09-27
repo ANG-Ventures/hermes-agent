@@ -298,7 +298,8 @@ def variable_write_denied(call) -> tuple[bool, dict]:
     existing variable is ever written. The old probe did GET-then-PATCH of
     CI_SELF_HOSTED_SLOTS[_BASELINE] with the value it read, which on a
     fail-open identity reverted any controller change made in between (C5 #27,
-    PR #954). Anything but 403 fails closed.
+    PR #954). Anything but 403 fails closed. A secondary-rate-limit 403 never
+    reaches here as 403: cioc.github raises RateLimited (status 429) for it.
     """
     probe = f"CI_OVERFLOW_WRITE_PROBE_{secrets.token_hex(4).upper()}"
     code = call("PATCH", f"actions/variables/{probe}", {"name": probe, "value": "0"})[0]
