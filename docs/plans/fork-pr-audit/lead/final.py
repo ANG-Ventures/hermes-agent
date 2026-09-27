@@ -49,4 +49,10 @@ def build():
     for k, (card, ev) in rulings.POST_RULING_2026_09_27.items():
         assert out[k]['final'] == 'DROP', (k, out[k]['final'])  # the ruling flips DROP rows only
         out[k]['final'], out[k]['why'] = 'KEEP', rulings.POST_RULING_TAG + ev + f' (slice card {card})'
+    for k, x in rulings.UNRESOLVED_RULINGS.items():
+        if k not in out:  # auto rows follow their code row in build_all.py
+            continue
+        assert out[k]['final'] == 'UNRESOLVED', (k, out[k]['final'])  # the ruling resolves UNRESOLVED rows only
+        assert x['verdict'] in VALID and x['verdict'] != 'UNRESOLVED', (k, x['verdict'])
+        out[k]['final'], out[k]['why'] = x['verdict'], rulings.unresolved_why(x, str(out[k]['why'] or ''))
     return out

@@ -1,4 +1,5 @@
 """Lead rulings (t_03e35f0e). Every entry: key -> (FINAL verdict, reason). Recorded verbatim in FINAL.md."""
+import json, os
 
 ACE14 = ('DROP', 'LEAD: measurement supports the drop (/undo 2, /redo 0 native invocations 2026-05-10..09-25) but registry '
          'entry 14 is lifecycle=fork-permanent (Ace ruling). DROP is ACE-GATED: the slice card must not merge until Ace '
@@ -185,3 +186,18 @@ POST_RULING_2026_09_27 = {
             'attribution check passed only via this mapping. The 2 nopr:40a6040932 lines stay DROP on '
             'audit/scripts_misc/revert-author-map-stale @4053ee9081.'),
 }
+
+# t_63023f77 measured and ruled the 24 rows the lead left UNRESOLVED (UNRESOLVED.md). The ruling file is the source;
+# final.build() applies it to code rows, build_all.py checks that the auto follower (nopr:08fc3aff65) inherits the same verdict.
+UNRESOLVED_RULING_TAG = 'RULED 2026-09-27 (t_63023f77, UNRESOLVED.md; was UNRESOLVED): '
+UNRESOLVED_RULINGS = json.load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                 'unresolved.verdicts.json'), encoding='utf-8'))
+
+
+def unresolved_why(x, prior):
+    why = UNRESOLVED_RULING_TAG + x['why'] + '. Measured: ' + x['measure'] + '. Upstream: ' + x['upstream']
+    if x.get('card'):
+        why += f' (slice card {x["card"]})'
+    if prior.startswith('LEAD'):
+        why += ' | prior lead note: ' + prior
+    return why
