@@ -197,6 +197,27 @@ def test_wake_refused_on_non_scheduled(kanban_home: Path) -> None:
         assert not ok and "only applies to 'scheduled'" in err
 
 
+def test_schedule_clears_stale_rate_limit_stamp(kanban_home: Path) -> None:
+    """A past rate-limit ``next_eligible_at`` must not become a timed wake.
+
+    Without the clear, an event-waiting card (no --at) is un-parked with a
+    ``schedule_elapsed`` event on the very next dispatcher tick.
+    """
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="rate-limited earlier", assignee="worker")
+        with kb.write_txn(conn):
+            # What the rate-limited / infra-unavailable exit path leaves behind.
+            conn.execute(
+                "UPDATE tasks SET next_eligible_at=? WHERE id=?",
+                (int(time.time()) - HOUR, tid),
+            )
+        assert kb.schedule_task(conn, tid, reason="wait for readback event")
+        assert kb.get_task(conn, tid).next_eligible_at is None
+        assert kb.wake_due_scheduled(conn) == []
+        assert kb.get_task(conn, tid).status == "scheduled"
+        assert "schedule_elapsed" not in _kinds(conn, tid)
+
+
 def test_manual_unblock_clears_wake_stamp(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = _scheduled(conn)

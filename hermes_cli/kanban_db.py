@@ -14958,7 +14958,10 @@ def schedule_task(
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   -- A leftover rate-limit cooldown would read as a timed wake
+                   -- to wake_due_scheduled; set_schedule_wake stamps a real one.
+                   next_eligible_at = NULL
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
