@@ -1239,6 +1239,7 @@ def set_current_board(slug: str) -> Path:
     if not normed:
         raise ValueError("board slug is required")
     path = current_board_path()
+    _assert_live_board_tree_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(normed + "\n", encoding="utf-8")
     return path
@@ -1247,6 +1248,7 @@ def set_current_board(slug: str) -> Path:
 def clear_current_board() -> None:
     """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
     _assert_not_delegated_child_mutation()
+    _assert_live_board_tree_write_allowed(current_board_path())
     try:
         current_board_path().unlink()
     except FileNotFoundError:
@@ -1851,6 +1853,7 @@ def write_board_metadata(
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
+    _assert_live_board_tree_write_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
@@ -2033,6 +2036,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
     d = board_dir(normed)
+    _assert_live_board_tree_write_allowed(d)
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
@@ -3413,7 +3417,12 @@ def _assert_live_board_write_allowed(path: Path) -> None:
             break
     if live_root is None:
         return  # not a live board — nothing this guard is about.
+    _refuse_live_kanban_write(target, live_root, "open the live board read-write")
 
+
+def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> None:
+    """Shared R1/R2 decision for :func:`_assert_live_board_write_allowed` and
+    :func:`_assert_live_board_tree_write_allowed`; raises or returns."""
     reason: Optional[str] = None
     if _in_test_context():
         reason = (
@@ -3444,8 +3453,7 @@ def _assert_live_board_write_allowed(path: Path) -> None:
         if os.environ.get(k, "").strip()
     ) or "<none>"
     raise LiveBoardWriteRefused(
-        f"kanban live-system guard: refusing to open the live board "
-        f"read-write — {reason}. Writes from here create REAL cards that the "
+        f"kanban live-system guard: refusing to {action} — {reason}. Writes from here create REAL cards that the "
         f"dispatcher claims and spawns real workers against (3 fixture cards + "
         f"3 burned runs on 2026-09-21). Active path pins: {pins}. To run "
         f"against a throwaway board: HERMES_KANBAN_SANDBOX=1 "
@@ -3454,6 +3462,40 @@ def _assert_live_board_write_allowed(path: Path) -> None:
         f"Read-only inspection of the live board is still allowed via "
         f"connect_readonly()."
     )
+
+
+def _is_live_board_tree_path(resolved: Path, root: Path) -> bool:
+    """True for board-set state of *root* that is not a DB: the ``current``
+    pointer, ``board-aliases.json`` and anything under ``kanban/boards/``."""
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    if len(parts) < 2 or parts[0] != "kanban":
+        return False
+    return parts[1] == "boards" or (len(parts) == 2 and parts[1] in ("current", "board-aliases.json"))
+
+
+def _assert_live_board_tree_write_allowed(path: Path) -> None:
+    """Refuse a test/probe process creating, renaming or re-pointing LIVE boards.
+
+    ``connect()``'s guard only sees ``kanban.db``. ``create_board()`` writes
+    ``board.json`` (and mkdirs the board dir) BEFORE it reaches ``connect()``,
+    so a refused create still left a board that ``list_boards()`` surfaces;
+    ``set_current_board()`` / ``remove_board()`` never touch the DB at all.
+    That is how ten fixture boards (alpha, curr, spawntest, slug-immutable, …)
+    landed in the live ``kanban/boards/`` on 2026-09-22 (card t_216b74e0).
+    Same production-root list and R1/R2 predicate as the DB guard.
+    """
+    try:
+        target = path.expanduser().resolve(strict=False)
+    except OSError:  # pragma: no cover - resolution failure is not a leak
+        return
+    for root in _production_kanban_roots():
+        if _is_live_board_tree_path(target, root):
+            _refuse_live_kanban_write(target, root, f"write live board state {target}")
+            return
 
 
 def connect_readonly(
@@ -4171,6 +4213,7 @@ def init_db(
         with contextlib.closing(connect(path)):
             pass
         return path
+    _assert_live_board_write_allowed(path)  # before the mkdir, not after
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
