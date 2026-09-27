@@ -846,6 +846,55 @@ def test_wiring_b1_fallback_429_does_not_rearm_primary(wired):
     assert (after.cls, after.n, after.until_epoch) == (before.cls, before.n, before.until_epoch)
 
 
+CODEX = ("openai-codex", "gpt-5.5")
+
+
+def _walk_to_second_fallback(a):
+    """primary -> fb1 (arms sticky) -> fb2 (B1: no re-arm, state names fb1)."""
+    a._fallback_chain = [{"provider": OPUS[0], "model": OPUS[1]},
+                         {"provider": CODEX[0], "model": CODEX[1]}]
+    assert _fail(a, CONN()) is True
+    assert _fail(a, _Err("pool at capacity", 503), reason=_FR.overloaded) is True
+    assert (a.provider, a.model) == CODEX
+    assert (_state(a).fallback_provider, _state(a).fallback_model) == OPUS
+
+
+def test_wiring_recovery_row_names_served_route_after_fb1_fb2_walk(wired):
+    """t_abad4e80: the recovery row's from-route is the route the agent
+    actually returned from (fb2), not state.fallback_* (fb1); policy fields
+    still land."""
+    home, _ = wired
+    a = _wired_agent()
+    _walk_to_second_fallback(a)
+    _age_episode(a, fallback_idle=61 * 60)
+    assert _restore(a) is True
+    assert (a.provider, a.model) == FABLE
+    [rec] = _rows(home, "recovery")
+    assert (rec["from_provider"], rec["from_model"]) == CODEX
+    assert (rec["to_provider"], rec["to_model"]) == FABLE
+    assert rec["return_branch"] == "fallback_cold" and rec["session_id"] == SID
+    assert "turns on gpt-5.5" in rec["notice_text"]
+
+
+def test_wiring_reinit_recovery_row_names_served_route_after_walk(wired):
+    """Same, gateway construction-time return: the stashed
+    _sticky_recovery_row must not overwrite prev_route (last served = fb2)."""
+    home, _ = wired
+    a = _wired_agent()
+    _walk_to_second_fallback(a)
+    _age_episode(a, until_ago=300, fallback_idle=600, last_primary_ago=10 * 60)
+    st = _state(a)
+    st.last_primary_seat = "sub-vps-6"
+    fss.default_store().put(_fw.key_for(a), st, _time.time())
+    runner, key = _runner_env(home, CODEX)
+    d = _wired_agent()
+    _prerun(runner, key, d)
+    assert (d.provider, d.model) == FABLE
+    [rec] = _rows(home, "recovery")
+    assert (rec["from_provider"], rec["from_model"]) == CODEX
+    assert rec["return_branch"] == "warm_seat" and rec["seat"] == "sub-vps-6"
+
+
 def test_wiring_content_policy_keeps_legacy_60s(wired):
     """B3: refusal reaches the legacy block unchanged (shared 60 s default)."""
     home, calls = wired

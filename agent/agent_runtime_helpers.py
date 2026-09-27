@@ -2200,7 +2200,7 @@ def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None)
                     agent, "recovery",
                     from_provider=_from_provider, from_model=_from_model,
                     to_provider=_to_route[0], to_model=_to_route[1],
-                    consume=False, extra=_policy_row,
+                    consume=False, extra=_fbe.policy_fields(_policy_row),
                 )
                 agent._fallback_restore_refused_logged = False
                 _rec_announce = False
