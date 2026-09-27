@@ -2283,6 +2283,12 @@ class Task:
     # worker runs at that depth regardless of the profile's
     # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
     reasoning_effort: Optional[str] = None
+    # Deliberate single-sub pin (``--pin-sub "<reason>"``, t_957ca870). Set
+    # only when ``provider_override`` is one claude-bpx-N / claude-apx-N sub.
+    # ``pin_sub_fallback`` lets a capped pinned sub fall back to its family
+    # pool; the default is to WAIT for the sub.
+    pin_sub_reason: Optional[str] = None
+    pin_sub_fallback: bool = False
     next_eligible_at: Optional[int] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
@@ -2398,6 +2404,14 @@ class Task:
                 row["reasoning_effort"]
                 if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
+            ),
+            pin_sub_reason=(
+                row["pin_sub_reason"]
+                if "pin_sub_reason" in keys and row["pin_sub_reason"]
+                else None
+            ),
+            pin_sub_fallback=bool(
+                row["pin_sub_fallback"] if "pin_sub_fallback" in keys else 0
             ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
@@ -2584,6 +2598,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Deliberate single-sub pin (t_957ca870): the operator's --pin-sub reason
+    -- when provider_override is claude-bpx-N / claude-apx-N. NULL = no pin.
+    pin_sub_reason       TEXT,
+    -- 1 = a capped/cooling pinned sub may fall back to its family pool
+    -- (claude-bpr / claude-apr); 0 (default) = the card waits for the sub.
+    pin_sub_fallback     INTEGER NOT NULL DEFAULT 0,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2761,6 +2781,7 @@ CREATE TABLE IF NOT EXISTS lane_model_overrides (
     reasoning_effort TEXT,
     reason       TEXT,
     firepower    TEXT,               -- justification when the model is flagship-class
+    pin_sub_reason TEXT,             -- --pin-sub reason when provider is claude-bpx-N/apx-N
     created_by   TEXT,
     created_at   INTEGER NOT NULL,
     expires_at   INTEGER NOT NULL
@@ -4344,6 +4365,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ).fetchone():
         _add_column_if_missing(
             conn, "lane_model_overrides", "reasoning_effort", "reasoning_effort TEXT"
+        )
+        _add_column_if_missing(
+            conn, "lane_model_overrides", "pin_sub_reason", "pin_sub_reason TEXT"
+        )
+
+    if "pin_sub_reason" not in cols:
+        # Deliberate single-sub pin (t_957ca870). NULL = no pin; existing
+        # rows had none (#1116 refused every pin at write time).
+        _add_column_if_missing(conn, "tasks", "pin_sub_reason", "pin_sub_reason TEXT")
+    if "pin_sub_fallback" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "pin_sub_fallback", "pin_sub_fallback INTEGER NOT NULL DEFAULT 0"
         )
 
     if "goal_mode" not in cols:
@@ -5982,6 +6015,8 @@ def create_task(
     flagship_override_reason: Optional[str] = None,
     flagship_override_author: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -6055,13 +6090,20 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
-    from hermes_cli.model_policy import validate_route_provider
+    from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
 
-    validate_route_provider(model_override, provider_override)
+    pin_sub_error = pin_sub_arg_error(
+        model_override, provider_override, pin_sub_reason,
+        pin_sub_fallback=bool(pin_sub_fallback),
+    )
+    if pin_sub_error:
+        raise ValueError(pin_sub_error)
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    validate_route_provider(model_override, provider_override, pin_sub_reason=pin_sub_reason)
     model_override, provider_override = _resolve_stored_model_pair(
         model_override, provider_override
     )
-    validate_route_provider(model_override, provider_override)
+    validate_route_provider(model_override, provider_override, pin_sub_reason=pin_sub_reason)
     from hermes_cli.model_policy import validate_worker_model
 
     flagship_override_reason = validate_worker_model(
@@ -6394,9 +6436,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        reasoning_effort,
+                        reasoning_effort, pin_sub_reason, pin_sub_fallback,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -6419,6 +6461,8 @@ def create_task(
                         model_override,
                         provider_override,
                         reasoning_effort,
+                        pin_sub_reason,
+                        1 if (pin_sub_reason and pin_sub_fallback) else 0,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -6452,8 +6496,21 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        **({"pin_sub_reason": pin_sub_reason,
+                            "pin_sub_fallback": bool(pin_sub_fallback)}
+                           if pin_sub_reason else {}),
                     },
                 )
+                if pin_sub_reason:
+                    from hermes_cli.model_policy import sub_pin_comment
+
+                    add_comment(
+                        conn,
+                        task_id,
+                        created_by or "operator",
+                        sub_pin_comment(provider_override, pin_sub_reason,
+                                        fallback=bool(pin_sub_fallback)),
+                    )
                 if near_dups:
                     forced = force_reason and bool(same)
                     _append_event(
@@ -6704,6 +6761,9 @@ def set_model_override(
     audit_comment_body: Optional[str] = None,
     flagship_override_reason: Optional[str] = None,
     flagship_override_author: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
+    pin_sub_author: Optional[str] = None,
 ) -> bool:
     """Set (or clear) the per-task model/provider override.
 
@@ -6734,12 +6794,17 @@ def set_model_override(
         model, provider,
         audit_comment_author=audit_comment_author,
         audit_comment_body=audit_comment_body,
+        pin_sub_reason=pin_sub_reason,
+        pin_sub_fallback=pin_sub_fallback,
     )
     with write_txn(conn):
         if not _set_model_override_locked(
             conn, task_id, model, provider,
             audit_comment_author=audit_comment_author,
             audit_comment_body=audit_comment_body,
+            pin_sub_reason=pin_sub_reason,
+            pin_sub_fallback=pin_sub_fallback,
+            pin_sub_author=pin_sub_author,
         ):
             return False
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
@@ -6753,6 +6818,8 @@ def _validate_model_override_args(
     *,
     audit_comment_author: Optional[str] = None,
     audit_comment_body: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
 ) -> tuple[Optional[str], Optional[str]]:
     """Normalise + validate a route pair WITHOUT touching the database.
 
@@ -6771,11 +6838,17 @@ def _validate_model_override_args(
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
-    from hermes_cli.model_policy import validate_route_provider
+    from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
 
-    validate_route_provider(model, provider)
+    pin_sub_error = pin_sub_arg_error(
+        model, provider, pin_sub_reason, pin_sub_fallback=bool(pin_sub_fallback),
+    )
+    if pin_sub_error:
+        raise ValueError(pin_sub_error)
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    validate_route_provider(model, provider, pin_sub_reason=pin_sub_reason)
     model, provider = _resolve_stored_model_pair(model, provider)
-    validate_route_provider(model, provider)
+    validate_route_provider(model, provider, pin_sub_reason=pin_sub_reason)
     # Main's flagship ban (model_policy) is the one predicate. A flagship
     # route is only writable together with the ``flagship override:`` comment
     # the dispatcher's flagship gate accepts, so a route this layer writes can
@@ -6828,8 +6901,15 @@ def _set_model_override_locked(
     *,
     audit_comment_author: Optional[str] = None,
     audit_comment_body: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
+    pin_sub_author: Optional[str] = None,
 ) -> bool:
     """Write one route override. MUST already be inside a ``write_txn``.
+
+    Every route write also (re)writes the pin columns: a route written
+    without ``pin_sub_reason`` clears any earlier pin, so a pin can never
+    outlive the route it authorized.
 
     The status re-read happens here, inside the caller's transaction, so it
     is the row state the write commits against — not a stale pre-check. A
@@ -6847,20 +6927,30 @@ def _set_model_override_locked(
         return False
     if row["status"] == "archived":
         raise RuntimeError(f"cannot set model override on archived task {task_id}")
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    pin_sub_fallback = bool(pin_sub_reason and pin_sub_fallback)
     conn.execute(
-        "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
-        (model, provider, task_id),
+        "UPDATE tasks SET model_override = ?, provider_override = ?, "
+        "pin_sub_reason = ?, pin_sub_fallback = ? WHERE id = ?",
+        (model, provider, pin_sub_reason, 1 if pin_sub_fallback else 0, task_id),
     )
-    _append_event(
-        conn, task_id, "model_override_set",
-        {"model": model, "provider": provider},
-    )
+    payload = {"model": model, "provider": provider}
+    if pin_sub_reason:
+        payload.update(pin_sub_reason=pin_sub_reason, pin_sub_fallback=pin_sub_fallback)
+    _append_event(conn, task_id, "model_override_set", payload)
     if audit_comment_body:
         add_comment(
             conn,
             task_id,
             audit_comment_author or "",
             audit_comment_body,
+        )
+    if pin_sub_reason:
+        from hermes_cli.model_policy import sub_pin_comment
+
+        add_comment(
+            conn, task_id, pin_sub_author or audit_comment_author or "operator",
+            sub_pin_comment(provider, pin_sub_reason, fallback=pin_sub_fallback),
         )
     return True
 
@@ -6932,6 +7022,10 @@ class BatchRouteWrite:
     audit_comment_body: Optional[str] = None
     touch_effort: bool = False
     effort: Optional[str] = None
+    # Deliberate single-sub pin (``--pin-sub``); only with ``touch_model``.
+    pin_sub_reason: Optional[str] = None
+    pin_sub_fallback: bool = False
+    pin_sub_author: Optional[str] = None
     # The selection predicate that chose this card, re-checked under the
     # batch's writer lock. ``None`` means "no constraint on that column".
     require_statuses: Optional[frozenset] = None
@@ -7004,6 +7098,8 @@ def apply_batch_route_writes(
                 write.model, write.provider,
                 audit_comment_author=write.audit_comment_author,
                 audit_comment_body=write.audit_comment_body,
+                pin_sub_reason=write.pin_sub_reason,
+                pin_sub_fallback=write.pin_sub_fallback,
             )
         effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
         prepared.append((write, model, provider, effort))
@@ -7035,6 +7131,9 @@ def apply_batch_route_writes(
                     conn, write.task_id, model, provider,
                     audit_comment_author=write.audit_comment_author,
                     audit_comment_body=write.audit_comment_body,
+                    pin_sub_reason=write.pin_sub_reason,
+                    pin_sub_fallback=write.pin_sub_fallback,
+                    pin_sub_author=write.pin_sub_author or write.audit_comment_author,
                 ):
                     raise RuntimeError(f"no such task: {write.task_id}")
                 changed += ("model_override", "provider_override")
@@ -15207,8 +15306,8 @@ def set_task_model(
         resolved_provider = None
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET model_override = ?, provider_override = ? "
-            "WHERE id = ?",
+            "UPDATE tasks SET model_override = ?, provider_override = ?, "
+            "pin_sub_reason = NULL, pin_sub_fallback = 0 WHERE id = ?",
             (resolved_model, resolved_provider, task_id),
         )
     return int(cur.rowcount or 0)
@@ -20356,6 +20455,42 @@ def _dispatch_once_locked(
         if payload is None:
             admitted_routes[task_id] = circuit_pool
             return False, None
+        from hermes_cli.model_policy import is_sub_pin_route, sub_pin_family_pool
+
+        if task.pin_sub_reason and is_sub_pin_route(task.model_override, route_provider):
+            # A deliberate pin (t_957ca870) bypasses the pool, not the
+            # governors: a capped / cooling / circuit-open pinned sub WAITS. It
+            # never drifts onto the profile ladder; only --pin-sub-fallback lets
+            # it ride its family pool (claude-bpr / claude-apr), and only while
+            # that pool is itself admissible.
+            pool = sub_pin_family_pool(route_provider) if task.pin_sub_fallback else None
+            if pool is not None:
+                from dataclasses import replace as _dc_replace
+
+                pool_task = _dc_replace(task, provider_override=pool)
+                pool_blocked = (
+                    pool_key(pool) in circuits
+                    or pool in cooling
+                    or capped_provider(
+                        pool_task, health_probes, health_cache, min_eligible=min_eligible,
+                        pool_urls=pool_urls, box_health=box_health,
+                    ) is not None
+                    or pool_budget(pool) is not None
+                )
+                if not pool_blocked:
+                    admitted_routes[task_id] = pool_key(pool)
+                    return False, ((task.model_override, pool), payload)
+            payload = {**payload, "pin": route_provider,
+                       "pin_fallback": pool if task.pin_sub_fallback else "wait"}
+            result.respawn_guarded.append((task_id, payload["reason"]))
+            _log.info(
+                "PHASE=kanban_dispatch_pin_held task=%s pin=%s reason=%s fallback=%s",
+                task_id, route_provider, payload["reason"], payload["pin_fallback"],
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(conn, task_id, "deferred", payload)
+            return True, None
         skipped: list = []
         fallback = available_profile_fallback(
             task, health_probes, health_cache, min_eligible=min_eligible,
@@ -20745,6 +20880,7 @@ def _dispatch_once_locked(
         note_lane_route(claimed, route_source)
         route_source = route_source or (
             "card-override" if claimed.model_override else "profile-default")
+        route_source = _pin_route_source(claimed, route_source)
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             route_source = fallback_route_source(route_source, fallback_selection)
@@ -20943,6 +21079,7 @@ def _dispatch_once_locked(
         note_lane_route(claimed, review_route_source)
         review_route_source = review_route_source or (
             "card-override" if claimed.model_override else "profile-default")
+        review_route_source = _pin_route_source(claimed, review_route_source)
         if fallback_selection is not None:
             apply_dispatch_fallback(claimed, fallback_selection)
             review_route_source = fallback_route_source(review_route_source, fallback_selection)
@@ -21498,6 +21635,7 @@ class LaneModelOverride:
     created_by: Optional[str] = None
     created_at: int = 0
     expires_at: int = 0
+    pin_sub_reason: Optional[str] = None
 
     @property
     def route(self) -> str:
@@ -21521,6 +21659,9 @@ def _lane_model_row(row) -> LaneModelOverride:
         created_by=row["created_by"],
         created_at=int(row["created_at"]),
         expires_at=int(row["expires_at"]),
+        pin_sub_reason=(
+            row["pin_sub_reason"] if "pin_sub_reason" in row.keys() else None
+        ) or None,
     )
 
 
@@ -21536,39 +21677,47 @@ def set_lane_model_override(
     firepower: Optional[str] = None,
     created_by: Optional[str] = None,
     now: Optional[int] = None,
+    pin_sub_reason: Optional[str] = None,
 ) -> LaneModelOverride:
     """Install (or replace) the lane override for ``assignee``.
+
+    ``pin_sub_reason`` (``--pin-sub``) authorizes a claude-bpx-N / apx-N lane;
+    without it a single-sub lane is refused exactly as on a card.
 
     ``assignee=None`` sets the board-wide lane. Re-setting the same lane is an
     upsert, so an operator extending a window never stacks duplicate rows.
     """
 
-    from hermes_cli.model_policy import validate_route_provider
+    from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
 
-    validate_route_provider(model, provider)
+    pin_sub_error = pin_sub_arg_error(model, provider, pin_sub_reason)
+    if pin_sub_error:
+        raise ValueError(pin_sub_error)
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    validate_route_provider(model, provider, pin_sub_reason=pin_sub_reason)
     created = int(time.time()) if now is None else int(now)
     key = (assignee or "").strip()
     with write_txn(conn):
         conn.execute(
             "INSERT INTO lane_model_overrides "
             "(assignee, provider, model, reasoning_effort, reason, firepower, created_by, "
-            " created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            " created_at, expires_at, pin_sub_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(assignee) DO UPDATE SET "
             "  provider=excluded.provider, model=excluded.model, "
             "  reasoning_effort=excluded.reasoning_effort, "
             "  reason=excluded.reason, firepower=excluded.firepower, "
             "  created_by=excluded.created_by, created_at=excluded.created_at, "
-            "  expires_at=excluded.expires_at",
+            "  expires_at=excluded.expires_at, pin_sub_reason=excluded.pin_sub_reason",
             (
                 key, provider, model, reasoning_effort, reason, firepower, created_by,
-                created, int(expires_at),
+                created, int(expires_at), pin_sub_reason,
             ),
         )
     return LaneModelOverride(
         assignee=(key or None), provider=provider, model=model,
         reasoning_effort=reasoning_effort, reason=reason, firepower=firepower, created_by=created_by,
-        created_at=created, expires_at=int(expires_at),
+        created_at=created, expires_at=int(expires_at), pin_sub_reason=pin_sub_reason,
     )
 
 
@@ -21737,7 +21886,26 @@ def apply_lane_model_override(
     task.provider_override = override.provider
     if task.reasoning_effort is None:
         task.reasoning_effort = override.reasoning_effort
-    return f"lane-override({override.ttl_remaining(now)}s remaining)"
+    source = f"lane-override({override.ttl_remaining(now)}s remaining)"
+    if override.pin_sub_reason:
+        # In-memory only, like the route itself: the lane pin governs this
+        # spawn's admission (wait, never a silent profile fallback).
+        task.pin_sub_reason = override.pin_sub_reason
+        task.pin_sub_fallback = False
+        return f"pin({source})"
+    return source
+
+
+def _pin_route_source(task: Task, source: Optional[str]) -> Optional[str]:
+    """``pin`` for a card's deliberate single-sub pin (t_957ca870), so the
+    dispatcher route line reads ``route=claude-bpx-N/<model> source=pin``.
+    Lane pins already carry ``pin(lane-override(...))``."""
+    from hermes_cli.model_policy import is_sub_pin_route
+
+    if (source == "card-override" and task.pin_sub_reason
+            and is_sub_pin_route(task.model_override, task.provider_override)):
+        return "pin"
+    return source
 
 
 def effective_worker_route(task: Task) -> str:

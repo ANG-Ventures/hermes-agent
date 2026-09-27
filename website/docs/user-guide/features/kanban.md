@@ -615,6 +615,31 @@ hermes kanban set-model t_abcd --clear-effort    # back to the profile's own set
 
 The dispatcher spawns the worker with `--reasoning <level>`, which overrides the profile's `agent.reasoning_effort` for that run only. The two knobs are deliberately independent: `set-model <id> --effort xhigh` leaves an existing model override untouched, and clearing the model (`set-model <id> none`) never resets the effort.
 
+### Pinning a worker to one subscription (`--pin-sub`)
+
+Workers can be pinned to any provider + model + effort. This is a supported operator capability. Workers ride the pool providers (`claude-bpr` / `claude-apr`) by default. To pin a card to ONE Claude subscription (`claude-bpx-N` / `claude-apx-N`), give a reason:
+
+```bash
+hermes kanban set-model t_abcd --provider claude-bpx-24 --model claude-fable-5-1 \
+    --effort xhigh --allow-flagship "Ace asked for Fable" --pin-sub "idle sub, full bars"
+hermes kanban create "hard refactor" --assignee coder \
+    --provider claude-bpx-24 --model claude-opus-5-5 --pin-sub "reason"
+hermes kanban lane-model set claude-bpx-24/claude-opus-5-5 --ttl 2h \
+    --reason "burst" --pin-sub "reason"
+hermes kanban pins                    # every live pin (cards + lanes), with age
+hermes kanban pins --stale-hours 24   # exits 1 if a card pin is older (daily lint)
+```
+
+- Without `--pin-sub`, a single-sub route is refused (the refusal names the pool and the flag).
+- The pre-rename aliases (`claude-api-proxy`, `claude-proxy`, `claude-subscription-proxy`, `claude-bridge`, `-fN` / `-failoverN` / `-fallbackN`) are refused even with `--pin-sub`. Use the real provider name.
+- The sub must be `enabled: true` in the usage registry (`~/.hermes/config/usage-registry.json`, the same file the relay pool loads). `claude-apx-N` is also refused while the sub is in burn-in, because apx is off during burn-in. `claude-bpx-N` serves burn-in subs.
+- Sub 0 (`claude-apx-0` / `claude-bpx-0`, Ace's own Max 20x) is pinnable with the same flag, as a **last resort**: only when Ace asks, or when every other sub is capped. Its protection is on the pool side, not here. The registry reserves it out of every pool (`pool_enabled: false`, `pool_lb_exclude: true`), so no worker reaches it without an explicit pin.
+- The whole route is pinned. Provider, model and effort all travel to the worker as `-m <model> --provider claude-bpx-N --reasoning <level>`. A later `set-model` without `--pin-sub` clears the pin.
+- A pin skips the pool but still passes every governor. The dispatch load gate, the flagship gate (`--allow-flagship` is still required for Fable/Astra) and the pinned sub's own health all apply. Sub health covers box usage cap, credential cooldown and rate-limit circuit. When the pinned sub is capped, the card **waits**. It never drifts onto the profile's fallback ladder. `--pin-sub-fallback` lets it ride the sub's family pool instead (`bpx-N` → `claude-bpr`, `apx-N` → `claude-apr`).
+- Visibility: `show` / `list` print `[PIN claude-bpx-N: <reason>]`. Each pin writes a `sub pin:` audit comment. The dispatcher route line reads `route=claude-bpx-N/<model> source=pin` (`source=pin(lane-override(...))` for a lane pin).
+
+**Why a reason is required (don't re-ban pins).** Fork PR #1116 (2026-09-26) refused every single-sub route after cards and lanes pinned to `claude-apx-0` put workers on Ace's personal sub. That sub was reachable under the alias `claude-api-proxy`. The result was 95× 429 plus 46× 401 in one day. The real hole was an *undeclared* route onto sub 0 hidden behind an alias, not pinning itself. So the aliases stay refused, sub 0 is reserved out of the pools, and a deliberate pin is allowed again with a logged reason.
+
 ### Cost strategy: frontier orchestrator, inexpensive workers
 
 Kanban's per-profile configs make the planner/worker cost split natural. Decomposing a project into well-scoped cards takes frontier-level judgment; executing a card that already carries a clear goal, context, and handoff evidence usually doesn't — and the workers are where the vast majority of tokens are spent, so the worker model is where the cost lives. Run your orchestrator/dispatcher profile on a frontier model and point worker profiles at inexpensive models. Each profile has its own `config.yaml` under `~/.hermes/profiles/<name>/`, and the dispatcher injects the profile-scoped `HERMES_HOME` when it spawns `hermes -p <assignee>`, so each worker reads its own profile's model settings:
