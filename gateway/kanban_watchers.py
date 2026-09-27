@@ -401,7 +401,10 @@ def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
     nothing further" (t_a4890a77: 72 of 482 pings in Ace's chat over 48h,
     25 visible echo replies). The passive line still posts; only the wake is
     skipped. Events with no recorded actor, or an actor whose origin is
-    unknown or another chat, still wake.
+    unknown or another chat, still wake. Matching is by the actor session's
+    recorded origin only: a bare ``actor == chat_id`` match proves nothing on
+    push subs, and non-push (api_server) subs never suppress (the wake is
+    their only delivery), so there is no chat_id shortcut.
     """
     origin_of = origin_of or _session_origin
     chat_id = str(sub.get("chat_id") or "")
@@ -412,10 +415,6 @@ def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
     for ev in events or []:
         actor = (getattr(ev, "actor_session_id", None) or "").strip()
         if not actor:
-            continue
-        if actor == chat_id:
-            # Non-push (api_server) subs: chat_id IS the session id.
-            out.add(ev.id)
             continue
         if actor not in cache:
             cache[actor] = origin_of(actor)
@@ -1687,10 +1686,21 @@ class GatewayKanbanWatchersMixin:
                             "blocked", "review_requested", "changes_requested",
                             "block_loop_detected",
                         )
+                        from gateway.wake import adapter_supports_push as _adapter_push_ok
+
+                        _is_push_adapter = _adapter_push_ok(adapter)
                         # A transition made from this chat's own session is
                         # not news to it: post the line, skip the wake
-                        # (t_a4890a77).
-                        _self_ids = d.get("self_event_ids") or set()
+                        # (t_a4890a77). Only when the passive line on a push
+                        # adapter IS the delivery: for delivery_mode='wake'
+                        # and non-push (api_server) subs the wake is the sole
+                        # delivery, and dropping it would advance the cursor
+                        # (and maybe unsubscribe) with nothing delivered.
+                        _self_ids = (
+                            d.get("self_event_ids") or set()
+                            if (send_passive and _is_push_adapter)
+                            else set()
+                        )
                         _wake_kinds = (
                             {
                                 ev.kind for ev in d["events"]
@@ -1705,9 +1715,6 @@ class GatewayKanbanWatchersMixin:
                                 "transition made by this chat's own session",
                                 sub["task_id"], platform_str, sub["chat_id"],
                             )
-                        from gateway.wake import adapter_supports_push as _adapter_push_ok
-
-                        _is_push_adapter = _adapter_push_ok(adapter)
                         _session_key = ""
                         _synth = ""
                         if _wake_kinds:

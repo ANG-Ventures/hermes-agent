@@ -790,7 +790,7 @@ def test_notifier_drops_subscription_at_once_when_target_is_gone(tmp_path, monke
 # ---------------------------------------------------------------------------
 
 
-def _self_caused_completion(actor_session_id):
+def _self_caused_completion(actor_session_id, delivery_mode="notify+wake"):
     conn = kb.connect()
     try:
         tid = kb.create_task(
@@ -801,7 +801,7 @@ def _self_caused_completion(actor_session_id):
         )
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat-1",
-            chat_type="dm", delivery_mode="notify+wake",
+            chat_type="dm", delivery_mode=delivery_mode,
         )
         kb.complete_task(conn, tid, summary="merged and closed")
         with kb.write_txn(conn):
@@ -866,5 +866,75 @@ def test_self_caused_event_ids_matching_rules():
     events = [ev(1, "same"), ev(2, "thread"), ev(3, "other"), ev(4, None),
               ev(5, "unknown"), ev(6, "c1")]
     got = self_caused_event_ids(sub, events, origin_of=origins.get)
-    # 6: non-push subs key chat_id on the raw session id.
-    assert got == {1, 6}
+    # 6: an actor id that merely equals chat_id is NOT proof of the same
+    # chat (FleetReview e014c9b89f4e); only a recorded origin match counts.
+    assert got == {1}
+
+
+def test_self_caused_event_on_wake_only_sub_still_wakes(tmp_path, monkeypatch):
+    """delivery_mode='wake' posts no passive line: the wake is the only
+    delivery, so a self-caused event must still wake (FleetReview d9c37a52d911)."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-only.db"))
+    kb.init_db()
+    _origins(monkeypatch, {"sess-chat-1": ("telegram", "chat-1", "")})
+    tid = _self_caused_completion("sess-chat-1", delivery_mode="wake")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert tid in _wake_text(adapter)
+    assert _unseen_terminal_events(tid) == []
+
+
+def test_self_caused_event_on_apiserver_sub_still_wakes(tmp_path, monkeypatch):
+    """Non-push (api_server) subs: the self-post wake IS the delivery, so an
+    event whose actor is the subscriber session still wakes it
+    (FleetReview d9c37a52d911, delegated child completion case)."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-self.db"))
+    kb.init_db()
+    _origins(monkeypatch, {"origin-session": ("api_server", "origin-session", "")})
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="child work", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="api_server", chat_id="origin-session",
+            delivery_mode="notify+wake",
+        )
+        kb.complete_task(conn, tid, summary="child done")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET actor_session_id=? "
+                "WHERE task_id=? AND kind='completed'",
+                ("origin-session", tid),
+            )
+    finally:
+        conn.close()
+
+    posts = []
+
+    async def fake_self_post(adapter, *, text, session_id):
+        posts.append({"text": text, "session_id": session_id})
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+
+    class ApiServerLike:
+        supports_async_delivery = False
+
+        async def send(self, chat_id, text, metadata=None):
+            from gateway.platforms.base import SendResult
+
+            return SendResult(success=False, error="no send()")
+
+        async def handle_message(self, event):
+            raise AssertionError("api_server wake must not use handle_message")
+
+    runner = _make_runner(ApiServerLike())
+    runner.adapters = {Platform.API_SERVER: runner.adapters[Platform.TELEGRAM]}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(posts) == 1 and tid in posts[0]["text"]
+    assert posts[0]["session_id"] == "origin-session"
