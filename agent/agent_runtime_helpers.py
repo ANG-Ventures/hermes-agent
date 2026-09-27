@@ -1808,6 +1808,9 @@ def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None)
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
     """
+    if getattr(agent, "_sticky_rebuild_refusal_pending", False) is True:
+        agent._sticky_rebuild_refusal_pending = False
+        return False  # construction-time resume already refused this turn
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
@@ -1819,6 +1822,9 @@ def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None)
         agent._fallback_index = 0
         return False
 
+    # A cached agent's next turn is a new restore decision. The rebuild
+    # refusal has its own one-shot skip at the restore boundary above.
+    agent._fallback_restore_refused_logged = False
     # Fallback spec §4.2/§4.3: ONE restore predicate (legacy cooldown AND the
     # sticky gate, probe form at the turn boundary). ``_policy_decision`` is
     # the mid-turn ``fallback_failed`` return, already allowed by the caller.
