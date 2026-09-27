@@ -7657,9 +7657,14 @@ class TurnRunner:
                     # interrupted/dangling tool tails stripped out.
                     inflight_note=_describe_inflight_tool_calls(ctx.history),
                 )
+                # Persist the RAW user text, even when it is empty (the boot
+                # auto-resume turn). The note is API-only: persisted as a
+                # non-empty user row it became the next resume's turn boundary
+                # and hid the original in-flight calls, and replayed as
+                # user-authored guidance (C6, #1123).
                 _persist_user_message_override = (
                     _raw_user_text
-                    if isinstance(_raw_user_text, str) and _raw_user_text.strip()
+                    if isinstance(_raw_user_text, str)
                     else ctx.message
                 )
                 try:
