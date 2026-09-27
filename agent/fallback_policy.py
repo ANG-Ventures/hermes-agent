@@ -969,7 +969,21 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
     prefix, window = _count_window(row, tz)
     seat = _seat_token(row, seat_names)
     hop = normalize_hop(row.get("hop"))
-    return f"{prefix}{_cause_phrase(row)} {_hop_segment(hop, seat, row.get('http_status'))}, {window}"
+    cause = _cause_phrase(row)
+    if _is_pool_wide_relay_busy(row, hop, cause):
+        return f"{prefix}relay busy: all subs at capacity (at the relay), {window}"
+    return f"{prefix}{cause} {_hop_segment(hop, seat, row.get('http_status'))}, {window}"
+
+
+def _is_pool_wide_relay_busy(row: Mapping[str, Any], hop: Optional[str], cause: str) -> bool:
+    """A pooled lane's pool_pressure refusal that names no seat was decided AT the
+    relay before any seat was chosen ("pool at capacity"): there is no seat to name
+    and the hop is known. t_e17de574: rendered "relay busy (hop unknown, sub
+    unknown)" through a 9-minute tailnet outage, which read as missing data."""
+    return (row.get("trigger_class") == "pool_pressure"
+            and not row.get("seat") and hop in (None, "relay")
+            and cause in ("relay busy", "pool at capacity")
+            and not is_direct_pin(row.get("from_provider")))
 
 
 def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
