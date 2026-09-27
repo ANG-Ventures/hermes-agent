@@ -162,7 +162,9 @@ class FileToolsIntegrationTests(unittest.TestCase):
             f.write(content)
         return p
 
-    def test_sibling_agent_write_surfaces_warning_through_handler(self):
+    def test_sibling_agent_write_is_refused_through_handler(self):
+        """Card t_f4377203: a sibling's write after our read REFUSES our write (was a warning
+        attached after the clobber). Nothing is written; a re-read unblocks it."""
         p = self._write_seed("shared.txt")
         r = json.loads(read_file_tool(path=p, task_id="agentA"))
         self.assertNotIn("error", r)
@@ -171,12 +173,40 @@ class FileToolsIntegrationTests(unittest.TestCase):
         self.assertNotIn("error", w_b)
 
         w_a = json.loads(write_file_tool(path=p, content="A stale\n", task_id="agentA"))
-        warn = w_a.get("_warning", "")
-        self.assertTrue(warn, f"expected warning, got: {w_a}")
-        # The cross-agent message names the sibling task_id.
-        self.assertIn("agentB", warn)
-        self.assertIn("sibling", warn.lower())
+        err = w_a.get("error", "")
+        self.assertTrue(w_a.get("sibling_write_blocked"), w_a)
+        self.assertIn("agentB", err)
+        self.assertIn("sibling", err.lower())
+        with open(p) as f:
+            self.assertEqual(f.read(), "B wrote\n")
 
+        json.loads(read_file_tool(path=p, task_id="agentA"))
+        w_a2 = json.loads(write_file_tool(path=p, content="A merged\n", task_id="agentA"))
+        self.assertNotIn("error", w_a2)
+        with open(p) as f:
+            self.assertEqual(f.read(), "A merged\n")
+
+    def test_sibling_agent_write_refuses_patch(self):
+        p = self._write_seed("shared2.txt", "alpha\n")
+        json.loads(read_file_tool(path=p, task_id="agentA"))
+        json.loads(write_file_tool(path=p, content="beta\n", task_id="agentB"))
+        res = json.loads(patch_tool(mode="replace", path=p, old_string="beta", new_string="gamma",
+                                    task_id="agentA"))
+        self.assertTrue(res.get("sibling_write_blocked"), res)
+        with open(p) as f:
+            self.assertEqual(f.read(), "beta\n")
+
+    def test_sibling_conflict_respects_kill_switch(self):
+        p = self._write_seed("shared3.txt")
+        json.loads(read_file_tool(path=p, task_id="agentA"))
+        json.loads(write_file_tool(path=p, content="B\n", task_id="agentB"))
+        p = os.path.realpath(p)  # the registry keys on the resolved path
+        self.assertTrue(file_state.sibling_write_conflict("agentA", p))
+        os.environ["HERMES_DISABLE_FILE_STATE_GUARD"] = "1"
+        try:
+            self.assertIsNone(file_state.sibling_write_conflict("agentA", p))
+        finally:
+            del os.environ["HERMES_DISABLE_FILE_STATE_GUARD"]
 
     def test_net_new_file_no_warning(self):
         p = os.path.join(self._tmpdir, "brand_new.txt")

@@ -3543,6 +3543,14 @@ def terminal_tool(
                 session_key=session_key,
                 env_type=env_type,
             )
+            snapshot_info = None
+            if env_type == "local":
+                # Card t_f4377203: run a snapshot of a shared-/tmp script so a later overwrite of
+                # the source (a sibling session reusing a generic name) cannot change what runs.
+                from gateway.session_context import get_session_env as _get_session_env
+                from tools.script_snapshot import snapshot_tmp_script_command
+                command, snapshot_info = snapshot_tmp_script_command(
+                    command, _get_session_env("HERMES_SESSION_ID", "") or "")
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -3572,6 +3580,8 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                if snapshot_info:
+                    result_data["script_snapshot"] = snapshot_info
                 # Background spawns detached and returns exit_code 0 immediately;
                 # it never inline-polls is_interrupted(), so the stale-bit kill
                 # cannot occur here and this note never co-occurs with rc=130.
