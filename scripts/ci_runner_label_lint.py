@@ -187,14 +187,14 @@ def load_tree(root: Path) -> dict[str, dict]:
 def load_ref(ref: str) -> dict[str, dict]:
     names = subprocess.run(
         ["git", "ls-tree", "--name-only", f"{ref}:{WORKFLOW_DIR}"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
     ).stdout.split()
     out = {}
     for name in names:
         if name.endswith((".yml", ".yaml")):
             body = subprocess.run(
                 ["git", "show", f"{ref}:{WORKFLOW_DIR}/{name}"],
-                check=True, capture_output=True, text=True,
+                check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
             ).stdout
             out[f"{WORKFLOW_DIR}/{name}"] = yaml.safe_load(body) or {}
     return out
