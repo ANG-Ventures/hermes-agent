@@ -412,6 +412,10 @@ class AdmissionGate:
                     raw = self._active_work()
                     if isinstance(raw, Mapping):
                         work_detail = {str(k): int(v) for k, v in raw.items()}
+                        # Per entry, not just the sum: +N/-N would cancel to a
+                        # false QUIESCENT while work is still active.
+                        if any(v < 0 for v in work_detail.values()):
+                            raise ValueError("negative work count")
                         work_total = sum(work_detail.values())
                     else:
                         work_total = int(raw)
