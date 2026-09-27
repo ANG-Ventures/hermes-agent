@@ -33729,9 +33729,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"\n- … and {omitted} more completion(s); inspect them with "
                 "the process tool if they affect the conclusion."
             )
-        lines.append(
-            "If a result does not change the current conclusion, absorb it silently.]"
-        )
+        from tools.process_registry import COMPLETION_SILENCE_HINT
+        lines.append(f"{COMPLETION_SILENCE_HINT}]")
         return "\n".join(lines)
 
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
@@ -34108,12 +34107,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _format_coalesced_async_delegations(blocks: list[str]) -> str:
         """Join per-delegation formatted blocks into one consolidated turn."""
+        from tools.process_registry import COMPLETION_SILENCE_HINT
         header = (
             f"[IMPORTANT: {len(blocks)} background subagent delegations "
             "completed for this session. Treat these results as one "
             "completion batch and send at most one consolidated user-facing "
-            "response. If a result does not change the current conclusion, "
-            "absorb it silently.]"
+            "response. "
+            + COMPLETION_SILENCE_HINT + "]"
         )
         return "\n\n".join([header, *blocks])
 

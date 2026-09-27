@@ -996,6 +996,27 @@ def _review_exit_refused(current_status: Optional[str], new_status: Optional[str
     )
 
 
+def _claimed_review_exit_refused(
+    conn: sqlite3.Connection, task_id: str, new_status: Optional[str],
+) -> bool:
+    """A ``running`` card whose current run was claimed FROM ``review`` is a
+    review in progress: moving it to todo/triage/scheduled would close the
+    reviewer run without ``request_changes`` and hand unreviewed work back
+    (FleetReview #999). ``ready`` is allowed -- it resumes to ``review``."""
+    if new_status is None or new_status in ("ready", "running", "review"):
+        return False
+    if new_status in _REVIEW_EXIT_STATUSES:
+        return False
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running" or row["current_run_id"] is None:
+        return False
+    return kanban_db._retry_status_for_run(
+        conn, task_id, row["current_run_id"],
+    ) == "review"
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -1004,7 +1025,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        if _review_exit_refused(task.status, payload.status):
+        if _review_exit_refused(task.status, payload.status) or (
+            _claimed_review_exit_refused(conn, task_id, payload.status)
+        ):
             raise HTTPException(status_code=409, detail=_REVIEW_EXIT_REFUSAL)
 
         review_assignee_deferred = (
@@ -1065,7 +1088,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # Direct status write for drag-drop (todo -> ready etc).
                     ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
+                try:
+                    ok = kanban_db.archive_task(conn, task_id)
+                except ValueError as e:  # ClosedUnmergedPrError (t_a1550189): card's PR closed unmerged
+                    raise HTTPException(status_code=409, detail=str(e))
             elif s == "running":
                 raise HTTPException(
                     status_code=400,
@@ -1282,6 +1308,9 @@ def _set_status_direct(
         (task_id,),
     ).fetchone()
     if held is None:
+        return False
+    if _claimed_review_exit_refused(conn, task_id, new_status):
+        # Refused BEFORE terminating the reviewer worker.
         return False
     released_lock = held["claim_lock"]
     if held["status"] == "running" and new_status != "running":
@@ -1531,8 +1560,11 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     results.append(entry)
                     continue
                 if payload.archive:
-                    if not kanban_db.archive_task(conn, tid):
-                        entry.update(ok=False, error="archive refused")
+                    try:
+                        if not kanban_db.archive_task(conn, tid):
+                            entry.update(ok=False, error="archive refused")
+                    except ValueError as e:  # ClosedUnmergedPrError (t_a1550189)
+                        entry.update(ok=False, error=str(e))
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":

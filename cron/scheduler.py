@@ -8649,6 +8649,9 @@ def _run_one_job_body(
                         delivery_error = _deliver_result(
                             job,
                             deliver_content,
+                            # Without this a FAILED run wore the success header
+                            # ("✅ Cronjob Response") over its own failure body.
+                            success=success,
                             adapters=adapters,
                             loop=loop,
                         )
@@ -8821,6 +8824,7 @@ def _run_one_job_body(
                             _summarize_cron_failure_for_delivery(job, _err_text)
                             + _failure_streak_nudge(job)
                         ),
+                        success=False,
                         adapters=adapters,
                         loop=loop,
                     )

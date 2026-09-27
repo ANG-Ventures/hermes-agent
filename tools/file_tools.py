@@ -2236,6 +2236,13 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     return None
 
 
+def _sibling_write_refusal(reason: str) -> str:
+    """Card t_f4377203: a sibling subagent's write after our last read REFUSES the edit
+    (it used to be a ``_warning`` attached after the clobber had already happened)."""
+    return (f"Refusing to write: {reason} The file was NOT modified. read_file it, "
+            "merge your change into the sibling's version, then write again.")
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -2295,6 +2302,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         with file_state.lock_path(_resolved):
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
+            sibling = file_state.sibling_write_conflict(task_id, _resolved)
+            if sibling:
+                return tool_error(_sibling_write_refusal(sibling), sibling_write_blocked=True,
+                                  resolved_path=_resolved)
             cross_warning = file_state.check_stale(task_id, _resolved)
             stale_warning = _check_file_staleness(path, task_id)
             # Workspace-divergence warning: relative path resolving outside the
@@ -2442,6 +2453,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 except Exception:
                     _r = None
                 _path_to_resolved[_p] = _r
+                _sibling = file_state.sibling_write_conflict(task_id, _r) if _r else None
+                if _sibling:
+                    return tool_error(_sibling_write_refusal(_sibling), sibling_write_blocked=True,
+                                      resolved_path=_r)
                 _cross = file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
                 if not _sw and _r:

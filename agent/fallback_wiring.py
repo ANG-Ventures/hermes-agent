@@ -370,6 +370,20 @@ def note_success(agent: Any, headers: Optional[Dict[str, str]]) -> None:
         logger.debug("sticky success note failed (best-effort)", exc_info=True)
 
 
+def note_compaction(agent: Any) -> None:
+    """§4.3: record a completed compaction (in place or rotating) on the
+    active sticky episode. Best-effort, never raises."""
+    try:
+        if not sticky_policy_enabled():
+            return
+        key = key_for(agent)
+        if not key.lineage_root or not key.primary_provider:
+            return
+        fp.note_compaction(store(), key, time.time())
+    except Exception:  # noqa: BLE001
+        logger.debug("sticky compaction note failed (best-effort)", exc_info=True)
+
+
 # ── §4.2 construction-time decision ──────────────────────────────────────
 
 _RESUME_UNTOUCHED = (

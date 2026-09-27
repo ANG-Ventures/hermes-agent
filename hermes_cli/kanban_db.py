@@ -5351,14 +5351,22 @@ def session_owner_profile(session_id: Optional[str]) -> Optional[str]:
 
 
 def _actor_profiles(actor: MutationActor) -> frozenset[str]:
-    """Every profile identity the actor legitimately holds: the bound
-    profile plus the owner profile of each caller session."""
-    names = {actor.profile} if actor.profile else set()
-    for sid in actor.session_ids:
-        owner = session_owner_profile(sid)
-        if owner:
-            names.add(owner)
-    return frozenset(names)
+    """Every profile identity the actor legitimately holds.
+
+    The owner profile of each caller session is authoritative. The bound
+    (env-derived) profile counts only when no caller session resolves to an
+    owner: a root-home repoint makes it read ``default`` -- an operator
+    profile -- from inside another profile's session, so keeping both let
+    that caller pass ``--operator`` or mutate a ``default``-assigned card
+    (FleetReview #1074).
+    """
+    owners = {
+        owner for owner in (session_owner_profile(sid) for sid in actor.session_ids)
+        if owner
+    }
+    if owners:
+        return frozenset(owners)
+    return frozenset({actor.profile} if actor.profile else ())
 
 
 def _valid_operator_reason(reason: str) -> bool:
@@ -5609,10 +5617,9 @@ def check_home_session(
         return None
     if home in actor.session_ids:
         return None
-    # Execution lane: the assignee works its card wherever it was born, and a
-    # dispatched worker always owns the card it was spawned for.
-    if actor.profile and (row["assignee"] or "") == actor.profile:
-        return None
+    # Execution lane: a dispatched worker always owns the card it was spawned
+    # for. The assignee match lives below, on :func:`_actor_profiles` (session
+    # owner over env profile), not on the raw env profile (FleetReview #1074).
     if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() == task_id:
         return None
     # ...and the cards it fanned out: item 1 stamps a worker's children with
@@ -7039,6 +7046,53 @@ class BatchRouteWrite:
     # stopped matching aborts the whole batch, exactly as it would have at
     # selection time — an operator naming five cards must not get four.
     skip_if_unmatched: bool = False
+    # ``set-model --live`` (t_033a3bb1): when the card is RUNNING, also append
+    # a run-scoped ``route_changed`` event in the SAME transaction. The live
+    # worker polls for it at its next loop iteration and switches in place
+    # (no abort, conversation kept). Not running => plain next-dispatch write.
+    live: bool = False
+
+
+# Run-scoped trigger for a live route switch (``set-model --live``). The card
+# row stays the authority on the route; the event only says "re-read it now".
+ROUTE_CHANGED_EVENT = "route_changed"
+# Run-scoped marker a worker writes when its runtime cannot switch in place
+# (``codex_app_server``: the turn runs in a subprocess, no loop-boundary
+# poll). A live write to such a run is next-dispatch only, never promised.
+ROUTE_LIVE_UNSUPPORTED_EVENT = "route_live_unsupported"
+
+
+def _append_live_route_changed_locked(
+    conn: sqlite3.Connection, task_id: str, *, touch_model: bool, touch_effort: bool,
+) -> Optional[int]:
+    """Append ``route_changed`` for the card's live run; in-txn only.
+
+    Returns the run id the event is scoped to, or None when the card has no
+    live run (not ``running``), in which case the write is next-dispatch only.
+    The payload snapshots the route just written, for the audit trail; the
+    worker still re-reads the card row, which is the authority.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id, model_override, provider_override, "
+        "reasoning_effort FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or (row["status"] or "").lower() != "running" or not row["current_run_id"]:
+        return None
+    run_id = int(row["current_run_id"])
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? LIMIT 1",
+        (task_id, run_id, ROUTE_LIVE_UNSUPPORTED_EVENT),
+    ).fetchone():
+        return None
+    _append_event(conn, task_id, ROUTE_CHANGED_EVENT, {
+        "live": True,
+        "model": row["model_override"],
+        "provider": row["provider_override"],
+        "reasoning_effort": row["reasoning_effort"],
+        "touch_model": bool(touch_model),
+        "touch_effort": bool(touch_effort),
+    }, run_id=run_id)
+    return run_id
 
 
 def _batch_write_mismatch(conn: sqlite3.Connection, write: BatchRouteWrite) -> Optional[str]:
@@ -7063,6 +7117,7 @@ def apply_batch_route_writes(
     writes: Sequence[BatchRouteWrite],
     *,
     skipped: Optional[dict[str, str]] = None,
+    live_runs: Optional[dict[str, int]] = None,
 ) -> list[str]:
     """Apply every route/effort write in ONE transaction, or none of them.
 
@@ -7119,6 +7174,7 @@ def apply_batch_route_writes(
     written: list[str] = []
     fields: dict[str, tuple[str, ...]] = {}
     skipped_now: dict[str, str] = {}
+    live_now: dict[str, int] = {}
     with write_txn(conn):
         for write, model, provider, effort in prepared:
             mismatch = _batch_write_mismatch(conn, write)
@@ -7148,8 +7204,17 @@ def apply_batch_route_writes(
             if changed:
                 written.append(write.task_id)
                 fields[write.task_id] = changed
+                if write.live:
+                    run_id = _append_live_route_changed_locked(
+                        conn, write.task_id,
+                        touch_model=write.touch_model, touch_effort=write.touch_effort,
+                    )
+                    if run_id is not None:
+                        live_now[write.task_id] = run_id
     if skipped is not None:
         skipped.update(skipped_now)
+    if live_runs is not None:
+        live_runs.update(live_now)
     # Observers fire only AFTER the whole batch commits, so a rolled-back
     # batch never announces a mutation that did not happen.
     for task_id in written:
@@ -8333,8 +8398,11 @@ def _prior_worker_still_alive(
     # An outcome cannot certify exit: operators can write the same outcomes as
     # worker tools, and a newer synthetic row can hide an older live owner.
     runs = conn.execute(
-        "SELECT r.id, r.outcome, r.ended_at, r.started_at, t.max_runtime_seconds "
-        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        # The run's OWN runtime cap, snapshotted at claim: the card's current
+        # cap can be shortened after release while that worker still runs
+        # (FleetReview #956). A run with no snapshot is probed, never skipped.
+        "SELECT r.id, r.outcome, r.ended_at, r.started_at, r.max_runtime_seconds "
+        "FROM task_runs r "
         "WHERE r.task_id = ? ORDER BY r.id DESC",
         (task_id,),
     ).fetchall()
@@ -8519,8 +8587,9 @@ def _real_pid_started_in_claim(pid, claimed_at, spawned_at,
     window ``[claimed_at - 1 s, spawned_at + 2 s]``.
 
     ``False``: provably not the recorded worker. ``None``: the needed reading
-    is unreadable. A missing bound is simply not applied, so missing evidence
-    never proves a PID recycled.
+    is unreadable, or the ``spawned`` upper bound is missing (identity
+    unproven). Missing evidence never proves a PID recycled, and never proves
+    it is the worker either.
     """
     if start_token is not None:
         try:
@@ -8539,6 +8608,13 @@ def _real_pid_started_in_claim(pid, claimed_at, spawned_at,
         return False
     if spawned_at is not None and created > float(spawned_at) + _OWNER_CREATE_LAG_SECONDS:
         return False
+    if spawned_at is None:
+        # Only the claim lower bound is known (no run-scoped ``spawned``
+        # evidence: legacy/migrated runs). Any process created after the
+        # claim -- including one that reused the worker's PID -- fits, so
+        # this is UNPROVEN, not proven: termination never signals it, while
+        # every liveness caller still treats it as alive (FleetReview #1021).
+        return None
     return True
 
 
@@ -9807,8 +9883,9 @@ def complete_task(
     # ``review`` is a reviewer/human approval and is left alone; so is a
     # claimed reviewer run approving with ``head_sha`` -- the PR it approved
     # is OPEN by definition and the land queue merges it from that record.
+    from hermes_cli import kanban_open_pr as _open_pr
+    _pr_query = None
     if candidate.status != 'review' and not approve_head_sha:
-        from hermes_cli import kanban_open_pr as _open_pr
         # Foreign-owner PRs (upstream / third-party repos) are mentions, not a
         # gate: the fleet cannot merge them (t_06dccfe3). Record, never route.
         foreign = _open_pr.foreign_pr_refs(
@@ -9818,8 +9895,10 @@ def complete_task(
             metadata = dict(metadata or {}, mentioned_foreign_prs=[
                 f"{r.repo}#{r.number}" for r in foreign
             ])
+        _pr_query = _open_pr.memo_query()
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
+            query_fn=_pr_query,
         )
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
@@ -9827,9 +9906,16 @@ def complete_task(
             # non-milestone PR through fleet-merge.sh.
             from hermes_cli import kanban_pr_freshness as _fresh
             try:
+                # Arm only the card's OWN handoff PR(s), never a PR the prose
+                # merely mentions (FleetReview #1234 finding).
                 freshness = _fresh.check(
                     still_open, task_id=task_id,
                     allow_arm=not is_milestone_card(conn, task_id),
+                    armable={
+                        f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
+                            metadata=metadata, survivor_pr=survivor_pr,
+                        )
+                    },
                 )
             except _fresh.DraftPrError as draft_err:
                 with write_txn(conn):
@@ -9869,6 +9955,26 @@ def complete_task(
                 # and the PR refs the review-card closer resolves on merged=true.
                 add_comment(conn, task_id, "kanban", _open_pr.route_comment(still_open))
             return bool(ok)
+    # Closed-unmerged done gate (t_a1550189): the card's own PR was closed
+    # without merge (e.g. auto-closed when its stacked base was deleted), so
+    # the work is not on default. Refuse done unless the handoff carries a
+    # SUPERSEDED-BY / RE-CARRIED-AS token naming merged work for that PR; an
+    # unreadable lookup refuses too. Every completion is gated, including a
+    # reviewer approving a card parked in review. Raises before any mutation.
+    try:
+        _open_pr.enforce_not_closed_unmerged(
+            task_id, result, summary, metadata=metadata,
+            survivor_pr=survivor_pr, superseded_by=superseded_by,
+            query_fn=_pr_query or _open_pr.memo_query(),
+            recorded=_card_recorded_pr_refs(conn, task_id),
+        )
+    except _open_pr.ClosedUnmergedPrError as closed_err:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_closed_unmerged_pr",
+                {"prs": closed_err.closed, "unverified": closed_err.unverified},
+            )
+        raise
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,
@@ -12660,8 +12766,8 @@ _REVIEW_HEAD_SHA_RE = re.compile(_HEAD_SHA_PATTERN)
 _REVIEW_NA_INABILITY = re.compile(
     r"\b(?:"
     r"skip(?:ped|ping|s)?|"
-    r"(?:could|can)\s*(?:not|n't)|cannot|unable|"
-    r"(?:did|was|were|does|do)\s*(?:not|n't)\s+(?:run|ran|execute|executed|attempt|attempted|try|tried|finish|finished|complete|completed|get|reach)|"
+    r"(?:could|can)\s*(?:not|n['\u2019]t)|can['\u2019]t|cannot|unable|"
+    r"(?:did|was|were|does|do)\s*(?:not|n['\u2019]t)\s+(?:run|ran|execute|executed|attempt|attempted|try|tried|finish|finished|complete|completed|get|reach)|"
     r"not\s+(?:run|ran|executed|attempted|tried|finished|completed|reached)|"
     r"ran\s+out|out\s+of\s+time|no\s+time\b|timed?\s*out|"
     r"fail(?:ed|s)?\s+to\b|errored|crashed|blocked\s+(?:by|on)\b|"
@@ -14177,8 +14283,57 @@ def decompose_triage_task(
     return child_ids
 
 
+def _card_recorded_pr_refs(conn: sqlite3.Connection, task_id: str, runs=None) -> list:
+    """Every PR string any of the card's runs persisted (``kanban_open_pr.recorded_pr_refs``): pr_url /
+    pr_urls / pr, auto_routed_open_prs and survivor PR evidence. The card's own PRs for the closed-unmerged
+    gates (FleetReview #1339), so neither done nor archive depends on which key carried the ref."""
+    from hermes_cli import kanban_open_pr as _open_pr
+    out: list = []
+    for run in (list_runs(conn, task_id) if runs is None else runs):
+        out.extend(_open_pr.recorded_pr_refs(run.metadata))
+    return out
+
+
+def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=None) -> None:
+    """Refuse to archive a card whose own PR was closed without merge (t_a1550189).
+
+    Archiving hides a card the same way ``done`` does, so a card whose PR was auto-closed (stacked base
+    deleted) must not vanish from the board with its content never on default. The card's own refs are
+    every PR any of its runs recorded (:func:`_card_recorded_pr_refs`). Archive passes when the card's result,
+    run summaries or comments carry a SUPERSEDED-BY / RE-CARRIED-AS token naming merged work, or a card
+    comment records an explicit close decision (``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|
+    DUPLICATE-OF``, the line the close-reason contract says to copy onto the card). Unreadable refuses.
+    """
+    from hermes_cli import kanban_open_pr as _open_pr
+    task = get_task(conn, task_id)
+    if task is None or task.status == "archived":
+        return
+    runs = list_runs(conn, task_id)
+    urls = _card_recorded_pr_refs(conn, task_id, runs=runs)
+    if not urls:
+        return
+    texts: list = [task.result] + [run.summary for run in runs]
+    comments = [c.body for c in list_comments(conn, task_id)]
+    try:
+        _open_pr.enforce_not_closed_unmerged(
+            task_id, *texts, recorded=urls,
+            query_fn=query_fn or _open_pr.memo_query(),
+            verb="archive", decision_texts=comments,
+        )
+    except _open_pr.ClosedUnmergedPrError as closed_err:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "archive_blocked_closed_unmerged_pr",
+                {"prs": closed_err.closed, "unverified": closed_err.unverified},
+            )
+        raise
+
+
 @_home_session_guarded("archive")
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Archive ``task_id``. Raises :class:`kanban_open_pr.ClosedUnmergedPrError` (no state change) when
+    the card's own PR is closed-unmerged with no recorded superseder or close decision (t_a1550189)."""
+    _archive_closed_pr_gate(conn, task_id)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "

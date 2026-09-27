@@ -451,6 +451,15 @@ def main():
     # import cost entirely off the path for users with no mcp_servers.
     ensure_mcp_discovery_started()
 
+    # Shared-checkout admission hold: the stdio server never enters the serve
+    # lifespan, so install the RPC gate here too or prompt.* RPCs start work
+    # during a hold. Refusal only: this process does not publish a consumer
+    # record (it would overwrite the serve process's record of the same name).
+    try:
+        server.enable_checkout_admission("serve")
+    except Exception:
+        logger.warning("checkout admission setup failed (stdio)", exc_info=True)
+
     if not write_json({
         "jsonrpc": "2.0",
         "method": "event",

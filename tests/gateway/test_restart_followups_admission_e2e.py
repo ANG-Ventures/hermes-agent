@@ -158,8 +158,10 @@ ARMS = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("arm", sorted(ARMS))
-async def test_admitted_followup_is_delivered_after_real_restart(home, arm):
+async def test_admitted_followup_is_delivered_after_real_restart(home, arm, monkeypatch):
     event, platforms = ARMS[arm]
+    if arm == "role-authorized":
+        monkeypatch.setenv("DISCORD_ALLOWED_ROLES", "123456")  # the live role gate
     spooled = await _park_and_stop(home, event, platforms)
     assert len(spooled) == 1
     record = json.loads(spooled[0].read_text())
@@ -375,3 +377,54 @@ async def test_profile_route_rejected_followup_is_reported_lost(home):
     lost = [ln for ln in lines if LOST in ln]
     assert len(lost) == 1 and "reason=profile_route_rejected" in lost[0], lines
     assert left == []
+
+
+# FleetReview #961 (C4 backfill): the replayed role grant must meet the LIVE
+# role gate at intake, like is_bot does, not just the park-time verdict. (The
+# relay flag needs no extra check: _adapter_for_source routes a relay-marked
+# replay only through adapters[Platform.RELAY], so it cannot reach intake once
+# the relay is unconfigured.)
+@pytest.mark.asyncio
+async def test_role_gate_removed_during_restart_refuses_replay(home, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOWED_ROLES", "123456")
+    spooled = await _park_and_stop(home, _event("role-user-5", "702", role_authorized=True), (Platform.DISCORD,))
+    assert len(spooled) == 1
+
+    reached, lines, left = await _boot(
+        home, (Platform.DISCORD,), before_boot=lambda: monkeypatch.delenv("DISCORD_ALLOWED_ROLES"),
+    )
+
+    assert reached == []
+    assert not [ln for ln in lines if UNTRUSTED in ln]  # MAC was valid
+    lost = [ln for ln in lines if LOST in ln]
+    assert len(lost) == 1 and "reason=unauthorized" in lost[0] and "role-user-5" in lost[0], lines
+    assert left == []
+
+
+def test_invalid_key_is_not_rotated_twice_by_racing_writers(home, monkeypatch):
+    """FleetReview #961: a writer that saw the invalid key before a peer healed
+    it must recheck under the lock, not rotate again and void the peer's MACs."""
+    keyp = rf.spool_dir().parent / rf.SPOOL_KEY_NAME
+    keyp.parent.mkdir(parents=True, exist_ok=True)
+    keyp.write_text("")
+    src = {"platform": "discord", "chat_id": "701", "user_id": "bot-777"}
+    assert rf.spool_followup("k1", "first", src, admission={"is_bot": True}) is not None
+    healed = keyp.read_text()
+
+    real_read = rf._read_spool_key
+    stale = {"left": 1}
+
+    def _stale_first_read(path):  # the racing writer's pre-heal view
+        if stale["left"]:
+            stale["left"] -= 1
+            return None, True
+        return real_read(path)
+
+    monkeypatch.setattr(rf, "_read_spool_key", _stale_first_read)
+    assert rf.spool_followup("k2", "second", src, admission={"is_bot": True}) is not None
+    monkeypatch.setattr(rf, "_read_spool_key", real_read)
+
+    assert keyp.read_text() == healed
+    records, _ = rf.take_followups()
+    assert sorted(r["session_key"] for r in records) == ["k1", "k2"]
+    assert all(r["_admission_verified"] is True for r in records)

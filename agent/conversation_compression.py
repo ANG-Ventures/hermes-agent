@@ -5803,6 +5803,16 @@ def compress_context(
         agent._last_compression_attempt_in_place = compacted_in_place
         agent._last_compaction_in_place = compacted_in_place
 
+        # §4.3 fallback ``compaction`` return branch: the prefix was rewritten
+        # (both modes), so both caches are cold. In-place mode never rotates
+        # session_id, so the sticky episode needs an explicit marker.
+        try:
+            from agent.fallback_wiring import note_compaction as _fb_note_compaction
+
+            _fb_note_compaction(agent)
+        except Exception:
+            logger.debug("fallback compaction marker skipped (non-fatal)", exc_info=True)
+
         # Surface the persist-failure signal (rotation-independent). True when a
         # compacted list was produced but the DB write to persist it was rolled
         # back (locked/contended state.db, FK error, ENOSPC). The gateway reads

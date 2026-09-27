@@ -435,6 +435,19 @@ def note_fallback_success(store: StickyStore, key: StickyKey, now: float,
     return state
 
 
+def note_compaction(store: StickyStore, key: StickyKey, now: float) -> Optional[StickyState]:
+    """§4.3 ``compaction`` input: stamp ``last_compaction_epoch`` on the
+    active episode. Called after every completed compaction, in place or
+    rotating (in-place mode never rotates ``session_id``). No-op without an
+    active episode."""
+    state = _load(store, key)
+    if state is None or not state.active:
+        return state
+    state.last_compaction_epoch = now
+    store.put(key, state, now)
+    return state
+
+
 def seat_from_response(provider: Optional[str],
                        headers: Optional[Mapping[str, str]]) -> Optional[str]:
     """D6 seat: ``x-pool-served-by`` on a pooled response; the provider name
@@ -774,10 +787,13 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
     if last_fb is not None and now - last_fb > FALLBACK_COLD_S:
         return Decision(True, "fallback_cold", f"fallback idle {now - last_fb:.0f}s", exp, warm)
     reasons.append("fallback_cold: last fallback call <= 60 min ago")
+    lc = state.last_compaction_epoch
+    if lc is not None and last_fb is not None and lc > last_fb:
+        return Decision(True, "compaction", "compaction ran since last fallback call", exp, warm)
     if (live_session_id and state.last_fallback_session_id
             and live_session_id != state.last_fallback_session_id):
         return Decision(True, "compaction", "session_id rotated since last fallback call", exp, warm)
-    reasons.append("compaction: no session_id rotation")
+    reasons.append("compaction: none since last fallback call")
     if verdict == "refuse":
         return Decision(False, None, "no_warm_primary_seat", exp, warm)
     if box_full:

@@ -1295,6 +1295,115 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
         env["HOME"] = home
 
 
+# --- Per-session scratch dir (card t_f4377203) ---
+# ``/tmp`` is ONE namespace shared by every agent session on a host, and they all reach for the
+# same generic script names: a sibling session rewrote Apollo's ``/tmp/act-1300.sh`` between its
+# write and its run (2026-09-24), and three stray commands executed. Each session gets its own
+# owner-only dir, ``<root>/var/scratch/<session_id>/``, exported to every local terminal child
+# as SESSION_SCRATCH_ENV. The hermes-home hook ``hooks/tmp_script_namespace_policy.py`` points
+# refused /tmp writes at the same path. Dirs idle for SESSION_SCRATCH_MAX_IDLE_HOURS are reaped.
+SESSION_SCRATCH_ENV = "HERMES_SESSION_SCRATCH"
+SESSION_SCRATCH_MAX_IDLE_HOURS = 7 * 24
+_SESSION_SCRATCH_PRUNE_STAMP = ".last_prune"
+_SESSION_SCRATCH_PRUNE_INTERVAL_SECONDS = 3600
+_session_scratch_pruned_once = False
+
+
+def get_session_scratch_root() -> Path:
+    """``<root>/var/scratch``: the parent of every per-session scratch dir (not created)."""
+    return get_default_hermes_root() / "var" / "scratch"
+
+
+def get_session_scratch_dir(session_id: str, *, create: bool = True) -> "Path | None":
+    """Per-session scratch dir ``<root>/var/scratch/<session_id>`` (mode 0700), or None for an
+    empty id. The id is reduced to ``[A-Za-z0-9_.-]`` so it can never escape the root."""
+    import re
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", (session_id or "").strip()).strip(".")
+    if not safe:
+        return None
+    path = get_session_scratch_root() / safe
+    if create:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            if sys.platform != "win32":
+                os.chmod(path, 0o700)
+        except OSError:
+            return path
+        _prune_session_scratch_once(path.parent, keep=path.name)
+    return path
+
+
+def _newest_mtime(path: Path) -> float:
+    """Newest mtime anywhere in *path*'s subtree (a dir's own mtime misses deep writes)."""
+    newest = path.lstat().st_mtime
+    for dirpath, dirnames, filenames in os.walk(path, onerror=lambda _e: None):
+        for name in dirnames + filenames:
+            try:
+                newest = max(newest, os.lstat(os.path.join(dirpath, name)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def prune_session_scratch(root: "Path | None" = None, max_idle_hours: float = SESSION_SCRATCH_MAX_IDLE_HOURS,
+                          *, keep: str = "") -> int:
+    """Delete per-session dirs under *root* with no write anywhere in their subtree for
+    *max_idle_hours*; *keep* (the caller's own dir) is never removed. Returns the count removed."""
+    import time
+    root = root if root is not None else get_session_scratch_root()
+    cutoff = time.time() - max_idle_hours * 3600
+    removed = 0
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if entry.name in (keep, _SESSION_SCRATCH_PRUNE_STAMP) or entry.is_symlink() or not entry.is_dir():
+            continue
+        try:
+            if _newest_mtime(entry) >= cutoff:
+                continue
+            shutil.rmtree(entry)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _prune_session_scratch_once(root: Path, *, keep: str = "") -> None:
+    """Run :func:`prune_session_scratch` at most once per process and once per hour across
+    processes (stamp file), so a fan-out of terminal children stays cheap."""
+    global _session_scratch_pruned_once
+    if _session_scratch_pruned_once:
+        return
+    _session_scratch_pruned_once = True
+    import time
+    stamp = root / _SESSION_SCRATCH_PRUNE_STAMP
+    try:
+        if time.time() - stamp.stat().st_mtime < _SESSION_SCRATCH_PRUNE_INTERVAL_SECONDS:
+            return
+    except OSError:
+        pass
+    try:
+        stamp.touch()
+        prune_session_scratch(root, keep=keep)
+    except Exception:
+        pass
+
+
+def apply_session_scratch_env(env: "dict[str, str]") -> bool:
+    """Export this session's scratch dir into a child *env* as SESSION_SCRATCH_ENV, keyed on the
+    ``HERMES_SESSION_ID`` already bridged into *env*. With no session id the var is removed, so a
+    child never inherits another session's dir. Returns True when the var was set."""
+    session_id = (env.get("HERMES_SESSION_ID") or "").strip()
+    path = get_session_scratch_dir(session_id) if session_id else None
+    if path is None:
+        env.pop(SESSION_SCRATCH_ENV, None)
+        return False
+    env[SESSION_SCRATCH_ENV] = str(path)
+    return True
+
+
 VALID_REASONING_EFFORTS = (
     "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 )

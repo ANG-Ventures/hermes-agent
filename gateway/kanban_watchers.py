@@ -599,14 +599,23 @@ def _release_refusal_pages(board: str, event_ids) -> None:
         kb.release_workspace_refusal_pages(conn, event_ids)
 
 
+def _alert_notify_script() -> Optional[Path]:
+    """notify.py under the RUNNING Hermes root (same resolver as the kanban
+    CLI's alerts), never a hardcoded ``~/.hermes``: a redirected/sandboxed
+    home must not page the live channel about its own boards."""
+    try:
+        from hermes_cli.kanban import _notify_script_path
+
+        found = _notify_script_path()
+    except Exception:
+        logger.debug("kanban dispatcher: notify.py lookup failed", exc_info=True)
+        return None
+    return Path(found) if found else None
+
+
 def _send_workspace_refusal_alert(board: str, summary: str) -> bool:
     """Best-effort #alerts page through the fleet notify boundary."""
-    candidates = (
-        Path.home() / ".hermes" / "scripts" / "notify.py",
-        Path.home() / ".hermes" / "skills-shared" / "general" / "scheduler" / "scripts" / "notify.py",
-        Path.home() / ".hermes" / "skills" / "devops" / "scheduler" / "scripts" / "notify.py",
-    )
-    script = next((path for path in candidates if path.is_file()), None)
+    script = _alert_notify_script()
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; workspace outage page not delivered")
         return False
@@ -699,8 +708,8 @@ class _GuardStuckNotifier:
 
 def _send_guard_stuck_alert(board: str, item: dict) -> bool:
     """Best-effort #alerts page with the exact recovery verb."""
-    script = Path.home() / ".hermes" / "scripts" / "notify.py"
-    if not script.is_file():
+    script = _alert_notify_script()
+    if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
         return False
     if item.get("reason") == "prior_worker_still_alive":

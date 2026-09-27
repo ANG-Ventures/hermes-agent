@@ -52,7 +52,7 @@ _DEFAULTS = {
     # load-bearing only when the sweep loop that reads it ships). Default off.
     "reprice_enabled": False,
     # Conversation prefix-stability guard (card t_c07124ab): fingerprint every
-    # outbound request and page #alerts once per session when already-sent
+    # outbound request and post to #logs once per session when already-sent
     # history / system prompt / tools change between consecutive requests.
     "prefix_guard": True,
 }
@@ -99,6 +99,7 @@ def record_api_call(
     relay_synthetic: bool,
     route_id: str | None,
     cache_ttl_requested: str | None = None,
+    call_id: str | None = None,
     api_kwargs: Any = None,
     session_key: str | None = None,
     prefix_reset: str | None = None,
@@ -143,6 +144,7 @@ def record_api_call(
         cache_write_5m=tier_5m,
         cache_write_1h=tier_1h,
         cache_ttl_requested=cache_ttl_requested,
+        call_id=call_id,
     )
     if api_kwargs is not None and session_key:
         observe_request_prefix(
@@ -163,6 +165,86 @@ def record_api_call(
                 if usage is not None else None
             ),
             compare_across_turns=prefix_compare_across_turns,
+        )
+
+
+def record_composite_calls(
+    *,
+    turn_id: str,
+    parent_seq: int,
+    sub_harness: str,
+    calls: list[dict[str, Any]],
+) -> None:
+    """Persist a composite (MoA) call's physical children when enabled.
+
+    Thin, fail-loud boundary like ``record_api_call``; the caller
+    (``chat_completion_helpers._emit_composite_api_call_records``) owns
+    sequence allocation and fail-open handling. ``calls[*]["usage"]`` may be
+    a CanonicalUsage or a pricing-call dict (token fields read by name).
+    """
+    if _config() is None:
+        return
+    from agent.usage_pricing import CanonicalUsage
+    from plugins.blackbox import store
+
+    rows = []
+    for call in calls:
+        usage = call.get("usage")
+        if not isinstance(usage, CanonicalUsage):
+            src = usage if isinstance(usage, dict) else call
+            usage = CanonicalUsage(
+                input_tokens=_int_value(src.get("input_tokens")),
+                output_tokens=_int_value(src.get("output_tokens")),
+                cache_read_tokens=_int_value(src.get("cache_read_tokens")),
+                cache_write_tokens=_int_value(src.get("cache_write_tokens")),
+                reasoning_tokens=_int_value(src.get("reasoning_tokens")),
+            )
+        rows.append({**call, "usage": usage})
+    store.insert_composite_calls(
+        turn_id, parent_seq, sub_harness=sub_harness, calls=rows,
+    )
+
+
+def _composite_physical_calls(turn_usage: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Physical (model, provider) calls nested under a composite turn's calls."""
+    out: list[dict[str, Any]] = []
+    for call in (turn_usage or {}).get("calls") or []:
+        nested = call.get("pricing_calls") if isinstance(call, dict) else None
+        if isinstance(nested, list):
+            out.extend(item for item in nested if isinstance(item, dict))
+    return out
+
+
+def _observe_pricing_sentinel(record: Any, turn_usage: dict[str, Any] | None,
+                              base_url: Any) -> None:
+    """Feed the new-model sentinel the turn's REAL model identities.
+
+    A composite (MoA) turn is recorded under a virtual preset identity
+    (provider 'moa', model 'moa/<preset>') that no price table will ever
+    know, so observing it would page #alerts for a model that does not
+    exist. Observe each physical call's route instead, and only when the
+    turn could not be fully priced (an unpriced physical call is what makes
+    the composite 'unknown' or 'partial'); ``is_known_model`` filters routes
+    that do have a rate.
+    """
+    from plugins.blackbox import sentinel
+
+    if str(record.provider or "").strip().lower() != "moa":
+        sentinel.observe_turn(
+            record.model, record.provider, record.cost_status, record.cost_usd,
+            base_url=base_url,
+        )
+        return
+    if str(record.cost_status or "").strip().lower() not in ("unknown", "partial"):
+        return
+    seen: set[tuple[str, str]] = set()
+    for call in _composite_physical_calls(turn_usage):
+        key = (str(call.get("model") or ""), str(call.get("provider") or ""))
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        sentinel.observe_turn(
+            key[0], key[1], "unknown", None, base_url=call.get("base_url"),
         )
 
 
@@ -200,7 +282,7 @@ def observe_request_prefix(
 
     Fingerprints the outbound request, compares it with the session's
     previous request in the store, and on the session's first unexplained
-    mutation dispatches ONE #alerts page on a daemon thread. Returns the
+    mutation dispatches ONE #logs notice on a daemon thread. Returns the
     store result (diagnostic; the caller ignores it) or None when disabled
     or failed. ``blackbox.prefix_guard: false`` switches the guard off.
     """
@@ -641,15 +723,7 @@ def _on_session_end(
         # ImportError (module missing on a partially-deployed tree) must not
         # reach the retention sweep / alert path below.
         try:
-            from plugins.blackbox import sentinel
-
-            sentinel.observe_turn(
-                record.model,
-                record.provider,
-                record.cost_status,
-                record.cost_usd,
-                base_url=kwargs.get("base_url"),
-            )
+            _observe_pricing_sentinel(record, turn_usage, kwargs.get("base_url"))
         except Exception:
             logger.warning("blackbox pricing sentinel dispatch failed", exc_info=True)
 

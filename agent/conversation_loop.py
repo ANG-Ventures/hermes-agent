@@ -1763,6 +1763,36 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 )
 
 
+# Known non-answer placeholders a provider can hand back as the whole final
+# text (t_887f9584). "No response requested." is the Claude Code CLI's synthetic
+# turn closer; a CLI-backed provider can surface it, and a model that has seen
+# it in its own history can echo it. Delivered verbatim it reads like a reply;
+# it is not one. The backstop routes it into the SAME once-only post-tool nudge
+# the empty-response path already uses, and if the model hands it back again
+# (or there were no tool results to re-process) the user sees a plain notice
+# instead. Genuinely empty text and "[SILENT]" are not placeholders: silent
+# cron / no_agent turns keep their existing path untouched.
+_PLACEHOLDER_FINAL_TEXTS = frozenset({"No response requested."})
+_TURN_ENDED_WITHOUT_REPLY = "(turn ended without a reply)"
+
+
+def classify_placeholder_final_text(text, *, prior_was_tool, already_nudged):
+    """Route a known placeholder final text.
+
+    Returns ``"empty"`` when the placeholder should be treated as an empty
+    post-tool response (the once-only nudge fires), ``"notice"`` when it must
+    be replaced by :data:`_TURN_ENDED_WITHOUT_REPLY`, and ``None`` for every
+    other text — including the empty string, which keeps its own ladder.
+    """
+    if not isinstance(text, str):
+        return None
+    if text.strip() not in _PLACEHOLDER_FINAL_TEXTS:
+        return None
+    if prior_was_tool and not already_nudged:
+        return "empty"
+    return "notice"
+
+
 # Shared recovery hint appended to every content-policy refusal message. Both
 # the HTTP-200 refusal path (``finish_reason=content_filter``) and the
 # exception path (a provider moderation error classified as
@@ -2600,6 +2630,14 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        # No loop boundary here, so ``set-model --live`` cannot apply in
+        # place: mark the run so the write side stops promising it.
+        from hermes_cli.kanban_worker_route import mark_live_route_unsupported
+
+        mark_live_route_unsupported(
+            agent, reason="codex_app_server runtime has no in-run switch point; "
+            "the route applies on the next dispatch (use --reclaim to apply now)",
+        )
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -2619,6 +2657,16 @@ def run_conversation(
                     f"User correction during the turn: {_redirect_text}"
                 )
             agent._persist_session(messages, conversation_history)
+
+        # Kanban ``set-model --live`` (t_033a3bb1): switch this worker's
+        # provider/model/effort in place between two provider calls. No-op
+        # (one env read) outside a kanban worker; never raises.
+        from hermes_cli.kanban_worker_route import apply_pending_live_route
+
+        active_system_prompt = apply_pending_live_route(
+            agent, iteration=api_call_count + 1,
+            active_system_prompt=active_system_prompt,
+        )
 
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
@@ -5401,6 +5449,23 @@ def run_conversation(
                                     aggregator_model=_agg_cost_model,
                                     aggregator_provider=_agg_cost_provider,
                                     aggregator_base_url=_agg_cost_base_url,
+                                )
+                                # Ledger each physical advisor/aggregator call
+                                # as a child of this composite call's virtual
+                                # turn_api_calls row (card t_02323499).
+                                from agent.chat_completion_helpers import (
+                                    _emit_composite_api_call_records,
+                                )
+
+                                _moa_preset = getattr(
+                                    getattr(getattr(_moa_client, "chat", None), "completions", None),
+                                    "preset_name",
+                                    None,
+                                )
+                                _emit_composite_api_call_records(
+                                    agent,
+                                    _turn_call["pricing_calls"],
+                                    sub_harness=f"moa:{_moa_preset if isinstance(_moa_preset, str) and _moa_preset else agent.model}",
                                 )
                         except Exception:
                             pass  # telemetry must never break the conversation loop
@@ -9235,6 +9300,30 @@ def run_conversation(
             else:
                 # Recover dropped calls before the empty-content fallback.
                 final_response = assistant_message.content or ""
+
+                # ── Known placeholder final text (t_887f9584) ─────────
+                _placeholder_route = classify_placeholder_final_text(
+                    final_response,
+                    prior_was_tool=any(m.get("role") == "tool" for m in messages[-5:]),
+                    already_nudged=getattr(agent, "_post_tool_empty_retried", False),
+                )
+                if _placeholder_route is not None:
+                    logger.warning(
+                        "Final text is a known placeholder %r — %s (model=%s provider=%s)",
+                        final_response,
+                        "treating as empty after tool calls" if _placeholder_route == "empty" else "replacing with a visible notice",
+                        agent.model, agent.provider,
+                    )
+                    final_response = "" if _placeholder_route == "empty" else _TURN_ENDED_WITHOUT_REPLY
+                    # The streamed buffer holds the same placeholder; partial-
+                    # stream recovery below must not resurrect it.
+                    agent._current_streamed_assistant_text = ""
+                    try:
+                        assistant_message.content = final_response
+                    except Exception:
+                        pass
+                    if _placeholder_route == "notice":
+                        agent._emit_status("⚠️ Model ended the turn with a placeholder instead of a reply")
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
