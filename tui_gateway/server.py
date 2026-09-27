@@ -13284,6 +13284,42 @@ def _hud_surface_note(session: dict) -> str:
     return hud_surface_note(getattr(session.get("agent"), "valid_tool_names", None))
 
 
+TURN_SYSTEM_CONTEXT_MAX_CHARS = 2000
+
+
+def _turn_system_context(raw: Any) -> str:
+    """Normalize prompt.submit ``system_context``: a bounded string, else "".
+
+    Non-strings are ignored rather than stringified so a stray object can
+    never land in the system prompt.
+    """
+    if not isinstance(raw, str):
+        return ""
+    from hermes_cli.input_sanitize import sanitize_user_prompt_text
+
+    return sanitize_user_prompt_text(raw).strip()[:TURN_SYSTEM_CONTEXT_MAX_CHARS]
+
+
+def _with_turn_system_context(base: str | None, context: str) -> str | None:
+    """The ephemeral system prompt for one turn carrying caller metadata.
+
+    prompt.submit ``system_context`` is metadata the MODEL needs (which room
+    a voice turn came from) but the user did not say. Putting it in the user
+    text makes models mirror it back; the system prompt does not. It is
+    appended after the profile's own ephemeral prompt (never replacing it)
+    and only for the duration of the turn, so the cached base system prompt
+    and the persisted transcript are untouched.
+
+    Prompt caching: the context lands in the system message, so a client must
+    keep it byte-stable for the life of a session (the clanker voice client
+    binds each warm session to one room, so its value never changes within a
+    session). Varying it turn to turn would re-bill the prefix every turn.
+    """
+    if not context:
+        return base
+    return f"{base}\n\n{context}" if base else context
+
+
 def _prepend_note(run_message: Any, note: str) -> Any:
     """Prefix a per-turn note onto the MODEL INPUT, leaving the prompt alone.
 
@@ -13830,9 +13866,17 @@ def _run_prompt_submit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+            _base_ephemeral = getattr(agent, "ephemeral_system_prompt", None)
+            _turn_ctx = session.get("turn_system_context") or ""
+            if _turn_ctx:
+                agent.ephemeral_system_prompt = _with_turn_system_context(
+                    _base_ephemeral, _turn_ctx
+                )
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)
             finally:
+                if _turn_ctx:
+                    agent.ephemeral_system_prompt = _base_ephemeral
                 # Stop AND join before anything below emits: an in-flight tick
                 # surviving past message.complete would roll the client's final
                 # usage back to a stale mid-turn snapshot. The join is
