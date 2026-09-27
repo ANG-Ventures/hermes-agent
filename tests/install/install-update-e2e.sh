@@ -124,7 +124,29 @@ collect_sandbox_logs() {
       grep -hE ' (error|verbose stack) ' "$npm_logs"/*.log | head -n 60 >&2 || true
       echo "--- end npm debug log errors ---" >&2
     fi
+    # A native build failing under `npm --silent` leaves only node-gyp's exit
+    # code: node-gyp inherits the silent loglevel, so its gyp ERR! lines -- the
+    # actual reason -- are never written anywhere. Re-run it verbosely.
+    if grep -qhE 'error command sh -c .*node-gyp rebuild' "$npm_logs"/*.log 2>/dev/null; then
+      diagnose_node_gyp "$dest"
+    fi
   fi
+}
+
+diagnose_node_gyp() {
+  local dest="$1"
+  local pkg
+  pkg="$(grep -hE ' error path .*/node_modules/' "$SANDBOX_ROOT/home/.npm/_logs"/*.log \
+    | tail -n 1 | sed -E 's/.* error path //')"
+  [ -n "$pkg" ] || return 0
+  local node_home='/home/hermes/.hermes/node'
+  local gyp="$node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js"
+  echo "--- node-gyp rebuild --loglevel=verbose in $pkg ---" >&2
+  in_sandbox "cd '$pkg' && timeout 600 '$node_home/bin/node' '$gyp' rebuild --loglevel=verbose" \
+    >"$dest/node-gyp-verbose.log" 2>&1 || true
+  grep -E 'gyp (ERR!|http|verb (download|install|get node dir))|UNCAUGHT|stack' \
+    "$dest/node-gyp-verbose.log" | head -n 80 >&2 || true
+  echo "--- end node-gyp (full log: node-gyp-verbose.log) ---" >&2
 }
 
 # ── preflight ──────────────────────────────────────────────────────────────
