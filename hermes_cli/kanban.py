@@ -102,7 +102,18 @@ def _fmt_task_line(t: kb.Task, refusal: Optional[dict] = None) -> str:
     flag = ""
     if refusal and t.status in _REFUSAL_VISIBLE_STATUSES:
         flag = f"  [{_fmt_refusal(refusal)}]"
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{flag}"
+    pin = _pin_badge(t)
+    pin = f"  {pin}" if pin else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{pin}{flag}"
+
+
+def _pin_badge(t) -> str:
+    """``[PIN claude-bpx-N: <reason>]`` for a card's deliberate sub pin."""
+    from hermes_cli.model_policy import format_pin_badge
+
+    return format_pin_badge(
+        getattr(t, "provider_override", None), getattr(t, "pin_sub_reason", None),
+    )
 
 
 def _fmt_links(links: list[tuple[str, str]]) -> str:
@@ -141,6 +152,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "reasoning_effort": t.reasoning_effort,
+        "pin_sub_reason": getattr(t, "pin_sub_reason", None),
+        "pin_sub_fallback": bool(getattr(t, "pin_sub_fallback", False)),
         "session_id": t.session_id,
         "unhomed": bool(getattr(t, "unhomed", False)),
         "workflow_template_id": t.workflow_template_id,
@@ -564,6 +577,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "--firepower is an alias.",
     )
     p_create.add_argument(
+        "--pin-sub", default=None, dest="pin_sub", metavar="REASON",
+        help="Deliberately pin this card to ONE Claude sub (--provider "
+             "claude-bpx-N / claude-apx-N) with a non-empty reason, recorded "
+             "as a 'sub pin:' comment and shown as [PIN ...] in show/list. "
+             "Pins provider + model + effort together (--model/--effort). "
+             "Workers ride the pool by default; pre-rename aliases "
+             "(claude-api-proxy, claude-bridge, -fN) and subs not enabled in "
+             "the usage registry are refused even with this flag. Sub 0 is a "
+             "last-resort pin (only when Ace asks or every other sub is "
+             "capped). A capped pinned sub WAITS (no profile fallback).",
+    )
+    p_create.add_argument(
+        "--pin-sub-fallback", action="store_true", dest="pin_sub_fallback",
+        help="With --pin-sub: when the pinned sub is capped/cooling, ride "
+             "its family pool (bpx-N -> claude-bpr, apx-N -> claude-apr) "
+             "instead of waiting.",
+    )
+    p_create.add_argument(
         "--reasoning",
         "--effort",
         default=None,
@@ -681,6 +712,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
 
     # --- assign ---
+    p_pins = sub.add_parser(
+        "pins",
+        help="List live deliberate sub pins (--pin-sub) on cards and lanes",
+    )
+    p_pins.add_argument("--json", action="store_true", dest="as_json")
+    p_pins.add_argument(
+        "--stale-hours", type=float, default=None, dest="stale_hours",
+        help="Exit 1 when any card pin is at least this old (daily lint).",
+    )
+
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
@@ -727,6 +768,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="REASON",
         help="Allow an orchestrator-only flagship model. Requires a non-empty "
              "reason, recorded as a task comment. --firepower is an alias.",
+    )
+    p_set_model.add_argument(
+        "--pin-sub", default=None, dest="pin_sub", metavar="REASON",
+        help="Deliberately pin this card to ONE Claude sub (--provider "
+             "claude-bpx-N / claude-apx-N) with a non-empty reason, recorded "
+             "as a 'sub pin:' comment and shown as [PIN ...] in show/list. "
+             "Pins provider + model + effort together (--model/--effort). "
+             "Workers ride the pool by default; pre-rename aliases "
+             "(claude-api-proxy, claude-bridge, -fN) and subs not enabled in "
+             "the usage registry are refused even with this flag. Sub 0 is a "
+             "last-resort pin (only when Ace asks or every other sub is "
+             "capped). A capped pinned sub WAITS (no profile fallback).",
+    )
+    p_set_model.add_argument(
+        "--pin-sub-fallback", action="store_true", dest="pin_sub_fallback",
+        help="With --pin-sub: when the pinned sub is capped/cooling, ride "
+             "its family pool (bpx-N -> claude-bpr, apx-N -> claude-apr) "
+             "instead of waiting.",
     )
     _effort_group = p_set_model.add_mutually_exclusive_group()
     _effort_group.add_argument(
@@ -780,6 +839,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="REASON",
         help="Required justification when the model is flagship/firepower-only "
              "(same flagship ban as create/set-model --allow-flagship).",
+    )
+    _lane_set.add_argument(
+        "--pin-sub", default=None, dest="pin_sub", metavar="REASON",
+        help="Authorize a single-sub lane (claude-bpx-N / claude-apx-N) with a "
+             "reason. Same refusals as set-model --pin-sub (pre-rename "
+             "aliases, subs not enabled in the usage registry); a capped "
+             "pinned lane holds its cards.",
     )
     _lane_show = _lane_sub.add_parser(
         "show", help="Show active lane overrides and their remaining TTL",
@@ -1763,6 +1829,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
             "lane-model": _cmd_lane_model,
+            "pins":     _cmd_pins,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -2457,6 +2524,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 max_retries=max_retries,
                 model_override=getattr(args, "model_override", None),
                 provider_override=getattr(args, "provider_override", None),
+                pin_sub_reason=getattr(args, "pin_sub", None),
+                pin_sub_fallback=bool(getattr(args, "pin_sub_fallback", False)),
                 flagship_override_reason=getattr(args, "allow_flagship", None),
                 flagship_override_author=args.created_by or _profile_author(),
                 reasoning_effort=getattr(args, "reasoning_effort", None),
@@ -2846,6 +2915,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+        if _pin_badge(task):
+            _fb = "family pool" if task.pin_sub_fallback else "wait"
+            print(f"  pin:       {_pin_badge(task)} (capped sub => {_fb})")
     print(f"  reasoning: {task.reasoning_effort or 'inherit'}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
@@ -3410,6 +3482,10 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.touch_model = True
                     write.model = effective_model
                     write.provider = provider
+                    write.pin_sub_reason = getattr(args, "pin_sub", None)
+                    write.pin_sub_fallback = bool(getattr(args, "pin_sub_fallback", False))
+                    if write.pin_sub_reason:
+                        write.pin_sub_author = _profile_author()
                     if firepower:
                         write.audit_comment_author = _profile_author()
                         # Same comment main's create/set-model writes, so
@@ -3623,7 +3699,8 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
         return 2
     from hermes_cli.model_policy import pinned_sub_provider_error
 
-    pin_error = pinned_sub_provider_error(model, provider)
+    pin_sub_reason = getattr(args, "pin_sub", None)
+    pin_error = pinned_sub_provider_error(model, provider, pin_sub_reason=pin_sub_reason)
     if pin_error:
         print(f"kanban: {pin_error}", file=sys.stderr)
         return 2
@@ -3652,12 +3729,18 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
             firepower=firepower_reason,
             created_by=_profile_author(),
             now=now,
+            pin_sub_reason=pin_sub_reason,
         )
     scope = f"assignee={assignee}" if assignee else "assignee=(board-wide)"
     print(
         f"lane-model set: route={override.route} {scope} "
         f"ttl={_format_ttl(ttl_seconds)} applies=next-dispatch"
     )
+    if override.pin_sub_reason:
+        from hermes_cli.model_policy import format_pin_badge
+
+        print(f"  {format_pin_badge(override.provider, override.pin_sub_reason)} "
+              "(capped sub => cards wait)")
     if reason:
         print(f"  reason: {reason}")
     if is_firepower_model(model) and firepower_reason:
@@ -3683,6 +3766,7 @@ def _cmd_lane_model_show(args: argparse.Namespace) -> int:
                 "route": row.route,
                 "reason": row.reason,
                 "firepower": row.firepower,
+                "pin_sub_reason": row.pin_sub_reason,
                 "created_by": row.created_by,
                 "created_at": row.created_at,
                 "expires_at": row.expires_at,
@@ -3703,9 +3787,77 @@ def _cmd_lane_model_show(args: argparse.Namespace) -> int:
             print(f"  reason: {row.reason}")
         if row.firepower:
             print(f"  firepower: {row.firepower}")
+        if row.pin_sub_reason:
+            from hermes_cli.model_policy import format_pin_badge
+
+            print(f"  {format_pin_badge(row.provider, row.pin_sub_reason)}")
         if row.created_by:
             print(f"  set by: {row.created_by}")
     return 0
+
+
+def _cmd_pins(args: argparse.Namespace) -> int:
+    """List every LIVE deliberate sub pin (cards + lanes) -- the daily lint.
+
+    #1116's failure mode was a forgotten pin silently hogging one sub, so every
+    live pin is listed with its age. ``--stale-hours N`` exits 1 when any card
+    pin is older than N hours (for a cron lint); otherwise exit 0.
+    """
+    from hermes_cli.model_policy import format_pin_badge
+
+    now = int(time.time())
+    stale_hours = getattr(args, "stale_hours", None)
+    rows = []
+    with kb.connect_closing() as conn:
+        placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
+        for r in conn.execute(
+            "SELECT t.id, t.status, t.assignee, t.title, t.model_override, "
+            "t.provider_override, t.pin_sub_reason, t.pin_sub_fallback, t.created_at, "
+            "(SELECT max(e.created_at) FROM task_events e WHERE e.task_id = t.id "
+            " AND e.kind IN ('model_override_set', 'created')) AS pinned_at "
+            f"FROM tasks t WHERE t.pin_sub_reason IS NOT NULL AND t.status IN ({placeholders}) "
+            "ORDER BY pinned_at ASC",
+            _ACTIVE_STATUSES,
+        ).fetchall():
+            pinned_at = int(r["pinned_at"] or r["created_at"] or now)
+            rows.append({
+                "kind": "card", "id": r["id"], "status": r["status"],
+                "assignee": r["assignee"], "title": r["title"],
+                "provider": r["provider_override"], "model": r["model_override"],
+                "reason": r["pin_sub_reason"],
+                "fallback": "pool" if r["pin_sub_fallback"] else "wait",
+                "age_hours": round((now - pinned_at) / 3600, 1),
+            })
+        for lane in kb.list_lane_model_overrides(conn, now=now):
+            if lane.pin_sub_reason:
+                rows.append({
+                    "kind": "lane", "id": lane.assignee or "(board-wide)",
+                    "status": "active", "assignee": lane.assignee, "title": "",
+                    "provider": lane.provider, "model": lane.model,
+                    "reason": lane.pin_sub_reason, "fallback": "wait",
+                    "age_hours": round((now - int(lane.created_at)) / 3600, 1),
+                    "ttl_seconds": lane.ttl_remaining(now),
+                })
+    stale = [
+        r for r in rows
+        if stale_hours is not None and r["kind"] == "card" and r["age_hours"] >= stale_hours
+    ]
+    if getattr(args, "as_json", False):
+        print(json.dumps({"pins": rows, "stale": [r["id"] for r in stale]}, indent=2))
+    elif not rows:
+        print("(no live sub pins -- every worker rides the pool)")
+    else:
+        for r in rows:
+            badge = format_pin_badge(r["provider"], r["reason"])
+            extra = (f"ttl={_format_ttl(r['ttl_seconds'])}" if r["kind"] == "lane"
+                     else f"status={r['status']} assignee={r['assignee'] or '-'}")
+            print(f"{r['kind']} {r['id']} {badge} model={r['model']} "
+                  f"age={r['age_hours']}h fallback={r['fallback']} {extra}"
+                  + (f"  {r['title']}" if r["title"] else ""))
+        if stale:
+            print(f"STALE (>= {stale_hours}h): {', '.join(r['id'] for r in stale)} -- "
+                  "clear with `hermes kanban set-model <id> none` if no longer wanted")
+    return 1 if stale else 0
 
 
 def _cmd_lane_model_clear(args: argparse.Namespace) -> int:
