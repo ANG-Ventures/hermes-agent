@@ -335,7 +335,9 @@ def closed_unmerged_refs(refs, *, query_fn: Optional[QueryFn] = None, unverified
         if query_fn is None:
             return []
     out = []
-    for ref in list(refs)[:MAX_LOOKUPS_PER_COMPLETION]:
+    # EVERY primary ref is looked up (FleetReview #1339): a cap here let the 11th own PR close unmerged
+    # and still pass. Primary refs are the card's own PRs, not prose, so they are bounded by the card.
+    for ref in refs:
         try:
             payload = query_fn(ref.repo, ref.number)
         except Exception as exc:
@@ -392,27 +394,69 @@ def supersedes(closed_ref, target: str, *, query_fn: Optional[QueryFn],
 def names_superseder(closed, *texts: Optional[str], superseded_by: Optional[str] = None,
                      query_fn: Optional[QueryFn] = None, sha_check: Optional[ShaCheckFn] = None) -> bool:
     """Is EVERY closed PR covered by a SUPERSEDED-BY/RE-CARRIED-AS token naming merged work?"""
+    return not _unsuperseded(closed, *texts, superseded_by=superseded_by, query_fn=query_fn, sha_check=sha_check)
+
+
+def _unsuperseded(closed, *texts: Optional[str], superseded_by: Optional[str] = None,
+                  query_fn: Optional[QueryFn] = None, sha_check: Optional[ShaCheckFn] = None) -> list:
+    """The closed refs NOT covered by a SUPERSEDED-BY/RE-CARRIED-AS token naming merged work."""
     if query_fn is None:
         query_fn = _default_query()
     if sha_check is None and not os.environ.get("PYTEST_CURRENT_TEST"):
         sha_check = sha_on_default
     targets = superseder_targets(*texts, superseded_by=superseded_by)[:MAX_LOOKUPS_PER_COMPLETION]
-    if not targets:
+    return [c for c in closed
+            if not any(supersedes(c, t, query_fn=query_fn, sha_check=sha_check) for t in targets)]
+
+
+def _decision_covers(closed_ref, text: str, *, sole: bool) -> bool:
+    """Does one ``CLOSED: <reason>`` decision text explain THIS closed PR (FleetReview #1339)?
+
+    It must name the PR (``owner/repo#N``, its URL, or ``#N``), or the card must own exactly one PR and
+    the text names none. A decision naming PR A never covers PR B."""
+    if not isinstance(text, str) or not _DECISION_RE.search(text):
         return False
-    return all(any(supersedes(c, t, query_fn=query_fn, sha_check=sha_check) for t in targets) for c in closed)
+    named = extract_pr_refs(text)
+    key = (closed_ref.repo.lower(), closed_ref.number)
+    if any((r.repo.lower(), r.number) == key for r in named):
+        return True
+    bare = {int(n) for n in re.findall(r"(?<![\w/])#(\d+)\b", text)}
+    if closed_ref.number in bare and not any(r.number == closed_ref.number for r in named):
+        return True
+    return sole and not named and not bare
+
+
+def recorded_pr_refs(metadata) -> list:
+    """Every PR string a run's metadata persisted for the card: ``pr_url``/``pr_urls``/``pr``, PRs the
+    open-PR route recorded (``auto_routed_open_prs``) and survivor PR evidence (``survivor.refs[].pr`` /
+    ``survivor.claims[].pr``). The card's own PR evidence, independent of which key carried it."""
+    if not isinstance(metadata, dict):
+        return []
+    out: list = []
+    for key in ("pr_url", "pr_urls", "pr", "auto_routed_open_prs"):
+        out.extend(_iter_strings(metadata.get(key)))
+    survivor = metadata.get("survivor")
+    if isinstance(survivor, dict):
+        for group in ("refs", "claims"):
+            for item in survivor.get(group) or ():
+                if isinstance(item, dict):
+                    out.extend(_iter_strings(item.get("pr")))
+    return out
 
 
 def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: Optional[dict] = None,
                                 survivor_pr=None, superseded_by: Optional[str] = None,
                                 query_fn: Optional[QueryFn] = None,
                                 sha_check: Optional[ShaCheckFn] = None,
-                                verb: str = "done", decision_texts=()) -> list:
+                                verb: str = "done", decision_texts=(), recorded=()) -> list:
     """Raise :class:`ClosedUnmergedPrError` when the card's own PR is closed-unmerged (or unreadable) and
     the handoff (``texts`` + ``superseded_by``) carries no SUPERSEDED-BY/RE-CARRIED-AS token naming merged
     work for it. ``decision_texts`` (archive only: card comments) may instead record an explicit
     ``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|DUPLICATE-OF`` decision. Returns the closed refs accepted."""
     # Fleet-owned refs only: a foreign (upstream / third-party) PR is a mention the fleet cannot land.
-    primary = split_fleet(extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
+    # ``recorded``: PR strings earlier runs persisted for this card (see :func:`recorded_pr_refs`), so a
+    # reviewer approving without repeating the PR is still gated on it (FleetReview #1339).
+    primary = split_fleet(extract_pr_refs(*recorded, metadata=metadata, survivor_pr=survivor_pr))[0]
     if not primary:
         return []
     unverified: list = []
@@ -421,10 +465,12 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
         raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed], unverified, verb=verb)
     if not closed:
         return []
-    if names_superseder(closed, *texts, *decision_texts, superseded_by=superseded_by, query_fn=query_fn,
-                        sha_check=sha_check):
-        return closed
-    if any(isinstance(t, str) and _DECISION_RE.search(t) for t in decision_texts):
+    # Each closed PR needs its OWN cover: a merged-work token, or (archive) a decision tied to that PR.
+    uncovered = _unsuperseded(closed, *texts, *decision_texts, superseded_by=superseded_by,
+                              query_fn=query_fn, sha_check=sha_check)
+    sole = len(primary) == 1
+    uncovered = [c for c in uncovered if not any(_decision_covers(c, t, sole=sole) for t in decision_texts)]
+    if not uncovered:
         return closed
     raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed], verb=verb)
 

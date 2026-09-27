@@ -300,3 +300,79 @@ def test_cli_archive_and_request_review_report_the_refusal_without_traceback(boa
                             allow_same_actor=False)
     assert cli._cmd_request_review(ns) == 1
     assert f"cannot request review for {tid2}: done refused" in capsys.readouterr().err
+
+
+# --- FleetReview #1339 follow-ups ------------------------------------------
+
+
+def test_every_primary_ref_is_checked_beyond_the_lookup_cap():
+    n = op.MAX_LOOKUPS_PER_COMPLETION + 1
+    urls = [f"https://github.com/ANG-Ventures/r/pull/{100 + i}" for i in range(n)]
+    last = 100 + n - 1
+    with pytest.raises(op.ClosedUnmergedPrError) as exc:
+        op.enforce_not_closed_unmerged("t_x", "done", metadata={"pr_urls": urls},
+                                       query_fn=lambda repo, k: {"state": "CLOSED" if k == last else "MERGED"},
+                                       sha_check=lambda r, s: False)
+    assert exc.value.closed == [f"ANG-Ventures/r#{last}"]
+
+
+def test_recorded_pr_refs_reads_every_persisted_key():
+    md = {"pr_url": "ANG-Ventures/r#1", "pr_urls": ["ANG-Ventures/r#2"], "pr": "ANG-Ventures/r#3",
+          "auto_routed_open_prs": ["ANG-Ventures/r#4"],
+          "survivor": {"kind": "patch", "refs": [{"pr": "ANG-Ventures/r#5"}], "claims": [{"pr": "ANG-Ventures/r#6"}]}}
+    assert op.recorded_pr_refs(md) == [f"ANG-Ventures/r#{i}" for i in range(1, 7)]
+    assert op.recorded_pr_refs(None) == []
+
+
+def test_decision_must_name_each_closed_pr_when_card_owns_several():
+    two = [PR_URL, "https://github.com/ANG-Ventures/r/pull/6"]
+    closed_both = states(n5="CLOSED", n6="CLOSED")
+    for decision in ("PR ANG-Ventures/r#5 CLOSED: REJECTED -- bad idea", "CLOSED: REJECTED -- bad idea"):
+        with pytest.raises(op.ClosedUnmergedPrError):
+            op.enforce_not_closed_unmerged("t_x", "done", recorded=two, query_fn=closed_both,
+                                           sha_check=lambda r, s: False, verb="archive",
+                                           decision_texts=[decision])
+    assert op.enforce_not_closed_unmerged(
+        "t_x", "done", recorded=two, query_fn=closed_both, sha_check=lambda r, s: False, verb="archive",
+        decision_texts=["ANG-Ventures/r#5 CLOSED: REJECTED", "PR #6 CLOSED: ABANDONED"]) != []
+
+
+def test_mixed_cover_superseder_for_one_decision_for_other():
+    two = [PR_URL, "https://github.com/ANG-Ventures/r/pull/6"]
+    assert op.enforce_not_closed_unmerged(
+        "t_x", "done", recorded=two, query_fn=states(n5="CLOSED", n6="CLOSED", n9="MERGED"),
+        sha_check=lambda r, s: False, verb="archive",
+        decision_texts=["PR #5 CLOSED: SUPERSEDED-BY #9", "ANG-Ventures/r#6 CLOSED: STALE"]) != []
+
+
+def test_unqualified_decision_covers_a_sole_pr():
+    assert op.enforce_not_closed_unmerged(
+        "t_x", "done", recorded=[PR_URL], query_fn=states(n5="CLOSED"), sha_check=lambda r, s: False,
+        verb="archive", decision_texts=["CLOSED: THROWAWAY -- spike"]) != []
+
+
+def test_e2e_review_approval_gated_on_pr_recorded_by_earlier_run(board, no_survivor, monkeypatch):
+    # The implementer's run recorded the PR; the reviewer approves without repeating it.
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        monkeypatch.setattr(op, "_default_query", lambda: states(n5="OPEN"))
+        assert kb.complete_task(conn, tid, summary="shipped", metadata={"pr_url": PR_URL}, expected_run_id=run)
+        assert _status(conn, tid) == "review"
+        monkeypatch.setattr(op, "_default_query", lambda: states(n5="CLOSED"))
+        with pytest.raises(op.ClosedUnmergedPrError):
+            kb.complete_task(conn, tid, summary="approved")
+        assert _status(conn, tid) == "review"
+
+
+@pytest.mark.parametrize("md", [
+    {"auto_routed_open_prs": ["ANG-Ventures/r#5"]},
+    {"survivor": {"kind": "ref", "refs": [{"pr": "ANG-Ventures/r#5", "state": "OPEN"}]}},
+])
+def test_e2e_archive_gated_on_route_and_survivor_evidence(board, no_survivor, monkeypatch, md):
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        monkeypatch.setattr(op, "_default_query", lambda: states(n5="MERGED"))
+        assert kb.complete_task(conn, tid, summary="shipped", metadata=md, expected_run_id=run)
+        monkeypatch.setattr(op, "_default_query", lambda: states(n5="CLOSED"))
+        with pytest.raises(op.ClosedUnmergedPrError):
+            kb.archive_task(conn, tid)

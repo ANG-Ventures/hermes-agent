@@ -9937,6 +9937,7 @@ def complete_task(
             task_id, result, summary, metadata=metadata,
             survivor_pr=survivor_pr, superseded_by=superseded_by,
             query_fn=_pr_query or _open_pr.memo_query(),
+            recorded=_card_recorded_pr_refs(conn, task_id),
         )
     except _open_pr.ClosedUnmergedPrError as closed_err:
         with write_txn(conn):
@@ -14253,12 +14254,23 @@ def decompose_triage_task(
     return child_ids
 
 
+def _card_recorded_pr_refs(conn: sqlite3.Connection, task_id: str, runs=None) -> list:
+    """Every PR string any of the card's runs persisted (``kanban_open_pr.recorded_pr_refs``): pr_url /
+    pr_urls / pr, auto_routed_open_prs and survivor PR evidence. The card's own PRs for the closed-unmerged
+    gates (FleetReview #1339), so neither done nor archive depends on which key carried the ref."""
+    from hermes_cli import kanban_open_pr as _open_pr
+    out: list = []
+    for run in (list_runs(conn, task_id) if runs is None else runs):
+        out.extend(_open_pr.recorded_pr_refs(run.metadata))
+    return out
+
+
 def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=None) -> None:
     """Refuse to archive a card whose own PR was closed without merge (t_a1550189).
 
     Archiving hides a card the same way ``done`` does, so a card whose PR was auto-closed (stacked base
     deleted) must not vanish from the board with its content never on default. The card's own refs are
-    every ``pr_url``/``pr_urls``/``pr`` any of its runs recorded. Archive passes when the card's result,
+    every PR any of its runs recorded (:func:`_card_recorded_pr_refs`). Archive passes when the card's result,
     run summaries or comments carry a SUPERSEDED-BY / RE-CARRIED-AS token naming merged work, or a card
     comment records an explicit close decision (``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|
     DUPLICATE-OF``, the line the close-reason contract says to copy onto the card). Unreadable refuses.
@@ -14267,23 +14279,15 @@ def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=Non
     task = get_task(conn, task_id)
     if task is None or task.status == "archived":
         return
-    urls: list = []
-    texts: list = [task.result]
-    for run in list_runs(conn, task_id):
-        md = run.metadata if isinstance(run.metadata, dict) else {}
-        for key in ("pr_url", "pr_urls", "pr"):
-            val = md.get(key)
-            if isinstance(val, str):
-                urls.append(val)
-            elif isinstance(val, (list, tuple)):
-                urls.extend(v for v in val if isinstance(v, str))
-        texts.append(run.summary)
+    runs = list_runs(conn, task_id)
+    urls = _card_recorded_pr_refs(conn, task_id, runs=runs)
     if not urls:
         return
+    texts: list = [task.result] + [run.summary for run in runs]
     comments = [c.body for c in list_comments(conn, task_id)]
     try:
         _open_pr.enforce_not_closed_unmerged(
-            task_id, *texts, metadata={"pr_urls": urls},
+            task_id, *texts, recorded=urls,
             query_fn=query_fn or _open_pr.memo_query(),
             verb="archive", decision_texts=comments,
         )
