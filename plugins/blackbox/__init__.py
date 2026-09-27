@@ -52,7 +52,7 @@ _DEFAULTS = {
     # load-bearing only when the sweep loop that reads it ships). Default off.
     "reprice_enabled": False,
     # Conversation prefix-stability guard (card t_c07124ab): fingerprint every
-    # outbound request and page #alerts once per session when already-sent
+    # outbound request and post to #logs once per session when already-sent
     # history / system prompt / tools change between consecutive requests.
     "prefix_guard": True,
 }
@@ -202,7 +202,7 @@ def observe_request_prefix(
 
     Fingerprints the outbound request, compares it with the session's
     previous request in the store, and on the session's first unexplained
-    mutation dispatches ONE #alerts page on a daemon thread. Returns the
+    mutation dispatches ONE #logs notice on a daemon thread. Returns the
     store result (diagnostic; the caller ignores it) or None when disabled
     or failed. ``blackbox.prefix_guard: false`` switches the guard off.
     """

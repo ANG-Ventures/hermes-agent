@@ -3364,6 +3364,45 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_called_once()
 
+    def test_failed_job_delivers_with_failure_framing(self):
+        """A failed run must reach _deliver_result with success=False, so it is
+        framed "⚠️ Cronjob Failed" and not under the "✅ Cronjob Response"
+        success header (noise r4, t_6bedca00)."""
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(False, "# output", "", "Script exited with code 1")), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_called_once()
+        assert deliver_mock.call_args.kwargs.get("success") is False
+
+    def test_successful_job_delivers_with_success_framing(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "3 items merged.", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_called_once()
+        assert deliver_mock.call_args.kwargs.get("success") is True
+
+    def test_exception_path_delivers_with_failure_framing(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", side_effect=RuntimeError("boom")), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_called_once()
+        assert deliver_mock.call_args.kwargs.get("success") is False
+
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
