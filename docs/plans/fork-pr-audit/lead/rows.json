@@ -6453,8 +6453,8 @@
   "auditor": "DROP",
   "adv": "stands",
   "adv_new": null,
-  "final": "DROP",
-  "why": "adversary: stands",
+  "final": "KEEP",
+  "why": "ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): #164 renamed the A-floor to _signature_partition, not removed it; live on origin/main (compaction_stats.py:959-982), fired 6x in prod logs 09-19..25, and #106 (KEEP) depends on it. (slice card t_6b6df0eb)",
   "x": {
    "branch": null,
    "evidence": {
@@ -16158,8 +16158,8 @@
   "auditor": "KEEP",
   "adv": "keep-unproven",
   "adv_new": "KEEP-UNPROVEN",
-  "final": "DROP",
-  "why": "LEAD: KEEP-UNPROVEN with no positive fire count, no executed upstream RED, no live knob/consumer/registry entry found in the row evidence -> DROP per rule (unmeasured \"still needed\" is not a KEEP).",
+  "final": "KEEP",
+  "why": "ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): follows #562: #589 only single-sources the creator-stamp rule of the #562/#568 stack (slice worker caveat). Branch audit/gateway/revert-589 (c2c77036a7) must not merge. (slice card t_5d546222)",
   "x": {
    "verdict": "KEEP",
    "problem": "kanban creator-stamp shape rule duplicated",
@@ -16291,8 +16291,8 @@
   "auditor": "KEEP",
   "adv": "keep-unproven",
   "adv_new": "KEEP-UNPROVEN",
-  "final": "DROP",
-  "why": "LEAD: KEEP-UNPROVEN with no positive fire count, no executed upstream RED, no live knob/consumer/registry entry found in the row evidence -> DROP per rule (unmeasured \"still needed\" is not a KEEP).",
+  "final": "KEEP",
+  "why": "ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): structural base of merged #566/#568/#682 (resolve_wake_participant / _live_chat_participants); git revert conflicts, and #682 records a field-observed phantom session this path prevents. (slice card t_7ea0fe09)",
   "x": {
    "verdict": "KEEP",
    "problem": "kanban wake minted a phantom session for an identity-less sub",
@@ -20536,8 +20536,8 @@
   "auditor": "KEEP",
   "adv": "keep-unproven",
   "adv_new": "KEEP-UNPROVEN",
-  "final": "DROP",
-  "why": "LEAD: KEEP-UNPROVEN with no positive fire count, no executed upstream RED, no live knob/consumer/registry entry found in the row evidence -> DROP per rule (unmeasured \"still needed\" is not a KEEP).",
+  "final": "KEEP",
+  "why": "ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): the root config and 12 profile configs (13) set telegram network_retry_max: 20 / network_retry_max_delay: 120 and fork/main passes them to the adapter; a revert silently drops every profile to upstream's hardcoded 10 retries / 60s cap. (slice card t_2e862bc6)",
   "x": {
    "verdict": "KEEP",
    "problem": "Telegram network-reconnect ladder not configurable",
@@ -27705,8 +27705,8 @@
   "auditor": "DROP",
   "adv": "stands",
   "adv_new": "DROP",
-  "final": "DROP",
-  "why": "adversary: stands",
+  "final": "KEEP",
+  "why": "ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): PR #1200 (the revert) went CI-red: af43fd64ff test_cron_auto_model relies on the gpt-5.5 -> openai-codex alias (4 failures). Close #1200 unmerged; branch audit/hermes_cli/revert-36134d8944 must not merge. (slice card t_b865b149)",
   "x": {
    "verdict": "DROP",
    "problem": "fix(model): route bare gpt-5.5 to Codex OAuth \u2014 Ace expects '/model gpt-5.5' to mean the subscription-backed OpenAI Codex route, not OpenAI API or an aggregator slug. Add a built-in direct alias for bare 'gpt-5.5' -> provider 'openai-codex', model 'gpt-5.5', while preserving explicit '/model openai-api:gpt-5.5' for the API rou",
@@ -30412,8 +30412,8 @@
   "auditor": "DROP",
   "adv": "stands",
   "adv_new": null,
-  "final": "DROP",
-  "why": "adversary: stands",
+  "final": "KEEP",
+  "why": "ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): #954 (merged after the audit) imports ci_overflow_acceptance from ci_overflow_integration.py:30; the rebased revert fails with ModuleNotFoundError (reproduced). Branch audit/scripts_misc/revert-ci-overflow-phase0 must not merge. (slice card t_7bc9ce6e)",
   "x": {
    "branch": "audit/scripts_misc/revert-ci-overflow-phase0",
    "evidence": {
@@ -33261,8 +33261,8 @@
   "auditor": "KEEP",
   "adv": "keep-unproven",
   "adv_new": "KEEP",
-  "final": "DROP",
-  "why": "LEAD: repair path for DBs that drifted in June, all repaired; 0 fires since. New DBs are created with the correct schema.",
+  "final": "KEEP",
+  "why": "ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): a full revert corrupts FTS (probe on a copy of shopper lcm.db: \"database disk image is malformed\"); the commit's drop-then-recreate-on-missing keeps trigger order correct, so reverting would ship the drifted trigger spec to new DBs. (slice card t_c335830a)",
   "x": {
    "verdict": "KEEP",
    "problem": "msg_fts_* triggers existed by name but referenced the dropped `content` column after the content->search_content rename; name-only health check reported healthy while every INSERT aborted.",
@@ -37434,8 +37434,8 @@
   "auditor": "DROP",
   "adv": "stands",
   "adv_new": null,
-  "final": "DROP",
-  "why": "adversary: stands",
+  "final": "KEEP",
+  "why": "ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): apollo@daemonarchy.local entry only: not stale, Apollo committed under it on 2026-09-22 and PR #872's attribution check passed only via this mapping. The 2 nopr:40a6040932 lines stay DROP on audit/scripts_misc/revert-author-map-stale @4053ee9081. (slice card t_8ff394b6)",
   "x": {
    "branch": "audit/scripts_misc/revert-author-map-stale",
    "evidence": {
