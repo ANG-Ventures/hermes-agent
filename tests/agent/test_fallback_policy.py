@@ -1571,3 +1571,78 @@ def test_eligibility_cache_follows_session_rotation(monkeypatch, provider, kwarg
     assert len(seen) == 3 and seen[2][kwarg] == expect("sid-newer")
     _fw._eligibility_fn(agent)()          # still at most one GET per (turn, route)
     assert len(seen) == 3
+
+
+def _break_activation_after_switch(monkeypatch):
+    """Raise inside try_activate_fallback AFTER the runtime fields and client
+    were swapped (the credential-pool rebind), so the outer ``except`` runs
+    on a half-switched agent."""
+    import agent.agent_runtime_helpers as arh
+
+    def _boom(agent):
+        raise RuntimeError("fallback activation broke after the switch")
+
+    monkeypatch.setattr(arh, "sync_credential_pool_entry_id", _boom)
+
+
+def _route_fields(agent):
+    return (agent.provider, agent.model, agent.base_url, agent.api_mode,
+            agent.requested_provider, bool(getattr(agent, "_fallback_activated", False)),
+            agent.client.tag, dict(agent._client_kwargs), agent.api_key,
+            getattr(agent, "_provider_fallback_active", False))
+
+
+def test_failed_activation_at_chain_end_restores_pre_switch_runtime(wired, monkeypatch):
+    """t_dce419d4: activation raises after the swap on the ONLY fallback ->
+    False, and the agent is still on the primary it was on (no half-switch)."""
+    home, _ = wired
+    a = _wired_agent()
+    a.api_key = "primary-key"
+    before = _route_fields(a)
+    _break_activation_after_switch(monkeypatch)
+    assert _fail(a, CONN()) is False
+    assert _route_fields(a) == before
+    assert (a.provider, a.model) == FABLE and a._fallback_activated is False
+    assert _ac._runtime_main_value("provider") in ("", FABLE[0])
+    assert _rows(home, "failover") == []
+
+
+def test_failed_activation_restores_before_trying_next_entry(wired, monkeypatch):
+    """The next chain entry is evaluated against the runtime that actually
+    failed, not the broken half-activated one."""
+    import agent.agent_runtime_helpers as arh
+
+    home, _ = wired
+    a = _wired_agent()
+    a._fallback_chain = [{"provider": OPUS[0], "model": OPUS[1]},
+                         {"provider": "openai-codex", "model": "gpt-5.5"}]
+    real = arh.sync_credential_pool_entry_id
+    seen = []
+
+    def _boom_on_opus(agent):
+        seen.append((agent.provider, agent.model))
+        if agent.model == OPUS[1]:
+            raise RuntimeError("opus activation broke")
+        return real(agent)
+
+    monkeypatch.setattr(arh, "sync_credential_pool_entry_id", _boom_on_opus)
+    assert _fail(a, CONN()) is True
+    assert (a.provider, a.model) == ("openai-codex", "gpt-5.5")
+    [row] = _rows(home, "failover")
+    assert (row["from_provider"], row["from_model"]) == FABLE
+
+
+def test_resume_reports_primary_truthfully_when_activation_raises(wired, monkeypatch):
+    """resume_sticky_fallback treats False as 'stayed on primary'; the rebuilt
+    agent must then actually BE on the primary route."""
+    home, _ = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True                          # arm sticky episode
+    b = _wired_agent()
+    b.api_key = "primary-key"
+    before = _route_fields(b)
+    _break_activation_after_switch(monkeypatch)
+    assert _fw.decide_rebuild_for_agent(b) == "primary"
+    assert _route_fields(b) == before
+    assert b._fallback_index == 0
+    assert _rows(home, "sticky_resume") == []
