@@ -1022,6 +1022,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
+    p_schedule_wake = p_schedule.add_mutually_exclusive_group()
+    p_schedule_wake.add_argument(
+        "--at", default=None, metavar="TS",
+        help="Timed wake: epoch seconds or ISO-8601 (naive = local time). The "
+             "dispatcher returns the card to ready on its first tick at/after TS. "
+             "Works on an already-scheduled card.",
+    )
+    p_schedule_wake.add_argument(
+        "--now", action="store_true",
+        help="Timed wake at now: the dispatcher returns the card to ready on its next tick",
+    )
 
     p_unblock = sub.add_parser(
         "unblock",
@@ -4425,20 +4436,47 @@ def _cmd_block(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _parse_wake_at(value: str) -> int:
+    """``--at`` value -> epoch seconds. Accepts epoch digits or ISO-8601
+    (a naive timestamp is local time, like every other human-typed time)."""
+    value = (value or "").strip()
+    if value.isdigit():
+        return int(value)
+    from datetime import datetime
+
+    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+
+
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    wake_at: Optional[int] = None
+    if getattr(args, "now", False):
+        wake_at = int(time.time())
+    elif getattr(args, "at", None):
+        try:
+            wake_at = _parse_wake_at(args.at)
+        except ValueError:
+            print(f"invalid --at {args.at!r} (epoch seconds or ISO-8601)", file=sys.stderr)
+            return 1
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            current = kb.get_task(conn, tid)
+            # An already-scheduled card only gets its wake time (re)set; the
+            # old path refused it outright, leaving no timed exit.
+            already = (
+                current is not None and current.status == "scheduled"
+                and wake_at is not None
+            )
             if reason:
                 _run_id, _sess_ref = safe_comment_provenance(tid)
                 kb.add_comment(
                     conn, tid, author, f"SCHEDULED: {reason}",
                     run_id=_run_id, session_ref=_sess_ref,
                 )
-            if not kb.schedule_task(
+            if not already and not kb.schedule_task(
                 conn,
                 tid,
                 reason=reason,
@@ -4446,8 +4484,20 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
-            else:
+                continue
+            if not already:
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+            if wake_at is None:
+                continue
+            ok, err = kb.set_schedule_wake(
+                conn, tid, wake_at=wake_at, actor=author, reason=reason,
+            )
+            if not ok:
+                failed.append(tid)
+                print(f"cannot set wake for {tid}: {err}", file=sys.stderr)
+            else:
+                when = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(wake_at))
+                print(f"Wake set {tid} at {when} (dispatcher promotes on its next tick at/after)")
     return 0 if not failed else 1
 
 
@@ -4970,6 +5020,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": child, "parent_id": parent}
                 for (child, parent) in res.stranded_by_triage
             ],
+            "woken_scheduled": list(getattr(res, "woken_scheduled", []) or []),
+            "unwoken_scheduled": [
+                {"task_id": tid, "parked_seconds": age}
+                for (tid, age) in getattr(res, "unwoken_scheduled", []) or []
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -5128,6 +5183,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # just stops mutating the board it is only supposed to observe.
     _print_review_awaiting_human(alert=not args.dry_run)
     _print_stranded_by_triage(res.stranded_by_triage)
+    if getattr(res, "woken_scheduled", None):
+        print(f"Woken (timed schedule elapsed): {', '.join(res.woken_scheduled)}")
+    unwoken = kb.format_unwoken_scheduled(getattr(res, "unwoken_scheduled", None))
+    if unwoken:
+        print(unwoken)
     return 0
 
 

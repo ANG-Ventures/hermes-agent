@@ -12995,9 +12995,14 @@ def promote_task(
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
+        hint = (
+            f" (a scheduled card wakes with 'hermes kanban unblock {task_id}'"
+            f" or 'hermes kanban schedule {task_id} --now|--at TS')"
+            if cur_status == "scheduled" else ""
+        )
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo' or 'blocked'{hint}"
         )
 
     if not force:
@@ -13132,7 +13137,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            # A scheduled card's ``next_eligible_at`` is its timed-wake stamp
+            # (``set_schedule_wake``); once it leaves ``scheduled`` a stale
+            # value must not read as a rate-limit cooldown on the ready card.
+            "next_eligible_at = CASE WHEN status = 'scheduled' "
+            "THEN NULL ELSE next_eligible_at END "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -14832,6 +14842,143 @@ def schedule_task(
         return True
 
 
+# Scheduled cards with no timed wake (``next_eligible_at IS NULL``) wait on a
+# named event only a human/automation will act on. Past this age they are
+# reported every dispatch tick instead of rotting silently (t_6915068e).
+SCHEDULED_UNWOKEN_THRESHOLD_SECONDS = 24 * 3600
+
+
+@_home_session_guarded("schedule")
+def set_schedule_wake(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    wake_at: int,
+    actor: str,
+    reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Give a ``scheduled`` card a timed wake: the dispatcher returns it to
+    ``ready`` (``todo`` while parents are open) on its first tick at or after
+    ``wake_at`` via :func:`wake_due_scheduled`.
+
+    Before this there was no timed exit from ``scheduled``: a card parked on
+    a date sat there until someone remembered to ``unblock`` it. The stamp
+    lives in ``next_eligible_at`` (the dispatcher's existing eligibility
+    column); ``unblock_task`` clears it when the card leaves ``scheduled``.
+
+    Returns ``(True, None)`` on success, ``(False, reason)`` if refused.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        if row["status"] != "scheduled":
+            return False, (
+                f"task {task_id} is {row['status']!r}; a wake time only "
+                f"applies to 'scheduled' tasks"
+            )
+        cur = conn.execute(
+            "UPDATE tasks SET next_eligible_at = ? "
+            "WHERE id = ? AND status = 'scheduled'",
+            (int(wake_at), task_id),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} changed state concurrently; retry"
+        _append_event(
+            conn, task_id, "schedule_wake_set",
+            {"actor": actor, "reason": reason, "wake_at": int(wake_at)},
+        )
+    return True, None
+
+
+def wake_due_scheduled(
+    conn: sqlite3.Connection, *, now: Optional[int] = None,
+) -> list[str]:
+    """Wake every ``scheduled`` card whose timed wake has passed.
+
+    Each card goes through :func:`unblock_task` (same parent re-gate, same
+    ``unblocked`` event, same stale-run recovery as the operator verb), then
+    gets a ``schedule_elapsed`` event naming the wake time so the audit trail
+    says WHY it moved. Cards with ``next_eligible_at IS NULL`` are never
+    touched: they wait on an event, and :func:`find_unwoken_scheduled`
+    reports them instead. Returns the woken ids.
+    """
+    now = int(time.time()) if now is None else int(now)
+    due = conn.execute(
+        "SELECT id, next_eligible_at FROM tasks "
+        "WHERE status = 'scheduled' AND next_eligible_at IS NOT NULL "
+        "AND next_eligible_at <= ? ORDER BY next_eligible_at, id",
+        (now,),
+    ).fetchall()
+    woken: list[str] = []
+    for row in due:
+        if not unblock_task(conn, row["id"]):
+            continue
+        with write_txn(conn):
+            _append_event(
+                conn, row["id"], "schedule_elapsed",
+                {"wake_at": int(row["next_eligible_at"]), "woken_at": now},
+            )
+        woken.append(row["id"])
+    return woken
+
+
+def find_unwoken_scheduled(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    threshold_seconds: int = SCHEDULED_UNWOKEN_THRESHOLD_SECONDS,
+) -> list[tuple[str, int]]:
+    """Return ``(task_id, parked_seconds)`` for ``scheduled`` cards with NO
+    timed wake that have been parked at least ``threshold_seconds``.
+
+    Such a card waits on a named event in its body; nothing in the dispatcher
+    will ever move it, so without this read it rots silently (t_dab7ed4e sat
+    32h past its gate on 2026-09-26). Parked-since is the latest ``scheduled``
+    event, falling back to ``created_at``. Pure read; ordered oldest first.
+    """
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT t.id AS id, COALESCE(("
+        "  SELECT MAX(e.created_at) FROM task_events e "
+        "  WHERE e.task_id = t.id AND e.kind = 'scheduled'"
+        "), t.created_at) AS parked_at "
+        "FROM tasks t "
+        "WHERE t.status = 'scheduled' AND t.next_eligible_at IS NULL",
+    ).fetchall()
+    out = [
+        (r["id"], now - int(r["parked_at"] or now))
+        for r in rows
+        if now - int(r["parked_at"] or now) >= int(threshold_seconds)
+    ]
+    out.sort(key=lambda item: (-item[1], item[0]))
+    return out
+
+
+def format_unwoken_scheduled(entries) -> str:
+    """One operator-facing line (plus per-card lines) for
+    :func:`find_unwoken_scheduled` output; ``""`` when there is nothing.
+    Shared by the CLI dispatch report and the gateway dispatcher warning."""
+    entries = list(entries or [])
+    if not entries:
+        return ""
+    lines = [
+        f"STRANDED: {len(entries)} scheduled task(s) have no timed wake "
+        f"(next_eligible_at NULL) and have been parked >= "
+        f"{SCHEDULED_UNWOKEN_THRESHOLD_SECONDS // 3600}h — nothing will "
+        f"wake them:"
+    ]
+    for tid, age in entries:
+        lines.append(f"  - {tid} parked {int(age) // 3600}h")
+    lines.append(
+        "  wake with: hermes kanban unblock <id>  |  "
+        "hermes kanban schedule <id> --now|--at TS"
+    )
+    return "\n".join(lines)
+
+
 # Dispatcher (one-shot pass)
 # ---------------------------------------------------------------------------
 
@@ -15607,6 +15754,13 @@ class DispatchResult:
     worker/operator handoff intentionally remains sticky until an explicit
     unblock. Surfaced so a zero-promotion tick names the hold instead of
     silently reporting ``promoted=0``."""
+    woken_scheduled: list[str] = field(default_factory=list)
+    """``scheduled`` task ids whose timed wake (``next_eligible_at``) passed
+    this tick and were returned to ``ready``/``todo`` by ``wake_due_scheduled``."""
+    unwoken_scheduled: list[tuple[str, int]] = field(default_factory=list)
+    """``(task_id, parked_seconds)`` for ``scheduled`` cards with NO timed wake
+    parked past ``SCHEDULED_UNWOKEN_THRESHOLD_SECONDS`` — nothing will ever
+    move them; see ``find_unwoken_scheduled``."""
     stranded_by_triage: list[tuple[str, str]] = field(default_factory=list)
     """``(child_id, parent_id)`` pairs where a ``todo`` card is held ONLY
     because a parent sits in ``triage``/``blocked`` — i.e. behind a card that
@@ -19476,6 +19630,10 @@ def _dispatch_once_locked(
     _reevaluate_pr_gates_for_tick(
         conn, result, dry_run=dry_run, prefetched=pr_gate_prefetch,
     )
+    # Timed wakes BEFORE recompute_ready so a woken card whose parents are
+    # done is spawnable this tick. Skipped under dry_run (the SAFE probe).
+    if not dry_run:
+        result.woken_scheduled = wake_due_scheduled(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
     # Explicit human holds whose graph dependencies are already satisfied.
     # Computed after promotion so creation-source dependency holds have left
@@ -19485,6 +19643,8 @@ def _dispatch_once_locked(
     # Computed AFTER recompute_ready so anything promotable this tick has
     # already left ``todo`` and can't be mis-reported as stranded.
     result.stranded_by_triage = find_stranded_by_triage(conn)
+    # Scheduled cards nothing will ever wake (no timed wake, parked > 24h).
+    result.unwoken_scheduled = find_unwoken_scheduled(conn)
 
     # Fan-out brake: per-board rolling-window USD ceiling. Evaluated AFTER all
     # reclaim/promotion bookkeeping so a paused board stays accurate on the
