@@ -258,12 +258,14 @@ def test_vendor_prefixed_override_forces_provider_on_spawn(
         encoding="utf-8",
     )
     with kb.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="sonnet task",
-            assignee="worker",
-            model_override="claude-apx-6/claude-sonnet-4-5",
+        tid = kb.create_task(conn, title="sonnet task", assignee="worker")
+        # Legacy row: writers refuse single-sub pins now (t_141135aa), but rows
+        # written before that still dispatch and must keep the prefix split.
+        conn.execute(
+            "UPDATE tasks SET model_override=? WHERE id=?",
+            ("claude-apx-6/claude-sonnet-4-5", tid),
         )
+        conn.commit()
         task = kb.get_task(conn, tid)
 
     argv = _spawn_argv_for(monkeypatch, task)

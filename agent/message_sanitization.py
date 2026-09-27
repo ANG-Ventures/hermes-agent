@@ -433,6 +433,37 @@ def close_interrupted_tool_sequence(
     return True
 
 
+def is_interrupt_close_row(msg: Any) -> bool:
+    """True for a harness-authored interrupt-close assistant row."""
+    return (
+        isinstance(msg, dict)
+        and msg.get("role") == "assistant"
+        and (
+            msg.get("_interrupt_close") is True
+            or msg.get("finish_reason") == _INTERRUPT_CLOSE_FINISH_REASON
+        )
+    )
+
+
+def provider_owns_transcript(provider: Any) -> bool:
+    """Whether the provider profile for ``provider`` opts out of receiving
+    interrupt-close rows (``ProviderProfile.owns_transcript``).
+
+    A relay over a resident CLI session keeps its own transcript and refuses
+    to resume when the client history carries an assistant reply it never
+    produced; the interrupt-close placeholder is exactly that (one
+    full-history re-mint per gateway restart per session, 2026-09-25).
+    Fail-open: any lookup problem means the row is sent as before.
+    """
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(str(provider or ""))
+    except Exception:
+        return False
+    return bool(getattr(profile, "owns_transcript", False))
+
+
 def _strip_non_ascii(text: str) -> str:
     """Remove non-ASCII characters, replacing with closest ASCII equivalent or removing.
 

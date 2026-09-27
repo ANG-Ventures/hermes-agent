@@ -307,6 +307,76 @@ def _failure_streak_nudge(job: dict) -> str:
     )
 
 
+# A no_agent job whose script fails with the byte-identical error this many
+# ticks in a row is stuck, not flaky: page ONCE with the full cause and a fix
+# hint, then stay quiet until the error changes or the job recovers
+# (t_04822736 — agent-browser-gc failed identically for 19 hourly ticks and
+# every per-tick alert was a truncated one-liner that never named the cause).
+_REPEATED_ERROR_PAGE_TICKS = 3
+
+_REPEATED_ERROR_FIX_HINTS = (
+    (
+        "blocked: script path resolves outside the scripts directory",
+        "The job's script (or a symlink to it) resolves outside this "
+        "profile's scripts/ dir. Put the file in the profile's scripts/, or "
+        "symlink it from there into the shared <hermes root>/scripts/ (the "
+        "only escape the guard admits).",
+    ),
+    (
+        "script not found",
+        "The script file is missing — restore it, or point the job at the "
+        "right file with `hermes cron edit {job_id} --script <file>`.",
+    ),
+    (
+        "script timed out",
+        "The script hangs every tick — fix the hang, or raise the job's "
+        "timeout if the work is genuinely slow.",
+    ),
+)
+
+
+def _repeated_script_error_page(job: dict, error: str | None) -> str | None:
+    """Alert-once gate for a no_agent job stuck on the same error.
+
+    Returns ``None`` to leave normal per-run failure delivery untouched, the
+    one-time page text when this run is the Nth consecutive identical failure
+    (N = ``_REPEATED_ERROR_PAGE_TICKS``), or ``""`` (suppress) for every
+    identical failure after that. Any change of error string, or a success,
+    resets ``error_repeat_streak`` in ``mark_job_run`` so the next distinct
+    failure alerts normally again. Read before ``mark_job_run`` records this
+    run, hence the prospective +1.
+    """
+    if not job.get("no_agent") or not error:
+        return None
+    if job.get("last_status") == "error" and job.get("last_error") == error:
+        streak = int(job.get("error_repeat_streak") or 0) + 1
+    else:
+        streak = 1
+    if streak < _REPEATED_ERROR_PAGE_TICKS:
+        return None
+    if streak > _REPEATED_ERROR_PAGE_TICKS:
+        return ""
+    job_id = job.get("id") or "<job_id>"
+    job_name = job.get("name") or job_id
+    cause = str(error).strip()
+    if len(cause) > 1500:
+        cause = cause[:1500] + " …"
+    lower = cause.lower()
+    hint = next(
+        (h for needle, h in _REPEATED_ERROR_FIX_HINTS if needle in lower),
+        "Fix the script, then verify with `hermes cron run {job_id}`; or "
+        "pause it with `hermes cron pause {job_id}`.",
+    ).format(job_id=job_id)
+    return (
+        f"🚨 Cron '{job_name}' ({job_id}) is stuck: its script has failed "
+        f"with the same error {streak} runs in a row.\n\n"
+        f"Cause: {cause}\n\n"
+        f"Fix: {hint}\n\n"
+        "Further identical failures are not paged; you will hear again "
+        "when the error changes."
+    )
+
+
 def _detect_gateway_code_skew() -> tuple[str, str] | None:
     """Boot-vs-disk revision skew for THIS process, or None.
 
@@ -870,6 +940,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
+    LATE_FIRE_KEY,
     AmbiguousJobReference,
     _ensure_cron_dir,
     advance_next_run,
@@ -1517,6 +1588,7 @@ def mark_running_jobs_interrupted(
     reason: str,
     *,
     only_owners: Optional[set] = None,
+    lock_timeout: Optional[float] = None,
 ) -> list:
     """Best-effort: mark every currently in-flight cron job interrupted.
 
@@ -1545,6 +1617,14 @@ def mark_running_jobs_interrupted(
     own jobs) are left untouched. Interruption flags are recorded per
     execution token, so a later run of the same job ID never consumes a
     stale flag that targeted its dead predecessor.
+
+    ``lock_timeout``: bound on each job's fire-fence wait. The fence is held
+    by the job's own thread across delivery, and in the gateway that
+    delivery waits on the event loop — so an unbounded wait from a
+    loop-adjacent caller can deadlock until the delivery future times out
+    (t_8d085477). A timed-out mark fails closed exactly like the legacy
+    flock timeout: the in-memory interrupt flag above is still recorded, only
+    the persisted ``last_status`` write is skipped.
 
     Returns the list of job IDs marked, for the caller to log.
     """
@@ -1591,6 +1671,7 @@ def mark_running_jobs_interrupted(
                     False,
                     reason,
                     expected_fire_owner=fire_owner,
+                    lock_timeout=lock_timeout,
                 ):
                     marked.append(job_id)
         except Exception as e:
@@ -3031,7 +3112,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
         result = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=_get_bot_chat_delivery_timeout(),
             env=env,
             creationflags=windows_hide_flags(),
@@ -4753,6 +4834,78 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _shared_scripts_dir(home: Path) -> Optional[Path]:
+    """Resolved ``<root>/scripts`` when *home* is a named profile, else None.
+
+    A named profile home is ``<root>/profiles/<name>``; its fleet-shared
+    scripts dir is the default root's ``scripts/``. The default (root) home
+    has no separate shared dir — its own scripts dir already is the shared one.
+    """
+    try:
+        from hermes_constants import named_profile_home
+
+        resolved = home.resolve()
+        if named_profile_home(resolved) != resolved:
+            return None
+        return (resolved.parent.parent / "scripts").resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _script_path_admitted(
+    path: Path, lexical: Path, scripts_dir: Path, home: Path
+) -> bool:
+    """Whether a resolved cron script path passes the scripts-dir guard.
+
+    *path* is the fully resolved target, *lexical* the absolute, ``..``
+    normalised but NOT symlink-resolved path. Admitted when the realpath is
+    inside the profile's own scripts dir, or when the entry sits lexically in
+    that dir and resolves (via symlink) into the fleet-shared
+    ``<root>/scripts``. ``..`` traversal, absolute paths and symlinks
+    pointing anywhere else stay refused.
+    """
+    scripts_dir_resolved = scripts_dir.resolve()
+    if _path_within(path, scripts_dir_resolved):
+        return True
+    shared = _shared_scripts_dir(home)
+    if shared is None or shared == scripts_dir_resolved:
+        return False
+    lexically_in_profile = _path_within(
+        lexical, Path(os.path.abspath(scripts_dir))
+    ) or _path_within(lexical, scripts_dir_resolved)
+    return lexically_in_profile and _path_within(path, shared)
+
+
+# Fleet default GitHub lane for cron script children (t_f0780685). A plain script
+# that ran a bare `gh` without naming a lane spent the shared stored login, and
+# every new agent-authored cron script re-opened that until someone noticed.
+# When this home ships the gh shim (var/gh-shim/gh), the child gets the shim
+# first on PATH plus a DEFAULT lane the shim uses only when the script sets no
+# lane itself (export / setdefault still win), and the script's path so the shim
+# keeps audited stored-login sites (gh-stored-login-scopes.json) on the stored
+# login. No shim -> the env is untouched. github-apps-lint reads this constant.
+CRON_SCRIPT_DEFAULT_GH_LANE = "watchers"
+
+
+def _apply_cron_default_gh_lane(env: dict, script: Path) -> None:
+    shim_dir = _get_hermes_home() / "var" / "gh-shim"
+    if not os.access(shim_dir / "gh", os.X_OK):
+        return
+    first = str(shim_dir)
+    rest = [p for p in env.get("PATH", "").split(os.pathsep) if p and p != first]
+    env["PATH"] = os.pathsep.join([first] + rest)
+    env.setdefault("HERMES_GH_LANE_DEFAULT", CRON_SCRIPT_DEFAULT_GH_LANE)
+    env["HERMES_CRON_SCRIPT"] = str(script)
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -4824,15 +4977,19 @@ def _run_job_script(
         # the scheduler with an unhandled exception.
         return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
     if raw.is_absolute():
+        lexical = Path(os.path.abspath(raw))
         path = raw.resolve()
     else:
+        lexical = Path(os.path.abspath(scripts_dir / raw))
         path = (scripts_dir / raw).resolve()
 
     # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
+    # escape — scripts MUST reside within HERMES_HOME/scripts/. One exception:
+    # an entry that lives (lexically) in a named profile's scripts dir and is
+    # a symlink into the fleet-shared <root>/scripts is admitted — profiles
+    # legitimately share scripts, and refusing that symlink left a job failing
+    # identically every tick for 19 h (t_04822736).
+    if not _script_path_admitted(path, lexical, scripts_dir, _get_hermes_home()):
         return False, (
             f"Blocked: script path resolves outside the scripts directory "
             f"({scripts_dir_resolved}): {script_path!r}"
@@ -4907,6 +5064,21 @@ def _run_job_script(
                 "errors": "replace",
             }
         env = build_subprocess_env()
+        # A script child is a plain script, not an agent process. The gateway
+        # advertises itself via AI_AGENT / HERMES_AGENT in its OWN os.environ
+        # (gateway.run.main), so without this every cron script inherited the
+        # agent marker and fleet tooling keyed on it (the gh shim's profile-wins
+        # lane resolution) misclassified laned no_agent crons as the gateway
+        # profile (t_7fee0f83). Any agent a script launches re-advertises itself.
+        for _agent_marker in ("AI_AGENT", "HERMES_AGENT"):
+            env.pop(_agent_marker, None)
+        # Same reason for the gateway's agent.process_env_files overlay (the gh
+        # lane PATH shim + git credential helper, t_45c11886): a script child
+        # keeps the env it had before this gateway sourced those files.
+        from hermes_cli.process_env_files import strip_overlay
+
+        strip_overlay(env)
+        _apply_cron_default_gh_lane(env, path)
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
@@ -5137,6 +5309,11 @@ def _build_job_prompt(
     user_prompt = str(job.get("prompt") or "")
     if extra_prompt:
         user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
+    # One-shot fired late by the restart catch-up (t_9bfdd7e3): say so up
+    # front so the agent re-checks a time-sensitive action before taking it.
+    from cron.jobs import late_fire_note
+    if job.get(LATE_FIRE_KEY):
+        user_prompt = f"{late_fire_note(job[LATE_FIRE_KEY])}\n\n{user_prompt}"
     prompt = user_prompt
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
@@ -6913,6 +7090,15 @@ def run_job(
                 resolve_exc,
             )
             fb_list = get_fallback_chain(_cfg)
+            # A job that declares its OWN ``fallback`` chain must get that chain
+            # here too, not only mid-run. Otherwise a primary that fails at
+            # resolve time (e.g. "Codex credential is in cooldown") walks the
+            # GLOBAL chain and the job's declared, pool-diverse net is never
+            # consulted (debug-log-analysis / weekly-pr-sweep: codex cooldown ->
+            # global claude-bpr rung -> HTTP 503 "no eligible sub", 2026-09-21).
+            # Jobs without their own chain keep the global chain unchanged.
+            if job.get("fallback"):
+                fb_list = _resolve_job_fallback_chain(job, fb_list, job_id) or []
             runtime = None
             for entry in fb_list:
                 if not isinstance(entry, dict):
@@ -7093,12 +7279,6 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
-        # Keep execution identity separate from delivery routing: these fields
-        # label the cron job in telemetry; origin/targets still drive delivery.
-        _cron_chat_id = str(job_id or "").strip()
-        _cron_job_name = str(job.get("name") or "").strip()
-        _cron_chat_label = _cron_job_name or _cron_chat_id
-        _cron_chat_name = f"cron / {_cron_chat_label}" if _cron_chat_label else ""
         # Initialize the SQLite session store so cron job messages are
         # persisted and discoverable via session_search (same pattern as
         # gateway/run.py) — only now, after every early-return path
@@ -7186,8 +7366,6 @@ def run_job(
             skip_memory=False,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
-            chat_id=_cron_chat_id or "",
-            chat_name=_cron_chat_name or "",
             session_id=_cron_session_id,
             session_db=_session_db,
         )
@@ -8337,10 +8515,14 @@ def _run_one_job_body(
                     if incident_acked and not drift_skip:
                         deliver_content = ""
                     else:
-                        deliver_content = (
-                            _summarize_cron_failure_for_delivery(job, error)
-                            + _failure_streak_nudge(job)
-                        )
+                        _stuck_page = _repeated_script_error_page(job, error)
+                        if _stuck_page is not None:
+                            deliver_content = _stuck_page
+                        else:
+                            deliver_content = (
+                                _summarize_cron_failure_for_delivery(job, error)
+                                + _failure_streak_nudge(job)
+                            )
                 if drift_skip and not success:
                     # Drift-skip alert: bypass the generic summarizer's
                     # 180-char truncation (it would eat the remediation
@@ -8555,8 +8737,12 @@ def _run_one_job_body(
             incident_acked, failure_incident_id = _upsert_incident_for_failure(
                 job, _err_text
             )
+            _stuck_page = _repeated_script_error_page(job, _err_text)
             if incident_acked:
                 delivery_outcome = "suppressed_acked"
+            elif _stuck_page == "":
+                # Same alert-once gate as the normal failure path above.
+                pass
             else:
                 try:
                     delivery_attempted = True
@@ -8568,8 +8754,11 @@ def _run_one_job_body(
                         # run body every tick builds a streak nobody is ever told
                         # about: its alerts only ever leave through here, and the
                         # nudge only ever left through there (#88655).
-                        _summarize_cron_failure_for_delivery(job, _err_text)
-                        + _failure_streak_nudge(job),
+                        _stuck_page
+                        or (
+                            _summarize_cron_failure_for_delivery(job, _err_text)
+                            + _failure_streak_nudge(job)
+                        ),
                         adapters=adapters,
                         loop=loop,
                     )
@@ -8690,6 +8879,39 @@ _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
 _last_dead_owner_reap_at: Optional[float] = None
 
 
+def _deliver_missed_oneshot_notices(adapters=None, loop=None) -> int:
+    """Deliver queued MISSED notices for one-shots the due-scan retired.
+
+    The due-scan runs under the jobs lock and only queues them; delivery is
+    framed as a failure (success=False) to the job's own deliver target so a
+    one-shot that never ran is loud, not a success-looking line in
+    cron/output. Best-effort: delivery errors are logged, never raised.
+    """
+    from cron.jobs import drain_missed_oneshot_notices
+
+    delivered = 0
+    for notice in drain_missed_oneshot_notices():
+        job = notice.get("job") or {}
+        try:
+            err = _deliver_result(
+                job, notice.get("text") or "", success=False,
+                adapters=adapters, loop=loop,
+            )
+            if err:
+                logger.error(
+                    "Job '%s': MISSED one-shot notice failed to deliver: %s",
+                    job.get("id", "?"), err,
+                )
+            else:
+                delivered += 1
+        except Exception as exc:
+            logger.error(
+                "Job '%s': MISSED one-shot notice delivery raised: %s",
+                job.get("id", "?"), exc,
+            )
+    return delivered
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -8723,6 +8945,7 @@ def tick(
     # exhaustion — must NOT be swallowed as "another instance holds the
     # lock": that previously made the scheduler appear healthy (tick returned
     # 0, heartbeat recorded success) while no job ever ran again (#87644).
+    _dispatch_release = None
     lock_fd = None
     try:
         lock_fd = open(lock_file, "w", encoding="utf-8")
@@ -8775,6 +8998,16 @@ def tick(
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
+        # Shared-checkout admission hold (gateway/checkout_admission.py): a
+        # gate exposing ``admit()`` returns a release callable that must span
+        # the whole dispatch window, so a hold engaged mid-tick still sees
+        # every job this tick registers (get_running_job_ids) or refuses it.
+        _dispatch_admit = getattr(can_dispatch, "admit", None)
+        if callable(_dispatch_admit):
+            _dispatch_release = _dispatch_admit()
+            if _dispatch_release is None:
+                logger.debug("Cron dispatch refused by shared-checkout admission hold")
+                return 0
 
         # Dead-owner claim reclaim (#86721): execution rows carry their owner
         # pid + process start time, but recovery previously ran only at
@@ -8808,6 +9041,7 @@ def tick(
                 logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 
         due_jobs = get_due_jobs()
+        _deliver_missed_oneshot_notices(adapters=adapters, loop=loop)
 
         # Bound the in-flight set BEFORE the dedup guard is consulted, so a
         # leaked claim is force-released in-cycle rather than silently eating
@@ -8911,6 +9145,10 @@ def tick(
             # compatible; real callers using return_job=True never take it.
             claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
             claimed_job["execution_id"] = job["execution_id"]
+            # The persisted record the CAS returns never carries the transient
+            # late-fire stamp from the due-scan; carry it across.
+            if job.get(LATE_FIRE_KEY):
+                claimed_job[LATE_FIRE_KEY] = job[LATE_FIRE_KEY]
             return run_one_job(
                 claimed_job,
                 adapters=adapters,
@@ -9121,6 +9359,11 @@ def tick(
 
         return sum(_results)
     finally:
+        if _dispatch_release is not None:
+            try:
+                _dispatch_release()
+            except Exception:
+                logger.debug("cron dispatch admission release failed", exc_info=True)
         if fcntl:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)

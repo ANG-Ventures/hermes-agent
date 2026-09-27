@@ -4,6 +4,8 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+from hermes_cli.lazy_registry import LazyFilledDict
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -54,6 +56,13 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # POSIX-sh files sourced ONCE at agent-process start (gateway, kanban
+        # worker, CLI); their exports land in the process env, so every child
+        # it spawns (in-process gh/git, workers, execute_code) inherits them.
+        # terminal.shell_init_files only reaches terminal shells. Fleet use:
+        # ["~/.hermes/fleet/gh-lane-env.sh"] puts process-spawned gh on the
+        # profile's GitHub lane. Fail-open; [] = off.
+        "process_env_files": [],
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -462,6 +471,13 @@ DEFAULT_CONFIG = {
         # being truncated; lower it to force background discipline.
         # Bridged to TERMINAL_MAX_FOREGROUND_TIMEOUT for child processes.
         "max_foreground_timeout": 600,
+        # Tighter foreground cap for turns delivered over a human messaging
+        # channel (Discord, Telegram, Slack, ...). The chat session cannot
+        # answer new messages while a foreground call runs, so this holds even
+        # when max_foreground_timeout is raised for CLI work. Can only lower
+        # the general cap, never raise it. Bridged to
+        # TERMINAL_GATEWAY_MAX_FOREGROUND_TIMEOUT.
+        "gateway_max_foreground_timeout": 600,
         # Free-disk threshold (GB) below which terminal output carries a
         # low-disk warning. Bridged to TERMINAL_DISK_WARNING_GB.
         "disk_warning_gb": 500.0,
@@ -1920,20 +1936,10 @@ DEFAULT_CONFIG = {
     # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
     # Re-homed here from hermes_cli/config.py when upstream extracted
     # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
-        "session_sync": {
-            "enabled": True,
-            "t_silence": 10.0,
-            "poll_interval": 2.5,
-            "refocus_debounce": 1.0,
-        },
-    # ── FORK-ONLY knobs (parity merge 2026-08-07) ─────────────────────────
-    # Re-homed here from hermes_cli/config.py when upstream extracted
-    # DEFAULT_CONFIG into this module. Fork-owned; keep on future syncs.
         # Dormant/default-off desktop/TUI backend restart continuation gate.
         # Config.yaml only: no env override, so the reconnect path remains inert
         # until an operator deliberately flips this key.
         "desktop_auto_resume": False,
-        "heavy_read_max_concurrency": 2,
         # Dormant/default-off rollout gate for the indexed session.list recency
         # path. Config.yaml only: no env override, so production stays on the
         # legacy CTE until an operator deliberately flips this key.
@@ -2857,6 +2863,22 @@ DEFAULT_CONFIG = {
         "allow_lazy_installs": True,
     },
 
+    # Shared-checkout admission hold (gateway/checkout_admission.py). Off by
+    # default. When several long-lived processes import ONE git checkout
+    # (e.g. two gateways + a serve backend), enabling this lets an operator
+    # hold new work, verify every process acknowledged and drained, and only
+    # then fetch/merge -- without idle-poll races or forced interrupts.
+    # Operator CLI: python -m gateway.checkout_admission --help.
+    "checkout_admission": {
+        "enabled": False,
+        # Shared directory; empty = <git-common-dir>/checkout-admission of the
+        # checkout this code runs from (the same for every consumer of it).
+        "dir": "",
+        # Consumer name per process kind in THIS profile, e.g.
+        # {"gateway": "gateway:default", "serve": "serve:clanker"}.
+        "consumers": {"gateway": "", "serve": ""},
+    },
+
     "cron": {
         # Allow cron-spawned agents to use the cronjob toolset (create/edit/
         # remove scheduled jobs from within a cron run — the "cron-librarian"
@@ -2949,6 +2971,12 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Restart catch-up window (seconds) for one-shot jobs. A one-shot whose
+        # run time fell inside a gateway restart fires late on boot (with a
+        # "fired late by N min" note prepended to its prompt) when it is past
+        # due by at most this much; beyond it the job is removed and a loud
+        # MISSED notice is delivered. 0 = the old 120s grace only. Default 6h.
+        "oneshot_catchup_s": 21600,
         # Timeout (seconds) for a no-agent cron script. Also overridable via
         # HERMES_CRON_SCRIPT_TIMEOUT. Keep this in sync with
         # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
@@ -2991,6 +3019,12 @@ DEFAULT_CONFIG = {
     "kanban": {
         "workspaces_root": None,
         "workspaces_root_require_mount": False,
+        # Let the dispatcher itself clear a scratch card stranded by mount
+        # loss (persisted path gone, root mounted + writable again) when the
+        # lost tree provably held nothing: no worker ever spawned into it, or
+        # a survivor pointer records its work on a remote. Off by default;
+        # the manual verb is ``hermes kanban workspace reset --all-stranded``.
+        "workspaces_auto_unstrand": False,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
@@ -3045,6 +3079,11 @@ DEFAULT_CONFIG = {
         # 10 min hold that pool's spawns for 10 min (one #logs line per trip).
         # Non-pool providers never count. 0 disables.
         "rate_limit_trip": 5,
+        # After a worker refuses its route because the provider's credential is
+        # rate limited (worker_route_pin_refused rate_limited=true, e.g. "Codex
+        # credential is in cooldown"), treat that provider as capped for this
+        # many seconds: no spawn and no fallback rung onto it. 0 disables.
+        "credential_cooldown_seconds": 1800,
         # CPU scheduling priority for dispatcher-spawned worker gateways, and
         # therefore for everything they spawn (terminal-tool children inherit
         # niceness). "background" (default) runs each worker at nice 19 — and,
@@ -3099,12 +3138,29 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Per-tick spawn cap for the dispatcher (gateway tick and
+        # `kanban dispatch`; the CLI --max flag wins over it). None = no cap.
+        "max_spawn": None,
         # Pause dispatcher SPAWNS (reclaims still run) while the host's
         # 1-minute load average is over `pause_above` (default: CPU count);
         # resume once it drops below `resume_below` (default: 0.75 × CPU
         # count). Hysteresis so a load that hovers at the bar doesn't flap
         # spawns every tick. Set enabled: false to disable.
-        "dispatch_load_gate": {"enabled": True, "pause_above": None, "resume_below": None},
+        # Projected-load admission (load1 lags a spawn burst by 60-90 s):
+        # each worker spawned in the last `ramp_seconds` counts as
+        # `worker_load_cost` of not-yet-visible load; a tick admits at most
+        # ceil((pause_above - load1 - pending) / worker_load_cost) and never
+        # more than `max_spawn_per_tick`. `load5_floor`: resuming from a
+        # pause also needs load5 < pause_above. See kanban_load_gate.py.
+        "dispatch_load_gate": {
+            "enabled": True,
+            "pause_above": None,
+            "resume_below": None,
+            "worker_load_cost": 2.0,
+            "ramp_seconds": 120,
+            "max_spawn_per_tick": 4,
+            "load5_floor": True,
+        },
         # Reviewer↔implementer round cap. A "round" is one changes_requested
         # verdict; once a card has collected this many, the next request for
         # review does NOT re-spawn the reviewer — the card is blocked
@@ -3112,12 +3168,27 @@ DEFAULT_CONFIG = {
         "max_review_rounds": 3,
         # "all" (default): every request_review routes to review_assignee.
         # "milestone_only": only cards whose title/body carry "[milestone]"
-        # or that are parents in task_links get a reviewer session; every
+        # or "qa:required" get a reviewer session (being a task_links parent
+        # does NOT count — fan-in QA makes every slice a parent); every
         # other card that asks for review is completed in place with a
         # review_skipped event (CI is the gate for slice work) — even when
         # the worker names a reviewer profile; only reviewer=human or
         # --force bypasses it.
+        # "none": no card gets a reviewer session (same bypasses).
+        # A present-but-unknown/empty value fails to "none" (never "all")
+        # and logs review_policy_invalid.
         "review_policy": "all",
+        # Default reviewer profile for request_review. None/blank = no
+        # default: a review request with no reviewer is refused rather than
+        # leaving the implementer as its own reviewer.
+        "review_assignee": None,
+        # Minutes an unclaimed review card may sit before it is reported
+        # stale. Non-positive/invalid values fall back to 30.
+        "review_stale_minutes": 30,
+        # Cross-session card mutation guard: "refuse" (default) blocks
+        # mutating a card homed in another session; "warn" lets it proceed
+        # with one stderr line. Any other value means "refuse".
+        "home_guard": "refuse",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
@@ -5508,3 +5579,9 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
 }
+
+
+
+# Provider/platform extensions are registered by the config module as fillers
+# that run on the first read (see lazy_registry for why).
+OPTIONAL_ENV_VARS = LazyFilledDict(OPTIONAL_ENV_VARS)

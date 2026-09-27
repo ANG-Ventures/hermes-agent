@@ -238,7 +238,8 @@ def test_request_review_malformed_provenance_gets_distinct_reason(
         )
         review = kb.claim_review_task(conn, tid)
         assert review is not None
-        assert kb.request_changes(
+        from tests.kanban_review_helpers import covered_request_changes
+        assert covered_request_changes(
             conn, tid, reason="fix", expected_run_id=review.current_run_id,
         ) == (True, "builder")
         # Corrupt the changes_requested payload so re-review cannot recover
@@ -618,17 +619,17 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
         assert reviewing.assignee == "argus"
 
         ok = kb.reopen_review_task(conn, tid)
-        assert ok is True
+        assert ok is False
         row = _row(conn, tid)
-        assert row["status"] == "ready"
+        assert row["status"] == "review"
         reopened = kb.get_task(conn, tid)
         assert reopened is not None
-        assert reopened.assignee == "worker"
+        assert reopened.assignee == "argus"
         assert row["current_run_id"] is None
         assert (row["block_recurrences"] or 0) == 0
-        assert _events(conn, tid, kind="review_reopened")
+        assert not _events(conn, tid, kind="review_reopened")
 
-        # Idempotent: not in review anymore -> reopening again is a no-op.
+        # No second attempt may bypass a full review either.
         assert kb.reopen_review_task(conn, tid) is False
 
 
@@ -647,8 +648,11 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
         )
         assert kb.get_task(conn, tid).status == "review"
 
-        # Human asks for changes -> reopen -> re-run.
-        assert kb.reopen_review_task(conn, tid) is True
+        # Reviewer asks for changes after claiming and recording all lenses.
+        assert kb.reopen_review_task(conn, tid) is False
+        assert kb.claim_review_task(conn, tid) is not None
+        from tests.kanban_review_helpers import covered_request_changes
+        assert covered_request_changes(conn, tid, reason="Fix v1")
         assert kb.get_task(conn, tid).status == "ready"
         kb.claim_task(conn, tid)
         kb.request_review(

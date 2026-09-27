@@ -30,6 +30,8 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
+from hermes_cli import provider_seam
+
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
@@ -149,10 +151,13 @@ def _normalize_route_base_url(base_url: Any) -> str:
 def _provider_default_routes(provider: str) -> set[str]:
     """Return known exact default routes for a canonical provider id."""
     routes: set[str] = set()
+    # One generation for both registries; a container whose owning module is
+    # first imported below falls back to its live facade.
+    g = provider_seam.snapshot()
     try:
         from hermes_cli.providers import HERMES_OVERLAYS, get_provider
 
-        overlay = HERMES_OVERLAYS.get(provider)
+        overlay = g.get("HERMES_OVERLAYS", HERMES_OVERLAYS).get(provider)
         provider_def = get_provider(provider, allow_network=False)
         for value in (
             getattr(overlay, "base_url_override", ""),
@@ -181,7 +186,7 @@ def _provider_default_routes(provider: str) -> set[str]:
         from hermes_cli.models import normalize_provider as normalize_model_provider
         from hermes_cli.providers import normalize_provider as normalize_registry_provider
 
-        for provider_id, config in PROVIDER_REGISTRY.items():
+        for provider_id, config in g.get("PROVIDER_REGISTRY", PROVIDER_REGISTRY).items():
             canonical_id = normalize_registry_provider(
                 normalize_model_provider(provider_id)
             )
@@ -952,10 +957,6 @@ def init_agent(
     # tail (the restart-loop backstop / auto-continue signal). Fresh per agent, so
     # the next turn's agent starts unset.
     agent._persist_superseded = False
-    # Set True by the gateway on an internal empty-text auto-resume turn so
-    # build_turn_context stamps the user row ephemeral (dropped from the durable
-    # transcript). Consumed once per turn. Default False = persist normally.
-    agent._suppress_user_turn_persist = False
     # Explicit hard cancellation is separate from redirect/message state. A
     # thread-safe Event makes the cause atomic for auxiliary stream pollers.
     agent._hard_interrupt_requested = threading.Event()
@@ -1079,9 +1080,6 @@ def init_agent(
     # models to "give up" prematurely on complex tasks (#7915).
     agent._budget_exhausted_injected = False
     agent._budget_grace_call = False
-    # True only during the one post-budget grace turn; read by the tool
-    # dispatchers to refuse side-effecting tools then (Guard D-core).
-    agent._in_budget_grace = False
 
     # Optional wall-clock run budget (seconds per run_conversation turn).
     # Explicit constructor arg wins; else resolved from config.yaml
@@ -1099,6 +1097,10 @@ def init_agent(
     # agent was doing when it was killed, and by the "still working"
     # notifications to show progress.
     agent._last_activity_ts: float = time.time()
+    # Previous-activity timestamp for the idle-compaction gap, stamped by a
+    # driver that resets _last_activity_ts before the turn (the gateway).
+    # Consumed (one-shot) by build_turn_context; None = use _last_activity_ts.
+    agent._idle_gap_anchor_ts = None
     # Last REAL progress (API call, stream chunk, tool call) — wait tickers
     # refresh _last_activity_ts only. Read by the kanban stall detector.
     agent._last_progress_ts: float = agent._last_activity_ts

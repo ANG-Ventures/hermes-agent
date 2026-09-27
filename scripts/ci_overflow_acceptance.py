@@ -269,18 +269,25 @@ def main() -> int:
     preflight.add_argument("--repo", default="ANG-Ventures/hermes-agent")
     preflight.add_argument("--out", type=Path, required=True)
     preflight.add_argument("--probe-sha", help="SHA of disposable data-only branch push; verify zero workflow runs")
-    for action in ("integration", "caches", "verify-run"):
+    import ci_overflow_integration  # sibling; late import (it imports this module)
+    ci_overflow_integration.add_parser(sub)
+    for action in ("caches", "verify-run"):
         sub.add_parser(action)
     args = parser.parse_args()
+    if args.action == "integration":
+        return _write_receipt(args.out, args.repo, ci_overflow_integration.integration_checks(args))
     if args.action != "preflight":
         print(f"{args.action}: not implemented", file=sys.stderr)
         return 2
     if args.repo != "ANG-Ventures/hermes-agent":
         parser.error("preflight is scoped to ANG-Ventures/hermes-agent")
-    results = preflight_checks(args.repo, args.probe_sha)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps({"schema_version": 1, "repo": args.repo, "observed_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-                                    "checks": results}, indent=2, sort_keys=True) + "\n")
+    return _write_receipt(args.out, args.repo, preflight_checks(args.repo, args.probe_sha))
+
+
+def _write_receipt(out: Path, repo: str, results: list[CheckResult]) -> int:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"schema_version": 1, "repo": repo, "observed_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                               "checks": results}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     for item in results:
         print(f"{item['status']:12} {item['name']}: {item['reason']}")
     return 0 if all(c["status"] == "PASS" for c in results) else 1

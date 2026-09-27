@@ -3207,13 +3207,28 @@ def finalize_context_engine_compression_notification(
 def _record_blackbox_compaction(agent: Any, *, trigger: str | None,
                                 before: int | None, after: int | None,
                                 telemetry: dict | None,
-                                cost_sink: dict | None = None) -> None:
+                                cost_sink: dict | None = None,
+                                noop: bool = False) -> None:
     """Record only committed work; an incomplete aux price remains unknown.
+
+    ``noop``: the engine returned the transcript unchanged (same message
+    count). With a live sink that observed zero ``call_llm`` calls, that
+    compaction spent nothing, so it contributes $0 instead of poisoning the
+    turn's total — LCM leaves no ``aux_cost_usd`` telemetry to fall back on.
 
     Several compactions in one turn: ``compaction_tokens_before`` keeps the
     FIRST compaction's pre-size (the context the turn arrived with),
     ``compaction_tokens_after`` the LAST one's post-size, and the cost sums.
+
+    Also leaves the one-shot ``_blackbox_prefix_reset`` marker the prefix-
+    stability guard consumes at the next request (card t_c07124ab): a
+    committed compaction is the sanctioned history rewrite, so the guard
+    tags that request's diff ``compaction:<trigger>`` instead of paging.
     """
+    try:
+        agent._blackbox_prefix_reset = f"compaction:{trigger or 'unattributed'}"
+    except Exception:
+        pass
     state = getattr(agent, "_blackbox_compaction", None)
     if not isinstance(state, dict):
         return
@@ -3225,14 +3240,27 @@ def _record_blackbox_compaction(agent: Any, *, trigger: str | None,
     # never fills _last_compression_telemetry, and chunk digests). Fallback:
     # the builtin compressor's own telemetry when no call_llm was observed.
     from agent.auxiliary_client import aux_cost_sink_total
+    reason = None
     if isinstance(cost_sink, dict) and cost_sink.get("calls"):
         cost = aux_cost_sink_total(cost_sink)
+        if cost is None:
+            reason = f"sink_unknown:{cost_sink.get('unknown_reason') or '?'}"
+    elif isinstance(cost_sink, dict) and noop:
+        # Zero summarizer calls and nothing summarized: a genuine $0.
+        cost = 0.0
     else:
         # Chunk digests are additional unpriced calls. Do not report a partial sum.
         cost = telemetry.get("aux_cost_usd") if isinstance(telemetry, dict) and not telemetry.get("chunking") else None
+        if cost is None:
+            reason = ("no_sink" if not isinstance(cost_sink, dict)
+                      else "no_calls_chunked" if isinstance(telemetry, dict) and telemetry.get("chunking")
+                      else "no_calls_no_telemetry_cost")
     if cost is not None and not state.get("compaction_cost_unknown"):
         state["compaction_cost_usd"] = round((state.get("compaction_cost_usd") or 0) + cost, 12)
     else:
+        if reason is not None:
+            logger.info("blackbox compaction cost unknown: trigger=%s reason=%s",
+                        trigger, reason)
         state["compaction_cost_usd"] = None
         state["compaction_cost_unknown"] = True
 
@@ -4697,6 +4725,12 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
+        # A compaction that runs while a fallback model is answering builds
+        # (or keeps) a prompt naming the FALLBACK. That is right in memory,
+        # but the stored row must carry the primary identity or the next turn
+        # rejects it as stale and rebuilds (cold prefix cache).
+        from agent.chat_completion_helpers import prompt_for_persistence
+
         _session_commit_succeeded = False
         _commit_started_at = time.monotonic()
         split_status = "not_applicable"
@@ -4983,7 +5017,9 @@ def compress_context(
                             or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                             model=agent.model,
                             model_config=agent._session_init_model_config,
-                            system_prompt=new_system_prompt,
+                            system_prompt=prompt_for_persistence(
+                                agent, new_system_prompt
+                            ),
                             messages=compressed,
                             cwd=getattr(agent, "working_directory", None),
                             profile_name=_profile_for_child,
@@ -5281,7 +5317,8 @@ def compress_context(
                 # Rotation already published prompt + compacted handoff atomically.
                 if in_place:
                     agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
+                        agent.session_id,
+                        prompt_for_persistence(agent, new_system_prompt),
                     )
                     agent._last_flushed_db_idx = 0
                 else:
@@ -5865,6 +5902,7 @@ def compress_context(
                 after=_compressed_est,
                 telemetry=getattr(agent.context_compressor, "_last_compression_telemetry", None),
                 cost_sink=_blackbox_cost_sink,
+                noop=len(compressed) == _pre_msg_count,
             )
         return compressed, new_system_prompt
     finally:

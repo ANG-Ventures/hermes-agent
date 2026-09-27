@@ -50,9 +50,8 @@ def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(tmp_path
     refused = _run_hermes(
         home,
         "kanban",
-        "comment",
+        "complete",
         task_id,
-        "must be refused",
         marker=True,
     )
 

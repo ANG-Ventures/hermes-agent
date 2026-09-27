@@ -446,6 +446,20 @@ class TestProductionPathWiring:
             if isinstance(fn, ast.Name) and fn.id.endswith("call_with_messages"):
                 if node.args and isinstance(node.args[0], ast.Attribute):
                     wired.add(node.args[0].attr)
+            # Host helpers that route rough vs usage-anchored input (t_bd01a34b)
+            # and forward ``messages`` to the calibration: helper(compressor,
+            # rough, messages, ...). Only counts when ``messages`` is passed.
+            helper_targets = {
+                "_should_compress_request": "should_compress_calibrated",
+                "_trigger_compare_tokens_for": "_trigger_calibrated_tokens",
+            }
+            if isinstance(fn, ast.Name) and fn.id in helper_targets:
+                if (
+                    len(node.args) >= 3
+                    and isinstance(node.args[2], ast.Name)
+                    and node.args[2].id == "messages"
+                ):
+                    wired.add(helper_targets[fn.id])
         missing = calibration_names - wired
         assert not missing, (
             "these calibration entry points are called WITHOUT the message "
@@ -454,10 +468,24 @@ class TestProductionPathWiring:
 
     def test_conversation_loop_preflight_passes_messages(self):
         src = Path(inspect.getfile(_conversation_loop())).read_text()
-        assert "_call_with_messages(" in src, (
-            "conversation_loop's preflight compaction gate must route through "
-            "call_with_messages so the request is classified"
+        tree = ast.parse(src)
+        gate_calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "_should_compress_request"
+        ]
+        assert gate_calls, (
+            "conversation_loop's pre-API compaction gate must route through "
+            "should_compress_request (which forwards messages to the calibration)"
         )
+        for call in gate_calls:
+            assert (
+                len(call.args) >= 3
+                and isinstance(call.args[2], ast.Name)
+                and call.args[2].id == "messages"
+            ), "the pre-API gate must pass the message list so it is classified"
 
     def test_call_with_messages_degrades_for_old_signatures(self):
         """A plugin engine predating the parameter must keep working."""

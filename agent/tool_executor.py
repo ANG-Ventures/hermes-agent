@@ -33,9 +33,6 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
-from agent.budget_grace_gate import (
-    grace_block_result,
-)
 from agent.fork_ext.tool_gate import (
     pre_tool_block_from_builtin_gate,
     resolve_tool_search_unwrap,
@@ -783,13 +780,8 @@ def _run_agent_tool_execution_middleware(
             begin_execution(callback)
 
         # ── Block ladder ────────────────────────────────────────────────
-        # parity NOTE (upstream->fork merge 2026-08-08): the fork-only
-        # budget-grace gate (Guard D-core) used to live in each dispatcher.
-        # Upstream moved plugin/scope/guardrail blocking here, so the gate is
-        # re-grafted at the head of THIS ladder — the single choke point both
-        # dispatchers funnel through — rather than duplicated per path. It
-        # runs FIRST so an exhausted-budget turn is refused before any plugin
-        # hook or guardrail bookkeeping observes the call.
+        # Fork tool-search scope block first (agent/fork_ext/tool_gate.py),
+        # then plugin pre_tool_call hooks, then guardrails.
         block_message = pre_tool_block_from_builtin_gate(
             agent, function_name, scope_block
         )
@@ -841,18 +833,9 @@ def _run_agent_tool_execution_middleware(
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
-                # parity NOTE (upstream->fork merge 2026-08-08): the fork's
-                # budget-grace refusal must carry the budget_grace_block
-                # metadata key (asserted by test_block_message_and_result_shape
-                # and test_grace_block_result_metadata_key_present_in_real_dispatch),
-                # so it uses the shared grace_block_result() rather than the
-                # generic {"error": ...} envelope every other block emits.
-                if block_error_type == "budget_grace_block":
-                    result = grace_block_result(function_name)
-                else:
-                    result = json.dumps(
-                        {"error": block_message}, ensure_ascii=False
-                    )
+                result = json.dumps(
+                    {"error": block_message}, ensure_ascii=False
+                )
                 error_type = block_error_type
                 error_message = block_message
             else:

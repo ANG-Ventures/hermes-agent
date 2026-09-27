@@ -39,7 +39,8 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import (
     automatic_compaction_status_message,
-    call_with_messages as _call_with_messages,
+    should_compress_request as _should_compress_request,
+    trigger_compare_tokens_for as _trigger_compare_tokens_for,
 )
 from agent.display import KawaiiSpinner
 from agent.confab_notice import TOOL_CALL_NOTICE_TEXT, confab_notice_status, is_metadata_only_tool_notice, should_announce_notice
@@ -60,6 +61,8 @@ from agent.tool_dispatch_helpers import (
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
+    is_interrupt_close_row,
+    provider_owns_transcript,
     _repair_tool_call_arguments,
     coalesce_tool_call_id,
     _sanitize_messages_non_ascii,
@@ -1405,7 +1408,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
-    if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+    stale_field = (
+        _stored_prompt_runtime_mismatch(agent, stored_prompt) if stored_prompt else None
+    )
+    if stored_prompt and stale_field is None:
         # Bot Chat capability epoch: an eternal bot session must adopt
         # user-initiated capability changes (skills/toolsets/MCP/SOUL/roster)
         # on the next message, not at /new or compression. The stored prompt
@@ -1510,10 +1516,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         return
     if stored_prompt:
         stored_state = "stale_runtime"
+        field, stored_value, runtime_value = stale_field
         logger.info(
-            "Stored system prompt for session %s has stale runtime identity; "
-            "rebuilding for model=%s provider=%s.",
+            "Stored system prompt for session %s has stale runtime identity "
+            "(%s: stored=%r runtime=%r); rebuilding for model=%s provider=%s.",
             agent.session_id,
+            field,
+            stored_value,
+            runtime_value,
             getattr(agent, "model", "") or "",
             getattr(agent, "provider", "") or "",
         )
@@ -1580,6 +1590,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
+    return _stored_prompt_runtime_mismatch(agent, prompt) is None
+
+
+def _stored_prompt_runtime_mismatch(agent, prompt: str):
+    """Return ``(field, stored, runtime)`` for the first stale identity field.
+
+    ``None`` when the stored prompt matches the runtime and may be reused.
+    """
 
     def line_value(label: str) -> str:
         """Last matching line wins.
@@ -1626,12 +1644,12 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_model = line_value("Model")
     current_model = str(getattr(agent, "model", "") or "").strip()
     if stored_model and current_model and stored_model != current_model:
-        return False
+        return ("Model", stored_model, current_model)
 
     stored_provider = line_value("Provider")
     current_provider = str(getattr(agent, "provider", "") or "").strip()
     if stored_provider and current_provider and stored_provider != current_provider:
-        return False
+        return ("Provider", stored_provider, current_provider)
 
     # Detect cwd drift: if the stored prompt was built in a different working
     # directory, reuse would silently inject a stale path into the prefix cache.
@@ -1640,8 +1658,9 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # rejected (they would always differ from the launch dir's os.getcwd()).
     stored_cwd = host_info_value("Current working directory")
     if stored_cwd:
-        if stored_cwd != str(resolve_agent_cwd()):
-            return False
+        current_cwd = str(resolve_agent_cwd())
+        if stored_cwd != current_cwd:
+            return ("Current working directory", stored_cwd, current_cwd)
 
     # Detect runtime-surface drift: the stored prompt records which platform it
     # was built for (e.g. "desktop" vs "cli"). Reusing a desktop-built prompt on
@@ -1649,9 +1668,9 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_platform = line_value("Platform")
     current_platform = str(getattr(agent, "platform", "") or "").strip()
     if stored_platform and current_platform and stored_platform != current_platform:
-        return False
+        return ("Platform", stored_platform, current_platform)
 
-    return True
+    return None
 
 
 # The three _get_continuation_prompt variants below, in named-constant form
@@ -2634,20 +2653,8 @@ def run_conversation(
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
         # this iteration regardless of outcome.
-        #
-        # ``_in_budget_grace`` is recomputed every iteration (default False) and
-        # set True ONLY for the grace turn. The tool dispatchers read it to
-        # refuse side-effecting tools during the grace turn (deny-by-default,
-        # read-only allowlist) — see ``agent/budget_grace_gate.py`` (Guard
-        # D-core). Refusing a call must NOT re-arm ``_budget_grace_call``: the
-        # flag is already cleared here, so the loop exits after this iteration
-        # whether the model's tool calls execute or are refused. A
-        # deny-that-loops would itself be a runaway, so the gate only blocks
-        # execution; it never extends the loop.
-        agent._in_budget_grace = False
         if agent._budget_grace_call:
             agent._budget_grace_call = False
-            agent._in_budget_grace = True
         elif not agent.iteration_budget.consume():
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
@@ -2837,10 +2844,18 @@ def run_conversation(
             )
 
         api_messages = []
+        # t_f40dc54a: a provider that keeps its own transcript (bridge relay
+        # over a resident CLI session) must not be sent the harness-authored
+        # interrupt-close row — it is a reply the provider never produced, and
+        # the relay's coherence gate answers it with a full-history re-mint.
+        # Looked up once per request; fail-open (row sent) on any error.
+        _omit_interrupt_close = provider_owns_transcript(agent.provider)
         for idx, msg in enumerate(messages):
             # Metadata-only provider events are durable UI rows, never system
             # instructions in the provider request.
             if is_metadata_only_tool_notice(msg):
+                continue
+            if _omit_interrupt_close and is_interrupt_close_row(msg):
                 continue
 
             # Structural clone, NOT msg.copy(): every in-place transform
@@ -3233,6 +3248,10 @@ def run_conversation(
         # the provider counted them, so no tools add-on is needed. Falls
         # back to the rough figures above when the anchor is stale/missing
         # (first request, post-compaction, usage-less providers).
+        # Keep the rough figure: the compaction trigger must know which one it
+        # got. Skew calibration applies to ROUGH only; the anchored figure is
+        # already real (t_bd01a34b: real 488K x skew 1.547 false-fired at 49%).
+        _rough_pressure_tokens = request_pressure_tokens
         _anchored_pressure = anchored_context_tokens(
             messages, getattr(agent, "_usage_anchor", None)
         )
@@ -3326,14 +3345,13 @@ def run_conversation(
         # (schema overhead / post-compaction) defers, while a raw-rough window
         # ceiling still fires the 413/dense-paste guard. Fall back to the raw
         # ``should_compress`` only if a plugin engine lacks the calibrated API.
+        # The skew scales ROUGH input only: when the usage anchor is valid the
+        # gate compares the anchored (already real) figure unscaled, and the
+        # raw-rough hard-frac ceiling still backstops a 413.
         #
         # `messages` is threaded through so the calibration can classify the
         # request and apply the per-content-class correction (see
-        # agent/content_class.py); `call_with_messages` degrades to the
-        # single-argument call for engines predating the parameter.
-        _should_compress_preflight = getattr(
-            _compressor, "should_compress_calibrated", _compressor.should_compress
-        )
+        # agent/content_class.py).
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
@@ -3345,8 +3363,11 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _call_with_messages(
-                _should_compress_preflight, request_pressure_tokens, messages
+            and _should_compress_request(
+                _compressor,
+                _rough_pressure_tokens,
+                messages,
+                anchored_tokens=_anchored_pressure,
             )
         ):
             if _moa_prepared_request is not None:
@@ -3361,11 +3382,16 @@ def run_conversation(
             _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
             if callable(_clear_warn):
                 _clear_warn()
+            # Print the figure the gate COMPARED (post-calibration / anchored)
+            # beside the raw inputs, so the logged inequality is true.
             logger.info(
-                "Pre-API compression: ~%s request tokens >= %s threshold "
-                "(context=%s, attempt=%s/%s)",
-                f"{request_pressure_tokens:,}",
+                "Pre-API compression: ~%s compared tokens >= %s threshold "
+                "(basis=%s, request=~%s, rough=~%s, context=%s, attempt=%s/%s)",
+                f"{_trigger_compare_tokens_for(_compressor, _rough_pressure_tokens, messages, _anchored_pressure):,}",
                 f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
+                "anchored" if _anchored_pressure is not None else "rough",
+                f"{request_pressure_tokens:,}",
+                f"{_rough_pressure_tokens:,}",
                 f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
                 if getattr(_compressor, "context_length", 0) else "unknown",
                 compression_attempts,
@@ -3602,74 +3628,6 @@ def run_conversation(
                     "Operation interrupted before the next model call (stop requested).",
                     effective_task_id=effective_task_id,
                     close_tail=True,
-                )
-            # ── Shared host-transport preflight ───────────────────────
-            # APR/BPR and direct 100.64/10 routes all depend on the local
-            # Tailscale client. If the host-local CLI explicitly says it is
-            # stopped, do not issue a request that can only consume the relay's
-            # full upstream timeout, then walk every route sharing the same
-            # prerequisite. Unknown/ambiguous CLI state fails open, so a lone
-            # provider timeout retains the normal retry and reason label.
-            try:
-                from agent.shared_transport_guard import (
-                    emit_unavailable_summary,
-                    record_unavailable_route,
-                    route_uses_tailscale,
-                    tailscale_status_down,
-                )
-
-                _route_uses_tailscale = route_uses_tailscale(
-                    getattr(agent, "provider", ""),
-                    getattr(agent, "base_url", ""),
-                )
-                _tailscale_down, _tailscale_evidence = (
-                    tailscale_status_down()
-                    if _route_uses_tailscale
-                    else (None, "not_applicable")
-                )
-                if _route_uses_tailscale and _tailscale_down is True:
-                    record_unavailable_route(agent, agent.provider, agent.model)
-                    agent._shared_transport_evidence = _tailscale_evidence
-                    if agent._try_activate_fallback(
-                        reason=FailoverReason.tailscale_down
-                    ):
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt
-                        )
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        # parity 2026-08-30: break to the restart-with-rebuilt-
-                        # messages handler (not a bare continue) so the pre-API
-                        # preflight re-runs against the fallback context window
-                        # (#84733 restart discipline; upstream guard enforces).
-                        _retry.restart_with_rebuilt_messages = True
-                        break
-
-                    emit_unavailable_summary(
-                        agent, evidence=_tailscale_evidence
-                    )
-                    # The terminal result below is the single human-facing
-                    # error. Drop the buffered aggregate here rather than send
-                    # the same Tailscale diagnosis twice; route count/session
-                    # detail remains in the WARNING diagnostic.
-                    agent._clear_status_buffer()
-                    _transport_error = "Tailscale down"
-                    agent._persist_session(messages, conversation_history)
-                    return {
-                        "final_response": _transport_error,
-                        "messages": messages,
-                        "completed": False,
-                        "api_calls": api_call_count,
-                        "error": _transport_error,
-                        "partial": True,
-                        "failed": True,
-                        "shared_transport_unavailable": "tailscale",
-                    }
-            except Exception:
-                logger.debug(
-                    "Shared-transport request preflight failed open",
-                    exc_info=True,
                 )
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
@@ -5885,6 +5843,11 @@ def run_conversation(
 
                 status_code = getattr(api_error, "status_code", None)
                 error_context = agent._extract_api_error_context(api_error)
+                # Fallback ledger evidence (spec Phase 1): consumed by the next
+                # failover, cleared by the next successful call. Never raises.
+                from agent import fallback_events as _fbe
+
+                _fbe.stash_api_error(agent, api_error, status_code, error_context)
                 # Stamp the quota window (5h vs 7d) so the failover announce can
                 # name WHICH limit bound. Consumed once by _quota_window_suffix;
                 # only set when the provider actually told us, so non-Anthropic
@@ -6876,7 +6839,18 @@ def run_conversation(
                                 "⚠️ Provider unreachable — switching to fallback provider..."
                             )
                         else:
-                            agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                            from agent.quota_registry_gate import (
+                                rate_limited_status_line,
+                            )
+
+                            # One line for the whole quota cascade: when the
+                            # usage registry already knows N subs are
+                            # exhausted, this names the count instead of the
+                            # walker emitting N "switching..." lines (the
+                            # 2026-09-21 ×10 spam). See quota_registry_gate.
+                            _quota_status = rate_limited_status_line(agent)
+                            if _quota_status:
+                                agent._buffer_status(_quota_status)
                         if agent._try_activate_fallback(
                             reason=classified.reason,
                             display_reason=classified.display_reason,
@@ -8003,6 +7977,35 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
+                    # When the registry proved the whole fallback tail dead,
+                    # surface the useful fail-fast fact instead of discarding
+                    # the producer-only reset timestamp.
+                    from agent.quota_registry_gate import (
+                        append_quota_exhaustion_message,
+                    )
+
+                    _final_response = append_quota_exhaustion_message(
+                        agent, _final_response
+                    )
+                    # ── Durable handoff at the cut (2026-09-21) ──────────
+                    # The chain is exhausted and this turn is about to die.
+                    # Persist what was in flight (the request, the tool calls
+                    # and their results, the half-written text, open todos) so
+                    # the next turn resumes instead of reconstructing from
+                    # chat scrollback. Never raises; see agent.turn_handoff.
+                    from agent.chat_completion_helpers import (
+                        _fallback_reason_text,
+                    )
+                    from agent.turn_handoff import capture_turn_handoff
+
+                    _handoff_notice = capture_turn_handoff(
+                        agent,
+                        messages,
+                        turn_start_idx=current_turn_user_idx,
+                        reason=_fallback_reason_text(classified.reason),
+                    )
+                    if _handoff_notice:
+                        _final_response += f"\n\n{_handoff_notice}"
                     return {
                         "final_response": _final_response,
                         "messages": messages,
@@ -8010,6 +8013,9 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _final_summary,
+                        # True when a machine-readable handoff was persisted
+                        # for this session and will be injected next turn.
+                        "turn_handoff_saved": bool(_handoff_notice),
                         # Surface the classified reason so callers (notably the
                         # kanban worker path in cli.py) can distinguish a
                         # transient throttle from a real failure and choose a
@@ -8283,24 +8289,6 @@ def run_conversation(
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
-
-            # Provider-specific response post-processing (inverse of
-            # ProviderProfile.prepare_messages). Default is pass-through, so
-            # this is a no-op for every provider that does not opt in.
-            # Guarded: a misbehaving profile must not cost a user-visible turn.
-            try:
-                from providers import get_provider_profile as _gpp
-
-                _resp_profile = _gpp(agent.provider)
-                if _resp_profile is not None and isinstance(
-                    getattr(normalized, "content", None), str
-                ):
-                    normalized.content = _resp_profile.process_response_text(
-                        normalized.content
-                    )
-            except Exception:
-                pass
-
             assistant_message = normalized
             finish_reason = normalized.finish_reason
 

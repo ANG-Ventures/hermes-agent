@@ -36,6 +36,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Optional
 
+from hermes_cli import provider_seam
+
 
 # ─── Public types ───────────────────────────────────────────────────────
 
@@ -702,17 +704,19 @@ def _append_unconfigured_rows(
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
 
+    g = provider_seam.snapshot()
+
     seen = {r["slug"].lower() for r in rows}
     cur = (ctx.current_provider or "").lower()
     cur_model = str(ctx.current_model or "").strip()
     extras: list[dict] = []
-    for entry in CANONICAL_PROVIDERS:
+    for entry in g.CANONICAL_PROVIDERS:
         if entry.slug.lower() in seen:
             continue
         if current_only and entry.slug.lower() != cur:
             continue
         if entry.slug.lower() == cur:
-            cfg = PROVIDER_REGISTRY.get(entry.slug)
+            cfg = g.PROVIDER_REGISTRY.get(entry.slug)
             auth_type = cfg.auth_type if cfg else "api_key"
             key_env = (
                 cfg.api_key_env_vars[0]
@@ -729,7 +733,7 @@ def _append_unconfigured_rows(
             extras.append(
                 {
                     "slug": entry.slug,
-                    "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
+                    "name": g._PROVIDER_LABELS.get(entry.slug, entry.label),
                     "is_current": True,
                     "is_user_defined": False,
                     "models": [cur_model] if cur_model else [],
@@ -745,7 +749,7 @@ def _append_unconfigured_rows(
         extras.append(
             {
                 "slug": entry.slug,
-                "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
+                "name": g._PROVIDER_LABELS.get(entry.slug, entry.label),
                 "is_current": entry.slug.lower() == cur,
                 "is_user_defined": False,
                 "models": [],

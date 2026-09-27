@@ -68,6 +68,96 @@ def get_accounting_context() -> Optional[tuple]:
     return _accounting.get()
 
 
+# (agent, turn_id) of the active agent turn, for the Blackbox per-call ledger
+# (``turn_api_calls``). Separate from ``_accounting`` because the ledger needs
+# the agent's per-turn sequence allocator and must work without a session DB.
+_blackbox_turn: ContextVar[Optional[tuple]] = ContextVar(
+    "aux_blackbox_turn", default=None
+)
+
+
+def set_blackbox_turn(agent: Any, turn_id: Optional[str]):
+    """Publish the turn aux calls are ledgered under. Returns the reset token."""
+    if agent is None or not turn_id:
+        return _blackbox_turn.set(None)
+    return _blackbox_turn.set((agent, str(turn_id)))
+
+
+def reset_blackbox_turn(token) -> None:
+    try:
+        _blackbox_turn.reset(token)
+    except Exception:
+        _blackbox_turn.set(None)
+
+
+def get_blackbox_turn() -> Optional[tuple]:
+    """Return ``(agent, turn_id)`` for the active turn, or ``None``."""
+    return _blackbox_turn.get()
+
+
+def _usage_api_mode(raw: Any, route_api_mode: Optional[str]) -> str:
+    """Usage dialect from the usage object itself (aux clients return
+    OpenAI-shaped usage even on Anthropic-routed providers)."""
+    def _has(key: str) -> bool:
+        val = raw.get(key) if isinstance(raw, dict) else getattr(raw, key, None)
+        return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+    if _has("prompt_tokens"):
+        return "chat_completions"
+    if _has("input_tokens"):
+        return route_api_mode or "anthropic_messages"
+    return route_api_mode or "chat_completions"
+
+
+def record_aux_api_call(
+    response: Any,
+    task: Optional[str],
+    route_info: Optional[dict] = None,
+) -> None:
+    """Ledger one successful auxiliary call in Blackbox ``turn_api_calls``.
+
+    One row per completed non-streaming aux call made inside an agent turn:
+    the route's provider/model, usage and cache fields, ``attribution =
+    'aux:<task>'`` and ``lane_family = 'aux'`` (so main-lane cache and
+    reconciliation readers can exclude it). Turn cost/token totals are not
+    touched. Strictly best-effort; no-ops outside a turn and for MoA slots
+    (their usage is folded into the main loop's totals, ``_EXCLUDED_TASKS``).
+    """
+    try:
+        if response is None or task in _EXCLUDED_TASKS:
+            return
+        binding = _blackbox_turn.get()
+        if binding is None:
+            return
+        agent, turn_id = binding
+        raw = (response.get("usage") if isinstance(response, dict)
+               else getattr(response, "usage", None))
+        route = route_info if isinstance(route_info, dict) else {}
+        provider = str(route.get("provider") or "")
+        model = str(route.get("model") or "")
+        if not model or model == "default":
+            model = str(getattr(response, "model", "") or "") or model
+        api_mode = _usage_api_mode(raw, route.get("api_mode"))
+        usage = None
+        if raw is not None:
+            from agent.usage_pricing import normalize_usage
+
+            # normalize_usage reads provider "anthropic" as the Anthropic
+            # dialect regardless of api_mode; the shape decides here.
+            norm_provider = "" if (api_mode == "chat_completions"
+                                   and provider.strip().lower() == "anthropic") else provider
+            usage = normalize_usage(raw, provider=norm_provider, api_mode=api_mode)
+        from agent.chat_completion_helpers import _emit_aux_api_call_record
+
+        _emit_aux_api_call_record(
+            agent, turn_id,
+            task=str(task or "unspecified"),
+            provider=provider, model=model, usage=usage, api_mode=api_mode,
+        )
+    except Exception:
+        logger.debug("Aux Blackbox ledger recording failed (non-fatal)", exc_info=True)
+
+
 def record_aux_usage(
     response: Any,
     task: Optional[str],

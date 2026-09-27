@@ -8,6 +8,7 @@ define a second ban list.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -87,6 +88,66 @@ def validate_worker_model(
 
 def override_comment(reason: str) -> str:
     return f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} {reason.strip()}"
+
+
+# ---------------------------------------------------------------------------
+# Single-sub pin refusal (t_141135aa, Ace 2026-09-25).  Kanban routes are
+# worker lanes: they ride the POOLS (claude-bpr / claude-apr), never one
+# subscription.  ``claude-apx-N`` / ``claude-bpx-N`` pin one sub, and the
+# pre-rename aliases (``claude-api-proxy`` = claude-apx-0 = Ace's personal Mac
+# sub, ``claude-bridge`` = claude-bpx-0, ``-fN`` = sub N) are the same pins
+# under a name that hides it.  Same patterns as the home fleet-config-lint
+# ``provider_naming_floor`` rule.
+# ---------------------------------------------------------------------------
+
+PRE_RENAME_PROVIDER_ALIAS_RE = re.compile(
+    r"^(?:claude-api-proxy(?:-f\d+|-failover\d+)?|claude-proxy(?:-f\d+)?"
+    r"|claude-subscription-proxy|claude-bridge(?:-f\d+|-failover\d+|-fallback\d+)?"
+    r"|claude-cli-bridge)$"
+)
+SINGLE_SUB_PIN_RE = re.compile(r"^claude-(?:apx|bpx)-\d+$")
+
+
+def _route_provider_names(model: Optional[str], provider: Optional[str]) -> list[str]:
+    names = []
+    for value in (provider, (model or "").split("/", 1)[0] if "/" in (model or "") else None):
+        name = str(value or "").strip().casefold()
+        if name:
+            names.append(name)
+    return names
+
+
+def pinned_sub_provider_error(
+    model: Optional[str], provider: Optional[str] = None
+) -> Optional[str]:
+    """Refusal text when a route pins one Claude sub (or a pre-rename alias of one).
+
+    Checks the explicit provider and a ``provider/`` prefix on the model.
+    Returns ``None`` for pool / non-Claude routes.
+    """
+    for name in _route_provider_names(model, provider):
+        lane = "bpr" if "bpx" in name or "bridge" in name else "apr"
+        if PRE_RENAME_PROVIDER_ALIAS_RE.match(name):
+            return (
+                f"provider '{name}' is a pre-rename alias of a single-sub pin "
+                "(claude-api-proxy = claude-apx-0 = Ace's personal Mac sub). "
+                f"Workers ride the pool: use provider claude-{lane} "
+                "(lane-model set, never a per-sub pin)."
+            )
+        if SINGLE_SUB_PIN_RE.match(name):
+            return (
+                f"provider '{name}' pins one Claude subscription; workers never pin "
+                f"claude-apx-N/claude-bpx-N. Use the pool provider claude-{lane} "
+                "(lane-model set for a lane-wide route)."
+            )
+    return None
+
+
+def validate_route_provider(model: Optional[str], provider: Optional[str] = None) -> None:
+    """Raise ``ValueError`` for a single-sub pin route (see above)."""
+    error = pinned_sub_provider_error(model, provider)
+    if error:
+        raise ValueError(error)
 
 
 # ---------------------------------------------------------------------------

@@ -481,75 +481,6 @@ CONCLUDE_SCHEMA = {
     },
 }
 
-# --- mem0_remember: the background-review write helper (registry tool, manager-free) ---
-# Registered via ctx.register_tool(toolset="memory_write", ...) so it dispatches through
-# the regular tool registry (handle_function_call), NOT the memory-provider path that
-# requires _memory_manager (None in the skip_memory=True review fork). See spec §5A
-# Phase-0 correction. Inherits the mem0_conclude salience rubric verbatim.
-REMEMBER_SCHEMA = {
-    "name": "mem0_remember",
-    "description": (
-        "Deliberately store ONE durable fact about the user or their stable environment into "
-        "long-term memory (mem0), verbatim (no LLM extraction). Use this from the background "
-        "self-improvement review when you find a fact worth keeping across sessions; it is the "
-        "manager-free counterpart to mem0_conclude. Save the FACT, never the conversation or "
-        "this prompt.\n"
-        "SAVE when you learn: a preference or taste; a standing decision or directive; a correction "
-        "to something previously believed; an account / device / service / credential pointer "
-        "(not the secret itself); durable environment or topology (hosts, IPs, paths, tools, how "
-        "things are wired); a long-lived plan, goal, or constraint. One fact per call; phrase it as "
-        "a standalone declarative fact that will still make sense months from now.\n"
-        "Do NOT save: work-narration or what you did this turn (built, ran, tested, committed, "
-        "pushed, deployed, verified, reviewed); status / progress / ETA / cost / token counts; "
-        "PR / issue / commit / SHA / phase-done / task-state; transient state that will be stale in "
-        "a week; anything already obvious from a stable doc."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "fact": {"type": "string", "description": "The single durable fact to store, as a standalone declarative sentence."},
-        },
-        "required": ["fact"],
-    },
-}
-
-
-def _dedup_norm_hash(text: str) -> str:
-    """Normalize (lowercase + collapse-whitespace + strip) then MD5.
-
-    DD-5: raw-text MD5 is trivially defeated by a trailing space / case; normalize first
-    so Tier-1 catches byte-and-whitespace-equal dupes. Tier-2 (cosine) catches the rest.
-    """
-    import hashlib
-    norm = " ".join((text or "").lower().split()).strip()
-    return hashlib.md5(norm.encode("utf-8")).hexdigest()
-
-
-# Dedup Tier-2 thresholds (D-7, calibrated by eval/dedup_threshold_sweep.py 2026-06-27).
-# CALIBRATION FINDING: on this store, reworded-same-fact cosines (0.58–0.92) and
-# contradiction cosines (0.61–0.99) OVERLAP — there is NO cosine threshold that catches
-# paraphrase-dupes without ALSO swallowing contradictions (value-flips like "weight 0.02"
-# vs "0.10" embed at ~0.99). So Tier-2 cosine CANNOT safely auto-skip on a fidelity-first
-# store. Resolution (matches DD-1): IDENTICAL is set to 0.995 — a near-verbatim safety belt
-# that Tier-1 exact-hash already covers — so Tier-2 effectively NEVER auto-skips; the
-# ambiguous band always WRITES. Real semantic dedup is deferred to Tier-4 (LLM reconcile).
-_DEDUP_COSINE_THRESHOLD = 0.95
-_DEDUP_COSINE_IDENTICAL = 0.995
-
-
-def _dedup_cosine_band(top_score, threshold=_DEDUP_COSINE_THRESHOLD, identical=_DEDUP_COSINE_IDENTICAL):
-    """Map a top-hit similarity to a band: 'skip_identical' | 'write_ambiguous' | 'write'."""
-    try:
-        s = float(top_score)
-    except (TypeError, ValueError):
-        return "write"
-    if s >= identical:
-        return "skip_identical"
-    if s >= threshold:
-        return "write_ambiguous"
-    return "write"
-
-
 # --- Destructive tools (gated; appended only when destructive_tools_enabled) ---
 
 FORGET_SCHEMA = {
@@ -1411,73 +1342,6 @@ class Mem0MemoryProvider(MemoryProvider):
         filters["metadata"] = metadata
         return filters
 
-    def _dedup_then_write(self, client, fact: str) -> Dict[str, Any]:
-        """Write a background-review fact through the dedup ladder (D-5).
-
-        Tier 1: exact-hash skip (normalized MD5, server-side `filters` lookup).
-        Tier 2: two-band cosine (>= IDENTICAL skip; ambiguous band WRITES — DD-1:
-                cosine is sign-blind, dropping the newer fact is unrecoverable).
-        Stamps write_origin=background_review + dedup_hash on the write.
-        Returns {"result": ..., "dedup": <tag>} so the digest can split outcomes.
-        """
-        norm_hash = _dedup_norm_hash(fact)
-
-        # Resolve thresholds (config-overridable, D-7).
-        try:
-            threshold = float(self._config.get("dedup_cosine_threshold", _DEDUP_COSINE_THRESHOLD))
-        except (TypeError, ValueError, AttributeError):
-            threshold = _DEDUP_COSINE_THRESHOLD
-        try:
-            identical = float(self._config.get("dedup_cosine_identical", _DEDUP_COSINE_IDENTICAL))
-        except (TypeError, ValueError, AttributeError):
-            identical = _DEDUP_COSINE_IDENTICAL
-
-        # --- Tier 1: exact-hash skip (TRUE nested-filters lookup, server-side) ---
-        try:
-            hit = client.search_meta_filtered(fact, {"dedup_hash": norm_hash}, top_k=1)
-            if self._unwrap_results(hit):
-                return {"result": "Already stored (exact dup).", "dedup": "skipped_exacthash"}
-        except Exception:
-            # Fail-open: a dedup-check failure must never block a real write.
-            pass
-
-        # --- Tier 2: two-band cosine pre-write check ---
-        # The live /search score is RRF-fused + reranked (top hit ~1.0 for ANY query),
-        # NOT a cosine — useless as a dedup signal (probe 2026-06-27). So we use /search
-        # only for CANDIDATE RETRIEVAL, then compute REAL cosine client-side against the
-        # candidate texts via the same embedder the store uses (text-embedding-3-small).
-        band = "write"
-        try:
-            sem = client.search(query=fact, top_k=self._dedup_candidate_k())
-            rows = self._drop_forgotten(self._unwrap_results(sem))
-            cand_texts = []
-            for r in rows:
-                if isinstance(r, dict):
-                    t = r.get("memory") or r.get("data") or ""
-                    if t:
-                        cand_texts.append(t)
-            if cand_texts:
-                vecs = self._dedup_embed([fact] + cand_texts)
-                if vecs and len(vecs) == len(cand_texts) + 1:
-                    qv = vecs[0]
-                    top_cos = max(self._dedup_cos(qv, cv) for cv in vecs[1:])
-                    band = _dedup_cosine_band(top_cos, threshold, identical)
-        except Exception:
-            band = "write"
-
-        if band == "skip_identical":
-            return {"result": "Already stored (near-identical).", "dedup": "skipped_identical"}
-
-        # band in ("write", "write_ambiguous") -> WRITE (ambiguous never skips, DD-1)
-        write_filters = self._write_filters(write_kind="deliberate")
-        meta = write_filters.get("metadata", {})
-        meta["write_origin"] = "background_review"
-        meta["dedup_hash"] = norm_hash
-        write_filters["metadata"] = meta
-        client.add([{"role": "user", "content": fact}], **write_filters, infer=False)
-        tag = "wrote_ambiguous" if band == "write_ambiguous" else "wrote"
-        return {"result": "Fact stored.", "dedup": tag}
-
     def _dedup_candidate_k(self) -> int:
         """How many retrieval candidates to cosine-check (config-overridable)."""
         try:
@@ -1946,41 +1810,7 @@ class Mem0MemoryProvider(MemoryProvider):
             except Exception:
                 return None
         try:
-            router_cfg = ((self._config or {}).get("mem0_capture_router") or {})
-
-            def _existing_fact_lookup(query: str):
-                """Best-effort existing-fact recall for RC1 contradiction correction detection.
-                Any failure degrades to [] so false negatives fall back to the normal salience gate."""
-                out = []
-                try:
-                    top_k = int(router_cfg.get("contradiction_lookup_k", self._dedup_candidate_k()))
-                except Exception:
-                    top_k = 5
-                try:
-                    resp = self._get_client().search(
-                        query=query,
-                        filters=self._read_filters(),
-                        top_k=top_k,
-                        keyword_search=self._keyword_search,
-                    )
-                    for row in self._drop_forgotten(self._unwrap_results(resp)):
-                        mem = row.get("memory") or row.get("text") or row.get("content")
-                        if mem:
-                            out.append(str(mem))
-                except Exception as e:
-                    logger.debug("mem0 capture-router contradiction mem0 lookup degraded: %s", e)
-                try:
-                    if self._gbrain_search_enabled:
-                        for hit in self._gbrain_pointers(query, limit=top_k, deadline_s=1.5):
-                            text = " ".join(str(hit.get(k) or "") for k in ("file", "title"))
-                            if text.strip():
-                                out.append(text.strip())
-                except Exception as e:
-                    logger.debug("mem0 capture-router contradiction gbrain lookup degraded: %s", e)
-                return out
-
-            return capture_router.build_router_from_config(
-                self._config or {}, existing_fact_lookup_fn=_existing_fact_lookup)
+            return capture_router.build_router_from_config(self._config or {})
         except Exception as e:
             logger.warning("mem0 capture-router build failed (router disabled): %s", e)
             return None
@@ -2081,25 +1911,6 @@ class Mem0MemoryProvider(MemoryProvider):
             self._capture_pipeline = None
             return None
 
-    def _auto_capture_active(self) -> bool:
-        """True only when the FOREGROUND per-turn capture path would ACTUALLY write — i.e. capture is
-        configured on AND a certified capture pipeline is available (gate assets present + version
-        matches). This must mirror EXACTLY the condition under which sync_turn enqueues, so the D-7
-        interlock never suppresses the background writer (mem0_remember) in a state where the
-        foreground path is ALSO not writing (Greptile P1): capture=auto but gate missing/mismatched
-        would otherwise drop the fact on the floor from BOTH paths.
-
-        The interlock is cross-process (foreground session vs background-review fork are separate
-        processes); the shared, decision-time signals are the persisted capture flag and the shipped,
-        version-pinned gate assets, both resolved identically in either process. Degrade-safe: any
-        error -> False (interlock does not block the background writer)."""
-        try:
-            if not capture_is_on(self._live_capture()):
-                return False
-            pipe = self._get_capture_pipeline()
-            return bool(pipe is not None and pipe._certified)
-        except Exception:
-            return False
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Enqueue the completed turn for durable, salience-gated, server-side auto-capture.
@@ -2274,28 +2085,6 @@ class Mem0MemoryProvider(MemoryProvider):
             except Exception as e:
                 self._record_failure()
                 return tool_error(f"Failed to store: {e}")
-
-        elif tool_name == "mem0_remember":
-            fact = args.get("fact", "")
-            if not fact:
-                return tool_error("Missing required parameter: fact")
-            # D-7 CROSS-PROCESS INTERLOCK (Greptile P1 — now ENFORCED, not just defined):
-            # when foreground per-turn auto-capture is genuinely ACTIVE, the background-review writer
-            # must NOT also write, or the two writers race overlapping facts. Key on the pipeline's
-            # real activity (certified gate AND capture on), NOT merely the configured capture value —
-            # so mem0_remember still writes when auto-capture isn't actually running (no certified
-            # pipeline). Read at DECISION TIME so a live capture flip is honored without a restart.
-            if self._auto_capture_active():
-                logger.info("mem0_remember suppressed: auto-capture is ACTIVE (D-7 interlock)")
-                return json.dumps({"status": "skipped",
-                                   "reason": "auto-capture active; background write suppressed (D-7 interlock)"})
-            try:
-                result = self._dedup_then_write(client, fact)
-                self._record_success()
-                return json.dumps(result)
-            except Exception as e:
-                self._record_failure()
-                return tool_error(f"Failed to remember: {e}")
 
         elif tool_name in ("mem0_forget", "mem0_delete"):
             # C1 fail-closed: if the gate is off these tools were never registered,

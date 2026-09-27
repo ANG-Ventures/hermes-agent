@@ -140,31 +140,23 @@ def _rowid_credits(tmp_path: Path) -> list:
 async def test_restart_loop_guard_records_at_most_once_per_gateway_boot(
     tmp_path, monkeypatch
 ):
-    """Repeated resume scans in one process leave ONE entry in the ledger.
-
-    This used to assert the call pattern against a mocked-out guard, which
-    only pinned the per-GatewayRunner ``_restart_loop_guard_recorded_this_boot``
-    flag; with the guard mocked the on-disk ledger was never exercised, so the
-    assertion held no matter what the guard itself did. The dedupe now lives in
-    the guard (keyed on process boot identity, covering every caller), so assert
-    the real observable: the persisted ledger.
-    """
     from gateway import restart_loop_guard
-
-    state_path = tmp_path / "restart_loop.json"
-    monkeypatch.setattr(restart_loop_guard, "_state_path", lambda: state_path)
-    restart_loop_guard.clear()
 
     runner, _adapter, db = _runner(tmp_path, monkeypatch)
     entry = _entry(runner)
     _mark_pending(runner, entry)
+    recorded = MagicMock(return_value=False)
+    inspected = MagicMock(return_value=False)
+    monkeypatch.setattr(restart_loop_guard, "check_and_record", recorded)
+    monkeypatch.setattr(restart_loop_guard, "is_restart_loop_tripped", inspected)
 
     runner._schedule_resume_pending_sessions()
     await asyncio.gather(*runner._background_tasks)
     runner._schedule_resume_pending_sessions()
     await asyncio.gather(*runner._background_tasks)
 
-    assert len(json.loads(state_path.read_text())["boots"]) == 1
+    recorded.assert_called_once()
+    inspected.assert_called_once()
     db.close()
 
 

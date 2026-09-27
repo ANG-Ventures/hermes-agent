@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -81,15 +82,26 @@ def test_verdicts_route_through_distinct_terminal_actions(skill_text: str) -> No
     assert "Escalate" in quick_reference and "`kanban_block`" in quick_reference
 
 
-def test_review_lenses_vary_per_round(skill_text: str) -> None:
+def test_review_runs_all_four_lenses_every_round(skill_text: str) -> None:
+    """Every round grades the whole deliverable: four lenses, one batch, one record."""
     lenses = skill_text.split("## Review Lenses", 1)[1].split("## Procedure", 1)[0]
-    # Round derivation must key off history the reviewer actually sees.
-    assert "`changes_requested`" in lenses
-    assert "Prior attempts on this task" in lenses
-    # One distinct lens per round.
-    for lens in ("Artifact", "Execution", "Contract"):
+    from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES
+
+    for lens in REQUIRED_REVIEW_LENSES:
         assert lens in lenses
-    # Execution lens must direct empirical verification via the terminal.
-    assert "`terminal`" in lenses
-    # Fan-out note: parallel reviewers get different briefs.
-    assert "`delegate_task`" in lenses
+    # All lenses launch together as one delegate batch whose id is recorded.
+    assert "`delegate_task" in lenses
+    assert "batch id" in lenses
+    # The machine-checked coverage record the request_changes gate parses.
+    example = next(
+        line for line in lenses.splitlines() if "review_coverage:" in line and "{" in line
+    )
+    payload = json.loads(example.strip().strip("`").split("review_coverage:", 1)[1])
+    assert tuple(payload["lenses"]) == REQUIRED_REVIEW_LENSES
+    for key in ("findings", "items", "review_minutes", "battery", "batch_id"):
+        assert key in payload
+    assert payload["findings"] == len(payload["items"]) >= 1
+    # Inability to run a lens is an escalation, never an n/a or a rework verdict.
+    assert "kanban_block(kind=capability)" in lenses
+    # Execution lens still directs empirical verification via the terminal.
+    assert "`terminal`" in skill_text

@@ -357,63 +357,9 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     return format_home_line(sid, row)
 
 
-class LoadGate:
-    """Hysteresis gate that pauses dispatcher SPAWNS while the host is over
-    its run-queue bar (``kanban.dispatch_load_gate``).
-
-    Measured 2026-09-24 on the Mac Studio (32 cores): load1 80-110 with the
-    dispatcher still spawning 9-14 workers a tick; the gateway took 15 min to
-    reach its first model call and its own shutdown watchdog force-exited a
-    planned restart because the drain never got CPU. Workers are separate
-    processes — but every one is more run-queue for the gateway to lose to.
-
-    Pure and clock-free: feed it ``load1`` + ``ncpu`` each tick, read
-    ``reason``. Pauses when ``load1 > pause_above`` (default ``ncpu``), resumes
-    only when ``load1 < resume_below`` (default ``0.75 * ncpu``) — the gap
-    stops a 60-second oscillation from flapping spawns every tick.
-    """
-
-    def __init__(self, cfg: Optional[dict], ncpu: int) -> None:
-        cfg = cfg if isinstance(cfg, dict) else {}
-        self.enabled = bool(cfg.get("enabled", True))
-        ncpu = max(1, int(ncpu or 1))
-        self.pause_above = self._num(cfg.get("pause_above"), float(ncpu))
-        self.resume_below = self._num(cfg.get("resume_below"), 0.75 * ncpu)
-        if self.resume_below >= self.pause_above:
-            # A degenerate band would flap; collapse to a sane one.
-            self.resume_below = 0.75 * self.pause_above
-        self.ncpu = ncpu
-        self.paused = False
-        self.reason: Optional[str] = None
-
-    @staticmethod
-    def _num(value, default: float) -> float:
-        try:
-            f = float(value)
-        except (TypeError, ValueError):
-            return float(default)
-        return f if f > 0 else float(default)
-
-    def update(self, load1: float) -> Optional[str]:
-        """Feed one sample; return the pause reason (None = spawning allowed)."""
-        if not self.enabled:
-            self.paused, self.reason = False, None
-            return None
-        try:
-            load1 = float(load1)
-        except (TypeError, ValueError):
-            return self.reason
-        if self.paused:
-            if load1 < self.resume_below:
-                self.paused, self.reason = False, None
-        elif load1 > self.pause_above:
-            self.paused = True
-        if self.paused:
-            self.reason = (
-                f"load1={load1:.1f} > pause_above={self.pause_above:.1f} "
-                f"(ncpu={self.ncpu}); resumes below {self.resume_below:.1f}"
-            )
-        return self.reason
+# LoadGate moved to hermes_cli.kanban_load_gate (shared with the standalone
+# `hermes kanban daemon` loop); re-exported here for existing importers.
+from hermes_cli.kanban_load_gate import LoadGate  # noqa: E402,F401
 
 
 def _format_spawn_routes(routes, sources=None) -> str:
@@ -509,7 +455,12 @@ def _format_workspace_refused_summary(refused) -> str:
         f"{reason}: {', '.join(sorted(task_ids))}"
         for reason, task_ids in sorted(grouped.items())
     )
-    return f"workspace_refused={len(entries)} ({details})"
+    summary = f"workspace_refused={len(entries)} ({details})"
+    if "stranded_by_mount_loss" in grouped:
+        from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND
+
+        summary += f" | recover stranded scratch cards: {STRANDED_RECOVERY_COMMAND}"
+    return summary
 
 
 class _WorkspaceRefusalOutageNotifier:
@@ -584,6 +535,77 @@ def _observe_workspace_refusal_outages(notifier, results) -> int:
             notifier.observe(board, refused, _send_workspace_refusal_alert)
         )
     return delivered
+
+
+# Consecutive dispatcher ticks one card may be refused admission before it is
+# paged on its own. The board-level outage page above fires once per outage;
+# a single card refused forever inside an otherwise healthy board (t_4b9809f4,
+# 2.7h 'ready' under a retired root) never produced a second signal.
+WORKSPACE_REFUSAL_CARD_PAGE_TICKS = 10
+
+
+class _WorkspaceRefusalCardNotifier:
+    """Page once per (board, card) after N consecutive refused ticks.
+
+    A board result that is missing or ``skipped_locked`` proves nothing, so
+    its counters are neither advanced nor reset. A failed send is retried
+    next tick; the latch clears once the card stops being refused.
+    """
+
+    def __init__(self, threshold: int = WORKSPACE_REFUSAL_CARD_PAGE_TICKS) -> None:
+        self.threshold = threshold
+        self._streak: dict[tuple[str, str], int] = {}
+        self._delivered: set[tuple[str, str]] = set()
+
+    def observe(self, results, send: Callable[[str, str, str, int], bool]) -> int:
+        delivered = 0
+        for board, result in results or []:
+            if result is None or getattr(result, "skipped_locked", False):
+                continue
+            refused = {
+                str(task_id): str(reason)
+                for task_id, reason in (getattr(result, "workspace_refused", None) or [])
+            }
+            for key in [k for k in self._streak if k[0] == board and k[1] not in refused]:
+                self._streak.pop(key, None)
+                self._delivered.discard(key)
+            for task_id, reason in sorted(refused.items()):
+                key = (board, task_id)
+                self._streak[key] = streak = self._streak.get(key, 0) + 1
+                if streak >= self.threshold and key not in self._delivered:
+                    if send(board, task_id, reason, streak):
+                        self._delivered.add(key)
+                        delivered += 1
+        return delivered
+
+
+def _send_workspace_refusal_card_alert(board: str, task_id: str, reason: str, streak: int) -> bool:
+    """Best-effort #alerts page for one card stuck behind admission."""
+    script = Path.home() / ".hermes" / "scripts" / "notify.py"
+    if not script.is_file():
+        logger.error("kanban dispatcher: notify.py unavailable; refused-card page not delivered")
+        return False
+    message = (
+        "🛑 **Kanban dispatcher** · card refused workspace admission "
+        f"{streak} consecutive ticks (shows as READY but never spawns)\n"
+        f"Board: `{board}` · Card: `{task_id}`\n`{reason}`\n"
+        f"Inspect: `hermes kanban show {task_id}`"
+    )
+    if reason.startswith("stranded_by_mount_loss:"):
+        from hermes_cli.kanban_workspace_policy import STRANDED_RECOVERY_COMMAND
+
+        message += f" · Recover: `{STRANDED_RECOVERY_COMMAND}`"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--send", message, "--channel", "discord",
+             "--profile", "default", "--sev", "error"],
+            check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=30,
+        )
+    except Exception:
+        logger.exception("kanban dispatcher: refused-card page failed")
+        return False
+    return proc.returncode == 0
 
 
 def _guard_stuck_cards(results) -> tuple[list[tuple[str, dict]], set[str]]:
@@ -915,11 +937,11 @@ class GatewayKanbanWatchersMixin:
         ``review_requested``, ``changes_requested``,
         ``block_loop_detected``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. The subscription is removed only when the
-        task is ``archived``. A ``done`` task can be reopened for review or
-        continuation, so its subscription and origin-session ownership must
-        survive completion. Cursor advancement prevents old events replaying
-        when that happens.
+        then advances the cursor. The subscription is removed after that
+        delivery once the task is ``done`` or ``archived``
+        (``kanban_db.NOTIFY_SUB_FINAL_STATUSES``): the terminal line arrives,
+        then the row is gone so it can never wake the origin session again.
+        A controller that reopens a ``done`` card re-subscribes explicitly.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -949,9 +971,8 @@ class GatewayKanbanWatchersMixin:
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "stalled", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
-        # Subscriptions are removed only when the task reaches the irreversible
-        # archived status. ``done`` is reversible in review/controller flows,
-        # so removing its subscription would silence a later reopen. We used
+        # Subscriptions are removed after delivery once the task is done or
+        # archived (kanban_db.NOTIFY_SUB_FINAL_STATUSES, t_6d6e9467). We used
         # to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
         # silently dropped the user out of the loop whenever the dispatcher
@@ -978,6 +999,13 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        from gateway.kanban_notify_failures import (
+            LaneFailureDedupe,
+            format_failure_notice,
+        )
+
+        lane_dedupe: LaneFailureDedupe = getattr(self, "_kanban_lane_dedupe", None) or LaneFailureDedupe()
+        self._kanban_lane_dedupe = lane_dedupe
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -1211,6 +1239,8 @@ class GatewayKanbanWatchersMixin:
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
+                # One message per failure event, one per lane-wide cause.
+                lane_dedupe.plan(deliveries)
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -1270,6 +1300,7 @@ class GatewayKanbanWatchersMixin:
                     wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        lane_key = None
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -1339,15 +1370,25 @@ class GatewayKanbanWatchersMixin:
                                     f"<card|PR|sha>`; otherwise re-scope it.{err}"
                                 )
                             else:
-                                msg = (
-                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                    f"after repeated spawn failures{err}"
+                                directive = d["failure_directives"].get(ev.id)
+                                if directive is None:
+                                    continue
+                                msg = format_failure_notice(
+                                    kind, ev.payload, task_id=sub["task_id"],
+                                    board_tag=board_tag, tag=tag,
+                                    assignee=who or "", directive=directive,
                                 )
+                                lane_key = directive.get("lane_key")
                         elif kind == "crashed":
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                            directive = d["failure_directives"].get(ev.id)
+                            if directive is None:
+                                continue
+                            msg = format_failure_notice(
+                                kind, ev.payload, task_id=sub["task_id"],
+                                board_tag=board_tag, tag=tag,
+                                assignee=who or "", directive=directive,
                             )
+                            lane_key = directive.get("lane_key")
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
@@ -1526,6 +1567,7 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                            lane_dedupe.mark_sent(lane_key)
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -1574,7 +1616,9 @@ class GatewayKanbanWatchersMixin:
                         #   advances after it succeeds — a failure rewinds the
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
-                        task_terminal = task and task.status == "archived"
+                        # done/archived end subscription ownership once the
+                        # claimed events are delivered (t_6d6e9467).
+                        task_terminal = _kb.notify_sub_is_final(task)
                         # Kinds that hand a decision back to the origin, so the
                         # origin has to take a turn. ``review_requested`` (the
                         # implementation is done and waits for a reviewer),
@@ -1854,11 +1898,11 @@ class GatewayKanbanWatchersMixin:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
                             sub_fail_counts.pop(sub_key, None)
-                        # Unsubscribe only on archive. Completion (``done``)
-                        # remains reversible: controllers reopen completed
-                        # work for review corrections and continuation. The
-                        # retained cursor prevents replay while preserving the
-                        # original delivery and wake ownership for that cycle.
+                        # Unsubscribe once the task is done/archived, AFTER
+                        # delivery (every failure path above ``continue``s
+                        # before reaching here). A reopened ``done`` card is
+                        # re-subscribed explicitly by its controller; leaving
+                        # the row would keep waking the origin session.
                         if _is_push_adapter and send_passive and _wake_kinds:
                             # notify+wake: the text ping above was the
                             # delivery and the cursor has advanced; the wake
@@ -2374,28 +2418,19 @@ class GatewayKanbanWatchersMixin:
         load_gate = LoadGate(kanban_cfg.get("dispatch_load_gate"), _ncpu)
         if load_gate.enabled:
             logger.info(
-                "kanban dispatcher: load gate armed pause_above=%.1f resume_below=%.1f ncpu=%d",
+                "kanban dispatcher: load gate armed pause_above=%.1f resume_below=%.1f "
+                "ncpu=%d worker_load_cost=%.1f ramp_seconds=%.0f max_spawn_per_tick=%d "
+                "load5_floor=%s",
                 load_gate.pause_above, load_gate.resume_below, load_gate.ncpu,
+                load_gate.worker_load_cost, load_gate.ramp_seconds,
+                load_gate.max_spawn_per_tick, load_gate.load5_floor,
             )
-        _load_gate_was_paused = False
+        def _sample_spawn_pause() -> "tuple[Optional[int], Optional[str]]":
+            """(allowance, reason) for this tick; (None, None) = no limit."""
+            return load_gate.admit_now()
 
-        def _sample_spawn_pause() -> "Optional[str]":
-            nonlocal _load_gate_was_paused
-            try:
-                load1 = os.getloadavg()[0]
-            except (AttributeError, OSError):
-                return None  # platform without loadavg: gate is inert
-            reason = load_gate.update(load1)
-            if bool(reason) != _load_gate_was_paused:
-                _load_gate_was_paused = bool(reason)
-                if reason:
-                    logger.warning("kanban dispatcher: spawns PAUSED — %s", reason)
-                else:
-                    logger.info(
-                        "kanban dispatcher: spawns RESUMED — load1=%.1f < resume_below=%.1f",
-                        load1, load_gate.resume_below,
-                    )
-            return reason
+        def _finish_gate_tick(spawned: int) -> None:
+            load_gate.finish_tick(spawned, logger=logger)
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
@@ -2412,8 +2447,10 @@ class GatewayKanbanWatchersMixin:
         # decision can legitimately sit for hours; warn every 5 min per board
         # rather than every tick.
         last_stranded_warn_at: dict[str, int] = {}
+        last_unwoken_warn_at: dict[str, int] = {}
         last_workspace_refusal_warn: dict[str, tuple[str, int]] = {}
         workspace_refusal_notifier = _WorkspaceRefusalOutageNotifier()
+        workspace_refusal_card_notifier = _WorkspaceRefusalCardNotifier()
         guard_stuck_notifier = _GuardStuckNotifier()
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
@@ -2451,7 +2488,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, budget_cache: "Optional[dict]" = None, spawn_paused: "Optional[str]" = None, spawn_limit: "Optional[int]" = None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -2502,6 +2539,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     spawn_paused=spawn_paused,
+                    spawn_limit=spawn_limit,
                     reconcile_orphans=reconcile_orphans,
                     budget_cache=budget_cache,
                 )
@@ -2558,7 +2596,12 @@ class GatewayKanbanWatchersMixin:
             # turn ledgers are the same files for every board, so without this
             # an N-board host re-reads every ledger N times per tick.
             budget_cache: dict = {}
-            _spawn_paused = _sample_spawn_pause()
+            # Load gate: ONE allowance per tick, shared across every board —
+            # the host's run queue is one resource no matter which board the
+            # worker came from.
+            _allowance, _spawn_paused = _sample_spawn_pause()
+            _remaining = _allowance
+            _tick_spawned = 0
             # Enumeration extent spans the whole per-board tick body, not just
             # the fingerprint's path resolve: `_tick_once_for_board` also calls
             # `connect(board=slug)`, which re-resolves internally. Scoping only
@@ -2566,7 +2609,22 @@ class GatewayKanbanWatchersMixin:
             # warnings that then silenced later single-board misreadings.
             for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug, budget_cache, _spawn_paused)))
+                _paused = _spawn_paused
+                if _paused is None and _remaining is not None and _remaining <= 0:
+                    _paused = (
+                        f"load gate: this tick's allowance of {_allowance} "
+                        f"spawn(s) is used"
+                    )
+                res = _tick_once_for_board(
+                    slug, budget_cache, _paused,
+                    None if _paused else _remaining,
+                )
+                out.append((slug, res))
+                _n = len(getattr(res, "spawned", None) or []) if res is not None else 0
+                _tick_spawned += _n
+                if _remaining is not None:
+                    _remaining -= _n
+            _finish_gate_tick(_tick_spawned)
             return out
 
         def _ready_nonempty() -> bool:
@@ -2752,6 +2810,11 @@ class GatewayKanbanWatchersMixin:
                         workspace_refusal_notifier,
                         results,
                     )
+                    await service(
+                        workspace_refusal_card_notifier.observe,
+                        results,
+                        _send_workspace_refusal_card_alert,
+                    )
                     any_spawned = False
                     for slug, res in (results or []):
                         spawned = getattr(res, "spawned", None) if res is not None else None
@@ -2798,6 +2861,22 @@ class GatewayKanbanWatchersMixin:
                                     ", ".join(parents), ", ".join(children),
                                 )
                                 last_stranded_warn_at[slug] = now_s
+                        # Scheduled cards with NO timed wake, parked > 24h: the
+                        # dispatcher will never move them (t_6915068e). Same
+                        # STRANDED channel, hourly — the condition is day-scale.
+                        unwoken = (
+                            getattr(res, "unwoken_scheduled", None)
+                            if res is not None else None
+                        )
+                        if unwoken:
+                            now_s = int(time.time())
+                            if now_s - last_unwoken_warn_at.get(slug, 0) >= 3600:
+                                from hermes_cli.kanban_db import format_unwoken_scheduled
+                                logger.warning(
+                                    "kanban dispatcher [%s]: %s",
+                                    slug, format_unwoken_scheduled(unwoken).replace("\n", " "),
+                                )
+                                last_unwoken_warn_at[slug] = now_s
                     # Health telemetry (aggregate across boards).
                     #
                     # A tick with ready work but zero spawns is only a REAL stall

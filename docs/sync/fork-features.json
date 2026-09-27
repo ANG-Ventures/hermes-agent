@@ -543,5 +543,34 @@
       "gateway",
       "cron"
     ]
+  },
+  {
+    "feature": "provider-registry generation seam (hermes_cli/provider_seam.py): the nine provider-registry containers are copy-on-write facades, and refresh() triggers run before provider recognition (registry-pins v0.2 hot registration)",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_provider_seam.py",
+      "tests/test_provider_registry_seam.py::test_t1_every_container_is_bound_to_its_facade",
+      "tests/test_provider_registry_seam.py::test_refresh_triggers_run_before_recognition",
+      "tests/test_provider_registry_seam.py::test_lazy_auto_extend_fires_through_facade_and_snapshot"
+    ],
+    "paths": [
+      "hermes_cli/provider_seam.py",
+      "hermes_cli/auth.py",
+      "hermes_cli/models.py",
+      "hermes_cli/providers.py",
+      "providers/__init__.py",
+      "hermes_cli/model_switch.py",
+      "hermes_cli/runtime_provider.py",
+      "hermes_cli/provider_catalog.py"
+    ],
+    "why": "#1072 (860e58f818) added the seam that the pin-factory plugin's hot registration (plugins.pin_factory.hot_registration) publishes through. The seam module is a fork-only file. Every binding (GuardedDict/_Lazy* facade at a definition site) and every refresh(\"typed\"|\"picker\"|\"request\") trigger is ONE line in a contended upstream file, so a conflict resolved toward upstream silently removes it: the container reverts to a plain dict that tears under concurrent registration, or a provider registered after boot stops resolving on that path. Measured on upstream main cda237464a on 2026-09-25 (no seam): a reader iterating PROVIDER_REGISTRY during register_provider raised RuntimeError('dictionary changed size during iteration'), and a late-registered provider was missing from _KNOWN_PROVIDER_NAMES, so parse_model_input('late-probe:m1') routed to openrouter. Parity-merge rule: keep every facade binding and all refresh triggers. RED-proven 2026-09-25 by deleting each of the switch_model/resolve_runtime_provider/list_authenticated_providers triggers, rebinding auth.PROVIDER_REGISTRY to a plain dict, and deleting provider_seam.py.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/123349",
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron",
+      "desktop"
+    ]
   }
 ]

@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
+from hermes_cli import provider_seam
 from agent.credential_pool import (
     CredentialPool,
     PooledCredential,
@@ -1855,6 +1856,8 @@ def resolve_runtime_provider(
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
     """
+    # Hot registration: publish the requested provider (only) if newly configured.
+    provider_seam.refresh("request", (requested or "").strip() or None)
     requested_provider = resolve_requested_provider(requested)
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined

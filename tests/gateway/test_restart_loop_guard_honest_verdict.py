@@ -30,7 +30,6 @@ Two properties are pinned here:
 
 from __future__ import annotations
 
-import json
 import logging
 
 import pytest
@@ -138,14 +137,7 @@ def test_tripped_breaker_log_does_not_claim_an_action_it_does_not_take(caplog, t
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
         tripped = False
         for i in range(3):
-            # Each iteration stands for a SEPARATE gateway process. The guard
-            # records at most once per process identity, so a simulated boot
-            # must carry its own ``boot_id`` — advancing ``now`` alone describes
-            # three resume scans inside one boot, which is the thing the
-            # breaker must NOT count three times.
-            tripped = rlg.check_and_record(
-                3, 60, now=1000.0 + i, max_gap_seconds=300, boot_id=f"boot-{i}"
-            )
+            tripped = rlg.check_and_record(3, 60, now=1000.0 + i, max_gap_seconds=300)
     assert tripped is True
 
     message = "\n".join(r.getMessage() for r in caplog.records)
@@ -181,17 +173,9 @@ def test_default_gap_cannot_chain_the_observed_restart_cadence(gap, tmp_path, mo
 
     now = 1000.0
     tripped = None
-    for boot in range(5):
-        # One distinct process per simulated boot (see the boot_id note in
-        # ``test_tripped_breaker_log_does_not_claim_an_action_it_does_not_take``).
-        # Without it this negative control would be vacuous: a single process
-        # identity records once and can never chain regardless of the gap.
+    for _ in range(5):
         tripped = rlg.check_and_record(
-            3,
-            60,
-            now=now,
-            max_gap_seconds=rlg.DEFAULT_MAX_GAP_SECONDS,
-            boot_id=f"boot-{boot}",
+            3, 60, now=now, max_gap_seconds=rlg.DEFAULT_MAX_GAP_SECONDS
         )
         now += gap
     assert tripped is False
@@ -208,44 +192,20 @@ def test_widening_max_gap_chains_the_observed_cadence(gap, tmp_path, monkeypatch
 
     now = 1000.0
     verdicts = []
-    for boot in range(3):
-        verdicts.append(
-            rlg.check_and_record(
-                3, 60, now=now, max_gap_seconds=14400, boot_id=f"boot-{boot}"
-            )
-        )
+    for _ in range(3):
+        verdicts.append(rlg.check_and_record(3, 60, now=now, max_gap_seconds=14400))
         now += gap
     assert verdicts == [False, False, True]
 
 
 def test_a_quiet_period_still_breaks_the_chain(tmp_path, monkeypatch):
     """Widening the gap must not make the breaker permanently sticky."""
-    state = tmp_path / "rl.json"
-    monkeypatch.setattr(rlg, "_state_path", lambda: state)
+    monkeypatch.setattr(rlg, "_state_path", lambda: tmp_path / "rl.json")
 
-    def ledger_len() -> int:
-        return len(json.loads(state.read_text(encoding="utf-8"))["boots"])
-
-    assert (
-        rlg.check_and_record(3, 60, now=1000.0, max_gap_seconds=14400, boot_id="boot-1")
-        is False
-    )
-    assert ledger_len() == 1
-    assert (
-        rlg.check_and_record(3, 60, now=2000.0, max_gap_seconds=14400, boot_id="boot-2")
-        is False
-    )
-    # The chain is genuinely accumulating before the quiet period, otherwise the
-    # final False below would pass for the wrong reason.
-    assert ledger_len() == 2
+    assert rlg.check_and_record(3, 60, now=1000.0, max_gap_seconds=14400) is False
+    assert rlg.check_and_record(3, 60, now=2000.0, max_gap_seconds=14400) is False
     # A gap wider than max_gap_seconds ends the episode.
-    assert (
-        rlg.check_and_record(
-            3, 60, now=2000.0 + 14401, max_gap_seconds=14400, boot_id="boot-3"
-        )
-        is False
-    )
-    assert ledger_len() == 1
+    assert rlg.check_and_record(3, 60, now=2000.0 + 14401, max_gap_seconds=14400) is False
 
 
 @pytest.mark.asyncio

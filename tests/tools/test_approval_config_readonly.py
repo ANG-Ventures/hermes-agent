@@ -68,6 +68,11 @@ def _patched_loaders(monkeypatch):
 def test_guard_never_calls_deepcopy_variant(config_home, monkeypatch):
     """Pin: a full guard pass must not pay one deepcopying load_config.
     Fails pre-fix (the guard called load_config 2x per invocation)."""
+    # Warm pass: the first guard call imports tools.environments.local, whose
+    # module-level provider blocklist reads PROVIDER_REGISTRY and so triggers
+    # the one-time (lazy) provider discovery. That is per-process, not
+    # per-invocation, and is not what this pin measures.
+    check_all_command_guards("ls -la", "local")
     calls = _patched_loaders(monkeypatch)
     check_all_command_guards("ls -la", "local")
     assert calls["legacy"] == 0, (

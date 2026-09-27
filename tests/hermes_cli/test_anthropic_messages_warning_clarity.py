@@ -42,7 +42,9 @@ def test_anthropic_messages_warning_names_provider_and_endpoint(monkeypatch):
     # deterministically, regardless of which providers happen to be registered
     # in the current environment (CI ships no user plugins, so the label would
     # otherwise fall through to the raw ``claude-api-proxy`` slug).
-    monkeypatch.setitem(models._PROVIDER_LABELS, "claude-api-proxy", "Claude API Proxy")
+    monkeypatch.setattr(
+        models, "_PROVIDER_LABELS", {**models._PROVIDER_LABELS, "claude-api-proxy": "Claude API Proxy"}
+    )
 
     with patch("hermes_cli.models.fetch_api_models", return_value=None), \
          patch("hermes_cli.models.probe_api_models", side_effect=_stub_probe):
@@ -72,7 +74,9 @@ def test_anthropic_messages_warning_handles_missing_base_url(monkeypatch):
     """If base_url is not provided we must still produce a sensible message
     rather than embedding ``None`` or a blank.
     """
-    monkeypatch.setitem(models._PROVIDER_LABELS, "claude-api-proxy", "Claude API Proxy")
+    monkeypatch.setattr(
+        models, "_PROVIDER_LABELS", {**models._PROVIDER_LABELS, "claude-api-proxy": "Claude API Proxy"}
+    )
 
     with patch("hermes_cli.models.fetch_api_models", return_value=None), \
          patch("hermes_cli.models.probe_api_models", side_effect=_stub_probe):

@@ -83,7 +83,63 @@ def resolve_prompt_cache_scope(agent: Any) -> str:
     key = (sid, db is not None)
     memo = getattr(agent, _MEMO_ATTR, None)
     if isinstance(memo, tuple) and len(memo) == 2 and memo[0] == key:
-        return memo[1]
+        return _apply_fork_tag(agent, memo[1])
+    return _apply_fork_tag(agent, _resolve_uncached(agent, sid, db, key))
+
+
+def is_slot_keyed_cache_route(provider: Any, model: Any, base_url: Any = "") -> bool:
+    """True when the cache key selects ONE server-side slot per conversation.
+
+    xAI (direct ``xai``/``xai-oauth``, ``api.x.ai``, or Grok routed via
+    OpenRouter as ``x-ai/grok-*``) pins its prompt cache to the server picked
+    by ``x-grok-conv-id`` / ``prompt_cache_key``: two divergent request
+    streams under one key evict each other. Anthropic, DeepSeek and Gemini
+    caches are content-addressed and OpenAI's ``prompt_cache_key`` only routes
+    over a prefix match, so sharing the key there is harmless (and saves the
+    fork a cold write).
+    """
+    p = str(provider or "").strip().lower()
+    if p in {"xai", "xai-oauth"}:
+        return True
+    if "api.x.ai" in str(base_url or "").lower():
+        return True
+    m = str(model or "").strip().lower()
+    return m.startswith(("x-ai/grok-", "xai/grok-"))
+
+
+# ``<scope>::<tag>`` — a double colon so gateway-style session keys that
+# already contain single colons are never mistaken for a fork scope.
+FORK_SCOPE_SEPARATOR = "::"
+
+
+def is_fork_cache_scope(scope: Any) -> bool:
+    """True when *scope* is a fork-derived scope (``<scope>::<tag>``)."""
+    return isinstance(scope, str) and FORK_SCOPE_SEPARATOR in scope
+
+
+def _apply_fork_tag(agent: Any, scope: str) -> str:
+    """Derive ``<scope>::<tag>`` for a tagged fork on a slot-keyed provider.
+
+    Background-review forks share the parent's ``session_id`` (and therefore
+    its scope) so content-addressed caches serve them warm. On a slot-keyed
+    provider that same key makes the fork evict the parent's conversation
+    slot — measured on xai-oauth: parent's next call read 1,152 of ~356k
+    prompt tokens after a fork. Re-evaluated per call (cheap; no DB), so a
+    mid-run provider fallback picks the right shape.
+    """
+    tag = getattr(agent, "_prompt_cache_fork_tag", None)
+    if not scope or not isinstance(tag, str) or not tag:
+        return scope
+    if not is_slot_keyed_cache_route(
+        getattr(agent, "provider", ""),
+        getattr(agent, "model", ""),
+        getattr(agent, "base_url", ""),
+    ):
+        return scope
+    return f"{scope}{FORK_SCOPE_SEPARATOR}{tag}"
+
+
+def _resolve_uncached(agent: Any, sid: str, db: Any, key: tuple) -> str:
     root = _lineage_root(sid, db) if db is not None else None
     scope = root or sid
     # Memoize on a successful walk, or when there is no DB to consult at all,

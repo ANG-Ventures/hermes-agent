@@ -669,19 +669,10 @@ def test_turn_lease_fence_walks_continuation_that_inherited_fork_markers(tmp_pat
     db.release_session_turn_lease("branch-continuation", branch_holder)
 
 
-def _notice_times(
-    monkeypatch, tmp_path, *, wait_seconds, backoff, cap=300.0, interval=15.0
-):
+def _notice_times(monkeypatch, *, wait_seconds, backoff, cap=300.0, interval=15.0):
     """Drive acquire_session_turn_lease against a permanently held lease with
-    a fake clock and record WHEN each on_wait notice fires.
-
-    A REAL SessionDB is used even though acquisition is stubbed: the wait loop
-    also runs read-only diagnostics (same-process contention detection), and a
-    bare ``SessionDB.__new__`` shell made those raise AttributeError on a
-    half-initialised handle — a fixture lie, not a cadence regression.
-    """
-    db = SessionDB(tmp_path / "state.db")
-    db.create_session("held", source="test")
+    a fake clock and record WHEN each on_wait notice fires."""
+    db = SessionDB.__new__(SessionDB)  # no DB needed: acquisition is stubbed
     clock = {"t": 1000.0}
 
     def fake_monotonic():
@@ -710,21 +701,21 @@ def _notice_times(
     return notices
 
 
-def test_turn_lease_wait_notices_back_off_geometrically(monkeypatch, tmp_path):
+def test_turn_lease_wait_notices_back_off_geometrically(monkeypatch):
     """A 10-minute wait must not post 40 'Still waiting' messages.
 
     Regression for the 2026-09-21 #apollo flood: 24 Discord posts in one
     6-minute lease wait because every 15s notice became a fresh message.
     Default cadence is now 0, 15, 45, 105, 225, 465 ... (x2, capped at 300s).
     """
-    notices = _notice_times(monkeypatch, tmp_path, wait_seconds=600.0, backoff=2.0)
+    notices = _notice_times(monkeypatch, wait_seconds=600.0, backoff=2.0)
     assert notices == [0, 15, 45, 105, 225, 465]
 
 
-def test_turn_lease_wait_notice_backoff_is_capped(monkeypatch, tmp_path):
+def test_turn_lease_wait_notice_backoff_is_capped(monkeypatch):
     """The gap never exceeds wait_notice_max_interval_seconds."""
     notices = _notice_times(
-        monkeypatch, tmp_path, wait_seconds=1800.0, backoff=2.0, cap=120.0
+        monkeypatch, wait_seconds=1800.0, backoff=2.0, cap=120.0
     )
     gaps = [b - a for a, b in zip(notices, notices[1:])]
     assert gaps[:3] == [15, 30, 60]
@@ -732,15 +723,15 @@ def test_turn_lease_wait_notice_backoff_is_capped(monkeypatch, tmp_path):
     assert len(notices) < 20  # 30 minutes, not 120 posts
 
 
-def test_turn_lease_wait_notice_backoff_one_keeps_fixed_cadence(monkeypatch, tmp_path):
+def test_turn_lease_wait_notice_backoff_one_keeps_fixed_cadence(monkeypatch):
     """backoff<=1 preserves the historical fixed-interval behavior."""
-    notices = _notice_times(monkeypatch, tmp_path, wait_seconds=90.0, backoff=1.0)
+    notices = _notice_times(monkeypatch, wait_seconds=90.0, backoff=1.0)
     assert notices == [0, 15, 30, 45, 60, 75]
 
 
-def test_turn_lease_wait_notice_cap_below_interval_is_honored(monkeypatch, tmp_path):
+def test_turn_lease_wait_notice_cap_below_interval_is_honored(monkeypatch):
     """A cap smaller than the base interval is a ceiling, not ignored."""
     notices = _notice_times(
-        monkeypatch, tmp_path, wait_seconds=60.0, backoff=2.0, cap=10.0, interval=15.0
+        monkeypatch, wait_seconds=60.0, backoff=2.0, cap=10.0, interval=15.0
     )
     assert notices == [0, 10, 20, 30, 40, 50]

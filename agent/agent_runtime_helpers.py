@@ -1793,7 +1793,11 @@ def recovery_should_announce(
     return True
 
 
-def restore_primary_runtime(agent) -> bool:
+class _SkipResetGate(Exception):
+    """Internal: skip the reset-aware pool gate on a policy-forced return."""
+
+
+def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None) -> bool:
     """Restore the primary runtime at the start of a new turn.
 
     In long-lived CLI sessions a single AIAgent instance spans multiple
@@ -1815,30 +1819,22 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_index = 0
         return False
 
-    # Opt-out of automatic turn-scoped recovery (model.auto_recovery, default
-    # True = today's behavior). When set False, a session that fell back STAYS
-    # on the fallback across turns (sticky) instead of auto-restoring the
-    # primary — the user switches back manually via /model. This is a deliberate
-    # opt-in for a KNOWN-persistent primary problem (e.g. the current context
-    # keeps tripping the primary's safety filter), where auto-recovery would
-    # cold-rebuild the fallback's prompt cache every turn. Placed AFTER the
-    # no-fallback index-reset above (which must stay first/unconditional, #20465)
-    # and BEFORE the cooldown check, so a disabled toggle short-circuits the
-    # restore without touching index hygiene. Fails toward current behavior
-    # (default True) on any config-read error.
-    _auto_recovery = True
-    try:
-        from hermes_cli.config import read_raw_config
-        _raw = read_raw_config() or {}
-        _mcfg = _raw.get("model", {}) if isinstance(_raw, dict) else {}
-        _auto_recovery = bool(_mcfg.get("auto_recovery", True))
-    except Exception:
-        pass  # config read failure → default-on (restore, current behavior)
-    if not _auto_recovery:
-        return False  # sticky fallback: stay on the fallback this turn
+    # Fallback spec §4.2/§4.3: ONE restore predicate (legacy cooldown AND the
+    # sticky gate, probe form at the turn boundary). ``_policy_decision`` is
+    # the mid-turn ``fallback_failed`` return, already allowed by the caller.
+    from agent import fallback_wiring as _fw
 
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
-        return False  # primary still in rate-limit cooldown, stay on fallback
+    _decision = _policy_decision
+    if _decision is None:
+        _decision = _fw.restore_allowed(agent, probe=True)
+        if not _decision.allowed:
+            from agent import fallback_events as _fbe
+
+            _fbe.record_restore_refused(agent, _decision.reason, extra={
+                **(_decision.warm or {}),
+                "gate_bound_expires_in_s": _decision.gate_bound_expires_in_s,
+            })
+            return False  # primary still gated (cooldown / sticky), stay on fallback
 
     # ── Reset-aware gate ──
     # The 60s ``_rate_limited_until`` cooldown covers transient rate limits,
@@ -1864,6 +1860,8 @@ def restore_primary_runtime(agent) -> bool:
     prefetched_primary_pool = None
     primary_pool_prefetched = False
     try:
+        if _policy_decision is not None:
+            raise _SkipResetGate  # fallback_failed: eligibility already checked
         primary_provider = str(
             (agent._primary_runtime or {}).get("provider") or ""
         ).strip().lower()
@@ -1907,7 +1905,12 @@ def restore_primary_runtime(agent) -> bool:
                     agent.provider,
                     agent.model,
                 )
+            from agent import fallback_events as _fbe
+
+            _fbe.record_restore_refused(agent, "pool_reset_pending")
             return False
+    except _SkipResetGate:
+        pass
     except Exception:
         logger.debug(
             "Reset-aware restore gate failed; falling back to per-turn retry",
@@ -2168,6 +2171,8 @@ def restore_primary_runtime(agent) -> bool:
         # own /model action (a /model switch rebuilds the agent), so no
         # override gating applies; the shared predicate still guards the
         # degenerate same-route case.
+        # Close the sticky episode on ANY return (active=false, returned_at).
+        _policy_row = _fw.on_primary_return(agent, _decision)
         try:
             _to_route = (rt["provider"], rt["model"])
             if provider_fallback_active and recovery_should_announce(
@@ -2187,6 +2192,17 @@ def restore_primary_runtime(agent) -> bool:
                     old_effort=_old_reasoning_config,
                     new_effort=getattr(agent, "reasoning_config", None),
                 )
+                from agent import fallback_events as _fbe
+
+                if _policy_row and _failed_class:
+                    _policy_row["trigger_class"] = _failed_class
+                _recovery_row = _fbe.build_row(
+                    agent, "recovery",
+                    from_provider=_from_provider, from_model=_from_model,
+                    to_provider=_to_route[0], to_model=_to_route[1],
+                    consume=False, extra=_policy_row,
+                )
+                agent._fallback_restore_refused_logged = False
                 _rec_announce = False
                 try:
                     from hermes_cli.config import read_raw_config
@@ -2195,16 +2211,20 @@ def restore_primary_runtime(agent) -> bool:
                     _rec_announce = bool(_mcfg.get("announce_recovery", False))
                 except Exception:
                     pass  # config read failure → default-off (silent)
-                _emit_fallback_announce(
-                    agent, _from_model, _to_route[1], _to_route[0],
-                    old_provider=_from_provider,
-                    old_effort=_old_reasoning_config,
-                    new_effort=getattr(agent, "reasoning_config", None),
-                    announce_enabled=_rec_announce,
-                    record_event=False,
-                    kind="recovery",
-                    recovery_via="restore",
-                )
+                try:
+                    _emit_fallback_announce(
+                        agent, _from_model, _to_route[1], _to_route[0],
+                        old_provider=_from_provider,
+                        old_effort=_old_reasoning_config,
+                        new_effort=getattr(agent, "reasoning_config", None),
+                        announce_enabled=_rec_announce,
+                        record_event=False,
+                        kind="recovery",
+                        recovery_via="restore",
+                        ledger_row=_recovery_row,
+                    )
+                finally:
+                    _fbe.write_row(_recovery_row)
                 # Per-turn marker (observability + end-of-turn parity).
                 agent._recovery_emitted_this_turn = (_from_route, _to_route)
         except Exception:  # noqa: BLE001 — the emit must never break the restore

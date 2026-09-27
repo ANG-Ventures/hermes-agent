@@ -120,7 +120,12 @@ class TestAtomicModelRouteClear:
         entry.model_override = dict(legacy)
         store._entries[key] = entry
         store._loaded = True
+        # t_cc8533d1: the snapshot is persisted outside ``_lock`` through
+        # ``_persist_routing_data``; a failure there must leave memory intact.
         store._save = MagicMock(side_effect=OSError("second write failed"))
+        store._persist_routing_data = MagicMock(
+            side_effect=OSError("second write failed")
+        )
 
         with pytest.raises(OSError, match="second write failed"):
             store.clear_model_route_override(key)

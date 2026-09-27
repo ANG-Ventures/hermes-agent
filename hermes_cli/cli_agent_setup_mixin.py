@@ -49,9 +49,10 @@ class CLIAgentSetupMixin:
         except Exception as exc:
             _primary_exc = exc
 
-        # A kanban worker spawned with ``--provider`` is pinned by the
-        # dispatcher (card set-model / lane override / fallback rung). Never
-        # substitute another provider for it at startup: that is how a card
+        # A kanban worker whose CARD pins the ``--provider`` it was spawned
+        # with (card set-model; lane overrides and fallback rungs are not
+        # pins, t_16642ede). Never substitute another provider for it at
+        # startup: that is how a card
         # pinned to openai-codex to escape a bridge fault ran on claude-bpr
         # (t_4fe0700a). Refuse loudly instead; a cooldown exits rate-limited.
         from hermes_cli.kanban_worker_route import (

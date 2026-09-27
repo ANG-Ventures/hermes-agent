@@ -2462,10 +2462,16 @@ install_node_deps() {
         # installed", hiding the degradation from the user (#77003). Now it
         # fails the install outright instead of burying the warning (#85297).
         # Capture npm output so failures are diagnosable (#87340).
+        # --foreground-scripts runs install scripts one at a time. node-pty
+        # and get-windows both run node-gyp, and with no headers cached yet
+        # (a fresh box, or an upgrade from a release with no native deps)
+        # both download them into the same ~/.cache/node-gyp/<ver> at once;
+        # the loser exits 7 and fails the install intermittently. Output
+        # still goes to $npm_log.
         local npm_log
         npm_log="$(mktemp)"
         if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
-                >"$npm_log" 2>&1; then
+                --foreground-scripts >"$npm_log" 2>&1; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
                 log_error "npm output:"

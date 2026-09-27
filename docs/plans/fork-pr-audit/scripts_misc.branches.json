@@ -1,0 +1,86 @@
+{
+ "lcm-campaign-harness": {
+  "branch": "audit/scripts_misc/revert-lcm-campaign-harness",
+  "head": "e607c70118",
+  "verify": "removed 24 paths; dangling non-doc refs to removed scripts: none; `pytest tests/context_engine/test_lcm_fork_load.py tests/context_engine/test_lcm_qa_adversarial.py tests/context_engine/test_lcm_multifact_disambiguation.py` -> ....                                                                     [100%] / 76 passed in 22.57s",
+  "push_rc": 0
+ },
+ "ci-overflow-phase0": {
+  "branch": "audit/scripts_misc/revert-ci-overflow-phase0",
+  "head": "9f2736bbb0",
+  "verify": "removed 4 paths; exact-path grep on the pushed branch for 'ci_overflow_acceptance' and 'receipts/preflight' outside docs/*.md -> 0 hits (the earlier stem grep over-matched 'preflight')",
+  "push_rc": 0
+ },
+ "staging": {
+  "branch": "audit/scripts_misc/revert-staging",
+  "head": "0ec3ef1e71",
+  "verify": "git rm staging/ (5 files); removed 3 staging-coupled test defs + 1 class-guard entry from tests/test_residual_cli_hint_pasteable.py (remaining 'staging/scripts' mentions: 2, docstring only); `pytest tests/test_residual_cli_hint_pasteable.py` -> ...........                                                              [100%] / 11 passed in 3.92s",
+  "push_rc": 0
+ },
+ "oneshot-probes": {
+  "branch": "audit/scripts_misc/revert-oneshot-probes",
+  "head": "16de093703",
+  "verify": "removed 3 paths; dangling non-doc refs to removed scripts: none",
+  "push_rc": 0
+ },
+ "perclass-backfill": {
+  "branch": "audit/scripts_misc/revert-perclass-backfill",
+  "head": "b375c8421d",
+  "verify": "removed 2 paths; dangling non-doc refs to removed scripts: none",
+  "push_rc": 0
+ },
+ "greptile": {
+  "branch": "audit/scripts_misc/revert-greptile",
+  "head": "84941deda3",
+  "verify": "removed greptile.json; exact grep for 'greptile.json' outside docs/*.md on the pushed branch -> 0 hits",
+  "push_rc": 0
+ },
+ "ci-review-comment": {
+  "branch": "audit/scripts_misc/revert-ci-review-comment",
+  "head": "028f715b28",
+  "verify": "live_comment.py + workflow = upstream/main bytes; `pytest tests/ci/test_live_comment.py` -> ......ss...                                                              [100%] / 9 passed, 2 skipped in 1.73s",
+  "push_rc": 0
+ },
+ "author-map-stale": {
+  "branch": "audit/scripts_misc/revert-author-map-stale",
+  "head": "3d0fc6a697",
+  "verify": "removed 3 lines from scripts/release.py; ast ok",
+  "push_rc": 0
+ },
+ "self-hosted-pool-gaps": {
+  "branch": "audit/scripts_misc/revert-self-hosted-pool-gaps",
+  "head": "a9d7bb8f71",
+  "verify": "hand-built reverse apply: #703: apply -R --3way rc=0 Applied patch to '.github/workflows/rust-tests.yml' cleanly.\nApplied patch to '.github/workfl",
+  "push_rc": 0
+ },
+ "mem0-bgr": {
+  "branch": null,
+  "why": "reverse-apply leaves conflicts in ['toolsets.py']; #118: apply -R --3way rc=1 Applied patch to 'toolsets.py' with conflicts.\nApplied patch to 'tests/plugins/memory/test_mem0_remember.py' cleanly.\nU toolsets.py | #116: apply -R --3way rc=1 conflicts.\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nFalling back to direct application...\nApplied patch to 'agent/background_review.py' with conflicts."
+ },
+ "livesync": {
+  "branch": null,
+  "why": "reverse-apply leaves conflicts in ['hermes_cli/config.py', 'hermes_state.py', 'tui_gateway/server.py']; #268: apply -R --3way rc=1 Applied patch to 'tui_gateway/server.py' with conflicts.\nApplied patch to 'hermes_state.py' with conflicts.\nApplied patch to 'hermes_cli/web_server.py' cleanly.\nApplied patch to 'hermes_cli/config.py' with conflicts.\nU hermes_cli/config.py\nU hermes_state.py\nU tui_gateway/server.py"
+ },
+ "web-source": {
+  "branch": "audit/scripts_misc/revert-web-source",
+  "head": "0f558a362c",
+  "verify": "web/src/lib/gatewayClient{,.test}.ts = upstream/main bytes (2 files changed, 82 deletions(-)); fork diff on these files was only #188 + its teardown note; vitest NOT run (web node_modules not installed in the audit workspace)",
+  "push_rc": 0
+ },
+ "desktop-update-test": {
+  "branch": "audit/scripts_misc/revert-desktop-update-test",
+  "head": "33931f2a39",
+  "verify": "git revert -n d7d5b85496 applied clean",
+  "push_rc": 0
+ },
+ "upstream-728": {
+  "branch": "audit/scripts_misc/upstream-728",
+  "head": "a3a0962377",
+  "verify": "on upstream/main \u2014 before: `pytest tests/gateway/test_update_command.py tests/gateway/test_update_streaming.py` -> FAILED tests/gateway/test_update_streaming.py::TestCmdUpdateGatewayMode::test_gateway_flag_enables_gateway_prompt_for_stash / 1 failed, 23 passed, 2 skipped, 7 warnings in 60.10s (0:01:00); after: `pytest tests/gateway/test_update_command.py tests/gateway/test_update_streaming.py` -> FAILED tests/gateway/test_update_streaming.py::TestCmdUpdateGatewayMode::test_gateway_flag_enables_gateway_prompt_for_stash / 1 failed, 23 passed, 2 skipped, 7 warnings in 23.38s | the 1 failure is identical before and after and unrelated: test_gateway_flag_enables_gateway_prompt_for_stash trips tests/home_io_guard.py ('TEST BUG: file I/O against the REAL home ... /tools') on unmodified ../up as well",
+  "push_rc": 0
+ },
+ "upstream-695": {
+  "branch": null,
+  "why": "cherry-pick of #695 conflicts on upstream/main in ui-tui/src/__tests__/virtualHistoryOffsetCache.test.ts (fork file carries other fork deltas); needs a hand port + vitest run with ui-tui node_modules"
+ }
+}

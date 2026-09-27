@@ -312,7 +312,7 @@ class ArmBHarness:
         cmd = ["hermes", "-p", self.cfg.profile, "chat", "-Q", "-m", self.cfg.model]
         cmd.extend([*args, "-q", prompt])
         return subprocess.run(
-            cmd, capture_output=True, text=True,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=self.cfg.timeout_seconds, env=env, check=False,
         )
 

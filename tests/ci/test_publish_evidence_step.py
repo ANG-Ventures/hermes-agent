@@ -245,7 +245,7 @@ def test_missing_evidence_artifact_is_fatal(tmp_path):
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
 def test_missing_artifact_is_a_clean_skip_only_when_the_producer_was_skipped(tmp_path):
-    """`Desktop E2E` is hard-disabled in ci.yaml (`if: ${{ false && ... }}`).
+    """`Desktop E2E` is hard-disabled in ci.yaml (`if: false`).
 
     No CI run therefore produces an `e2e-evidence-*` artifact, so treating a
     missing artifact as fatal unconditionally would red the publish workflow
@@ -290,19 +290,70 @@ def test_absent_producer_job_is_fatal_not_a_skip(tmp_path):
     assert "renamed or removed" in result.stdout + result.stderr
 
 
+def _e2e_desktop_if(ci_path: Path):
+    """The ``if:`` of ci.yaml's e2e-desktop job, as YAML parses it."""
+    spec = yaml.safe_load(ci_path.read_text(encoding="utf-8"))
+    return spec["jobs"]["e2e-desktop"].get("if")
+
+
+def _is_constant_false(cond) -> bool:
+    """True when a job ``if:`` can never be truthy, whatever it is spelled as.
+
+    GitHub accepts a bare YAML ``false`` (parsed to ``False``), the string
+    ``false`` and ``${{ false }}``. The ``${{ false && (...) }}`` form is
+    also never truthy, but on a reusable-workflow job it crashes GitHub's
+    workflow parser at startup (0 jobs, "An unexpected error has occurred";
+    t_bc0052b9), so it does not count as a supported spelling here.
+    """
+    if cond is False:
+        return True
+    if not isinstance(cond, str):
+        return False
+    text = re.sub(r"\s+", "", cond)
+    return text in {"false", "${{false}}"}
+
+
+@pytest.mark.parametrize("cond,expected", [
+    (False, True),
+    ("false", True),
+    ("${{ false }}", True),
+    (None, False),
+    (True, False),
+    ("${{ needs.detect.outputs.frontend == 'true' }}", False),
+    ("${{ false && (needs.detect.outputs.frontend == 'true') }}", False),
+])
+def test_constant_false_recognises_only_parser_safe_spellings(cond, expected):
+    assert _is_constant_false(cond) is expected
+
+
 def test_the_evidence_producer_is_currently_disabled_in_ci():
     """Pins the premise the skip-vs-fail rule depends on.
 
     If `Desktop E2E` is ever re-enabled, this test fails and forces a
-    re-read of that rule rather than letting it silently go stale.
+    re-read of that rule rather than letting it silently go stale. It
+    asserts behaviour (the job's ``if`` is a constant false in a spelling
+    GitHub's parser accepts), not one literal string.
     """
-    ci = (_ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
-    e2e = ci.split("e2e-desktop:", 1)[1].split("\n  docs-site:", 1)[0]
-    assert "if: ${{ false &&" in e2e, (
-        "Desktop E2E is no longer hard-disabled — a missing evidence artifact "
-        "may now be a real regression on every PR; revisit the skip rule in "
-        "scripts/ci/publish_evidence_step.sh"
+    cond = _e2e_desktop_if(_ROOT / ".github/workflows/ci.yaml")
+    assert _is_constant_false(cond), (
+        f"Desktop E2E is no longer hard-disabled (if: {cond!r}); a missing "
+        "evidence artifact may now be a real regression on every PR; revisit "
+        "the skip rule in scripts/ci/publish_evidence_step.sh"
     )
+
+
+def test_the_evidence_producer_guard_is_parser_safe():
+    """``${{ false && ... }}`` on this reusable job crashed GitHub at startup.
+
+    Re-runs of ci.yaml died with 0 jobs and wiped the head's required
+    checks (t_bc0052b9, #1086 stranded 3 h). Whatever the job's ``if`` is,
+    it must not be the constant-folded ``false &&`` expression.
+    """
+    cond = _e2e_desktop_if(_ROOT / ".github/workflows/ci.yaml")
+    if isinstance(cond, str):
+        assert not re.search(r"\$\{\{\s*false\s*&&", cond), (
+            f"e2e-desktop uses the parser-crashing form: if: {cond!r}"
+        )
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")

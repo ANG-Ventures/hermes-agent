@@ -86,6 +86,7 @@ class WireAdapter(BasePlatformAdapter):
         self._send_behaviour = send_behaviour
         self._prefers_fresh_final = prefers_fresh_final
         self.wire = []  # (kind, payload) for every frame that rendered
+        self.messages = {}  # message_id -> text currently on screen
         self._next_id = 0
 
     def prefers_fresh_final_streaming(self, text=None) -> bool:
@@ -108,6 +109,7 @@ class WireAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="send rejected")
         self._next_id += 1
         self.wire.append(("send", content))
+        self.messages[f"m-{self._next_id}"] = content
         return SendResult(success=True, message_id=f"m-{self._next_id}")
 
     async def edit_message(
@@ -116,6 +118,7 @@ class WireAdapter(BasePlatformAdapter):
         verdict = self._edit_behaviour(len(self.wire))
         if verdict is True:
             self.wire.append(("edit", content))
+            self.messages[message_id] = content
             return SendResult(success=True, message_id=message_id)
         if verdict == "lie":
             return SendResult(success=True, message_id=message_id)
@@ -123,19 +126,54 @@ class WireAdapter(BasePlatformAdapter):
 
     async def delete_message(self, chat_id, message_id) -> bool:
         self.wire.append(("delete", message_id))
+        self.messages.pop(message_id, None)
         return True
 
     def rendered_complete_answer(self, final_text: str) -> bool:
-        """True when some frame the platform rendered carried *final_text*."""
-        return any(
+        """True when what the user can see carries *final_text*.
+
+        Either one rendered frame holds it, or the messages still on screen
+        read as the complete answer in order: the stream consumer's fallback
+        (edits stopped working) deliberately sends only the missing tail as a
+        new message below the frozen preview.  A cursor is tolerated only on
+        a preview that such a continuation follows; a lone preview still
+        showing the cursor is the #82656 shape and never counts.
+        """
+        if any(
             kind in ("send", "edit") and final_text.strip() in payload
             for kind, payload in self.wire
-        )
+        ):
+            return True
+        shown = list(self.messages.values())
+        if len(shown) < 2:
+            return False
+        parts = [
+            text[: -len(CURSOR)] if text.endswith(CURSOR) else text
+            for text in shown[:-1]
+        ] + [shown[-1]]
+        return " ".join(" ".join(parts).split()) == " ".join(final_text.split())
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(
+    autouse=True, params=[1, 10**6], ids=["fallback-at-first-flood", "flood-never-exhausts"]
+)
+def _flood_strike_regime(request, monkeypatch):
+    """Pin which side of the flood-strike limit every scenario runs on.
+
+    A failed edit is a flood strike; after ``_MAX_FLOOD_STRIKES`` the consumer
+    enters fallback and sends the missing tail itself.  With ``edit_interval=0``
+    the strike count reached before ``finish()`` is the number of consumer loop
+    turns that fit in ``_drive``'s sleeps -- under 3 idle, 3+ on a loaded
+    runner -- so the branch under test used to be chosen by the scheduler
+    (run 36069213079, slice 11/16).  Both regimes now run on every host.
+    """
+    monkeypatch.setattr(GatewayStreamConsumer, "_MAX_FLOOD_STRIKES", request.param)
+    return request.param
 
 
 async def _drive(adapter, *, interrupt: bool):

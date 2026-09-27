@@ -155,6 +155,11 @@ async def test_start_gateway_replace_aborts_when_force_killed_pid_still_alive(
     )
     # _pid_exists never goes False — the force-kill did not take.
     monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+    # The drain-budget grace wait is a real asyncio.sleep loop sized from
+    # config (~80s by default) — it made this one test 85s locally / ~200s on
+    # CI. Its sizing is covered by test_replace_takeover_grace.py; here only
+    # the "still alive after SIGKILL -> abort" branch matters.
+    monkeypatch.setattr("gateway.run.resolve_replace_takeover_grace_s", lambda *a: 0.0)
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
     monkeypatch.setattr("gateway.run.os.kill", lambda pid, sig: None)
     monkeypatch.setattr("time.sleep", lambda _: None)

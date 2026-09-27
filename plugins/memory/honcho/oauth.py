@@ -166,10 +166,11 @@ def _in_failure_cooldown(key: tuple[str, str]) -> bool:
     )
 
 
-# Memoized reauth_required verdict per grant: key → (config mtime_ns, result).
-# The verdict only changes when the config file is rewritten (re-login), so an
-# unchanged mtime short-circuits the read+parse on the dead-grant hot path.
-_reauth_check_cache: dict[tuple[str, str], tuple[int, bool]] = {}
+# Memoized reauth_required verdict per grant: key → (config content digest, result).
+# The verdict only changes when the config file is rewritten (re-login), so
+# unchanged bytes short-circuit the parse on the dead-grant hot path. Keyed on
+# content, not mtime: a rewrite inside one mtime tick kept a stale verdict.
+_reauth_check_cache: dict[tuple[str, str], tuple[str | None, bool]] = {}
 
 
 def _refresh_token_digest(cred: OAuthCredential) -> str:
@@ -191,19 +192,19 @@ def reauth_required(path: Path, host: str) -> bool:
     key = (str(path), host)
     if key not in _dead_grants:
         return False
-    # A re-login rewrites the config file, so gate the read+parse on mtime:
-    # while the file is unchanged the answer cannot change.
+    # A re-login rewrites the config file, so gate the parse on its bytes:
+    # while the content is unchanged the answer cannot change.
     try:
-        mtime = path.stat().st_mtime_ns
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
-        mtime = -1
+        digest = None
     cached = _reauth_check_cache.get(key)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and cached[0] == digest:
         return cached[1]
     block = (_read_config(path).get("hosts") or {}).get(host) or {}
     cred = OAuthCredential.from_host_block(block)
     result = cred is not None and _grant_is_dead(key, cred)
-    _reauth_check_cache[key] = (mtime, result)
+    _reauth_check_cache[key] = (digest, result)
     return result
 
 

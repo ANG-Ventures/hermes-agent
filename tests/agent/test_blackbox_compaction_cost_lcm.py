@@ -145,6 +145,79 @@ def test_lcm_unpriced_summary_call_keeps_cost_null(tmp_path, monkeypatch):
     assert agent._blackbox_compaction["compaction_tokens_before"] is not None
 
 
+def test_lcm_noop_compaction_after_priced_one_keeps_turn_priced(tmp_path, monkeypatch, caplog):
+    """t_6583c046: live turns ran a real compaction, then pre-API pressure
+    re-fired and LCM returned the transcript unchanged (N->N, zero summarizer
+    calls). The zero-call sink fell through to LCM's absent telemetry and
+    poisoned the whole turn to NULL (16/16 NULL turns on 09-24/25). A no-op
+    spent nothing: the turn keeps the first compaction's exact price."""
+    import agent.auxiliary_client as aux
+
+    calls: list = []
+    monkeypatch.setattr(aux, "_call_llm_impl", _transport(calls))
+    engine = _engine(tmp_path)
+    agent = _agent(tmp_path, engine)
+    messages = _messages()
+    compressed, _ = agent._compress_context(
+        messages, "You are testing LCM.",
+        approx_tokens=count_messages_tokens(messages), trigger_reason="threshold")
+    assert calls and engine._last_compression_status == "compacted"
+    priced = agent._blackbox_compaction["compaction_cost_usd"]
+    assert priced == _expected_cost(len(calls))
+
+    import agent.conversation_compression as cc
+    recorded: list = []
+    real_record = cc._record_blackbox_compaction
+
+    def spy(*a, **kw):
+        recorded.append(kw)
+        return real_record(*a, **kw)
+
+    monkeypatch.setattr(cc, "_record_blackbox_compaction", spy)
+    n_calls = len(calls)
+    out, _ = agent._compress_context(list(compressed), "You are testing LCM.",
+                                     approx_tokens=count_messages_tokens(compressed),
+                                     trigger_reason="pre_api_pressure")
+    assert len(calls) == n_calls, "premise: the second compaction made no summarizer call"
+    assert len(out) == len(compressed), "premise: the second compaction was a no-op"
+    assert len(recorded) == 1 and recorded[0]["noop"] is True, (
+        "premise: the no-op was committed and recorded")
+    assert agent._blackbox_compaction["compaction_cost_usd"] == priced
+
+
+def test_zero_call_non_noop_compaction_stays_unknown_and_logs_reason(caplog):
+    """A compaction that CHANGED the transcript without any observed call_llm
+    is not provably free: fail closed and say why."""
+    import logging
+    from agent.conversation_compression import _record_blackbox_compaction
+
+    agent = SimpleNamespace(_blackbox_compaction={"idle_compaction_fired": False})
+    with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+        _record_blackbox_compaction(agent, trigger="threshold", before=10, after=5,
+                                    telemetry=None,
+                                    cost_sink={"usd": 0.0, "calls": 0, "unknown": False})
+    assert agent._blackbox_compaction["compaction_cost_usd"] is None
+    assert "reason=no_calls_no_telemetry_cost" in caplog.text
+
+
+def test_unpriced_sink_logs_first_unknown_reason(caplog):
+    import logging
+    import agent.auxiliary_client as aux
+    from agent.conversation_compression import _record_blackbox_compaction
+
+    sink = aux.new_aux_cost_sink()
+    with aux.aux_cost_sink(sink):
+        aux._record_aux_call_cost(SimpleNamespace(usage=None, model="m"), {}, streamed=False)
+        aux._record_aux_call_cost(SimpleNamespace(usage=None, model="m"), {}, streamed=True)
+    assert sink["unknown"] is True and sink["unknown_reason"] == "no_usage"
+    agent = SimpleNamespace(_blackbox_compaction={"idle_compaction_fired": False})
+    with caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+        _record_blackbox_compaction(agent, trigger="threshold", before=10, after=5,
+                                    telemetry=None, cost_sink=sink, noop=True)
+    assert agent._blackbox_compaction["compaction_cost_usd"] is None
+    assert "reason=sink_unknown:no_usage" in caplog.text
+
+
 def test_sink_does_not_leak_outside_compaction(monkeypatch):
     import agent.auxiliary_client as aux
 

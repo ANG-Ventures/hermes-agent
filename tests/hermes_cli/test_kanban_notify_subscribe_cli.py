@@ -102,3 +102,34 @@ def test_notify_subscribe_cli_unknown_task_errors(kanban_home, capsys):
             "SELECT COUNT(*) FROM kanban_notify_subs"
         ).fetchone()[0]
     assert count == 0
+
+
+def _mode_for(task_id: str) -> str:
+    with kb.connect_closing() as conn:
+        return conn.execute(
+            "SELECT delivery_mode FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+
+
+def test_notify_subscribe_cli_defaults_to_passive_notify(kanban_home, capsys):
+    """Wake is opt-in (t_6d6e9467): a bare notify-subscribe never wakes."""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="default mode")
+    rc = kc.kanban_command(_parse_cli([
+        "kanban", "notify-subscribe", task_id,
+        "--platform", "discord", "--chat-id", "c1",
+    ]))
+    assert rc == 0, capsys.readouterr().err
+    assert _mode_for(task_id) == "notify"
+
+
+def test_notify_subscribe_cli_wake_flag_opts_into_wake(kanban_home, capsys):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="explicit wake")
+    rc = kc.kanban_command(_parse_cli([
+        "kanban", "notify-subscribe", task_id,
+        "--platform", "discord", "--chat-id", "c1", "--wake",
+    ]))
+    assert rc == 0, capsys.readouterr().err
+    assert _mode_for(task_id) == "notify+wake"

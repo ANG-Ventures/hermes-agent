@@ -144,7 +144,7 @@ def _age(stamp, now: datetime) -> str:
 def summary_markdown(placement, reason: str, now: datetime) -> str:
     if placement is None:
         return (f"### CI overflow placement\n\n`plan_valid=false` — {reason}. Every test slice and e2e "
-                "run on the local pool `self-hosted,Linux,X64,hermes-ci` (local fallback).\n")
+                "run on the static split (CI_RUNNER_LABELS / CI_SELF_HOSTED_SLOTS) (static fallback).\n")
     plan, s = placement["plan"], placement["plan"]["summary"]
     snap = s.get("snapshot") or {}
     obs = f"{snap.get('online', '?')}/{snap.get('idle', '?')}/{snap.get('queued_matching_jobs', '?')}"

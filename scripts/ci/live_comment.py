@@ -56,7 +56,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -64,256 +66,6 @@ import zipfile
 from pathlib import Path
 
 API_BASE = "https://api.github.com"
-
-# ---------------------------------------------------------------------------
-# Rate-limit governor + conditional-request cache
-# ---------------------------------------------------------------------------
-#
-# The poller shares ONE installation token (1000 req/hr/repo) with every other
-# job in the repo. Measured 2026-09-19: a single cycle charged 11 requests, and
-# 12 pollers were alive concurrently (one per open PR — the concurrency group
-# works; it is the PR count that scales, not duplicate pollers). At a 15 s
-# interval that is ~2,640 req/hr per poller, which exhausted the installation
-# limit and failed unrelated jobs sharing the token.
-#
-# Two levers, both measured against the live API:
-#
-#   1. Conditional requests. A 304 Not Modified does NOT decrement
-#      X-RateLimit-Remaining (verified: two If-None-Match requests left
-#      remaining unchanged at 4691, the next unconditional GET took it to
-#      4690). Every poll re-reads the same URLs, so caching by ETag makes a
-#      steady-state cycle cost zero.
-#   2. Immutable artifacts. Artifact zips were re-downloaded every cycle.
-#      An artifact id never changes content (``overwrite: true`` mints a new
-#      id), so one download per id suffices.
-#
-# On top of that, the governor watches X-RateLimit-Remaining and stretches the
-# interval when the installation budget runs low, and treats a 403/429
-# rate-limit response as "back off", never as a failure.
-
-_LOW_REMAINING_THRESHOLD = 200
-_LOW_REMAINING_INTERVAL = 60
-
-# How long the poller pauses between merge-queue membership rechecks.
-#
-# Merge-queue membership is NOT terminal: required checks can fail or time
-# out, and a human can remove a PR from the queue. Merge-group runs never
-# post a comment (the workflow's ``if`` requires ``event == 'pull_request'``),
-# so if this poller exited on a queued PR, a later dequeue would leave no
-# process to publish the review result at all.
-#
-# So a queued PR pauses instead of exiting. The pause must be much longer
-# than the poll interval or the recheck costs more budget than skipping the
-# poll saves: one GraphQL call per 5 minutes is ~12 req/hr per poller,
-# against the ~2 charged calls per 45 s cycle it suppresses.
-_MERGE_QUEUE_RECHECK_INTERVAL = 300
-
-# Socket timeout for every API call. Without it a hung connection blocks on
-# the OS default (minutes, or forever), and the poller stops updating the
-# comment with no log line and no error.
-_REQUEST_TIMEOUT = 30
-
-# Socket timeout for the artifact BLOB hop (hop 2 of a download). It is a
-# separate constant from _REQUEST_TIMEOUT because it is a bulk transfer, not
-# an API call — but it must be a named constant, not a literal, so the
-# timeout the download path actually uses is visible to the budget
-# arithmetic below and gated by a test.
-_ARTIFACT_BLOB_TIMEOUT = 60
-
-# Default hard wall-clock ceiling, INCLUDING merge-queue pauses.
-#
-# It must be finite by DEFAULT, not only when the workflow passes a flag:
-# queue pauses are excluded from the active timeout, so with no ceiling a
-# permanently-queued PR pauses forever and is eventually SIGKILLed by the
-# Actions job deadline — publishing nothing.
-#
-# 3300s is the SUPPORTED MONITORING WINDOW, chosen deliberately rather than
-# inherited: with _SHUTDOWN_RESERVE_SECONDS active polling runs to 3000s,
-# which is exactly the window the poller had before the reserve existed
-# (``--timeout 3000``). A 2700 default silently cut it to 2400s — a
-# ten-minute observability regression for any run finishing between 40 and
-# 50 minutes. The workflow's 60-minute timeout-minutes leaves 300s past this
-# budget, more than the ~90s an in-flight request plus the final PATCH can
-# overrun by.
-_DEFAULT_MAX_WALL_SECONDS = 3300
-
-# How much of the wall-clock budget is RESERVED for the shutdown snapshot.
-#
-# The cutoff must fire BEFORE the budget is spent, not when it is already
-# gone: the snapshot itself is a sequence of synchronous API calls (a
-# paginated jobs read, an artifact listing, up to _REQUEST_TIMEOUT-bounded
-# downloads, a PATCH). Starting it at t=budget left it racing the Actions
-# job deadline with nothing but luck between it and a SIGKILL. So active
-# polling stops at ``budget - reserve`` and the snapshot gets the reserve
-# to itself, additionally bounded by a hard ``deadline`` passed into the
-# artifact fetch so uncached downloads cannot overrun it either.
-_SHUTDOWN_RESERVE_SECONDS = 300
-
-# How much of the shutdown reserve is held back for the final PATCH itself.
-#
-# A fetch deadline equal to the end of the budget only bounds when a
-# download may START; the write that follows still needs a window of its
-# own. So artifact fetching stops this long before the budget ends, and the
-# PATCH (plus one retry) runs inside what is left.
-_PATCH_RESERVE_SECONDS = 60
-
-# Pause between shutdown-snapshot retries. Short: the reserve is finite and
-# the usual failure is a single transient API error, not a sustained outage.
-_FINAL_RETRY_BACKOFF = 5
-
-
-
-
-class RateLimitError(Exception):
-    """A 403/429 that the rate limiter produced, not a real failure."""
-
-    def __init__(self, retry_after: float):
-        super().__init__(f"rate limited; retry after {retry_after:.0f}s")
-        self.retry_after = retry_after
-
-
-class _ApiState:
-    """Per-process API bookkeeping: ETag cache, budget, call counters."""
-
-    def __init__(self) -> None:
-        self.etags: dict[str, tuple[str, object, str]] = {}
-        self.artifacts: dict[str, list[dict]] = {}
-        # Last successfully parsed statuses per artifact NAME, used to carry
-        # a section across a transient download failure of a newer id.
-        self.artifacts_by_name: dict[str, list[dict]] = {}
-        # Which artifact id produced each artifacts_by_name entry, so an
-        # older same-named artifact cannot overwrite a newer one.
-        self.artifact_name_ids: dict[str, int] = {}
-        # Keyed by (repo, pr_number): the PATCH URL for a comment carries only
-        # the comment id, not the PR, so a process-global id would let a
-        # second PR's poller overwrite the FIRST PR's comment.
-        self.comment_ids: dict[tuple[str, str], int] = {}
-        # True when the last fetch could not READ some artifact group because
-        # its deadline was spent. The result is then partial, and the final
-        # snapshot must not treat it as authoritative.
-        self.fetch_incomplete = False
-        self.remaining: int | None = None
-        self.limit: int | None = None
-        self.retry_after: float = 0.0
-        self.charged = 0
-        self.not_modified = 0
-
-    def reset(self) -> None:
-        self.__init__()
-
-    def comment_id_for(self, repo: str, pr_number: str) -> int | None:
-        return self.comment_ids.get((repo, str(pr_number)))
-
-    def set_comment_id(self, repo: str, pr_number: str, comment_id: int | None) -> None:
-        key = (repo, str(pr_number))
-        if comment_id:
-            self.comment_ids[key] = comment_id
-        else:
-            self.comment_ids.pop(key, None)
-
-
-    def observe(self, headers) -> None:
-        """Record rate-limit headers from any response (success or error).
-
-        ``retry_after`` reflects ONLY the response being observed. It used to
-        be accumulated with ``max()`` and never cleared, so the largest delay
-        ever seen outlived its response: after recovering from a 20-minute
-        primary limit, a later 5-second secondary limit still backed off 20
-        minutes, which ``_nap`` clamps to the remaining timeout — the poller
-        then ran out the clock without publishing a final status.
-        """
-        def _int(name: str) -> int | None:
-            raw = headers.get(name) if headers is not None else None
-            if raw is None:
-                return None
-            try:
-                return int(str(raw).strip())
-            except (TypeError, ValueError):
-                return None
-
-        remaining = _int("X-RateLimit-Remaining")
-        if remaining is not None:
-            self.remaining = remaining
-        limit = _int("X-RateLimit-Limit")
-        if limit is not None:
-            self.limit = limit
-
-        retry_after = _int("Retry-After")
-        if retry_after is not None and retry_after > 0:
-            self.retry_after = float(retry_after)
-            return
-        # Secondary/primary limits without Retry-After carry a reset epoch.
-        if remaining == 0:
-            reset_at = _int("X-RateLimit-Reset")
-            if reset_at is not None:
-                self.retry_after = max(0.0, reset_at - time.time())
-                return
-        # This response imposes no delay — a stored one has been served out.
-        self.retry_after = 0.0
-
-
-    def effective_interval(self, base: int) -> int:
-        """Stretch the poll interval when the installation budget is low."""
-        if self.remaining is not None and self.remaining < _LOW_REMAINING_THRESHOLD:
-            return max(base, _LOW_REMAINING_INTERVAL)
-        return base
-
-    def budget_line(self) -> str:
-        remaining = "?" if self.remaining is None else str(self.remaining)
-        limit = "?" if self.limit is None else str(self.limit)
-        return (f"rate-limit remaining={remaining}/{limit} "
-                f"charged={self.charged} not-modified={self.not_modified}")
-
-
-STATE = _ApiState()
-
-
-def _read_retry_after(headers) -> float:
-    """Retry-After from a response, without touching the REST budget state.
-
-    Used by the GraphQL path: GraphQL has its own point budget, so its
-    headers must not update the REST governor's remaining/limit — but a
-    Retry-After on it is still a real instruction to back off.
-    """
-    if headers is None:
-        return 0.0
-    raw = headers.get("Retry-After")
-    if raw is None:
-        return 0.0
-    try:
-        value = float(str(raw).strip())
-    except (TypeError, ValueError):
-        return 0.0
-    return value if value > 0 else 0.0
-
-
-def _is_rate_limited(err: urllib.error.HTTPError) -> bool:
-    """True when an HTTP error is a rate-limit response, not a real failure."""
-    if err.code == 429:
-        return True
-    if err.code != 403:
-        return False
-    headers = err.headers
-    if headers is None:
-        return False
-    if str(headers.get("X-RateLimit-Remaining", "")).strip() == "0":
-        return True
-    if headers.get("Retry-After"):
-        return True
-    body = ""
-    try:
-        body = err.read().decode("utf-8", "replace")
-    except Exception:
-        pass
-    return "rate limit" in body.lower()
-
-
-def _raise_if_rate_limited(err: urllib.error.HTTPError) -> None:
-    """Convert a rate-limit HTTPError into a RateLimitError; else re-raise."""
-    STATE.observe(err.headers)
-    if _is_rate_limited(err):
-        raise RateLimitError(STATE.retry_after or float(_LOW_REMAINING_INTERVAL)) from err
-    raise err
 
 # Job names that are infrastructure (this script, the gate, the detector)
 # and should never appear in the review comment.
@@ -391,78 +143,39 @@ def classify_jobs(api_jobs: list[dict]) -> tuple[dict[str, str], list[str], dict
 # ---------------------------------------------------------------------------
 
 
-def _headers(token: str, extra: dict[str, str] | None = None) -> dict[str, str]:
-    base = {
+def _api_request(url: str, token: str) -> dict:
+    """Authenticated GitHub API GET (single page)."""
+    req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "ci-live-comment",
-    }
-    if extra:
-        base.update(extra)
-    return base
+    })
+    with urllib.request.urlopen(req) as resp:
+        data: dict = json.loads(resp.read())
+        return data
 
 
-def _conditional_get(url: str, token: str, cache_key: str):
-    """GET ``url``, reusing the cached body when GitHub answers 304.
-
-    A 304 Not Modified is free: it does not decrement the installation's
-    ``X-RateLimit-Remaining``. The poller re-reads the same handful of URLs
-    every cycle, so in steady state (nothing changed since the last poll)
-    an entire cycle costs zero rate-limit budget.
-
-    Returns ``(payload, link_header)``. ``payload`` is whatever the endpoint
-    returns — a dict or a list; callers unwrap it (``_api_get_paginated``
-    applies its own ``list_key``). On 304 the cached payload and Link header
-    are replayed.
-    """
-    cached = STATE.etags.get(cache_key)
-    extra = {"If-None-Match": cached[0]} if cached else None
-    req = urllib.request.Request(url, headers=_headers(token, extra))
-    try:
-        with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
-            STATE.observe(resp.headers)
-            STATE.charged += 1
-            body = json.loads(resp.read())
-            etag = resp.headers.get("ETag", "")
-            link = resp.headers.get("Link", "")
-            if etag:
-                STATE.etags[cache_key] = (etag, body, link)
-            return body, link
-    except urllib.error.HTTPError as e:
-        if e.code == 304 and cached is not None:
-            STATE.observe(e.headers)
-            STATE.not_modified += 1
-            return cached[1], cached[2]
-        _raise_if_rate_limited(e)
-        raise
-
-
-def _api_request(url: str, token: str, cache_key: str | None = None) -> dict:
-    """Authenticated GitHub API GET (single page), ETag-cached."""
-    data, _ = _conditional_get(url, token, cache_key or url)
-    return data if isinstance(data, dict) else {}
-
-
-def _api_get_paginated(
-    url: str, token: str, list_key: str | None = None, cache_key: str | None = None,
-) -> list:
-    """Authenticated GitHub API GET with pagination, ETag-cached per page."""
+def _api_get_paginated(url: str, token: str, list_key: str | None = None) -> list:
+    """Authenticated GitHub API GET with pagination."""
     results: list = []
-    key_base = cache_key or url
-    page = 0
-    next_url: str | None = url
-    while next_url:
-        page += 1
-        data, link_header = _conditional_get(next_url, token, f"{key_base}#p{page}")
+    while url:
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "ci-live-comment",
+        })
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+            link_header = resp.headers.get("Link", "")
 
         if list_key:
-            results.extend(data.get(list_key, []) if isinstance(data, dict) else [])
+            results.extend(data.get(list_key, []))
         elif isinstance(data, list):
             results.extend(data)
         else:
-            # Endpoint returned a non-list without a list_key — nothing to page.
-            return results
+            return data
 
         next_url = None
         for part in link_header.split(","):
@@ -470,6 +183,7 @@ def _api_get_paginated(
             if 'rel="next"' in part:
                 next_url = part[part.find("<") + 1:part.find(">")]
                 break
+        url = next_url
 
     return results
 
@@ -593,37 +307,12 @@ def find_comment_id(token: str, repo: str, pr_number: str) -> int | None:
 
 
 def upsert_comment(
-    token: str, repo: str, pr_number: str, body: str, comment_id: int | None = None,
-    _allow_recreate: bool = True,
+    token: str, repo: str, pr_number: str, body: str, comment_id: int | None = None
 ) -> int | None:
-    """Create or update the review comment. Returns the comment ID.
-
-    The comment id is cached for the life of the process: once the poller
-    knows which comment is its own, every later cycle PATCHes it directly
-    instead of re-listing the PR's comments (one fewer charged request per
-    update, and the listing grows with PR chatter).
-
-    If the cached comment was deleted, the PATCH answers 404. Clearing the
-    cached id and deferring re-creation to "the next cycle" loses the comment
-    entirely when the 404 lands on the final cycle (the quiet grace is already
-    spent and the loop is about to break), so the re-create is issued
-    immediately, once. ``_allow_recreate`` bounds that to a single retry.
-    """
+    """Create or update the review comment. Returns the comment ID."""
     owner, repo_name = repo.split("/")
     if comment_id is None:
-        comment_id = STATE.comment_id_for(repo, pr_number)
-    if comment_id is None:
-        try:
-            comment_id = find_comment_id(token, repo, pr_number)
-        except RateLimitError:
-            raise
-        except Exception as e:
-            # find_comment_id sits OUTSIDE the try below; an HTTPError or a
-            # transport error here used to escape run()'s RateLimitError-only
-            # handler and kill the poller.
-            print(f"  Could not list comments ({e}) — will retry next cycle.",
-                  file=sys.stderr)
-            return None
+        comment_id = find_comment_id(token, repo, pr_number)
 
     if comment_id:
         url = f"{API_BASE}/repos/{owner}/{repo_name}/issues/comments/{comment_id}"
@@ -633,47 +322,20 @@ def upsert_comment(
         method = "POST"
 
     data = json.dumps({"body": body}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method, headers=_headers(token, {
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json",
-    }))
+        "User-Agent": "ci-live-comment",
+    })
     try:
-        with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
-            STATE.observe(resp.headers)
-            STATE.charged += 1
+        with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read())
-            new_id = result.get("id")
-            if new_id:
-                STATE.set_comment_id(repo, pr_number, new_id)
-            return new_id
+            return result.get("id")
     except urllib.error.HTTPError as e:
-        STATE.observe(e.headers)
-        if _is_rate_limited(e):
-            raise RateLimitError(
-                STATE.retry_after or float(_LOW_REMAINING_INTERVAL)
-            ) from e
-        if e.code == 404 and method == "PATCH":
-            # Someone deleted our comment. Re-create it NOW: deferring to the
-            # next cycle silently drops the final status when this is the last
-            # one. ``_allow_recreate=False`` on the retry keeps it to one POST.
-            STATE.set_comment_id(repo, pr_number, None)
-            print("  Review comment was deleted — recreating it.", file=sys.stderr)
-            if _allow_recreate:
-                return upsert_comment(
-                    token, repo, pr_number, body,
-                    comment_id=0, _allow_recreate=False,
-                )
-            return None
         print(f"  API error {e.code}: {e.reason}", file=sys.stderr)
         return None
-    except Exception as e:
-        # URLError / socket.timeout / ssl.SSLError. HTTPError is a SUBCLASS of
-        # URLError, not the reverse, so the handler above does not cover these
-        # — and an escape here killed the poller and froze the comment for the
-        # rest of the run. Comment posting is best-effort; retry next cycle.
-        print(f"  Network error updating the comment ({e}) — will retry.",
-              file=sys.stderr)
-        return None
-
 
 
 # ---------------------------------------------------------------------------
@@ -685,10 +347,6 @@ def upsert_comment(
 # ``review-status.json`` file in GITHUB_OUTPUT format:
 #   review_status=<json array of {source, results: [...]} objects>
 _REVIEW_STATUS_ARTIFACT_PREFIX = "review-status-"
-
-# Where artifact zips are staged. Module-level so tests can redirect it
-# instead of writing into the real shared /tmp.
-_ARTIFACT_TEMP_BASE = Path("/tmp/review-status-artifacts")
 
 
 def _list_artifacts(token: str, repo: str, run_id: str) -> list[dict]:
@@ -707,42 +365,17 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _bounded_timeout(base: float, deadline: float | None) -> float | None:
-    """Clamp a socket timeout to the time left before ``deadline``.
-
-    Returns ``None`` when the deadline has already passed, meaning "do not
-    start this request at all". A request bounded only by its own socket
-    timeout can begin just before the cutoff and still run a further
-    30-60s, eating the window the final PATCH needs.
-    """
-    if deadline is None:
-        return base
-    room = deadline - time.time()
-    if room <= 0:
-        return None
-    return max(1.0, min(base, room))
-
-
 def _download_artifact(
     token: str, repo: str, artifact: dict, dest_dir: Path,
-    deadline: float | None = None,
 ) -> Path | None:
     """Download a single artifact zip via the API and extract it.
 
     Returns the path to ``review-status.json`` inside the extracted dir,
     or ``None`` if the download or extraction failed.
-
-    ``deadline`` is an absolute ``time.time()`` instant past which no hop
-    may still be running: each request's socket timeout is clamped to the
-    time remaining, and a hop whose window is already gone is not started.
     """
     owner, repo_name = repo.split("/")
     archive_download_url = artifact.get("archive_download_url", "")
     if not archive_download_url:
-        return None
-
-    redirect_timeout = _bounded_timeout(_REQUEST_TIMEOUT, deadline)
-    if redirect_timeout is None:
         return None
 
     # The archive_download_url is an API URL that 302s to a signed blob
@@ -752,56 +385,31 @@ def _download_artifact(
     opener = urllib.request.build_opener(_NoRedirectHandler)
     location = ""
     try:
-        resp = opener.open(urllib.request.Request(
-            archive_download_url, headers=_headers(token),
-        ), timeout=redirect_timeout)
-        STATE.observe(resp.headers)
-        STATE.charged += 1
+        opener.open(urllib.request.Request(archive_download_url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "ci-live-comment",
+        }), timeout=30)
     except urllib.error.HTTPError as e:
-        STATE.observe(e.headers)
-        if e.code == 302:
-            STATE.charged += 1
-            location = e.headers.get("Location", "")
-        elif _is_rate_limited(e):
-            raise RateLimitError(
-                STATE.retry_after or float(_LOW_REMAINING_INTERVAL)
-            ) from e
+        location = e.headers.get("Location", "") if e.code == 302 else ""
     except Exception:
         location = ""
     if not location:
         return None
 
-    # Download/extract paths are keyed by the immutable artifact ID, never by
-    # name: an ``overwrite: true`` upload (every ``review-status-*``) mints a
-    # NEW id under the SAME name, so name-keyed paths let a stale extract from
-    # the previous id be served for the newer one.
-    # Keyed by the immutable id, and BOUNDED: an artifact name is
-    # caller-chosen and can be long enough that name+id+".zip" exceeds the
-    # filesystem's per-component limit, whose OSError reads as a transient
-    # download failure and silently drops the section.
-    artifact_id = artifact.get("id", "noid")
-    # NAME_MAX is a BYTE limit, so truncating by CHARACTERS is not enough:
-    # 80 four-byte characters plus the id and ".zip" blows past 255 bytes,
-    # and the resulting OSError reads as a transient download failure that
-    # silently drops the section. Truncate the encoded bytes instead.
-    name_bytes = str(artifact["name"]).encode("utf-8")[:80]
-    safe_name = name_bytes.decode("utf-8", "ignore")
-    slug = f"{safe_name}-{artifact_id}"
-    zip_path = dest_dir / f"{slug}.zip"
-    blob_timeout = _bounded_timeout(_ARTIFACT_BLOB_TIMEOUT, deadline)
-    if blob_timeout is None:
-        return None
+    zip_path = dest_dir / f"{artifact['name']}.zip"
     try:
         # No auth headers here; further redirects are safe to follow.
         with urllib.request.urlopen(
             urllib.request.Request(location, headers={"User-Agent": "ci-live-comment"}),
-            timeout=blob_timeout,
+            timeout=60,
         ) as resp:
             zip_path.write_bytes(resp.read())
     except Exception:
         return None
 
-    extract_dir = dest_dir / slug
+    extract_dir = dest_dir / artifact["name"]
     extract_dir.mkdir(parents=True, exist_ok=True)
     try:
         with zipfile.ZipFile(zip_path) as zf:
@@ -815,37 +423,23 @@ def _download_artifact(
     return status_file if status_file.exists() else None
 
 
-def _artifact_sort_key(artifact_id) -> int:
-    """Numeric ordering for artifact ids; non-numeric sort lowest."""
+def _parse_status_file(status_file: Path) -> list[dict]:
+    """Parse a review-status.json file in GITHUB_OUTPUT format."""
     try:
-        return int(artifact_id)
-    except (TypeError, ValueError):
-        return -1
-
-
-def _parse_status_file(status_file: Path) -> list[dict] | None:
-    """Parse a review-status.json file in GITHUB_OUTPUT format.
-
-    Returns ``None`` when the file could not be READ or PARSED — distinct
-    from ``[]``, which is a valid empty payload. Conflating them let a
-    transient read failure cache "no statuses" for an immutable artifact id
-    and erase an already-published review section.
-    """
-    try:
-        content = status_file.read_text(encoding="utf-8").strip()
+        content = status_file.read_text(encoding="utf-8-sig").strip()
         if content.startswith("review_status="):
             content = content[len("review_status="):]
         statuses = json.loads(content)
+        if isinstance(statuses, list):
+            return statuses
     except (json.JSONDecodeError, OSError):
-        return None
-    if isinstance(statuses, list):
-        return statuses
-    return None
+        pass
+    return []
 
 
 def fetch_all_review_statuses(
-    token: str, repo: str, run_id: str, deadline: float | None = None,
-) -> list[dict] | None:
+    token: str, repo: str, run_id: str,
+) -> list[dict]:
     """Fetch and merge all review-status artifacts from the run.
 
     Lists artifacts with the ``review-status-`` prefix on the orchestrator
@@ -854,138 +448,39 @@ def fetch_all_review_statuses(
     reusable workflow jobs to the caller run, so one listing covers every
     status-producing job.
 
-    An artifact's content is immutable for a given artifact id — re-uploading
-    with ``overwrite: true`` mints a NEW id — so each id is downloaded at most
-    once per process and the parsed statuses are cached. Before this, every
-    poll cycle re-downloaded every artifact (measured: 4 extra charged
-    requests per cycle on a typical run, plus the listing).
-
-    Returns the merged list of ``{source, results: [...]}`` objects, or
-    ``None`` when the artifact LISTING itself failed. ``None`` means
-    "unknown", not "none exist": returning an empty list there made the
-    caller republish the comment with every review section deleted.
+    Returns the merged list of ``{source, results: [...]}`` objects.
     Artifacts that don't exist yet or fail to parse are silently skipped.
-
-    ``deadline`` is an absolute ``time.time()`` value past which no further
-    UNCACHED artifact is downloaded, and which bounds each in-flight request
-    so a hop cannot start just before the cutoff and run a further 30-60s.
-    Both the shutdown snapshot and ordinary polling pass one, so a run with
-    many uncached artifacts cannot spend an unbounded number of downloads
-    against the wall-clock budget and be SIGKILLed with nothing published.
-    Cached/carried values are still merged — they cost no request.
-
-    A group whose newest artifact could not be read contributes NOTHING and
-    sets ``STATE.fetch_incomplete``; only a value this process already
-    published for that same newest id is carried. An OLDER same-named
-    artifact is never substituted: on a rerun that would present a
-    superseded attempt's failure as the current result. Unknown beats stale.
     """
-    temp_base = _ARTIFACT_TEMP_BASE
+    all_statuses: list[dict] = []
+    temp_base = Path(tempfile.gettempdir()) / "review-status-artifacts"
 
     try:
         artifacts = _list_artifacts(token, repo, run_id)
-    except RateLimitError:
-        raise
-    except Exception as e:
-        # A transient listing failure must not silently republish the comment
-        # with every review section gone. Signal "unknown", not "empty", and
-        # let the caller keep the last known statuses.
-        print(f"  Could not list artifacts ({e}) — keeping the previous "
-              f"review statuses.", file=sys.stderr)
-        STATE.fetch_incomplete = True
-        return None
+    except Exception:
+        return all_statuses
 
     rs_artifacts = [
         a for a in artifacts
         if a.get("name", "").startswith(_REVIEW_STATUS_ARTIFACT_PREFIX)
     ]
     if not rs_artifacts:
-        STATE.fetch_incomplete = False
-        return []
+        return all_statuses
 
+    # Clean temp dir for this run's artifacts.
     run_dl_dir = temp_base / str(run_id)
+    if run_dl_dir.exists():
+        shutil.rmtree(run_dl_dir)
     run_dl_dir.mkdir(parents=True, exist_ok=True)
 
-    # Group by artifact NAME and use only the newest artifact that actually
-    # parses. A rerun leaves several non-expired artifacts with the same
-    # name; appending all of them and deduping by `source` afterwards only
-    # worked while the newest one carried every source. A newest artifact
-    # that validly contains `[]` (several producers emit that on success)
-    # contributes no source, so an older artifact from a FAILED attempt was
-    # appended later and survived the dedupe — the comment kept showing an
-    # obsolete failure after the rerun passed.
-    by_name: dict[str, list[dict]] = {}
     for artifact in rs_artifacts:
-        by_name.setdefault(artifact.get("name", ""), []).append(artifact)
+        status_file = _download_artifact(token, repo, artifact, run_dl_dir)
+        if status_file is None:
+            continue
+        statuses = _parse_status_file(status_file)
+        all_statuses.extend(statuses)
 
-    all_statuses: list[dict] = []
-    incomplete = False
-    for name, group in by_name.items():
-        # Explicit newest-first: do not rely on the listing's order.
-        group = sorted(
-            group, key=lambda a: _artifact_sort_key(a.get("id")), reverse=True)
-        newest = group[0]
-        newest_id = _artifact_sort_key(newest.get("id"))
-        key = str(newest.get("id", newest.get("name", "")))
-        chosen: list[dict] | None = STATE.artifacts.get(key)
-        skipped = False
-        if chosen is None:
-            if deadline is not None and time.time() >= deadline:
-                # Out of shutdown margin — do not start another 30-60s
-                # download. Fall through to the carried value below.
-                skipped = True
-                print(f"  Shutdown margin spent — skipping the uncached "
-                      f"artifact {name}.", file=sys.stderr)
-            else:
-                status_file = _download_artifact(
-                    token, repo, newest, run_dl_dir, deadline=deadline)
-                if status_file is None and deadline is not None and \
-                        time.time() >= deadline:
-                    # The download was cut short by the deadline rather than
-                    # by the artifact being unavailable.
-                    skipped = True
-                if status_file is not None:
-                    statuses = _parse_status_file(status_file)
-                    # `None` is a transient read/parse failure, NOT a valid
-                    # empty payload; caching it would replace the last
-                    # known-good section with nothing.
-                    if statuses is not None:
-                        STATE.artifacts[key] = statuses
-                        chosen = statuses
-                        prev_id = STATE.artifact_name_ids.get(name)
-                        if prev_id is None or newest_id >= prev_id:
-                            STATE.artifacts_by_name[name] = statuses
-                            STATE.artifact_name_ids[name] = newest_id
-        if chosen is None:
-            # Only the NEWEST artifact of a name is eligible to be READ.
-            # Walking down to an older same-named artifact in the listing
-            # resurrected a SUPERSEDED attempt's failure: on a rerun, a cold
-            # poller that cannot read the new archive would publish the
-            # previous attempt's result as if it were the rerun's. Unknown
-            # beats stale.
-            #
-            # A value this process already PUBLISHED under this name is a
-            # different case — it is on screen right now, and deleting the
-            # section over one blip on a re-uploaded zip is the regression
-            # the carry exists to prevent.
-            chosen = STATE.artifacts_by_name.get(name)
-            if chosen is None:
-                # Nothing readable and nothing published: the group's state
-                # is UNKNOWN. Contribute nothing, and when the deadline is
-                # what stopped us from looking, say the result is partial so
-                # the caller does not treat it as authoritative.
-                if skipped:
-                    incomplete = True
-                print(f"  Review status for {name} is not readable yet — "
-                      f"leaving the section unknown this cycle.",
-                      file=sys.stderr)
-                continue
-        all_statuses.extend(chosen)
-
-    STATE.fetch_incomplete = incomplete
-
-    # Distinct artifact NAMES can still carry the same source (e.g. a
-    # renamed producer across a rerun) — dedupe by source so the comment
+    # A re-run can leave several non-expired artifacts with the same name,
+    # each carrying the same source — dedupe by source so the comment
     # doesn't render duplicate sections.
     seen: set[str] = set()
     deduped: list[dict] = []
@@ -1055,249 +550,36 @@ def run(
     pr_number: str,
     run_url: str,
     commit_info: str = "",
-    interval: int = 45,
+    interval: int = 15,
     timeout: int = 1800,
     dry_run: bool = False,
     watch_workflows: list[str] | None = None,
-    max_wall_seconds: int | None = _DEFAULT_MAX_WALL_SECONDS,
 ) -> int:
     """Poll for job statuses and update the PR comment until all done.
 
     Always returns 0. The poller reports on the CI run from a different run.
     Thus a failed CI job is not a failure of this job. The CI run has its
-    own gate, which reports that. Comment posting is best-effort — including
-    when the shared installation token runs out of rate-limit budget: the
-    poller backs off and keeps going, and never fails the job over it.
+    own gate, which reports that. Comment posting is best-effort.
     """
     asm = _import_assembler()
     start = time.time()
-    wall_start = start
-    # Active polling stops here, leaving the reserve for the shutdown
-    # snapshot; the snapshot itself is bounded by the full budget.
-    reserve = None
-    poll_ceiling = None
-    if max_wall_seconds is not None:
-        reserve = min(float(_SHUTDOWN_RESERVE_SECONDS),
-                      max_wall_seconds / 2.0)
-        poll_ceiling = max_wall_seconds - reserve
     last_body = ""
     quiet_grace_used = False
     prev_completed: dict[str, str] = {}
     prev_pending: list[str] = []
     prev_artifact_count = 0
-    prev_artifact_statuses: list[dict] = []
-
-    # -inf so the first cycle always checks; then throttled to one check per
-    # _MERGE_QUEUE_RECHECK_INTERVAL so the recheck does not become a new
-    # per-cycle charge against the budget this whole module defends.
-    last_queue_check = float("-inf")
-
-
-    def _nap(seconds: float) -> None:
-        """Sleep, but never past the timeout OR the wall-clock budget.
-
-        Queued time is added back to ``start``, so the ACTIVE timeout can
-        have thousands of seconds left while the workflow job has seconds.
-        Clamping only against ``timeout`` would let an ordinary sleep or a
-        rate-limit backoff run into the Actions deadline and be SIGKILLed.
-        """
-        remaining_time = timeout - (time.time() - start)
-        if poll_ceiling is not None:
-            remaining_time = min(
-                remaining_time,
-                poll_ceiling - (time.time() - wall_start),
-            )
-        time.sleep(max(0.0, min(seconds, remaining_time)))
-
-    def _pause_for_queue(seconds: float) -> None:
-        """Sleep while merge-queued, WITHOUT spending the poll lifetime.
-
-        A queued pause is not polling work — it is waiting for the PR to
-        come back. Counting it against ``timeout`` means a PR queued for the
-        full 50-minute window exits the poller, and a later dequeue then has
-        no reporter at all: exactly the failure the pause exists to prevent
-        (merge-group runs never post a comment). So advance ``start`` by the
-        paused duration, which leaves the poller its full budget of ACTIVE
-        polling once the PR returns.
-
-        It is bounded by ``max_wall_seconds`` regardless: the Actions job has
-        its own hard ``timeout-minutes``, and being SIGKILLed mid-pause
-        publishes nothing at all. Stopping cleanly before that lets the
-        final status be written.
-        """
-        nonlocal start
-        before = time.time()
-        if poll_ceiling is not None:
-            room = poll_ceiling - (before - wall_start)
-            seconds = min(seconds, max(0.0, room))
-        time.sleep(max(0.0, seconds))
-        start += time.time() - before
-
-
-
-    def _publish_final_snapshot() -> bool:
-        """Best-effort last write before an early, non-completion exit.
-
-        Both the wall-clock cutoff and a poller that spends its whole life
-        with the PR merge-queued would otherwise exit having published
-        nothing at all — and merge-group runs never post a comment, so no
-        other process would.
-
-        It runs with ``_SHUTDOWN_RESERVE_SECONDS`` of the wall-clock budget
-        deliberately left unspent. Artifact fetching gets a cutoff of
-        ``budget - _PATCH_RESERVE_SECONDS`` — earlier than the budget
-        itself, so the PATCH that follows has a window of its own rather
-        than inheriting whatever a last download left behind.
-
-        Returns True when a write landed (or none was needed because the
-        body is unchanged), False when the snapshot failed and is worth
-        retrying inside the remaining reserve.
-        """
-        nonlocal last_body, prev_artifact_statuses
-        if dry_run:
-            return True
-        fetch_deadline = None
-        if max_wall_seconds is not None:
-            fetch_deadline = (
-                wall_start + max_wall_seconds - _PATCH_RESERVE_SECONDS)
-        try:
-            jobs, runs_completed = collect_run_jobs(
-                token, repo, run_id, watch_workflows)
-            fetched = fetch_all_review_statuses(
-                token, repo, run_id, deadline=fetch_deadline)
-        except Exception as e:
-            print(f"  Could not collect a final snapshot ({e}).", file=sys.stderr)
-            return False
-        if fetched is None or STATE.fetch_incomplete:
-            # `None` is a failed LISTING; `fetch_incomplete` is a listing
-            # that succeeded but whose groups could not all be read. Either
-            # way the result is not authoritative — republishing it would
-            # delete review sections from the comment, permanently, since
-            # this is the last write. Keep the last known statuses, exactly
-            # as the normal polling path does.
-            statuses = prev_artifact_statuses
-        else:
-            statuses = fetched
-        prev_artifact_statuses = statuses
-        completed, pending, job_urls = classify_jobs(jobs)
-        body = build_comment_body(
-            asm, completed, pending, run_url, job_urls,
-            json.dumps(statuses) if statuses else "",
-            _commit_info_for_state(commit_info, pending=bool(pending)),
-            waiting=not runs_completed,
-        )
-        if body == last_body:
-            return True
-        try:
-            if upsert_comment(token, repo, pr_number, body):
-                last_body = body
-                print("  Published a final status snapshot before exiting.")
-                return True
-        except RateLimitError:
-            print("  Rate limited while publishing the final snapshot.",
-                  file=sys.stderr)
-        return False
-
-    def _publish_final_snapshot_with_retry() -> bool:
-        """Publish the shutdown snapshot, retrying inside the reserve.
-
-        A transient failure on the last write used to be terminal: the
-        caller broke out of the loop immediately after, discarding the
-        whole remaining shutdown reserve and leaving the comment stale.
-        The reserve exists precisely so this write can be attempted more
-        than once — spend it.
-        """
-        if _publish_final_snapshot():
-            return True
-        if max_wall_seconds is None:
-            return False
-        # Leave the PATCH reserve itself untouched: retry only while a whole
-        # further attempt still fits before the budget ends.
-        retry_until = wall_start + max_wall_seconds - _PATCH_RESERVE_SECONDS
-        while time.time() < retry_until:
-            room = retry_until - time.time()
-            time.sleep(max(0.0, min(float(_FINAL_RETRY_BACKOFF), room)))
-            if time.time() >= retry_until:
-                break
-            print("  Retrying the final snapshot inside the shutdown reserve.",
-                  file=sys.stderr)
-            if _publish_final_snapshot():
-                return True
-        print("  Could not publish a final snapshot within the reserve.",
-              file=sys.stderr)
-        return False
 
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
             print(f"Timeout ({timeout}s) reached — stopping poll.", file=sys.stderr)
-            _publish_final_snapshot_with_retry()
             break
-        if poll_ceiling is not None and (time.time() - wall_start) >= poll_ceiling:
-            # The Actions job's own timeout-minutes is about to SIGKILL us.
-            # Exit cleanly instead: a killed process publishes nothing.
-            #
-            # But a bare break also publishes nothing when the budget runs
-            # out mid-pause: the comment would be missing or stale for a PR
-            # whose CI finished during the final minutes. So take ONE last
-            # pass first and write whatever is known.
-            #
-            # This fires at budget MINUS the shutdown reserve, so the
-            # snapshot's own API calls have room before the job deadline —
-            # including a retry if the first attempt fails transiently.
-            print(f"Wall-clock poll ceiling ({poll_ceiling:.0f}s of a "
-                  f"{max_wall_seconds}s budget) reached — publishing a final "
-                  f"status before stopping.",
-                  file=sys.stderr)
-            _publish_final_snapshot_with_retry()
-            break
-
-        # A PR that has entered the merge queue is already approved and
-        # merging; its live comment is read by nobody, while its poller keeps
-        # spending the shared installation budget the merge-queue CI runs
-        # need. But queue membership is NOT terminal — a required check can
-        # fail, or a human can remove the PR — and merge-group runs never post
-        # a comment, so exiting here would leave a dequeued PR with no
-        # reporter at all. Pause and recheck instead.
-        #
-        # Throttled: one GraphQL call per _MERGE_QUEUE_RECHECK_INTERVAL, not
-        # one per cycle, or the check itself becomes the cost it avoids.
-        if pr_number and not dry_run and (
-            time.time() - last_queue_check >= _MERGE_QUEUE_RECHECK_INTERVAL
-        ):
-            last_queue_check = time.time()
-            try:
-                queued = pr_is_in_merge_queue(token, repo, pr_number)
-            except RateLimitError as e:
-                backoff = max(e.retry_after, float(_LOW_REMAINING_INTERVAL))
-                print(f"  Rate limited on the merge-queue check — backing off "
-                      f"{backoff:.0f}s ({STATE.budget_line()})", file=sys.stderr)
-                _nap(backoff)
-                continue
-            if queued:
-                if not last_body:
-                    # A poller that starts while the PR is already queued
-                    # would otherwise never create the comment at all.
-                    _publish_final_snapshot()
-                print(f"  PR #{pr_number} is in the merge queue — pausing "
-                      f"{_MERGE_QUEUE_RECHECK_INTERVAL}s "
-                      f"(will resume if it is dequeued).")
-                _pause_for_queue(_MERGE_QUEUE_RECHECK_INTERVAL)
-                continue
-
-        cycle_start_charged = STATE.charged
 
         try:
             jobs, runs_completed = collect_run_jobs(token, repo, run_id, watch_workflows)
-        except RateLimitError as e:
-            backoff = max(e.retry_after, float(_LOW_REMAINING_INTERVAL))
-            print(f"  Rate limited while collecting jobs — backing off {backoff:.0f}s "
-                  f"({STATE.budget_line()})", file=sys.stderr)
-            _nap(backoff)
-            continue
         except Exception as e:
             print(f"  API error collecting jobs: {e}", file=sys.stderr)
-            _nap(STATE.effective_interval(interval))
+            time.sleep(interval)
             continue
 
         completed, pending, job_urls = classify_jobs(jobs)
@@ -1320,35 +602,8 @@ def run(
             print(f"  → {len(gone_pending)} job(s) disappeared from pending: {', '.join(gone_pending)}")
 
         # Dynamically fetch all review-status artifacts from the run.
-        #
-        # The active cycle gets the poll-ceiling as an absolute deadline
-        # too, not only the shutdown snapshot: a cycle that starts just
-        # before the ceiling can otherwise serially try every uncached
-        # artifact at 30-60s each, spend the whole shutdown reserve, and be
-        # SIGKILLed before the final snapshot is written — the exact
-        # failure the reserve exists to prevent. Past the ceiling the fetch
-        # falls back to cached/carried values, which cost no request.
-        poll_deadline = None
-        if poll_ceiling is not None:
-            poll_deadline = wall_start + poll_ceiling
-        try:
-            artifact_statuses = fetch_all_review_statuses(
-                token, repo, run_id, deadline=poll_deadline)
-        except RateLimitError as e:
-            backoff = max(e.retry_after, float(_LOW_REMAINING_INTERVAL))
-            print(f"  Rate limited while fetching artifacts — backing off "
-                  f"{backoff:.0f}s ({STATE.budget_line()})", file=sys.stderr)
-            _nap(backoff)
-            continue
-        if artifact_statuses is None or STATE.fetch_incomplete:
-            # The listing failed, or the deadline stopped us from reading
-            # some group. Either way this cycle's view is not authoritative:
-            # reuse the last known statuses so the comment is not
-            # republished with review sections gone.
-            artifact_statuses = prev_artifact_statuses
-        prev_artifact_statuses = artifact_statuses
+        artifact_statuses = fetch_all_review_statuses(token, repo, run_id)
         artifact_count_changed = len(artifact_statuses) != prev_artifact_count
-
         if artifact_count_changed:
             print(f"  Found {len(artifact_statuses)} review status entries from artifacts "
                   f"(was {prev_artifact_count} last poll)")
@@ -1387,63 +642,18 @@ def run(
                 print("--- DRY RUN — comment body ---")
                 print(body)
                 print("--- END ---")
-                last_body = body
             else:
-                try:
-                    cid = upsert_comment(token, repo, pr_number, body)
-                except RateLimitError as e:
-                    backoff = max(e.retry_after, float(_LOW_REMAINING_INTERVAL))
-                    print(f"  Rate limited while updating the comment — backing off "
-                          f"{backoff:.0f}s ({STATE.budget_line()})", file=sys.stderr)
-                    _nap(backoff)
-                    continue
+                cid = upsert_comment(token, repo, pr_number, body)
                 if cid:
                     print(f"  Updated comment {cid} ({reason})")
-                    last_body = body
                 else:
-                    # Leave last_body unchanged so the next cycle retries the
-                    # same body instead of treating the failure as posted.
-                    #
-                    # On the FINAL cycle there is no next cycle: all_done is
-                    # true and the quiet grace is spent, so the loop breaks
-                    # below. Retry here or the comment is left stale.
-                    if all_done and quiet_grace_used:
-                        print("  Final upsert failed — retrying once before exit.",
-                              file=sys.stderr)
-                        _nap(min(5.0, float(interval)))
-                        try:
-                            cid = upsert_comment(token, repo, pr_number, body)
-                        except RateLimitError as e:
-                            # Do NOT give up: budget usually remains, so back
-                            # off for real and let the loop try again rather
-                            # than exiting with a stale comment.
-                            backoff = max(e.retry_after,
-                                          float(_LOW_REMAINING_INTERVAL))
-                            print(f"  Rate limited on the final retry — "
-                                  f"backing off {backoff:.0f}s and continuing.",
-                                  file=sys.stderr)
-                            _nap(backoff)
-                            quiet_grace_used = False
-                            continue
-                        if cid:
-                            print(f"  Updated comment {cid} on the final retry")
-                            last_body = body
-                        else:
-                            print("  Final comment update failed after a retry.",
-                                  file=sys.stderr)
-                    else:
-                        print(f"  Failed to update comment ({reason}, will retry)",
-                              file=sys.stderr)
+                    print(f"  Failed to update comment ({reason}, will retry)", file=sys.stderr)
+            last_body = body
         else:
             if pending:
                 print(f"  No change since last poll. Still waiting on: {', '.join(pending)}")
             else:
                 print("  No change since last poll.")
-
-        # One budget line per cycle, so a rate-limit incident is diagnosable
-        # from the job log alone.
-        print(f"  {STATE.budget_line()} "
-              f"(this cycle charged {STATE.charged - cycle_start_charged})")
 
         prev_completed = completed
         prev_pending = pending
@@ -1452,7 +662,7 @@ def run(
             quiet_grace_used = True
             print("  No jobs pending and runs report completed — "
                   "waiting 10s for downstream jobs to appear.")
-            _nap(10)
+            time.sleep(10)
             continue
 
         if all_done:
@@ -1468,11 +678,7 @@ def run(
                   "in progress — waiting for its jobs to appear.")
 
         quiet_grace_used = False
-        sleep_for = STATE.effective_interval(interval)
-        if sleep_for != interval:
-            print(f"  Low rate-limit budget — stretching poll interval "
-                  f"{interval}s → {sleep_for}s")
-        _nap(sleep_for)
+        time.sleep(interval)
 
     return 0
 
@@ -1509,99 +715,15 @@ def resolve_pr_number(token: str, repo: str, head_sha: str) -> str:
     return ""
 
 
-def pr_is_in_merge_queue(token: str, repo: str, pr_number: str) -> bool:
-    """True when the PR has already entered the merge queue.
-
-    A queued PR is approved and merging; a live-updating review comment on it
-    is read by nobody, and its poller competes for the same installation
-    rate-limit budget as the merge-queue CI runs that actually gate the merge.
-    ``merge_group`` runs never get a comment at all (the workflow's ``if``
-    requires ``event == 'pull_request'``), so skipping queued PRs costs no
-    signal.
-
-    ``isInMergeQueue`` is GraphQL-only — the REST pull object does not expose
-    it. On any error this returns False: failing open keeps the comment
-    working, which is the safer default for a best-effort reporter.
-    """
-    if not pr_number:
-        return False
-    owner, repo_name = repo.split("/")
-    query = (
-        "query($owner:String!,$name:String!,$number:Int!){"
-        "repository(owner:$owner,name:$name){"
-        "pullRequest(number:$number){isInMergeQueue}}}"
-    )
-    payload = json.dumps({
-        "query": query,
-        "variables": {"owner": owner, "name": repo_name, "number": int(pr_number)},
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        f"{API_BASE}/graphql", data=payload, method="POST",
-        headers=_headers(token, {"Content-Type": "application/json"}),
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
-            # NOT STATE.observe(): GraphQL has its OWN budget (5000 points,
-            # separate from the REST installation limit). Feeding its
-            # headers into the REST governor overwrites a low REST remaining
-            # with a healthy GraphQL one and silently disarms the backoff —
-            # measured: REST 50/1000 (interval 60s) became 4900/5000
-            # (interval 45s) after one membership check.
-            STATE.charged += 1
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        # A rate-limited membership check must back the poller off, not be
-        # silently read as "not queued".
-        if _is_rate_limited(e):
-            print("  Merge-queue check was rate limited — backing off.",
-                  file=sys.stderr)
-            raise RateLimitError(
-                _read_retry_after(e.headers) or float(_LOW_REMAINING_INTERVAL)
-            ) from e
-        print(f"  Could not check merge-queue membership ({e}) — polling anyway.",
-              file=sys.stderr)
-        return False
-    except (ValueError, OSError) as e:
-        print(f"  Could not check merge-queue membership ({e}) — polling anyway.",
-              file=sys.stderr)
-        return False
-
-    try:
-        return bool(data["data"]["repository"]["pullRequest"]["isInMergeQueue"])
-    except (KeyError, TypeError):
-        return False
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """The poller's CLI parser.
-
-    Factored out of :func:`main` so tests can assert against the REAL
-    defaults. A test that rebuilds a look-alike parser with the expected
-    default hardcoded asserts only that argparse works.
-    """
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--interval", type=int, default=45,
-                        help="Seconds between polls (default: 45). The poller "
-                             "shares one installation rate-limit budget with "
-                             "every other job in the repo, and one poller runs "
-                             "per open PR.")
+    parser.add_argument("--interval", type=int, default=15,
+                        help="Seconds between polls (default: 15).")
     parser.add_argument("--timeout", type=int, default=1800,
                         help="Max seconds to poll before giving up (default: 1800).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print comment body instead of posting to PR.")
-    parser.add_argument("--max-wall-seconds", type=int,
-                        default=_DEFAULT_MAX_WALL_SECONDS,
-                        help="Hard wall-clock ceiling, INCLUDING merge-queue "
-                             "pauses. Set it below the workflow job's "
-                             "timeout-minutes so the poller stops cleanly "
-                             "instead of being SIGKILLed mid-pause (a killed "
-                             "process publishes nothing).")
-    return parser
-
-
-def main() -> int:
-    args = build_parser().parse_args()
-
+    args = parser.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN", "")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
@@ -1635,10 +757,6 @@ def main() -> int:
             return 0
         print(f"Resolved PR #{pr_number} from commit {commit_sha[:7]}")
 
-    # Merge-queue membership is handled INSIDE run(): it is not terminal, so
-    # a queued PR pauses and rechecks rather than exiting (exiting would leave
-    # a later dequeue with no reporter — merge-group runs never comment).
-
     commit_url = os.environ.get("COMMIT_URL", "")
     if not commit_url and commit_sha and pr_number:
         server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
@@ -1670,7 +788,6 @@ def main() -> int:
         timeout=args.timeout,
         dry_run=args.dry_run,
         watch_workflows=watch_workflows,
-        max_wall_seconds=args.max_wall_seconds,
     )
 
 

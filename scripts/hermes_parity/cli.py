@@ -174,7 +174,7 @@ def cmd_bisect(args: argparse.Namespace) -> int:
                     [str(merge_python), "-m", "pytest", *tests, "-q", "-o", "addopts=", "-p", "no:randomly"],
                     cwd=repo,
                     env=bisect_mod.clean_pytest_env(repo, merge_python),
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     check=False,

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.hermes_cli._survivor_gh_fake import pr_target, rest_pr
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_survivor as survivor
 
@@ -32,9 +34,9 @@ def remote(monkeypatch):
     def run(args, **kwargs):
         if args[0] == "gh":
             calls.append(args)
-            assert args[:6] == ["gh", "pr", "view", "68", "--repo", "example/project"]
+            assert pr_target(args) == ("example/project", "68"), args
             view = {k: v for k, v in state.items() if k != "ref"}
-            return subprocess.CompletedProcess(args, 0, json.dumps(view).encode(), b"")
+            return subprocess.CompletedProcess(args, 0, json.dumps(rest_pr(view)).encode(), b"")
         if "ls-remote" in args:
             calls.append(args)
             return subprocess.CompletedProcess(

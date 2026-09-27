@@ -170,7 +170,7 @@ def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
                     str(path),
                 ],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
                 stdin=subprocess.DEVNULL,
             )

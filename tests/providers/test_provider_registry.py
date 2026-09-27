@@ -1,27 +1,18 @@
 import pytest
 
+from hermes_cli import provider_seam
 from providers import ProviderProfile
 import providers
 
 
 @pytest.fixture(autouse=True)
 def isolate_provider_registry():
-    registry = providers._REGISTRY.copy()
-    aliases = providers._ALIASES.copy()
-    provider_list_cache = (
-        None
-        if providers._PROVIDER_LIST_CACHE is None
-        else list(providers._PROVIDER_LIST_CACHE)
-    )
+    generation = provider_seam.current()
     discovered = providers._discovered
 
     yield
 
-    providers._REGISTRY.clear()
-    providers._REGISTRY.update(registry)
-    providers._ALIASES.clear()
-    providers._ALIASES.update(aliases)
-    providers._PROVIDER_LIST_CACHE = provider_list_cache
+    provider_seam._restore(generation)
     providers._discovered = discovered
 
 
@@ -30,9 +21,7 @@ def _profile(name: str, *aliases: str) -> ProviderProfile:
 
 
 def _reset_registry() -> None:
-    providers._REGISTRY.clear()
-    providers._ALIASES.clear()
-    providers._PROVIDER_LIST_CACHE = None
+    provider_seam._reset("_REGISTRY", "_ALIASES")
     providers._discovered = True
 
 

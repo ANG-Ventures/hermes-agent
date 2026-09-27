@@ -197,6 +197,108 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ON turn_api_calls(ts);
         CREATE INDEX IF NOT EXISTS idx_blackbox_api_calls_sub
             ON turn_api_calls(sub_key);
+
+        -- Conversation prefix-stability guard (card t_c07124ab). One row per
+        -- session holding the fingerprint of the LAST request sent on it
+        -- (hashes + byte sizes only, never text); the next request of the
+        -- same session is compared against it and then replaces it. Keyed on
+        -- the session so the check survives agent-cache eviction and gateway
+        -- restarts (a cross-process comparison is tagged, see `context`).
+        -- `alerted_at` is the once-per-session page stamp (transition state).
+        CREATE TABLE IF NOT EXISTS prefix_sessions (
+            session_key TEXT PRIMARY KEY,
+            turn_id TEXT,
+            seq INT,
+            ts REAL,
+            pid INT,
+            api_mode TEXT,
+            model TEXT,
+            cache_read INT,
+            fingerprint_json TEXT,
+            updated_at REAL,
+            alerted_at REAL,
+            prompt_tokens INT
+        );
+
+        -- One row per violated segment per request pair. `kind` is
+        -- 'mutation' (a historical index changed in place — the class that
+        -- collapses every cache read to the static prefix) or 'shrink'
+        -- (history got shorter). `context` is NULL for an unexplained
+        -- mutation; a tagged one carries why it is expected
+        -- ('compaction:<trigger>', 'process_restart', 'api_mode_change',
+        -- 'model_change') and is excluded from alerting, not allowlisted.
+        -- `alerted` = 1 on the one row per session that paged #alerts.
+        CREATE TABLE IF NOT EXISTS prefix_mutations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL,
+            session_key TEXT,
+            turn_id TEXT,
+            seq INT,
+            prev_turn_id TEXT,
+            prev_seq INT,
+            prev_ts REAL,
+            provider TEXT,
+            lane_family TEXT,
+            model TEXT,
+            segment TEXT,
+            kind TEXT,
+            first_divergent_index INT,
+            bytes_before INT,
+            bytes_after INT,
+            messages_before INT,
+            messages_after INT,
+            context TEXT,
+            allowlisted INT NOT NULL DEFAULT 0,
+            allowlist_reason TEXT,
+            cache_read_before INT,
+            cache_read_after INT,
+            alerted INT NOT NULL DEFAULT 0,
+            prompt_tokens_before INT,
+            prompt_tokens_after INT
+        );
+        -- Harness route-change ledger (fallback-cache spec 2026-09-25, Phase
+        -- 1). One row per successful try_activate_fallback (failover), per
+        -- primary restore (recovery), and per refused restore episode
+        -- (restore_refused). failover+recovery rows mirror the lines in
+        -- state/model-route-changes.log (the report's parity check). The
+        -- next_call_* columns are back-filled by insert_api_call when the
+        -- session's next 200 call lands. err_head is scrubbed, <=160 chars,
+        -- and only set for non-2xx error JSON — never model output.
+        CREATE TABLE IF NOT EXISTS fallback_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            session_id TEXT,
+            turn_id TEXT,
+            seq INT,
+            from_provider TEXT,
+            from_model TEXT,
+            to_provider TEXT,
+            to_model TEXT,
+            kind TEXT NOT NULL,
+            reason TEXT,
+            trigger_class TEXT,
+            class_source TEXT,
+            http_status INT,
+            relay_synthetic INT NOT NULL DEFAULT 0,
+            route_id TEXT,
+            err_hash TEXT,
+            err_head TEXT,
+            cooldown_s REAL,
+            sticky_until_epoch REAL,
+            next_call_ts REAL,
+            next_call_cache_read INT,
+            next_call_cache_write INT,
+            next_call_cold INT
+        );
+        CREATE INDEX IF NOT EXISTS idx_blackbox_fallback_events_ts
+            ON fallback_events(ts);
+        CREATE INDEX IF NOT EXISTS idx_blackbox_fallback_events_session
+            ON fallback_events(session_id, next_call_cold);
+
+        CREATE INDEX IF NOT EXISTS idx_blackbox_prefix_mutations_ts
+            ON prefix_mutations(ts);
+        CREATE INDEX IF NOT EXISTS idx_blackbox_prefix_mutations_session
+            ON prefix_mutations(session_key);
         """
     )
     # Additive migration for DBs created before the last-call cache split
@@ -214,6 +316,27 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         if col not in _existing:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {kind}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+    # Provider-reported prompt size on the prefix-guard rows: a turn-boundary
+    # prompt that shrinks with NO recorded mutation is a rewrite BELOW the
+    # harness (e.g. a relay bridge reseeding its resident session).
+    for _table, _cols in (("prefix_sessions", ("prompt_tokens",)),
+                          ("prefix_mutations", ("prompt_tokens_before", "prompt_tokens_after"))):
+        _have = {row[1] for row in conn.execute(f"PRAGMA table_info({_table})")}
+        for _col in _cols:
+            if _col not in _have:
+                try:
+                    conn.execute(f"ALTER TABLE {_table} ADD COLUMN {_col} INT")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+    _fe_have = {row[1] for row in conn.execute("PRAGMA table_info(fallback_events)")}
+    for _col, _kind in _FALLBACK_EVENT_PHASE2_COLUMNS:
+        if _col not in _fe_have:
+            try:
+                conn.execute(f"ALTER TABLE fallback_events ADD COLUMN {_col} {_kind}")
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
@@ -492,22 +615,50 @@ def lane_family(provider: str) -> str:
     return "codex" if p == "openai-codex" else "other"
 
 
+# Auxiliary-model calls (compression, title_generation, vision, web_extract, ...)
+# are ledgered with ``attribution='aux:<task>'`` and ``lane_family='aux'``. Their
+# tokens are NOT part of the turn's main-model totals, so every reader that
+# reconciles against the turn or measures the main lane's cache behaviour must
+# exclude this family (card t_39628ae3).
+AUX_LANE_FAMILY = "aux"
+AUX_ATTRIBUTION_PREFIX = "aux:"
+_NOT_AUX = "COALESCE(lane_family, '') != 'aux'"
+
+
+def is_aux_attribution(attribution: Any) -> bool:
+    return (isinstance(attribution, str) and attribution.startswith(AUX_ATTRIBUTION_PREFIX)
+            and len(attribution) > len(AUX_ATTRIBUTION_PREFIX))
+
+
 def _refresh_cache_monitoring(conn: sqlite3.Connection, turn_id: str) -> None:
     """Reconcile calls even when they arrive after the turn row."""
-    conn.execute("""
+    # Main lane only: an aux call (lane_family='aux') is a different model on a
+    # different prompt; letting it be the "first call" or add to the write tiers
+    # would misreport the main conversation's cache behaviour.
+    conn.execute(f"""
         UPDATE turns SET
             cache_write_5m = (SELECT SUM(cache_write_5m) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
             cache_write_1h = (SELECT SUM(cache_write_1h) FROM turn_api_calls
-                              WHERE turn_id = turns.turn_id),
+                              WHERE turn_id = turns.turn_id AND {_NOT_AUX}),
             first_call_cache_miss = (
                 SELECT CASE WHEN input_tokens IS NULL OR cache_read IS NULL
                                       OR cache_write IS NULL THEN NULL
                             WHEN input_tokens + cache_read + cache_write <= 0 THEN NULL
+                            -- Read-only lanes (xAI, codex, OpenAI-shaped usage with
+                            -- only prompt_tokens_details.cached_tokens) never report
+                            -- a write, so the write rule below is structurally 0
+                            -- there. A cold first call is a read under half the
+                            -- prompt. Anthropic lanes keep the write rule.
+                            WHEN lane_family IS NOT NULL
+                                 AND lane_family NOT IN ('apx/apr', 'bpx/bpr', 'cpx/cpr')
+                                 AND cache_write = 0 THEN
+                                CASE WHEN cache_read * 2 < input_tokens + cache_read
+                                     THEN 1 ELSE 0 END
                             WHEN cache_write * 5 >= 4 *
                                  (input_tokens + cache_read + cache_write) THEN 1
                             ELSE 0 END
-                FROM turn_api_calls WHERE turn_id = turns.turn_id
+                FROM turn_api_calls WHERE turn_id = turns.turn_id AND {_NOT_AUX}
                   -- First SUCCESSFUL call: a 429/5xx/timeout attempt carries
                   -- zero usage and would hide the cold write on the retry.
                   AND (http_status IS NULL OR http_status BETWEEN 200 AND 299)
@@ -755,7 +906,8 @@ def insert_api_call(
     provenance raise rather than silently replacing or dropping ledger rows.
     Calls may arrive before their parent turn is finalized.
     """
-    if attribution not in ("wire", "pinned", "inferred", "external"):
+    aux = is_aux_attribution(attribution)
+    if not aux and attribution not in ("wire", "pinned", "inferred", "external"):
         raise ValueError(f"Invalid API-call attribution: {attribution!r}")
     # SQLite permits NULL in a non-INTEGER PRIMARY KEY column, so the composite
     # key alone does not stop a NULL turn_id/seq row (and NULLs never collide,
@@ -779,11 +931,89 @@ def insert_api_call(
              usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
              usage.reasoning_tokens, attribution, http_status,
              _bool_int(relay_synthetic), route_id, cache_write_5m,
-             cache_write_1h, cache_ttl_requested, lane_family(provider)),
+             cache_write_1h, cache_ttl_requested,
+             AUX_LANE_FAMILY if aux else lane_family(provider)),
         )
         _refresh_cache_monitoring(conn, turn_id)
         if conn.execute("SELECT 1 FROM turns WHERE turn_id = ?", (turn_id,)).fetchone():
             _refresh_served_subs(conn, turn_id)
+        if http_status in (None, 200):
+            _backfill_fallback_next_call(conn, turn_id, ts, usage)
+
+
+_FALLBACK_EVENT_COLUMNS = (
+    "ts", "session_id", "turn_id", "seq", "from_provider", "from_model",
+    "to_provider", "to_model", "kind", "reason", "trigger_class",
+    "class_source", "http_status", "relay_synthetic", "route_id", "err_hash",
+    "err_head", "cooldown_s", "sticky_until_epoch",
+    # Phase 2 (§4.7 / §4.8): policy + notice columns.
+    "hop", "seat", "attempts", "first_err_ts", "last_err_ts", "return_branch",
+    "expected_warm", "dwell_s", "dwell_turns", "notice_text",
+    "gate_bound_expires_in_s",
+    # Warm-seat spec §4.4 / §5 P3: the /eligibility warm poll behind a
+    # return or refusal (doomed / warm_return_raced / cap_expiry reporting).
+    "warm_rank_effective", "warm_refusal", "warm_seat", "warm_age_s",
+    "warm_window_s", "warm_eligible", "warm_refusal_arm", "warm_gate",
+)
+# Additive columns on fallback_events (Phase 2 + warm-seat P3); migrated per column.
+_FALLBACK_EVENT_PHASE2_COLUMNS = (
+    ("hop", "TEXT"), ("seat", "TEXT"), ("attempts", "INT"), ("first_err_ts", "REAL"),
+    ("last_err_ts", "REAL"), ("return_branch", "TEXT"), ("expected_warm", "INT"),
+    ("dwell_s", "REAL"), ("dwell_turns", "INT"), ("notice_text", "TEXT"),
+    ("gate_bound_expires_in_s", "REAL"),
+    ("warm_rank_effective", "TEXT"), ("warm_refusal", "TEXT"), ("warm_seat", "TEXT"),
+    ("warm_age_s", "REAL"), ("warm_window_s", "REAL"), ("warm_eligible", "INT"),
+    ("warm_refusal_arm", "INT"), ("warm_gate", "TEXT"),
+)
+FALLBACK_EVENT_KINDS = ("failover", "recovery", "restore_refused", "sticky_resume")
+
+
+def insert_fallback_event(row: dict[str, Any]) -> None:
+    """Append one fallback-ledger row. Raises on a bad kind (the caller is
+    fail-open); the err_head is re-scrubbed here so no path can persist an
+    unscrubbed error head."""
+    if row.get("kind") not in FALLBACK_EVENT_KINDS:
+        raise ValueError(f"invalid fallback event kind: {row.get('kind')!r}")
+    values = dict(row)
+    if values.get("err_head"):
+        values["err_head"] = scrub_and_truncate(values["err_head"], 160)
+    values["relay_synthetic"] = _bool_int(values.get("relay_synthetic"))
+    for _flag in ("expected_warm", "warm_eligible", "warm_refusal_arm"):
+        if values.get(_flag) is not None:
+            values[_flag] = _bool_int(values.get(_flag))
+    cols = ", ".join(_FALLBACK_EVENT_COLUMNS)
+    marks = ", ".join("?" for _ in _FALLBACK_EVENT_COLUMNS)
+    with _connect() as conn:
+        conn.execute(
+            f"INSERT INTO fallback_events ({cols}) VALUES ({marks})",
+            tuple(values.get(c) for c in _FALLBACK_EVENT_COLUMNS),
+        )
+
+
+def _backfill_fallback_next_call(conn: sqlite3.Connection, turn_id: str,
+                                 ts: float, usage: CanonicalUsage) -> None:
+    """Stamp the cache outcome of the session's first 200 call after each
+    failover/recovery row (the cost of the route change). Cold = cache_read
+    under half the prompt (the evidence scripts' convention)."""
+    try:
+        session_id = str(turn_id).split(":", 1)[0]
+        cr = int(usage.cache_read_tokens or 0)
+        cw = int(usage.cache_write_tokens or 0)
+        prompt = int(usage.input_tokens or 0) + cr + cw
+        if prompt <= 0:
+            return
+        conn.execute(
+            """
+            UPDATE fallback_events
+               SET next_call_ts = ?, next_call_cache_read = ?,
+                   next_call_cache_write = ?, next_call_cold = ?
+             WHERE session_id = ? AND next_call_cold IS NULL
+               AND kind IN ('failover', 'recovery') AND ts <= ?
+            """,
+            (ts, cr, cw, 1 if cr < 0.5 * prompt else 0, session_id, ts),
+        )
+    except Exception:
+        logger.debug("fallback ledger back-fill failed", exc_info=True)
 
 
 def mark_alerted(turn_id: str) -> bool:
@@ -793,6 +1023,192 @@ def mark_alerted(turn_id: str) -> bool:
             (turn_id,),
         )
         return cur.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
+# Conversation prefix-stability guard (card t_c07124ab).
+#
+# A prefix-cached provider serves a cache hit only when the leading bytes of a
+# request equal an earlier request's. Within one session the harness must keep
+# the system prompt, the tool schemas and every already-sent message
+# byte-stable between consecutive requests. ``record_prefix_check`` compares
+# the fingerprint of each outbound request with the previous request of the
+# same session, persists one ``prefix_mutations`` row per violated segment and
+# reports whether this is the session's FIRST unexplained mutation — the
+# transition the caller pages on, exactly once per session.
+# ---------------------------------------------------------------------------
+
+PREFIX_ALERT_MIN_SPACING_S = 15 * 60
+_PREFIX_ALERT_META_KEY = "prefix_guard_last_alert_ts"
+
+
+def _prefix_context(prev: sqlite3.Row, *, pid: int, api_mode: str, model: str,
+                    reset: str | None) -> str | None:
+    """Why a rewrite is EXPECTED for this pair, or None (unexplained).
+
+    Compaction is the one sanctioned history rewrite and is tagged by the
+    harness event that performed it (``reset``), so it is excluded rather
+    than allowlisted. A cross-process pair (gateway restart rebuilt the
+    request from the transcript) and a model / API-mode switch (different
+    tool schema, different system prompt) are recorded but not paged.
+    """
+    if reset:
+        return reset
+    if prev["pid"] is not None and int(prev["pid"]) != int(pid):
+        return "process_restart"
+    if (prev["api_mode"] or "") != (api_mode or ""):
+        return "api_mode_change"
+    if (prev["model"] or "") != (model or ""):
+        return "model_change"
+    return None
+
+
+def record_prefix_check(
+    *, session_key: str, turn_id: str, seq: int, ts: float, pid: int,
+    provider: str, model: str, api_mode: str, fingerprint: dict[str, Any],
+    cache_read: int | None, reset: str | None = None,
+    allowlist: Any = None, prompt_tokens: int | None = None,
+    compare_across_turns: bool = True,
+) -> dict[str, Any]:
+    """Compare one request with the session's previous request and persist.
+
+    When the previous request belongs to another turn the comparison runs in
+    turn-boundary mode (no last-message exemption). ``compare_across_turns``
+    False makes a new turn start a fresh baseline instead (background-review
+    forks: each fork is its own conversation replaying the parent snapshot).
+
+    Returns ``{"violations": [...], "alert": bool, "suppressed": int}``.
+    ``alert`` is True only on the transition from "this session has never
+    paged" to "it has an unexplained, non-allowlisted mutation", and only
+    when the profile-wide spacing floor allows another page; ``suppressed``
+    counts pages held back by that floor since the last one went out.
+    The previous fingerprint is replaced by this one in the same transaction,
+    so a mutation is reported once, at the request that introduced it.
+    """
+    from plugins.blackbox import prefix_guard
+
+    violations: list[dict[str, Any]] = []
+    pageable: list[dict[str, Any]] = []
+    alert = False
+    suppressed = 0
+    previous: dict[str, Any] | None = None
+    with _connect() as conn:
+        prev = conn.execute(
+            "SELECT * FROM prefix_sessions WHERE session_key = ?", (session_key,)
+        ).fetchone()
+        if prev is not None and prev["fingerprint_json"]:
+            try:
+                prev_fp = json.loads(prev["fingerprint_json"])
+            except (TypeError, ValueError):
+                prev_fp = None
+            if isinstance(prev_fp, dict) and (
+                compare_across_turns or prev["turn_id"] == turn_id
+            ):
+                previous = {
+                    "turn_id": prev["turn_id"], "seq": prev["seq"], "ts": prev["ts"],
+                    "messages": len(prev_fp.get("messages") or []),
+                    "cache_read": prev["cache_read"],
+                }
+                context = _prefix_context(
+                    prev, pid=pid, api_mode=api_mode, model=model, reset=reset,
+                )
+                if context is None and prefix_guard.native_checkpoint_changed(prev_fp, fingerprint):
+                    context = "compaction:native"
+                turn_boundary = prev["turn_id"] != turn_id
+                for diff in prefix_guard.compare(
+                    prev_fp, fingerprint, turn_boundary=turn_boundary,
+                ):
+                    reason = prefix_guard.allowlist_reason(
+                        allowlist, segment=diff["segment"], session_key=session_key,
+                        now=ts,
+                    )
+                    row = {
+                        **diff,
+                        "context": context,
+                        "allowlisted": 1 if reason else 0,
+                        "allowlist_reason": reason,
+                    }
+                    violations.append(row)
+                    conn.execute(
+                        """
+                        INSERT INTO prefix_mutations (
+                            ts, session_key, turn_id, seq, prev_turn_id, prev_seq,
+                            prev_ts, provider, lane_family, model, segment, kind,
+                            first_divergent_index, bytes_before, bytes_after,
+                            messages_before, messages_after, context, allowlisted,
+                            allowlist_reason, cache_read_before, cache_read_after,
+                            prompt_tokens_before, prompt_tokens_after
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ts, session_key, turn_id, seq, prev["turn_id"], prev["seq"],
+                            prev["ts"], provider, lane_family(provider), model,
+                            diff["segment"], diff["kind"], diff["first_divergent_index"],
+                            diff["bytes_before"], diff["bytes_after"],
+                            len(prev_fp.get("messages") or []),
+                            len(fingerprint.get("messages") or []),
+                            context, row["allowlisted"], reason,
+                            prev["cache_read"], cache_read,
+                            prev["prompt_tokens"], prompt_tokens,
+                        ),
+                    )
+                pageable = [
+                    v for v in violations
+                    if v["kind"] == prefix_guard.KIND_MUTATION
+                    and v["context"] is None and not v["allowlisted"]
+                ]
+                if pageable and prev["alerted_at"] is None:
+                    last = conn.execute(
+                        "SELECT value FROM meta WHERE key = ?", (_PREFIX_ALERT_META_KEY,)
+                    ).fetchone()
+                    last_ts = float(last["value"]) if last and last["value"] else None
+                    held = conn.execute(
+                        "SELECT value FROM meta WHERE key = 'prefix_guard_suppressed'"
+                    ).fetchone()
+                    suppressed = int(held["value"]) if held and held["value"] else 0
+                    if last_ts is None or ts - last_ts >= PREFIX_ALERT_MIN_SPACING_S:
+                        alert = True
+                        conn.execute(
+                            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                            (_PREFIX_ALERT_META_KEY, repr(float(ts))),
+                        )
+                        conn.execute(
+                            "INSERT OR REPLACE INTO meta(key, value) "
+                            "VALUES ('prefix_guard_suppressed', '0')"
+                        )
+                        conn.execute(
+                            "UPDATE prefix_mutations SET alerted = 1 WHERE id = ("
+                            "SELECT MAX(id) FROM prefix_mutations WHERE session_key = ?"
+                            " AND context IS NULL AND allowlisted = 0 AND kind = ?)",
+                            (session_key, prefix_guard.KIND_MUTATION),
+                        )
+                    else:
+                        suppressed += 1
+                        conn.execute(
+                            "INSERT OR REPLACE INTO meta(key, value) "
+                            "VALUES ('prefix_guard_suppressed', ?)",
+                            (str(suppressed),),
+                        )
+        alerted_at = prev["alerted_at"] if prev is not None else None
+        if pageable and alerted_at is None:
+            # A held-back page still consumes the session's single alert slot:
+            # the mutation is on record, the next one in this session is noise.
+            alerted_at = ts
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO prefix_sessions (
+                session_key, turn_id, seq, ts, pid, api_mode, model, cache_read,
+                fingerprint_json, updated_at, alerted_at, prompt_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_key, turn_id, seq, ts, pid, api_mode, model, cache_read,
+                json.dumps(fingerprint, separators=(",", ":")), time.time(), alerted_at,
+                prompt_tokens,
+            ),
+        )
+    return {"violations": violations, "alert": alert, "suppressed": suppressed,
+            "previous": previous}
 
 
 # ---------------------------------------------------------------------------
@@ -1220,6 +1636,16 @@ def sweep(retention_days: int, max_deletes: int = 10000) -> int:
             )
             """,
             (orphan_cutoff, max_deletes),
+        )
+        # Fallback ledger rows carry their own ts and no parent turn row.
+        conn.execute(
+            """
+            DELETE FROM fallback_events
+            WHERE id IN (
+                SELECT id FROM fallback_events WHERE ts < ? ORDER BY ts LIMIT ?
+            )
+            """,
+            (cutoff, max_deletes),
         )
         deleted = len(turn_ids)
         # Atomic: deletes + sentinel commit together so a crash can't leave the

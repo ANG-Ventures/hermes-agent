@@ -1674,13 +1674,13 @@ def setup_terminal_backend(config: dict):
                 result = subprocess.run(
                     [uv_bin, "pip", "install", "--python", sys.executable, "vercel"],
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                 )
             else:
                 result = subprocess.run(
                     [sys.executable, "-m", "pip", "install", "vercel"],
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                 )
             if result.returncode == 0:
                 print_success("vercel SDK installed")

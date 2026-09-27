@@ -30,6 +30,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_default_hermes_root
 
@@ -79,11 +80,28 @@ def _fmt_respawn_guard_detail(detail: Optional[dict]) -> str:
     return " — " + ", ".join(parts) if parts else ""
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+# Statuses on which an open workspace-refusal episode is still live news.
+_REFUSAL_VISIBLE_STATUSES = frozenset({"todo", "ready", "review"})
+
+
+def _fmt_refusal(state: Optional[dict]) -> str:
+    """``WORKSPACE REFUSED (<reason>) since <ts>`` or ``""``."""
+    if not state:
+        return ""
+    return (
+        f"WORKSPACE REFUSED ({state.get('reason')}) since "
+        f"{_fmt_ts(state.get('since'))}"
+    )
+
+
+def _fmt_task_line(t: kb.Task, refusal: Optional[dict] = None) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    flag = ""
+    if refusal and t.status in _REFUSAL_VISIBLE_STATUSES:
+        flag = f"  [{_fmt_refusal(refusal)}]"
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{flag}"
 
 
 def _fmt_links(links: list[tuple[str, str]]) -> str:
@@ -265,6 +283,53 @@ def _check_dispatcher_presence(
 # Argparse builder
 # ---------------------------------------------------------------------------
 
+def _intermix_optional_positionals(parser: argparse.ArgumentParser) -> None:
+    """Let options appear before trailing ``*``/``?`` positionals.
+
+    Stock argparse binds an optional positional (``nargs="*"``/``"?"``) to
+    ``[]``/default the moment it meets an option, so
+    ``comment <id> --author X "text"`` failed with ``unrecognized arguments:
+    text`` once ``text`` became ``nargs="*"`` (#1166). Every leaf parser in
+    the kanban tree that owns such a positional is switched to
+    ``parse_known_intermixed_args``; parsers with sub-commands are walked,
+    not converted (intermixed parsing cannot host subparsers).
+    """
+    subparser_actions = [
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    ]
+    if subparser_actions:
+        seen: set[int] = set()
+        for action in subparser_actions:
+            for child in action.choices.values():
+                if id(child) not in seen:
+                    seen.add(id(child))
+                    _intermix_optional_positionals(child)
+        return
+    if not any(
+        not a.option_strings and a.nargs in ("*", "?") for a in parser._actions
+    ):
+        return
+    base = type(parser)
+    if getattr(base, "_kanban_intermixed", False):
+        return
+
+    class _Intermixed(base):  # type: ignore[misc, valid-type]
+        _kanban_intermixed = True
+
+        def parse_known_args(self, args=None, namespace=None):
+            # parse_known_intermixed_args re-enters parse_known_args on
+            # py<3.12; the guard makes those inner passes the stock parser.
+            if getattr(self, "_kanban_in_intermixed", False):
+                return super().parse_known_args(args, namespace)
+            self._kanban_in_intermixed = True
+            try:
+                return self.parse_known_intermixed_args(args, namespace)
+            finally:
+                self._kanban_in_intermixed = False
+
+    parser.__class__ = _Intermixed
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
@@ -420,6 +485,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument("--body-file", default=None, metavar="PATH",
+                          help="Read the opening post from PATH ('-' = stdin). Use this instead of --body for text with backticks or $(...): the shell never sees it.")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -453,6 +520,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
                                "the dispatcher SIGTERMs (then SIGKILLs) the worker "
                                "and re-queues the task.")
+    p_create.add_argument("--force", default=None, dest="force_reason",
+                          metavar="REASON",
+                          help="File the card even though a non-archived card "
+                               "with the same title was created in the last 24h "
+                               "(near-duplicate guard). The reason is recorded "
+                               "as a near_duplicate_forced event.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
@@ -521,7 +594,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--session", default=None, metavar="SESSION_ID",
                           help="Home session to stamp on the card (default: "
-                               "$HERMES_SESSION_ID when set; 'none' = unstamped)")
+                               "$HERMES_SESSION_ID when set; 'none' = unstamped). "
+                               "An explicit --session WINS over a --parent's "
+                               "home; omitted, the child follows the parent's "
+                               "current home.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -797,11 +873,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_claim.add_argument("task_id")
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
                          help="Claim TTL in seconds (default: 900)")
+    p_claim.add_argument("--review", action="store_true",
+                         help="Claim a parked review run (human-only boards)")
 
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
     p_comment.add_argument("task_id")
-    p_comment.add_argument("text", nargs="+", help="Comment body")
+    p_comment.add_argument("text", nargs="*", help="Comment body (or use --body-file)")
+    p_comment.add_argument("--body-file", default=None, metavar="PATH",
+                           help="Read the comment body from PATH ('-' = stdin). Use this for "
+                                "text with backticks or $(...): the shell never sees it.")
     p_comment.add_argument("--author", default=None,
                            help="Author name (default: $HERMES_PROFILE or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
@@ -857,7 +938,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help="Why --survivor-none has no remote ref; include the follow-up card id.")
     p_complete.add_argument("--survivor-pr", default=None, action="append", metavar="[REPO=]OWNER/REPO#N",
                             help="Name an external survivor by pull request. Verified with "
-                                 "gh pr view (state OPEN or MERGED) AND required to name this "
+                                 "the GitHub REST API (state OPEN or MERGED) AND required to name this "
                                  "task; an unverifiable claim refuses the completion. Naming "
                                  "the task in the PR's head BRANCH binds the claim. A match "
                                  "only in the PR title or body is a mention, not a tie to this "
@@ -958,6 +1039,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
+    p_schedule_wake = p_schedule.add_mutually_exclusive_group()
+    p_schedule_wake.add_argument(
+        "--at", default=None, metavar="TS",
+        help="Timed wake: epoch seconds or ISO-8601 (naive = local time). The "
+             "dispatcher returns the card to ready on its first tick at/after TS. "
+             "Works on an already-scheduled card.",
+    )
+    p_schedule_wake.add_argument(
+        "--now", action="store_true",
+        help="Timed wake at now: the dispatcher returns the card to ready on its next tick",
+    )
 
     p_unblock = sub.add_parser(
         "unblock",
@@ -969,6 +1061,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_workspace = sub.add_parser(
+        "workspace",
+        help="Workspace maintenance (recover scratch cards stranded by mount loss)",
+    )
+    _ws_sub = p_workspace.add_subparsers(dest="workspace_action")
+    _ws_reset = _ws_sub.add_parser(
+        "reset",
+        help="Clear a stranded scratch card's dead workspace_path so the "
+             "dispatcher recreates <root>/<board>/<id>",
+    )
+    _ws_reset.add_argument("task_ids", nargs="*")
+    _ws_reset.add_argument(
+        "--all-stranded", action="store_true",
+        help="Reset every scratch card whose persisted path is gone",
+    )
+    _ws_reset.add_argument("--dry-run", action="store_true")
+    _ws_reset.add_argument("--reason", default=None, help="Recorded on the workspace_reset event")
 
     p_requeue = sub.add_parser("requeue", help="Explicitly retry a READY card held by the respawn guard")
     p_requeue.add_argument("task_id")
@@ -1044,12 +1154,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_request_changes.add_argument("task_id")
     p_request_changes.add_argument(
-        "reason", nargs="+", help="Concrete changes required before re-review",
+        "reason", nargs="+", help="Concrete changes required; first post a current-run review_coverage JSON comment",
+    )
+    p_request_changes.add_argument(
+        "--coverage", default=None,
+        help="Review coverage JSON; records a run-attributed comment before transition (human CLI)",
     )
 
     p_reopen_review = sub.add_parser(
         "reopen-review",
-        help="Send one or more review tasks back for changes (review -> ready/todo)",
+        help="Retired: claim review and request-changes with a full coverage comment instead",
     )
     p_reopen_review.add_argument("task_ids", nargs="+")
     p_reopen_review.add_argument(
@@ -1191,6 +1305,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    # --- home-index (cross-board index read by kanban-home-cards) ---
+    p_hidx = sub.add_parser(
+        "home-index",
+        help="Rebuild (default) or --check the cross-board home-card index "
+             "from every board; prints drift (missing/extra/stale rows)",
+    )
+    p_hidx.add_argument("--check", action="store_true",
+                        help="Report drift only; exit 1 when drift >= 1")
+    p_hidx.add_argument("--json", action="store_true")
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1226,6 +1350,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "it reads the full board context and replies in its own voice), or "
              "'wake' (wake the agent only, no passive message). Omit to leave an "
              "existing subscription's mode unchanged (new subs default to 'notify').",
+    )
+    p_nsub.add_argument(
+        "--wake",
+        action="store_true",
+        help="Shorthand for --delivery-mode notify+wake. Wake is opt-in only: "
+             "each wake is a full agent turn that queues the human's messages.",
     )
 
     p_nlist = sub.add_parser(
@@ -1425,7 +1555,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Kyzcreig/* GitHub URLs the clone uses --reference-if-able "
             "against a bare mirror under <hermes root>/mirrors/, created "
             "lazily, so the checkout stores only objects the mirror lacks. "
-            "Other URLs are cloned normally. Common git-clone options "
+            "A local-path source is cloned with --no-local (never "
+            "hard-linked), borrowing from its origin's mirror when that is a "
+            "fleet repo. Other URLs are cloned normally. Common git-clone options "
             "(-q, -b, --depth, --filter, --no-checkout, --single-branch, "
             "--no-tags, --origin, ...) are forwarded."
         ),
@@ -1445,6 +1577,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_hl.add_argument("--dry-run", action="store_true",
                       help="With --backfill: list what would be stamped")
     p_hl.add_argument("--json", action="store_true")
+    p_hl.add_argument("--open-prs", action="store_true",
+                      help="List done cards (last 7 days) whose result names a "
+                           "still-OPEN GitHub PR (exit 1 when any)")
 
     # --- repair ---
     p_repair = sub.add_parser(
@@ -1483,8 +1618,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                 metavar="REASON",
                 help="Act on a card whose home session is another session "
                      "(or an unhomed card); records a takeover event and "
-                     "posts REASON as a comment the home session sees.",
+                     "posts REASON as a comment the home session sees. On "
+                     "assign/unblock/promote/reclaim/triage-resolve "
+                     "it also RE-HOMES the card to your session (children "
+                     "and pings follow; prev_session_id kept in the event); "
+                     "never on complete, and never for cron/sweep actors. "
+                     "Re-home without a status change: "
+                     "hermes kanban edit <id> --session <sid> --takeover R.",
             )
+            _p.add_argument(
+                "--operator",
+                dest="operator",
+                default=None,
+                metavar="WHO: WHY",
+                help="Operator profiles (apollo/default, aegis) applying a "
+                     "relayed human decision to a foreign card; records an "
+                     "operator_override event, posts no comment.",
+            )
+    _intermix_optional_positionals(kanban_parser)
     return kanban_parser
 
 
@@ -1610,6 +1761,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "requeue":  _cmd_requeue,
+            "workspace": _cmd_workspace,
             "reopen":   _cmd_reopen,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
@@ -1622,6 +1774,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
+            "home-index": _cmd_home_index,
             "log":      _cmd_log,
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -1656,6 +1809,7 @@ def kanban_command(args: argparse.Namespace) -> int:
                 profile=_profile_author(),
                 foreign_ok=getattr(args, "foreign_ok", None),
                 surface="cli",
+                operator=getattr(args, "operator", None),
             )
         try:
             with actor_scope:
@@ -1684,7 +1838,7 @@ _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "claim", "complete", "block", "unblock", "archive", "assign", "reassign",
     "reclaim", "set-model", "edit", "update", "promote", "triage-resolve",
     "schedule", "requeue", "reopen", "reopen-review", "request-review",
-    "request-changes", "link", "specify", "decompose",
+    "request-changes", "link", "specify", "decompose", "workspace",
 })
 
 
@@ -1760,7 +1914,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "link",
     "unlink",
     "claim",
-    "comment",
+    # "comment" is deliberately absent: a child may append a comment (t_70fcc2c3);
+    # kanban_db.add_comment marks the author "(subagent)".
     "attach",
     "attach-rm",
     "complete",
@@ -1770,6 +1925,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule",
     "unblock",
     "requeue",
+    "workspace",
     "reopen",
     "promote",
     "triage-resolve",
@@ -2211,6 +2367,18 @@ def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
         return False
 
 
+def _read_body_file(path: str) -> str:
+    """Read a card/comment body from ``path`` (``-`` = stdin).
+
+    Shell callers pass markdown through ``--body-file`` / a quoted heredoc
+    instead of a double-quoted argv string, where backticks and ``$(...)``
+    are executed by the shell as command substitution (t_f7e11e44).
+    """
+    if path == "-":
+        return sys.stdin.read()
+    return Path(path).expanduser().read_text(encoding="utf-8")
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_worker_policy as _kwp
 
@@ -2228,6 +2396,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
         return 2
+    body_file = getattr(args, "body_file", None)
+    if body_file is not None:
+        if args.body is not None:
+            print("kanban: --body and --body-file are mutually exclusive", file=sys.stderr)
+            return 2
+        try:
+            args.body = _read_body_file(body_file)
+        except OSError as exc:
+            print(f"kanban: --body-file: {exc}", file=sys.stderr)
+            return 2
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
@@ -2270,8 +2448,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     triage=bool(getattr(args, "triage", False)),
                 ),
                 session_id=_resolve_session_flag(getattr(args, "session", None)),
+                session_explicit=getattr(args, "session", None) is not None,
+                duplicate_guard=True,
+                force_reason=getattr(args, "force_reason", None),
             )
             task = kb.get_task(conn, task_id)
+            dup_warning = kb.near_duplicate_warning(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -2285,6 +2467,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 "Subscribed the calling session for finish notifications "
                 "(kanban.cli_auto_subscribe)."
             )
+        if dup_warning:
+            similar = ", ".join(
+                f"{d['id']} ({d['score']:.2f})" for d in dup_warning.get("duplicates", [])
+            )
+            print(f"\n⚠  similar card(s) created in the last 24h: {similar}", file=sys.stderr)
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are
@@ -2372,7 +2559,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        # A delegate_task child's connection is read-only; promotion is a
+        # status mutation, so it lists the board as-is (the dispatcher promotes).
+        if not kb._is_delegated_child():
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
@@ -2397,6 +2587,12 @@ def _cmd_list(args: argparse.Namespace) -> int:
             stranded = kb.find_stranded_by_triage(conn)
         except Exception:
             triage_ids, stranded = [], []
+        try:
+            refusals = kb.workspace_refusal_state(
+                conn, [t.id for t in tasks if t.status in _REFUSAL_VISIBLE_STATUSES],
+            )
+        except Exception:
+            refusals = {}
     if getattr(args, "json", False):
         print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
         return 0
@@ -2425,9 +2621,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
         caller = _caller_session_id()
     if not caller:
         for t in tasks:
-            print(_fmt_task_line(t))
+            print(_fmt_task_line(t, refusals.get(t.id)))
         return 0
-    print(_format_session_grouped(tasks, kb.home_ids(caller)))
+    print(_format_session_grouped(tasks, kb.home_ids(caller), refusals))
     return 0
 
 
@@ -2437,6 +2633,19 @@ def _cmd_home_lint(args: argparse.Namespace) -> int:
     Designed for a no_agent cron (empty stdout = nothing delivered). With
     ``--backfill`` stamps the stragglers ``unhomed`` and exits 0.
     """
+    if getattr(args, "open_prs", False):
+        from hermes_cli import kanban_open_pr
+        with kb.connect_closing() as conn:
+            hits = kanban_open_pr.find_done_with_open_pr(conn)
+        if args.json:
+            print(json.dumps({"done_with_open_pr": hits}))
+        else:
+            for hit in hits:
+                print(
+                    f"kanban home-lint: {hit['id']} is DONE but names OPEN PR(s) "
+                    f"{', '.join(hit['open_prs'])} -- {hit['title']}"
+                )
+        return 1 if hits else 0
     with kb.connect_closing() as conn:
         if getattr(args, "backfill", False):
             ids = kb.backfill_unhomed(conn, dry_run=bool(args.dry_run))
@@ -2458,7 +2667,7 @@ def _cmd_home_lint(args: argparse.Namespace) -> int:
     return 1 if ids else 0
 
 
-def _format_session_grouped(tasks, home: "frozenset[str]") -> str:
+def _format_session_grouped(tasks, home: "frozenset[str]", refusals=None) -> str:
     """Session-first listing: this session's cards in full, every other
     session's cards collapsed to one ``id · status · title`` line each.
 
@@ -2468,7 +2677,8 @@ def _format_session_grouped(tasks, home: "frozenset[str]") -> str:
     mine = [t for t in tasks if t.session_id and t.session_id in home]
     others = [t for t in tasks if not (t.session_id and t.session_id in home)]
     lines = [f"THIS SESSION ({len(mine)})"]
-    lines += [_fmt_task_line(t) for t in mine] or ["  (none)"]
+    refusals = refusals or {}
+    lines += [_fmt_task_line(t, refusals.get(t.id)) for t in mine] or ["  (none)"]
     lines.append("")
     lines.append(
         f"OTHER SESSIONS ({len(others)}) -- not yours: comment, don't act "
@@ -2476,6 +2686,8 @@ def _format_session_grouped(tasks, home: "frozenset[str]") -> str:
     )
     for t in others:
         tag = " [unhomed]" if t.unhomed else ""
+        if refusals.get(t.id) and t.status in _REFUSAL_VISIBLE_STATUSES:
+            tag += f" [{_fmt_refusal(refusals[t.id])}]"
         lines.append(f"  {t.id} \u00b7 {t.status} \u00b7 {t.title}{tag}")
     return "\n".join(lines)
 
@@ -2534,6 +2746,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        refusal = (
+            kb.workspace_refusal_state(conn, [task.id]).get(task.id)
+            if task.status in _REFUSAL_VISIBLE_STATUSES else None
+        )
         if not getattr(args, "json", False):
             graph = kb.task_graph_context(conn, task.id)
 
@@ -2542,6 +2758,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "task": _task_to_dict(task),
             "home": _home_label(task.session_id, unhomed=task.unhomed),
             "latest_summary": latest_summary,
+            "workspace_refusal": refusal,
             "parents": parents,
             "children": children,
             "parent_links": [
@@ -2593,7 +2810,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return 0
 
     print(f"Task {task.id}: {task.title}")
-    print(f"  status:    {task.status}")
+    print(f"  status:    {task.status}"
+          + (f"  [{_fmt_refusal(refusal)}]" if refusal else ""))
     print(f"  assignee:  {task.assignee or '-'}")
     print(f"  session:   {task.session_id or (kb.UNHOMED_SESSION if task.unhomed else '-')}")
     print(f"  home:      {_home_label(task.session_id, unhomed=task.unhomed)}")
@@ -3383,6 +3601,12 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
     if provider_error:
         print(f"kanban: {provider_error}", file=sys.stderr)
         return 2
+    from hermes_cli.model_policy import pinned_sub_provider_error
+
+    pin_error = pinned_sub_provider_error(model, provider)
+    if pin_error:
+        print(f"kanban: {pin_error}", file=sys.stderr)
+        return 2
 
     firepower_reason = parsed.firepower if parsed else None
     guard_error = firepower_guard_error(model, firepower_reason)
@@ -3675,6 +3899,15 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         print(json.dumps(out_json, indent=2, ensure_ascii=False))
         return 0
 
+    # Host-level dispatcher load gate (kanban.dispatch_load_gate), published
+    # each tick by the gated dispatcher loop (gateway or `kanban daemon`).
+    try:
+        from hermes_cli import kanban_load_gate as _klg
+
+        print(_klg.format_state_line(_klg.read_state()))
+    except Exception:
+        pass
+
     if not diags_by_task:
         print("No active diagnostics on this board.")
         return 0
@@ -3733,7 +3966,13 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        if args.review:
+            task = kb.claim_review_task(
+                conn, args.task_id, ttl_seconds=args.ttl,
+                session_ref=_operator_review_session_ref(),
+            )
+        else:
+            task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -3774,7 +4013,24 @@ def _cmd_comment(args: argparse.Namespace) -> int:
       Saying "unknown" is the honest answer, and it is what the tri-state
       contract elsewhere in this codebase already does.
     """
-    body = " ".join(args.text).strip()
+    body_file = getattr(args, "body_file", None)
+    if body_file is not None and args.text:
+        print("kanban: pass the comment as TEXT or --body-file, not both", file=sys.stderr)
+        return 2
+    if body_file is None and not args.text:
+        print("kanban: comment body required (TEXT or --body-file)", file=sys.stderr)
+        return 2
+    if body_file is not None:
+        try:
+            body = _read_body_file(body_file).strip()
+        except OSError as exc:
+            print(f"kanban: --body-file: {exc}", file=sys.stderr)
+            return 2
+    else:
+        body = " ".join(args.text).strip()
+    if not body:
+        print("kanban: comment body is empty", file=sys.stderr)
+        return 2
     if args.max_len is not None:
         if args.max_len < 1:
             print("kanban: --max-len must be positive", file=sys.stderr)
@@ -3785,6 +4041,10 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     author = args.author or _profile_author()
     run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
+        if run_id is None:
+            # Human review lane: the session holding ``claim --review`` on this
+            # card attests to that review run (the claim is the provenance).
+            run_id = _operator_review_run_id(conn, args.task_id)
         kb.add_comment(
             conn, args.task_id, author, body,
             run_id=run_id, session_ref=session_ref,
@@ -3871,6 +4131,37 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _operator_review_session_ref() -> Optional[str]:
+    """Session fingerprint that may bind / use a human-lane review claim.
+
+    ``None`` (never bindable) for a delegate_task child, for anything inside a
+    cron job (in-process context flag or a ``cron_*`` session id), and for a
+    caller with no session at all: those cannot prove they are the reviewer
+    session, so they get no review run from :func:`_operator_review_run_id`.
+    """
+    try:
+        from agent.delegation_context import (
+            _NON_DISPATCHER_OWNED_CONTEXT,
+            is_delegated_child_process_context,
+        )
+
+        if is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get():
+            return None
+    except Exception:
+        return None
+    session_id = _caller_session_id()
+    if not session_id or session_id.startswith("cron_"):
+        return None
+    return kb.derive_session_ref(session_id)
+
+
+def _operator_review_run_id(conn, task_id: str) -> Optional[int]:
+    """The active review run on ``task_id`` iff THIS session claimed it."""
+    return kb.review_claim_run_for_session(
+        conn, task_id, _operator_review_session_ref(),
+    )
+
+
 def _worker_run_id_for(task_id: str) -> Optional[int]:
     """Return this process's dispatcher run id, but only if it OWNS the run.
 
@@ -3912,6 +4203,44 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, conn
         judge_available=goals.goal_judge_available,
         judge=goals.judge_goal,
     )
+
+
+def _last_event_id(conn, task_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+#: Events ``complete_task`` records when it does NOT close the card. It
+#: returns a bare bool, so the CLI reads the reason back off the card rather
+#: than printing a generic line (or nothing) while the card stays put
+#: (t_1e080b8d: an operator saw rc=0 and no reason, card still in review).
+_COMPLETION_OUTCOME_EVENTS = {
+    "completion_route_refused": "open-PR review route refused",
+    "completion_routed_to_review": "handoff names still-OPEN PR(s)",
+    "workspace_held": "workspace held",
+}
+
+
+def _completion_outcome(conn, task_id: str, after_event: int) -> str:
+    """Why this ``complete`` call did not mark ``task_id`` done, or ''."""
+    kinds = tuple(_COMPLETION_OUTCOME_EVENTS)
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        f"AND kind IN ({','.join('?' * len(kinds))}) ORDER BY id",
+        (task_id, after_event, *kinds),
+    ).fetchall()
+    parts = []
+    for kind, payload in rows:
+        try:
+            data = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        detail = data.get("reason") or ", ".join(data.get("open_prs") or [])
+        label = _COMPLETION_OUTCOME_EVENTS[kind]
+        parts.append(f"{label}: {detail}" if detail else label)
+    return "; ".join(parts)
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -3984,6 +4313,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
+            last_event = _last_event_id(conn, tid)
             try:
                 done = kb.complete_task(
                     conn, tid,
@@ -4002,11 +4332,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
+            except DraftPrError as draft_err:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
+                continue
+            outcome = _completion_outcome(conn, tid, last_event)
             if not done:
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                print(f"cannot complete {tid}: {outcome or '(unknown id or terminal state)'}",
+                      file=sys.stderr)
             else:
-                print(f"Completed {tid}")
+                after = kb.get_task(conn, tid)
+                if getattr(after, "status", None) == "review":
+                    print(f"Routed {tid} to review, NOT done: "
+                          f"{outcome or 'handoff names a still-OPEN PR'}")
+                else:
+                    print(f"Completed {tid}")
     return 0 if not failed else 1
 
 
@@ -4127,20 +4468,47 @@ def _cmd_block(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _parse_wake_at(value: str) -> int:
+    """``--at`` value -> epoch seconds. Accepts epoch digits or ISO-8601
+    (a naive timestamp is local time, like every other human-typed time)."""
+    value = (value or "").strip()
+    if value.isdigit():
+        return int(value)
+    from datetime import datetime
+
+    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+
+
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    wake_at: Optional[int] = None
+    if getattr(args, "now", False):
+        wake_at = int(time.time())
+    elif getattr(args, "at", None):
+        try:
+            wake_at = _parse_wake_at(args.at)
+        except ValueError:
+            print(f"invalid --at {args.at!r} (epoch seconds or ISO-8601)", file=sys.stderr)
+            return 1
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            current = kb.get_task(conn, tid)
+            # An already-scheduled card only gets its wake time (re)set; the
+            # old path refused it outright, leaving no timed exit.
+            already = (
+                current is not None and current.status == "scheduled"
+                and wake_at is not None
+            )
             if reason:
                 _run_id, _sess_ref = safe_comment_provenance(tid)
                 kb.add_comment(
                     conn, tid, author, f"SCHEDULED: {reason}",
                     run_id=_run_id, session_ref=_sess_ref,
                 )
-            if not kb.schedule_task(
+            if not already and not kb.schedule_task(
                 conn,
                 tid,
                 reason=reason,
@@ -4148,8 +4516,20 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
-            else:
+                continue
+            if not already:
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+            if wake_at is None:
+                continue
+            ok, err = kb.set_schedule_wake(
+                conn, tid, wake_at=wake_at, actor=author, reason=reason,
+            )
+            if not ok:
+                failed.append(tid)
+                print(f"cannot set wake for {tid}: {err}", file=sys.stderr)
+            else:
+                when = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(wake_at))
+                print(f"Wake set {tid} at {when} (dispatcher promotes on its next tick at/after)")
     return 0 if not failed else 1
 
 
@@ -4177,6 +4557,44 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_workspace(args: argparse.Namespace) -> int:
+    if getattr(args, "workspace_action", None) != "reset":
+        print("usage: kanban workspace reset (<task_id>... | --all-stranded) [--dry-run]",
+              file=sys.stderr)
+        return 2
+    ids = list(args.task_ids or [])
+    if bool(ids) == bool(args.all_stranded):
+        print("kanban workspace reset: give task id(s) or --all-stranded (not both)",
+              file=sys.stderr)
+        return 2
+    actor = _profile_author()
+    verb = "Would reset" if args.dry_run else "Reset"
+    refused = 0
+    with kb.connect_closing() as conn:
+        if args.all_stranded:
+            ids = kb.stranded_workspace_candidates(conn)
+            if not ids:
+                print("No stranded scratch workspaces.")
+                return 0
+        for task_id in ids:
+            task = kb.get_task(conn, task_id)
+            previous = task.workspace_path if task else None
+            try:
+                ok, err = kb.reset_stranded_workspace(
+                    conn, task_id, actor=actor, reason=args.reason, dry_run=args.dry_run,
+                )
+            except kb.ForeignSessionMutationError as exc:
+                # One foreign-home card must not abort a board-wide sweep.
+                ok, err = False, str(exc)
+            if ok:
+                print(f"{verb} {task_id} (was {previous})")
+            else:
+                refused += 1
+                print(f"cannot reset {task_id}: {err}", file=sys.stderr)
+    # --all-stranded is best-effort over candidates; explicit ids must all land.
+    return 1 if refused and not args.all_stranded else 0
 
 
 def _cmd_requeue(args: argparse.Namespace) -> int:
@@ -4255,17 +4673,21 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        ok, reason = kb.request_review(
-            conn,
-            tid,
-            summary=summary,
-            metadata=metadata,
-            reviewer=reviewer,
-            expected_run_id=_worker_run_id_for(tid),
-            force=bool(getattr(args, "force", False)),
-            allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
-            with_reason=True,
-        )
+        try:
+            ok, reason = kb.request_review(
+                conn,
+                tid,
+                summary=summary,
+                metadata=metadata,
+                reviewer=reviewer,
+                expected_run_id=_worker_run_id_for(tid),
+                force=bool(getattr(args, "force", False)),
+                allow_same_actor=bool(getattr(args, "allow_same_actor", False)),
+                with_reason=True,
+            )
+        except DraftPrError as draft_err:
+            print(f"cannot request review for {tid}: {draft_err}", file=sys.stderr)
+            return 1
         if not ok:
             detail = reason or "not running/ready?"
             print(
@@ -4292,11 +4714,51 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
+        # The caller must hold the review run: as its dispatcher-owned worker,
+        # or as the operator session that made ``claim --review`` (human lane).
+        worker_run = _worker_run_id_for(tid)
+        held_run = worker_run if worker_run is not None else _operator_review_run_id(conn, tid)
+        parked_session = None
+        if held_run is None:
+            # Card parked in ``review`` with nobody holding it: the operator
+            # session opens the review run itself and sends back in ONE txn
+            # (same audit as ``claim --review`` + request-changes). Only a
+            # session that could hold that claim may do this.
+            task = kb.get_task(conn, tid)
+            if task is not None and task.status == "review":
+                parked_session = _operator_review_session_ref()
+            if parked_session is None:
+                print(
+                    f"cannot request changes for {tid}: this session does not hold its "
+                    f"review run; claim it from the reviewing session first "
+                    f"(hermes kanban claim {tid} --review). Delegate children and "
+                    f"cron jobs cannot hold a human-lane review claim.",
+                    file=sys.stderr,
+                )
+                return 1
+        elif args.coverage is not None:
+            kb.add_comment(
+                conn, tid, _profile_author(),
+                "review_coverage: " + str(kb.redact_review_value(args.coverage)),
+                run_id=held_run,
+            )
         ok, detail = kb.request_changes(
             conn,
             tid,
             reason=reason,
-            expected_run_id=_worker_run_id_for(tid),
+            expected_run_id=held_run,
+            **(
+                {
+                    # Open the review run as this session, and record the
+                    # coverage on it inside the same transaction so the
+                    # coverage gate can pass.
+                    "claimer": _profile_author(),
+                    "coverage": args.coverage,
+                    "session_ref": parked_session,
+                }
+                if parked_session is not None
+                else {}
+            ),
         )
         if not ok:
             print(
@@ -4304,6 +4766,21 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        if worker_run is None:
+            # Human lane: the implementer resumes from the thread, so the
+            # verdict lands there as the rework comment (the run summary
+            # carries it too).
+            _unused_run, session_ref = safe_comment_provenance(tid)
+            kb.add_comment(
+                conn, tid, _profile_author(),
+                "changes requested (human review lane): "
+                + str(kb.redact_review_value(reason)),
+                run_id=(
+                    held_run if held_run is not None
+                    else getattr(kb.latest_run(conn, tid), "id", None)
+                ),
+                session_ref=session_ref,
+            )
         print(
             f"Requested changes for {tid}"
             + (f"; routed to {detail}" if detail else "")
@@ -4312,30 +4789,16 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
 
 
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
+    """Retired verb: a review returns to its implementer only via request-changes."""
     ids = list(args.task_ids or [])
     if not ids:
         print("at least one task_id is required", file=sys.stderr)
         return 1
-    reason = getattr(args, "reason", None)
-    if reason is not None:
-        reason = str(kb.redact_review_value(reason.strip())).strip() or None
-    author = _profile_author() if reason else None
-    failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.reopen_review_task(conn, tid):
-                failed.append(tid)
-                print(f"cannot reopen {tid} (not in review?)", file=sys.stderr)
-            else:
-                if reason:
-                    kb.add_comment(
-                        conn,
-                        tid,
-                        author or "operator",
-                        f"CHANGES REQUESTED: {reason}",
-                    )
-                print(f"Reopened {tid}" + (f": {reason}" if reason else ""))
-    return 0 if not failed else 1
+            kb.reopen_review_task(conn, tid)
+            print(f"cannot reopen {tid}: legacy bypass retired; claim review and use request-changes with full coverage", file=sys.stderr)
+    return 1
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
@@ -4589,6 +5052,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": child, "parent_id": parent}
                 for (child, parent) in res.stranded_by_triage
             ],
+            "woken_scheduled": list(getattr(res, "woken_scheduled", []) or []),
+            "unwoken_scheduled": [
+                {"task_id": tid, "parked_seconds": age}
+                for (tid, age) in getattr(res, "unwoken_scheduled", []) or []
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -4747,6 +5215,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # just stops mutating the board it is only supposed to observe.
     _print_review_awaiting_human(alert=not args.dry_run)
     _print_stranded_by_triage(res.stranded_by_triage)
+    if getattr(res, "woken_scheduled", None):
+        print(f"Woken (timed schedule elapsed): {', '.join(res.woken_scheduled)}")
+    unwoken = kb.format_unwoken_scheduled(getattr(res, "unwoken_scheduled", None))
+    if unwoken:
+        print(unwoken)
     return 0
 
 
@@ -5003,11 +5476,14 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return False
 
     try:
+        from hermes_cli.kanban_load_gate import gate_from_config
+
         kb.run_daemon(
             interval=args.interval,
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             on_tick=_on_tick,
+            load_gate=gate_from_config(),
         )
     finally:
         if pidfile:
@@ -5066,6 +5542,30 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\n(stopped)")
         return 0
+
+
+def _cmd_home_index(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_home_index
+
+    check = bool(getattr(args, "check", False))
+    report = kanban_home_index.resync(check_only=check)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        mode = "check" if check else "sync"
+        print(
+            f"home-index {mode}: boards={report['boards']} rows={report['rows']} "
+            f"drift={report['drift']} (missing={report['missing']} "
+            f"extra={report['extra']} stale={report['stale']}) "
+            f"errors={len(report['errors'])} path={kanban_home_index.index_path()}"
+        )
+        for line in report["samples"]:
+            print(f"  {line}")
+        for err in report["errors"]:
+            print(f"  error: {err}")
+    if report["errors"]:
+        return 2
+    return 1 if (check and report["drift"]) else 0
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
@@ -5137,7 +5637,10 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             thread_id=args.thread_id, user_id=args.user_id,
             user_id_alt=getattr(args, "user_id_alt", None),
             notifier_profile=args.notifier_profile or _profile_author(),
-            delivery_mode=getattr(args, "delivery_mode", None),
+            delivery_mode=(
+                getattr(args, "delivery_mode", None)
+                or ("notify+wake" if getattr(args, "wake", False) else None)
+            ),
         )
     print(f"Subscribed {args.platform}:{args.chat_id}"
           + (f":{args.thread_id}" if args.thread_id else "")

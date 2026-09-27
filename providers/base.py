@@ -78,6 +78,20 @@ class ProviderProfile:
     # top-level fields rather than ignoring them.
     supports_prompt_cache_key: bool = False
 
+    # owns_transcript: the provider keeps its OWN copy of the conversation
+    # (a relay over a resident CLI session, resumed by a routing key) and
+    # reconciles what the harness sends against it. For such a lane the
+    # harness-authored interrupt-close row (``_interrupt_close``: the
+    # "Operation interrupted." placeholder or a partial reply appended by
+    # ``close_interrupted_tool_sequence`` on a /stop or gateway restart) is a
+    # reply the provider never produced — its coherence gate refuses to
+    # resume and re-sends the whole history into a fresh session (one full
+    # prompt-cache rewrite per restart per session, 2026-09-25). Opt-in:
+    # profiles that set this have the row OMITTED from the wire; persisted
+    # history is untouched and strict-alternation providers (which need the
+    # row, #48879) keep the default.
+    owns_transcript: bool = False
+
     # ── Model catalog ─────────────────────────────────────────
     # fallback_models: curated list shown in /model picker when live fetch fails.
     # Only agentic models that support tool calling should appear here.
@@ -140,35 +154,6 @@ class ProviderProfile:
         Default: pass-through.
         """
         return messages
-
-    def process_response_text(self, text: str) -> str:
-        """Provider-specific post-processing for assistant TEXT.
-
-        The inverse seam of :meth:`prepare_messages`. Called on assistant text
-        coming back from the provider, before it reaches the conversation and
-        the display.
-
-        Motivating case: a provider profile that rewrites outbound content (for
-        example, replacing identity tokens before they reach an untrusted
-        third-party relay) currently has no supported way to undo that rewrite
-        on the way back. Today the only option is to monkey-patch
-        ``normalize_response`` from a plugin, which is both fragile and
-        provider-blind: the transports are shared by every OpenAI-compatible
-        provider and are not given the profile, so a patch installed for one
-        provider silently applies to all of them.
-
-        Contract for implementers:
-          * Must be PURE and DETERMINISTIC — the same input always yields the
-            same output. Non-determinism here corrupts replayed history.
-          * Must be IDEMPOTENT: ``f(f(x)) == f(x)``. The streaming path may
-            apply it to buffered fragments and again to the assembled text.
-          * Must NEVER raise. The caller guards, but an exception here costs a
-            user-visible turn.
-          * Should be cheap: it runs on every assistant response.
-
-        Default: pass-through.
-        """
-        return text
 
     def build_extra_body(
         self, *, session_id: str | None = None, **context: Any

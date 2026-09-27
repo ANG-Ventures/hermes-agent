@@ -257,6 +257,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, aliases=("set-home",), desktop="terminal"),
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]", argument_mode="mixed"),
+    CommandDef("resume-handoff",
+               "Resume work from a turn cut by a provider failure", "Session",
+               aliases=("resume_handoff",)),
 
     # Configuration
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
@@ -1498,7 +1501,12 @@ _SLACK_PRIORITY_CANONICALS = ("debug",)
 #   - merge: niche session-management command (fold this session's summary into
 #     another); reached via /hermes merge on Slack so it doesn't displace a
 #     higher-frequency native slash at the 50-command cap. Native everywhere else.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "boomerang", "merge"})
+#   - resume-handoff: rare recovery command (replay a turn cut by an
+#     unrecoverable provider failure); the handoff is also injected
+#     automatically on the next turn, so the explicit command is a
+#     convenience. Reached via /hermes resume-handoff on Slack rather than
+#     displacing /usage at the 50-cap. Native everywhere else.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "boomerang", "merge", "resume-handoff"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

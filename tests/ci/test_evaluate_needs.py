@@ -267,7 +267,7 @@ def test_main_preserves_compact_needs_json_shape(tmp_path, monkeypatch, capsys):
 def test_e2e_desktop_may_skip_while_intentionally_disabled():
     """The classifier must NOT require a job ci.yml deliberately disables.
 
-    ci.yml guards e2e-desktop with `false &&` because this branch takes
+    ci.yml guards e2e-desktop with a constant `if: false` because this branch takes
     upstream's apps/desktop verbatim and inherits their broken Playwright
     suite (#76627: the mock-backend Electron window never gets a title).
     Requiring it here would fail the umbrella gate on a skip we chose.
@@ -308,9 +308,18 @@ def test_e2e_desktop_exemption_matches_the_ci_yml_guard():
     ci_yml = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yaml"
     text = ci_yml.read_text(encoding="utf-8")
 
-    block = re.search(r"^  e2e-desktop:\n(?:.*\n)*?^    uses:", text, re.MULTILINE)
-    assert block, "could not locate the e2e-desktop job block in ci.yml"
-    disabled_in_ci = "false &&" in block.group(0)
+    import yaml
+
+    job = yaml.safe_load(text)["jobs"].get("e2e-desktop")
+    assert job, "could not locate the e2e-desktop job in ci.yml"
+    cond = job.get("if")
+    # Constant false in any spelling GitHub accepts (t_bc0052b9 replaced the
+    # parser-crashing `${{ false && (...) }}` with a bare `if: false`).
+    disabled_in_ci = cond is False or (
+        isinstance(cond, str)
+        and (re.sub(r"\s+", "", cond) in {"false", "${{false}}"}
+             or re.match(r"\$\{\{\s*false\s*&&", cond) is not None)
+    )
 
     exempt_in_classifier = (
         evaluate_needs(
@@ -322,6 +331,6 @@ def test_e2e_desktop_exemption_matches_the_ci_yml_guard():
     assert disabled_in_ci == exempt_in_classifier, (
         "ci.yml and evaluate_needs.py disagree about e2e-desktop: "
         f"disabled_in_ci={disabled_in_ci} exempt_in_classifier={exempt_in_classifier}. "
-        "Re-enabling the job means deleting BOTH the `false &&` guard and the "
+        "Re-enabling the job means deleting BOTH the constant-false guard and the "
         "classifier exemption."
     )

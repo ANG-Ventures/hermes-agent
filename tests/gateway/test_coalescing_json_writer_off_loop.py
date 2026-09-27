@@ -205,3 +205,43 @@ def test_gate_proof_inline_write_does_stall_the_loop(tmp_path, monkeypatch):
             held, lambda: utils.atomic_json_write(path, {"a": 1})
         )
     )
+
+
+def test_background_write_lands_at_path_resolved_at_construction(tmp_path, monkeypatch):
+    """A late background write must not follow a HERMES_HOME that changed after
+    the owner was built (t_73d1988f).
+
+    ``_DiscordRestartRecoveryState`` passes a path_fn that reads
+    ``get_hermes_home()``.  Evaluated on the writer thread at write time, a
+    straggler write from one owner landed in the NEXT owner's home, so its
+    ``_load`` resurrected foreign active channels (main red on
+    tests/discord/test_restart_backfill.py under CI load).  Ordering witness:
+    the snapshot is held until HERMES_HOME has moved, then released.
+    """
+    from plugins.platforms.discord.adapter import _DiscordRestartRecoveryState
+
+    home_a = tmp_path / "a"
+    home_b = tmp_path / "b"
+    home_a.mkdir()
+    home_b.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    state = _DiscordRestartRecoveryState(persist_interval_s=0.0)
+
+    release = threading.Event()
+    real_snapshot = state._writer._snapshot
+
+    def _held_snapshot():
+        release.wait(5.0)
+        return real_snapshot()
+
+    state._writer._snapshot = _held_snapshot
+    state.mark_channel_active("987011")  # writer thread now blocked in snapshot
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    release.set()
+    assert _wait_writes(state._writer, 1)
+
+    assert list(home_b.rglob("*.json")) == [], "late write leaked into the new home"
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    assert _DiscordRestartRecoveryState(persist_interval_s=0.0).recent_channels(1e9) == []
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    assert _DiscordRestartRecoveryState(persist_interval_s=0.0).recent_channels(1e9) == ["987011"]

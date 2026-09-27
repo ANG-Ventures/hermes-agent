@@ -124,7 +124,8 @@ def _create_and_subscribe_as(source: SessionSource, entry) -> tuple[str, dict]:
                 conn, title="worker card", assignee="worker",
                 session_id=entry.session_key,
             )
-            assert subscribe_calling_session(conn, tid) is True
+            # Wake is opt-in (t_6d6e9467); this file tests wake routing.
+            assert subscribe_calling_session(conn, tid, wake=True) is True
             kb.complete_task(conn, tid, summary="done")
             return tid, kb.list_notify_subs(conn, tid)[0]
         finally:

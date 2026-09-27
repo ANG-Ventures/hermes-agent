@@ -93,13 +93,51 @@ def test_format_footer_skips_missing_context_length():
         # bare model, no provider anywhere
         ("", "gpt-5.4", ("", "gpt-5.4")),
         (None, None, ("", "")),
-        # BOTH provider given AND model carries a prefix -> model's prefix wins
-        # (no ugly triple openai-codex/claude-app/claude-opus-4-8)
-        ("openai-codex", "claude-app/claude-opus-4-8", ("claude-app", "claude-opus-4-8")),
+        # provider given AND the model merely repeats it as a prefix -> de-dupe
+        # (no ugly triple claude-app/claude-app/claude-opus-4-8)
+        ("claude-app", "claude-app/claude-opus-4-8", ("claude-app", "claude-opus-4-8")),
+        ("Claude-App", "claude-app/claude-opus-4-8", ("Claude-App", "claude-opus-4-8")),
+        # AGGREGATOR vendor namespace: the slash is part of the MODEL id, and the
+        # served provider (who actually billed the turn) must NOT be swallowed.
+        # Regression: footer showed "moonshotai/kimi-k3" for an OpenRouter turn.
+        ("openrouter", "moonshotai/kimi-k3", ("openrouter", "moonshotai/kimi-k3")),
+        ("nous", "nousresearch/hermes-4-70b", ("nous", "nousresearch/hermes-4-70b")),
+        # provider repeated AND aggregator namespace -> de-dupe once, keep vendor
+        ("openrouter", "openrouter/moonshotai/kimi-k3", ("openrouter", "moonshotai/kimi-k3")),
     ],
 )
 def test_split_provider_model(provider, model, expected):
     assert _split_provider_model(provider, model) == expected
+
+
+def test_footer_and_compaction_banner_share_one_provider_model_normalizer():
+    """Contract: the footer must not carry its own copy of the split logic.
+
+    Two copies (gateway/runtime_footer + agent/provider_model_util) drifted
+    once and produced different provider/model strings for the same turn.
+    """
+    from agent.provider_model_util import split_provider_model
+
+    for prov, mdl in [
+        ("openrouter", "moonshotai/kimi-k3"),
+        ("claude-app", "claude-app/claude-opus-4-8"),
+        ("", "openai/gpt-5.4"),
+        ("claude-bpr", "claude-fable-5-1"),
+    ]:
+        assert _split_provider_model(prov, mdl) == split_provider_model(prov, mdl)
+
+
+def test_format_footer_provider_model_aggregator_keeps_served_provider():
+    line = format_runtime_footer(
+        model="moonshotai/kimi-k3",
+        provider="openrouter",
+        context_tokens=127_500,
+        context_length=1_048_576,
+        fields=("provider_model", "context_full"),
+    )
+    # Exact live shape from the Discord report (2026-09-25), with the fix:
+    # "moonshotai/kimi-k3 · 127.5k/1.0M (12%)" -> served provider in front.
+    assert line == "openrouter/moonshotai/kimi-k3 · 127.5k/1.0M (12%)"
 
 
 @pytest.mark.parametrize(

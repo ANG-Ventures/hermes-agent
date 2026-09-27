@@ -292,7 +292,8 @@ def test_no_nudge_for_handoff_after_successor_claims(
     if outcome == "changes_requested":
         origin_run_id = successor.current_run_id
         tool_name = "kanban_request_changes"
-        assert kb.request_changes(
+        from tests.kanban_review_helpers import covered_request_changes
+        assert covered_request_changes(
             conn, task.id, reason="Add boundary coverage", expected_run_id=origin_run_id,
         )[0]
         successor = kb.claim_task(conn, task.id, claimer="builder:2")
@@ -450,7 +451,8 @@ def test_conversation_loop_enforces_originating_run(worker_run, monkeypatch, han
             assert successor is not None
             if handoff == "changes_requested":
                 monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(successor.current_run_id))
-                assert kb.request_changes(
+                from tests.kanban_review_helpers import covered_request_changes
+                assert covered_request_changes(
                     conn, task.id, reason="Add coverage", expected_run_id=successor.current_run_id,
                 )[0]
                 assert kb.claim_task(conn, task.id, claimer="builder:2") is not None

@@ -616,6 +616,12 @@ def aux_cost_sink_total(sink: Optional[Dict[str, Any]]) -> Optional[float]:
     return round(float(sink.get("usd") or 0.0), 12)
 
 
+def _mark_sink_unknown(sink: Dict[str, Any], reason: str) -> None:
+    """Fail the sink closed; keep the FIRST reason for the compaction log line."""
+    sink["unknown"] = True
+    sink.setdefault("unknown_reason", reason)
+
+
 def _record_aux_call_cost(response: Any, route_info: Optional[Dict[str, str]],
                           *, streamed: bool) -> None:
     sink = _aux_cost_sink.get()
@@ -624,14 +630,14 @@ def _record_aux_call_cost(response: Any, route_info: Optional[Dict[str, str]],
     try:
         sink["calls"] = int(sink.get("calls") or 0) + 1
         if streamed:
-            sink["unknown"] = True
+            _mark_sink_unknown(sink, "streamed")
             return
         raw = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
         route = route_info if isinstance(route_info, dict) else {}
         provider = route.get("provider") or ""
         model = route.get("model") or getattr(response, "model", None) or ""
         if raw is None or not model:
-            sink["unknown"] = True
+            _mark_sink_unknown(sink, "no_usage" if raw is None else "no_model")
             return
         from agent.usage_pricing import estimate_usage_cost, normalize_usage
 
@@ -648,7 +654,7 @@ def _record_aux_call_cost(response: Any, route_info: Optional[Dict[str, str]],
         elif _has("input_tokens"):
             api_mode = route.get("api_mode") or "anthropic_messages"
         else:
-            sink["unknown"] = True
+            _mark_sink_unknown(sink, "usage_shape")
             return
         # normalize_usage reads provider "anthropic" as the Anthropic dialect
         # regardless of api_mode; the shape decided above wins for normalizing,
@@ -659,15 +665,15 @@ def _record_aux_call_cost(response: Any, route_info: Optional[Dict[str, str]],
         if (usage.usage_unknown or usage.input_tokens_unknown or usage.output_tokens_unknown
                 or not (usage.input_tokens or usage.output_tokens or usage.cache_read_tokens
                         or usage.cache_write_tokens)):
-            sink["unknown"] = True
+            _mark_sink_unknown(sink, "usage_unknown")
             return
         price = estimate_usage_cost(model, usage, provider=provider)
         if price.amount_usd is None:
-            sink["unknown"] = True
+            _mark_sink_unknown(sink, f"unpriced_model:{provider}/{model}")
             return
         sink["usd"] = float(sink.get("usd") or 0.0) + float(price.amount_usd)
     except Exception:
-        sink["unknown"] = True
+        _mark_sink_unknown(sink, "exception")
         logger.debug("auxiliary call cost unavailable", exc_info=True)
 
 
@@ -1521,7 +1527,7 @@ _OPENROUTER_MODEL = "google/gemini-3.6-flash"
 _NOUS_MODEL = "google/gemini-3.6-flash"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
-_AUTH_JSON_PATH = get_hermes_home() / "auth.json"
+_AUTH_JSON_PATH = Path(get_hermes_home()) / "auth.json"
 
 # Codex OAuth endpoint used when a caller explicitly requests
 # provider="openai-codex".  There is deliberately no hardcoded default
@@ -10110,6 +10116,9 @@ def call_llm(
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         outcome = "ok"
         _record_aux_call_cost(response, route_info, streamed=bool(stream))
+        if not stream:
+            from agent.aux_accounting import record_aux_api_call
+            record_aux_api_call(response, task, route_info)
         return response
     finally:
         if latency_info is not None:
@@ -11125,6 +11134,8 @@ async def async_call_llm(
             route_info=route_info,
         )
         outcome = "ok"
+        from agent.aux_accounting import record_aux_api_call
+        record_aux_api_call(response, task, route_info)
         return response
     finally:
         # Same duration contract as the sync path: an engine that summarises on the async

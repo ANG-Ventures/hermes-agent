@@ -972,17 +972,26 @@ class UpdateTaskBody(BaseModel):
     clear_reasoning_effort: bool = False
 
 
-def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
-    """Route a task leaving the ``review`` lane through ``reopen_review_task``
-    (proper transition: stale-run recovery, parent re-gate, ``review_reopened``
-    event) instead of a raw status write. Returns the transition result, or
-    ``None`` when the task isn't in ``review`` so the caller falls through to
-    its normal handling. Shared by the single-task and bulk status handlers so
-    the review-reopen routing can't drift between them.
-    """
-    if current is not None and getattr(current, "status", None) == "review":
-        return kanban_db.reopen_review_task(conn, task_id)
-    return None
+# A card in ``review`` leaves it only through a verdict verb: approve
+# (``done``), escalate (``blocked``), request_changes (a claimed review run with
+# a full coverage record), or ``archived``. Every other dashboard status write
+# -- ready/todo/triage/scheduled, single or bulk -- would hand the card back
+# without a review record. ``_set_status_direct`` enforces this itself (one
+# owner); the routes pre-check it only to return a clear 409.
+_REVIEW_EXIT_STATUSES = frozenset({"done", "blocked", "archived"})
+_REVIEW_EXIT_REFUSAL = (
+    "Claim review and request changes with a full coverage comment "
+    "(POST /tasks/{id}/request-changes); direct review reopening is retired"
+)
+
+
+def _review_exit_refused(current_status: Optional[str], new_status: Optional[str]) -> bool:
+    return (
+        current_status == "review"
+        and new_status is not None
+        and new_status != "review"
+        and new_status not in _REVIEW_EXIT_STATUSES
+    )
 
 
 @router.patch("/tasks/{task_id}")
@@ -993,6 +1002,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        if _review_exit_refused(task.status, payload.status):
+            raise HTTPException(status_code=409, detail=_REVIEW_EXIT_REFUSAL)
 
         review_assignee_deferred = (
             payload.status == "review" and payload.assignee is not None
@@ -1042,16 +1053,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 if ok and review_assignee_deferred and not payload.assignee:
                     ok = kanban_db.assign_task(conn, task_id, None)
             elif s == "ready":
-                # Re-open a blocked/scheduled/review task, or just an explicit
-                # status set. "Changes requested" (review -> ready) goes through
-                # reopen_review_task via _reopen_if_review.
+                # Re-open a blocked/scheduled task, or just an explicit
+                # status set. A review card never gets here (see
+                # _review_exit_refused); _set_status_direct refuses it anyway.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
                     ok = kanban_db.unblock_task(conn, task_id)
                 else:
-                    reopened = _reopen_if_review(conn, task_id, current)
                     # Direct status write for drag-drop (todo -> ready etc).
-                    ok = reopened if reopened is not None else _set_status_direct(conn, task_id, "ready")
+                    ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
             elif s == "running":
@@ -1060,14 +1070,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
             elif s in ("todo", "triage", "scheduled"):
-                # Only a review task moving to 'todo' needs the reopen
-                # transition; fetch lazily so triage/scheduled skip the query.
-                current = kanban_db.get_task(conn, task_id) if s == "todo" else None
-                reopened = _reopen_if_review(conn, task_id, current)
-                ok = reopened if reopened is not None else _set_status_direct(conn, task_id, s)
+                ok = _set_status_direct(conn, task_id, s)
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
+                remaining = kanban_db.get_task(conn, task_id)
+                if remaining and _review_exit_refused(remaining.status, s):
+                    raise HTTPException(status_code=409, detail=_REVIEW_EXIT_REFUSAL)
                 # For ``ready``, name the blocking parent(s) so the dashboard
                 # can render an actionable toast instead of a silent no-op.
                 # See #26744.
@@ -1277,6 +1286,9 @@ def _set_status_direct(
         termination = kanban_db._terminate_reclaimed_worker(
             held["worker_pid"], held["claim_lock"],
             conn=conn, task_id=task_id,
+            owner_window=kanban_db._worker_owner_window(
+                conn, task_id, held["worker_pid"],
+            ),
         )
         if kanban_db._worker_survived_termination(termination):
             kanban_db._refuse_reclaim_unproven_death(
@@ -1292,6 +1304,10 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if _review_exit_refused(prev["status"], new_status):
+            # Checked inside the write txn: a card that entered review after
+            # the route's pre-check is still refused.
             return False
         if prev["status"] == "running" and (
             held["status"] != "running" or prev["claim_lock"] != released_lock
@@ -1377,8 +1393,12 @@ def _set_status_direct(
                 task_id,
                 terminations,
             )
-    for pid, claim_lock in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+    for entry in terminations:
+        pid, claim_lock = entry
+        kanban_db._terminate_reclaimed_worker(
+            pid, claim_lock,
+            owner_window=kanban_db._termination_window(entry),
+        )
     # If we re-opened something, children may have gone stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
@@ -1504,6 +1524,10 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     entry.update(ok=False, error="not found")
                     results.append(entry)
                     continue
+                if _review_exit_refused(task.status, payload.status):
+                    entry.update(ok=False, error=_REVIEW_EXIT_REFUSAL)
+                    results.append(entry)
+                    continue
                 if payload.archive:
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")
@@ -1532,8 +1556,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         if cur and cur.status in ("blocked", "scheduled"):
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
-                            reopened = _reopen_if_review(conn, tid, cur)
-                            ok = reopened if reopened is not None else _set_status_direct(conn, tid, "ready")
+                            ok = _set_status_direct(conn, tid, "ready")
                     elif s == "running":
                         entry.update(
                             ok=False,
@@ -1547,10 +1570,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     elif s == "scheduled":
                         ok = kanban_db.schedule_task(conn, tid)
                     elif s in {"todo", "triage"}:
-                        # Fetch lazily: only review->todo needs reopen.
-                        cur = kanban_db.get_task(conn, tid) if s == "todo" else None
-                        reopened = _reopen_if_review(conn, tid, cur)
-                        ok = reopened if reopened is not None else _set_status_direct(conn, tid, s)
+                        ok = _set_status_direct(conn, tid, s)
                     else:
                         entry.update(ok=False, error=f"unknown status {s!r}")
                         results.append(entry)
@@ -1984,6 +2004,50 @@ def reclaim_task_endpoint(
                 ),
             )
         return {"ok": True, "task_id": task_id}
+    finally:
+        conn.close()
+
+
+class RequestChangesBody(BaseModel):
+    reason: str
+    # review_coverage JSON text; required for a card parked in ``review``.
+    coverage: Optional[str] = None
+    author: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/request-changes")
+def request_changes_endpoint(
+    task_id: str,
+    payload: RequestChangesBody,
+    board: Optional[str] = Query(None),
+):
+    """Return a review card to its implementer with a coverage record.
+
+    The dashboard's review -> ready/todo status writes are refused (a card
+    leaves review only through a verdict); this is the send-back verdict.
+    Maps 1:1 to ``hermes kanban request-changes <id> <reason> --coverage``:
+    a card parked in ``review`` gets its review run opened as the caller and
+    closed in the same transaction.
+    """
+    if not payload.reason.strip():
+        raise HTTPException(status_code=400, detail="reason is required")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        ok, detail = kanban_db.request_changes(
+            conn, task_id,
+            reason=payload.reason,
+            claimer=(payload.author or "dashboard"),
+            coverage=payload.coverage,
+        )
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail=f"cannot request changes for {task_id}: {detail or 'invalid review state'}",
+            )
+        return {"ok": True, "task_id": task_id, "implementer": detail}
     finally:
         conn.close()
 

@@ -1297,6 +1297,39 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
     assert s["user_id_alt"] == "alt-user-9"
     assert s["chat_type"] == "forum"
+    # Wake is opt-in (t_6d6e9467): the default is the passive line only.
+    assert s["delivery_mode"] == "notify"
+
+
+def test_create_wake_true_opts_gateway_session_into_wake(monkeypatch, worker_env):
+    """``wake=True`` is the only path to a notify+wake gateway sub."""
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "alt-user-9")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
+
+    out = kt._handle_create({
+        "title": "auto-sub gateway",
+        "assignee": "peer",
+        "wake": True,
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    new_tid = d["task_id"]
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(new_tid))
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["platform"] == "telegram"
+    assert s["chat_id"] == "chat-42"
+    assert s["thread_id"] == "thread-7"
+    assert s["user_id"] == "user-9"
+    assert s["user_id_alt"] == "alt-user-9"
+    assert s["chat_type"] == "forum"
     assert s["delivery_mode"] == "notify+wake"
 
 

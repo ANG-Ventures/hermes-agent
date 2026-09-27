@@ -133,6 +133,92 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    @pytest.mark.parametrize("name", ["agent_marker_probe.py", "agent_marker_probe.sh"])
+    def test_script_child_is_not_an_agent_process(self, cron_env, monkeypatch, name):
+        """A cron script child is a plain script, not an agent process.
+
+        The gateway advertises itself with AI_AGENT / HERMES_AGENT in its OWN
+        os.environ (gateway.run.main); a script child inherited both and was
+        classified as an agent by fleet tooling keyed on that marker (the gh
+        shim resolved every laned no_agent cron to the gateway profile's lane,
+        t_7fee0f83). Profile home must still propagate.
+        """
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setenv("AI_AGENT", "hermes-agent")
+        monkeypatch.setenv("HERMES_AGENT", "true")
+        script = cron_env / "scripts" / name
+        if name.endswith(".sh"):
+            script.write_text(
+                'echo "ai=${AI_AGENT-ABSENT} marker=${HERMES_AGENT-ABSENT} home=${HERMES_HOME:+SET}"\n'
+            )
+        else:
+            script.write_text(
+                "import os\n"
+                "g = os.environ.get\n"
+                "print('ai=%s marker=%s home=%s' % (g('AI_AGENT', 'ABSENT'), "
+                "g('HERMES_AGENT', 'ABSENT'), 'SET' if g('HERMES_HOME') else ''))\n"
+            )
+
+        success, output = _run_job_script(name)
+        assert success is True, output
+        assert output == "ai=ABSENT marker=ABSENT home=SET"
+
+    _LANE_PROBE = (
+        "import os, shutil\n"
+        "g = os.environ.get\n"
+        "print('lane=%s default=%s script=%s first=%s' % (g('HERMES_GH_LANE', '-'), g('HERMES_GH_LANE_DEFAULT', '-'), "
+        "os.path.basename(g('HERMES_CRON_SCRIPT', '-')), os.environ['PATH'].split(os.pathsep)[0]))\n"
+    )
+
+    def test_default_gh_lane_when_home_ships_the_shim(self, cron_env, monkeypatch):
+        """t_f0780685: an unlaned cron script gets the gh shim first on PATH and a DEFAULT lane
+        (never the explicit lane var, so a script's own setdefault/export still wins), plus its
+        own path so the shim can keep audited stored-login sites on the stored login."""
+        from cron.scheduler import CRON_SCRIPT_DEFAULT_GH_LANE, _run_job_script
+
+        shim_dir = cron_env / "var" / "gh-shim"
+        shim_dir.mkdir(parents=True)
+        (shim_dir / "gh").write_text("#!/bin/sh\n")
+        (shim_dir / "gh").chmod(0o755)
+        monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", str(shim_dir), "/bin"]))
+        monkeypatch.delenv("HERMES_GH_LANE", raising=False)
+        (cron_env / "scripts" / "lane_probe.py").write_text(self._LANE_PROBE)
+
+        success, output = _run_job_script("lane_probe.py")
+        assert success is True, output
+        assert output == "lane=- default=%s script=lane_probe.py first=%s" % (
+            CRON_SCRIPT_DEFAULT_GH_LANE, shim_dir)
+
+    def test_default_gh_lane_keeps_an_explicit_default_and_lane(self, cron_env, monkeypatch):
+        from cron.scheduler import _run_job_script
+
+        shim_dir = cron_env / "var" / "gh-shim"
+        shim_dir.mkdir(parents=True)
+        (shim_dir / "gh").write_text("#!/bin/sh\n")
+        (shim_dir / "gh").chmod(0o755)
+        monkeypatch.setenv("HERMES_GH_LANE", "lander")
+        monkeypatch.setenv("HERMES_GH_LANE_DEFAULT", "ci-actuators")
+        (cron_env / "scripts" / "lane_probe.py").write_text(self._LANE_PROBE)
+
+        success, output = _run_job_script("lane_probe.py")
+        assert success is True, output
+        assert output.startswith("lane=lander default=ci-actuators script=lane_probe.py"), output
+
+    def test_no_shim_leaves_the_env_untouched(self, cron_env, monkeypatch):
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.delenv("HERMES_GH_LANE", raising=False)
+        monkeypatch.delenv("HERMES_GH_LANE_DEFAULT", raising=False)
+        monkeypatch.delenv("HERMES_CRON_SCRIPT", raising=False)
+        monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+        (cron_env / "scripts" / "lane_probe.py").write_text(self._LANE_PROBE)
+
+        success, output = _run_job_script("lane_probe.py")
+        assert success is True, output
+        assert output.startswith("lane=- default=- script=- first="), output
+        assert "gh-shim" not in output, output
+
     @pytest.mark.windows_only
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         # Windows-only: the fake ``sys.platform`` could not reproduce the

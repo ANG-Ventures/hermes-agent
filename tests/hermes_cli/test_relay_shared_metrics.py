@@ -1420,7 +1420,17 @@ def test_concurrent_due_exports_create_one_daily_package(tmp_path):
     assert store.counter_snapshot()[0]["packaged_value"] == 1
 
 
-def test_concurrent_model_call_updates_are_transactional(tmp_path):
+def test_concurrent_model_call_updates_are_transactional(tmp_path, monkeypatch):
+    # The claim is "no lost or torn increments", not the production 250 ms
+    # busy budget: on a loaded runner one commit can hold the write lock past
+    # 250 ms and the other thread raised "database is locked" (merge-group
+    # slice 10/16, run 36069213079). Give the writers a patient busy timeout.
+    connection = SharedMetricsStore._connection
+    monkeypatch.setattr(
+        SharedMetricsStore,
+        "_connection",
+        lambda self, *, busy_timeout_ms=0: connection(self, busy_timeout_ms=30_000),
+    )
     database_path = tmp_path / "metrics.sqlite3"
     outbox_directory = tmp_path / "outbox"
     SharedMetricsStore(database_path, outbox_directory)

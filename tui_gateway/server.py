@@ -219,12 +219,6 @@ _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS = 60
 _TURN_SETTLE_BEFORE_CLOSE_SECONDS = 5.0
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
-_SESSION_CHANGES_ROW_LIMIT = 500
-_SESSION_SYNC_ENABLED_DEFAULT = True
-_SESSION_SYNC_T_SILENCE_DEFAULT = 10.0
-_SESSION_SYNC_POLL_INTERVAL_DEFAULT = 2.5
-_SESSION_SYNC_REFOCUS_DEBOUNCE_DEFAULT = 1.0
-_SESSION_CHANGES_DISABLED_ERROR = 4051
 
 # ── Async RPC dispatch (#12546) ──────────────────────────────────────
 # A handful of handlers block the dispatcher loop in entry.py for seconds
@@ -372,15 +366,6 @@ _LONG_HANDLERS = frozenset(
         "shell.exec",
         "skills.manage",
         "slash.exec",
-    }
-)
-_SESSION_DB_HEAVY_METHODS = frozenset(
-    {
-        "insights.get",
-        "projects.project_sessions",
-        "projects.tree",
-        "session.list",
-        "session.most_recent",
     }
 )
 
@@ -3033,15 +3018,6 @@ def _err(rid, code: int, msg: str, data: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": error}
 
 
-def is_session_db_heavy_method(method: str | None) -> bool:
-    return method in _SESSION_DB_HEAVY_METHODS
-
-
-def backend_busy_error(rid, exc) -> dict:
-    payload = exc.to_payload() if hasattr(exc, "to_payload") else {"retryable": True}
-    return _err(rid, 5038, "backend busy; retry shortly", payload)
-
-
 def method(name: str):
     def dec(fn):
         _methods[name] = fn
@@ -3069,6 +3045,81 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     return rid, method, params
 
 
+# ── Shared-checkout admission hold (gateway/checkout_admission.py) ──────
+# Every RPC -- stdio, and every existing or new WebSocket connection -- goes
+# through handle_request, so gating here covers persistent connections too.
+# Methods that start agent work take an admission ticket BEFORE the handler
+# persists anything; the ticket is released when the handler returns (by then
+# ``session["running"]`` counts the turn) or handed to the worker thread via
+# ``_start_counted_thread`` for fire-and-forget work (background / btw).
+_CHECKOUT_GATED_METHODS = frozenset({"prompt.submit", "prompt.background", "prompt.btw"})
+_checkout_gate_ref = None
+_checkout_rpc_ticket: contextvars.ContextVar = contextvars.ContextVar(
+    "checkout_rpc_ticket", default=None
+)
+
+
+def _serve_active_work() -> dict:
+    """Authoritative serve-process work: running sessions + side work."""
+    running = sum(1 for s in list(_sessions.values()) if s.get("running"))
+    counts = {"sessions_running": running}
+    try:
+        from agent.conversation_compression import compactions_in_flight
+
+        counts["compaction"] = int(compactions_in_flight())
+    except ImportError:
+        pass
+    try:
+        from cron.scheduler import get_running_job_ids
+
+        counts["cron"] = len(get_running_job_ids())
+    except ImportError:
+        pass
+    return counts
+
+
+def enable_checkout_admission(kind: str = "serve"):
+    """Install this process's admission gate (called by the serve lifespan).
+
+    Returns the gate (caller runs ``gate.publish_forever()`` on its serving
+    loop) or None when ``checkout_admission`` is disabled for this kind.
+    """
+    global _checkout_gate_ref
+    from gateway.checkout_admission import process_gate
+
+    gate = process_gate(kind)
+    if gate is not None:
+        gate.set_active_work(_serve_active_work)
+        gate.set_serving(lambda: {"ok": True, "sessions": len(_sessions)})
+    _checkout_gate_ref = gate
+    return gate
+
+
+def _start_counted_thread(target, *, name: str | None = None) -> threading.Thread:
+    """Start fire-and-forget agent work, keeping the RPC's admission ticket
+    (if any) held until the work finishes instead of until the RPC returns."""
+    box = _checkout_rpc_ticket.get()
+    ticket = None
+    if box is not None:
+        ticket, box["ticket"] = box.get("ticket"), None
+
+    def _run():
+        try:
+            target()
+        finally:
+            if ticket is not None:
+                ticket.release()
+
+    th = threading.Thread(target=_run, daemon=True, name=name)
+    try:
+        th.start()
+    except BaseException:
+        if ticket is not None:
+            ticket.release()
+        raise
+    return th
+
+
 def handle_request(req: dict) -> dict | None:
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
@@ -3078,26 +3129,30 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
+    box = None
+    gate = _checkout_gate_ref
+    if gate is not None and method in _CHECKOUT_GATED_METHODS:
+        from gateway.checkout_admission import AdmissionRefused
+
+        try:
+            box = {"ticket": gate.admit(f"rpc:{method}")}
+        except AdmissionRefused as exc:
+            logger.info("refusing %s: %s", method, exc.reason)
+            return _err(
+                rid,
+                5075,
+                "paused for a maintenance update; not accepting new turns — retry shortly",
+            )
     token = _current_rpc_method.set(method)
+    box_token = _checkout_rpc_ticket.set(box) if box is not None else None
     try:
         return fn(rid, params)
     finally:
+        if box_token is not None:
+            _checkout_rpc_ticket.reset(box_token)
         _current_rpc_method.reset(token)
-
-
-def handle_request_bound(req: dict, transport: Optional[Transport] = None) -> dict | None:
-    """Handle one request with dispatch()'s transport binding, synchronously.
-
-    WebSocket heavy-read RPCs call this under an async-side semaphore. Going
-    straight to ``handle_request`` keeps the semaphore held until the DB scan is
-    done instead of releasing after ``dispatch`` merely schedules a pool worker.
-    """
-    t = transport or _stdio_transport
-    token = bind_transport(t)
-    try:
-        return handle_request(req)
-    finally:
-        reset_transport(token)
+        if box is not None and box.get("ticket") is not None:
+            box["ticket"].release()
 
 
 def _current_session_steer_authority(
@@ -4828,38 +4883,6 @@ def _load_desktop_auto_resume_config(cfg: dict | None = None) -> dict[str, Any]:
     }
 
 
-def _load_session_sync_config(cfg: dict | None = None) -> dict[str, Any]:
-    """Return dashboard session-sync config with config.yaml-only controls."""
-    root = _load_cfg() if cfg is None else cfg
-    dashboard = root.get("dashboard") if isinstance(root, dict) else {}
-    if not isinstance(dashboard, dict):
-        dashboard = {}
-    session_sync = dashboard.get("session_sync")
-    if not isinstance(session_sync, dict):
-        session_sync = {}
-    return {
-        "enabled": is_truthy_value(
-            session_sync.get("enabled"),
-            default=_SESSION_SYNC_ENABLED_DEFAULT,
-        ),
-        "t_silence": _coerce_float_config_value(
-            session_sync.get("t_silence"),
-            _SESSION_SYNC_T_SILENCE_DEFAULT,
-            min_value=0.0,
-        ),
-        "poll_interval": _coerce_float_config_value(
-            session_sync.get("poll_interval"),
-            _SESSION_SYNC_POLL_INTERVAL_DEFAULT,
-            min_value=0.1,
-        ),
-        "refocus_debounce": _coerce_float_config_value(
-            session_sync.get("refocus_debounce"),
-            _SESSION_SYNC_REFOCUS_DEBOUNCE_DEFAULT,
-            min_value=0.0,
-        ),
-    }
-
-
 def _desktop_auto_resume_enabled(cfg: dict | None = None) -> bool:
     return bool(_load_desktop_auto_resume_config(cfg).get("enabled"))
 
@@ -6404,6 +6427,20 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     return surfaces
 
 
+def _surface_fold_in(platform: str) -> set[str]:
+    """Client-surface toolsets minus ``agent.disabled_toolsets``.
+
+    The fold-in happens after ``_get_platform_tools`` already subtracted
+    ``agent.disabled_toolsets``, so the same subtraction is applied to the
+    fold-in itself; otherwise ``disabled_toolsets: [project]`` is a no-op here,
+    the only surface where the toolset exists (upstream #54433). ``desktop_ui``
+    is kept regardless: it is the client's own control surface.
+    """
+    surfaces = _gui_surface_toolsets(platform)
+    disabled = set(_load_disabled_toolsets() or [])
+    return surfaces - (disabled - {"desktop_ui"})
+
+
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     session_platform = platform or _resolve_session_platform()
     explicit = [
@@ -6430,7 +6467,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
                 # coding posture returns before the fallback path that normally
                 # adds them — without this the desktop loses its pane/project
                 # tools exactly when sitting in a repo (see below).
-                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
+                return sorted({*selection, *_surface_fold_in(session_platform)})
         except Exception:
             pass
 
@@ -6547,7 +6584,7 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
         # folding them in here is the gate that exposes them on exactly the
         # surface that can answer them.
-        return sorted(enabled | _gui_surface_toolsets(session_platform))
+        return sorted(enabled | _surface_fold_in(session_platform))
     except Exception:
         if fallback_notice is not None:
             print(
@@ -6555,6 +6592,27 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
                 file=sys.stderr,
                 flush=True,
             )
+        return None
+
+
+def _load_disabled_toolsets() -> list[str] | None:
+    """``agent.disabled_toolsets`` from config.yaml, or ``None``.
+
+    The classic CLI and the messaging gateway both forward this list to
+    AIAgent, where ``get_tool_definitions`` strips the named toolsets even out
+    of composite defaults (#17309). The TUI/serve gateway dropped it, so a
+    profile denylist silently had no effect on any session built here
+    (upstream #44499; clanker-warm-client desktop_project, t_3f53bfd7).
+    """
+    try:
+        from agent.skill_utils import parse_config_string_list
+
+        from hermes_cli.config import load_config
+
+        agent_cfg = load_config().get("agent") or {}
+        disabled = parse_config_string_list(agent_cfg.get("disabled_toolsets"))
+        return [str(ts) for ts in disabled] or None
+    except Exception:
         return None
 
 
@@ -6817,53 +6875,6 @@ def _apply_model_switch(
         raise ValueError(result.error_message or "model switch failed")
 
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
-
-    if agent:
-        # A no-op switch — the agent is already on the exact model+provider the
-        # switch resolved to — must short-circuit BEFORE the expensive-model
-        # confirmation gate and BEFORE the commit side effects. Two reasons this
-        # is placed here, ahead of both gates:
-        #   1. Running the commit side effects (agent.switch_model, marker
-        #      append, history_version bump, worker restart, session.info emit)
-        #      on a same-model "switch" injected a synthetic user message and
-        #      tripped the "history_version mismatch — output NOT written" path,
-        #      burning a full API call on brand-new sessions (the desktop
-        #      reconnect junk-session bug).
-        #   2. Detecting the no-op before the expensive-model gate avoids a
-        #      spurious confirmation dialog when a user re-selects the model
-        #      they are already on (an already-active model is never a NEW
-        #      expense to confirm).
-        # The per-turn config sync (_sync_agent_model_with_config) is the common
-        # trigger: config.yaml carries "claude-apr/claude-opus-4-8" while
-        # agent.model is the bare "claude-opus-4-8", so its own early-out misses
-        # and it calls through to here with a target identical to the live
-        # agent. Compare the RESOLVED target (post switch_model parsing) so a
-        # provider-prefixed vs bare spelling of the same model is caught.
-        _cur_model = getattr(agent, "model", "") or ""
-        _cur_provider = getattr(agent, "provider", "") or ""
-        _same_provider = (
-            not result.target_provider or result.target_provider == _cur_provider
-        )
-        if result.new_model == _cur_model and _same_provider:
-            # Mirror the real-switch commit's persistence for the override so a
-            # later rebuild (resume / _reset_session_agent) re-derives the same
-            # model — the ONLY side effects a no-op legitimately performs.
-            if pin_session_override and isinstance(session, dict):
-                session["model_override"] = {
-                    "model": result.new_model,
-                    "provider": result.target_provider,
-                    "base_url": result.base_url,
-                    "api_key": result.api_key,
-                    "api_mode": result.api_mode,
-                }
-                _persist_live_session_runtime(session)
-            if persist_global:
-                _persist_model_switch(result)
-            return {
-                "value": result.new_model,
-                "warning": result.warning_message or "",
-                "confirm_required": False,
-            }
 
     if agent:
         try:
@@ -7947,7 +7958,8 @@ def _current_profile_name() -> str:
 # checkout), surfacing a one-click "update to align" prompt instead of failing
 # cryptically downstream. Bump whenever the desktop's backend contract changes.
 # v2: adds the file.attach RPC (remote-gateway non-image file upload).
-# v3: adds server-side pinned sessions (`pinned` session rows + session.pin),
+# v3: adds server-side pinned sessions (`pinned` session rows; the fork-only
+#     session.pin RPC was removed — pins are written via the sessions REST router),
 # approvals.mode config RPCs, and session.info reconciliation.
 # v4: session.create fast=false is an explicit per-session normal-tier override.
 # v5: uvicorn ws_max_size raised for one-shot base64 file.attach frames (>16 MiB).
@@ -9126,6 +9138,8 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         # their toolsets against that same platform rather than the gateway
         # process's, so they never carry GUI schema they cannot use.
         or _load_enabled_toolsets("tui"),
+        "disabled_toolsets": getattr(agent, "disabled_toolsets", None)
+        or _load_disabled_toolsets(),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -9623,6 +9637,7 @@ def _make_agent(
             else _load_service_tier()
         ),
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        disabled_toolsets=_load_disabled_toolsets(),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -11612,74 +11627,6 @@ def _live_session_payload(
     return _attach_todo_state(payload, session)
 
 
-@method("session.changes")
-def _(rid, params: dict) -> dict:
-    sync_cfg = _load_session_sync_config()
-    if not sync_cfg["enabled"]:
-        return _err(
-            rid,
-            _SESSION_CHANGES_DISABLED_ERROR,
-            "session changes disabled",
-        )
-
-    session_key = str(params.get("session_id") or "").strip()
-    if not session_key:
-        return _err(rid, 4044, "session not found")
-    try:
-        since = int(params.get("since_message_id") or 0)
-    except (TypeError, ValueError):
-        since = 0
-    if since < 0:
-        since = 0
-
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5037)
-    try:
-        if db.get_session(session_key) is None:
-            return _err(rid, 4044, "session not found")
-        rows = db.get_messages_after(
-            session_key,
-            since,
-            limit=_SESSION_CHANGES_ROW_LIMIT,
-        )
-    except Exception as e:
-        return _err(rid, 5038, f"session changes unavailable: {e}")
-
-    messages = _history_to_messages(rows)
-    last_id = since
-    for row in rows:
-        try:
-            last_id = max(last_id, int(row.get("id") or last_id))
-        except (TypeError, ValueError):
-            pass
-    return _ok(rid, {"messages": messages, "last_id": last_id})
-
-
-@method("session.pin")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-    assert session is not None
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5007)
-    key = session["session_key"]
-    pinned = bool(params.get("pinned"))
-    try:
-        if not db.set_session_pinned(key, pinned):
-            _ensure_session_db_row(session)
-            with _session_db(session) as scoped_db:
-                if scoped_db is None or not scoped_db.set_session_pinned(key, pinned):
-                    return _err(rid, 5007, "session pin failed")
-        session["pinned"] = pinned
-        _emit_session_info_for_session(params.get("session_id", ""), session)
-        return _ok(rid, {"pinned": pinned, "session_key": key})
-    except Exception as e:
-        return _err(rid, 5007, str(e))
-
-
 def _main_runtime_from_agent(agent) -> dict | None:
     """Build an aux-client main_runtime override from a live agent.
 
@@ -12898,15 +12845,17 @@ def _collect_kanban_notifications(session: dict) -> list:
                 if not events:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
-                for ev in events:
+                from gateway.kanban_notify_failures import collapse_retry_pairs
+
+                for ev in collapse_retry_pairs(list(events)):
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
                         texts.append(text)
-                # Unsubscribe only on archive. ``done`` is reversible in
-                # review/controller flows, so retaining the subscription lets
-                # a later reopen notify the same originating TUI/Desktop
-                # session. The claimed cursor prevents historical replay.
-                if task and getattr(task, "status", "") == "archived":
+                # Unsubscribe once the task is done/archived — the events
+                # claimed above are already queued for delivery, so the
+                # terminal line still arrives (t_6d6e9467). A reopened
+                # ``done`` card is re-subscribed explicitly by its controller.
+                if _kb.notify_sub_is_final(task):
                     try:
                         _kb.remove_notify_sub(
                             conn,
@@ -13373,6 +13322,42 @@ def _hud_surface_note(session: dict) -> str:
     return hud_surface_note(getattr(session.get("agent"), "valid_tool_names", None))
 
 
+TURN_SYSTEM_CONTEXT_MAX_CHARS = 2000
+
+
+def _turn_system_context(raw: Any) -> str:
+    """Normalize prompt.submit ``system_context``: a bounded string, else "".
+
+    Non-strings are ignored rather than stringified so a stray object can
+    never land in the system prompt.
+    """
+    if not isinstance(raw, str):
+        return ""
+    from hermes_cli.input_sanitize import sanitize_user_prompt_text
+
+    return sanitize_user_prompt_text(raw).strip()[:TURN_SYSTEM_CONTEXT_MAX_CHARS]
+
+
+def _with_turn_system_context(base: str | None, context: str) -> str | None:
+    """The ephemeral system prompt for one turn carrying caller metadata.
+
+    prompt.submit ``system_context`` is metadata the MODEL needs (which room
+    a voice turn came from) but the user did not say. Putting it in the user
+    text makes models mirror it back; the system prompt does not. It is
+    appended after the profile's own ephemeral prompt (never replacing it)
+    and only for the duration of the turn, so the cached base system prompt
+    and the persisted transcript are untouched.
+
+    Prompt caching: the context lands in the system message, so a client must
+    keep it byte-stable for the life of a session (the clanker voice client
+    binds each warm session to one room, so its value never changes within a
+    session). Varying it turn to turn would re-bill the prefix every turn.
+    """
+    if not context:
+        return base
+    return f"{base}\n\n{context}" if base else context
+
+
 def _prepend_note(run_message: Any, note: str) -> Any:
     """Prefix a per-turn note onto the MODEL INPUT, leaving the prompt alone.
 
@@ -13561,6 +13546,23 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> bool:
+    # Every caller has already set session["running"] (so the turn is counted
+    # by _serve_active_work). Under a ``freeze`` hold even continuations are
+    # refused here -- before the turn thread starts -- and reported, never
+    # interrupted mid-run. ``drain`` admits them (they are counted).
+    _gate = _checkout_gate_ref
+    if _gate is not None:
+        _refusal = _gate.check(internal=True)
+        if _refusal is not None:
+            with session["history_lock"]:
+                session["running"] = False
+            logger.info("deferring turn for %s: %s", sid, _refusal.reason)
+            _emit(
+                "error",
+                sid,
+                {"message": "Paused for a maintenance update; this turn was not started — resend shortly."},
+            )
+            return False
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -13902,9 +13904,17 @@ def _run_prompt_submit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+            _base_ephemeral = getattr(agent, "ephemeral_system_prompt", None)
+            _turn_ctx = session.get("turn_system_context") or ""
+            if _turn_ctx:
+                agent.ephemeral_system_prompt = _with_turn_system_context(
+                    _base_ephemeral, _turn_ctx
+                )
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)
             finally:
+                if _turn_ctx:
+                    agent.ephemeral_system_prompt = _base_ephemeral
                 # Stop AND join before anything below emits: an in-flight tick
                 # surviving past message.complete would roll the client's final
                 # usage back to a stale mid-turn snapshot. The join is
@@ -14970,6 +14980,21 @@ def _(rid, params: dict) -> dict:
                     )
                 parsed_flags = parse_model_switch_args(value)
                 explicit_provider = parsed_flags.explicit_provider
+                # A build already in flight (started, not ready, no error
+                # yet) must finish before we decide: if it fails, the
+                # failed-build recovery below has to replace it; switching
+                # against agent None while it runs would let it fail later
+                # with the stale overrides and no rebuild.
+                inflight_ready = session.get("agent_ready")
+                if (
+                    session.get("agent") is None
+                    and session.get("agent_error") is None
+                    and session.get("agent_build_started")
+                    and inflight_ready is not None
+                    and not inflight_ready.is_set()
+                ):
+                    if not inflight_ready.wait(timeout=30.0):
+                        return _err(rid, 5032, "agent initialization timed out")
                 failed_agent_init = (
                     session.get("agent") is None
                     and session.get("agent_error") is not None

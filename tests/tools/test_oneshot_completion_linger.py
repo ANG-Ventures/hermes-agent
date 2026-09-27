@@ -321,7 +321,7 @@ _E2E_PARENT = textwrap.dedent(
     # success. If the parent is gone, that write raises SIGPIPE/BrokenPipe
     # and the marker file never appears — the destroyed-reply symptom.
     session = reg.spawn_local(
-        "sleep 2; echo delivering; echo done > " + marker,
+        {child_wait!r} + "; echo delivering; echo done > " + marker,
         task_id="e2e",
     )
     session.notify_on_complete = True
@@ -334,11 +334,14 @@ _E2E_PARENT = textwrap.dedent(
 )
 
 
-def _run_e2e_parent(tmp_path, *, linger: bool) -> Path:
+def _run_e2e_parent(tmp_path, *, linger: bool, child_wait: str = "sleep 2") -> Path:
     marker = tmp_path / ("done_linger.txt" if linger else "done_nolinger.txt")
     script = tmp_path / f"parent_{linger}.py"
     script.write_text(
-        _E2E_PARENT.format(repo=str(REPO_ROOT), marker=str(marker), linger=linger),
+        _E2E_PARENT.format(
+            repo=str(REPO_ROOT), marker=str(marker), linger=linger,
+            child_wait=child_wait,
+        ),
         encoding="utf-8",
     )
     env = dict(os.environ)
@@ -376,10 +379,35 @@ def test_e2e_control_immediate_exit_loses_delivery_without_linger(tmp_path):
     """Control proving the bug class: the same parent WITHOUT the linger may
     lose the delivery. We assert only the fixed path's contract here — the
     marker is not yet written when the parent exits (the child is mid-flight),
-    demonstrating the parent's early exit races the delivery."""
-    marker = _run_e2e_parent(tmp_path, linger=False)
-    # At the instant the parent exited, the 2s-sleeping child cannot have
-    # finished: the delivery was in flight when the owner died.
+    demonstrating the parent's early exit races the delivery.
+
+    The child holds its delivery until the test opens a gate AFTER the parent
+    has exited, so "in flight when the owner died" holds by construction. A
+    fixed ``sleep 2`` raced the parent's post-spawn lifetime: once a loaded
+    runner stretched that past the child's window, the delivery landed first
+    (merge-group slice 10/16, run 36069213079)."""
+    gate = tmp_path / "gate"
+    pidfile = tmp_path / "child.pid"
+    marker = _run_e2e_parent(
+        tmp_path, linger=False,
+        child_wait=f"echo $$ > {pidfile}; while [ ! -e {gate} ]; do sleep 0.05; done",
+    )
     assert not marker.exists(), (
         "control invalid: delivery finished before the parent exited"
+    )
+    deadline = time.monotonic() + 30
+    while not pidfile.exists() or not pidfile.read_text().strip():
+        assert time.monotonic() < deadline, "child never started"
+        time.sleep(0.05)
+    child = int(pidfile.read_text())
+    gate.touch()  # release the delivery into the dead owner's pipe
+    while True:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        assert time.monotonic() < deadline, "child never finished its delivery"
+        time.sleep(0.05)
+    assert not marker.exists(), (
+        "delivery survived the owner's exit — the control no longer shows the bug"
     )

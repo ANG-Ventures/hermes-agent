@@ -6984,6 +6984,32 @@ class GatewaySlashCommandsMixin:
             else:
                 return t("gateway.title.current_no_title", session_id=session_id)
 
+    async def _handle_resume_handoff_command(self, event: MessageEvent) -> str:
+        """Handle /resume-handoff — replay a turn cut by a provider failure.
+
+        The handoff was written by ``agent.turn_handoff.capture_turn_handoff``
+        at the cut and is keyed by the same session key the gateway resolves
+        for every other session command. The command previews what was captured
+        without consuming it; the next user turn injects the handoff into the
+        model context exactly once.
+        """
+        from gateway.turn_handoff_command import (
+            NO_HANDOFF_REPLY,
+            render_resume_handoff_reply,
+        )
+        from types import SimpleNamespace
+
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(source)
+        if not session_key:
+            return NO_HANDOFF_REPLY
+        return await asyncio.to_thread(
+            render_resume_handoff_reply,
+            SimpleNamespace(_gateway_session_key=session_key),
+        )
+
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
         if not self._session_db:
@@ -7950,7 +7976,8 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.merge.fold_failed", error=exc)
 
         # --- Layer 2: durable .md record (self-purging). ---
-        record_path = self._write_merge_record(
+        record_path = await asyncio.to_thread(
+            self._write_merge_record,
             source_title, source_session_id, target_title, target_id,
             summary, source.platform.value if source.platform else "gateway",
         )
@@ -8688,6 +8715,12 @@ class GatewaySlashCommandsMixin:
             from agent.skill_commands import reload_skills
 
             result = await loop.run_in_executor(None, reload_skills)
+            try:
+                from gateway.run import _invalidate_skill_slug_index
+
+                _invalidate_skill_slug_index()
+            except Exception:
+                logger.debug("skill slug index invalidation failed", exc_info=True)
             added = result.get("added", [])      # [{"name", "description"}, ...]
             removed = result.get("removed", [])  # [{"name", "description"}, ...]
             total = result.get("total", 0)

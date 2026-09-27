@@ -686,6 +686,10 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+# GitHub App identity lanes (hermes-home spec plans/2026-09-25_github-app-identities D3): every
+# hermes process -- gateway, `hermes -p X` child, kanban worker -- is an AGENT whose GitHub lane comes
+# from its profile (gh shim profile_map). An inherited lane env var must never reach its children.
+os.environ.pop("HERMES_GH_LANE", None)
 
 # ---------------------------------------------------------------------------
 # Kanban worker authority — consume the dispatcher's single-use grant.
@@ -4033,8 +4037,10 @@ def select_provider_and_model(args=None):
         group_providers,
         provider_group_for_slug,
     )
+    from hermes_cli import provider_seam
 
-    provider_labels = dict(_PROVIDER_LABELS)  # derive from canonical list
+    g = provider_seam.snapshot()
+    provider_labels = dict(g._PROVIDER_LABELS)  # derive from canonical list
     if active and active in _custom_provider_map:
         active_label = _custom_provider_map[active]["name"]
     else:
@@ -4052,7 +4058,7 @@ def select_provider_and_model(args=None):
     # row ("Kimi / Moonshot ▸"); picking it opens a member sub-picker that
     # resolves back to a concrete slug, so the dispatch chain below is
     # unchanged. Custom providers and the trailing actions stay flat.
-    canonical_descs = {p.slug: p.tui_desc for p in CANONICAL_PROVIDERS}
+    canonical_descs = {p.slug: p.tui_desc for p in g.CANONICAL_PROVIDERS}
     # Honor ``model_catalog.excluded_providers`` so the CLI ``hermes model``
     # picker hides the same providers the gateway/TUI pickers do. A canonical
     # provider is hidden if its slug OR any of its aliases appears in the
@@ -4064,18 +4070,18 @@ def select_provider_and_model(args=None):
         if p
     }
     if _cli_excluded:
-        _alias_to_canon = _PROVIDER_ALIASES
+        _alias_to_canon = g._PROVIDER_ALIASES
         _names_for: dict[str, set[str]] = {}
-        for _p in CANONICAL_PROVIDERS:
+        for _p in g.CANONICAL_PROVIDERS:
             _names_for[_p.slug] = {_p.slug.lower()}
         for _alias, _canon in _alias_to_canon.items():
             _names_for.setdefault(_canon, {_canon.lower()}).add(_alias.lower())
         _visible_slugs = [
-            p.slug for p in CANONICAL_PROVIDERS
+            p.slug for p in g.CANONICAL_PROVIDERS
             if not _names_for.get(p.slug, {p.slug.lower()}) & _cli_excluded
         ]
     else:
-        _visible_slugs = [p.slug for p in CANONICAL_PROVIDERS]
+        _visible_slugs = [p.slug for p in g.CANONICAL_PROVIDERS]
 
     # Hide the numeric failover lanes (``claude-apx-7``, ``claude-bpx-15``, …)
     # exactly as ``list_picker_providers`` (CLI/Discord) and
@@ -7699,7 +7705,7 @@ def _desktop_macos_has_valid_real_signature(app: Path) -> bool:
         return False
     try:
         info = subprocess.run(
-            [codesign, "-dv", str(app)], check=False, capture_output=True, text=True
+            [codesign, "-dv", str(app)], check=False, capture_output=True, text=True, encoding="utf-8", errors="replace"
         )
         output = f"{info.stdout}\n{info.stderr}"
         if info.returncode != 0 or "TeamIdentifier=" not in output \
@@ -7885,7 +7891,7 @@ def _desktop_macos_relaunchable_fixup(
         # safeStorage can read the old key. Tracked as follow-up.
         result = subprocess.run(
             [codesign, "--force", "--deep", "--sign", "-", str(app)],
-            check=False, capture_output=True, text=True,
+            check=False, capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if result.returncode != 0:
             print(
@@ -7895,7 +7901,7 @@ def _desktop_macos_relaunchable_fixup(
             return False
         verify = subprocess.run(
             [codesign, "--verify", "--deep", "--strict", str(app)],
-            check=False, capture_output=True, text=True,
+            check=False, capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if verify.returncode != 0:
             print(
@@ -7923,7 +7929,7 @@ def _macos_codesigning_identity_valid(security: str, identity: str) -> bool:
     try:
         result = subprocess.run(
             [security, "find-identity", "-v", "-p", "codesigning"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         )
     except Exception:
         return False
@@ -8018,7 +8024,7 @@ def _desktop_macos_setup_tcc_identity(identity: str = "Hermes Local Signing") ->
                         "-P", "hermeslocal",
                         "-T", codesign, "-T", "/usr/bin/codesign_allocate",
                     ],
-                    capture_output=True, text=True, check=False,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
                 )
 
             _export_p12([])
@@ -8043,7 +8049,7 @@ def _desktop_macos_setup_tcc_identity(identity: str = "Hermes Local Signing") ->
             # front-load.
             trusted = subprocess.run(
                 [security, "add-trusted-cert", "-r", "trustRoot", "-p", "codeSign", "-k", keychain, str(crt)],
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
             )
             if trusted.returncode != 0:
                 print(
@@ -13162,6 +13168,22 @@ def _advertise_agent_env() -> None:
     os.environ.setdefault("HERMES_AGENT", "true")
 
 
+def _apply_process_env_files() -> None:
+    """Source ``agent.process_env_files`` into this process's env (fail-open).
+
+    Runs after the profile override and the agent marker, so the files see the
+    same env a terminal shell would. Every child the process later spawns
+    (in-process gh/git, kanban workers, execute_code) inherits the result.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.process_env_files import apply_process_env_files
+
+        apply_process_env_files(load_config_readonly())
+    except Exception:
+        pass
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -13171,6 +13193,7 @@ def main():
     # Let child processes (and tools like huggingface_hub) detect they run
     # under an AI agent harness.
     _advertise_agent_env()
+    _apply_process_env_files()
 
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:

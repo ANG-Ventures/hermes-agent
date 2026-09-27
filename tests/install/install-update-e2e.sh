@@ -112,6 +112,46 @@ collect_sandbox_logs() {
     cat "$dest/proxy.log" >&2
     echo "--- end proxy.log ---" >&2
   fi
+  # install.sh runs `npm install --silent`, so a failed install prints nothing
+  # of npm's own reason. npm always writes a debug log under the sandbox HOME;
+  # keep it and print its error lines.
+  local npm_logs="$SANDBOX_ROOT/home/.npm/_logs"
+  if [ -d "$npm_logs" ]; then
+    mkdir -p "$dest/npm-logs"
+    cp -a "$npm_logs/." "$dest/npm-logs/" 2>/dev/null || true
+    if grep -hE ' (error|verbose stack) ' "$npm_logs"/*.log >/dev/null 2>&1; then
+      echo "--- sandbox npm debug log errors ---" >&2
+      grep -hE ' (error|verbose stack) ' "$npm_logs"/*.log | head -n 60 >&2 || true
+      echo "--- end npm debug log errors ---" >&2
+    fi
+    # A native build failing under `npm --silent` leaves only node-gyp's exit
+    # code: node-gyp inherits the silent loglevel, so its gyp ERR! lines -- the
+    # actual reason -- are never written anywhere. Re-run it verbosely.
+    if grep -qhE 'error command sh -c .*node-gyp rebuild' "$npm_logs"/*.log 2>/dev/null; then
+      diagnose_node_gyp "$dest"
+    fi
+  fi
+}
+
+diagnose_node_gyp() {
+  local dest="$1"
+  # npm rolls the failed package back out of node_modules, so rebuild the
+  # same name@version in a scratch dir with the same node, npm and sandbox env.
+  local pkgid
+  pkgid="$(grep -hE ' verbose pkgid [^ ]+@[0-9]' "$SANDBOX_ROOT/home/.npm/_logs"/*.log \
+    | tail -n 1 | sed -E 's/.* verbose pkgid //')"
+  [ -n "$pkgid" ] || return 0
+  local name="${pkgid%@*}"
+  local node_home='/home/hermes/.hermes/node'
+  local gyp="$node_home/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js"
+  echo "--- node-gyp rebuild --loglevel=verbose for $pkgid ---" >&2
+  in_sandbox "set -e; d=\$(mktemp -d); cd \"\$d\"; npm init -y >/dev/null; \
+npm install --ignore-scripts --no-audit --no-fund '$pkgid'; cd 'node_modules/$name'; \
+timeout 600 '$node_home/bin/node' '$gyp' rebuild --loglevel=verbose" \
+    >"$dest/node-gyp-verbose.log" 2>&1 || true
+  grep -E 'gyp (ERR!|http|info ok|verb (download|install|get node dir))|UNCAUGHT|npm (ERR!|error)' \
+    "$dest/node-gyp-verbose.log" | head -n 80 >&2 || true
+  echo "--- end node-gyp (full log: node-gyp-verbose.log) ---" >&2
 }
 
 # ── preflight ──────────────────────────────────────────────────────────────

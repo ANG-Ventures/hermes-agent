@@ -8,8 +8,7 @@ import yaml
 _WORKFLOW = (
     Path(__file__).resolve().parents[2] / ".github" / "workflows" / "js-autofix.yml"
 )
-_TRUSTED_TOKEN = "${{ secrets.AUTOFIX_BOT_PAT }}"
-_JOB_TOKEN = "${{ github.token }}"
+_APP_TOKEN = "${{ steps.app-token.outputs.token }}"
 
 
 def _apply_steps() -> list[dict]:
@@ -21,21 +20,32 @@ def _named_step(steps: list[dict], name: str) -> dict:
     return next(step for step in steps if step.get("name") == name)
 
 
-def test_push_uses_trusted_identity_and_pr_operations_use_job_token():
-    """The PAT triggers checks; the job token has PR auto-merge permission."""
+def test_push_and_pr_operations_use_fleet_app_token():
+    """Push and PR calls use the ang-fleet-workers App token.
+
+    A personal PAT gets a 403 on ANG-Ventures repos (t_7d5d7258). The job token
+    may not create PRs here, and its pushes queue bot PR checks for approval.
+    """
     steps = _apply_steps()
 
-    guard = _named_step(steps, "Require trusted push token")
-    assert guard["env"]["AUTOFIX_TOKEN"] == _TRUSTED_TOKEN
+    mint = next(step for step in steps if step.get("id") == "app-token")
+    assert str(mint["uses"]).startswith("actions/create-github-app-token@")
+    assert mint["with"]["app-id"] == "${{ secrets.FLEET_WORKERS_APP_ID }}"
+    assert mint["with"]["private-key"] == "${{ secrets.FLEET_WORKERS_APP_PRIVATE_KEY }}"
+    assert steps.index(mint) == 0
 
     checkout = next(step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@"))
-    assert checkout["with"]["token"] == _TRUSTED_TOKEN
+    assert checkout["with"]["token"] == _APP_TOKEN
 
     for name in (
         "Create/update PR and enable auto-merge",
         "Wait for merge, auto-close on failure or stale",
     ):
-        assert _named_step(steps, name)["env"]["GH_TOKEN"] == _JOB_TOKEN
+        assert _named_step(steps, name)["env"]["GH_TOKEN"] == _APP_TOKEN
+
+    rendered = yaml.safe_dump(steps)
+    assert "AUTOFIX_BOT_PAT" not in rendered
+    assert "github.token" not in rendered
 
 
 def test_auto_merge_is_rearmed_for_the_current_bot_head():

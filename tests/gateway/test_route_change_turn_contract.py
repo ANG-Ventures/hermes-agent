@@ -59,6 +59,16 @@ def make_agent(monkeypatch):
     monkeypatch.setattr(
         "agent.conversation_loop.jittered_backoff", lambda *a, **kw: 0.0
     )
+    # Pool-capacity 503s wait via capacity_retry_wait, not jittered_backoff
+    # (~6s real sleep per 503). Keep its give-up decision (None), zero the wait.
+    import agent.conversation_loop as _loop
+
+    _capacity_wait = _loop.capacity_retry_wait
+    monkeypatch.setattr(
+        _loop,
+        "capacity_retry_wait",
+        lambda **kw: None if _capacity_wait(**kw) is None else 0.0,
+    )
     monkeypatch.setattr(
         "agent.model_metadata.get_model_context_length", lambda *a, **kw: 200000
     )
@@ -198,11 +208,28 @@ def test_pool_exhaustion_then_429_delivers_each_hop_before_final(
             },
         )
         agent._rate_limited_until = 0
+        # Phase 2 (fallback spec §4.2): the primary's pool-wide quota_model
+        # armed a sticky episode, so the next turn boundary stays put ...
+        await asyncio.to_thread(agent._restore_primary_runtime)
+        await asyncio.sleep(0)
+        assert len(adapter.messages) == 2
+        # ... until the §4.3 gate opens (until passed, fallback idle > 60 min).
+        from agent import fallback_sticky_store as fss
+        from agent import fallback_wiring as fw
+
+        key = fw.key_for(agent)
+        state = fss.get(key)
+        assert state is not None and state.active and state.cls == "quota_model"
+        now = time.time()
+        state.until_epoch = now - 1
+        state.last_fallback_call_epoch = now - 61 * 60
+        fss.default_store().put(key, state, now)
         await asyncio.to_thread(agent._restore_primary_runtime)
         await asyncio.sleep(0)
         assert len(adapter.messages) == 2 + int(announce_recovery)
         if announce_recovery:
             assert "Model recovery" in adapter.messages[-1][1]
+            assert "fallback idle 61m" in adapter.messages[-1][1]
 
     asyncio.run(scenario())
     assert attempts == ["primary/model"] * 3 + ["fallback/one", "fallback/two"]
@@ -429,7 +456,8 @@ def test_warm_cache_recovery_preserves_from_effort_and_announces_once(
         )
         await asyncio.sleep(0)
         assert len(adapter.messages) == 1
-        fallback = adapter.messages[0][1].split(": ", 1)[1]
+        # Strip the §4.8 cause rider (" — <cause> <hop> <sub>, <time>").
+        fallback = adapter.messages[0][1].split(" — ", 1)[0].split(": ", 1)[1]
         assert fallback.endswith("(high)")
         capsys.readouterr()
         adapter.messages.clear()
@@ -455,9 +483,8 @@ def test_warm_cache_recovery_preserves_from_effort_and_announces_once(
 
 
 @pytest.mark.parametrize("same_route", [False, True])
-@pytest.mark.parametrize("blocked_by", ["cooldown", "auto_recovery"])
 def test_warm_cache_blocked_recovery_keeps_fallback_effort(
-    monkeypatch, same_route, blocked_by
+    monkeypatch, same_route
 ):
     agent = prepare_warm_fallback(monkeypatch, same_route)
     adapter = RecordingAdapter()
@@ -473,10 +500,7 @@ def test_warm_cache_blocked_recovery_keeps_fallback_effort(
         await asyncio.sleep(0)
         old_model = agent.model
         adapter.messages.clear()
-        if blocked_by == "cooldown":
-            agent._rate_limited_until = time.monotonic() + 3600
-        else:
-            config["model"]["auto_recovery"] = False
+        agent._rate_limited_until = time.monotonic() + 3600
         for _ in range(2):
             result = await run_turn(owner, agent, adapter, config)
             assert agent.model == old_model
@@ -484,7 +508,6 @@ def test_warm_cache_blocked_recovery_keeps_fallback_effort(
             assert result["reasoning_config"]["effort"] == "high"
             assert adapter.messages == []
         agent._rate_limited_until = 0
-        config["model"]["auto_recovery"] = True
         result = await run_turn(owner, agent, adapter, config)
         assert result["reasoning_config"] == {"effort": "low"}
         assert len(adapter.messages) == 1

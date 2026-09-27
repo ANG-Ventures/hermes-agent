@@ -381,14 +381,20 @@ def capped_provider(
 def available_profile_fallback(
     task, probes: dict, cache: dict, *, min_eligible: int = 1,
     pool_urls: dict | None = None, skip_pools=frozenset(), box_health: bool = True,
-    budget_available=None,
+    budget_available=None, skip_providers=frozenset(), skipped: list | None = None,
 ) -> tuple[str, str] | None:
     """Pick a healthy configured profile rung without changing the task row.
 
     Each rung is judged on ITS OWN serving pool (``capped_provider``), and a
     rung whose ``pool_key`` is in ``skip_pools`` (an open rate-limit circuit)
-    is never chosen.
+    or whose provider is in ``skip_providers`` (credential cooldown) is never
+    chosen. When ``skipped`` is a list, every rejected rung is appended to it
+    as ``{"provider", "model", "reason"}`` so the caller can say why.
     """
+    def _skip(provider, model, reason):
+        if skipped is not None:
+            skipped.append({"provider": provider, "model": model, "reason": reason})
+
     from hermes_cli.config import load_config
     from hermes_cli.fallback_config import get_fallback_chain
     from hermes_cli.profiles import resolve_profile_env
@@ -410,8 +416,13 @@ def available_profile_fallback(
         if provider == effective_provider(task):
             continue
         if skip_pools and pool_key(provider) in skip_pools:
+            _skip(provider, model, "rate_limit_circuit")
+            continue
+        if skip_providers and provider.strip().lower() in skip_providers:
+            _skip(provider, model, "credential_cooldown")
             continue
         if budget_available is not None and not budget_available(provider):
+            _skip(provider, model, "pool_budget")
             continue
         candidate = SimpleNamespace(
             model_override=model, provider_override=provider, assignee=task.assignee,
@@ -421,4 +432,5 @@ def available_profile_fallback(
             box_health=box_health,
         ) is None:
             return model, provider
+        _skip(provider, model, "provider_capped")
     return None

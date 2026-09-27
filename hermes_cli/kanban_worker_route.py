@@ -10,7 +10,7 @@ ran on ``claude-bpr`` (t_7b7cb5aa run 9822, card t_4fe0700a).
 
 This module is the worker-side counterpart: one run-scoped
 ``worker_route_substituted`` event per substitution, and a predicate for
-"this worker's provider was pinned at spawn", which the CLI uses to refuse an
+"this worker's card pins its provider", which the CLI uses to refuse an
 auth-time substitution instead of running a pinned card on another lane.
 """
 from __future__ import annotations
@@ -37,14 +37,22 @@ def _is_owning_worker() -> bool:
 
 
 def pinned_worker_provider(explicit_provider: Optional[str]) -> Optional[str]:
-    """The provider this kanban worker was pinned to at spawn, else None.
+    """The provider this kanban worker is CARD-pinned to at spawn, else None.
 
-    The dispatcher only passes ``--provider`` when it resolved a route for the
-    card (card ``set-model``, lane override, or capped-pool fallback rung), so
-    an explicit ``--provider`` inside an owning worker is a pin, not a default.
+    The dispatcher passes ``--provider`` for a card ``set-model`` pin, a
+    board-wide lane override, AND a capped-pool fallback rung. Only the first
+    is a pin (t_16642ede): the other two are claim-only and never written to
+    the card, so treating any ``--provider`` as a pin stripped every
+    lane-overridden worker of its auth-time fallback chain. The explicit flag
+    is the value; :func:`card_pinned_provider` is the predicate. A run spawned
+    on a different provider than the card pins (a dispatch fallback rung) is
+    already off its pin and keeps the fallback chain, same as the runtime
+    check in :func:`refuse_runtime_failover`.
     """
     provider = (explicit_provider or "").strip().lower()
     if not provider or provider == "auto" or not _is_owning_worker():
+        return None
+    if card_pinned_provider() != provider:
         return None
     return provider
 

@@ -50,13 +50,6 @@ class _InlineToolGateAdapter:
         return out_name, out_args, block_message, block_result
 
     def pre_tool_block_from_builtin_gate(self, agent, function_name, tool_scope_block):
-        from agent.budget_grace_gate import grace_block_message, is_readonly_grace_tool
-
-        if getattr(agent, "_in_budget_grace", False) and not is_readonly_grace_tool(function_name):
-            return {
-                "message": grace_block_message(function_name),
-                "error_type": "budget_grace_block",
-            }
         if tool_scope_block is not None:
             return {
                 "message": tool_scope_block,

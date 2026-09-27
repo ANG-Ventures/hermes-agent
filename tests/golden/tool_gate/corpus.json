@@ -56,30 +56,16 @@
       "tool_name": "golden_lookup"
     },
     {
-      "name": "budget grace blocks side effect",
+      "name": "tool scope block surfaces",
       "kind": "pre_block",
-      "agent": {"_in_budget_grace": true},
-      "function_name": "terminal",
-      "tool_scope_block": null
-    },
-    {
-      "name": "budget grace allows readonly",
-      "kind": "pre_block",
-      "agent": {"_in_budget_grace": true},
-      "function_name": "read_file",
-      "tool_scope_block": null
-    },
-    {
-      "name": "tool scope outranks plugin path after grace",
-      "kind": "pre_block",
-      "agent": {"_in_budget_grace": false},
+      "agent": {},
       "function_name": "golden_lookup",
       "tool_scope_block": "'golden_lookup' is not available in this session. Use tool_search to find tools you can call."
     },
     {
       "name": "no pre block",
       "kind": "pre_block",
-      "agent": {"_in_budget_grace": false},
+      "agent": {},
       "function_name": "read_file",
       "tool_scope_block": null
     },

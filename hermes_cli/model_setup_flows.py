@@ -27,6 +27,7 @@ import subprocess
 import urllib.parse
 
 from hermes_cli.config import clear_model_endpoint_credentials
+from hermes_cli import provider_seam
 from hermes_cli.providers import custom_provider_slug
 
 
@@ -852,6 +853,7 @@ def _model_flow_minimax_oauth(config, current_model="", args=None):
         PROVIDER_REGISTRY,
     )
 
+    g = provider_seam.snapshot()
     state = get_provider_auth_state("minimax-oauth")
     if not state or not state.get("access_token"):
         print("Not logged into MiniMax. Starting OAuth login...")
@@ -862,7 +864,7 @@ def _model_flow_minimax_oauth(config, current_model="", args=None):
                 no_browser=bool(getattr(args, "no_browser", False)),
                 timeout=getattr(args, "timeout", None) or 15.0,
             )
-            _login_minimax_oauth(mock_args, PROVIDER_REGISTRY["minimax-oauth"])
+            _login_minimax_oauth(mock_args, g.PROVIDER_REGISTRY["minimax-oauth"])
         except SystemExit:
             print("Login cancelled or failed.")
             return
@@ -878,7 +880,7 @@ def _model_flow_minimax_oauth(config, current_model="", args=None):
 
     from hermes_cli.models import _PROVIDER_MODELS
 
-    model_ids = _PROVIDER_MODELS.get("minimax-oauth", [])
+    model_ids = g.get("_PROVIDER_MODELS", _PROVIDER_MODELS).get("minimax-oauth", [])
     selected = _prompt_model_selection(
         model_ids,
         current_model,
@@ -1817,8 +1819,9 @@ def _model_flow_copilot(config, current_model=""):
         normalize_copilot_model_id,
     )
 
+    g = provider_seam.snapshot()
     provider_id = "copilot"
-    pconfig = PROVIDER_REGISTRY[provider_id]
+    pconfig = g.PROVIDER_REGISTRY[provider_id]
 
     creds = resolve_api_key_provider_credentials(provider_id)
     api_key = creds.get("api_key", "")
@@ -1923,7 +1926,7 @@ def _model_flow_copilot(config, current_model=""):
         model_list = [model_id for model_id in live_models if model_id]
         print(f"  Found {len(model_list)} model(s) from GitHub Copilot")
     else:
-        model_list = _PROVIDER_MODELS.get(provider_id, [])
+        model_list = g._PROVIDER_MODELS.get(provider_id, [])
         if model_list:
             print(
                 "  ⚠ Could not auto-detect models from GitHub Copilot — showing defaults."
@@ -2016,8 +2019,9 @@ def _model_flow_copilot_acp(config, current_model=""):
 
     del config
 
+    g = provider_seam.snapshot()
     provider_id = "copilot-acp"
-    pconfig = PROVIDER_REGISTRY[provider_id]
+    pconfig = g.PROVIDER_REGISTRY[provider_id]
 
     status = get_external_process_provider_status(provider_id)
     resolved_command = (
@@ -2064,7 +2068,7 @@ def _model_flow_copilot_acp(config, current_model=""):
         model_list = [item.get("id", "") for item in catalog if item.get("id")]
         print(f"  Found {len(model_list)} model(s) from GitHub Copilot")
     else:
-        model_list = _PROVIDER_MODELS.get("copilot", [])
+        model_list = g._PROVIDER_MODELS.get("copilot", [])
         if model_list:
             print(
                 "  ⚠ Could not auto-detect models from GitHub Copilot — showing defaults."
@@ -2137,8 +2141,9 @@ def _model_flow_kimi(config, current_model=""):
     )
     from hermes_cli.models import _PROVIDER_MODELS
 
+    g = provider_seam.snapshot()
     provider_id = "kimi-coding"
-    pconfig = PROVIDER_REGISTRY[provider_id]
+    pconfig = g.PROVIDER_REGISTRY[provider_id]
     base_url_env = pconfig.base_url_env_var or ""
 
     # Step 1: Check / prompt for API key
@@ -2167,7 +2172,7 @@ def _model_flow_kimi(config, current_model=""):
     print()
 
     # Step 3: Model selection — show appropriate models for the endpoint
-    model_list = _PROVIDER_MODELS.get("kimi-coding" if is_coding_plan else "moonshot", [])
+    model_list = g._PROVIDER_MODELS.get("kimi-coding" if is_coding_plan else "moonshot", [])
 
     if model_list:
         selected = _prompt_model_selection(
@@ -2221,8 +2226,9 @@ def _model_flow_stepfun(config, current_model=""):
     )
     from hermes_cli.models import _PROVIDER_MODELS, fetch_api_models
 
+    g = provider_seam.snapshot()
     provider_id = "stepfun"
-    pconfig = PROVIDER_REGISTRY[provider_id]
+    pconfig = g.PROVIDER_REGISTRY[provider_id]
     base_url_env = pconfig.base_url_env_var or ""
 
     existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
@@ -2275,7 +2281,7 @@ def _model_flow_stepfun(config, current_model=""):
         model_list = live_models
         print(f"  Found {len(model_list)} model(s) from {pconfig.name} API")
     else:
-        model_list = _PROVIDER_MODELS.get(provider_id, [])
+        model_list = g._PROVIDER_MODELS.get(provider_id, [])
         if model_list:
             print(
                 f"  Could not auto-detect models from {pconfig.name} API — "
@@ -2822,7 +2828,8 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         normalize_opencode_model_id,
     )
 
-    pconfig = PROVIDER_REGISTRY[provider_id]
+    g = provider_seam.snapshot()
+    pconfig = g.PROVIDER_REGISTRY[provider_id]
     key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
     base_url_env = pconfig.base_url_env_var or ""
 
@@ -2984,7 +2991,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         from hermes_cli.models import fetch_api_models
 
         api_key_for_probe = existing_key or (get_env_value(key_env) if key_env else "")
-        curated = _PROVIDER_MODELS.get(provider_id, [])
+        curated = g._PROVIDER_MODELS.get(provider_id, [])
         live_models = fetch_api_models(api_key_for_probe, effective_base)
         if live_models:
             model_list = live_models
@@ -3016,13 +3023,13 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         # live probes (models.dev's cost.input==0 filter lags reality —
         # e.g. deepseek-v4-flash-free stayed "free" there after its promo
         # ended and the relay started 401ing it keyless).
-        model_list = _PROVIDER_MODELS.get(provider_id, [])
+        model_list = g._PROVIDER_MODELS.get(provider_id, [])
         if model_list:
             print(
                 f'  Showing {len(model_list)} keyless free models — use "Enter custom model name" for others.'
             )
     else:
-        curated = _PROVIDER_MODELS.get(provider_id, [])
+        curated = g._PROVIDER_MODELS.get(provider_id, [])
 
         # Try models.dev first — returns tool-capable models, filtered for noise
         mdev_models: list = []
@@ -3145,6 +3152,8 @@ def _model_flow_anthropic(config, current_model=""):
     )
     from hermes_cli.models import _PROVIDER_MODELS
 
+    g = provider_seam.snapshot()
+
     # Check ALL credential sources
     from hermes_cli.auth import get_anthropic_key
 
@@ -3184,7 +3193,7 @@ def _model_flow_anthropic(config, current_model=""):
             # BSM key looks identical to a key in .env and users assume
             # nothing is wired up.
             source_suffix = ""
-            for var in PROVIDER_REGISTRY["anthropic"].api_key_env_vars:
+            for var in g.PROVIDER_REGISTRY["anthropic"].api_key_env_vars:
                 if os.getenv(var, "").strip() == existing_key:
                     source_suffix = format_secret_source_suffix(var)
                     if source_suffix:
@@ -3245,7 +3254,7 @@ def _model_flow_anthropic(config, current_model=""):
     print()
 
     # Model selection
-    model_list = _PROVIDER_MODELS.get("anthropic", [])
+    model_list = g._PROVIDER_MODELS.get("anthropic", [])
     if model_list:
         selected = _prompt_model_selection(
             model_list,

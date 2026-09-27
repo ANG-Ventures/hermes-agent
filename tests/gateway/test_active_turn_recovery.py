@@ -130,14 +130,20 @@ def test_mark_and_clear_use_single_entry_persistence(tmp_path):
     store = _make_store(tmp_path)
     entry = store.get_or_create_session(_make_source())
     real_save_entry = store._save_entry
-    store._save_entry = MagicMock(wraps=real_save_entry)
+    held_during_save = []
+
+    def _tracking_save_entry(*args, **kwargs):
+        # t_cc8533d1: the durable write must run with the store lock released.
+        held_during_save.append(store._lock.held_by_current_thread())
+        return real_save_entry(*args, **kwargs)
+
+    store._save_entry = MagicMock(side_effect=_tracking_save_entry)
 
     token = store.mark_turn_active(entry.session_key)
     assert token is not None
     store._save_entry.assert_called_once_with(
         entry.session_key,
         entry_data=store._entries[entry.session_key].to_dict(),
-        lock_held=True,
     )
 
     store._save_entry.reset_mock()
@@ -145,8 +151,8 @@ def test_mark_and_clear_use_single_entry_persistence(tmp_path):
     store._save_entry.assert_called_once_with(
         entry.session_key,
         entry_data=store._entries[entry.session_key].to_dict(),
-        lock_held=True,
     )
+    assert held_during_save == [False, False]
 
 
 def test_failed_mark_persistence_does_not_leak_marker_into_later_save(tmp_path):

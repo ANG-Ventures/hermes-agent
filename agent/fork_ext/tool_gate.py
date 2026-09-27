@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agent.budget_grace_gate import grace_block_message, is_readonly_grace_tool
-
 
 def tool_search_scoped_names(agent) -> frozenset:
     try:
@@ -80,11 +78,6 @@ def resolve_tool_search_unwrap(agent, function_name: str, function_args: dict[st
 
 
 def pre_tool_block_from_builtin_gate(agent, function_name: str, tool_scope_block: str | None) -> dict[str, str] | None:
-    if getattr(agent, "_in_budget_grace", False) and not is_readonly_grace_tool(function_name):
-        return {
-            "message": grace_block_message(function_name),
-            "error_type": "budget_grace_block",
-        }
     if tool_scope_block is not None:
         return {
             "message": tool_scope_block,

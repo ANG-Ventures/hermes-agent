@@ -134,6 +134,9 @@ describe('parseMarkdownIntoBlocksCached', () => {
   // the pre-fix boundary at seed 11 / step 257, so the workload can't shrink
   // without gutting the guard. The work is bounded but exceeds one test's 5s
   // default budget, so raise the timeout rather than weaken the coverage.
+  // The timeout is a hang-guard, not a speed assertion: the workload is fixed,
+  // and CI measured 13.6-25.8 s for it (2026-09-25), then 30.0 s on a loaded
+  // runner -> red main at 05bfb486. 120 s keeps the guard with real headroom.
   it('matches a full lex at every char-level streaming cut over noisy markdown (property fuzz)', () => {
     // Character-level append fuzz over the markdown control alphabet — the
     // harness that surfaced the setext-underline merge above. Growing a single
@@ -160,5 +163,5 @@ describe('parseMarkdownIntoBlocksCached', () => {
         expect(parseMarkdownIntoBlocksCached(text)).toEqual(parseMarkdownIntoBlocks(text))
       }
     }
-  }, 30_000)
+  }, 120_000)
 })

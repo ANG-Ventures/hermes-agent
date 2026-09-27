@@ -12,7 +12,7 @@ restart-interrupted session, whose next turn re-runs the offending
 logic — SIGTERM every ~10 seconds until manually broken.
 
 This module is the last-resort circuit breaker: it records a timestamp
-once per gateway process that sees restart-interrupted sessions pending,
+each time the gateway boots with restart-interrupted sessions pending,
 keeps the current chain of such boots persisted across processes (each
 boot is a fresh process, so in-memory state is useless), and reports the
 loop as "tripped" once too many of them chain together.  Boots chain
@@ -35,9 +35,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 from hermes_constants import get_hermes_home
 
@@ -65,60 +64,28 @@ DEFAULT_MAX_GAP_SECONDS = 300
 # verdict; the rest are kept for forensics.
 _MAX_STORED_BOOTS = 50
 
-_process_boot_pid = os.getpid()
-_process_boot_id = f"{_process_boot_pid}:{time.time_ns()}"
-
 
 def _state_path():
     return get_hermes_home() / "gateway" / "restart_loop.json"
 
 
-def _load_state() -> Tuple[List[float], List[Optional[str]]]:
+def _load_boots() -> List[float]:
     try:
         raw = _state_path().read_text(encoding="utf-8")
         data = json.loads(raw)
-        raw_boots = data.get("boots", [])
-        raw_boot_ids = data.get("boot_ids", [])
-        boots: List[float] = []
-        boot_ids: List[Optional[str]] = []
-        for index, timestamp in enumerate(raw_boots):
-            if not isinstance(timestamp, (int, float)):
-                continue
-            boots.append(float(timestamp))
-            boot_id = raw_boot_ids[index] if index < len(raw_boot_ids) else None
-            boot_ids.append(boot_id if isinstance(boot_id, str) else None)
-        return boots, boot_ids
+        boots = data.get("boots", [])
+        return [float(t) for t in boots if isinstance(t, (int, float))]
     except (OSError, ValueError, TypeError):
-        return [], []
+        return []
 
 
-def _load_boots() -> List[float]:
-    return _load_state()[0]
-
-
-def _save_boots(
-    boots: List[float], boot_ids: Optional[List[Optional[str]]] = None
-) -> None:
+def _save_boots(boots: List[float]) -> None:
     try:
         path = _state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        state: Dict[str, object] = {"boots": boots}
-        if boot_ids is not None:
-            state["boot_ids"] = boot_ids
-        path.write_text(json.dumps(state), encoding="utf-8")
+        path.write_text(json.dumps({"boots": boots}), encoding="utf-8")
     except OSError:
         pass
-
-
-def _current_process_boot_id() -> str:
-    """Stable identity for this gateway process, refreshed after a fork."""
-    global _process_boot_id, _process_boot_pid
-
-    pid = os.getpid()
-    if pid != _process_boot_pid:
-        _process_boot_pid = pid
-        _process_boot_id = f"{pid}:{time.time_ns()}"
-    return _process_boot_id
 
 
 def _chain_gap(window_seconds: int, max_gap_seconds: int) -> float:
@@ -160,39 +127,19 @@ def record_restart_interrupted_boot(
     *,
     now: Optional[float] = None,
     max_gap_seconds: int = DEFAULT_MAX_GAP_SECONDS,
-    boot_id: Optional[str] = None,
 ) -> List[float]:
     """Record that the gateway just booted with restart-interrupted sessions.
 
     Drops boots that belong to an earlier, already-broken chain (any gap wider
-    than ``max_gap_seconds``) and appends the current time. Repeated resume
-    scans from the same process identity return the existing chain without
-    appending. Returns the pruned+appended list (most recent last). Best-effort
-    — a persistence failure returns the in-memory list without raising.
+    than ``max_gap_seconds``) and appends the current time.  Returns the
+    pruned+appended list (most recent last).  Best-effort — a persistence
+    failure returns the in-memory list without raising.
     """
     ts = time.time() if now is None else now
-    identity = _current_process_boot_id() if boot_id is None else boot_id
     gap = _chain_gap(window_seconds, max_gap_seconds)
-    stored_boots, stored_ids = _load_state()
-    if identity in stored_ids:
-        return _chain_ending_at(stored_boots, ts, gap)
-
-    chain_pairs: List[Tuple[float, Optional[str]]] = []
-    previous = ts
-    for timestamp, stored_id in sorted(
-        zip(stored_boots, stored_ids), key=lambda pair: pair[0], reverse=True
-    ):
-        if timestamp <= ts and previous - timestamp > gap:
-            break
-        chain_pairs.append((timestamp, stored_id))
-        if timestamp <= ts:
-            previous = timestamp
-    chain_pairs.reverse()
-    boots = [timestamp for timestamp, _stored_id in chain_pairs]
-    boot_ids = [stored_id for _timestamp, stored_id in chain_pairs]
+    boots = _chain_ending_at(_load_boots(), ts, gap)
     boots.append(ts)
-    boot_ids.append(identity)
-    _save_boots(boots[-_MAX_STORED_BOOTS:], boot_ids[-_MAX_STORED_BOOTS:])
+    _save_boots(boots[-_MAX_STORED_BOOTS:])
     return boots
 
 
@@ -238,21 +185,17 @@ def check_and_record(
     *,
     now: Optional[float] = None,
     max_gap_seconds: int = DEFAULT_MAX_GAP_SECONDS,
-    boot_id: Optional[str] = None,
 ) -> bool:
     """Record this restart-interrupted boot and report whether the loop is now
     tripped.
 
-    This is the single entry point the gateway calls: it records the current
-    process at most once, then checks whether the chain has reached the
+    This is the single entry point the gateway calls: it appends the current
+    boot, then checks whether the (now-updated) chain has reached the
     threshold.  Returns True when auto-resume should be SKIPPED to break the
     loop.
     """
     boots = record_restart_interrupted_boot(
-        window_seconds,
-        now=now,
-        max_gap_seconds=max_gap_seconds,
-        boot_id=boot_id,
+        window_seconds, now=now, max_gap_seconds=max_gap_seconds
     )
     tripped = len(boots) >= max_restarts if max_restarts > 0 else False
     if tripped:
