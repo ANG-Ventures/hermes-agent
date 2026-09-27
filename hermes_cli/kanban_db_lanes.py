@@ -76,16 +76,21 @@ def set_lane_model_override(
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
     now: Optional[int] = None,
+    pin_reason: Optional[str] = None,
 ) -> LaneModelOverride:
     """Install (or replace) the override for ``assignee`` (None = board-wide).
 
     Re-setting the same lane is an upsert, so extending a window never stacks
-    duplicate rows.
+    duplicate rows. A provider listed in ``kanban.pin_reason_required_providers``
+    also needs ``pin_reason``: a lane route moves many cards onto it at once.
     """
+    from hermes_cli.kanban_pin_policy import check_route_pin
+
     provider = (provider or "").strip()
     model = (model or "").strip()
     if not provider or not model:
         raise ValueError("a lane-model override needs both a provider and a model")
+    check_route_pin(provider, pin_reason)
     created = int(time.time()) if now is None else int(now)
     if int(expires_at) <= created:
         raise ValueError("a lane-model override must expire in the future")

@@ -377,6 +377,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
             max_retries=max_retries, model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            pin_reason=getattr(args, "pin_reason", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
@@ -732,6 +733,8 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
             writes = _set_model_writes(conn, ids, where, all_active, model, provider)
             if not writes:
                 return _err("kanban: selector matched no active tasks")
+            for write in writes:
+                write.pin_reason = getattr(args, "pin_reason", None)
             # One transaction for the whole batch (see apply_batch_route_writes).
             written = kb.apply_batch_route_writes(conn, writes, skipped=skipped)
             if reclaim and written:
@@ -830,7 +833,7 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
         row = kbl.set_lane_model_override(
             conn, provider=provider, model=model, expires_at=now + ttl_seconds,
             reasoning_effort=effort, reason=reason, assignee=assignee,
-            created_by=_profile_author(), now=now,
+            created_by=_profile_author(), now=now, pin_reason=getattr(args, "pin_reason", None),
         )
     print(f"lane-model set: route={row.route} lane={_lane_label(row.assignee)} "
           f"ttl={_format_ttl(ttl_seconds)} applies=next-dispatch")

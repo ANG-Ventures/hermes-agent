@@ -28,6 +28,8 @@ from typing import Any, Iterable, Optional, Sequence
 
 from toolsets import get_toolset_names
 
+from hermes_cli.kanban_pin_policy import check_route_pin, required_provider_globs
+
 _log = logging.getLogger(__name__)
 
 
@@ -1279,6 +1281,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    pin_reason: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1288,6 +1291,8 @@ def create_task(
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
+    ``pin_reason``: required when the provider matches
+    ``kanban.pin_reason_required_providers`` (see ``kanban_pin_policy``).
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
@@ -1300,6 +1305,7 @@ def create_task(
 
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
+    pin_reason = check_route_pin(provider_override, pin_reason)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -1411,6 +1417,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        **({"pin_reason": pin_reason} if pin_reason else {}),
                     },
                 )
                 if task_status == "blocked":
@@ -1597,17 +1604,28 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 
 def set_model_override(
     conn: sqlite3.Connection, task_id: str, model: Optional[str], provider: Optional[str] = None,
+    *, pin_reason: Optional[str] = None,
 ) -> bool:
     """Set (empty ``model`` clears BOTH) the per-task model/provider override.
     Allowed while ``running``: it applies on the NEXT dispatch, which is the
-    rate-limit-recovery flow (set, then reclaim/retry)."""
+    rate-limit-recovery flow (set, then reclaim/retry). ``pin_reason`` is
+    required for providers listed in ``kanban.pin_reason_required_providers``."""
     model, provider = _validate_model_override(model, provider)
+    pin_reason = check_route_pin(provider, pin_reason)
     return _set_task_override(
         conn, task_id,
         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
-        "model_override_set", {"model": model, "provider": provider},
+        "model_override_set", _route_event_payload(model, provider, pin_reason),
         ("model_override", "provider_override"), archived_msg="cannot set model override",
     )
+
+
+def _route_event_payload(model: Optional[str], provider: Optional[str], pin_reason: Optional[str]) -> dict:
+    """``model_override_set`` payload; ``pin_reason`` only when one was given."""
+    payload = {"model": model, "provider": provider}
+    if pin_reason:
+        payload["pin_reason"] = pin_reason
+    return payload
 
 
 def _set_task_override(
@@ -1676,6 +1694,7 @@ class BatchRouteWrite:
     require_statuses: Optional[frozenset] = None
     require_assignees: Optional[frozenset] = None
     skip_if_unmatched: bool = False
+    pin_reason: Optional[str] = None
 
 
 def _batch_write_mismatch(conn: sqlite3.Connection, write: BatchRouteWrite) -> Optional[str]:
@@ -1716,10 +1735,12 @@ def apply_batch_route_writes(
     Task-updated observers fire only after the whole batch commits.
     """
     prepared = [(w, *_validate_model_override(w.model, w.provider)) for w in writes]
+    globs = required_provider_globs()
+    reasons = [check_route_pin(provider, w.pin_reason, globs=globs) for w, _model, provider in prepared]
     written: list[str] = []
     skipped_now: dict[str, str] = {}
     with write_txn(conn):
-        for write, model, provider in prepared:
+        for (write, model, provider), pin_reason in zip(prepared, reasons):
             mismatch = _batch_write_mismatch(conn, write)
             if mismatch is not None:
                 if not write.skip_if_unmatched:
@@ -1729,7 +1750,7 @@ def apply_batch_route_writes(
             if not _set_task_override_locked(
                 conn, write.task_id,
                 "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
-                (model, provider), "model_override_set", {"model": model, "provider": provider},
+                (model, provider), "model_override_set", _route_event_payload(model, provider, pin_reason),
                 archived_msg="cannot set model override",
             ):
                 raise RuntimeError(f"no such task: {write.task_id}; no cards were changed")

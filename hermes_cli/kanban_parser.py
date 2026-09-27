@@ -203,6 +203,10 @@ _SPECS = [
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
+        _arg("--pin-reason", metavar="REASON",
+             help="Stated reason for pinning to a provider listed in "
+                  "kanban.pin_reason_required_providers (config.yaml). Required for those "
+                  "providers, recorded on the card event; ignored by the policy otherwise."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
@@ -270,6 +274,10 @@ _SPECS = [
              help="After the routes commit, release the claim on selected RUNNING cards so "
                   "the next dispatch respawns them on the new route. Without it a live "
                   "worker keeps its old model until it exits."),
+        _arg("--pin-reason", metavar="REASON",
+             help="Stated reason for pinning to a provider listed in "
+                  "kanban.pin_reason_required_providers (config.yaml). Required for those "
+                  "providers, recorded on the card event; ignored by the policy otherwise."),
     ], help="Set or clear the model/provider override on one or many tasks "
             "(takes effect on the next dispatch)"),
     _cmd("lane-model", children=("lane_action", [
@@ -284,6 +292,10 @@ _SPECS = [
             _arg("--assignee", help="Restrict the override to one profile. Omit for board-wide."),
             _arg("--effort", dest="reasoning_effort",
                  help="Reasoning effort for lane spawns (a card's own effort still wins)."),
+            _arg("--pin-reason", metavar="REASON",
+                 help="Stated reason for pinning to a provider listed in "
+                  "kanban.pin_reason_required_providers (config.yaml). Required for those "
+                  "providers, recorded on the card event; ignored by the policy otherwise."),
         ], help="Install a lane override that expires on its TTL"),
         _cmd("show", [_json_flag()], help="Show active lane overrides and their remaining TTL"),
         _cmd("clear", [
