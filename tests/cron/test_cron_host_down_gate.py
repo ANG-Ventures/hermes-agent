@@ -153,6 +153,26 @@ def test_owner_deadman_itself_is_exempt(fleet):
     assert chat == ALERTS
 
 
+def test_owner_exemption_is_scoped_to_the_host_it_owns(fleet):
+    """ace-ai's deadman reporting on a DOWN nas must not bypass nas's gate (#1026 C4)."""
+    _arm(fleet)
+    nas_latch = _arm(fleet, "nas")
+    job = _qbt_job(name="ace-ai-host-deadman", script="ace-ai-host-deadman.py")
+    chat, msg = _deliver(job, "rsync to fleet nas 192.168.1.159 failed")
+    assert chat == LOGS
+    assert "[host-down: nas since" in msg and "deferred to nas-host-deadman" in msg
+    assert (nas_latch.parent / "suppressed.jsonl").exists()
+
+
+def test_owner_note_about_its_own_host_still_pages_with_another_host_down(fleet):
+    _arm(fleet)
+    _arm(fleet, "nas")
+    job = _qbt_job(name="ace-ai-host-deadman", script="ace-ai-host-deadman.py")
+    for content in ("ACE-AI is DOWN", "ACE-AI is DOWN; fleet nas also unreachable", "ssh exited rc=255"):
+        chat, msg = _deliver(job, content)
+        assert chat == ALERTS and "[host-down" not in msg, content
+
+
 def test_non_alerts_target_untouched(fleet):
     _arm(fleet)
     job = _qbt_job(deliver="discord:999")
