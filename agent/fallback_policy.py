@@ -497,6 +497,19 @@ class Eligibility:
     warm_age_s: Optional[float] = None
     warm_window_s: Optional[float] = None
     warm_refusal: Optional[str] = None
+    # Free child slots on the bound / warm seat's box (claude-pool BoxCapacity,
+    # t_90d3bd12). None = unknown, stale or an older relay: today's behaviour.
+    bound_box_free: Optional[int] = None
+    warm_box_free: Optional[int] = None
+
+
+def _opt_int(v: Any) -> Optional[int]:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _opt_float(v: Any) -> Optional[float]:
@@ -529,6 +542,8 @@ def parse_eligibility(obj: Any) -> Optional[Eligibility]:
         warm_age_s=_opt_float(obj.get("warm_age_s")),
         warm_window_s=_opt_float(obj.get("warm_window_s")),
         warm_refusal=obj.get("warm_refusal"),
+        bound_box_free=_opt_int(obj.get("bound_box_free")),
+        warm_box_free=_opt_int(obj.get("warm_box_free")),
     )
 
 
@@ -613,6 +628,10 @@ def _warm_seat(state: StickyState, now: float, *, primary_provider: str,
     # expiry (bound_expiry="none", claude-pool since t_4bbac8a8): a binding
     # that still reports bound_seat == last_primary_seat is live.
     ttl_ok = exp is None or exp >= BOUND_EXPIRES_MIN_S
+    if elig.bound_box_free == 0:
+        # Ace 09-27 04:38: return to the warm seat "unless that box is too
+        # full and contended". Stay sticky; the next boundary re-checks.
+        return False, BOX_FULL_REASON, exp
     if seat_ok and elig.bound_eligible and ttl_ok:
         return True, f"warm_seat: bound seat {seat} eligible", exp
     why = []
@@ -623,6 +642,22 @@ def _warm_seat(state: StickyState, now: float, *, primary_provider: str,
     if not ttl_ok:
         why.append(f"bound_expires_in_s {exp} < 60")
     return False, "warm_seat: " + "; ".join(why), exp
+
+
+BOX_FULL_REASON = "warm_seat: bound box full"
+
+
+def _box_full(elig: Optional[Eligibility], verdict: Optional[str]) -> bool:
+    """A warm return would land on a box with no free child slot: the bound
+    box, or (``return_now``: the relay's warm pick routes there) the warm
+    seat's box. Unknown (None) never refuses."""
+    if elig is None:
+        return False
+    return elig.bound_box_free == 0 or (verdict == "return_now" and elig.warm_box_free == 0)
+
+
+def _box_fields(elig: Eligibility) -> Dict[str, Any]:
+    return {"bound_box_free": elig.bound_box_free, "warm_box_free": elig.warm_box_free}
 
 
 def warm_refusal_arm(session_key: Optional[str], pct: Any = WARM_REFUSAL_AB_PCT_DEFAULT) -> bool:
@@ -641,7 +676,7 @@ def _warm_snapshot(elig: Eligibility, arm: bool, verdict: Optional[str]) -> Dict
     return {"warm_rank_effective": elig.warm_rank_effective, "warm_refusal": elig.warm_refusal,
             "warm_seat": elig.warm_seat, "warm_age_s": elig.warm_age_s,
             "warm_window_s": elig.warm_window_s, "warm_eligible": elig.warm_eligible,
-            "warm_refusal_arm": arm, "warm_gate": verdict}
+            "warm_refusal_arm": arm, "warm_gate": verdict, **_box_fields(elig)}
 
 
 def warm_gate(elig: Optional[Eligibility], *, refusal_arm: bool) -> Optional[str]:
@@ -696,6 +731,7 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
     exp: Optional[float] = None
     verdict: Optional[str] = None
     warm: Optional[Dict[str, Any]] = None
+    box_full = False
     if probe:
         provider = primary_provider or state.primary_provider
         if eligibility is not None:
@@ -712,12 +748,18 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
             verdict = warm_gate(elig, refusal_arm=refusal_arm)
             if elig is not None and elig.warm_rank_effective in ("shadow", "enforce"):
                 warm = _warm_snapshot(elig, refusal_arm, verdict)
-            if verdict == "return_now":
+            if _box_full(elig, verdict):
+                box_full = True
+                warm = {**(warm or {}), **_box_fields(elig)}
+            if verdict == "return_now" and not box_full:
                 return Decision(True, "warm_seat",
                                 f"warm_seat: warm eligible seat {elig.warm_seat} "
                                 f"(warm_rank=enforce, age {elig.warm_age_s}s < {elig.warm_window_s}s)",
                                 elig.bound_expires_in_s, warm)
-        if verdict != "refuse":
+        if box_full:
+            reasons.append(BOX_FULL_REASON)
+            exp = elig.bound_expires_in_s
+        elif verdict != "refuse":
             ok, why, exp = _warm_seat(state, now, primary_provider=provider,
                                       eligibility=eligibility, direct_pin_benched=direct_pin_benched)
             if ok:
@@ -738,6 +780,8 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
     reasons.append("compaction: no session_id rotation")
     if verdict == "refuse":
         return Decision(False, None, "no_warm_primary_seat", exp, warm)
+    if box_full:
+        return Decision(False, None, BOX_FULL_REASON, exp, warm)
     return Decision(False, None, " | ".join(reasons), exp, warm)
 
 
