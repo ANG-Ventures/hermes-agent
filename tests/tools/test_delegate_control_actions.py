@@ -661,7 +661,7 @@ def test_parent_owned_process_notification_unchanged():
     assert text is not None
     assert "Started by subagent" not in text
     assert text.startswith("[IMPORTANT: Background process proc_parentowned")
-    assert "Command: make build\nOutput:\nok]" in text
+    assert "Command: make build\nOutput:\nok\n" in text and text.endswith("]")
 
 
 # ---------------------------------------------------------------------------
