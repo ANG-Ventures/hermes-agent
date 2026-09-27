@@ -278,3 +278,60 @@ def test_read_only_mask_refuses_non_allowlisted_calls(tmp_path, call):
     body = "import json, subprocess\ncmd = ['sqlite3']\n" + call + "\n" + _MUTATION_LOOP.format(log=log)
     heredoc, _ = _forms(tmp_path, body)
     assert guard("echo ok; " + heredoc, cwd=str(tmp_path))
+
+
+
+# Backfill C1 (#1017 review, t_95f9dfe2): a module-reachable callable must not pass
+# as a VALUE. The loop masks the log literal; the executor after it runs each line.
+_MASKED_OUT_LOOP = (
+    "import json, subprocess\nout = []\n"
+    "for line in reversed(open('{log}').read().splitlines()):\n"
+    "    d = json.loads(line)\n"
+    "    out.append(line)\n"
+)
+
+
+@pytest.mark.parametrize("executor", [
+    "sorted(out, key=subprocess.os.system)\n",
+    "max(out, key=subprocess.os.system)\n",
+    "min(out, key=subprocess.run)\n",
+    "s = subprocess\ns.sys.path_hooks.append(s.os.system)\n",
+    "print(subprocess)\n",
+    "json.dumps(out, default=subprocess.run)\n",
+    "json.loads('{{}}', object_hook=subprocess.run)\n",
+    "sorted(out, **dict(key=print))\n",
+    "sorted(out, key=d.get)\n",
+])
+def test_read_only_mask_refuses_module_callables_as_values(tmp_path, executor):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    ordinary, _ = _forms(tmp_path, _MASKED_OUT_LOOP.format(log=log))
+    unsafe, _ = _forms(tmp_path, _MASKED_OUT_LOOP.format(log=log) + executor.format())
+    assert not guard("echo ok; " + ordinary, cwd=str(tmp_path))
+    assert guard("echo ok; " + unsafe, cwd=str(tmp_path))
+
+
+def test_json_default_hook_cannot_execute_a_masked_script(tmp_path):
+    """#1017 P1: json.dumps(path, default=subprocess.run) runs the masked script."""
+    script = tmp_path / "restart.sh"
+    script.write_text("hermes gateway " + "restart\n")
+    head = (
+        "import json, subprocess\nfrom pathlib import Path\n"
+        f"path = Path('{tmp_path}') / 'restart.sh'\nprint(Path('{script}').read_text())\n"
+    )
+    ordinary, _ = _forms(tmp_path, head + "print(json.dumps(str(path)))\n")
+    unsafe, _ = _forms(tmp_path, head + "json.dumps(path, default=subprocess.run)\n")
+    assert not guard("echo ok; " + ordinary, cwd=str(tmp_path))
+    assert guard("echo ok; " + unsafe, cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("executor", [
+    "print(sorted(out, key=len))\n",
+    "print(json.dumps(out, default=str, indent=2, sort_keys=True))\n",
+    "print(max(out, key=len, default=None))\n",
+])
+def test_read_only_mask_still_allows_data_callbacks(tmp_path, executor):
+    log = tmp_path / "intake.jsonl"
+    log.write_text("hermes gateway " + "restart\n")
+    body, _ = _forms(tmp_path, _MASKED_OUT_LOOP.format(log=log) + executor)
+    assert not guard("echo ok; " + body, cwd=str(tmp_path))
