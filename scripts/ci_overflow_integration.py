@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -289,6 +290,21 @@ def pr_ci_legacy(repo: str, run_id: int | None) -> CheckResult:
         return check(name, "UNVERIFIABLE", {}, str(exc))
 
 
+def variable_write_denied(call) -> tuple[bool, dict]:
+    """Non-writing probe: may this identity write repo Actions variables?
+
+    PATCH a variable name that does not exist. A denied identity gets 403; a
+    permitted one reaches the route and gets 404 (nothing to update). No
+    existing variable is ever written. The old probe did GET-then-PATCH of
+    CI_SELF_HOSTED_SLOTS[_BASELINE] with the value it read, which on a
+    fail-open identity reverted any controller change made in between (C5 #27,
+    PR #954). Anything but 403 fails closed.
+    """
+    probe = f"CI_OVERFLOW_WRITE_PROBE_{secrets.token_hex(4).upper()}"
+    code = call("PATCH", f"actions/variables/{probe}", {"name": probe, "value": "0"})[0]
+    return code == 403, {"probe_variable": probe, "patch_http": code}
+
+
 def app_gates(repo: str, controller_root: Path | None) -> list[CheckResult]:
     names = ("ac2_app_reads_runners", "ac3_no_k_baseline_writes_identity", "ac2_cas_two_writers")
     if controller_root is None:
@@ -309,13 +325,8 @@ def app_gates(repo: str, controller_root: Path | None) -> list[CheckResult]:
     st, runners = call("GET", "actions/runners?per_page=100")
     out.append(check(names[0], "PASS" if st == 200 and runners["total_count"] >= 1 else "BLOCK",
                      {"http": st, "total_count": runners and runners["total_count"]}))
-    writes = {}
-    for var in ("CI_SELF_HOSTED_SLOTS", "CI_SELF_HOSTED_SLOTS_BASELINE"):
-        _, cur = call("GET", f"actions/variables/{var}")
-        # Same-value write: even a fail-open identity would change nothing.
-        writes[var] = call("PATCH", f"actions/variables/{var}", {"name": var, "value": cur["value"]})[0] if cur else None
-    denied = all(code in (403, 404) for code in writes.values())
-    out.append(check(names[1], "PASS" if denied else "BLOCK", {"patch_http": writes},
+    denied, evidence = variable_write_denied(call)
+    out.append(check(names[1], "PASS" if denied else "BLOCK", evidence,
                      "" if denied else "controller identity can write K/BASELINE"))
     branch = "argus-probe/t_f02c34f7-cas"
     _, main = call("GET", "git/ref/heads/main")

@@ -196,3 +196,24 @@ def test_unprobed_planner_jobs_do_not_block_a_fully_probed_rerun():
     fresh = [{**j, "runner_name": j["runner_name"] + "-x", "started_at": "2026-09-24T06:57:10Z"} for j in A1]
     logs = {j["name"]: "PROBE slice=x executing_attempt=3 planned_attempt=3" for j in fresh if "Run tests" in j["name"]}
     assert integ.selective_rerun_verdict(A1, fresh, logs)["status"] == "PASS"
+
+
+def test_variable_write_probe_never_writes_an_existing_variable():
+    """C5 #27 (PR #954): the K/BASELINE write-permission gate must not
+    GET-then-PATCH the live slot variables (a revert on a fail-open identity)."""
+    calls = []
+
+    def call(method, path, body=None):
+        calls.append((method, path))
+        return (403, None) if method == "PATCH" else (200, {"value": "8"})
+
+    denied, evidence = integ.variable_write_denied(call)
+    assert denied is True and evidence["patch_http"] == 403
+    assert all("CI_SELF_HOSTED_SLOTS" not in path for _, path in calls)
+    assert [m for m, _ in calls] == ["PATCH"]
+
+
+@pytest.mark.parametrize("code", [404, 200, 204, 500])
+def test_variable_write_probe_fails_closed_unless_403(code):
+    denied, _ = integ.variable_write_denied(lambda m, p, b=None: (code, None))
+    assert denied is False
