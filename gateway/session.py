@@ -4089,6 +4089,7 @@ class SessionStore:
             entry = published
             _needs_save = True
             if entry is candidate:
+                self._discard_turn_handoff(session_key)
                 try:
                     _origin_json = json.dumps(source.to_dict())
                 except Exception:
@@ -4874,6 +4875,21 @@ class SessionStore:
                 self._save()
         return count
 
+    @staticmethod
+    def _discard_turn_handoff(session_key: str) -> None:
+        """Drop the key's saved turn handoff at a conversation boundary.
+
+        The handoff file is keyed by the chat key, not the session id, so it
+        would otherwise be injected into the first turn of the NEXT
+        conversation under the same key. Best-effort; never raises.
+        """
+        try:
+            from agent.turn_handoff import discard_turn_handoff
+
+            discard_turn_handoff(session_key)
+        except Exception:
+            logger.debug("turn handoff discard failed for %s", session_key, exc_info=True)
+
     def reset_session(
         self,
         session_key: str,
@@ -4944,6 +4960,7 @@ class SessionStore:
 
             self._entries[session_key] = new_entry
             self._save()
+            self._discard_turn_handoff(session_key)
             _reset_origin_json = None
             if old_entry.origin is not None:
                 try:
@@ -5085,6 +5102,7 @@ class SessionStore:
 
             self._entries[session_key] = new_entry
             self._save()
+            self._discard_turn_handoff(session_key)
 
         if self._db and db_end_session_id:
             try:

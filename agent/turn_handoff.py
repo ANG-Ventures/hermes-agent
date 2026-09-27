@@ -347,6 +347,32 @@ def consume_turn_handoff(
     return _load_turn_handoff(session_key, root=root, consume=True)
 
 
+def discard_turn_handoff(
+    session_key: str,
+    *,
+    root: Optional[Path] = None,
+) -> bool:
+    """Delete any handoff saved for ``session_key``. Never raises.
+
+    Handoffs are keyed by the stable chat key, which OUTLIVES a conversation:
+    ``/new``, ``/reset``, idle/daily auto-reset and ``/resume`` all mint or
+    switch the session id under the same key. The session store calls this at
+    each of those boundaries so the first turn of the next conversation cannot
+    inject the discarded conversation's request, results and tool re-issue
+    instruction. Returns True when a file was removed.
+    """
+    if not session_key:
+        return False
+    try:
+        handoff_path_for(session_key, root=root).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        logger.debug("turn handoff discard failed for %s", session_key, exc_info=True)
+        return False
+
+
 def prune_expired_handoffs(*, root: Optional[Path] = None) -> int:
     """Delete handoffs past their TTL. Returns the number removed."""
     base = Path(root) if root is not None else _default_root()
