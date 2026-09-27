@@ -1224,6 +1224,61 @@ def test_replay_script_old_flaps_new_bounded(tmp_path):
     assert mod.main(["--ledger", "48h", "--db", str(db), "--target", "0"]) == 1
 
 
+def _replay_mod():
+    import importlib.util as _ilu
+
+    spec = _ilu.spec_from_file_location("replay_fp", REPO / "scripts" / "replay-fallback-policy.py")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_replay_script_missing_or_unreadable_db_fails_loudly(tmp_path, capsys):
+    """A missing DB, a DB without the ledger table, or an empty window must
+    never print PASS / exit 0 (fabricated green)."""
+    mod = _replay_mod()
+    rc = mod.main(["--db", str(tmp_path / "nope.db")])
+    out = capsys.readouterr()
+    assert rc == mod.RC_UNREADABLE and rc != 0
+    assert "PASS" not in out.out and "nope.db" in out.err
+    db = tmp_path / "turns.db"
+    _sqlite3.connect(str(db)).close()  # exists, no fallback_events table
+    assert mod.main(["--db", str(db)]) == mod.RC_UNREADABLE
+    con = _sqlite3.connect(str(db))
+    con.execute("create table fallback_events (id integer primary key, ts real, session_id text,"
+                " kind text, trigger_class text, from_provider text, from_model text,"
+                " to_provider text, to_model text)")
+    con.commit()
+    con.close()
+    rc = mod.main(["--db", str(db)])
+    out = capsys.readouterr().out
+    assert rc == mod.RC_VACUOUS and rc not in (0, 1)
+    assert "VACUOUS" in out and "PASS" not in out
+
+
+@pytest.mark.parametrize("hop_class", ["conn", "quota_model"])
+def test_replay_script_fallback_to_fallback_hop_is_a_new_leg(hop_class):
+    """While the new policy is sticky, a failover off the fallback (fb -> fb2)
+    is a real leg under the new policy too; only the re-failover caused by a
+    suppressed return is suppressed."""
+    mod = _replay_mod()
+    t0 = _time.time() - 3600
+    rows = [{"ts": t0, "session_id": "s", "kind": "failover", "trigger_class": "quota_model"},
+            {"ts": t0 + 60, "session_id": "s", "kind": "failover", "trigger_class": hop_class}]
+    res = mod.replay(rows)
+    assert res["quota_model_events"] == 1
+    assert res["max_legs_per_quota_event_old"] == 2
+    assert res["max_legs_per_quota_event"] == 2
+    # suppressed return + its re-failover, then a real fb -> fb2 hop
+    rows = [{"ts": t0, "session_id": "s", "kind": "failover", "trigger_class": "quota_model"},
+            {"ts": t0 + 60, "session_id": "s", "kind": "recovery", "trigger_class": None},
+            {"ts": t0 + 120, "session_id": "s", "kind": "failover", "trigger_class": "quota_model"},
+            {"ts": t0 + 180, "session_id": "s", "kind": "failover", "trigger_class": hop_class}]
+    res = mod.replay(rows)
+    assert res["max_legs_per_quota_event_old"] == 4
+    assert res["max_legs_per_quota_event"] == 2
+
+
 # ── warm-seat spec §4.4 / §5 P3: harness return gate (-k warm) ────────────
 
 def _warm(mode="enforce", *, eligible=None, age=600.0, window=3300.0, refusal="on",
