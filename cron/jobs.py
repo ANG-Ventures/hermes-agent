@@ -438,19 +438,46 @@ def _jobs_lock():
 
 
 @contextlib.contextmanager
-def _fire_job_lock(job_id: str):
+def _fire_job_lock(job_id: str, *, timeout: Optional[float] = None):
     """Serialize one job's owner mutations and external side effects.
 
     Unlike the global jobs lock, this lock may be held across network delivery.
     It is scoped to one profile + job, so unrelated cron jobs keep progressing.
     Fencing fails closed when cross-process locking is unavailable.
+
+    ``timeout`` bounds the WHOLE wait — the in-process lock as well as the
+    cross-process flock. Without it the in-process ``RLock`` is acquired with
+    no bound at all, so a caller that shares the process with the fence
+    holder waits for as long as the holder's network delivery takes. The
+    gateway shutdown path is such a caller, and it runs on the event loop
+    the holder is waiting on (t_8d085477). ``None`` keeps the legacy
+    behaviour: unbounded in-process wait, ``_JOBS_LOCK_TIMEOUT_SECONDS``
+    for the flock.
     """
     cron_dir = _current_cron_store().cron_dir
     lock_key = f"{cron_dir.resolve()}::{job_id}"
     with _fire_fence_locks_guard:
         local_lock = _fire_fence_locks.setdefault(lock_key, threading.RLock())
 
-    with local_lock:
+    flock_timeout = _JOBS_LOCK_TIMEOUT_SECONDS
+    if timeout is not None:
+        timeout = max(float(timeout), 0.0)
+        flock_timeout = min(flock_timeout, timeout)
+        started = time.monotonic()
+        if not local_lock.acquire(timeout=timeout):
+            logger.warning(
+                "Timed out after %.1fs waiting for in-process fire fence of "
+                "job %s; failing closed",
+                timeout,
+                job_id,
+            )
+            yield False
+            return
+        flock_timeout = max(flock_timeout - (time.monotonic() - started), 0.0)
+    else:
+        local_lock.acquire()
+
+    try:
         ensure_dirs()
         lock_name = uuid.uuid5(uuid.NAMESPACE_URL, lock_key).hex
         lock_path = cron_dir / f".fire-{lock_name}.lock"
@@ -460,7 +487,7 @@ def _fire_job_lock(job_id: str):
             lock_fd = open(lock_path, "a+", encoding="utf-8")
             lock_fd.seek(0)
             if fcntl is not None:
-                deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
+                deadline = time.monotonic() + flock_timeout
                 while True:
                     try:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -499,6 +526,8 @@ def _fire_job_lock(job_id: str):
                     pass
                 finally:
                     lock_fd.close()
+    finally:
+        local_lock.release()
 
 
 @contextlib.contextmanager
@@ -3448,8 +3477,9 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    lock_timeout: Optional[float] = None,
 ) -> bool:
-    with _fire_job_lock(job_id) as acquired:
+    with _fire_job_lock(job_id, timeout=lock_timeout) as acquired:
         if not acquired:
             return False
         return _mark_job_run_locked(

@@ -130,7 +130,13 @@ class TestStartupPlatformIsolation:
                                 "gateway.channel_directory.build_channel_directory",
                                 new=AsyncMock(return_value={"platforms": {}}),
                             ):
-                                with patch("gateway.run.asyncio.create_task", side_effect=fake_create_task):
+                                with patch("gateway.run.asyncio.create_task", side_effect=fake_create_task), \
+                                        patch(
+                                            # fake_create_task's MagicMock never completes, so the
+                                            # boot-send wait would burn its full 30s drain budget.
+                                            "gateway.run._startup_restore_drain_timeout_secs",
+                                            return_value=0.01,
+                                        ):
                                     assert await runner.start() is True
 
         assert Platform.TELEGRAM in runner._failed_platforms
@@ -896,6 +902,10 @@ class TestVoiceInputCallbackWiring:
                                     with patch(
                                         "gateway.run.asyncio.create_task",
                                         side_effect=fake_create_task,
+                                    ), patch(
+                                        # See test_start_continues_after_platform_connect_timeout.
+                                        "gateway.run._startup_restore_drain_timeout_secs",
+                                        return_value=0.01,
                                     ):
                                         assert await runner.start() is True
 

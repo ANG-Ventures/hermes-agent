@@ -13,9 +13,8 @@ raising after a refactor, a logging call with a bad format arg — the permit is
 burned permanently.  Repeat it ``cap`` times and the gate is dead until the
 process restarts.
 
-Live instances:
+Live instance:
   * ``gateway/turn_admission.py::TurnAdmission.slot``            (PR #827)
-  * ``hermes_cli/session_db_heavy_gate.py::session_db_heavy_read_slot``
 
 THE DISCRIMINATOR (and why the obvious one is wrong)
 ----------------------------------------------------
