@@ -352,3 +352,65 @@ def test_stall_none_results_bare_stall_is_bad():
     # Defensive: a None board result contributes nothing; a bare stall still counts.
     assert _stall_streak_is_bad(True, False, [("b", None)]) is True
 
+
+
+# --- per-card refusal page (t_bc32ac90) -------------------------------------
+# One card refused every tick inside an otherwise healthy board read as plain
+# 'ready' for 2.7h (t_4b9809f4). It pages once after N consecutive refusals.
+
+from gateway.kanban_watchers import (  # noqa: E402
+    WORKSPACE_REFUSAL_CARD_PAGE_TICKS,
+    _WorkspaceRefusalCardNotifier,
+)
+
+_REASON = "workspaces_root_unmounted: /Volumes/ramscratch/kanban-workspaces"
+
+
+def _refused(*ids):
+    return [("default", _FakeResult(workspace_refused=[(i, _REASON) for i in ids]))]
+
+
+def test_card_refusal_pages_once_at_threshold():
+    sent = []
+    notifier = _WorkspaceRefusalCardNotifier()
+    send = lambda *a: sent.append(a) or True  # noqa: E731
+    for _ in range(WORKSPACE_REFUSAL_CARD_PAGE_TICKS - 1):
+        assert notifier.observe(_refused("t_4b9809f4"), send) == 0
+    assert notifier.observe(_refused("t_4b9809f4"), send) == 1
+    assert sent == [("default", "t_4b9809f4", _REASON, WORKSPACE_REFUSAL_CARD_PAGE_TICKS)]
+    for _ in range(5):
+        notifier.observe(_refused("t_4b9809f4"), send)
+    assert len(sent) == 1
+
+
+def test_card_refusal_streak_resets_when_card_admitted():
+    sent = []
+    notifier = _WorkspaceRefusalCardNotifier(threshold=3)
+    send = lambda *a: sent.append(a) or True  # noqa: E731
+    notifier.observe(_refused("t_a"), send)
+    notifier.observe(_refused("t_a"), send)
+    notifier.observe(_refused(), send)  # admitted this tick
+    notifier.observe(_refused("t_a"), send)
+    notifier.observe(_refused("t_a"), send)
+    assert not sent
+    notifier.observe(_refused("t_a"), send)
+    assert len(sent) == 1
+
+
+def test_card_refusal_unobserved_board_neither_counts_nor_resets():
+    sent = []
+    notifier = _WorkspaceRefusalCardNotifier(threshold=2)
+    send = lambda *a: sent.append(a) or True  # noqa: E731
+    notifier.observe(_refused("t_a"), send)
+    notifier.observe([("default", _FakeResult(skipped_locked=True)), ("default", None)], send)
+    assert not sent
+    notifier.observe(_refused("t_a"), send)
+    assert len(sent) == 1
+
+
+def test_card_refusal_failed_send_retries_next_tick():
+    attempts = []
+    notifier = _WorkspaceRefusalCardNotifier(threshold=1)
+    notifier.observe(_refused("t_a"), lambda *a: attempts.append(a) and False)
+    assert notifier.observe(_refused("t_a"), lambda *a: attempts.append(a) or True) == 1
+    assert len(attempts) == 2

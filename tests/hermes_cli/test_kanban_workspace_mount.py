@@ -323,9 +323,11 @@ def test_most_specific_historical_root_wins(home, monkeypatch):
             return expected_mount or root
 
         monkeypatch.setattr(policy, 'validate_mount', validate)
+        # dir kind: with no configured root both recorded roots are retired,
+        # and a retired-root SCRATCH card is reallocated instead of refused.
         task_id = kb.create_task(
             conn, title='nested fence', assignee='default',
-            workspace_kind='scratch', workspace_path=str(path),
+            workspace_kind='dir', workspace_path=str(path),
         )
         result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kw: None)
         assert task_id in result.stranded_by_mount_loss
