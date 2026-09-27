@@ -2,8 +2,8 @@
 cron lifecycle_guard) that false-positive on heredoc *bodies*. Stripping every body is unsafe the
 other way (a fake ``<<`` in quotes can swallow an operator; unquoted bodies expand; ``bash <<'EOF'``
 executes), so a body is masked ONLY when every delimiter is quoted, every heredoc has an exact
-terminator line, the owning simple command is an allowlisted non-shell interpreter, and no list
-operator follows the heredoc. Otherwise the command is returned untouched: a false positive is
+terminator line, the owning simple command is an allowlisted non-shell interpreter, and no
+pipe/background/conditional operator follows the heredoc. Otherwise the command is returned untouched: a false positive is
 acceptable, hiding shell syntax from a guard is not.
 Masked bodies keep their newline count (re.MULTILINE)."""
 
@@ -112,8 +112,10 @@ def _scan_heredoc_command_unit(command: str, start: int):
     """Scan one logical command.
 
     Return ``(end, specs, unknown_operator, post_heredoc_list_operator, owner_start)``.
-    List operators before the first heredoc select the simple command that owns it. A list
-    operator after a heredoc keeps the body visible because another command may consume it.
+    List operators before the first heredoc select the simple command that owns it. After a
+    heredoc, ``;`` only ends the owning command (the body still belongs to it); a pipe,
+    background/conditional operator, or a second heredoc in a later command keeps the body
+    visible because the owner is no longer unambiguous.
     """
     cursor = start
     quote = None
@@ -122,6 +124,7 @@ def _scan_heredoc_command_unit(command: str, start: int):
     unknown_operator = False
     post_heredoc_list_operator = False
     owner_start = start
+    owner_closed = False
     while cursor < len(command):
         char = command[cursor]
         if char == "\n" and (comment or quote is None):
@@ -148,12 +151,16 @@ def _scan_heredoc_command_unit(command: str, start: int):
                 cursor += 2
             else:
                 cursor, delimiter, strip_tabs, quoted = parsed
+                if owner_closed:
+                    post_heredoc_list_operator = True
                 specs.append((delimiter, strip_tabs, quoted))
         else:
             if char in ";|&" and not (
                 char == "&" and _is_fd_redirect_ampersand(command, cursor)
             ):
-                if specs:
+                if specs and char == ";":
+                    owner_closed = True
+                elif specs:
                     post_heredoc_list_operator = True
                 else:
                     owner_start = cursor + 1

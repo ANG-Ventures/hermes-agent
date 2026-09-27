@@ -207,3 +207,23 @@ def test_open_loop_mask_refuses_non_allowlisted_calls(tmp_path, call):
     log.write_text("hermes gateway " + "restart\n")
     body = "import json, subprocess\ncmd = ['sqlite3']\n" + call + "\n" + _OPEN_LOOP.format(log=log)
     assert guard(f"echo ok; python3 - <<'PY'\n{body}PY", cwd=str(tmp_path))
+
+
+def test_semicolon_after_heredoc_keeps_the_owning_command(tmp_path):
+    script = tmp_path / "action.sh"
+    script.write_text("hermes gateway " + "restart\n")
+    shell = f"bash <<'EOF'; python3 -V\nsh -c '{script}'\nEOF"
+    document = "cat <<'EOF' > notes.md; python3 -V\nhermes gateway " + "restart\nEOF"
+    assert guard(shell, cwd=str(tmp_path))
+    assert not guard(document, cwd=str(tmp_path))
+
+
+def test_second_heredoc_after_semicolon_is_not_attributed_to_first_owner(tmp_path):
+    script = tmp_path / "action.sh"
+    script.write_text("hermes gateway " + "restart\n")
+    command = (
+        "cat <<'A' > notes.md; bash <<'B'\n"
+        "notes\nA\n"
+        f"sh -c '{script}'\nB"
+    )
+    assert guard(command, cwd=str(tmp_path))
