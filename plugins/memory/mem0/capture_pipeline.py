@@ -179,11 +179,16 @@ class CapturePipeline:
         try:
             try:
                 from .capture_queue import idem_key
+                from .capture_router import active_profile_name
             except ImportError:
                 from capture_queue import idem_key
+                from capture_router import active_profile_name
             key = idem_key(session_id, turn_ordinal, user_content, assistant_content)
+            # Stamp the originating profile HERE, on the turn thread: the drain thread does not
+            # inherit the per-request home ContextVar, so it cannot resolve it later.
             enq = self._queue.enqueue(key, {"user": user_content, "assistant": assistant_content,
-                                            "session_id": session_id})
+                                            "session_id": session_id,
+                                            "profile": active_profile_name()})
             # Start/restart the worker after every active enqueue. The worker
             # retires itself when the durable queue becomes empty; start() is
             # idempotent while it is still accepting work.
