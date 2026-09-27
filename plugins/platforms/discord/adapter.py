@@ -2679,19 +2679,20 @@ class DiscordAdapter(BasePlatformAdapter):
         # (C5 #31, PR #967: it used to leave the live Discord client connected).
         flush_cancelled = False
 
-        async def _flush(label, fn, **kwargs):
+        async def _flush(label, owner_attr, **kwargs):
             nonlocal flush_cancelled
             try:
-                if await self._run_thread_to_completion(fn, **kwargs):
+                owner = getattr(self, owner_attr, None)
+                if owner is None:
+                    return
+                if await self._run_thread_to_completion(owner.flush, **kwargs):
                     flush_cancelled = True
             except Exception:
                 logger.debug("[%s] %s shutdown flush failed", self.name, label, exc_info=True)
 
-        await _flush("restart-recovery", self._restart_recovery.flush, shutdown_ts=time.time())
-        await _flush("non-conversational ids", self._nonconversational_messages.flush)
-        _dead = getattr(self, "_dead_channels", None)
-        if _dead is not None:
-            await _flush("dead-channel ids", _dead.flush)
+        await _flush("restart-recovery", "_restart_recovery", shutdown_ts=time.time())
+        await _flush("non-conversational ids", "_nonconversational_messages")
+        await _flush("dead-channel ids", "_dead_channels")
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
