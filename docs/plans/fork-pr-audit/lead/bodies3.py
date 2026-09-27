@@ -4,6 +4,7 @@ from common import *
 import render, bodies
 
 ROW, CARDS = render.ROW, render.CARDS
+check_cards(ROW, CARDS)
 
 
 def body(c):

@@ -3,34 +3,14 @@
 Flips DROP rows to KEEP in lead/rows.json where the slice worker falsified the DROP premise. Idempotent:
 a row already flipped is left alone; a row in any other state aborts. Prints verdict totals before/after.
 Re-render FINAL.md / ROLLUP.md with lead/render.py afterwards.
+
+Superseded as the source of truth (t_04cd162a): the table lives in rulings.POST_RULING_2026_09_27 and final.build()
+applies it, so lead/build_all.py reproduces these rows. On a rebuilt rows.json this script is a no-op.
 """
 import collections, json, os, sys
 
 L = os.path.dirname(os.path.abspath(__file__)) + '/'
-TAG = 'ACE RULING 2026-09-27 (DROP -> KEEP, premise falsified by the slice worker): '
-FLIPS = {
-    'nopr:4ed79b6dad': ('t_2e862bc6', 'the root config and 12 profile configs (13) set telegram network_retry_max: 20 / '
-                        'network_retry_max_delay: 120 and fork/main passes them to the adapter; a revert silently drops every '
-                        'profile to upstream\'s hardcoded 10 retries / 60s cap.'),
-    '#109': ('t_6b6df0eb', '#164 renamed the A-floor to _signature_partition, not removed it; live on origin/main '
-             '(compaction_stats.py:959-982), fired 6x in prod logs 09-19..25, and #106 (KEEP) depends on it.'),
-    '#932': ('t_7bc9ce6e', '#954 (merged after the audit) imports ci_overflow_acceptance from ci_overflow_integration.py:30; '
-             'the rebased revert fails with ModuleNotFoundError (reproduced). Branch audit/scripts_misc/revert-ci-overflow-phase0 '
-             'must not merge.'),
-    '#562': ('t_7ea0fe09', 'structural base of merged #566/#568/#682 (resolve_wake_participant / _live_chat_participants); '
-             'git revert conflicts, and #682 records a field-observed phantom session this path prevents.'),
-    '#589': ('t_5d546222', 'follows #562: #589 only single-sources the creator-stamp rule of the #562/#568 stack (slice worker '
-             'caveat). Branch audit/gateway/revert-589 (c2c77036a7) must not merge.'),
-    'nopr:36134d8944': ('t_b865b149', 'PR #1200 (the revert) went CI-red: af43fd64ff test_cron_auto_model relies on the '
-                        'gpt-5.5 -> openai-codex alias (4 failures). Close #1200 unmerged; branch '
-                        'audit/hermes_cli/revert-36134d8944 must not merge.'),
-    'nopr:051c2076e1': ('t_c335830a', 'a full revert corrupts FTS (probe on a copy of shopper lcm.db: "database disk image is '
-                        'malformed"); the commit\'s drop-then-recreate-on-missing keeps trigger order correct, so reverting '
-                        'would ship the drifted trigger spec to new DBs.'),
-    '#22': ('t_8ff394b6', 'apollo@daemonarchy.local entry only: not stale, Apollo committed under it on 2026-09-22 and PR #872\'s '
-            'attribution check passed only via this mapping. The 2 nopr:40a6040932 lines stay DROP on '
-            'audit/scripts_misc/revert-author-map-stale @4053ee9081.'),
-}
+from rulings import POST_RULING_TAG as TAG, POST_RULING_2026_09_27 as FLIPS  # canonical table; final.build() applies it
 
 
 def _scalar(line):
