@@ -615,9 +615,27 @@ hermes kanban set-model t_abcd --clear-effort    # back to the profile's own set
 
 The dispatcher spawns the worker with `--reasoning <level>`, which overrides the profile's `agent.reasoning_effort` for that run only. The two knobs are deliberately independent: `set-model <id> --effort xhigh` leaves an existing model override untouched, and clearing the model (`set-model <id> none`) never resets the effort.
 
-### Pinning a worker to one subscription (`--pin-sub`)
+### Pinning a kanban card/worker: provider, model, effort
 
-Workers can be pinned to any provider + model + effort. This is a supported operator capability. Workers ride the pool providers (`claude-bpr` / `claude-apr`) by default. To pin a card to ONE Claude subscription (`claude-bpx-N` / `claude-apx-N`), give a reason:
+This is the canonical reference for routing one card's worker. Any card can be pinned to any provider + model + effort; it is a supported operator capability, not a workaround. Workers ride the pool providers (`claude-bpr` / `claude-apr`) by default, and a pin to ONE Claude subscription needs a stated reason.
+
+```bash
+hermes kanban set-model <card> --model M --provider P --effort L \
+    [--pin-sub "<reason>"] [--pin-sub-fallback] \
+    [--allow-flagship "<reason>"] [--reclaim]
+```
+
+| Flag | What it does |
+|---|---|
+| `--model M` (or last positional) | Model the worker spawns with (`-m M`). `none` clears the model + provider override. |
+| `--provider P` | Provider the model belongs to (`--provider P`). Requires a model; cleared with it. |
+| `--effort L` / `--clear-effort` | Reasoning effort (`--reasoning L`): `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Independent of the model (see [per-task reasoning effort](#per-task-reasoning-effort)). |
+| `--pin-sub "<reason>"` | Required when `P` is a single sub (`claude-bpx-N` / `claude-apx-N`). Records a `sub pin:` comment and a `[PIN P: reason]` badge. Without it a single-sub route is refused. |
+| `--pin-sub-fallback` | With `--pin-sub`: when the pinned sub is capped/cooling, ride its family pool (`bpx-N` → `claude-bpr`, `apx-N` → `claude-apr`) instead of waiting. |
+| `--allow-flagship "<reason>"` | Required for flagship models (Fable/Astra, `kanban.banned_worker_model_substrings`). Recorded as a `flagship override:` comment. Alias `--firepower`. |
+| `--reclaim` | Also abort a RUNNING worker so the next dispatch respawns it on the new route. Without it, a running worker keeps its old route until it finishes; the pin applies to the next run. |
+
+`create` takes the same `--model/--provider/--reasoning/--pin-sub/--pin-sub-fallback/--allow-flagship` flags, and `lane-model set <provider>/<model> --ttl … --reason … --pin-sub "<reason>"` pins a whole lane (time-boxed). Examples:
 
 ```bash
 hermes kanban set-model t_abcd --provider claude-bpx-24 --model claude-fable-5-1 \
@@ -630,15 +648,21 @@ hermes kanban pins                    # every live pin (cards + lanes), with age
 hermes kanban pins --stale-hours 24   # exits 1 if a card pin is older (daily lint)
 ```
 
+**What `--reclaim` does to context.** Reclaim terminates the running worker and closes its run with outcome `reclaimed`. The NEXT run is a fresh agent session on the new route. It is seeded from the card body, every comment (including prior runs' handoff summaries), and the same workspace/branch. The in-flight conversation is **not** carried over: anything the old worker had only in its head is lost. So before reclaiming a card mid-task, post a checkpoint comment (`kanban_comment` / `hermes kanban comment`) with what has been done and what is next.
+
+**Rules for single-sub pins:**
+
 - Without `--pin-sub`, a single-sub route is refused (the refusal names the pool and the flag).
 - The pre-rename aliases (`claude-api-proxy`, `claude-proxy`, `claude-subscription-proxy`, `claude-bridge`, `-fN` / `-failoverN` / `-fallbackN`) are refused even with `--pin-sub`. Use the real provider name.
-- The sub must be `enabled: true` in the usage registry (`~/.hermes/config/usage-registry.json`, the same file the relay pool loads). `claude-apx-N` is also refused while the sub is in burn-in, because apx is off during burn-in. `claude-bpx-N` serves burn-in subs.
+- The sub must be `enabled: true` in the usage registry (`~/.hermes/config/usage-registry.json`, the same file the relay pool loads); an unreadable registry fails closed. `claude-apx-N` is also refused while the sub is in burn-in, because apx is off during burn-in. `claude-bpx-N` serves burn-in subs.
 - Sub 0 (`claude-apx-0` / `claude-bpx-0`, Ace's own Max 20x) is pinnable with the same flag, as a **last resort**: only when Ace asks, or when every other sub is capped. Its protection is on the pool side, not here. The registry reserves it out of every pool (`pool_enabled: false`, `pool_lb_exclude: true`), so no worker reaches it without an explicit pin.
-- The whole route is pinned. Provider, model and effort all travel to the worker as `-m <model> --provider claude-bpx-N --reasoning <level>`. A later `set-model` without `--pin-sub` clears the pin.
-- A pin skips the pool but still passes every governor. The dispatch load gate, the flagship gate (`--allow-flagship` is still required for Fable/Astra) and the pinned sub's own health all apply. Sub health covers box usage cap, credential cooldown and rate-limit circuit. When the pinned sub is capped, the card **waits**. It never drifts onto the profile's fallback ladder. `--pin-sub-fallback` lets it ride the sub's family pool instead (`bpx-N` → `claude-bpr`, `apx-N` → `claude-apr`).
-- Visibility: `show` / `list` print `[PIN claude-bpx-N: <reason>]`. Each pin writes a `sub pin:` audit comment. The dispatcher route line reads `route=claude-bpx-N/<model> source=pin` (`source=pin(lane-override(...))` for a lane pin).
+- The whole route is pinned. Provider, model and effort all travel to the worker as `-m <model> --provider claude-bpx-N --reasoning <level>`. A later `set-model` without `--pin-sub` (or `edit --model`) clears the pin.
+- A pin skips the pool but still passes every governor. The dispatch load gate, the flagship gate and the pinned sub's own health all apply. Sub health covers box usage cap, credential cooldown and rate-limit circuit. When the pinned sub is capped, the card **waits** (`pin_fallback=wait`). It never drifts onto the profile's fallback ladder unless `--pin-sub-fallback` is set.
+- No gateway restart is needed: the dispatcher reads the pin on its next tick.
 
-**Why a reason is required (don't re-ban pins).** Fork PR #1116 (2026-09-26) refused every single-sub route after cards and lanes pinned to `claude-apx-0` put workers on Ace's personal sub. That sub was reachable under the alias `claude-api-proxy`. The result was 95× 429 plus 46× 401 in one day. The real hole was an *undeclared* route onto sub 0 hidden behind an alias, not pinning itself. So the aliases stay refused, sub 0 is reserved out of the pools, and a deliberate pin is allowed again with a logged reason.
+**Seeing a pin.** `show` / `list` print `[PIN claude-bpx-N: <reason>]`; `kanban show --json` carries `model_override`, `provider_override`, `reasoning_effort`, `pin_sub_reason`, `pin_sub_fallback`. Each pin writes a `sub pin:` audit comment. The dispatcher route line reads `route=claude-bpx-N/<model> source=pin` (`source=pin(lane-override(...))` for a lane pin), and the run's `spawned` event records the relay pool it was charged to, e.g. `spawned {"pid": 3203, "pool": "sub-vps-24"}` for a pin to `claude-bpx-24` versus `"pool": "claude-bpr"` for a pooled worker. Verified live 2026-09-27: t_887f9584 pinned to `claude-bpx-24` / Fable / `high` with `--pin-sub` dispatched on `sub-vps-24` with no gateway restart.
+
+**Why a reason is required (don't re-ban pins).** Fork PR #1116 (2026-09-26) refused every single-sub route after cards and lanes pinned to `claude-apx-0` put workers on Ace's personal sub. That sub was reachable under the alias `claude-api-proxy`. The result was 95× 429 plus 46× 401 in one day. The real hole was an *undeclared* route onto sub 0 hidden behind an alias, not pinning itself. So the aliases stay refused, sub 0 is reserved out of the pools, and a deliberate pin is allowed again with a logged reason (#1317 spec, #1318 implementation). Do not reintroduce a blanket "workers never pin" rule.
 
 ### Cost strategy: frontier orchestrator, inexpensive workers
 
