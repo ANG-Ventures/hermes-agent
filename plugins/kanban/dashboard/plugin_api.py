@@ -1065,7 +1065,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # Direct status write for drag-drop (todo -> ready etc).
                     ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
+                try:
+                    ok = kanban_db.archive_task(conn, task_id)
+                except ValueError as e:  # ClosedUnmergedPrError (t_a1550189): card's PR closed unmerged
+                    raise HTTPException(status_code=409, detail=str(e))
             elif s == "running":
                 raise HTTPException(
                     status_code=400,
@@ -1531,8 +1534,11 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     results.append(entry)
                     continue
                 if payload.archive:
-                    if not kanban_db.archive_task(conn, tid):
-                        entry.update(ok=False, error="archive refused")
+                    try:
+                        if not kanban_db.archive_task(conn, tid):
+                            entry.update(ok=False, error="archive refused")
+                    except ValueError as e:  # ClosedUnmergedPrError (t_a1550189)
+                        entry.update(ok=False, error=str(e))
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
