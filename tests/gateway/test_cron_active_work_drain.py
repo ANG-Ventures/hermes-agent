@@ -102,8 +102,8 @@ class TestKillToolSubprocessesMarksCronInterrupted:
         marked_calls = []
         real_mark = sched.mark_running_jobs_interrupted
 
-        def _spy(reason):
-            result = real_mark(reason)
+        def _spy(reason, **kwargs):
+            result = real_mark(reason, **kwargs)
             marked_calls.append((reason, result))
             return result
 

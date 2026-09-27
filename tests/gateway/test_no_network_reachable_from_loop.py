@@ -116,7 +116,6 @@ REACHABLE_BASELINE = frozenset({
     "gateway/run.py _run_agent_admitted -> open_credentialed_url",
     "gateway/run.py _run_background_task_inner -> urlopen",
     "gateway/run.py _stop_impl -> requests.get",
-    "gateway/run.py _stop_impl_body -> requests.get",
     "gateway/run.py start -> urlopen",
     "gateway/run.py stop -> requests.get",
     "gateway/slash_commands.py _handle_btw_command -> urlopen",

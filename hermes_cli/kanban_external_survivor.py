@@ -408,6 +408,28 @@ def _landed(slug, number, head, merge):
         return False
 
 
+def _rest_pr_view(payload):
+    """Normalise ``gh api repos/<slug>/pulls/<n>`` to the fields ``verify_pr`` reads.
+
+    PR state is read over REST, never ``gh pr view``: that is a GraphQL call,
+    GraphQL is ONE per-user rate-limit bucket shared by every fleet host, and
+    it failed ``Could not resolve to a Repository`` for a repo REST answered
+    for, holding t_62c6a323 behind an unverifiable ``--survivor-pr``
+    (t_1e080b8d). ``mergeCommit`` is only set once merged: REST reports a
+    test-merge ``merge_commit_sha`` for an OPEN PR, GraphQL reported null.
+    """
+    head = payload.get("head") or {}
+    merged = bool(payload.get("merged") or payload.get("merged_at"))
+    return {
+        "state": "MERGED" if merged else str(payload.get("state") or "").upper(),
+        "headRefOid": head.get("sha"),
+        "headRefName": head.get("ref"),
+        "mergeCommit": {"oid": payload.get("merge_commit_sha")} if merged else None,
+        "title": payload.get("title"),
+        "body": payload.get("body"),
+    }
+
+
 def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
     """Resolve a PR claim against GitHub.
 
@@ -445,11 +467,10 @@ def verify_pr(claim, shas=(), *, mined_for=None, corroborate=("headRefName",)):
     if not match:
         return None
     slug, number = match.groups()
-    output = _query(["gh", "pr", "view", number, "--repo", slug,
-                     "--json", "state,headRefOid,headRefName,mergeCommit,title,body"])
+    output = _query(["gh", "api", f"repos/{slug}/pulls/{number}"])
     corroborated_by = None
     try:
-        view = json.loads(output)
+        view = _rest_pr_view(json.loads(output))
         state, head = view["state"], view["headRefOid"]
         merge = (view.get("mergeCommit") or {}).get("oid")
         oid = merge if state == "MERGED" else head

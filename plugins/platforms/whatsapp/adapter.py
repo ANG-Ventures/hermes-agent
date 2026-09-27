@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Dict, Optional, Any
 
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
-from hermes_cli.cli_hint import hint_value
 from hermes_constants import (
     find_node_executable,
     get_hermes_dir,
@@ -610,7 +609,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
                         self._set_fatal_error(
                             "whatsapp_npm_install_failed",
-                            f"WhatsApp bridge npm install failed. Run `cd {hint_value(str(bridge_dir))} && {hint_value(_npm_bin)} install` manually, then restart `hermes gateway`.",
+                            f"WhatsApp bridge npm install failed. Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
                             retryable=False,
                         )
                         return False
@@ -624,7 +623,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     print(f"[{self.name}] Failed to install dependencies: {e}")
                     self._set_fatal_error(
                         "whatsapp_npm_install_failed",
-                        f"WhatsApp bridge npm install failed ({e}). Run `cd {hint_value(str(bridge_dir))} && {hint_value(_npm_bin)} install` manually, then restart `hermes gateway`.",
+                        f"WhatsApp bridge npm install failed ({e}). Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
                         retryable=False,
                     )
                     return False

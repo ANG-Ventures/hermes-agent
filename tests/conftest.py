@@ -109,6 +109,51 @@ def _strip_nonsandbox_file_handlers(sandbox_prefix=None):
 # conftest is imported before any test module, so setting it here closes that
 # window. The per-test fixture still applies for everything after import.
 #
+# ── Keep the pytest temp root OUTSIDE the live Hermes root (t_f64dfdb6) ────
+# get_default_hermes_root() maps ANY HERMES_HOME that resolves under the
+# native ~/.hermes back to ~/.hermes itself (that is how a profile home finds
+# its root). Kanban workers can run with TMPDIR=~/.hermes/kanban/workspaces/
+# <task>/tmp, which puts tmp_path - and so the per-test sandbox home - under the
+# live root: every profile write (create_profile, POST /api/profiles, SOUL
+# writes) then lands in the REAL ~/.hermes/profiles/. That is how
+# profiles/demo, worker, builder-auth and work appeared 2026-09-23 04:03-04:05.
+# Relocate the temp root before pytest or the session sandbox below derive any
+# path from it; the per-test guard in _hermetic_environment refuses whatever
+# still slips through (--basetemp, PYTEST_DEBUG_TEMPROOT).
+def _real_hermes_root() -> Path:
+    """The platform-native Hermes root (mirrors hermes_constants's default)."""
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return (base / "hermes").resolve()
+    return (Path.home() / ".hermes").resolve()
+
+
+def _is_under_real_hermes_root(path) -> bool:
+    """True when *path* is the live Hermes root or anywhere beneath it."""
+    try:
+        Path(path).resolve().relative_to(_real_hermes_root())
+        return True
+    except ValueError:
+        return False
+    except Exception:
+        return True  # unresolvable: treat as unsafe
+
+
+def _outside_tmp_base() -> str:
+    for candidate in ("/tmp", "/var/tmp"):
+        if os.path.isdir(candidate) and not _is_under_real_hermes_root(candidate):
+            return candidate
+    return str(Path.home())
+
+
+if _is_under_real_hermes_root(tempfile.gettempdir()):
+    _SAFE_TMP_ROOT = tempfile.mkdtemp(prefix="hermes-pytest-tmp-", dir=_outside_tmp_base())
+    for _tmp_var in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[_tmp_var] = _SAFE_TMP_ROOT
+    tempfile.tempdir = None  # drop gettempdir()'s cache so it re-reads TMPDIR
+    atexit.register(shutil.rmtree, _SAFE_TMP_ROOT, True)
+
 # ORDER MATTERS: the kanban write guard's deny-list (further down) must know
 # the REAL Hermes root — capture it BEFORE the sandbox rewires HERMES_HOME,
 # otherwise the deny-list would point at the throwaway tempdir and the guard
@@ -569,6 +614,16 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # 3-GUARD (t_f64dfdb6): a sandbox home under the live root is no sandbox -
+    # get_default_hermes_root() resolves it to the REAL ~/.hermes, so profile
+    # writes escape into the operator's profiles/. Refuse instead of leaking.
+    if _is_under_real_hermes_root(fake_hermes_home):
+        raise RuntimeError(
+            f"HERMETICITY VIOLATION: per-test HERMES_HOME {fake_hermes_home} is "
+            f"under the live Hermes root {_real_hermes_root()}; profile writes "
+            "would land in the real profiles/. Point TMPDIR / --basetemp / "
+            "PYTEST_DEBUG_TEMPROOT outside it. See t_f64dfdb6."
+        )
     # Keep the subprocess-surviving isolation marker pointed at THIS test's
     # home (#82770): children spawned by the test inherit it by default, so
     # hermes_state's live-DB guard stays armed in them even when the test

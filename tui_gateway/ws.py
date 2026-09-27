@@ -33,10 +33,6 @@ import time
 from typing import Any
 
 from tui_gateway import server
-from hermes_cli.session_db_heavy_gate import (
-    SessionDBHeavyReadBusy,
-    session_db_heavy_read_slot,
-)
 from tui_gateway.event_replay import replay_epoch
 
 _log = logging.getLogger(__name__)
@@ -321,28 +317,6 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def _dispatch_ws_request(req: Any, transport: WSTransport | None) -> dict | None:
-    """Dispatch one WS JSON-RPC request.
-
-    Heavy SessionDB list scans queue on the event loop before they occupy a
-    worker thread. For those methods we bypass ``server.dispatch`` because it
-    would only schedule the long-handler pool job and return, releasing the gate
-    before the actual DB read finished.
-    """
-    req_id = req.get("id") if isinstance(req, dict) else None
-    req_method = req.get("method") if isinstance(req, dict) else None
-    if server.is_session_db_heavy_method(req_method):
-        try:
-            async with session_db_heavy_read_slot(
-                surface="ws",
-                operation=str(req_method),
-            ):
-                return await asyncio.to_thread(server.handle_request_bound, req, transport)
-        except SessionDBHeavyReadBusy as exc:
-            return server.backend_busy_error(req_id, exc)
-    return await asyncio.to_thread(server.dispatch, req, transport)
-
-
 async def handle_ws(
     ws: Any,
     *,
@@ -513,7 +487,7 @@ async def handle_ws(
                 continue
 
             try:
-                resp = await _dispatch_ws_request(req, transport)
+                resp = await asyncio.to_thread(server.dispatch, req, transport)
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(

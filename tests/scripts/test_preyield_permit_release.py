@@ -1,20 +1,12 @@
-"""Regression + guard tests for the pre-yield permit leak class.
+"""Guard tests for the pre-yield permit leak class.
 
-Two halves:
-
-1. A BEHAVIOUR test on the live site — ``session_db_heavy_read_slot`` must hand
-   its permit back when its pre-yield region raises, and a fresh caller must be
-   admitted immediately afterwards (the burned-slot symptom, not just the
-   counter).  Mirrors ``tests/gateway/test_turn_concurrency.py::
-   test_pre_yield_failure_releases_acquired_permits`` from PR #827.
-
-2. The pytest wrapper for ``scripts/check_preyield_permit_release.py`` — the
-   repo-level guard that stops a THIRD such context manager landing unguarded.
-   Same shape as ``tests/tools/test_subprocess_stdin_guard.py``.
+The pytest wrapper for ``scripts/check_preyield_permit_release.py`` — the
+repo-level guard that stops a new acquire-before-yield context manager landing
+unguarded. The live site's behaviour test is
+``tests/gateway/test_turn_concurrency.py::test_pre_yield_failure_releases_acquired_permits``
+(PR #827). Same shape as ``tests/tools/test_subprocess_stdin_guard.py``.
 """
 
-import asyncio
-import ast
 import importlib.util
 import subprocess
 import sys
@@ -36,78 +28,6 @@ def _load_guard():
 
 
 # --------------------------------------------------------------------------
-# 1. Behaviour: the live site releases when the pre-yield region raises.
-# --------------------------------------------------------------------------
-
-
-def test_pre_yield_failure_releases_the_heavy_read_permit(monkeypatch):
-    """Anything raised after acquire but before yield must release the permit.
-
-    ``session_db_heavy_read_slot`` is an async generator: if it raises before
-    its first ``yield``, ``__aexit__`` never runs, so the pre-yield region is
-    the ONLY place that can hand the permit back.  Without that guard, each
-    fault burns one of ``max_concurrency`` permits permanently; at zero, every
-    heavy read sheds ``SessionDBHeavyReadBusy`` until the process restarts.
-
-    The statements in that window (``_record_stats``, ``_LOG.info``) do not
-    raise today — this is a latent leak, gated so a refactor cannot make it
-    live.  Injected at ``_record_stats``, the window's first statement.
-    """
-    from hermes_cli import session_db_heavy_gate as gate
-
-    cap = 2
-    gate.reset_session_db_heavy_read_gate_for_tests()
-    monkeypatch.setattr(gate, "_configured_max_concurrency", lambda: cap)
-
-    calls = []
-    real_record_stats = gate._record_stats
-
-    def boom(**kwargs):
-        if kwargs.get("acquired"):
-            calls.append(kwargs)
-            raise RuntimeError("injected pre-yield fault")
-        return real_record_stats(**kwargs)
-
-    async def run():
-        semaphore = gate.session_db_heavy_read_semaphore()
-        assert semaphore._value == cap
-
-        monkeypatch.setattr(gate, "_record_stats", boom)
-        entered = False
-        with pytest.raises(RuntimeError, match="injected pre-yield fault"):
-            async with gate.session_db_heavy_read_slot(
-                surface="test", operation="victim"
-            ):
-                entered = True
-
-        assert calls, "pre-yield region did not reach the injected fault"
-        assert entered is False
-        assert semaphore._value == cap, "permit burned by the pre-yield raise"
-
-        # The burned-slot symptom: repeat it cap times, then a healthy caller
-        # must still be served immediately rather than shed.
-        for _ in range(cap):
-            with pytest.raises(RuntimeError):
-                async with gate.session_db_heavy_read_slot(
-                    surface="test", operation="victim"
-                ):
-                    pass
-
-        monkeypatch.setattr(gate, "_record_stats", real_record_stats)
-        served = False
-        async with gate.session_db_heavy_read_slot(
-            surface="test", operation="healthy"
-        ):
-            served = True
-
-        assert served, "gate starved: a healthy caller was shed after the faults"
-        assert semaphore._value == cap
-
-    asyncio.run(run())
-    gate.reset_session_db_heavy_read_gate_for_tests()
-
-
-# --------------------------------------------------------------------------
 # 2. The repo-level guard.
 # --------------------------------------------------------------------------
 
@@ -123,20 +43,6 @@ def test_repo_has_no_unguarded_preyield_permit_acquires():
     assert result.returncode == 0, (
         f"pre-yield permit release check failed:\n{result.stdout}\n{result.stderr}"
     )
-
-
-def test_guard_enumerates_the_live_heavy_read_site():
-    """Positive coverage assertion: a guard that enumerates nothing is vacuous.
-
-    Named, not counted — "still clean" is indistinguishable from "clean because
-    the discovery shape broke and found zero sites".
-    """
-    guard = _load_guard()
-    source = (REPO_ROOT / "hermes_cli" / "session_db_heavy_gate.py").read_text()
-    sites, violations = guard.scan_source(source, "hermes_cli/session_db_heavy_gate.py")
-
-    assert [s["function"] for s in sites] == ["session_db_heavy_read_slot"]
-    assert violations == []
 
 
 def test_guard_flags_an_unguarded_acquire_before_yield():
@@ -1072,92 +978,3 @@ def test_guard_fires_on_a_partial_release_mutation_of_the_live_site():
     assert [v["function"] for v in violations] == ["slot"], (
         "a partial release at the live multi-permit site must be flagged"
     )
-
-
-# --------------------------------------------------------------------------
-# 4. Gate module: the aborted pre-yield window must not be counted as served.
-# --------------------------------------------------------------------------
-
-
-def test_aborted_pre_yield_window_records_no_admission_stats(monkeypatch):
-    """An abort before the yield means the caller never got the slot.
-
-    ``_record_stats`` used to run FIRST in the window, so a fault after it left
-    acquired_count / queued_count / queue_wait_seconds_total counting a slot
-    that was never granted — the counters overstated served load exactly when
-    the gate was faulting. It now runs LAST in the guarded window.
-    """
-    from hermes_cli import session_db_heavy_gate as gate
-
-    gate.reset_session_db_heavy_read_gate_for_tests()
-    monkeypatch.setattr(gate, "_configured_max_concurrency", lambda: 2)
-    # Force was_queued so the log call (the injection point) is reached.
-    monkeypatch.setattr(gate, "_QUEUE_WAIT_LOG_THRESHOLD_S", -1.0)
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("injected pre-yield fault")
-
-    async def run():
-        semaphore = gate.session_db_heavy_read_semaphore()
-        monkeypatch.setattr(gate._LOG, "info", boom)
-
-        entered = False
-        with pytest.raises(RuntimeError, match="injected pre-yield fault"):
-            async with gate.session_db_heavy_read_slot(
-                surface="test", operation="victim"
-            ):
-                entered = True
-        assert entered is False
-        assert semaphore._value == 2, "permit burned by the pre-yield raise"
-
-        stats = gate.session_db_heavy_read_stats()
-        assert stats["acquired_count"] == 0, (
-            "an aborted pre-yield window counted a slot the caller never got"
-        )
-        assert stats["queued_count"] == 0
-        assert stats["queue_wait_seconds_total"] == 0.0
-
-        # ...and a GRANTED admission is still counted.
-        monkeypatch.undo()
-        monkeypatch.setattr(gate, "_configured_max_concurrency", lambda: 2)
-        async with gate.session_db_heavy_read_slot(
-            surface="test", operation="healthy"
-        ):
-            pass
-        assert gate.session_db_heavy_read_stats()["acquired_count"] == 1
-
-    asyncio.run(run())
-    gate.reset_session_db_heavy_read_gate_for_tests()
-
-
-def test_max_concurrency_read_does_not_deepcopy_config_per_admission():
-    """The cap read runs on the event loop per admission — keep it off load_config().
-
-    ``load_config()`` performs a full expansion + ``copy.deepcopy`` per call
-    (measured ~429 us against the live 22 KB config.yaml, vs ~4.6 us for the
-    read-only variant). Both share the same (mtime_ns, size) freshness key, so
-    this is a cost change, not a behaviour change.
-    """
-    from hermes_cli import session_db_heavy_gate as gate
-
-    # AST, not a text grep: the docstring legitimately names load_config to
-    # explain the choice, so only real imports/calls count.
-    tree = ast.parse(Path(gate.__file__).read_text())
-    imported = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        for alias in node.names
-    }
-    called = {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    assert "read_raw_config_readonly" in imported
-    assert "load_config" not in imported, (
-        "the per-admission cap read must not go through load_config()"
-    )
-    assert "load_config" not in called
-    # Still resolves to a usable positive cap.
-    assert gate._configured_max_concurrency() >= 1

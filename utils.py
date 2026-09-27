@@ -626,6 +626,41 @@ def atomic_roundtrip_yaml_save(
 ) -> None:
     """Persist a full config-state dict while preserving comments and ordering.
 
+    See :func:`roundtrip_yaml_render` for the reconciliation rules; this
+    wrapper renders and then writes atomically (temp + fsync + replace).
+    """
+    path = Path(path)
+    text = roundtrip_yaml_render(path, new_state)
+    original_mode = _preserve_file_mode(path)
+    original_owner = _preserve_file_owner(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        real_path = atomic_replace(tmp_path, path)
+        real_path_obj = Path(real_path)
+        _restore_file_owner(real_path_obj, original_owner)
+        _restore_file_mode(real_path_obj, original_mode)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def roundtrip_yaml_render(
+    path: Union[str, Path],
+    new_state: dict,
+) -> str:
+    """Render ``new_state`` over the on-disk YAML at ``path``, keeping comments.
+
     Behaves like ``atomic_yaml_write`` (writes the whole file in one shot from
     ``new_state``), but routes through ruamel.yaml round-trip mode so existing
     comments, key order, quotes, and readable Unicode survive.
@@ -653,6 +688,8 @@ def atomic_roundtrip_yaml_save(
     ``new_state``. Imported lazily to avoid a module-level circular import —
     ``hermes_cli.config`` itself imports from this module.
     """
+    import io
+
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
     from ruamel.yaml.scalarstring import DoubleQuotedScalarString
@@ -695,6 +732,26 @@ def atomic_roundtrip_yaml_save(
             return DoubleQuotedScalarString(value)
         return value
 
+    def _same_scalar(a, b) -> bool:
+        # Skip re-assigning an unchanged leaf: assignment drops ruamel's
+        # preserved quoting/number style for that value. bool is an int
+        # subclass, so keep True from comparing equal to an on-disk 1.
+        if isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
+            return False
+        return a == b and isinstance(a, bool) == isinstance(b, bool)
+
+    def _merge_list(dst: list, src: list) -> None:
+        # Same-length lists reconcile element-wise so comments attached to
+        # untouched items survive (e.g. ``custom_providers.0.api_key``).
+        for idx, value in enumerate(src):
+            current = dst[idx]
+            if isinstance(value, dict) and isinstance(current, CommentedMap):
+                _merge(current, value)
+            elif isinstance(value, list) and isinstance(current, list) and len(value) == len(current):
+                _merge_list(current, value)
+            elif not _same_scalar(current, value):
+                dst[idx] = _quote_if_yaml11_ambiguous(value)
+
     def _merge(dst: CommentedMap, src: dict) -> None:
         # Update / recurse into keys present in src.
         for key, value in src.items():
@@ -704,6 +761,14 @@ def atomic_roundtrip_yaml_save(
                     current = CommentedMap()
                     dst[key] = current
                 _merge(current, value)
+            elif (
+                isinstance(value, list)
+                and isinstance(dst.get(key), list)
+                and len(dst[key]) == len(value)
+            ):
+                _merge_list(dst[key], value)
+            elif key in dst and _same_scalar(dst[key], value):
+                continue
             else:
                 dst[key] = _quote_if_yaml11_ambiguous(value)
         # Delete keys missing from src — preserves "explicit absence" semantics
@@ -714,28 +779,9 @@ def atomic_roundtrip_yaml_save(
 
     _merge(existing, new_state)
 
-    original_mode = _preserve_file_mode(path)
-    original_owner = _preserve_file_owner(path)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f".{path.stem}_",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml_rt.dump(existing, f)
-            f.flush()
-            os.fsync(f.fileno())
-        real_path = atomic_replace(tmp_path, path)
-        real_path_obj = Path(real_path)
-        _restore_file_owner(real_path_obj, original_owner)
-        _restore_file_mode(real_path_obj, original_mode)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    buf = io.StringIO()
+    yaml_rt.dump(existing, buf)
+    return buf.getvalue()
 
 
 # ─── JSON Helpers ─────────────────────────────────────────────────────────────

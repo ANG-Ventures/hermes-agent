@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.hermes_cli._survivor_gh_fake import rest_pr
+
 from hermes_cli import kanban_db as kb
 
 HEAD = "a1" * 20
@@ -38,7 +40,7 @@ def remote(monkeypatch):
     def run(args, **kwargs):
         if args[0] == "gh":
             calls.append(list(args))
-            return subprocess.CompletedProcess(args, 0, json.dumps(state).encode(), b"")
+            return subprocess.CompletedProcess(args, 0, json.dumps(rest_pr(state)).encode(), b"")
         if "ls-remote" in args and "-C" not in args:
             calls.append(list(args))
             return subprocess.CompletedProcess(

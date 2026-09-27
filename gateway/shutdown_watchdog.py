@@ -601,13 +601,54 @@ def resolve_shutdown_watchdog_delay(
     return drain + grace
 
 
+def _format_asyncio_tasks(
+    loop: Optional[asyncio.AbstractEventLoop], *, frame_limit: int = 12
+) -> str:
+    """Coroutine stacks of every task on ``loop``, for the watchdog dump.
+
+    faulthandler shows threads only: when the loop thread is idle in
+    ``select()`` the dump cannot say WHICH await the stop path is parked on
+    (3 of the 8 force-exits of 2026-09-24/25 looked exactly like that,
+    t_8d085477). Called from the watchdog thread while the loop is either
+    wedged or idle; reading task frames cross-thread is racy but read-only,
+    and a set mutating under iteration is retried, then reported.
+    """
+    if loop is None:
+        return "(no loop registered)\n"
+    tasks = None
+    for _ in range(5):
+        try:
+            tasks = list(asyncio.all_tasks(loop))
+            break
+        except RuntimeError:
+            continue
+    if tasks is None:
+        return "(asyncio.all_tasks kept changing under iteration)\n"
+    lines = [f"{len(tasks)} task(s)"]
+    for task in tasks:
+        try:
+            coro = task.get_coro()
+            name = getattr(coro, "__qualname__", None) or repr(coro)
+            lines.append(f"Task {task.get_name()!r} coro={name} done={task.done()}")
+            for frame in task.get_stack(limit=frame_limit):
+                code = frame.f_code
+                lines.append(
+                    f"  File \"{code.co_filename}\", line {frame.f_lineno} "
+                    f"in {code.co_name}"
+                )
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            lines.append(f"  (task inspection failed: {exc!r})")
+    return "\n".join(lines) + "\n"
+
+
 def _write_watchdog_dump(
     dump_path: Path,
     *,
     delay_s: float,
     snapshot: Optional[Dict[str, Any]],
+    loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> None:
-    """Best-effort faulthandler + metadata dump before hard-exit."""
+    """Best-effort faulthandler + asyncio-task + metadata dump before hard-exit."""
     try:
         dump_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -629,6 +670,11 @@ def _write_watchdog_dump(
                 faulthandler.dump_traceback(file=fh, all_threads=True)
             except Exception:
                 fh.write("(faulthandler.dump_traceback failed)\n")
+            fh.write("--- asyncio tasks ---\n")
+            try:
+                fh.write(_format_asyncio_tasks(loop))
+            except Exception:
+                fh.write("(asyncio task dump failed)\n")
             fh.write("--- end dump ---\n")
             fh.flush()
     except Exception:
@@ -655,6 +701,7 @@ def arm_shutdown_watchdog(
     exit_code: int = 1,
     dump_path: Optional[Path] = None,
     name: str = "gateway-shutdown-watchdog",
+    loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> Optional[threading.Event]:
     """Arm a daemon-thread hard-exit backstop for a wedged shutdown path.
 
@@ -681,10 +728,20 @@ def arm_shutdown_watchdog(
     passed in, and a ``None`` there means only that the optional backstop is
     absent, which is the pre-existing behaviour.
 
+    ``loop``: the event loop whose task stacks the dump should include;
+    defaults to the running loop of the arming thread, if any.
+
     The deliberate ``delay_s <= 0`` disable still returns the event: nothing
     was armed, but nothing was asked for either, so it is not a failure.
     """
     done = done_event if done_event is not None else threading.Event()
+    if loop is None:
+        # Armed from a coroutine on the gateway loop (the stop path): capture
+        # it so the dump can include that loop's task stacks.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
     try:
         delay = max(float(delay_s), 0.0)
     except (TypeError, ValueError):
@@ -712,7 +769,7 @@ def arm_shutdown_watchdog(
                 snapshot = {"snapshot_error": repr(exc)}
 
         target = dump_path if dump_path is not None else get_shutdown_watchdog_dump_path()
-        _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot)
+        _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot, loop=loop)
 
         try:
             logger.critical(
