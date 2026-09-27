@@ -8805,7 +8805,10 @@ class GatewaySlashCommandsMixin:
             try:
                 from gateway.run import _invalidate_skill_slug_index
 
-                _invalidate_skill_slug_index()
+                # Off-loop: the invalidation takes _skill_slug_index_lock, which
+                # a cold index build holds for its whole rglob walk (C5 #33,
+                # PR #969). Blocking on it here would stall the event loop.
+                await loop.run_in_executor(None, _invalidate_skill_slug_index)
             except Exception:
                 logger.debug("skill slug index invalidation failed", exc_info=True)
             added = result.get("added", [])      # [{"name", "description"}, ...]
