@@ -32,6 +32,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
     FailoverReason,
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
+    _extract_status_code,
 )
 from agent.errors import EmptyStreamError, ProviderStreamParseError
 from agent.turn_context import substitute_api_content
@@ -64,6 +65,10 @@ from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
+
+# Pre-delivery stream failures with these statuses are recoverable capacity
+# signals (rate limit / pool exhausted / overloaded), not faults at this layer.
+_CAPACITY_STATUS_CODES = frozenset({429, 503, 529})
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
@@ -6800,10 +6805,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "   To avoid this delay, set display.streaming: false "
                                 "in config.yaml\n"
                             )
-                        logger.exception(
-                            "Streaming failed before delivery: %s",
-                            e,
-                        )
+                        if _extract_status_code(e) in _CAPACITY_STATUS_CODES:
+                            # Capacity (429 / 503 / 529): the main loop owns
+                            # retry + fallback and logs ERROR ("API call failed
+                            # after N retries") only if the turn is lost.
+                            logger.warning(
+                                "Streaming failed before delivery: %s",
+                                e,
+                            )
+                        else:
+                            logger.exception(
+                                "Streaming failed before delivery: %s",
+                                e,
+                            )
 
                     # Propagate the error to the main retry loop instead of
                     # falling back to non-streaming inline.  The main loop has
