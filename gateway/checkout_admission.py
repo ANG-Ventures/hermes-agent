@@ -51,6 +51,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -239,8 +240,11 @@ class HoldStore:
                     raise HoldConflict(
                         f"{exc}; its owner is unknown -- re-hold with "
                         "--recover-unreadable to take it over") from exc
+                # Copy, don't move: hold.json stays in place (closed) until
+                # _atomic_write_json swaps the replacement in, so a crash or
+                # write failure here can never leave admission open.
                 with contextlib.suppress(OSError):
-                    os.replace(self.hold_path, self.directory / f"hold.unreadable.{int(time.time())}.json")
+                    shutil.copyfile(self.hold_path, self.directory / f"hold.unreadable.{int(time.time())}.json")
                 logger.warning("checkout admission: %s took over an unreadable hold", owner)
                 current = None  # re-holding over garbage keeps it CLOSED
             if current is not None and current.owner != owner:

@@ -706,6 +706,25 @@ def test_unreadable_hold_cannot_be_taken_over_without_explicit_recovery(store):
     assert list(store.directory.glob("hold.unreadable.*.json"))  # kept for audit
 
 
+def test_recover_unreadable_keeps_hold_closed_if_replacement_write_fails(store, monkeypatch):
+    """#1354 checkout_admission.py:242: --recover-unreadable must not move the
+    unreadable hold away before its replacement is installed; a failed write
+    must leave hold.json in place (admission still refused), not absent."""
+    store.hold("owner-a", [GW])
+    store.hold_path.write_text("garbage", encoding="utf-8")
+
+    def boom(path, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ca, "_atomic_write_json", boom)
+    with pytest.raises(OSError):
+        store.hold("op", [GW], recover_unreadable=True)
+    assert store.hold_path.read_text(encoding="utf-8") == "garbage"
+    with pytest.raises(HoldUnreadable):
+        store.read_hold()  # still fail-closed, never None (open)
+    assert list(store.directory.glob("hold.unreadable.*.json"))  # audit copy
+
+
 def test_consumer_name_shared_by_two_live_processes_is_unknown(store):
     """#1035 checkout_admission.py:419: a busy and an idle process publishing
     under ONE consumer name must not let the idle snapshot read QUIESCENT."""
