@@ -1000,8 +1000,9 @@ def test_wiring_resume_after_three_evictions_and_restart(wired):
     fss.default_store().evict_memory()                      # gateway restart
     b = _fresh_rebuild(home, calls, st0)
     assert len(_rows(home, "sticky_resume")) == 4
+    assert _restore(b) is False  # first turn consumes the rebuild decision
     _age_episode(b, fallback_idle=61 * 60)
-    assert _restore(b) is True
+    assert _restore(b) is True  # later turn can return once eligible
     assert (b.provider, b.model) == FABLE and b.client.tag == "primary"
 
 
@@ -1096,6 +1097,36 @@ def test_wiring_g2_one_decision_one_notice_per_rebuild(wired):
     notices = [m for _k, m in d._announced if m.startswith("🔄 Model recovery")]
     assert len(notices) == 1 and "primary eligible on sub-vps-6" in notices[0]
     assert rec["notice_text"] == notices[0]
+
+
+@pytest.mark.parametrize("warm_refusal", [False, True])
+def test_wiring_rebuild_refusal_is_once_per_turn(wired, monkeypatch, warm_refusal):
+    """A fresh resume and its turn-start restore are one refused decision;
+    a cached agent makes a new decision on the next turn."""
+    home, calls = wired
+    a = _wired_agent()
+    assert _fail(a, CONN()) is True
+    if warm_refusal:
+        monkeypatch.setattr(_fw, "warm_refusal_arm", lambda key: True)
+        _age_episode(a, until_ago=300, fallback_idle=600, last_primary_ago=60 * 60)
+    runner, key = _runner_env(home, OPUS)
+    b = _wired_agent()
+    _prerun(runner, key, b)
+    assert (b.provider, b.model) == OPUS
+    assert len(_rows(home, "restore_refused")) == 1
+    assert len(_rows(home, "sticky_resume")) == 1
+    eligibility_polls = calls["elig"]
+    assert eligibility_polls == (1 if warm_refusal else 0)
+
+    from agent.agent_runtime_helpers import restore_primary_runtime
+    assert restore_primary_runtime(b) is False
+    assert (b.provider, b.model) == OPUS
+    assert len(_rows(home, "restore_refused")) == 1
+    assert calls["elig"] == eligibility_polls  # no second warm-path poll
+
+    assert restore_primary_runtime(b) is False  # next turn, cached agent
+    assert len(_rows(home, "restore_refused")) == 2
+    assert len(_rows(home, "sticky_resume")) == 1
 
 
 def test_wiring_db_only_restart_fallback_cold_and_compaction(wired):

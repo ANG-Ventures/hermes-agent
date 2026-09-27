@@ -455,8 +455,11 @@ def decide_rebuild_for_agent(agent: Any) -> str:
                     "sticky_until_epoch": rd.state.until_epoch,
                     "from_provider": rd.state.fallback_provider,
                     "from_model": rd.state.fallback_model})
-                agent._fallback_restore_refused_logged = False
-            return "resume" if resume_sticky_fallback(agent, rd.state) else "primary"
+            resumed = resume_sticky_fallback(agent, rd.state)
+            if resumed and rd.decision is not None:
+                # Turn-start restore would repeat this construction-time decision.
+                agent._sticky_rebuild_refusal_pending = True
+            return "resume" if resumed else "primary"
         if rd.action == "return" and rd.state is not None and rd.decision is not None:
             # rd.state is post-record_return (active=false); the row wants
             # the episode fields, which record_return keeps.
