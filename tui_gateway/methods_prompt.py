@@ -346,8 +346,10 @@ def _(rid, params: dict) -> dict:
     # from) that the model must see but the user did not say. It rides in the
     # SYSTEM prompt for this turn instead of the user text: a header line in
     # the user message gets mirrored into a share of replies (t_c6793d84).
-    # Rewritten on every submit, so omitting it clears the previous value.
-    session["turn_system_context"] = _turn_system_context(params.get("system_context"))
+    # Bound to THIS submit: stored on the session only when this submit claims
+    # the turn, and carried in the queue envelope when it arrives mid-turn, so
+    # a later submit cannot overwrite (or clear) a queued turn's context.
+    turn_system_context = _turn_system_context(params.get("system_context"))
     has_truncation = (
         truncate_user_ordinal is not None
         or params.get("truncate_before_row_id") is not None
@@ -382,6 +384,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            system_context=turn_system_context,
         )
         if busy_response is not None:
             return busy_response
@@ -816,6 +819,7 @@ def _(rid, params: dict) -> dict:
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
         session["running"] = True
+        session["turn_system_context"] = turn_system_context
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)

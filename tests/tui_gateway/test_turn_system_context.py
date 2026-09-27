@@ -151,29 +151,76 @@ class TestNormalization:
         assert server._with_turn_system_context("base", "") == "base"
 
 
-class TestSubmitRecording:
-    """``prompt.submit`` stores the context per submit, like ``surface``."""
+class TestQueuedSubmitKeepsItsOwnContext:
+    """A mid-turn submit carries its context in the queue envelope.
+
+    The context used to live in ``session["turn_system_context"]`` and be
+    rewritten on every submit, so a queued turn ran with whatever the LAST
+    submit sent (another room's metadata, or none).
+    """
+
+    ROOM2 = "Turn metadata (trusted): origin_room=office"
 
     @pytest.fixture
-    def busy_session(self):
-        session = _session(running=True)
-        server._sessions["sid"] = session
-        yield session
-        server._sessions.pop("sid", None)
-
-    def _submit(self, **params):
-        return server._methods["prompt.submit"](
-            "r1", {"session_id": "sid", "text": "what is this?", "queued": True, **params}
+    def busy(self, turn_env):
+        runs: list = []
+        agent = types.SimpleNamespace(
+            session_id="agent-sid",
+            ephemeral_system_prompt="PROFILE PERSONA",
+            clear_interrupt=lambda: None,
         )
 
-    def test_recorded(self, busy_session):
-        self._submit(system_context=ROOM_LINE)
-        assert busy_session["turn_system_context"] == ROOM_LINE
+        def run_conversation(user_message, **kwargs):
+            runs.append((user_message, agent.ephemeral_system_prompt))
+            return {"final_response": "pong"}
 
-    def test_next_submit_without_it_clears_it(self, busy_session):
-        self._submit(system_context=ROOM_LINE)
-        self._submit()
-        assert busy_session["turn_system_context"] == ""
+        agent.run_conversation = run_conversation
+        session = _session(agent=agent, running=True)
+        server._sessions["sid"] = session
+        yield session, runs
+        server._sessions.pop("sid", None)
+
+    def _submit(self, text, **params):
+        return server._methods["prompt.submit"](
+            "r1", {"session_id": "sid", "text": text, "queued": True, **params}
+        )
+
+    def _drain_all(self, session):
+        for _ in range(4):
+            with session["history_lock"]:
+                session["running"] = False
+            if not session.get("queued_prompt"):
+                return
+            server._drain_queued_prompt("rid", "sid", session)
+
+    def test_later_submit_does_not_overwrite_queued_context(self, busy):
+        session, runs = busy
+        self._submit("A", system_context=ROOM_LINE)
+        self._submit("B", system_context=self.ROOM2)
+        # Busy submits never touch the live turn's context.
+        assert session.get("turn_system_context") is None
+        self._drain_all(session)
+        assert runs == [
+            ("A", "PROFILE PERSONA\n\n" + ROOM_LINE),
+            ("B", "PROFILE PERSONA\n\n" + self.ROOM2),
+        ]
+
+    def test_later_submit_without_context_does_not_clear_it(self, busy):
+        session, runs = busy
+        self._submit("A", system_context=ROOM_LINE)
+        self._submit("B")
+        self._drain_all(session)
+        assert runs == [
+            ("A", "PROFILE PERSONA\n\n" + ROOM_LINE),
+            ("B", "PROFILE PERSONA"),
+        ]
+
+    def test_same_context_submits_still_merge(self, busy):
+        session, runs = busy
+        self._submit("A", system_context=ROOM_LINE)
+        self._submit("B", system_context=ROOM_LINE)
+        self._drain_all(session)
+        assert runs == [("A\n\nB", "PROFILE PERSONA\n\n" + ROOM_LINE)]
 
 
 def test_session_create_advertises_the_capability():
