@@ -3625,6 +3625,83 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
+# Agent attributes try_activate_fallback mutates when it switches runtimes.
+# Restored as a unit when activation raises part-way (t_dce419d4).
+_SWITCH_STATE_ATTRS = (
+    "_config_context_length", "model", "provider", "requested_provider",
+    "base_url", "api_mode", "_reasoning_echo_flag", "_fallback_activated",
+    "reasoning_config", "_credential_pool", "_credential_pool_entry_id",
+    "api_key", "_anthropic_api_key", "_anthropic_base_url",
+    "_anthropic_client", "_is_anthropic_oauth", "client", "_client_kwargs",
+    "_use_prompt_caching", "_use_native_cache_layout", "request_overrides",
+    "_cached_system_prompt", "_provider_fallback_active",
+    "_provider_fallback_route",
+)
+_COMPRESSOR_STATE_ATTRS = (
+    "model", "context_length", "base_url", "api_key", "provider", "api_mode",
+)
+_MISSING = object()
+
+
+def _snapshot_switch_state(agent) -> Dict[str, Any]:
+    """Capture the runtime fields a fallback switch mutates."""
+    snap: Dict[str, Any] = {
+        "attrs": {a: getattr(agent, a, _MISSING) for a in _SWITCH_STATE_ATTRS},
+        "compressor": None,
+        "_aux_token": None,
+    }
+    comp = getattr(agent, "context_compressor", None)
+    if comp:
+        snap["compressor"] = {
+            a: getattr(comp, a, _MISSING) for a in _COMPRESSOR_STATE_ATTRS
+        }
+    return snap
+
+
+def _restore_switch_state(agent, snap: Dict[str, Any]) -> None:
+    """Undo a partially applied fallback switch. Best-effort per field."""
+    for attr, value in snap["attrs"].items():
+        try:
+            if value is _MISSING:
+                if attr in getattr(agent, "__dict__", {}):
+                    delattr(agent, attr)
+            else:
+                setattr(agent, attr, value)
+        except Exception:  # noqa: BLE001 — restore every field we can
+            logger.debug("fallback rollback: could not restore %s", attr, exc_info=True)
+    comp_snap = snap.get("compressor")
+    comp = getattr(agent, "context_compressor", None)
+    if comp_snap and comp and _MISSING not in (
+        comp_snap["model"], comp_snap["context_length"],
+    ) and any(
+        getattr(comp, a, _MISSING) != v for a, v in comp_snap.items()
+    ):
+        try:
+            comp.update_model(
+                model=comp_snap["model"],
+                context_length=comp_snap["context_length"],
+                base_url=comp_snap["base_url"] if comp_snap["base_url"] is not _MISSING else "",
+                api_key=comp_snap["api_key"] if comp_snap["api_key"] is not _MISSING else "",
+                provider=comp_snap["provider"] if comp_snap["provider"] is not _MISSING else "",
+                api_mode=comp_snap["api_mode"] if comp_snap["api_mode"] is not _MISSING else "",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("fallback rollback: could not restore compressor", exc_info=True)
+    token = snap.get("_aux_token")
+    if token is not None:
+        try:
+            from agent.auxiliary_client import reset_runtime_main
+
+            reset_runtime_main(token)
+        except Exception:  # noqa: BLE001
+            logger.debug("fallback rollback: could not reset aux runtime", exc_info=True)
+    if hasattr(agent, "_transport_cache"):
+        try:
+            agent._transport_cache.clear()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def try_activate_fallback(
     agent,
     reason: "FailoverReason | None" = None,
@@ -3828,6 +3905,7 @@ def try_activate_fallback(
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
+    _switch_snapshot = None
     try:
         from agent.auxiliary_client import resolve_provider_client
         # Pass base_url and api_key from fallback config so custom
@@ -3947,6 +4025,12 @@ def try_activate_fallback(
         # and audit sink need the OLD (primary) effort to compare against the
         # fallback entry's effort. See _effort_label / _append_route_change.
         _old_reasoning_config = getattr(agent, "reasoning_config", None)
+        # Snapshot every runtime field the switch below mutates. If anything
+        # after this point raises, the outer ``except`` restores it before
+        # trying the next entry / returning False — otherwise the agent is
+        # left half-switched onto a broken route while callers read False as
+        # "still on the previous runtime" (t_dce419d4).
+        _switch_snapshot = _snapshot_switch_state(agent)
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
         # the stale value from the previous model.  See #22387.
@@ -4059,7 +4143,7 @@ def try_activate_fallback(
             # (e.g. the Codex OAuth token) instead of pinning the stale
             # primary key. provider+model+base_url+api_mode are the load-
             # bearing fields for correct routing and are all final here.
-            set_runtime_main(
+            _switch_snapshot["_aux_token"] = set_runtime_main(
                 fb_provider, fb_model,
                 base_url=fb_base_url,
                 api_key="",
@@ -4418,6 +4502,8 @@ def try_activate_fallback(
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
+        if _switch_snapshot is not None:
+            _restore_switch_state(agent, _switch_snapshot)
         return agent._try_activate_fallback(reason, error_context=error_context, display_reason=display_reason)  # try next in chain
 
 
