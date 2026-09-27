@@ -1083,6 +1083,8 @@ def _worktree_git(worktree: Path, *argv: str) -> "subprocess.CompletedProcess[st
         ["git", "-C", str(worktree), *argv],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=_WORKTREE_GIT_TIMEOUT_S,
         env=env,
         check=False,
@@ -1142,7 +1144,7 @@ def _worktree_bundle_meta(worktree: Path, commits: int) -> Dict[str, Any]:
     """
     meta: Dict[str, Any] = {"commits": commits}
     try:
-        meta["gitdir"] = (worktree / ".git").read_text(errors="replace").strip()
+        meta["gitdir"] = (worktree / ".git").read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         pass
     for key, argv in (

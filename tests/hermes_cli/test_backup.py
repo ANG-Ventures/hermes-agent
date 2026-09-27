@@ -2251,7 +2251,8 @@ class TestWorktreeUnpushedCommitBundles:
         env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
                    GIT_COMMITTER_EMAIL="t@t")
         return subprocess.run(["git", "-C", str(cwd), *argv], check=True,
-                              capture_output=True, text=True, env=env).stdout.strip()
+                              capture_output=True, text=True, encoding="utf-8",
+                              env=env).stdout.strip()
 
     def test_unpushed_worktree_commits_are_recoverable_from_archive(self, tmp_path, monkeypatch):
         import shutil as _sh
@@ -2262,7 +2263,7 @@ class TestWorktreeUnpushedCommitBundles:
         _make_hermes_tree(hermes_home)
         parent = tmp_path / "parent"   # stands in for ~/.hermes/.git: never archived
         self._git(tmp_path, "init", "-q", "-b", "main", str(parent))
-        (parent / "a.txt").write_text("a\n")
+        (parent / "a.txt").write_text("a\n", encoding="utf-8")
         self._git(parent, "add", "a.txt")
         self._git(parent, "commit", "-q", "-m", "base")
         remote = tmp_path / "remote.git"  # holds only the base commit
@@ -2275,7 +2276,7 @@ class TestWorktreeUnpushedCommitBundles:
         clean = hermes_home / "wt" / "clean"
         self._git(parent, "worktree", "add", "-q", "-b", "feat", str(dirty), "main")
         self._git(parent, "worktree", "add", "-q", "--detach", str(clean), "main")
-        (dirty / "b.txt").write_text("unique\n")
+        (dirty / "b.txt").write_text("unique\n", encoding="utf-8")
         self._git(dirty, "add", "b.txt")
         self._git(dirty, "commit", "-q", "-m", "unpushed work")
         unique_sha = self._git(dirty, "rev-parse", "HEAD")
