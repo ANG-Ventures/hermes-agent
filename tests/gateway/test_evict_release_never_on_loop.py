@@ -11,8 +11,13 @@ The hole (t_fc4d28db): when ``Thread.start()`` raised -- thread exhaustion,
 ``RuntimeError: can't start new thread``, a condition this fleet has hit --
 every eviction site released INLINE, i.e. on the loop.  The same shape sat in
 the cross-process eviction and the memory-pressure valve.  All three now go
-through ``GatewayRunner._release_agent_off_loop``, which drops the release
-instead of running it on the caller's thread.
+through ``GatewayRunner._release_agent_off_loop``.
+
+When the thread cannot start, the helper still releases inline.  Dropping the
+release would lose the pressure valve's end-of-session memory commit (#11205)
+and its ``trim_memory``; a slow release under thread exhaustion is the lesser
+harm.  The static walker does not see that fallback because it calls the
+``target`` parameter, not a named release body.
 """
 
 from __future__ import annotations
@@ -128,16 +133,61 @@ def test_release_runs_off_the_loop_thread():
     assert loop_thread not in ran_on
 
 
-def test_thread_exhaustion_does_not_release_on_the_loop(monkeypatch):
+def _no_threads(monkeypatch):
     def _boom(self):
         raise RuntimeError("can't start new thread")
 
     monkeypatch.setattr(threading.Thread, "start", _boom)
+
+
+def test_thread_exhaustion_still_releases(monkeypatch):
+    """Thread.start() failing must not drop the release (review of #1314)."""
+    _no_threads(monkeypatch)
     runner = _runner()
     runner._agent_cache["discord:s1"] = (MagicMock(), "sig", 1)
-    loop_thread, ran_on = _evict_from_a_coroutine(runner, "discord:s1")
-    assert loop_thread not in ran_on, (
-        "Thread.start() failed and the release ran inline on the event loop"
-    )
-    # The entry is still evicted; only the eager release is dropped.
+    _loop_thread, ran_on = _evict_from_a_coroutine(runner, "discord:s1")
+    assert ran_on, "Thread.start() failed and the evicted agent was never released"
     assert "discord:s1" not in runner._agent_cache
+
+
+def test_thread_exhaustion_pressure_valve_still_commits_and_trims(monkeypatch):
+    """The pressure valve's fallback must keep the memory commit and the trim."""
+    from collections import OrderedDict
+
+    import gateway.agent_cache_pressure as acp
+    import hermes_cli.mem_trim as mem_trim
+    from gateway.agent_cache_pressure import AgentCacheBounds
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = threading.Lock()
+    runner._running_agents = {}
+    runner._agent_cache_bounds_cache = AgentCacheBounds(
+        memory_high_mb=1000, max_evictions_per_pass=8, protect_recent=1
+    )
+    monkeypatch.setattr(acp, "read_anon_rss_mb", lambda: 4000)
+
+    committed: list = []
+    released: list = []
+    runner._commit_memory_before_soft_evict = (
+        lambda agent, key: committed.append(key)
+    )
+    runner._release_evicted_agent_soft = lambda agent: released.append(agent)
+    trims: list = []
+    monkeypatch.setattr(
+        mem_trim, "trim_memory", lambda **kw: trims.append(kw) or 0,
+    )
+
+    for i in range(3):
+        agent = MagicMock()
+        agent._session_messages = [{"role": "user", "content": "x"}] * 2
+        agent._last_flushed_db_idx = 2
+        runner._agent_cache[f"s{i}"] = (agent, "sig")
+
+    _no_threads(monkeypatch)
+    assert runner._sweep_agent_cache_under_pressure() == 2
+
+    assert committed == ["s0", "s1"], "end-of-session memory commit was dropped"
+    assert len(released) == 2
+    assert trims and trims[0].get("force") is True, "trim_memory was skipped"
