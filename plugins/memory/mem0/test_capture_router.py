@@ -243,6 +243,30 @@ def test_fallback_claim_headers_sanitize_and_never_raise(monkeypatch):
     assert cr.fallback_claim_headers()["x-hermes-profile"] == "default"
 
 
+def test_fallback_headers_use_turn_profile_not_drain_thread_context(tmp_path, monkeypatch):
+    """P1 (#1340 review): the drain thread and the two-pass pool do not inherit the per-request
+    home ContextVar. The fallback claim must carry the turn's profile, not the thread's default."""
+    import types, sys as _sys
+    mod = types.ModuleType("fake_profiles")
+    mod.get_active_profile_name = lambda: "default"   # what a context-less thread resolves
+    monkeypatch.setitem(_sys.modules, "her" + "mes_cli.profiles", mod)
+    seen = []
+    base = FakeHTTP(prefs_cands=[{"content": "p", "class": "preference"}],
+                    world_cands=[{"content": "w", "class": "world_entity"}], fail_primary=True)
+
+    def http(url, body, headers, timeout):
+        seen.append((url, dict(headers)))
+        return base(url, body, headers, timeout)
+
+    router = make_router(tmp_path, http)
+    router.route_turn("u", "a", turn_id="t006", session="s", profile="coder")
+    fb = [h for u, h in seen if "18813" in u]
+    assert len(fb) == 2 and all(h["x-hermes-profile"] == "coder" for h in fb)
+    # legacy rows (no stamp) keep resolving in the current context
+    assert cr.fallback_claim_headers()["x-hermes-profile"] == "default"
+    assert cr.fallback_claim_headers("bad\r\nprofile")["x-hermes-profile"] == "bad--profile"
+
+
 def test_extractor_soft_error_when_both_fail():
     http = FakeHTTP(fail_all=True)
     ext = BridgeExtractor(http_fn=http, auth_fn=lambda ref: "s")
@@ -417,8 +441,8 @@ def test_drain_router_none_is_inert(tmp_path):
 class SpyRouter:
     def __init__(self):
         self.calls = []
-    def route_turn(self, user, assistant, *, turn_id, session, ts=None):
-        self.calls.append((user, assistant, turn_id, session))
+    def route_turn(self, user, assistant, *, turn_id, session, ts=None, profile=None):
+        self.calls.append((user, assistant, turn_id, session, profile))
         return {"error": None, "world_facts": [], "prefs_facts": []}
 
 
@@ -437,6 +461,19 @@ def test_drain_invokes_router_when_wired(tmp_path):
     assert store.add_calls == 1               # unchanged mem0 write path still ran
     assert len(spy.calls) == 1                # router invoked once
     assert spy.calls[0][3] == "sess-x"        # session threaded through
+
+
+def test_drain_threads_stamped_profile_to_router(tmp_path):
+    """The enqueue-time profile stamp reaches the router; a legacy row without it passes None."""
+    q = CaptureQueue(str(tmp_path / "cq.db"))
+    spy = SpyRouter()
+    w = _worker(q, FakeStore(), router=spy)
+    q.enqueue(idem_key("s", 1, "stamped turn", "ok"),
+              {"user": "stamped turn", "assistant": "ok", "session_id": "s", "profile": "coder"})
+    q.enqueue(idem_key("s", 2, "legacy turn", "ok"),
+              {"user": "legacy turn", "assistant": "ok", "session_id": "s"})
+    assert w.drain_once() is True and w.drain_once() is True
+    assert sorted(c[4] or "" for c in spy.calls) == ["", "coder"]
 
 
 class BoomRouter:
