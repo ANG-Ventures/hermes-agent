@@ -2673,23 +2673,35 @@ class DiscordAdapter(BasePlatformAdapter):
         # force a durable write of the active-channel map, so the post-restart
         # backfill knows how far back to scan (ANCHOR = shutdown_ts) and has the
         # latest activity map regardless of the debounce window. Fail-open — a
-        # flush error must never block teardown.
+        # flush error must never block teardown -- nor may a CANCELLED flush:
+        # a cancel mid-flush still tears the client down below, then re-raises
+        # (C5 #31, PR #967: it used to skip teardown and leave the live
+        # Discord client connected).
+        flush_cancelled = False
         try:
             await asyncio.to_thread(
                 self._restart_recovery.flush, shutdown_ts=time.time()
             )
+        except asyncio.CancelledError:
+            flush_cancelled = True
         except Exception:
             logger.debug("[%s] restart-recovery shutdown flush failed", self.name, exc_info=True)
-        try:
-            await asyncio.to_thread(self._nonconversational_messages.flush)
-        except Exception:
-            logger.debug("[%s] non-conversational ids shutdown flush failed", self.name, exc_info=True)
-        try:
-            _dead = getattr(self, "_dead_channels", None)
-            if _dead is not None:
-                await asyncio.to_thread(_dead.flush)
-        except Exception:
-            logger.debug("[%s] dead-channel ids shutdown flush failed", self.name, exc_info=True)
+        if not flush_cancelled:
+            try:
+                await asyncio.to_thread(self._nonconversational_messages.flush)
+            except asyncio.CancelledError:
+                flush_cancelled = True
+            except Exception:
+                logger.debug("[%s] non-conversational ids shutdown flush failed", self.name, exc_info=True)
+        if not flush_cancelled:
+            try:
+                _dead = getattr(self, "_dead_channels", None)
+                if _dead is not None:
+                    await asyncio.to_thread(_dead.flush)
+            except asyncio.CancelledError:
+                flush_cancelled = True
+            except Exception:
+                logger.debug("[%s] dead-channel ids shutdown flush failed", self.name, exc_info=True)
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
@@ -2743,6 +2755,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._release_platform_lock()
 
         logger.info("[%s] Disconnected", self.name)
+        if flush_cancelled:
+            raise asyncio.CancelledError()
 
     def _command_sync_state_path(self) -> _Path:
         from hermes_constants import get_hermes_home
@@ -2831,6 +2845,28 @@ class DiscordAdapter(BasePlatformAdapter):
         ):
             return "same slash-command fingerprint already synced"
         return None
+
+    @staticmethod
+    async def _state_write_off_loop(fn, *args) -> None:
+        """Run a command-sync state write (read-modify-write + atomic rename)
+        on a worker thread, and do NOT return early on cancellation: the
+        thread keeps writing after a cancelled ``to_thread``, so returning
+        would release ``_post_connect_sync_lock`` under a live write and let
+        a newer attempt interleave with it (C5 #30, PR #967). Waits for the
+        write, then re-raises the cancellation."""
+        fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(fut)
+                break
+            except asyncio.CancelledError:
+                if fut.done():
+                    break
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError()
+        fut.result()
 
     def _record_command_sync_attempt(self, app_id: Any, fingerprint: str) -> None:
         state = self._read_command_sync_state()
@@ -3129,7 +3165,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
             # _record_command_sync_* end in atomic_json_write (fsync + rename):
             # run them on a worker thread, never inline on the loop.
-            await asyncio.to_thread(self._record_command_sync_attempt, app_id, fingerprint)
+            await self._state_write_off_loop(self._record_command_sync_attempt, app_id, fingerprint)
 
             http = getattr(self._client, "http", None)
             has_ratelimit_timeout = http is not None and hasattr(http, "max_ratelimit_timeout")
@@ -3151,7 +3187,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     # Rate-limited but no retry-after signal — back off for a
                     # conservative default so we don't slam the bucket again.
                     retry_after = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
-                await asyncio.to_thread(
+                await self._state_write_off_loop(
                     self._record_command_sync_rate_limit, app_id, fingerprint, retry_after
                 )
                 logger.warning(
@@ -3169,7 +3205,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if has_ratelimit_timeout:
                     http.max_ratelimit_timeout = previous_ratelimit_timeout
 
-            await asyncio.to_thread(self._record_command_sync_success, app_id, fingerprint, summary)
+            await self._state_write_off_loop(self._record_command_sync_success, app_id, fingerprint, summary)
             logger.info(
                 "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
                 self.name,
